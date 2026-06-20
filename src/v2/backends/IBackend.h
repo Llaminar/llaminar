@@ -20,6 +20,7 @@
 
 #include "DeviceType.h"
 #include <cstddef>
+#include <cstdint>
 #include <future>
 #include <string>
 
@@ -241,6 +242,21 @@ namespace llaminar2
         virtual void *createEvent(int device_id) = 0;
 
         /**
+         * @brief Create an event suitable for elapsed-time measurement.
+         *
+         * Normal synchronization events may disable timing to avoid pipeline
+         * overhead in the hot path.  Profiling code that needs device elapsed
+         * time must request timing-capable events explicitly through this API.
+         *
+         * @param device_id GPU device ID (0-based)
+         * @return Opaque event handle (nullptr on failure)
+         */
+        virtual void *createTimingEvent(int device_id)
+        {
+            return createEvent(device_id);
+        }
+
+        /**
          * @brief Destroy an event created by createEvent()
          *
          * @param event Opaque event handle (may be nullptr)
@@ -291,6 +307,32 @@ namespace llaminar2
          * waits for a specific point in the stream, not all device operations.
          */
         virtual bool waitForEvent(void *event, int device_id) = 0;
+
+        /**
+         * @brief Measure elapsed milliseconds between two recorded timing events.
+         *
+         * The caller must ensure both events came from @ref createTimingEvent
+         * and have completed before relying on the value.  Implementations
+         * return false when elapsed timing is unsupported.
+         *
+         * @param start_event Event recorded before the measured work
+         * @param stop_event Event recorded after the measured work
+         * @param device_id GPU device ID (0-based)
+         * @param out_ms Destination for elapsed milliseconds
+         * @return true on success, false on unsupported/error
+         */
+        virtual bool eventElapsedTimeMs(
+            void *start_event,
+            void *stop_event,
+            int device_id,
+            float *out_ms)
+        {
+            (void)start_event;
+            (void)stop_event;
+            (void)device_id;
+            (void)out_ms;
+            return false;
+        }
 
         /**
          * @brief Set active device for subsequent operations
@@ -566,10 +608,20 @@ namespace llaminar2
          * @param device_id Device where data resides
          * @param out_value Receives the maximum value
          * @param out_index Receives the index of the maximum element
+         * @param stream Optional device stream to enqueue work on
+         * @param partial_vals Device scratch [partial_capacity] for the
+         *        two-pass multi-block reduction (per-block partial max values).
+         *        Production GPU backends require caller-owned workspace/arena
+         *        scratch and fail loud when it is missing or undersized.
+         * @param partial_idxs Device scratch [partial_capacity] for the
+         *        per-block partial max indices (paired with @p partial_vals).
+         * @param partial_capacity Number of entries in the partial scratch buffers.
          * @return true if executed on device, false if not supported (caller should fall back)
          */
         virtual bool argmaxF32(const void *data_device, int n, int device_id,
-                               float *out_value, int *out_index, void *stream = nullptr)
+                               float *out_value, int *out_index, void *stream = nullptr,
+                               void *partial_vals = nullptr, void *partial_idxs = nullptr,
+                               int partial_capacity = 0)
         {
             (void)data_device;
             (void)n;
@@ -577,7 +629,94 @@ namespace llaminar2
             (void)out_value;
             (void)out_index;
             (void)stream;
+            (void)partial_vals;
+            (void)partial_idxs;
+            (void)partial_capacity;
             return false; // Not supported by default
+        }
+
+        /**
+         * @brief GPU-side greedy argmax for several contiguous FP32 rows.
+         *
+         * @param data_device Device pointer to row-major FP32 data.
+         * @param rows Number of rows to sample.
+         * @param cols Number of columns per row.
+         * @param device_id Device where data resides.
+         * @param out_values Host buffer [rows] for max values.
+         * @param out_indices Host buffer [rows] for row-local argmax indices.
+         * @param stream Optional device stream to enqueue work on.
+         * @param partial_vals Device scratch shared across rows. Backends that
+         *        implement a fused batched kernel should partition this scratch
+         *        internally. The default implementation calls argmaxF32() once
+         *        per row, preserving existing backend behavior.
+         * @param partial_idxs Device scratch paired with @p partial_vals.
+         * @param partial_capacity Number of entries in each scratch buffer.
+         * @return true if every row was sampled on device.
+         */
+        virtual bool argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
+                                          float *out_values, int *out_indices, void *stream = nullptr,
+                                          void *partial_vals = nullptr, void *partial_idxs = nullptr,
+                                          int partial_capacity = 0)
+        {
+            if (!data_device || rows <= 0 || cols <= 0 || !out_values || !out_indices)
+                return false;
+
+            const auto *base = static_cast<const float *>(data_device);
+            for (int row = 0; row < rows; ++row)
+            {
+                if (!argmaxF32(base + static_cast<size_t>(row) * static_cast<size_t>(cols),
+                               cols,
+                               device_id,
+                               out_values + row,
+                               out_indices + row,
+                               stream,
+                               partial_vals,
+                               partial_idxs,
+                               partial_capacity))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        /**
+         * @brief Enqueue GPU-side greedy argmax for several contiguous FP32 rows.
+         *
+         * Unlike argmaxF32BatchedRows(), this vLLM-style primitive leaves the
+         * row-local argmax values and indices on device. It performs no
+         * allocation, host copy, or synchronization, and is suitable for graph
+         * capture plus downstream device-side speculative verification summary.
+         *
+         * @param out_values_device Device buffer [rows] for max values.
+         * @param out_indices_device Device buffer [rows] for row-local token ids.
+         * @param output_stride Element stride between adjacent output rows.
+         */
+        virtual bool enqueueArgmaxF32BatchedRowsDevice(
+            const void *data_device,
+            int rows,
+            int cols,
+            int device_id,
+            void *stream,
+            void *out_values_device,
+            void *out_indices_device,
+            void *partial_vals = nullptr,
+            void *partial_idxs = nullptr,
+            int partial_capacity = 0,
+            int output_stride = 1)
+        {
+            (void)data_device;
+            (void)rows;
+            (void)cols;
+            (void)device_id;
+            (void)stream;
+            (void)out_values_device;
+            (void)out_indices_device;
+            (void)partial_vals;
+            (void)partial_idxs;
+            (void)partial_capacity;
+            (void)output_stride;
+            return false;
         }
 
         /**
@@ -606,6 +745,1163 @@ namespace llaminar2
             (void)out_indices;
             (void)stream;
             return false; // Not supported by default
+        }
+
+        /**
+         * @brief GPU-side top-k/top-p/temperature sampling over FP32 logits.
+         *
+         * This synchronous convenience wrapper only copies the selected token
+         * back to the host. It must not materialize full logits on the CPU.
+         *
+         * @param data_device Device pointer to FP32 logits [n]
+         * @param n Vocabulary size
+         * @param top_k Top-k candidate limit (1..256, clamped by backend)
+         * @param top_p Nucleus probability threshold (<=0 or >=1 disables)
+         * @param temperature Sampling temperature (<=0 treated as 1)
+         * @param rng_seed Deterministic RNG seed
+         * @param rng_offset Per-sample RNG offset/counter
+         * @param device_id Device where data resides
+         * @param out_token Host pointer for selected token
+         * @param stream Explicit GPU stream
+         * @return true if sampled on device
+         */
+        virtual bool sampleTopKTopPF32(const void *data_device, int n,
+                                       int top_k, float top_p, float temperature,
+                                       uint64_t rng_seed, uint64_t rng_offset,
+                                       int device_id, int *out_token,
+                                       void *stream = nullptr)
+        {
+            (void)data_device;
+            (void)n;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)rng_seed;
+            (void)rng_offset;
+            (void)device_id;
+            (void)out_token;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable top-k/top-p/temperature sampling.
+         *
+         * The selected token is written to out_token_device. This method performs
+         * no allocation, host/device copies, or synchronization, and requires an
+         * explicit non-null stream.
+         */
+        virtual bool enqueueSampleTopKTopPF32Device(const void *data_device, int n,
+                                                    int top_k, float top_p, float temperature,
+                                                    uint64_t rng_seed, uint64_t rng_offset,
+                                                    int device_id, void *stream,
+                                                    void *out_token_device)
+        {
+            (void)data_device;
+            (void)n;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)rng_seed;
+            (void)rng_offset;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable top-k/top-p distribution construction.
+         *
+         * Writes a compact probability table of length top_k to device buffers.
+         * Entries outside the selected top-p nucleus are marked with token id -1
+         * and probability 0. This method performs no allocation, host/device
+         * copies, or synchronization, and requires an explicit non-null stream.
+         */
+        virtual bool enqueueBuildTopKTopPDistributionF32Device(const void *data_device, int n,
+                                                               int top_k, float top_p, float temperature,
+                                                               int device_id, void *stream,
+                                                               void *out_token_ids_device,
+                                                               void *out_probs_device,
+                                                               void *scratch_values_device = nullptr,
+                                                               void *scratch_indices_device = nullptr,
+                                                               int scratch_capacity = 0)
+        {
+            (void)data_device;
+            (void)n;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_probs_device;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable top-k/top-p distribution construction for rows.
+         *
+         * Builds `row_count` compact probability tables from a contiguous logits
+         * matrix without allocating, synchronizing, or touching the default GPU
+         * stream. `row_stride` is measured in FP32 elements between input rows;
+         * `out_stride` is measured in INT32/FP32 entries between compact output
+         * slots. Scratch capacity is the total number of `(value,index)` entries
+         * available across every row in the batched launch.
+         *
+         * This is the vLLM-style target/bonus verifier-row companion to the
+         * scalar distribution builder above. It lets the runner queue all
+         * all-position verifier target rows behind one explicit stream handoff
+         * instead of launching a scalar table builder per row.
+         */
+        virtual bool enqueueBuildTopKTopPDistributionsF32Device(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_token_ids_device,
+            int out_stride,
+            void *out_probs_device,
+            void *scratch_values_device = nullptr,
+            void *scratch_indices_device = nullptr,
+            int scratch_capacity = 0)
+        {
+            (void)data_device;
+            (void)row_count;
+            (void)n;
+            (void)row_stride;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_ids_device;
+            (void)out_stride;
+            (void)out_probs_device;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable top-k/top-p processing into full logits.
+         *
+         * Converts raw logits into the processed-logit representation consumed by
+         * the vLLM-style stochastic verifier: temperature is applied, tokens
+         * outside the top-k/top-p nucleus are set to -inf, and active tokens keep
+         * logits whose softmax exactly matches the compact top-k/top-p
+         * distribution. `out_logits_device` may alias `data_device` after the
+         * implementation has computed top-k partials, which lets graph stages
+         * process LM-head output in place when ownership permits.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a default/null GPU stream.
+         */
+        virtual bool enqueueBuildTopKTopPProcessedLogitsF32Device(
+            const void *data_device,
+            int row_count,
+            int n,
+            int row_stride,
+            int top_k,
+            float top_p,
+            float temperature,
+            int device_id,
+            void *stream,
+            void *out_logits_device,
+            int out_row_stride,
+            void *scratch_values_device = nullptr,
+            void *scratch_indices_device = nullptr,
+            int scratch_capacity = 0)
+        {
+            (void)data_device;
+            (void)row_count;
+            (void)n;
+            (void)row_stride;
+            (void)top_k;
+            (void)top_p;
+            (void)temperature;
+            (void)device_id;
+            (void)stream;
+            (void)out_logits_device;
+            (void)out_row_stride;
+            (void)scratch_values_device;
+            (void)scratch_indices_device;
+            (void)scratch_capacity;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable sampling from a compact probability table.
+         *
+         * The threshold is a host-provided random draw in [0, 1), allowing callers
+         * to preserve their existing deterministic RNG stream while keeping logits
+         * and distribution math on the device. The output token is written to a
+         * scalar device buffer. Requires an explicit non-null stream.
+         */
+        virtual bool enqueueSampleDistributionF32Device(
+            const void *token_ids_device,
+            const void *probs_device,
+            int top_k,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)token_ids_device;
+            (void)probs_device;
+            (void)top_k;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable sampling from processed full logits.
+         *
+         * The logits row is already in sampling space: temperature, penalties,
+         * and any token masks have been applied. This is the vLLM-style
+         * full-logit companion to enqueueSampleDistributionF32Device(), used for
+         * bonus-ready or residual rows without materializing compact top-k
+         * tables. Implementations must use the explicit non-null stream only.
+         */
+        virtual bool enqueueSampleProcessedLogitsF32Device(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Lazily sample a processed bonus row only when a batch needs it.
+         *
+         * Stochastic MTP only consumes the bonus ready token when the first
+         * target token does not stop and every verified speculative row
+         * accepts. This graph-capturable primitive checks the compact verifier
+         * outputs on device, returns `-1` immediately when the bonus is not
+         * semantically needed, and otherwise samples @p logits_device exactly
+         * like enqueueSampleProcessedLogitsF32Device().
+         *
+         * Backends must use the explicit non-null @p stream only. They must not
+         * allocate, synchronize, or fall back to a default/null GPU stream.
+         */
+        virtual bool enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float threshold,
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            int first_token,
+            const void *first_token_device,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)threshold;
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)row_count;
+            (void)first_token;
+            (void)first_token_device;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style draft proposal from raw logits.
+         *
+         * Draft proposal deliberately uses only temperature-scaled raw logits:
+         * target rows own top-k/top-p, penalties, and residual correction. The
+         * kernel writes the full proposal probability row plus the sampled draft
+         * token and q(sampled_token), giving the verifier everything it needs
+         * without building a compact top-k/top-p draft table.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a device-default/null stream.
+         */
+        virtual bool enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float temperature,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_probabilities_device,
+            int out_row_stride,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)temperature;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_probabilities_device;
+            (void)out_row_stride;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style draft proposal while preserving draft logits.
+         *
+         * This is the production draft-side companion to
+         * enqueueSoftmaxAndSampleTemperatureLogitsF32Device(). It samples from
+         * the temperature-only proposal distribution, writes the sampled token
+         * plus q(sampled_token), and stores the temperature-scaled proposal
+         * logits in `out_logits_device` for rejection verification.
+         *
+         * The verifier can then compute p/q and recovered-token weights from
+         * logits/logsumexp, avoiding a full-vocab draft probability matrix.
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a device-default/null stream.
+         */
+        virtual bool enqueueScaleAndSampleTemperatureLogitsF32Device(
+            const void *logits_device,
+            int vocab_size,
+            int row_stride,
+            float temperature,
+            float threshold,
+            int device_id,
+            void *stream,
+            void *out_logits_device,
+            int out_row_stride,
+            void *out_token_device,
+            void *out_probability_device = nullptr)
+        {
+            (void)logits_device;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)temperature;
+            (void)threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_logits_device;
+            (void)out_row_stride;
+            (void)out_token_device;
+            (void)out_probability_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable softmax for processed full-logit rows.
+         *
+         * The input rows are already in sampling space: temperature, penalties,
+         * and token masks have been applied. Non-finite logits are written as
+         * probability zero. This is the vLLM-style materialization step that
+         * feeds full-probability rejection sampling.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a device-default/null stream.
+         */
+        virtual bool enqueueSoftmaxProcessedLogitsF32Device(
+            const void *logits_device,
+            int row_count,
+            int vocab_size,
+            int row_stride,
+            int device_id,
+            void *stream,
+            void *out_probabilities_device,
+            int out_row_stride)
+        {
+            (void)logits_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)device_id;
+            (void)stream;
+            (void)out_probabilities_device;
+            (void)out_row_stride;
+            return false;
+        }
+
+        /**
+         * @brief Fill vLLM-style inverse-exponential rejection samples on device.
+         *
+         * Writes `row_count` full-vocab rows. Row `r` uses logical position
+         * `first_logical_position + r` so the same speculative verification
+         * step produces identical recovered-token choices whether it is captured
+         * or replayed. Implementations must only enqueue work on the explicit
+         * non-null stream; no allocation, synchronization, or default/null
+         * stream use is allowed.
+         */
+        virtual bool enqueueFillInverseExponentialSamplesF32Device(
+            void *out_samples_device,
+            int row_count,
+            int vocab_size,
+            int row_stride,
+            uint64_t seed,
+            int first_logical_position,
+            int device_id,
+            void *stream)
+        {
+            (void)out_samples_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)row_stride;
+            (void)seed;
+            (void)first_logical_position;
+            (void)device_id;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable speculative verify from compact distributions.
+         *
+         * target/draft distributions must be the top-k probability tables
+         * produced by enqueueBuildTopKTopPDistributionF32Device(). The kernel
+         * accepts draft_token with min(1, p/q), otherwise samples from the
+         * residual max(p - q, 0). It writes only small scalar outputs to device
+         * buffers and requires an explicit non-null stream.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32Device(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int draft_token,
+            uint64_t accept_seed,
+            uint64_t accept_offset,
+            uint64_t residual_seed,
+            uint64_t residual_offset,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)draft_token;
+            (void)accept_seed;
+            (void)accept_offset;
+            (void)residual_seed;
+            (void)residual_offset;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue graph-capturable speculative verify using caller RNG draws.
+         *
+         * Equivalent to enqueueSpeculativeVerifyDistributionsF32Device(), but
+         * consumes explicit accept/residual thresholds instead of deriving random
+         * numbers from seed/offset pairs.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholds(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)draft_token;
+            (void)accept_threshold;
+            (void)residual_threshold;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue batched speculative verification using caller RNG draws.
+         *
+         * This checks accept/reject decisions and computes each row's candidate
+         * residual correction token for several contiguous target/draft
+         * distribution slots in one launch. Callers still decide which first
+         * rejected row is semantically consumed.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int distribution_stride,
+            const int *draft_tokens_host,
+            const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
+            int row_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)distribution_stride;
+            (void)draft_tokens_host;
+            (void)accept_thresholds_host;
+            (void)residual_thresholds_host;
+            (void)row_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue batched speculative verification using device draft tokens.
+         *
+         * This is the vLLM-style sibling of
+         * enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(): the
+         * sampled draft token sequence already lives in arena-owned device
+         * memory, so the verifier kernel reads `draft_tokens_device[row]`
+         * directly instead of receiving draft tokens as host scalar kernel
+         * arguments. If `draft_token_probabilities_device` is provided, row `r`
+         * contains q(draft_tokens_device[r]) from the draft sampler and the
+         * verifier can skip the sampled-token lookup in the compact draft
+         * table. Residual sampling still uses the full draft table.
+         *
+         * Passing both draft distribution pointers as null is a separate,
+         * intentional vLLM-style greedy-draft mode: the draft proposal is
+         * treated as one-hot at `draft_tokens_device[row]`, so the verifier can
+         * use the compact target distribution without materializing any draft
+         * probability table. Passing only one null draft pointer is invalid.
+         *
+         * Thresholds normally arrive as scalar host values.  For deterministic
+         * seeded vLLM-style one-hot verification, callers may pass both
+         * threshold arrays as null and provide `inverse_sample_seed` plus
+         * `inverse_sample_first_logical_position`; the backend must derive
+         * accept/residual thresholds inside the explicit stream launch using
+         * `sampling_math::mtp_spec_threshold_from_seed()`.  Passing only one
+         * null threshold array, omitting the seed, or requesting seeded
+         * thresholds with a materialized draft distribution is invalid.
+         *
+         * Implementations must only enqueue work on `stream`; they must not
+         * allocate, synchronize, or use a default/null GPU stream.
+         */
+        virtual bool enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_token_ids_device,
+            const void *target_probs_device,
+            const void *draft_token_ids_device,
+            const void *draft_probs_device,
+            int top_k,
+            int distribution_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
+            int row_count,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            const void *draft_token_probabilities_device = nullptr,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            int inverse_sample_vocab_size = 0)
+        {
+            (void)target_token_ids_device;
+            (void)target_probs_device;
+            (void)draft_token_ids_device;
+            (void)draft_probs_device;
+            (void)top_k;
+            (void)distribution_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)residual_thresholds_host;
+            (void)row_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)draft_token_probabilities_device;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)inverse_sample_vocab_size;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue batched stochastic verification from processed full logits.
+         *
+         * This is the vLLM-style sibling of the compact-table verifier. The
+         * target and draft rows are already processed into sampling space
+         * (temperature/penalties/masks applied), and the kernel recovers only
+         * the sampled draft token probabilities needed for accept/reject. On a
+         * rejection it samples the residual distribution from the full logits.
+         *
+         * Implementations must launch only on the explicit non-null `stream`;
+         * no allocation, synchronization, or device-default/null stream use is
+         * allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_logits_device,
+            const void *draft_logits_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            const float *residual_thresholds_host,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            const void *draft_token_probabilities_device = nullptr)
+        {
+            (void)target_logits_device;
+            (void)draft_logits_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)residual_thresholds_host;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)draft_token_probabilities_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style verify from target logits and draft probabilities.
+         *
+         * The target rows are processed logits: penalties, top-k/top-p masks,
+         * and temperature have already been applied. The draft rows are
+         * temperature-only proposal probabilities captured when each MTP draft
+         * token was sampled. In vLLM-style greedy-draft mode
+         * @p no_draft_probabilities treats the draft distribution as one-hot at
+         * the sampled token. The kernel computes p(draft) from the target row,
+         * reads or synthesizes q(draft), and on rejection samples the recovered
+         * token by reducing `max(p - q, 0) * inverse_exp(token)`.
+         *
+         * This keeps the production path closer to vLLM by avoiding target
+         * full-probability rows and inverse-random matrices. Implementations
+         * must launch only on the explicit non-null `stream`; no allocation,
+         * synchronization, or device-default/null stream use is allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_logits_device,
+            const void *draft_probabilities_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            bool no_draft_probabilities = false)
+        {
+            (void)target_logits_device;
+            (void)draft_probabilities_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)no_draft_probabilities;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style verify from target and draft logits.
+         *
+         * Target rows are processed logits: penalties, top-k/top-p masks, and
+         * temperature have already been applied. Draft rows are temperature-only
+         * proposal logits captured when each MTP draft token was sampled. The
+         * kernel computes p(draft) and q(draft) from row-local logsumexp and, on
+         * rejection, samples the recovered token with the same inverse-exp race
+         * used by vLLM-style probability rejection.
+         *
+         * This is a measured alternative to the probability-row path. It avoids
+         * materializing full draft probability rows while preserving exact
+         * rejection semantics, but production promotion still depends on
+         * backend-specific perf evidence. Implementations must launch only on
+         * the explicit non-null `stream`; no allocation, synchronization, or
+         * default/null stream use is allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProcessedTargetDraftLogitsF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_logits_device,
+            const void *draft_logits_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            const void *draft_token_probabilities_device = nullptr)
+        {
+            (void)target_logits_device;
+            (void)draft_logits_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)inverse_sample_seed;
+            (void)inverse_sample_first_logical_position;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)draft_token_probabilities_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue vLLM-style stochastic verify from full probability rows.
+         *
+         * `target_probabilities_device` and `draft_probabilities_device` are
+         * full-vocab probability rows for each verifier row. On rejection, the
+         * kernel samples the recovered token by reducing
+         * `max(target_prob - draft_prob, 0) * inverse_rejection_samples`.
+         *
+         * This mirrors vLLM's random rejection sampler and is the target
+         * production contract for stochastic MTP. Implementations must launch
+         * only on the explicit non-null `stream`; no allocation,
+         * synchronization, or device-default/null stream use is allowed.
+         */
+        virtual bool enqueueSpeculativeVerifyProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+            const void *target_probabilities_device,
+            const void *draft_probabilities_device,
+            const void *inverse_rejection_samples_device,
+            int row_count,
+            int vocab_size,
+            int target_row_stride,
+            int draft_row_stride,
+            int inverse_sample_row_stride,
+            const void *draft_tokens_device,
+            const float *accept_thresholds_host,
+            int device_id,
+            void *stream,
+            void *out_token_device,
+            void *out_accepted_device,
+            void *out_accept_probability_device = nullptr,
+            void *out_accept_threshold_device = nullptr,
+            bool no_draft_probabilities = false)
+        {
+            (void)target_probabilities_device;
+            (void)draft_probabilities_device;
+            (void)inverse_rejection_samples_device;
+            (void)row_count;
+            (void)vocab_size;
+            (void)target_row_stride;
+            (void)draft_row_stride;
+            (void)inverse_sample_row_stride;
+            (void)draft_tokens_device;
+            (void)accept_thresholds_host;
+            (void)device_id;
+            (void)stream;
+            (void)out_token_device;
+            (void)out_accepted_device;
+            (void)out_accept_probability_device;
+            (void)out_accept_threshold_device;
+            (void)no_draft_probabilities;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue device-side reduction of batched speculative verifier rows.
+         *
+         * The row verifier writes `verify_tokens_device` and
+         * `verify_accepted_device`. This graph-capturable reducer converts those
+         * row-local decisions into the vLLM-style output contract: committed
+         * output tokens plus a small integer metadata table. Stop tokens are
+         * host-side scalars copied into kernel arguments by backend wrappers;
+         * the kernel never dereferences host memory. Requires an explicit
+         * non-null stream.
+         */
+        virtual bool enqueueSummarizeSpeculativeVerifyBatch(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            int first_token,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)row_count;
+            (void)first_token;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)bonus_token_device;
+            (void)has_bonus_token;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue batch summary using a device-resident first token.
+         *
+         * This is the graph-friendly companion to
+         * enqueueSummarizeSpeculativeVerifyBatch(). The first main-model token
+         * is sampled on GPU and remains in arena scratch until this reducer
+         * consumes it. Backends must launch on the explicit `stream`, read
+         * `first_token_device` inside the kernel, and call the same shared
+         * SamplingMath reducer as the host-token variant.
+         *
+         * @param first_token_device Device pointer to one INT32 sampled token.
+         * @return true when the reducer launch was queued successfully.
+         */
+        virtual bool enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
+            const void *verify_tokens_device,
+            const void *verify_accepted_device,
+            int row_count,
+            const void *first_token_device,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            const void *bonus_token_device,
+            bool has_bonus_token,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)verify_accepted_device;
+            (void)row_count;
+            (void)first_token_device;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)bonus_token_device;
+            (void)has_bonus_token;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Enqueue device-side reduction of greedy verifier rows.
+         *
+         * Greedy MTP uses the same vLLM-style compact batch contract as the
+         * stochastic verifier, but row acceptance is simply
+         * `verify_tokens[row] == draft_tokens[row + 1]`. Backends must launch a
+         * small graph-capturable kernel on the explicit non-null `stream`,
+         * compare the device-resident verifier argmax rows with the
+         * device-resident compact verifier input row, and write only compact
+         * output tokens plus metadata for the host handoff.
+         *
+         * @param verify_tokens_device INT32 verifier argmax rows
+         *        `[compare_row_count + 1]`; the final row is the bonus ready
+         *        token used only when all speculative rows accept.
+         * @param draft_tokens_device INT32 verifier input row
+         *        `[first_token, draft_1, ...]`.
+         * @param compare_row_count Number of speculative rows to compare.
+         * @param first_token Legacy host shadow of `draft_tokens_device[0]`.
+         *        GPU reducers must read entry zero from @p draft_tokens_device
+         *        so deferred first-token paths do not need a pre-verifier D2H.
+         */
+        virtual bool enqueueSummarizeGreedySpeculativeVerifyBatch(
+            const void *verify_tokens_device,
+            const void *draft_tokens_device,
+            int compare_row_count,
+            int first_token,
+            const int *stop_tokens_host,
+            int stop_token_count,
+            int device_id,
+            void *stream,
+            void *out_tokens_device,
+            void *out_meta_device)
+        {
+            (void)verify_tokens_device;
+            (void)draft_tokens_device;
+            (void)compare_row_count;
+            (void)first_token;
+            (void)stop_tokens_host;
+            (void)stop_token_count;
+            (void)device_id;
+            (void)stream;
+            (void)out_tokens_device;
+            (void)out_meta_device;
+            return false;
+        }
+
+        /**
+         * @brief Derive device-resident speculative state publication metadata.
+         *
+         * The compact verifier reducers write one metadata row per request. This
+         * graph-capturable helper converts that compact row into the row index
+         * and cache-token count consumed by MTP state publication:
+         *
+         * - restore row: flattened verifier state row to publish
+         * - target cached tokens: base cached tokens plus committed verifier rows
+         * - accepted state count: verifier rows committed for the request
+         * - all-drafts-accepted and stopped flags: transaction predicates that
+         *   let downstream graph-captured consumers decide whether the resident
+         *   next-condition token is a continuation candidate without first
+         *   materializing the compact outcome on the CPU
+         * - ok: 1 when the compact metadata was valid for publication
+         *
+         * `base_cached_tokens_device` is an INT32 array with one entry per
+         * request. All output pointers are INT32 arrays with one entry per
+         * request. Backends must launch on the explicit non-null `stream`, never
+         * allocate inside this call, and use the shared SamplingMath helper so
+         * CUDA, ROCm, and CPU-side tests keep the same off-by-one semantics.
+         */
+        virtual bool enqueueDeriveSpeculativePublicationMetadata(
+            const void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            int max_state_commit_rows,
+            int device_id,
+            void *stream,
+            void *out_restore_rows_device,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device,
+            void *out_next_condition_tokens_device = nullptr,
+            const void *output_tokens_device = nullptr,
+            int output_token_stride = 0,
+            void *out_all_drafts_accepted_flags_device = nullptr,
+            void *out_stopped_flags_device = nullptr)
+        {
+            (void)meta_device;
+            (void)meta_stride;
+            (void)base_cached_tokens_device;
+            (void)request_count;
+            (void)padded_state_rows_per_request;
+            (void)max_state_commit_rows;
+            (void)device_id;
+            (void)stream;
+            (void)out_restore_rows_device;
+            (void)out_target_cached_tokens_device;
+            (void)out_accepted_state_counts_device;
+            (void)out_ok_device;
+            (void)out_next_condition_tokens_device;
+            (void)output_tokens_device;
+            (void)output_token_stride;
+            (void)out_all_drafts_accepted_flags_device;
+            (void)out_stopped_flags_device;
+            return false;
+        }
+
+        /**
+         * @brief Derive shifted MTP KV cache publication counts on device.
+         *
+         * Direct all-position MTP publication updates both the main target KV
+         * cache and each shifted sidecar KV cache.  This helper derives the
+         * sidecar depth's target cached-token count and wrapped-head advance
+         * count from the same compact verifier metadata as
+         * enqueueDeriveSpeculativePublicationMetadata(), using
+         * `max(0, target_cached_tokens - mtp_depth - 1)`.
+         */
+        virtual bool enqueueDeriveShiftedSpeculativePublicationMetadata(
+            const void *meta_device,
+            int meta_stride,
+            const void *base_cached_tokens_device,
+            int request_count,
+            int padded_state_rows_per_request,
+            int max_state_commit_rows,
+            int mtp_depth,
+            int device_id,
+            void *stream,
+            void *out_target_cached_tokens_device,
+            void *out_accepted_state_counts_device,
+            void *out_ok_device)
+        {
+            (void)meta_device;
+            (void)meta_stride;
+            (void)base_cached_tokens_device;
+            (void)request_count;
+            (void)padded_state_rows_per_request;
+            (void)max_state_commit_rows;
+            (void)mtp_depth;
+            (void)device_id;
+            (void)stream;
+            (void)out_target_cached_tokens_device;
+            (void)out_accepted_state_counts_device;
+            (void)out_ok_device;
+            return false;
+        }
+
+        /**
+         * @brief GPU-side sparse logit penalty application
+         *
+         * Applies a sparse set of additive penalties to logits in-place on the GPU.
+         * Each entry (token_id, penalty) subtracts the penalty from logits[token_id].
+         * Used to apply presence, frequency, and DRY penalties without a full D2H
+         * transfer of the logits tensor (~600KB for 151K vocab).
+         *
+         * @param logits_device Device pointer to FP32 logits [vocab_size] — modified in-place
+         * @param token_ids_host Host array of token IDs to penalize
+         * @param penalties_host Host array of penalty values (positive = penalize)
+         * @param num_penalties Number of entries in token_ids and penalties arrays
+         * @param vocab_size Total vocabulary size (for bounds checking)
+         * @param device_id Device where logits reside
+         * @param stream Optional stream for async execution
+         * @return true if executed on device, false if not supported
+         */
+        virtual bool applyLogitPenaltiesF32(void *logits_device,
+                                            const int *token_ids_host,
+                                            const float *penalties_host,
+                                            int num_penalties, int vocab_size,
+                                            int device_id, void *stream = nullptr)
+        {
+            (void)logits_device;
+            (void)token_ids_host;
+            (void)penalties_host;
+            (void)num_penalties;
+            (void)vocab_size;
+            (void)device_id;
+            (void)stream;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Enqueue sparse logit penalties from device-resident inputs.
+         *
+         * This is the graph-capturable form of applyLogitPenaltiesF32(): token IDs
+         * and penalty values already live on the target device, the caller supplies
+         * an explicit non-null stream, and the backend only enqueues the penalty
+         * kernel. It performs no allocation, host/device copies, or synchronization.
+         *
+         * @param logits_device Device pointer to FP32 logits [vocab_size], modified in-place
+         * @param token_ids_device Device pointer to int token IDs [num_penalties]
+         * @param penalties_device Device pointer to FP32 penalties [num_penalties]
+         * @param num_penalties Number of entries in token_ids_device and penalties_device
+         * @param vocab_size Total vocabulary size for bounds checking
+         * @param device_id Device where all pointers reside
+         * @param stream Explicit non-null GPU stream
+         * @return true if the kernel launch was enqueued
+         */
+        virtual bool enqueueLogitPenaltiesF32Device(void *logits_device,
+                                                    const void *token_ids_device,
+                                                    const void *penalties_device,
+                                                    int num_penalties, int vocab_size,
+                                                    int device_id, void *stream)
+        {
+            (void)logits_device;
+            (void)token_ids_device;
+            (void)penalties_device;
+            (void)num_penalties;
+            (void)vocab_size;
+            (void)device_id;
+            (void)stream;
+            return false;
         }
 
         // ====================================================================
@@ -726,6 +2022,105 @@ namespace llaminar2
             (void)event;
             (void)device_id;
             return true;
+        }
+
+        // ====================================================================
+        // Async Host-to-Device Transfer (no implicit sync)
+        // ====================================================================
+
+        /**
+         * @brief Submit async H2D copy on a specific stream WITHOUT synchronizing
+         *
+         * Unlike hostToDevice() which syncs after the memcpy, this submits the
+         * copy and returns immediately. Caller is responsible for synchronization
+         * (typically via recordEvent + streamWaitEvent or synchronizeStream).
+         *
+         * @param dst Device destination pointer (must be pre-allocated)
+         * @param src Host source pointer (should be pinned for true async DMA)
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (must not be nullptr)
+         * @return true on success, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, stream)
+         * - ROCm: hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice, stream)
+         * - CPU: memcpy (synchronous fallback)
+         */
+        virtual bool hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                          int device_id, void *stream)
+        {
+            // Default: fall back to synchronous hostToDevice
+            return hostToDevice(dst, src, bytes, device_id, stream);
+        }
+
+        /**
+         * @brief Submit async D2H copy on a specific stream WITHOUT synchronizing
+         *
+         * This is the device-to-host companion to hostToDeviceOnStream().  It is
+         * intended for small compact summaries where several D2H copies should
+         * be queued on one explicit producer stream and followed by exactly one
+         * synchronizeStream() at the ownership handoff.  GPU implementations
+         * must reject nullptr streams; CPU implementations may treat the stream
+         * as an ignored synchronous marker.
+         *
+         * @param dst Host destination pointer (should be pinned for true async DMA)
+         * @param src Device source pointer
+         * @param bytes Number of bytes to copy
+         * @param device_id GPU device ID (0-based)
+         * @param stream Opaque stream handle (must not be nullptr for GPU)
+         * @return true on successful enqueue/copy, false on error
+         *
+         * **Semantics**:
+         * - CUDA: cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream)
+         * - ROCm: hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost, stream)
+         * - CPU: memcpy (synchronous fallback)
+         */
+        virtual bool deviceToHostOnStream(void *dst, const void *src, size_t bytes,
+                                          int device_id, void *stream)
+        {
+            // Default: fall back to synchronous deviceToHost.
+            return deviceToHost(dst, src, bytes, device_id, stream);
+        }
+
+        // ====================================================================
+        // Pinned Host Memory Allocation
+        // ====================================================================
+
+        /**
+         * @brief Allocate pinned (page-locked) host memory for async DMA transfers
+         *
+         * Pinned memory enables true async H2D/D2H transfers without internal
+         * staging copies. Required for overlapped pipeline transfers.
+         *
+         * @param bytes Number of bytes to allocate
+         * @param device_id GPU device ID (for device affinity, 0-based)
+         * @return Host pointer (nullptr on failure)
+         *
+         * **Semantics**:
+         * - CUDA: cudaHostAlloc(&ptr, bytes, cudaHostAllocDefault)
+         * - ROCm: hipHostMalloc(&ptr, bytes, hipHostMallocDefault)
+         * - CPU: malloc(bytes)
+         *
+         * **Lifetime**: Caller owns memory, must call freePinned()
+         */
+        virtual void *allocatePinned(size_t bytes, int device_id)
+        {
+            (void)bytes;
+            (void)device_id;
+            return nullptr;
+        }
+
+        /**
+         * @brief Free pinned host memory allocated by allocatePinned()
+         *
+         * @param ptr Host pointer from allocatePinned() (may be nullptr)
+         * @param device_id GPU device ID used for allocation
+         */
+        virtual void freePinned(void *ptr, int device_id)
+        {
+            (void)ptr;
+            (void)device_id;
         }
 
         // ====================================================================

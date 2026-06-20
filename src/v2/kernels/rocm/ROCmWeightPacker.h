@@ -23,6 +23,10 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 namespace llaminar2
 {
@@ -46,6 +50,15 @@ namespace llaminar2
         // =================================================================
 
         /**
+         * @brief Initialize ROCm IQ-grid constant tables for all native-VNNI TUs.
+         *
+         * IQ grid formats need per-device LUTs in the GEMV, GEMM, and MoE prefill
+         * translation units. This is normally reached through packNativeVNNI(), but
+         * GPU-pipeline loading bypasses host packing and must call it directly.
+         */
+        bool ensureIQGridTablesInitialized(int device_id);
+
+        /**
          * @brief Pack tensor to native-VNNI layout (internal, called by packWeightsToROCm)
          *
          * Converts any supported ≤6-bit quantized tensor to native-VNNI format:
@@ -58,6 +71,54 @@ namespace llaminar2
          * @return true on success
          */
         bool packNativeVNNI(const TensorBase *tensor, ROCmPackedWeights &out);
+
+        /**
+         * @brief Batch-packed MoE expert weights for ROCm (single GPU allocation for all experts).
+         *
+         * Same design as MoEBatchPackedWeightsCUDA but for ROCm/HIP devices.
+         */
+        struct MoEBatchPackedWeightsROCm
+        {
+            std::vector<uint8_t> all_native_vnni;
+            std::vector<uint16_t> all_native_scales;
+            std::vector<uint16_t> all_native_mins;
+            std::vector<uint32_t> all_native_emins;
+
+            int num_experts = 0;
+            int rows_per_expert = 0;
+            int K = 0;
+            int blocks_per_row = 0;
+            uint8_t codebook_id = 0;
+
+            size_t vnni_bytes_per_expert = 0;
+            size_t scales_per_expert = 0;
+            size_t mins_per_expert = 0;
+            size_t emins_per_expert = 0;
+
+            struct DeviceUpload
+            {
+                uint8_t *d_native_vnni = nullptr;
+                void *d_native_scales = nullptr;  // __half* on device
+                void *d_native_mins = nullptr;
+                void *d_native_emins = nullptr;
+            };
+
+            std::mutex upload_mutex;
+            std::unordered_map<int, DeviceUpload> device_uploads;
+
+            MoEBatchPackedWeightsROCm() = default;
+            MoEBatchPackedWeightsROCm(const MoEBatchPackedWeightsROCm &) = delete;
+            MoEBatchPackedWeightsROCm &operator=(const MoEBatchPackedWeightsROCm &) = delete;
+            ~MoEBatchPackedWeightsROCm();
+
+            bool uploadToDevice(int rocm_device_id);
+            DeviceUpload getExpertDevicePointers(int rocm_device_id, int expert_id) const;
+            void freeHostBuffers();
+        };
+
+        std::shared_ptr<MoEBatchPackedWeightsROCm> packMoEExpertsROCm(
+            const std::vector<std::shared_ptr<TensorBase>> &expert_views,
+            int num_experts, int rows_per_expert);
 
     } // namespace rocm
 } // namespace llaminar2

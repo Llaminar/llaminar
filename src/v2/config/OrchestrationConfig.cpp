@@ -16,6 +16,7 @@
 #include <numeric>
 #include <cmath>
 #include <set>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace llaminar2
@@ -183,6 +184,105 @@ namespace llaminar2
     // DomainDefinition Implementation
     // =========================================================================
 
+    namespace
+    {
+        ExecutionDomainScope toExecutionDomainScope(TPScope scope)
+        {
+            switch (scope)
+            {
+            case TPScope::LOCAL:
+                return ExecutionDomainScope::LOCAL;
+            case TPScope::NODE_LOCAL:
+                return ExecutionDomainScope::NODE_LOCAL;
+            case TPScope::GLOBAL:
+                return ExecutionDomainScope::GLOBAL;
+            case TPScope::AUTO:
+            case TPScope::HYBRID:
+                return ExecutionDomainScope::AUTO;
+            }
+            return ExecutionDomainScope::AUTO;
+        }
+
+        TPScope toTPScope(ExecutionDomainScope scope)
+        {
+            switch (scope)
+            {
+            case ExecutionDomainScope::LOCAL:
+                return TPScope::LOCAL;
+            case ExecutionDomainScope::NODE_LOCAL:
+                return TPScope::NODE_LOCAL;
+            case ExecutionDomainScope::GLOBAL:
+                return TPScope::GLOBAL;
+            case ExecutionDomainScope::SINGLE:
+            case ExecutionDomainScope::AUTO:
+                return TPScope::AUTO;
+            }
+            return TPScope::AUTO;
+        }
+
+        bool sameWeights(const std::vector<float> &lhs, const std::vector<float> &rhs)
+        {
+            if (lhs.size() != rhs.size())
+                return false;
+            for (size_t index = 0; index < lhs.size(); ++index)
+            {
+                if (std::abs(lhs[index] - rhs[index]) > 1e-6f)
+                    return false;
+            }
+            return true;
+        }
+
+        bool sameDomainDefinition(
+            const ExecutionDomainDefinition &lhs,
+            const ExecutionDomainDefinition &rhs)
+        {
+            auto normalizedScope = [](const ExecutionDomainDefinition &domain)
+            {
+                if (domain.scope == ExecutionDomainScope::SINGLE && domain.participants.size() == 1)
+                    return ExecutionDomainScope::AUTO;
+                return domain.scope;
+            };
+
+            return lhs.name == rhs.name &&
+                   lhs.participants == rhs.participants &&
+                   sameWeights(lhs.weights, rhs.weights) &&
+                   lhs.backend == rhs.backend &&
+                   normalizedScope(lhs) == normalizedScope(rhs) &&
+                   lhs.owner_rank == rhs.owner_rank &&
+                   lhs.ranks == rhs.ranks &&
+                   lhs.compute_kind == rhs.compute_kind;
+        }
+
+        void addUniqueName(std::vector<std::string> &names, const std::string &name)
+        {
+            if (name.empty())
+                return;
+            if (std::find(names.begin(), names.end(), name) == names.end())
+                names.push_back(name);
+        }
+
+        std::vector<std::string> overlayDenseDomainNames(const MoEExpertParallelPlan &plan)
+        {
+            std::vector<std::string> names;
+            addUniqueName(names, plan.continuation_domain);
+            addUniqueName(names, plan.effectiveBaseModelDomain());
+            addUniqueName(names, plan.shared_expert_domain);
+            for (const auto &domain : plan.dense_domains)
+                addUniqueName(names, domain.name);
+            return names;
+        }
+
+        std::vector<std::string> overlayRoutedDomainNames(const MoEExpertParallelPlan &plan)
+        {
+            std::vector<std::string> names;
+            for (const auto &tier : plan.routed_tiers)
+                addUniqueName(names, tier.domain);
+            for (const auto &domain : plan.domains)
+                addUniqueName(names, domain.name);
+            return names;
+        }
+    } // namespace
+
     DomainDefinition DomainDefinition::parse(const std::string &spec)
     {
         auto result = tryParse(spec);
@@ -197,168 +297,51 @@ namespace llaminar2
 
     std::optional<DomainDefinition> DomainDefinition::tryParse(const std::string &spec)
     {
-        if (spec.empty())
-        {
-            return std::nullopt;
-        }
+        ExecutionDomainParseOptions options;
+        options.context = "domain definition";
 
+        auto parsed = ExecutionDomainDefinition::tryParse(spec, options);
+        if (!parsed)
+            return std::nullopt;
+        return fromExecutionDomainDefinition(*parsed);
+    }
+
+    ExecutionDomainDefinition DomainDefinition::toExecutionDomainDefinition() const
+    {
+        ExecutionDomainDefinition domain;
+        domain.name = name;
+        domain.participants = devices;
+        domain.weights = weights;
+        domain.backend = backend;
+        domain.scope = toExecutionDomainScope(scope);
+        domain.owner_rank = owner_rank;
+        domain.ranks = explicit_ranks;
+        domain.compute_kind = compute_kind;
+        return domain;
+    }
+
+    DomainDefinition DomainDefinition::fromExecutionDomainDefinition(const ExecutionDomainDefinition &domain)
+    {
         DomainDefinition def;
-
-        // Split by ';' for different sections
-        auto sections = split(spec, ';');
-        if (sections.empty())
-        {
-            return std::nullopt;
-        }
-
-        // First section must be "name=devices"
-        auto &main_section = sections[0];
-        size_t eq_pos = main_section.find('=');
-        if (eq_pos == std::string::npos)
-        {
-            return std::nullopt;
-        }
-
-        def.name = main_section.substr(0, eq_pos);
-        if (def.name.empty())
-        {
-            return std::nullopt;
-        }
-
-        // Parse devices (comma-separated)
-        std::string devices_str = main_section.substr(eq_pos + 1);
-        auto device_specs = split(devices_str, ',');
-        if (device_specs.empty())
-        {
-            return std::nullopt;
-        }
-
-        for (const auto &dev_spec : device_specs)
-        {
-            auto addr = GlobalDeviceAddress::tryParse(dev_spec);
-            if (!addr)
-            {
-                return std::nullopt;
-            }
-            def.devices.push_back(*addr);
-        }
-
-        // Parse optional sections (weights, backend)
-        for (size_t i = 1; i < sections.size(); ++i)
-        {
-            auto &section = sections[i];
-            eq_pos = section.find('=');
-            if (eq_pos == std::string::npos)
-            {
-                continue; // Ignore malformed sections
-            }
-
-            std::string key = toLower(section.substr(0, eq_pos));
-            std::string value = section.substr(eq_pos + 1);
-
-            if (key == "weights")
-            {
-                auto weight_strs = split(value, ',');
-                for (const auto &w_str : weight_strs)
-                {
-                    try
-                    {
-                        float w = std::stof(w_str);
-                        def.weights.push_back(w);
-                    }
-                    catch (const std::exception &)
-                    {
-                        return std::nullopt;
-                    }
-                }
-            }
-            else if (key == "backend")
-            {
-                auto backend = parseCollectiveBackendType(value);
-                if (!backend)
-                {
-                    return std::nullopt;
-                }
-                def.backend = *backend;
-            }
-        }
-
+        def.name = domain.name;
+        def.devices = domain.participants;
+        def.weights = domain.weights;
+        def.backend = domain.backend;
+        def.compute_kind = domain.compute_kind;
+        def.scope = toTPScope(domain.scope);
+        def.owner_rank = domain.owner_rank;
+        def.explicit_ranks = domain.ranks;
         return def;
     }
 
     std::vector<std::string> DomainDefinition::validate() const
     {
-        std::vector<std::string> errors;
-
-        if (name.empty())
-        {
-            errors.push_back("Domain name cannot be empty");
-        }
-
-        if (devices.empty())
-        {
-            errors.push_back("Domain '" + name + "' has no devices");
-        }
-
-        if (!weights.empty())
-        {
-            if (weights.size() != devices.size())
-            {
-                errors.push_back("Domain '" + name + "' has " +
-                                 std::to_string(devices.size()) + " devices but " +
-                                 std::to_string(weights.size()) + " weights");
-            }
-
-            float sum = std::accumulate(weights.begin(), weights.end(), 0.0f);
-            if (std::abs(sum - 1.0f) > 0.01f)
-            {
-                errors.push_back("Domain '" + name + "' weights sum to " +
-                                 std::to_string(sum) + " (expected 1.0)");
-            }
-
-            for (size_t i = 0; i < weights.size(); ++i)
-            {
-                if (weights[i] < 0.0f || weights[i] > 1.0f)
-                {
-                    errors.push_back("Domain '" + name + "' has invalid weight " +
-                                     std::to_string(weights[i]) + " (expected 0.0-1.0)");
-                }
-            }
-        }
-
-        return errors;
+        return toExecutionDomainDefinition().validate();
     }
 
     std::string DomainDefinition::toString() const
     {
-        std::ostringstream oss;
-        oss << name << "=[";
-        for (size_t i = 0; i < devices.size(); ++i)
-        {
-            if (i > 0)
-                oss << ",";
-            oss << devices[i].toShortString();
-        }
-        oss << "]";
-
-        if (!weights.empty())
-        {
-            oss << " weights=[";
-            for (size_t i = 0; i < weights.size(); ++i)
-            {
-                if (i > 0)
-                    oss << ",";
-                oss << weights[i];
-            }
-            oss << "]";
-        }
-
-        if (backend != CollectiveBackendType::AUTO)
-        {
-            oss << " backend=" << collectiveBackendTypeToString(backend);
-        }
-
-        return oss.str();
+        return toExecutionDomainDefinition().toString();
     }
 
     // =========================================================================
@@ -485,6 +468,246 @@ namespace llaminar2
         return !domain_definitions.empty() || !pp_stage_definitions.empty();
     }
 
+    std::vector<ExecutionDomainDefinition> OrchestrationConfig::executionDomainDefinitions() const
+    {
+        std::vector<ExecutionDomainDefinition> domains;
+        domains.reserve(domain_definitions.size() +
+                        (moe_expert_parallel_plan ? moe_expert_parallel_plan->dense_domains.size() +
+                                                        moe_expert_parallel_plan->domains.size()
+                                                  : 0));
+
+        std::unordered_map<std::string, size_t> index_by_name;
+        auto appendIfNew = [&](const ExecutionDomainDefinition &domain)
+        {
+            if (index_by_name.find(domain.name) != index_by_name.end())
+                return;
+            index_by_name.emplace(domain.name, domains.size());
+            domains.push_back(domain);
+        };
+
+        if (moe_expert_parallel_plan)
+        {
+            for (const auto &domain : moe_expert_parallel_plan->dense_domains)
+                appendIfNew(domain);
+            for (const auto &domain : moe_expert_parallel_plan->domains)
+                appendIfNew(domain.toExecutionDomainDefinition());
+        }
+
+        for (const auto &domain : domain_definitions)
+            appendIfNew(domain.toExecutionDomainDefinition());
+
+        return domains;
+    }
+
+    std::vector<std::string> normalizeMoEExpertOverlayDomains(OrchestrationConfig &config)
+    {
+        std::vector<std::string> errors;
+        auto &plan_ptr = config.moe_expert_parallel_plan;
+        if (!plan_ptr)
+            return errors;
+
+        auto &plan = *plan_ptr;
+        std::vector<ExecutionDomainDefinition> inventory;
+        std::unordered_map<std::string, size_t> index_by_name;
+
+        auto addDomain = [&](const ExecutionDomainDefinition &domain, const std::string &source)
+        {
+            if (domain.name.empty())
+            {
+                errors.push_back(source + " defines an execution domain with an empty name");
+                return;
+            }
+
+            auto existing = index_by_name.find(domain.name);
+            if (existing != index_by_name.end())
+            {
+                auto &prior = inventory[existing->second];
+                if (!sameDomainDefinition(prior, domain))
+                {
+                    errors.push_back("Conflicting execution domain definition for '" + domain.name +
+                                     "'. Define each hardware domain once with --define-domain; "
+                                     "--moe-expert-overlay-domain is a strict alias and must not "
+                                     "redefine a domain with different devices, scope, backend, ranks, weights, or compute kind");
+                }
+                else if (prior.scope == ExecutionDomainScope::AUTO && domain.scope != ExecutionDomainScope::AUTO)
+                {
+                    prior = domain;
+                }
+                return;
+            }
+
+            index_by_name.emplace(domain.name, inventory.size());
+            inventory.push_back(domain);
+        };
+
+        for (const auto &domain : config.domain_definitions)
+            addDomain(domain.toExecutionDomainDefinition(), "--define-domain");
+
+        for (const auto &domain : plan.dense_domains)
+            addDomain(domain, "MoE continuation dense domain");
+
+        for (const auto &domain : plan.domains)
+            addDomain(domain.toExecutionDomainDefinition(), "--moe-expert-overlay-domain");
+
+        if (!errors.empty())
+            return errors;
+
+        config.domain_definitions.clear();
+        config.domain_definitions.reserve(inventory.size());
+        for (const auto &domain : inventory)
+            config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain));
+
+        std::vector<ExecutionDomainDefinition> normalized_dense_domains;
+        for (const auto &name : overlayDenseDomainNames(plan))
+        {
+            auto it = index_by_name.find(name);
+            if (it == index_by_name.end())
+                continue;
+            normalized_dense_domains.push_back(inventory[it->second]);
+        }
+
+        if (!normalized_dense_domains.empty() || !plan.dense_domains.empty())
+            plan.dense_domains = std::move(normalized_dense_domains);
+
+        std::vector<ExpertComputeDomain> normalized_plan_domains;
+        for (const auto &name : overlayRoutedDomainNames(plan))
+        {
+            auto it = index_by_name.find(name);
+            if (it == index_by_name.end())
+                continue;
+            try
+            {
+                normalized_plan_domains.push_back(
+                    ExpertComputeDomain::fromExecutionDomainDefinition(inventory[it->second]));
+            }
+            catch (const std::exception &e)
+            {
+                errors.push_back("MoE expert overlay domain '" + name + "': " + e.what());
+            }
+        }
+
+        if (!normalized_plan_domains.empty() || !plan.domains.empty())
+            plan.domains = std::move(normalized_plan_domains);
+
+        return errors;
+    }
+
+    std::vector<std::string> validateMoEExpertOverlayConfig(const OrchestrationConfig &config)
+    {
+        std::vector<std::string> errors;
+        const auto &plan_ptr = config.moe_expert_parallel_plan;
+        if (!plan_ptr)
+        {
+            return errors;
+        }
+
+        const auto &plan = *plan_ptr;
+        const bool has_overlay_details =
+            !plan.continuation_domain.empty() ||
+            !plan.base_model_domain.empty() ||
+            !plan.shared_expert_domain.empty() ||
+            plan.residency_policy != ExpertResidencyPolicy::Disabled ||
+            !plan.continuation_domain_spec.domain.empty() ||
+            !plan.dense_domains.empty() ||
+            !plan.domains.empty() ||
+            !plan.routed_tiers.empty() ||
+            !plan.placements.empty();
+
+        if (!plan.enabled)
+        {
+            if (has_overlay_details)
+            {
+                errors.push_back("MoE expert overlay is off/disabled but overlay domain, tier, continuation, shared-domain, residency, or placement settings were also provided");
+            }
+            return errors;
+        }
+
+        MoEExpertParallelValidationOptions validation_options;
+        auto plan_result = validateMoEExpertParallelPlan(plan, validation_options);
+        for (const auto &error : plan_result.errors)
+        {
+            errors.push_back("MoE expert overlay: " + error);
+        }
+
+        if (config.device_for_this_rank.has_value() && !plan.continuation_domain.empty())
+        {
+            const std::string device_spec = config.cpu_global_tp_all_local
+                                                ? "cpu"
+                                                : config.device_for_this_rank->toShortString();
+            errors.push_back("Conflicting options: --device/-d " + device_spec +
+                             " and --moe-expert-overlay-continuation " +
+                             plan.continuation_domain +
+                             ". Overlay continuation is the root/base placement; remove -d or disable overlay");
+        }
+
+        if (config.device_for_this_rank.has_value() && !plan.base_model_domain.empty())
+        {
+            const std::string device_spec = config.cpu_global_tp_all_local
+                                                ? "cpu"
+                                                : config.device_for_this_rank->toShortString();
+            errors.push_back("Conflicting options: --device/-d " + device_spec +
+                             " and --moe-expert-overlay-base-domain " +
+                             plan.base_model_domain +
+                             ". Overlay base/non-expert placement is explicit; remove -d or disable overlay");
+        }
+
+        auto domainByName = [&](const std::string &name) -> const ExpertComputeDomain *
+        {
+            auto it = std::find_if(plan.domains.begin(), plan.domains.end(),
+                                   [&](const auto &domain)
+                                   {
+                                       return domain.name == name;
+                                   });
+            return it == plan.domains.end() ? nullptr : &*it;
+        };
+
+        const auto *continuation_domain = domainByName(plan.continuation_domain);
+        const int continuation_owner = continuation_domain ? continuation_domain->owner_rank : -1;
+
+        const std::string base_domain_name = plan.effectiveBaseModelDomain();
+        const auto *base_domain = domainByName(base_domain_name);
+        if (!plan.base_model_domain.empty() && base_domain && continuation_owner >= 0)
+        {
+            const int base_owner = base_domain->owner_rank;
+            if (base_owner >= 0 && base_owner != continuation_owner)
+            {
+                errors.push_back("MoE expert overlay base/non-expert model domain '" + base_domain_name +
+                                 "' owner rank " + std::to_string(base_owner) +
+                                 " does not match continuation root rank " +
+                                 std::to_string(continuation_owner) +
+                                 "; current overlay root execution requires base and continuation placement on the same root rank");
+            }
+        }
+
+        for (const auto &tier : plan.routed_tiers)
+        {
+            if (tier.domain == plan.continuation_domain)
+                continue;
+
+            const auto *domain = domainByName(tier.domain);
+            if (!domain)
+                continue;
+
+            const bool remote_single_device =
+                domain->kind == ExpertDomainKind::SingleDevice &&
+                domain->owner_rank >= 0 &&
+                continuation_owner >= 0 &&
+                domain->owner_rank != continuation_owner;
+            if (remote_single_device)
+            {
+                errors.push_back("MoE expert overlay auxiliary domain '" + domain->name +
+                                 "' has no Phase 6 worker implementation for remote single-device replicated experts");
+            }
+        }
+
+        if (!config.pp_stage_definitions.empty())
+        {
+            errors.push_back("MoE expert overlay cannot be combined with --pp-stage in Phase 2: overlay domains are same-layer expert roles, not PP layer ownership");
+        }
+
+        return errors;
+    }
+
     std::vector<std::string> OrchestrationConfig::validate() const
     {
         std::vector<std::string> errors;
@@ -601,6 +824,46 @@ namespace llaminar2
             errors.push_back("CPU layers must be >= 0, got " + std::to_string(cpu_layers));
         }
 
+        // Validate optional same-layer MoE expert overlay plan.
+        {
+            OrchestrationConfig normalized = *this;
+            if (normalized.moe_expert_parallel_plan)
+            {
+                normalized.moe_expert_parallel_plan =
+                    std::make_shared<MoEExpertParallelPlan>(*normalized.moe_expert_parallel_plan);
+            }
+            auto normalize_errors = normalizeMoEExpertOverlayDomains(normalized);
+            for (const auto &error : normalize_errors)
+            {
+                errors.push_back("MoE expert overlay: " + error);
+            }
+            auto overlay_errors = validateMoEExpertOverlayConfig(normalized);
+            errors.insert(errors.end(), overlay_errors.begin(), overlay_errors.end());
+        }
+
+        if (moe_hot_expert_cache.kind == MoEHotExpertCacheConfig::Kind::Count &&
+            moe_hot_expert_cache.count < 0)
+        {
+            errors.push_back("MoE hot expert cache count must be >= 0");
+        }
+        if (moe_hot_expert_cache.kind == MoEHotExpertCacheConfig::Kind::Percent &&
+            (moe_hot_expert_cache.percent < 0.0f || moe_hot_expert_cache.percent > 100.0f))
+        {
+            errors.push_back("MoE hot expert cache percent must be in [0, 100]");
+        }
+        if (moe_rebalance.window_size <= 0)
+        {
+            errors.push_back("MoE rebalance window must be > 0");
+        }
+        if (moe_rebalance.max_window_size < 0)
+        {
+            errors.push_back("MoE rebalance max window must be >= 0");
+        }
+        if (moe_rebalance.window_growth_factor <= 0.0f)
+        {
+            errors.push_back("MoE rebalance window growth factor must be > 0");
+        }
+
         // Validate precision strings
         {
             const std::string act = toLower(activation_precision);
@@ -622,6 +885,89 @@ namespace llaminar2
             {
                 errors.push_back("Invalid kv_cache_precision: '" + kv_cache_precision +
                                  "' (valid: auto, fp32, fp16, q8_1, q16_1, tq4, tq)");
+            }
+        }
+
+        if (prefix_cache.block_size <= 0)
+        {
+            errors.push_back("Prefix cache block size must be > 0");
+        }
+        if (mtp.enabled)
+        {
+            if (mtp.draft_tokens <= 0)
+            {
+                errors.push_back("MTP draft tokens must be > 0");
+            }
+            if (mtp.max_request_batch <= 0)
+            {
+                errors.push_back("MTP max request batch must be > 0");
+            }
+
+            const auto &depth_policy = mtp.depth_policy;
+            if (depth_policy.min_depth < 0)
+            {
+                errors.push_back("MTP depth policy min depth must be >= 0");
+            }
+            if (depth_policy.max_depth < 0)
+            {
+                errors.push_back("MTP depth policy max depth must be >= 0");
+            }
+            if (depth_policy.initial_depth < 0)
+            {
+                errors.push_back("MTP depth policy initial depth must be >= 0");
+            }
+
+            if (depth_policy.mode != MTPDepthPolicyMode::Fixed)
+            {
+                /*
+                 * Fixed-depth MTP is normalized by MTPDepthController to
+                 * min=max=initial=draft_tokens and ignores dynamic hysteresis
+                 * fields. Validate the rolling-window knobs only for observe
+                 * and dynamic modes so hard-pinned benchmark lanes are not
+                 * coupled to adaptive-policy defaults.
+                 */
+                const int effective_max_depth =
+                    depth_policy.max_depth > 0 ? depth_policy.max_depth : mtp.draft_tokens;
+                const int effective_initial_depth =
+                    resolveMTPDepthPolicyInitialDepth(
+                        depth_policy,
+                        mtp.draft_tokens,
+                        mtp.verify_mode);
+                if (effective_max_depth < depth_policy.min_depth)
+                {
+                    errors.push_back("MTP depth policy max depth must be >= min depth");
+                }
+                if (effective_initial_depth < depth_policy.min_depth ||
+                    effective_initial_depth > effective_max_depth)
+                {
+                    errors.push_back("MTP depth policy initial depth must be within [min depth, max depth]");
+                }
+                if (depth_policy.window_size <= 0)
+                {
+                    errors.push_back("MTP depth policy window size must be > 0");
+                }
+                if (depth_policy.min_samples <= 0)
+                {
+                    errors.push_back("MTP depth policy min samples must be > 0");
+                }
+                if (depth_policy.cooldown_steps < 0)
+                {
+                    errors.push_back("MTP depth policy cooldown steps must be >= 0");
+                }
+                if (depth_policy.promote_consecutive_windows <= 0)
+                {
+                    errors.push_back("MTP depth policy promote consecutive windows must be > 0");
+                }
+                auto valid_rate = [](double value)
+                {
+                    return value >= 0.0 && value <= 1.0;
+                };
+                if (!valid_rate(depth_policy.promote_full_accept_rate) ||
+                    !valid_rate(depth_policy.demote_zero_accept_rate) ||
+                    !valid_rate(depth_policy.demote_acceptance_rate))
+                {
+                    errors.push_back("MTP depth policy thresholds must be in [0, 1]");
+                }
             }
         }
 
@@ -664,22 +1010,83 @@ namespace llaminar2
         }
 
         // Named domains
-        if (!domain_definitions.empty())
+        // Unified domain inventory
+        const auto inventory = executionDomainDefinitions();
+        if (!inventory.empty())
         {
-            oss << "  domains:\n";
-            for (const auto &d : domain_definitions)
+            oss << "  execution_domains:\n";
+            for (const auto &d : inventory)
             {
                 oss << "    - " << d.toString() << "\n";
             }
         }
         if (!pp_stage_definitions.empty())
         {
-            oss << "  pp_stages:\n";
+            oss << "  placements:\n";
+            oss << "    pp_layers:\n";
             for (const auto &s : pp_stage_definitions)
             {
-                oss << "    - " << s.toString() << "\n";
+                oss << "      - " << s.toString() << "\n";
             }
         }
+
+        if (moe_expert_parallel_plan && moe_expert_parallel_plan->enabled)
+        {
+            const auto &plan = *moe_expert_parallel_plan;
+            oss << renderMoEExpertParallelPlanExplanation(plan);
+        }
+
+        oss << "  moe:\n";
+        oss << "    expert_mode: " << moeExpertModeToString(moe_expert_mode) << "\n";
+        oss << "    rebalance: " << moeRebalanceRuntimeModeToString(moe_rebalance.mode) << "\n";
+        oss << "    hot_expert_cache: " << moe_hot_expert_cache.toString() << "\n";
+        oss << "    rebalance_window: " << moe_rebalance.window_size << "\n";
+        oss << "    rebalance_max_window: " << moe_rebalance.max_window_size << "\n";
+        oss << "    rebalance_window_growth: " << moe_rebalance.window_growth_factor << "\n";
+        oss << "    release_raw_expert_weights: "
+            << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
+
+        if (benchmark_mode || !benchmark_json_output_path.empty())
+        {
+            oss << "  benchmark:\n";
+            oss << "    enabled: " << (benchmark_mode ? "true" : "false") << "\n";
+            if (!benchmark_json_output_path.empty())
+                oss << "    json_output: " << benchmark_json_output_path << "\n";
+        }
+
+        oss << "  prefix_cache:\n";
+        oss << "    enabled: " << (prefix_cache.enabled ? "true" : "false") << "\n";
+        oss << "    storage: " << prefixCacheStorageModeToString(prefix_cache.storage_mode) << "\n";
+        oss << "    block_size: " << prefix_cache.block_size << "\n";
+        oss << "    ram_budget_bytes: " << prefix_cache.ram_budget_bytes << "\n";
+        oss << "    device_budget_bytes: " << prefix_cache.device_budget_bytes << "\n";
+        oss << "    disk_budget_bytes: " << prefix_cache.disk_budget_bytes << "\n";
+        if (!prefix_cache.disk_dir.empty())
+            oss << "    disk_dir: " << prefix_cache.disk_dir << "\n";
+        oss << "    terminal_state: " << prefixCacheTerminalStateModeToString(prefix_cache.terminal_state) << "\n";
+        oss << "    moe_policy: " << prefixCacheMoEPolicyToString(prefix_cache.moe_policy) << "\n";
+
+        oss << "  mtp:\n";
+        oss << "    enabled: " << (mtp.enabled ? "true" : "false") << "\n";
+        oss << "    draft_tokens: " << mtp.draft_tokens << "\n";
+        oss << "    max_request_batch: " << mtp.max_request_batch << "\n";
+        oss << "    verify_mode: " << mtpVerifyModeToString(mtp.verify_mode) << "\n";
+        oss << "    depth_policy: " << mtpDepthPolicyModeToString(mtp.depth_policy.mode) << "\n";
+        oss << "    min_draft_tokens: " << mtp.depth_policy.min_depth << "\n";
+        oss << "    max_draft_tokens: " << mtp.depth_policy.max_depth << "\n";
+        oss << "    initial_draft_tokens: " << mtp.depth_policy.initial_depth << "\n";
+        oss << "    depth_window: " << mtp.depth_policy.window_size << "\n";
+        oss << "    depth_min_samples: " << mtp.depth_policy.min_samples << "\n";
+        oss << "    depth_cooldown: " << mtp.depth_policy.cooldown_steps << "\n";
+        oss << "    depth_promote_windows: "
+            << mtp.depth_policy.promote_consecutive_windows << "\n";
+        oss << "    depth_generated_policy: "
+            << (mtp.depth_policy.use_generated_policy ? "true" : "false") << "\n";
+        oss << "    depth_promote_full_accept: " << mtp.depth_policy.promote_full_accept_rate << "\n";
+        oss << "    depth_demote_zero_accept: " << mtp.depth_policy.demote_zero_accept_rate << "\n";
+        oss << "    depth_demote_acceptance: " << mtp.depth_policy.demote_acceptance_rate << "\n";
+        oss << "    require_terminal_hidden_for_full_hit: "
+            << (mtp.require_terminal_hidden_for_full_hit ? "true" : "false") << "\n";
 
         // Simple TP
         oss << "  tp_degree: " << tp_degree << "\n";

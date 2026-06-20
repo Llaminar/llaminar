@@ -13,8 +13,10 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../../compute_stages/IComputeStage.h"
-#include "../graph/IGraphBuilder.h"             // For ForwardOutput
+#include "../graph/IGraphBuilder.h" // For ForwardOutput
+#include "PrefillGraphCache.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -62,7 +64,7 @@ namespace llaminar2
     struct GraphCacheConfig
     {
         bool enabled = true;         ///< Enable graph caching (Phase 10)
-        int decode_seq_len = 1;      ///< Sequence length that triggers decode caching
+        int decode_seq_len = 4;      ///< Max continuation length that can use decode caching.
         bool cache_attention = true; ///< Cache attention graphs
         bool cache_ffn = true;       ///< Cache FFN graphs
     };
@@ -79,12 +81,20 @@ namespace llaminar2
         int batch_size = 0;
         DeviceId device = DeviceId::cpu();
         bool decode = false;
+        bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
+        bool all_position_logits = false;
+        int all_position_logit_rows = 0; ///< Compact verifier logits row count when all-position logits are row-indexed.
+        bool uses_device_token_ids = false; ///< True when embedding reads token IDs from a stable device buffer.
+        bool uses_device_position_ids = false; ///< True when RoPE reads position IDs from a stable device buffer.
         bool standard_path = true;
         bool pp_stage_enabled = false;
         int pp_first_layer = -1;
         int pp_last_layer = -1;
         bool pp_has_embedding = false;
         bool pp_has_lm_head = false;
+        bool is_bucketed_prefill = false;
+        int bucket_seq_len = 0;
+        uint64_t moe_placement_epoch = 0;
 
         bool operator==(const ForwardGraphSignature &other) const
         {
@@ -92,12 +102,20 @@ namespace llaminar2
                    batch_size == other.batch_size &&
                    device == other.device &&
                    decode == other.decode &&
+                   decode_has_history == other.decode_has_history &&
+                   all_position_logits == other.all_position_logits &&
+                   all_position_logit_rows == other.all_position_logit_rows &&
+                   uses_device_token_ids == other.uses_device_token_ids &&
+                   uses_device_position_ids == other.uses_device_position_ids &&
                    standard_path == other.standard_path &&
                    pp_stage_enabled == other.pp_stage_enabled &&
                    pp_first_layer == other.pp_first_layer &&
                    pp_last_layer == other.pp_last_layer &&
                    pp_has_embedding == other.pp_has_embedding &&
-                   pp_has_lm_head == other.pp_has_lm_head;
+                   pp_has_lm_head == other.pp_has_lm_head &&
+                   is_bucketed_prefill == other.is_bucketed_prefill &&
+                   bucket_seq_len == other.bucket_seq_len &&
+                   moe_placement_epoch == other.moe_placement_epoch;
         }
     };
 
@@ -109,13 +127,219 @@ namespace llaminar2
             h ^= (std::hash<int>{}(sig.batch_size) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<DeviceId>{}(sig.device) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.decode_has_history) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.all_position_logits) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(sig.all_position_logit_rows) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.uses_device_token_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.uses_device_position_ids) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.standard_path) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_stage_enabled) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_first_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(sig.pp_last_layer) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_has_embedding) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.pp_has_lm_head) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<bool>{}(sig.is_bucketed_prefill) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<int>{}(sig.bucket_seq_len) + 0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (std::hash<uint64_t>{}(sig.moe_placement_epoch) + 0x9e3779b9 + (h << 6) + (h >> 2));
             return h;
+        }
+    };
+
+    enum class ForwardReplayStateCacheClass
+    {
+        Other,
+        BucketedPrefill,
+        OrdinaryDecode,
+        SingleTokenOrdinaryDecode,
+        AllPositionVerifier,
+    };
+
+    enum class ForwardReplayStateMutationKind
+    {
+        GeneralLiveStateMutation,
+        MTPCorrectionReplayBoundary,
+        RequestBoundaryStateReset,
+    };
+
+    enum class ForwardReplayStateAction
+    {
+        ResetReplayState,
+        PreserveReplayStateAndRebindStreams,
+    };
+
+    inline ForwardReplayStateCacheClass classifyForwardReplayStateCache(
+        const ForwardGraphSignature &signature)
+    {
+        if (!signature.decode)
+        {
+            if (signature.is_bucketed_prefill)
+                return ForwardReplayStateCacheClass::BucketedPrefill;
+            return ForwardReplayStateCacheClass::Other;
+        }
+        if (signature.all_position_logits)
+            return ForwardReplayStateCacheClass::AllPositionVerifier;
+        if (signature.seq_len == 1 && signature.batch_size <= 1)
+            return ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode;
+        return ForwardReplayStateCacheClass::OrdinaryDecode;
+    }
+
+    /**
+     * @brief True when a segmented decode capture is tied to a specific live
+     *        KV/recurrent-state epoch rather than only to stable buffer names.
+     *
+     * Multi-token ordinary decode encodes live KV/recurrent-state progression
+     * directly in the replayed graph.  After MTP publishes an accepted row,
+     * that capture must be refreshed before it can read the newly published
+     * live state.
+     *
+     * All-position verifier graphs are different: verifier-row GDN/short-conv
+     * state is published through stage-owned capture slots, and verifier row
+     * metadata is refreshed before every launch.  Keeping that graph warm is
+     * the vLLM-style fast path; stream/event handoff and per-launch metadata
+     * updates provide the freshness boundary instead of live-epoch recapture.
+     * Single-token decode is also version-safe because token/position metadata
+     * is updated before replay and it reads stable live-state buffer addresses.
+     */
+    inline bool isLiveStateVersionedReplayCache(
+        const ForwardGraphSignature &signature)
+    {
+        if (!signature.decode)
+            return false;
+        if (signature.all_position_logits)
+            return false;
+        return !(signature.seq_len == 1 && signature.batch_size <= 1);
+    }
+
+    inline ForwardReplayStateAction chooseForwardReplayStateAction(
+        ForwardReplayStateMutationKind mutation,
+        ForwardReplayStateCacheClass cache_class)
+    {
+        if (mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary &&
+            cache_class != ForwardReplayStateCacheClass::OrdinaryDecode)
+        {
+            return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
+        }
+        if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
+            (cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode ||
+             cache_class == ForwardReplayStateCacheClass::AllPositionVerifier ||
+             cache_class == ForwardReplayStateCacheClass::BucketedPrefill))
+        {
+            return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
+        }
+        return ForwardReplayStateAction::ResetReplayState;
+    }
+
+    inline ForwardReplayStateAction chooseForwardReplayStateAction(
+        ForwardReplayStateMutationKind mutation,
+        const ForwardGraphSignature &signature)
+    {
+        if ((mutation == ForwardReplayStateMutationKind::MTPCorrectionReplayBoundary ||
+             mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset) &&
+            isLiveStateVersionedReplayCache(signature))
+        {
+            return ForwardReplayStateAction::ResetReplayState;
+        }
+        if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
+            classifyForwardReplayStateCache(signature) == ForwardReplayStateCacheClass::Other)
+        {
+            return ForwardReplayStateAction::ResetReplayState;
+        }
+        return chooseForwardReplayStateAction(
+            mutation,
+            classifyForwardReplayStateCache(signature));
+    }
+
+    /**
+     * @brief Latest runtime metadata observed for a prefill graph-cache entry.
+     *
+     * The cache key remains bucket-shaped so one captured graph can safely serve
+     * multiple real-token lengths in the same bucket. This observation records
+     * the latest real chunk that flowed through that stable shape for diagnostics,
+     * perf export, and Phase 12 graph-capture acceptance.
+     */
+    struct PrefillGraphExecutionObservation
+    {
+        bool valid = false;
+        int chunk_index = 0;
+        int bucket_seq_len = 0;
+        int real_token_start = 0;
+        int real_token_count = 0;
+        int real_token_end = 0;
+        std::string domain_id = "single";
+        int participant_id = 0;
+        uint64_t placement_epoch = 0;
+        uint64_t topology_signature = 0;
+        std::string capture_phase = "cold";
+        std::string recapture_reason = "none";
+    };
+
+    /**
+     * @brief RAII owner for an explicit GPU stream used by cached graph capture.
+     *
+     * The stream is created through the same worker GPU context that owns the
+     * graph-capture backend. It is move-only so ForwardGraphCache entries remain
+     * movable inside unordered_map storage without leaking backend stream handles.
+     */
+    struct CachedGraphStream
+    {
+        void *stream = nullptr;           ///< Backend stream handle (hipStream_t/cudaStream_t as void*)
+        IWorkerGPUContext *ctx = nullptr; ///< Context that created the stream (not owned)
+
+        CachedGraphStream() = default;
+        ~CachedGraphStream() { reset(); }
+
+        CachedGraphStream(const CachedGraphStream &) = delete;
+        CachedGraphStream &operator=(const CachedGraphStream &) = delete;
+
+        CachedGraphStream(CachedGraphStream &&other) noexcept
+            : stream(other.stream), ctx(other.ctx)
+        {
+            other.stream = nullptr;
+            other.ctx = nullptr;
+        }
+
+        CachedGraphStream &operator=(CachedGraphStream &&other) noexcept
+        {
+            if (this != &other)
+            {
+                reset();
+                stream = other.stream;
+                ctx = other.ctx;
+                other.stream = nullptr;
+                other.ctx = nullptr;
+            }
+            return *this;
+        }
+
+        /// @brief Ensure a stream exists for the provided GPU context.
+        bool ensure(IWorkerGPUContext *new_ctx)
+        {
+            if (!new_ctx)
+                return false;
+            if (stream && ctx == new_ctx)
+                return true;
+
+            reset();
+            stream = new_ctx->createStream();
+            if (!stream)
+            {
+                ctx = nullptr;
+                return false;
+            }
+            ctx = new_ctx;
+            return true;
+        }
+
+        /// @brief Destroy the owned stream, if any.
+        void reset()
+        {
+            if (stream && ctx)
+            {
+                ctx->synchronizeStream(stream);
+                ctx->destroyStream(stream);
+            }
+            stream = nullptr;
+            ctx = nullptr;
         }
     };
 
@@ -133,8 +357,11 @@ namespace llaminar2
     struct ForwardGraphCache
     {
         std::unique_ptr<ComputeGraph> graph; ///< Cached compute graph
-        ForwardOutput output;           ///< Cached output (logits pointer)
+        ForwardOutput output;                ///< Cached output (logits pointer)
         bool valid = false;                  ///< Whether cache is usable
+
+        /// Workspace generation recorded after the graph's stages were bound.
+        uint64_t workspace_generation = 0;
 
         // Stable buffers — stages point to these, contents updated each step
         std::vector<int> token_ids;    ///< Persistent decode token storage
@@ -143,7 +370,7 @@ namespace llaminar2
         // PP hidden state copy — for non-embedding PP stages, the external
         // hidden state must be copied to the working buffer on every forward.
         // During graph build (cache MISS) this copy happens inline in
-        // Qwen2Graph::buildPartialForwardGraph(). On cache HIT we must redo
+        // QwenStandardGraph::buildPartialForwardGraph(). On cache HIT we must redo
         // the copy here because the graph build code is not re-executed.
         TensorBase *pp_external_hidden_state = nullptr; ///< Source (stage N-1 output)
         TensorBase *pp_working_buffer = nullptr;        ///< Destination (local residual/hidden)
@@ -160,26 +387,60 @@ namespace llaminar2
         std::vector<IComputeStage *> dynamic_param_stages;
         bool dynamic_param_stages_cached = false;
 
+        // Pre-cached pointers to stages that override onGraphReplayed().
+        // For prefill monolithic graph replay, these must be called after launch
+        // to advance KV cache heads and other host-side bookkeeping.
+        std::vector<IComputeStage *> replay_callback_stages;
+        bool replay_callback_stages_cached = false;
+
+        // Pre-cached pointers to stages that consume fixed-bucket prefill replay
+        // metadata. These are updated before prefill capture/replay so callback
+        // stages can advance host state by real tokens instead of padded rows.
+        std::vector<IComputeStage *> prefill_replay_param_stages;
+        bool prefill_replay_param_stages_cached = false;
+
         // Tracks whether setGPUStream has been applied to all stages.
-        // The capture_stream never changes once set, so we skip the
-        // 339-stage loop on subsequent decode steps.
+        // Decode graph replay reapplies the capture stream before dynamic
+        // params because manual/collective segments may temporarily bind a
+        // different stream during execution.
         bool gpu_stream_applied = false;
 
-        // The stream pointer that was last applied to all stages. If
-        // segment_cache.reset() destroys the capture_stream and a new one is
-        // created, we must re-apply it to avoid stages holding a dangling
-        // stream pointer.
+        // The stream pointer that was last applied to all stages. Replay-state
+        // resets preserve the capture stream, but workspace rebinds and full
+        // invalidation can still force a new stream binding epoch. Track the
+        // pointer so cached stages are rebound whenever that epoch changes.
         void *applied_stream = nullptr;
 
         // Tracks whether Phase 3 graph replay is active (no markCompleted calls),
         // allowing us to skip the 339-node graph.reset() since flags are already clear.
         bool phase3_active = false;
 
+        /// Live replay-state epoch that the current segmented capture is safe for.
+        /// Multi-token ordinary decode and multi-row all-position verifier graphs
+        /// are invalidated when speculative publication advances live state to a
+        /// newer epoch. Single-token decode, including MTP condition decode, is
+        /// version-safe: it updates token/position metadata before every launch
+        /// and reads stable live-state buffer addresses.
+        uint64_t segmented_capture_live_state_epoch = 0;
+
+        bool requiresLiveStateEpochRecapture(bool live_state_versioned_context,
+                                             bool segmented_capture_allowed,
+                                             uint64_t live_state_epoch) const
+        {
+            return live_state_versioned_context &&
+                   segmented_capture_allowed &&
+                   segment_cache.initialized &&
+                   !segment_cache.needs_capture &&
+                   segmented_capture_live_state_epoch != 0 &&
+                   segmented_capture_live_state_epoch != live_state_epoch;
+        }
+
         /// GPU graph capture/replay for eliminating per-kernel launch overhead
         std::unique_ptr<IGPUGraphCapture> gpu_graph;
 
-        /// Segmented GPU graph cache — excludes non-capturable stages (attention, KV cache)
-        /// and captures contiguous runs of capturable stages into separate graphs
+        /// Segmented GPU graph cache. Capturable stages, including attention
+        /// when its dynamic launch variant is stable, can live inside one
+        /// segment; non-capturable stages and manual boundaries split it.
         DeviceGraphExecutor::GraphSegmentCache segment_cache;
 
         /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
@@ -189,33 +450,221 @@ namespace llaminar2
         /// GPU context for creating new graph captures (not owned)
         IWorkerGPUContext *gpu_ctx = nullptr;
 
+        /// Prefill graph capture/replay cache (keyed by seq_len)
+        std::unique_ptr<PrefillGraphCache> prefill_graph_cache;
+
+        /// Latest diagnostic metadata for bucketed/chunked prefill graph execution.
+        PrefillGraphExecutionObservation last_prefill_graph_observation;
+
+        /// Monotonic engine-level LRU tick for bucketed prefill forward-cache eviction.
+        uint64_t bucketed_prefill_last_access_tick = 0;
+
+        /// Explicit stream for prefill warmup/capture/replay.
+        CachedGraphStream prefill_capture_stream;
+
         /// Number of consecutive graph update failures (fallback heuristic)
         int gpu_graph_update_failures = 0;
 
         /// Maximum consecutive update failures before disabling graph capture
         static constexpr int kMaxGraphUpdateFailures = 4;
 
-        void invalidate()
+        /**
+         * @brief Reset GPU graph replay/capture state while keeping the cached ComputeGraph.
+         *
+         * Hard resets preserve graph topology but discard graph executables.
+         * Use this after topology/workspace/live-state mutations whose capture
+         * safety is not proven. Request-boundary resets that want served-style
+         * capture reuse should use resetSessionStatePreservingSegmentedReplay().
+         *
+         * The capture stream itself is retained because cached stages store that
+         * stream pointer internally. Destroying it here would leave dynamic-param
+         * updates (for example token-id preloads) with a dangling HIP stream before
+         * the next warmup has a chance to rebind every stage.
+         */
+        void resetReplayState()
         {
             if (gpu_graph)
             {
                 gpu_graph->reset();
                 gpu_graph.reset();
             }
-            segment_cache.reset();
+            segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+            gpu_graph_update_failures = 0;
+            phase3_active = false;
+            segmented_capture_live_state_epoch = 0;
+        }
+
+        /**
+         * @brief Drop captured replay state after workspace buffers are rebound.
+         *
+         * The cached ComputeGraph remains valid, but HIP/CUDA graph captures
+         * encode raw workspace addresses. Rebinding stages to a new workspace
+         * manager therefore requires throwing away any captured decode segments
+         * and monolithic prefill graph entries before the next launch.
+         */
+        void resetReplayStateAfterWorkspaceRebind()
+        {
+            resetReplayState();
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll();
+            gpu_stream_applied = false;
+            applied_stream = nullptr;
+        }
+
+        /**
+         * @brief Force cached stages to rebind their explicit GPU stream.
+         *
+         * KernelFactory::resetAllDynamicState() clears cached kernel stream
+         * bindings. Some correction-replay paths deliberately preserve
+         * verifier graph executables, but those stages still need to receive
+         * the capture stream again before updateDynamicParams() or replay
+         * callbacks can safely touch backend objects.
+         */
+        void markGPUStreamBindingsDirty()
+        {
+            gpu_stream_applied = false;
+            applied_stream = nullptr;
+        }
+
+        /**
+         * @brief Stamp a preserved replay capture for the current live state.
+         *
+         * This is intentionally reserved for replay classes whose state-safety
+         * has been proven separately. In particular, single-token condition
+         * decode and all-position verifier replay may be preserved across MTP
+         * accepted-state publication; multi-token ordinary decode remains
+         * epoch-versioned and recaptures after publication.
+         */
+        void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
+        {
+            segmented_capture_live_state_epoch = live_state_epoch;
+        }
+
+        /**
+         * @brief Reset request-scoped stage state while preserving safe segmented replay.
+         *
+         * Request boundaries clear KV/GDN/short-conv live state, token metadata,
+         * and backend stream bindings, but single-token decode and all-position
+         * verifier captures are designed to read stable device buffers whose
+         * contents are refreshed before every launch.  Keeping those segmented
+         * executables hot is the served-inference path we want: warmup captures
+         * once, later requests replay after device-state reset.
+         *
+         * Bucketed prefill graph executables also stay hot across request
+         * boundaries. Ready entries replay the same deterministic prompt mutation
+         * over freshly reset live state with token/position metadata refreshed on
+         * the explicit capture stream before launch. Warmup-only entries are
+         * demoted to Initialized: lazy stage/kernel resources may survive, but
+         * request-local capture arming does not. Capturing or otherwise invalid
+         * entries are still dropped rather than silently reused.
+         */
+        void resetSessionStatePreservingSegmentedReplay()
+        {
+            if (gpu_graph)
+            {
+                gpu_graph->reset();
+                gpu_graph.reset();
+            }
+            PrefillGraphRequestResetSummary prefill_reset;
+            if (prefill_graph_cache)
+                prefill_reset = prefill_graph_cache->prepareEntriesForRequestReset();
+            last_prefill_graph_observation = {};
+
+            if (graph)
+            {
+                const bool captured_replay_preserved =
+                    (segment_cache.initialized && !segment_cache.needs_capture) ||
+                    prefill_reset.ready_preserved > 0;
+                const bool lazy_prefill_only =
+                    !captured_replay_preserved && prefill_reset.initialized > 0;
+
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                    {
+                        if (lazy_prefill_only)
+                            node->stage->resetSessionStatePreservingLazyInitialization();
+                        else
+                            node->stage->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            markGPUStreamBindingsDirty();
+            gpu_graph_update_failures = 0;
+            phase3_active = segment_cache.initialized && !segment_cache.needs_capture;
+            segmented_capture_live_state_epoch = 0;
+        }
+
+        /**
+         * @brief Reset request-scoped state while preserving reusable graph objects.
+         *
+         * This is the request-boundary counterpart to invalidate(): it keeps the
+         * cached ComputeGraph, stable token buffers, and workspace bindings, but
+         * clears stage/kernels' dynamic metadata and decode replay captures so
+         * the next prompt starts from cleared KV/GDN model state.
+         *
+         * Monolithic prefill graph captures are dropped here even though the
+         * cached ComputeGraph topology is preserved.  Prefill captures record a
+         * stateful prompt mutation over KV/GDN/short-conv buffers and may embed
+         * backend context/workspace pointers in captured kernel parameters.  A
+         * request clear resets those live buffers, so the next request must warm
+         * or capture prefill against the fresh state instead of replaying the
+         * prior request's executable graph.
+         */
+        void resetSessionState()
+        {
+            resetReplayState();
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll(PrefillGraphRejectReason::RequestStateReset);
+            last_prefill_graph_observation = {};
+
+            if (graph)
+            {
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
+
+            gpu_stream_applied = false;
+            applied_stream = nullptr;
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
-            gpu_graph_update_failures = 0;
+            segmented_capture_live_state_epoch = 0;
+        }
+
+        void invalidate()
+        {
+            resetReplayState();
+            segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+            if (prefill_graph_cache)
+                prefill_graph_cache->invalidateAll();
+            last_prefill_graph_observation = {};
+            prefill_capture_stream.reset();
+            bucketed_prefill_last_access_tick = 0;
             graph.reset();
             valid = false;
+            workspace_generation = 0;
             token_ids.clear();
             position_ids.clear();
             collective_nodes.clear();
             dynamic_param_stages.clear();
             dynamic_param_stages_cached = false;
+            replay_callback_stages.clear();
+            replay_callback_stages_cached = false;
+            prefill_replay_param_stages.clear();
+            prefill_replay_param_stages_cached = false;
             gpu_stream_applied = false;
             applied_stream = nullptr;
+            gpu_stream = nullptr;
+            gpu_ctx = nullptr;
             phase3_active = false;
+            segmented_capture_live_state_epoch = 0;
             pp_external_hidden_state = nullptr;
             pp_working_buffer = nullptr;
             pp_copy_bytes = 0;

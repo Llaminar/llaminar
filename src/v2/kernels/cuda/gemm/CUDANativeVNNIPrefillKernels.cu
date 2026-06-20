@@ -11,6 +11,8 @@
 
 #include "CUDANativeVNNIDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,16 +20,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
 #include <vector>
-
-struct CUDAPrefillStreamScratch_
-{
-    cudaStream_t stream = nullptr;
-    float *fixup_buf = nullptr;
-    size_t fixup_buf_size = 0; // in bytes
-    float *splitk_partials = nullptr;
-    size_t splitk_partials_size = 0; // in bytes
-};
 
 // =========================================================================
 // Per-device prefill context — replaces process-global statics for SM count
@@ -37,7 +31,10 @@ struct CUDAPrefillContext_
 {
     int sm_count = 0;
     int device_id = -1;
-    std::vector<CUDAPrefillStreamScratch_> stream_scratch;
+    float *workspace_splitk_partials = nullptr;
+    size_t workspace_splitk_partials_size = 0;
+    float *workspace_fixup_buf = nullptr;
+    size_t workspace_fixup_buf_size = 0;
 };
 
 struct LastLaunchSelection_
@@ -76,51 +73,22 @@ static int querySmCount(CUDAPrefillContext_ *ctx)
     return ctx->sm_count;
 }
 
-static CUDAPrefillStreamScratch_ *getOrCreateStreamScratch(CUDAPrefillContext_ *ctx, cudaStream_t stream)
-{
-    for (auto &scratch : ctx->stream_scratch)
-    {
-        if (scratch.stream == stream)
-            return &scratch;
-    }
-
-    ctx->stream_scratch.push_back({stream});
-    return &ctx->stream_scratch.back();
-}
-
 static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
-    auto *scratch = getOrCreateStreamScratch(ctx, stream);
-    if (scratch->fixup_buf_size < required_bytes)
+    if (ctx->workspace_fixup_buf && ctx->workspace_fixup_buf_size >= required_bytes)
     {
-        if (scratch->fixup_buf)
-            cudaFree(scratch->fixup_buf);
-        scratch->fixup_buf = nullptr;
-        scratch->fixup_buf_size = 0;
-        cudaSetDevice(ctx->device_id);
-        if (cudaMalloc(&scratch->fixup_buf, required_bytes) != cudaSuccess)
-            return nullptr;
-        scratch->fixup_buf_size = required_bytes;
+        cudaMemsetAsync(ctx->workspace_fixup_buf, 0, required_bytes, stream);
+        return ctx->workspace_fixup_buf;
     }
-    cudaMemsetAsync(scratch->fixup_buf, 0, required_bytes, stream);
-    return scratch->fixup_buf;
+    return nullptr;
 }
 
 static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
-    auto *scratch = getOrCreateStreamScratch(ctx, stream);
-    if (scratch->splitk_partials_size < required_bytes)
-    {
-        if (scratch->splitk_partials)
-            cudaFree(scratch->splitk_partials);
-        scratch->splitk_partials = nullptr;
-        scratch->splitk_partials_size = 0;
-        cudaSetDevice(ctx->device_id);
-        if (cudaMalloc(&scratch->splitk_partials, required_bytes) != cudaSuccess)
-            return nullptr;
-        scratch->splitk_partials_size = required_bytes;
-    }
-    return scratch->splitk_partials;
+    (void)stream;
+    if (ctx->workspace_splitk_partials && ctx->workspace_splitk_partials_size >= required_bytes)
+        return ctx->workspace_splitk_partials;
+    return nullptr;
 }
 
 namespace
@@ -730,6 +698,7 @@ namespace
         const uint32_t *__restrict__ emins_B,
         float *__restrict__ C,
         const float *__restrict__ scales_A,
+        const int32_t *__restrict__ sums_A,
         const float *__restrict__ C_existing,
         const float *__restrict__ bias,
         int M,
@@ -1296,17 +1265,29 @@ namespace
 
                     if constexpr (IS_ASYMMETRIC)
                     {
-                        const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
-                        const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
-                        int32_t s0 = 0, s1 = 0;
-#pragma unroll
-                        for (int w = 0; w < 8; ++w)
+                        const int grow0 = block_m + a_row_base + gid;
+                        const int grow1 = grow0 + 8;
+                        if (sums_A)
                         {
-                            s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
-                            s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
+                            sum_A_row0_all[wi] = static_cast<float>(
+                                sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb]);
+                            sum_A_row1_all[wi] = static_cast<float>(
+                                sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb]);
                         }
-                        sum_A_row0_all[wi] = static_cast<float>(s0);
-                        sum_A_row1_all[wi] = static_cast<float>(s1);
+                        else
+                        {
+                            const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
+                            const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
+                            int32_t s0 = 0, s1 = 0;
+#pragma unroll
+                            for (int w = 0; w < 8; ++w)
+                            {
+                                s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
+                                s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
+                            }
+                            sum_A_row0_all[wi] = static_cast<float>(s0);
+                            sum_A_row1_all[wi] = static_cast<float>(s1);
+                        }
                     }
 
                     if constexpr (IS_DUAL_SCALE_ASYM || IS_IQ1_M)
@@ -1501,7 +1482,16 @@ namespace
                     [[maybe_unused]] float sum_A_row0 = 0.0f, sum_A_row1 = 0.0f;
                     if constexpr (IS_ASYMMETRIC)
                     {
-                        if (grow0 < M)
+                        if (sums_A)
+                        {
+                            if (grow0 < M)
+                                sum_A_row0 = static_cast<float>(
+                                    sums_A[static_cast<size_t>(grow0) * num_q40_blocks + kb]);
+                            if (grow1 < M)
+                                sum_A_row1 = static_cast<float>(
+                                    sums_A[static_cast<size_t>(grow1) * num_q40_blocks + kb]);
+                        }
+                        else if (grow0 < M)
                         {
                             const int8_t *row0_ptr = &smem_A[stage][(a_row_base + gid) * SMEM_STRIDE_64 + k_offset];
                             int32_t s0 = 0;
@@ -1509,8 +1499,17 @@ namespace
                             for (int w = 0; w < 8; ++w)
                                 s0 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row0_ptr)[w], s0);
                             sum_A_row0 = static_cast<float>(s0);
+                            if (grow1 < M)
+                            {
+                                const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
+                                int32_t s1 = 0;
+#pragma unroll
+                                for (int w = 0; w < 8; ++w)
+                                    s1 = __dp4a(0x01010101, reinterpret_cast<const int32_t *>(row1_ptr)[w], s1);
+                                sum_A_row1 = static_cast<float>(s1);
+                            }
                         }
-                        if (grow1 < M)
+                        else if (grow1 < M)
                         {
                             const int8_t *row1_ptr = &smem_A[stage][(a_row_base + gid + 8) * SMEM_STRIDE_64 + k_offset];
                             int32_t s1 = 0;
@@ -2452,8 +2451,14 @@ namespace
     //   g_force_tile_id: -1 = auto (heuristic), 0..5 = TileId enum value
     //   g_force_split_k:  0 = auto (heuristic), 1..8 = forced split-K value
     // =========================================================================
-    static int g_force_tile_id = -1;
-    static int g_force_split_k = 0;
+    static int g_force_tile_id = []()
+    {
+        return llaminar2::debugEnv().gemm.cuda_force_prefill_tile;
+    }();
+    static int g_force_split_k = []()
+    {
+        return llaminar2::debugEnv().gemm.cuda_force_prefill_split_k;
+    }();
 
     // Deterministic mode: disables stream-K and caps BK64 split-K to 1 on
     // shapes where split-K rounding drift is known to affect parity.
@@ -2463,26 +2468,22 @@ namespace
     // Set via LLAMINAR_DETERMINISTIC=1 env var.
     static bool g_deterministic_mode = []()
     {
-        const char *env = std::getenv("LLAMINAR_DETERMINISTIC");
-        return env && std::atoi(env) != 0;
+        return llaminar2::debugEnv().gemm.deterministic;
     }();
 
     // BK256 mode: 0=auto (heuristic), 1=force ON, -1=force OFF
     // Set via LLAMINAR_BK256_MODE env var or extern C API.
     static int g_bk256_force_mode = []()
     {
-        const char *env = std::getenv("LLAMINAR_BK256_MODE");
-        return env ? std::atoi(env) : 0;
+        return llaminar2::debugEnv().gemm.cuda_bk256_mode;
     }();
 
     // ─── Format complexity classification ─────────────────────────────
-    // Asymmetric formats (Q4_1, Q5_1, IQ1_S) have per-block min-correction
-    // that increases register pressure. Sweep data shows these formats
-    // strongly prefer T64x128_w2x2 (128 threads, more regs/thread) over
-    // larger warp configs where Q4_0's heuristic would pick T128x128 or w2x4.
+    // Fallback-only format complexity. Production dispatch should come from
+    // generated sweep tables aligned to the graph-prefill bucket policy.
     enum class FormatComplexity
     {
-        Simple,     // CB 0,4,6,11,12,15,18 – single-scale, Q4_0 heuristic works
+        Simple,     // CB 0,4,6,11,12,15,19 – single-scale, Q4_0 heuristic works
         Asymmetric, // CB 5,7,16 – min-correction overhead, needs w2x2 bias
         DualScale   // CB 8,9,10,13,14,17 – dual-scale (profitability-gated)
     };
@@ -2509,10 +2510,9 @@ namespace
 
     // ─── Generated sweep-driven dispatch tables ───────────────────────
     // Auto-generated by analyze_cuda_tc_gemm_dispatch.py from tile sweep
-    // CSVs. Provides per-codebook binary-search lookup from (M_bin, N, K)
+    // CSVs. Provides per-codebook binary-search lookup from (M_key, N, K)
     // to the empirically best (tile_id, split_k) combination.
-    // Manual exceptions from CUDANativeVNNIPrefillDispatchExceptions.json
-    // are baked into the generated tables.
+    // The M key follows the canonical MTP rows + graph-prefill buckets.
 #include "kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc"
 
     // ─── Asymmetric-format heuristic ──────────────────────────────────
@@ -2821,6 +2821,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -2863,6 +2864,7 @@ namespace
             d_emins,
             d_kernel_C,
             d_scales_A_block,
+            d_sums_A_block,
             d_C_existing,
             d_bias,
             M,
@@ -2899,6 +2901,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -2941,6 +2944,7 @@ namespace
             d_emins,
             d_kernel_C,
             d_scales_A_block,
+            d_sums_A_block,
             d_C_existing,
             d_bias,
             M,
@@ -2973,8 +2977,7 @@ namespace
     // =========================================================================
     static int g_stream_k_force_mode = []()
     {
-        const char *env = std::getenv("LLAMINAR_STREAM_K");
-        return env ? std::atoi(env) : 0;
+        return llaminar2::debugEnv().gemm.cuda_stream_k_mode;
     }();
 
     // =========================================================================
@@ -3006,6 +3009,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -3017,8 +3021,6 @@ namespace
         CUDAPrefillContext_ *prefill_ctx)
     {
         const int nsm = querySmCount(prefill_ctx);
-        const int ntx = (N + BN - 1) / BN;
-        const int nty = (M + BM - 1) / BM;
 
         // Query how many blocks the hardware can run concurrently per SM,
         // given the kernel's compiled register and shared memory usage.
@@ -3058,6 +3060,7 @@ namespace
             d_emins,
             d_C_fp32,
             d_scales_A_block,
+            d_sums_A_block,
             nullptr, // d_C_existing: not supported with stream-K
             nullptr, // d_bias: applied post-hoc below
             M, N, K,
@@ -3143,6 +3146,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M,
         int N,
         int K,
@@ -3194,6 +3198,7 @@ namespace
             d_emins,
             d_C_fp32,
             d_scales_A_block,
+            d_sums_A_block,
             d_C_existing,
             d_bias,
             M, N, K,
@@ -3382,6 +3387,126 @@ namespace
         return 2;
     }
 
+    struct PrefillWorkspacePlan
+    {
+        int tile_id = -1;
+        int split_k = 1;
+        int streamk = 0;
+        bool bk256 = false;
+        size_t splitk_partials_bytes = 0;
+        size_t streamk_fixup_bytes = 0;
+    };
+
+    void tileShape(TileId tile, int &bm, int &bn)
+    {
+        switch (tile)
+        {
+        case TileId::T64x64_w2x2:
+            bm = 64;
+            bn = 64;
+            return;
+        case TileId::T64x128_w2x2:
+        case TileId::T64x128_w4x2:
+        case TileId::T64x128_w2x4:
+            bm = 64;
+            bn = 128;
+            return;
+        case TileId::T128x128_w4x2:
+        case TileId::T128x128_w4x4:
+            bm = 128;
+            bn = 128;
+            return;
+        }
+        bm = 64;
+        bn = 128;
+    }
+
+    template <uint8_t CB>
+    PrefillWorkspacePlan planGenericPrefillWorkspace(
+        int M,
+        int N,
+        int K,
+        CUDAPrefillContext_ *prefill_ctx)
+    {
+        PrefillWorkspacePlan plan;
+
+        if constexpr (CB == 0)
+        {
+            const bool bk256_forced = (g_bk256_force_mode > 0);
+            const bool bk256_disabled = (g_bk256_force_mode < 0);
+            const int SM = querySmCount(prefill_ctx);
+            const int t64x128_check = ((M + 63) / 64) * ((N + 127) / 128);
+            const bool bk256_auto = !bk256_disabled && (K > 2 * N) && (t64x128_check < SM);
+            if (bk256_forced || bk256_auto)
+            {
+                const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
+                const int bk256_bn = use_narrow_bn64 ? 64 : 128;
+                int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
+                if (g_deterministic_mode)
+                    sk = 1;
+                plan.tile_id = use_narrow_bn64 ? -3 : -2;
+                plan.split_k = sk;
+                plan.bk256 = true;
+                if (sk > 1)
+                    plan.splitk_partials_bytes = static_cast<size_t>(sk) * M * N * sizeof(float);
+                return plan;
+            }
+        }
+
+        TileChoice tc;
+        if (g_force_tile_id >= 0 && g_force_tile_id <= 5)
+        {
+            tc = {static_cast<TileId>(g_force_tile_id),
+                  (g_force_split_k > 0) ? g_force_split_k : 1};
+        }
+        else
+        {
+            uint8_t gen_tile_id = 0;
+            uint8_t gen_split_k = 1;
+            if (selectPrefillTileGenerated<CB>(M, N, K, gen_tile_id, gen_split_k))
+            {
+                tc = {static_cast<TileId>(gen_tile_id), static_cast<int>(gen_split_k)};
+            }
+            else
+            {
+                constexpr FormatComplexity complexity = getFormatComplexity(CB);
+                tc = choosePrefillTile(M, N, K, prefill_ctx, complexity);
+            }
+        }
+
+        if (g_deterministic_mode && tc.split_k > 1)
+            tc.split_k = 1;
+
+        plan.tile_id = static_cast<int>(tc.tile);
+        plan.split_k = tc.split_k;
+
+        int bm = 64;
+        int bn = 128;
+        tileShape(tc.tile, bm, bn);
+
+        if constexpr (CB == 0)
+        {
+            if (!g_deterministic_mode && tc.split_k == 1 && g_stream_k_force_mode == 2)
+            {
+                const int ntx = (N + bn - 1) / bn;
+                const int nty = (M + bm - 1) / bm;
+                const int total_tiles = ntx * nty;
+                plan.streamk = 2;
+                plan.streamk_fixup_bytes = static_cast<size_t>(total_tiles) * bm * bn * sizeof(float);
+                return plan;
+            }
+            if (!g_deterministic_mode && tc.split_k == 1 && shouldUseStreamK(M, N, K, bm, bn, prefill_ctx))
+            {
+                plan.streamk = 1;
+                return plan;
+            }
+        }
+
+        if (tc.split_k > 1)
+            plan.splitk_partials_bytes = static_cast<size_t>(tc.split_k) * M * N * sizeof(float);
+        return plan;
+    }
+
     // =========================================================================
     // Unified prefill dispatch: single format-agnostic path for ALL codebooks.
     //
@@ -3401,6 +3526,7 @@ namespace
         const uint32_t *d_emins,
         float *d_C_fp32,
         const float *d_scales_A_block,
+        const int32_t *d_sums_A_block,
         int M, int N, int K,
         float alpha, float beta,
         const float *d_C_existing,
@@ -3424,6 +3550,8 @@ namespace
                 const bool use_narrow_bn64 = (M <= 32) && (N <= 1024);
                 const int bk256_bn = use_narrow_bn64 ? 64 : 128;
                 int sk = chooseSplitK_BK256(M, N, K, 128, bk256_bn, prefill_ctx);
+                if (g_deterministic_mode)
+                    sk = 1;
                 bool ok = false;
                 if (use_narrow_bn64)
                 {
@@ -3476,7 +3604,8 @@ namespace
         }
         else
         {
-            // Try generated dispatch tables first
+            // Generated dispatch tables are trained from sweep CSVs against the
+            // same MTP rows and graph-prefill buckets used by production.
             uint8_t gen_tile_id = 0, gen_split_k = 1;
             if (selectPrefillTileGenerated<CB>(M, N, K, gen_tile_id, gen_split_k))
             {
@@ -3490,10 +3619,11 @@ namespace
             }
         }
 
-        // Deterministic mode: cap BK64 split_k to 1 for maximum numerical
-        // parity with PyTorch's single-pass FP32 matmul. Two-phase split-K is
-        // deterministic by design, but BK64 split-K still introduces FP32
-        // accumulation-order drift that compounds through attention layers.
+        // Deterministic parity mode uses the stable single-partition path.
+        // Split-K is race-free here, but it changes FP32 accumulation order;
+        // for short prompts and grouped MoE rows those ULPs can compound into
+        // near-tie greedy token flips. Production auto mode keeps the faster
+        // split-K/StreamK choices for Phase 14 throughput.
         if (g_deterministic_mode && tc.split_k > 1)
             tc.split_k = 1;
 
@@ -3505,21 +3635,21 @@ namespace
     {                                                                                   \
         if constexpr (CB == 0)                                                          \
         {                                                                               \
-            if (tc.split_k == 1 && g_stream_k_force_mode == 2)                          \
+            if (!g_deterministic_mode && tc.split_k == 1 && g_stream_k_force_mode == 2)   \
             {                                                                           \
                 recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 2);      \
                 return launchNativeVNNITC_BK64_StreamK_TwoPass<CB, BM_, BN_, WM_, WN_>( \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
-                    d_C_fp32, d_scales_A_block,                                         \
+                    d_C_fp32, d_scales_A_block, d_sums_A_block,                         \
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
             }                                                                           \
-            if (tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx))    \
+            if (!g_deterministic_mode && tc.split_k == 1 && shouldUseStreamK(M, N, K, BM_, BN_, prefill_ctx)) \
             {                                                                           \
                 recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 1);      \
                 return launchNativeVNNITC_BK64_StreamK<CB, BM_, BN_, WM_, WN_>(         \
                     d_A_int8, d_payload, d_scales, d_mins, d_emins,                     \
-                    d_C_fp32, d_scales_A_block,                                         \
+                    d_C_fp32, d_scales_A_block, d_sums_A_block,                         \
                     M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream,            \
                     prefill_ctx);                                                       \
             }                                                                           \
@@ -3530,25 +3660,25 @@ namespace
             recordLastLaunchSelection(static_cast<int>(tc.tile), 8, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 8>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         case 4:                                                                         \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 4, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 4>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         case 2:                                                                         \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 2, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 2>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         default:                                                                        \
             recordLastLaunchSelection(static_cast<int>(tc.tile), 1, false, 0);          \
             return launchNativeVNNITC_BK64<CB, BM_, BN_, WM_, WN_, 1>(                  \
                 d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32,               \
-                d_scales_A_block, M, N, K, alpha, beta, d_C_existing, d_bias,           \
+                d_scales_A_block, d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, \
                 cuda_stream, prefill_ctx);                                              \
         }                                                                               \
     } while (0)
@@ -3689,15 +3819,113 @@ extern "C"
     {
         if (!ctx)
             return;
-        cudaSetDevice(ctx->device_id);
-        for (auto &scratch : ctx->stream_scratch)
-        {
-            if (scratch.fixup_buf)
-                cudaFree(scratch.fixup_buf);
-            if (scratch.splitk_partials)
-                cudaFree(scratch.splitk_partials);
-        }
         delete ctx;
+    }
+
+    void cudaPrefillContext_bindWorkspace(
+        CUDAPrefillContext *ctx,
+        float *splitk_partials,
+        size_t splitk_partials_bytes,
+        float *streamk_fixup,
+        size_t streamk_fixup_bytes)
+    {
+        if (!ctx)
+            return;
+        ctx->workspace_splitk_partials = splitk_partials;
+        ctx->workspace_splitk_partials_size = splitk_partials_bytes;
+        ctx->workspace_fixup_buf = streamk_fixup;
+        ctx->workspace_fixup_buf_size = streamk_fixup_bytes;
+    }
+
+    bool cudaNativeVNNIPrefill_getWorkspacePlan(
+        uint8_t codebook_id,
+        int M,
+        int N,
+        int K,
+        int cuda_device_id,
+        size_t *splitk_partials_bytes,
+        size_t *streamk_fixup_bytes,
+        int *planned_split_k,
+        int *planned_streamk)
+    {
+        if (splitk_partials_bytes)
+            *splitk_partials_bytes = 0;
+        if (streamk_fixup_bytes)
+            *streamk_fixup_bytes = 0;
+        if (planned_split_k)
+            *planned_split_k = 1;
+        if (planned_streamk)
+            *planned_streamk = 0;
+        if (M <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
+            return false;
+
+        CUDAPrefillContext_ temp_ctx;
+        temp_ctx.device_id = cuda_device_id;
+
+        PrefillWorkspacePlan plan;
+        switch (codebook_id)
+        {
+        case 0:
+            plan = planGenericPrefillWorkspace<0>(M, N, K, &temp_ctx);
+            break;
+        case 4:
+            plan = planGenericPrefillWorkspace<4>(M, N, K, &temp_ctx);
+            break;
+        case 5:
+            plan = planGenericPrefillWorkspace<5>(M, N, K, &temp_ctx);
+            break;
+        case 6:
+            plan = planGenericPrefillWorkspace<6>(M, N, K, &temp_ctx);
+            break;
+        case 7:
+            plan = planGenericPrefillWorkspace<7>(M, N, K, &temp_ctx);
+            break;
+        case 8:
+            plan = planGenericPrefillWorkspace<8>(M, N, K, &temp_ctx);
+            break;
+        case 9:
+            plan = planGenericPrefillWorkspace<9>(M, N, K, &temp_ctx);
+            break;
+        case 10:
+            plan = planGenericPrefillWorkspace<10>(M, N, K, &temp_ctx);
+            break;
+        case 11:
+            plan = planGenericPrefillWorkspace<11>(M, N, K, &temp_ctx);
+            break;
+        case 12:
+            plan = planGenericPrefillWorkspace<12>(M, N, K, &temp_ctx);
+            break;
+        case 13:
+            plan = planGenericPrefillWorkspace<13>(M, N, K, &temp_ctx);
+            break;
+        case 14:
+            plan = planGenericPrefillWorkspace<14>(M, N, K, &temp_ctx);
+            break;
+        case 15:
+            plan = planGenericPrefillWorkspace<15>(M, N, K, &temp_ctx);
+            break;
+        case 16:
+            plan = planGenericPrefillWorkspace<16>(M, N, K, &temp_ctx);
+            break;
+        case 17:
+            plan = planGenericPrefillWorkspace<17>(M, N, K, &temp_ctx);
+            break;
+        case 19:
+            plan = planGenericPrefillWorkspace<19>(M, N, K, &temp_ctx);
+            break;
+        default:
+            return false;
+        }
+
+        if (splitk_partials_bytes)
+            *splitk_partials_bytes = plan.splitk_partials_bytes;
+        if (streamk_fixup_bytes)
+            *streamk_fixup_bytes = plan.streamk_fixup_bytes;
+        if (planned_split_k)
+            *planned_split_k = plan.split_k;
+        if (planned_streamk)
+            *planned_streamk = plan.streamk;
+        return true;
     }
 } // extern "C"
 
@@ -3713,6 +3941,7 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
     const uint32_t *d_emins,
     float *d_C_fp32,
     const float *d_scales_A_block,
+    const int32_t *d_sums_A_block,
     int M,
     int N,
     int K,
@@ -3738,101 +3967,145 @@ extern "C" bool cudaNativeVNNIPrefill_fp32(
 
     cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
+    bool ok = false;
     switch (codebook_id)
     {
     // --- Single-scale formats (no min correction) ---
     case 0:
-        return launchGenericPrefillBK64<0>(
+        ok = launchGenericPrefillBK64<0>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 4:
-        return launchGenericPrefillBK64<4>(
+        ok = launchGenericPrefillBK64<4>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 6: // Q5_0
-        return launchGenericPrefillBK64<6>(
+        ok = launchGenericPrefillBK64<6>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 11: // IQ3_S
-        return launchGenericPrefillBK64<11>(
+        ok = launchGenericPrefillBK64<11>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 12: // IQ3_XXS
-        return launchGenericPrefillBK64<12>(
+        ok = launchGenericPrefillBK64<12>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 15: // IQ2_XXS
-        return launchGenericPrefillBK64<15>(
+        ok = launchGenericPrefillBK64<15>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     // --- Asymmetric formats (need min correction, d_mins required) ---
-    case 5: // Q4_1 / Q4_K / Q5_K
+    case 5: // Q4_1 / Q4_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<5>(
+        ok = launchGenericPrefillBK64<5>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
-    case 7: // Q5_1
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
+    case 7: // Q5_1 / Q5_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<7>(
+        ok = launchGenericPrefillBK64<7>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 16: // IQ1_S
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<16>(
+        ok = launchGenericPrefillBK64<16>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            d_sums_A_block, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     // --- Dual-scale formats (separate lo/hi scales via split MMA) ---
     case 8: // Q6_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<8>(
+        ok = launchGenericPrefillBK64<8>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 9: // Q3_K
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<9>(
+        ok = launchGenericPrefillBK64<9>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 10: // Q2_K (dual-scale + asymmetric via emins)
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<10>(
+        ok = launchGenericPrefillBK64<10>(
             d_A_int8, d_payload, d_scales, d_mins, d_emins, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 13: // IQ2_S
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<13>(
+        ok = launchGenericPrefillBK64<13>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 14: // IQ2_XS
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<14>(
+        ok = launchGenericPrefillBK64<14>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
     case 17: // IQ1_M (dual-scale + delta correction)
         if (!d_mins)
             return false;
-        return launchGenericPrefillBK64<17>(
+        ok = launchGenericPrefillBK64<17>(
             d_A_int8, d_payload, d_scales, d_mins, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     // --- 8-bit format (no decode overhead, single-scale) ---
     case 19: // Q8_0
-        return launchGenericPrefillBK64<19>(
+        ok = launchGenericPrefillBK64<19>(
             d_A_int8, d_payload, d_scales, nullptr, nullptr, d_C_fp32, d_scales_A_block,
-            M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+            nullptr, M, N, K, alpha, beta, d_C_existing, d_bias, cuda_stream, prefill_ctx);
+        break;
 
     default:
         return false;
     }
+
+    if (ok && llaminar2::PerfStatsCollector::isEnabled())
+    {
+        int tile_id = -1;
+        int split_k = 1;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &tile_id, &split_k, &used_bk256, &used_streamk);
+        llaminar2::PerfStatsCollector::addCounter(
+            "kernel",
+            "cuda_native_vnni_prefill_calls",
+            1.0,
+            "gemm",
+            "cuda:" + std::to_string(cuda_device_id),
+            llaminar2::PerfStatsCollector::Tags{
+                {"codebook", std::to_string(static_cast<int>(codebook_id))},
+                {"m", std::to_string(M)},
+                {"n", std::to_string(N)},
+                {"k", std::to_string(K)},
+                {"tile_id", std::to_string(tile_id)},
+                {"split_k", std::to_string(split_k)},
+                {"bk256", used_bk256 ? "1" : "0"},
+                {"streamk", std::to_string(used_streamk)},
+                {"sums_a", d_sums_A_block ? "1" : "0"}});
+    }
+    return ok;
 }
 
 // =========================================================================
@@ -3882,19 +4155,19 @@ namespace
         case 8:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 8>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         case 4:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 4>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         case 2:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 2>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         default:
             return launchNativeVNNITC_BK64<0, BM, BN, WM, WN, 1>(
                 A, payload, scales, nullptr, nullptr, C, scales_A,
-                M, N, K, alpha, beta, C_existing, bias, stream);
+                nullptr, M, N, K, alpha, beta, C_existing, bias, stream);
         }
     }
 
@@ -4005,29 +4278,29 @@ extern "C"
         switch (config_idx)
         {
         case 0:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 1:
-            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 32, 128, 1, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 2:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 3:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 64, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 4:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 5:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 6:
-            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 64, 128, 2, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 7:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 4, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 8:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 64, 2, 1>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 9:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 10:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 2, 2>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         case 11:
-            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
+            return launchNativeVNNITC_BK64_StreamK<0, 128, 128, 4, 4>(A, payload, scales, nullptr, nullptr, C, scales_A, nullptr, M, N, K, alpha, beta, C_existing, bias, cs, pctx);
         default:
             return false;
         }

@@ -144,6 +144,7 @@ namespace llaminar2
 
         void synchronize() override;
         void synchronizeStream(void *stream) override;
+        bool synchronizeStreamChecked(void *stream) override;
         void insertStreamDependency(void *dependent_stream, void *dependency_stream) override;
 
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override;

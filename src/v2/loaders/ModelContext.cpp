@@ -53,6 +53,15 @@ namespace llaminar2
             return loader_.loadTensorColumnSlice(name, col_start, col_end, device, weight_precision);
         }
 
+        std::shared_ptr<TensorBase> loadTensorExpertSlice(
+            const std::string &name,
+            size_t expert_start, size_t expert_end,
+            DeviceId device,
+            WeightPrecision weight_precision) override
+        {
+            return loader_.loadTensorExpertSlice(name, expert_start, expert_end, device, weight_precision);
+        }
+
         bool hasTensor(const std::string &name) const override { return loader_.hasTensor(name); }
         std::vector<std::string> tensorNames() const override { return loader_.tensorNames(); }
         std::string architecture() const override { return loader_.architecture(); }
@@ -198,6 +207,8 @@ namespace llaminar2
 
         // Configure mmap before loading (must precede loadModel)
         ctx->loader_.setUseMmap(config.use_mmap);
+        ctx->loader_.setSkipMmapCacheEviction(config.skip_mmap_cache_eviction);
+        ctx->loader_.setTargetIsGpu(config.target_is_gpu);
 
         // Load model metadata
         try
@@ -284,9 +295,9 @@ namespace llaminar2
         // This ensures nested MDO (TP within PP) builds graphs with correct layer count
         ctx->pp_block_count_override_ = last_layer - first_layer;
 
-        LOG_INFO("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
-                                                                        << "), embedding=" << (has_embedding ? "yes" : "no")
-                                                                        << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+        LOG_DEBUG("[ModelContext] Created PP stage context for layers [" << first_layer << ", " << last_layer
+                                                                         << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                         << ", lm_head=" << (has_lm_head ? "yes" : "no"));
 
         return ctx;
     }

@@ -10,6 +10,7 @@
 #include "../../tensors/TensorClasses.h"
 #include "../../utils/Logger.h"
 #include <algorithm>
+#include <set>
 #include <stdexcept>
 
 #ifdef HAVE_MPI
@@ -170,6 +171,73 @@ namespace llaminar2
     int PipelineRunner::vocab_size() const
     {
         return vocab_size_;
+    }
+
+    void PipelineRunner::enableSnapshotCapture(const std::string &output_dir)
+    {
+        for (auto &stage : stages_)
+        {
+            if (stage.runner)
+                stage.runner->enableSnapshotCapture(output_dir);
+        }
+    }
+
+    void PipelineRunner::disableSnapshotCapture()
+    {
+        for (auto &stage : stages_)
+        {
+            if (stage.runner)
+                stage.runner->disableSnapshotCapture();
+        }
+    }
+
+    void PipelineRunner::clearSnapshots()
+    {
+        for (auto &stage : stages_)
+        {
+            if (stage.runner)
+                stage.runner->clearSnapshots();
+        }
+    }
+
+    const float *PipelineRunner::getSnapshot(const std::string &key, size_t &out_size) const
+    {
+        for (const auto &stage : stages_)
+        {
+            if (!stage.runner)
+                continue;
+            const float *data = stage.runner->getSnapshot(key, out_size);
+            if (data)
+                return data;
+        }
+        out_size = 0;
+        return nullptr;
+    }
+
+    SnapshotInfo PipelineRunner::getSnapshotWithShape(const std::string &key) const
+    {
+        for (const auto &stage : stages_)
+        {
+            if (!stage.runner)
+                continue;
+            auto info = stage.runner->getSnapshotWithShape(key);
+            if (info.data)
+                return info;
+        }
+        return {};
+    }
+
+    std::vector<std::string> PipelineRunner::getSnapshotKeys() const
+    {
+        std::set<std::string> all_keys;
+        for (const auto &stage : stages_)
+        {
+            if (!stage.runner)
+                continue;
+            auto keys = stage.runner->getSnapshotKeys();
+            all_keys.insert(keys.begin(), keys.end());
+        }
+        return std::vector<std::string>(all_keys.begin(), all_keys.end());
     }
 
     // =========================================================================

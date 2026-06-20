@@ -18,6 +18,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <cstdint>
 #include <unordered_map>
 
 namespace llaminar2
@@ -121,6 +122,18 @@ namespace llaminar2
 
         void setComputeStreams(const std::vector<void *> &compute_streams) override;
 
+        /**
+         * @brief Return true when the current GPU graph configuration supports
+         *        LocalTP GPU-native collectives for a backend.
+         *
+         * @param backend Backend whose GPU graph policy should be checked.
+         * @param reason_out Optional pointer receiving human-readable reason.
+         * @return true when policy permits LocalTP collective execution.
+         */
+        static bool isLocalTPGpuGraphPolicySupported(
+            CollectiveBackendType backend,
+            std::string *reason_out = nullptr);
+
         // =====================================================================
         // Output Tensor Registry (ILocalTPContext interface + concrete impl)
         // =====================================================================
@@ -218,6 +231,20 @@ namespace llaminar2
         bool isAbortRequested() const { return abort_requested_.load(std::memory_order_acquire); }
 
     private:
+        struct OnStreamCollectiveContract
+        {
+            bool initialized = false;
+            std::string stage_name;
+            size_t count = 0;
+            int dtype = -1;
+            std::string precision;
+            uint64_t seen_slots = 0;
+            int arrivals = 0;
+        };
+
+        static std::atomic<uint64_t> next_context_id_;
+        uint64_t context_id_ = 0;
+
         std::vector<GlobalDeviceAddress> devices_;
         std::vector<float> weights_; ///< Normalized weights (sum to 1.0)
         CollectiveBackendType backend_;
@@ -298,6 +325,13 @@ namespace llaminar2
         std::atomic<bool> abort_requested_{false};
 
         // =====================================================================
+        // Collective Contract Trace State
+        // =====================================================================
+        mutable std::mutex contract_trace_mutex_;
+        std::vector<uint64_t> onstream_sequence_by_slot_;
+        std::unordered_map<uint64_t, OnStreamCollectiveContract> onstream_contracts_;
+
+        // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
         // =====================================================================
         // When allreduce precision is "fp16" (set per-layer via schema or globally\n        // via LLAMINAR_ALLREDUCE_PRECISION), FP32 allreduces cast to FP16 first
@@ -357,6 +391,14 @@ namespace llaminar2
          * @return true on success
          */
         bool allreduceImpl(TensorBase *tensor);
+
+        bool traceOnStreamCollectiveContract(int device_index,
+                                             TensorBase *tensor,
+                                             const std::string &stage_name,
+                                             size_t effective_count,
+                                             CollectiveDataType dtype,
+                                             void *stream,
+                                             const std::string &precision);
 
         /**
          * @brief Barrier-synchronized allreduce for NCCL/RCCL multi-GPU backends
@@ -472,13 +514,10 @@ namespace llaminar2
 
         /**
          * @brief Return true when the current GPU graph configuration supports
-         *        LocalTP NCCL collectives.
-         *
-         * - If GPU graphs are OFF, LocalTP NCCL is supported.
-         * - If GPU graphs are ON, segmented collective mode must also be ON.
+         *        this context's LocalTP GPU-native collectives.
          *
          * @param reason_out Optional pointer receiving human-readable reason.
-         * @return true when policy permits LocalTP NCCL collective execution.
+         * @return true when policy permits LocalTP collective execution.
          */
         bool isLocalTPNCCLGraphPolicySupported(std::string *reason_out = nullptr) const;
     };

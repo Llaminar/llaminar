@@ -251,6 +251,22 @@ namespace llaminar2::primitives
         OMP_WORKSHARE_REGION(do_work);
     }
 
+    void compute_swiglu_serial(const float *gate, const float *up, float *output, int size)
+    {
+        // Same ISA dispatch as compute_swiglu, but without OMP parallelization.
+        // For small sizes (e.g. MoE intermediate=512 at M=1), the OMP
+        // fork/join overhead (~6µs) far exceeds the compute cost (~0.1µs).
+        const int chunk_size = 1024;
+        for (int i = 0; i < size; i += chunk_size)
+        {
+            int current_chunk = std::min(chunk_size, size - i);
+            const float *g_ptr = gate + i;
+            const float *u_ptr = up + i;
+            float *o_ptr = output + i;
+            ISA_DISPATCH_VOID(compute_swiglu, g_ptr, u_ptr, o_ptr, current_chunk);
+        }
+    }
+
     void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
     {
         // Layer-fusion support: avoid nested parallel region if already parallel

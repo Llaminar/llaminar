@@ -36,7 +36,6 @@
 #include "../../../interfaces/ICollectiveContext.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
-#include "../coherence/StageCoherence.h" // For CoherenceBuffer (cached in GraphSegment)
 #include "../../../memory/BufferArena.h" // Phase 2: contract-based coherence
 #include <memory>
 #include <vector>
@@ -76,11 +75,14 @@ namespace llaminar2
         bool stage_dump = true;           ///< Stage dump framework (input/output snapshots)
         bool snapshot_callback = true;    ///< Invoke snapshot callback after execution
         bool pointer_validation = false;  ///< GPU pointer device validation
+        bool preserve_gpu_streams = false; ///< Keep caller-assigned streams instead of rebinding normal passes to the worker stream
 
         /// Full execution — coherence, validation, profiling, everything.
         static StageRunPolicy full()
         {
-            return StageRunPolicy{};
+            StageRunPolicy p{};
+            p.timeline = true; // Enable GPU event timeline for prefill profiling
+            return p;
         }
 
         /// Fast decode — minimal overhead for cached decode graphs.
@@ -181,6 +183,9 @@ namespace llaminar2
          * @brief Set snapshot callback for debugging
          */
         void setSnapshotCallback(StageSnapshotCallback callback) override { config_.snapshot_callback = std::move(callback); }
+
+        void setStageFailureCallback(StageFailureCallback callback) { config_.stage_failure_callback = std::move(callback); }
+        void setCancellationCallback(ExecutionCancellationCallback callback) { config_.cancellation_requested = std::move(callback); }
 
         /**
          * @brief Set the current layer context for stage dumping
@@ -346,18 +351,24 @@ namespace llaminar2
          */
         struct GraphSegment
         {
+            struct ArenaWriteBinding
+            {
+                BufferId id;
+                DeviceId device;
+            };
+
             std::vector<std::string> stage_names;          ///< Ordered stage names in this segment
             bool capturable = true;                        ///< Whether this segment can be graph-captured
             std::unique_ptr<IGPUGraphCapture> capture;     ///< GPU graph (only for capturable segments)
             std::vector<IComputeStage *> replay_callbacks; ///< Stages needing onGraphReplayed() (precomputed)
             uint64_t last_executed_step = 0;               ///< Last decode-step where this segment executed
 
-            // ── Pre-cached coherence buffers (populated once during capture) ──
-            // Eliminates per-decode-step getDumpInfo() + extractOutputBuffers()
-            // + dynamic_cast overhead (~1352 vector allocs + 676 virtual calls
-            // per step for Qwen2.5-7B with 338 capturable stages).
-            std::vector<CoherenceBuffer> cached_all_output_buffers; ///< Flattened outputs of all stages
-            bool replay_buffers_cached = false;                     ///< True after first post-launch caching
+            // Output coherence is marked through stable BufferArena ids after
+            // replay. Avoid retaining raw TensorBase* caches here: prefix
+            // restore, rollback, and request clears can legally mutate tensor
+            // ownership while preserving graph topology.
+            std::vector<ArenaWriteBinding> cached_arena_writes;
+            bool arena_writes_cached = false;
         };
 
         /**
@@ -369,21 +380,38 @@ namespace llaminar2
          */
         struct GraphSegmentCache
         {
+            /**
+             * @brief Controls whether reset() keeps the explicit capture stream alive.
+             *
+             * Preserve is used for recapture/retry state resets where cached stages
+             * may still hold the stream pointer. Destroy is reserved for teardown or
+             * cache invalidation where no stage will execute again before rebinding.
+             */
+            enum class StreamResetPolicy
+            {
+                Preserve,
+                Destroy
+            };
+
             std::vector<GraphSegment> segments;       ///< Ordered segments
             bool initialized = false;                 ///< Whether segments have been built
             bool needs_capture = false;               ///< True after warmup, before capture
             int consecutive_failures = 0;             ///< Segment-level failure counter
             uint64_t decode_step = 0;                 ///< Monotonic segmented-execution step counter
+            uint64_t capture_variant_signature = 0;   ///< Stage-reported launch-topology variant for this cache
+            uint64_t variant_recapture_count = 0;     ///< Resets caused by launch-topology variant changes
+            std::string perf_context;                 ///< Optional structured stats tag for the replay caller
             void *capture_stream = nullptr;           ///< Locally-created blocking stream for capture/replay
             void *sync_event = nullptr;               ///< Cached event for GPU-side inter-stream sync
             IWorkerGPUContext *gpu_ctx_ref = nullptr; ///< GPU context for stream lifecycle (not owned)
+            DeviceId capture_device = DeviceId::invalid(); ///< Device used to resolve the stream owner at teardown
+            bool capture_context_from_pool = false; ///< True when the stream was created by the pool context
             static constexpr int kMaxFailures = 4;    ///< Disable after N failures
 
             GraphSegmentCache() = default;
             ~GraphSegmentCache()
             {
-                destroySyncEvent();
-                destroyCaptureStream();
+                reset(StreamResetPolicy::Destroy);
             }
 
             // Move-only (non-copyable due to stream/event ownership)
@@ -393,51 +421,75 @@ namespace llaminar2
                   needs_capture(other.needs_capture),
                   consecutive_failures(other.consecutive_failures),
                   decode_step(other.decode_step),
+                  capture_variant_signature(other.capture_variant_signature),
+                  variant_recapture_count(other.variant_recapture_count),
+                  perf_context(std::move(other.perf_context)),
                   capture_stream(other.capture_stream),
                   sync_event(other.sync_event),
-                  gpu_ctx_ref(other.gpu_ctx_ref)
+                  gpu_ctx_ref(other.gpu_ctx_ref),
+                  capture_device(other.capture_device),
+                  capture_context_from_pool(other.capture_context_from_pool)
             {
                 other.capture_stream = nullptr;
                 other.sync_event = nullptr;
                 other.gpu_ctx_ref = nullptr;
+                other.capture_device = DeviceId::invalid();
+                other.capture_context_from_pool = false;
+                other.capture_variant_signature = 0;
+                other.variant_recapture_count = 0;
             }
             GraphSegmentCache &operator=(GraphSegmentCache &&other) noexcept
             {
                 if (this != &other)
                 {
-                    destroySyncEvent();
-                    destroyCaptureStream();
+                    reset(StreamResetPolicy::Destroy);
                     segments = std::move(other.segments);
                     initialized = other.initialized;
                     needs_capture = other.needs_capture;
                     consecutive_failures = other.consecutive_failures;
                     decode_step = other.decode_step;
+                    capture_variant_signature = other.capture_variant_signature;
+                    variant_recapture_count = other.variant_recapture_count;
+                    perf_context = std::move(other.perf_context);
                     capture_stream = other.capture_stream;
                     sync_event = other.sync_event;
                     gpu_ctx_ref = other.gpu_ctx_ref;
+                    capture_device = other.capture_device;
+                    capture_context_from_pool = other.capture_context_from_pool;
                     other.capture_stream = nullptr;
                     other.sync_event = nullptr;
                     other.gpu_ctx_ref = nullptr;
+                    other.capture_device = DeviceId::invalid();
+                    other.capture_context_from_pool = false;
+                    other.capture_variant_signature = 0;
+                    other.variant_recapture_count = 0;
                 }
                 return *this;
             }
             GraphSegmentCache(const GraphSegmentCache &) = delete;
             GraphSegmentCache &operator=(const GraphSegmentCache &) = delete;
 
-            void reset()
+            void reset(StreamResetPolicy stream_policy = StreamResetPolicy::Destroy)
             {
+                synchronizeCaptureStream();
                 segments.clear();
                 initialized = false;
                 needs_capture = false;
                 consecutive_failures = 0;
                 decode_step = 0;
+                capture_variant_signature = 0;
                 destroySyncEvent();
-                destroyCaptureStream();
+                if (stream_policy == StreamResetPolicy::Destroy)
+                    destroyCaptureStream();
             }
 
             /// Create a local blocking stream for graph capture via the GPU context.
             /// @param ctx GPU context that creates the stream (stored for cleanup)
-            bool ensureCaptureStream(IWorkerGPUContext *ctx);
+            bool ensureCaptureStream(IWorkerGPUContext *ctx,
+                                     DeviceId device = DeviceId::invalid());
+
+            /// Wait for queued replay/capture work before graph resources are torn down.
+            void synchronizeCaptureStream();
 
             /// Destroy the capture stream if it exists
             void destroyCaptureStream();
@@ -447,6 +499,9 @@ namespace llaminar2
 
             /// Destroy the cached sync event if it exists
             void destroySyncEvent();
+
+            /// Resolve the current lifecycle context for stream/event cleanup.
+            IWorkerGPUContext *resolveLifecycleContext(const char *operation);
         };
 
         /**
@@ -477,7 +532,9 @@ namespace llaminar2
                                               void *gpu_stream,
                                               IWorkerGPUContext *gpu_ctx,
                                               const std::unordered_set<std::string> *collective_nodes = nullptr,
-                                              bool collectives_graph_capturable = false);
+                                              bool collectives_graph_capturable = false,
+                                              bool force_recapture = false,
+                                              bool defer_final_sync = false);
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
@@ -487,7 +544,9 @@ namespace llaminar2
             bool allow_fast_decode = true;
             bool allow_segmented_capture = false;
             bool collective_segmented_enabled = false;
-            bool collectives_graph_capturable = false; ///< True when collective ops can be captured into GPU graph
+            bool collectives_graph_capturable = false; ///< True only for explicit future graph-captured collective paths
+            bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
+            bool defer_final_sync = false;             ///< Caller will synchronize the replay stream through a following operation.
             int max_segment_failures = 4;
         };
 
@@ -539,6 +598,9 @@ namespace llaminar2
                        IDeviceContext *ctx,
                        const StageRunPolicy &policy,
                        const std::unordered_set<std::string> *collective_nodes = nullptr);
+
+        bool cancellationRequested(const std::string &node_name) const;
+        void notifyStageFailure(const std::string &node_name, const std::string &reason) const;
 
         /**
          * @brief Execute a single stage according to the given policy.

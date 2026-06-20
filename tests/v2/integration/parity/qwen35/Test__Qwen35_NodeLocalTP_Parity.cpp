@@ -56,6 +56,8 @@ static const std::vector<std::string> kNodeLocalTPExcludedStages = {
     "Q_ROPE",
     "K_ROPE",
     "ATTENTION_CONTEXT",
+    "FA_GATE",
+    "ATTENTION_CONTEXT_GATED",
     // FFN sharded intermediates
     "FFN_GATE",
     "FFN_UP",
@@ -73,6 +75,8 @@ static const std::vector<std::string> kNodeLocalTPExcludedStages = {
     // "FFN_RESIDUAL",
     // GDN-specific: QKV projection covers gdn_proj (same snapshot key)
     "QKV_PROJECTION",
+    // GDN-specific: short-conv preserves the sharded QKV packed layout
+    "GDN_CONV1D_OUTPUT",
     // GDN-specific: Z gate output is column-parallel (sharded by v_heads)
     "GDN_Z_PROJECTION",
     // GDN-specific: recurrence output is per-local-heads under TP

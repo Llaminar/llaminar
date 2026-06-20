@@ -25,6 +25,8 @@
 #include "../mpi_orchestration/IExecutionPlanBuilder.h"
 #include "../local_execution/orchestrators/IInferenceRunner.h"
 #include "../mpi_orchestration/DeviceInventory.h"
+#include "../prefix_cache/PrefixCacheStats.h"
+#include "../mtp/MTPDepthController.h"
 #include "../local_execution/orchestrators/RankOrchestrator.h"
 #include "../../planning/MemoryPlanner.h"
 #include "../../collective/ILocalTPContext.h"
@@ -33,12 +35,24 @@
 #include "../../interfaces/IMPIContext.h"
 #include "../../utils/MPIContext.h"
 #include "../../utils/Tokenizer.h"
+#include "../moe/ExpertWeightTransfer.h"
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <optional>
+#include <utility>
 
 namespace llaminar2
 {
+
+    class MoERebalanceController;
+    class IModelContext;
+    struct ExpertReplicaSet;
+    struct MoEExpertOverlayExecutionPlan;
+
+    std::shared_ptr<MoEExpertParallelPlan> freezeMoEExpertOverlayPlanForModel(
+        IModelContext &model_ctx,
+        const std::shared_ptr<MoEExpertParallelPlan> &plan);
 
     /**
      * @brief Concrete implementation of IOrchestrationRunner
@@ -144,11 +158,19 @@ namespace llaminar2
         // =====================================================================
 
         bool prefill(const std::vector<int32_t> &tokens) override;
+        bool supportsPrefillBatch(int request_batch) const override;
+        bool prefillBatch(
+            const std::vector<std::vector<int32_t>> &token_batches) override;
         GenerationResult decodeStep() override;
+        GenerationResult forceDecodeToken(int32_t token) override;
+        bool supportsDecodeStepBatch(int request_batch) const override;
+        GenerationBatchResult decodeStepBatch(int request_batch) override;
         GenerationResult generate(
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,
             const SamplingParams &sampling) override;
+        void setDecodeStepTokenBudget(int max_tokens) override;
+        bool maybeApplyMoERebalance() override;
 
         // =====================================================================
         // IOrchestrationRunner: Configuration
@@ -166,6 +188,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Advanced
@@ -192,6 +215,46 @@ namespace llaminar2
         const GraphExecutorStats *executorStats() const override;
         void resetExecutorStats() override;
 
+        /// Get MoE rebalance controller from the underlying DGO (if any)
+        MoERebalanceController *moeRebalanceController() const;
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const;
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const;
+
+        /// Apply rebalanced expert masks to DGO's cached MoEExpertComputeStages
+        void applyMoEExpertMasks(
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received = {},
+            const std::string &domain_id = {});
+
+        /// Apply MoE masks to every local device runner when the underlying
+        /// runner is a RankOrchestrator. Returns true if handled.
+        bool applyMoEExpertMasksForAllLocalDevices(const MoERebalanceController &controller);
+
+        /// Apply precomputed MoE masks to every local device runner when the
+        /// underlying runner is a RankOrchestrator. Returns true if handled.
+        bool applyMoEExpertMasksForAllLocalDevices(
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+            const std::string &domain_id = {});
+
+        /// Set expert replica info for per-token dynamic dispatch
+        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int participant_id);
+
+        /// Apply one dynamic MoE rebalance cycle, including bounded hot replicas.
+        bool applyMoERebalanceWithReplicas(bool log_histogram_summary = false);
+
+        /// Transfer packed weights for migrating experts via MPI.
+        ReceivedWeightsMap transferExpertWeights(
+            const std::vector<ExpertMigration> &manifest, int num_layers);
+
+        /// Transfer pre-packed weights for replicated experts via MPI (non-destructive).
+        ReceivedWeightsMap transferReplicaWeights(
+            const ExpertReplicaSet &replicas, int num_layers);
+
+        /// Release raw expert weight data after initial VNNI packing.
+        /// @return Total bytes freed/released
+        size_t releaseRawExpertWeights();
+
         // =====================================================================
         // IOrchestrationRunner: GPU-side Sampling
         // =====================================================================
@@ -206,6 +269,8 @@ namespace llaminar2
         void setSamplingParams(const SamplingParams &params) override;
         SamplingParams getSamplingParams() const { return active_sampling_params_; }
         SamplingParams getRecommendedSamplingParams() const override;
+        std::string getStopThinkingPrompt() const override;
+        ToolCallFormat getToolCallFormat() const override;
 
         // =====================================================================
         // MPI Worker Loop (for non-root ranks in server mode)
@@ -218,12 +283,14 @@ namespace llaminar2
          */
         enum class MPICommand : int32_t
         {
-            CLEAR_CACHE = 1,       ///< Clear KV cache
-            SET_SAMPLING = 2,      ///< Set sampling parameters (followed by SamplingParams broadcast)
-            PREFILL = 3,           ///< Prefill (followed by token count + tokens)
-            DECODE_STEP = 4,       ///< Run one decode step
-            SKIP_LOGITS_DECODE = 5, ///< Set skip-logits-gather for decode
-            SHUTDOWN = 99          ///< Exit the worker loop
+            CLEAR_CACHE = 1,         ///< Clear KV cache
+            SET_SAMPLING = 2,        ///< Set sampling parameters (followed by SamplingParams broadcast)
+            PREFILL = 3,             ///< Prefill (followed by token count + tokens)
+            DECODE_STEP = 4,         ///< Run one decode step (followed by int32 token budget)
+            SKIP_LOGITS_DECODE = 5,  ///< Set skip-logits-gather for decode
+            APPLY_MOE_REBALANCE = 6, ///< Apply dynamic MoE rebalance/hot replicas
+            FORCE_DECODE_TOKEN = 7,  ///< Commit a forced token (followed by token id)
+            SHUTDOWN = 99            ///< Exit the worker loop
         };
 
         /**
@@ -239,6 +306,10 @@ namespace llaminar2
          * @brief Signal workers to exit their loops.
          */
         void shutdownMPIWorkers() override;
+        void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> mpi_ctx) override
+        {
+            moe_expert_overlay_mpi_ctx_ = std::move(mpi_ctx);
+        }
 
         /**
          * @brief Enable MPI coordinated mode.
@@ -289,6 +360,8 @@ namespace llaminar2
          * @brief Load model weights (partial for PP, sharded for TP)
          */
         bool loadWeights();
+
+        bool freezeMoEExpertOverlayPlanForLoadedModel();
 
         /**
          * @brief Validate TP/PP configuration against loaded model
@@ -362,6 +435,56 @@ namespace llaminar2
          */
         bool buildSingleDeviceComputeGraph();
 
+        /**
+         * @brief Print consolidated startup banner (rank 0 only).
+         *
+         * Called after all validation passes, before buildComputeGraph().
+         * Consolidates topology, config, model, and preflight info.
+         */
+        void printStartupBanner();
+
+        bool shouldUseMTPDecode() const;
+        std::string mtpDecodeHardFailureReason() const;
+        std::string mtpDecodeBypassReason() const;
+        void recordMTPBypass(const std::string &reason);
+        /**
+         * @brief Emit one structured Phase 9.8 verifier-economy snapshot.
+         *
+         * The snapshot is intentionally separate from decode timers. It lets
+         * dashboards distinguish a correct serial fallback from an economical
+         * grouped/resident verifier path without adding per-token hot-path
+         * logging overhead when perfstats are disabled.
+         */
+        void recordMTPVerifierEconomyPerfStatsIfNeeded();
+        bool ensureMTPDepthController(const MTPRuntimeConfig &mtp);
+        int effectiveMTPMaxDraftDepth(const MTPRuntimeConfig &mtp) const;
+        int currentMTPDraftDepth(const MTPRuntimeConfig &mtp);
+        /**
+         * @brief Read the host-visible sidecar base position for MTP planning.
+         *
+         * vLLM-style resident publication can advance logical positions on the
+         * device before the compatibility bridge refreshes host mirrors.  This
+         * helper is the only MTP planning path that may read `get_position()`;
+         * it hard-fails when a current resident mailbox exists but host mirrors
+         * have not been adopted yet.
+         */
+        std::optional<int> currentMTPBaseSidecarPositionForPlanning(
+            const char *context,
+            std::string *error = nullptr) const;
+        void recordMTPDepthZeroBypass();
+        void recordMTPDepthObservation(
+            int requested_depth,
+            int effective_depth,
+            int accepted_speculative_prefix,
+            bool budget_limited,
+            bool rollback);
+        GenerationResult decodeStepMTP();
+        void clearBatchedDecodeState();
+        bool forwardPrefillTokens(
+            const int *tokens,
+            int token_count,
+            const std::string &failure_message);
+
         // =====================================================================
         // Error Handling
         // =====================================================================
@@ -384,6 +507,7 @@ namespace llaminar2
         // Dependencies (injected or created)
         std::unique_ptr<IExecutionPlanBuilder> plan_builder_;
         std::shared_ptr<IMPIContext> mpi_ctx_;
+        std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx_;
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<ILocalTPContext> local_tp_ctx_;
         std::unique_ptr<ILocalPPContext> local_pp_ctx_;
@@ -399,12 +523,111 @@ namespace llaminar2
         // Inference state
         std::vector<int32_t> stop_tokens_;
         Sampler sampler_;
-        SamplingParams active_sampling_params_;      // Current sampling params for decodeStep()
-        SamplingParams recommended_sampling_params_; // Model-specific defaults
-        int32_t last_token_{0};                      // Last token for decode step
-        bool prefill_logits_ready_{false};           // True after prefill(); first decodeStep() samples from existing logits
-        bool mpi_coordinated_mode_{false};           // When true, rank 0 broadcasts commands for worker loop
+        SamplingParams active_sampling_params_;                         // Current sampling params for decodeStep()
+        SamplingParams recommended_sampling_params_;                    // Model-specific defaults
+        std::string stop_thinking_prompt_;                              // Model-specific stop-thinking prompt
+        ToolCallFormat tool_call_format_{ToolCallFormat::HERMES_2_PRO}; // Model-specific tool call format
+        int32_t last_token_{0};                                         // Last token for decode step
+        bool prefill_logits_ready_{false};                              // True when terminal logits already predict the next decode token
+        std::optional<int32_t> ready_sampled_token_;                    // Token already sampled from ready terminal logits
+        std::optional<SamplingParams> ready_sampled_params_;            // Sampling params used to produce ready_sampled_token_
+        /**
+         * @brief Device-resident source for @ref ready_sampled_token_.
+         *
+         * A ready token is sampled one step early from the verifier's bonus
+         * terminal row, then emitted at the beginning of the next decode step.
+         * The host token remains necessary for the served response, but the
+         * next MTP sidecar should consume the token and logical position from
+         * the device mailbox when one is available.  This keeps the real
+         * inference path aligned with vLLM-style resident state publication
+         * instead of re-uploading the same token from a CPU shadow.
+         */
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            ready_sampled_resident_state_;
+        /**
+         * @brief Already-emitted correction token that still needs a main verifier row.
+         *
+         * vLLM-style MTP rejection publishes accepted state only through the
+         * accepted verifier prefix.  When stochastic verification rejects a
+         * draft, the sampled correction is emitted to the caller immediately,
+         * but the next speculative transaction can consume that correction as
+         * verifier input row zero instead of running a standalone one-token
+         * condition forward.  This field owns that handoff.  The token is
+         * already in `sampler_` history and must not be emitted or recorded
+         * again when the next transaction commits.
+         */
+        std::optional<int32_t> pending_mtp_condition_token_;
+        std::optional<SamplingParams> pending_mtp_condition_params_;
+        /**
+         * @brief Device-resident source for @ref pending_mtp_condition_token_.
+         *
+         * The host token above is still required because `decodeStep()` returns
+         * concrete token ids to the caller.  It must not, however, become the
+         * source of truth for the next GPU sidecar.  When direct MTP
+         * publication exposes a logical-state mailbox, this handle lets the
+         * next fixed-depth stochastic transaction consume the correction token
+         * and logical position from GPU metadata, matching vLLM's
+         * device-resident transaction shape.
+         */
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            pending_mtp_condition_resident_state_;
+        /**
+         * @brief First MTP sidecar already queued for the next decode step.
+         *
+         * vLLM overlaps response copies with target-state postprocessing and
+         * the following draft proposal.  In Llaminar's synchronous
+         * `decodeStep()` API we still return concrete host tokens, but when a
+         * direct GPU publication has a resident continuation token and no stop
+         * token can invalidate it, we can enqueue the next first sidecar before
+         * waiting for the host response bridge.  The next decode step consumes
+         * this handle only if it still matches the pending/ready resident
+         * mailbox exactly.
+         */
+        std::optional<DeviceResidentLogicalSequenceStateHandle>
+            prelaunched_mtp_first_sidecar_resident_state_;
+        std::optional<SamplingParams>
+            prelaunched_mtp_first_sidecar_params_;
+        /**
+         * @brief Per-request state initialized by prefillBatch().
+         *
+         * Phase 8 request batching must never reuse the scalar last-token or
+         * ready-logit fields above. This small state object is the ownership
+         * bridge for the future decodeStepBatch() implementation: every
+         * request starts with its own terminal prompt token and ready-logit
+         * bit, while scalar decode is explicitly disabled until the batch is
+         * cleared or consumed by the batched decode API.
+         */
+        struct BatchedDecodeRequestState
+        {
+            int32_t last_token = 0;
+            bool prefill_logits_ready = false;
+            std::optional<int32_t> ready_sampled_token;
+            std::optional<SamplingParams> ready_sampled_params;
+            /**
+             * @brief Independent sampler history for this logical request.
+             *
+             * Request batching must match running each prompt as its own scalar
+             * decode stream. Sharing `sampler_` across lanes would interleave
+             * RNG draws and repetition history, which is harmless for strict
+             * greedy decode but wrong for stochastic or penalty-aware MTP.
+             */
+            Sampler sampler;
+            bool is_complete = false;
+        };
+        std::vector<BatchedDecodeRequestState> batched_request_states_;
+        bool batched_decode_active_{false};
+        int decode_step_token_budget_{0};                               // Optional per-step cap used by generate(); 0 means unlimited
+        bool mpi_coordinated_mode_{false};                              // When true, rank 0 broadcasts commands for worker loop
         std::shared_ptr<ITokenizer> tokenizer_;
+        MTPStats mtp_stats_;
+        std::unique_ptr<MTPDepthController> mtp_depth_controller_;
+        bool mtp_verifier_economy_perfstats_emitted_{false};
+        PrefillChunkStats prefill_chunk_stats_;
+        PrefixCacheRequestSummary prefix_request_summary_;
+        bool mtp_bypassed_{false};
+        bool mtp_bypass_recorded_for_request_{false};
+        std::string mtp_bypass_reason_;
+        uint64_t request_epoch_{0};
     };
 
 } // namespace llaminar2

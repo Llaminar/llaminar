@@ -10,8 +10,15 @@
  */
 
 #include <gtest/gtest.h>
-#include <memory>
+#include <algorithm>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
 #include "tensors/Tensors.h"
@@ -22,6 +29,58 @@ namespace llaminar2
 {
     namespace
     {
+        namespace fs = std::filesystem;
+
+        fs::path findRepoRoot()
+        {
+            std::vector<fs::path> starts;
+            starts.push_back(fs::current_path());
+            starts.push_back(fs::path(__FILE__));
+
+            for (auto start : starts)
+            {
+                if (fs::is_regular_file(start))
+                    start = start.parent_path();
+
+                for (fs::path candidate = start; !candidate.empty(); candidate = candidate.parent_path())
+                {
+                    if (fs::exists(candidate / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp") &&
+                        fs::exists(candidate / "tests/v2/CMakeLists.txt"))
+                    {
+                        return candidate;
+                    }
+
+                    if (candidate == candidate.root_path())
+                        break;
+                }
+            }
+
+            return fs::current_path();
+        }
+
+        std::string readFile(const fs::path &path)
+        {
+            std::ifstream input(path);
+            if (!input)
+                return {};
+
+            std::ostringstream buffer;
+            buffer << input.rdbuf();
+            return buffer.str();
+        }
+
+        std::string sliceFunction(const std::string &source,
+                                  const std::string &begin_marker,
+                                  const std::string &end_marker)
+        {
+            const size_t begin = source.find(begin_marker);
+            if (begin == std::string::npos)
+                return {};
+            const size_t end = source.find(end_marker, begin);
+            if (end == std::string::npos)
+                return source.substr(begin);
+            return source.substr(begin, end - begin);
+        }
 
         /**
          * @brief Mock KV cache for testing dynamic kv_len queries
@@ -109,6 +168,17 @@ namespace llaminar2
                 if (out_kv_len)
                     *out_kv_len = cached_tokens_[layer];
                 return true;
+            }
+
+            bool get_kv_converted(int layer, int seq_idx,
+                                  ActivationPrecision target,
+                                  ITensor **out_k, ITensor **out_v,
+                                  int *out_kv_len = nullptr,
+                                  const KVReadParams *rope = nullptr) override
+            {
+                (void)target;
+                (void)rope;
+                return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
             }
 
             // Legacy individual accessors (deprecated)
@@ -286,6 +356,162 @@ namespace llaminar2
             std::unique_ptr<FP32Tensor> workspace_mask_;
         };
 
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionIsGraphCapturable)
+        {
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = kv_cache_->get_k(0, 0);
+            params.V = kv_cache_->get_v(0, 0);
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = 127;
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.auto_detect_mode = true;
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = 0;
+            params.device_id = DeviceId::rocm(0);
+
+            AttentionComputeStage stage(params);
+            EXPECT_TRUE(stage.isGraphCapturable());
+            EXPECT_FALSE(stage.requiresGraphCaptureSegmentBoundaryBefore());
+            EXPECT_FALSE(stage.requiresGraphCaptureSegmentBoundaryAfter());
+        }
+
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, ROCmDynamicDecodeAttentionVariantChangesAtSplitBucket)
+        {
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = kv_cache_->get_k(0, 0);
+            params.V = kv_cache_->get_v(0, 0);
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = 64;
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.auto_detect_mode = true;
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = 0;
+            params.device_id = DeviceId::rocm(0);
+
+            AttentionComputeStage stage(params);
+
+            kv_cache_->setCachedTokens(0, 62); // post-append kv_len=63
+            const uint64_t bucket_a = stage.graphCaptureVariantSignature();
+            ASSERT_NE(bucket_a, 0u);
+
+            kv_cache_->setCachedTokens(0, 63); // post-append kv_len=64
+            const uint64_t bucket_a_edge = stage.graphCaptureVariantSignature();
+            EXPECT_EQ(bucket_a_edge, bucket_a);
+
+            kv_cache_->setCachedTokens(0, 64); // post-append kv_len=65
+            const uint64_t bucket_b = stage.graphCaptureVariantSignature();
+            EXPECT_NE(bucket_b, 0u);
+            EXPECT_NE(bucket_b, bucket_a)
+                << "ROCm split-K decode must recapture when crossing the 64-token launch bucket";
+        }
+
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, CPUAndROCmPrefillGraphCaptureContractsRemainUnchanged)
+        {
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = kv_cache_->get_k(0, 0);
+            params.V = kv_cache_->get_v(0, 0);
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 8;
+            params.kv_len = 8;
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.auto_detect_mode = true;
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = 0;
+
+            params.device_id = DeviceId::cpu();
+            AttentionComputeStage cpu_stage(params);
+            EXPECT_TRUE(cpu_stage.isGraphCapturable());
+
+            params.device_id = DeviceId::rocm(0);
+            AttentionComputeStage rocm_prefill_stage(params);
+            EXPECT_TRUE(rocm_prefill_stage.isGraphCapturable());
+            EXPECT_FALSE(rocm_prefill_stage.requiresGraphCaptureSegmentBoundaryBefore());
+            EXPECT_FALSE(rocm_prefill_stage.requiresGraphCaptureSegmentBoundaryAfter());
+        }
+
+        /// @brief Reference FP32 single-query GQA attention over a caller-selected KV prefix.
+        std::vector<float> referenceSingleQueryGQAAttention(
+            const float *q_data,
+            const float *k_data,
+            const float *v_data,
+            int kv_len,
+            int num_heads,
+            int num_kv_heads,
+            int head_dim)
+        {
+            std::vector<float> output(static_cast<size_t>(num_heads * head_dim), 0.0f);
+            std::vector<float> scores(static_cast<size_t>(kv_len), 0.0f);
+
+            const int kv_row_stride = num_kv_heads * head_dim;
+            const int gqa_group_size = num_heads / num_kv_heads;
+            const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+            for (int head = 0; head < num_heads; ++head)
+            {
+                const int kv_head = head / gqa_group_size;
+                const float *q_head = q_data + head * head_dim;
+
+                float max_score = -std::numeric_limits<float>::infinity();
+                for (int pos = 0; pos < kv_len; ++pos)
+                {
+                    const float *k_head = k_data + pos * kv_row_stride + kv_head * head_dim;
+                    float dot = 0.0f;
+                    for (int dim = 0; dim < head_dim; ++dim)
+                    {
+                        dot += q_head[dim] * k_head[dim];
+                    }
+                    scores[static_cast<size_t>(pos)] = dot * scale;
+                    max_score = std::max(max_score, scores[static_cast<size_t>(pos)]);
+                }
+
+                float denom = 0.0f;
+                for (int pos = 0; pos < kv_len; ++pos)
+                {
+                    const float weight = std::exp(scores[static_cast<size_t>(pos)] - max_score);
+                    scores[static_cast<size_t>(pos)] = weight;
+                    denom += weight;
+                }
+
+                for (int dim = 0; dim < head_dim; ++dim)
+                {
+                    float value = 0.0f;
+                    for (int pos = 0; pos < kv_len; ++pos)
+                    {
+                        const float *v_head = v_data + pos * kv_row_stride + kv_head * head_dim;
+                        value += (scores[static_cast<size_t>(pos)] / denom) * v_head[dim];
+                    }
+                    output[static_cast<size_t>(head * head_dim + dim)] = value;
+                }
+            }
+
+            return output;
+        }
+
+        /// @brief Returns the largest absolute elementwise difference for equal-sized buffers.
+        float maxAbsDiff(const float *actual, const std::vector<float> &expected)
+        {
+            float max_diff = 0.0f;
+            for (size_t i = 0; i < expected.size(); ++i)
+            {
+                max_diff = std::max(max_diff, std::abs(actual[i] - expected[i]));
+            }
+            return max_diff;
+        }
+
         /**
          * @test Verify that when kv_cache is provided, execute() queries it dynamically
          *
@@ -349,6 +575,107 @@ namespace llaminar2
                 sum += std::abs(out_data[i]);
             }
             EXPECT_GT(sum, 0.0f) << "Output should have non-zero values after attention";
+        }
+
+        /**
+         * @test Verify decode uses real cached tokens, not padded KV storage rows
+         */
+        TEST_F(Test__AttentionComputeStage_DynamicKVLen, DecodeIgnoresHostilePaddedKVRows)
+        {
+            const int layer_idx = 1;
+            const int real_kv_len = 5;
+            const int bucket_kv_len = 9;
+
+            kv_cache_->setCachedTokens(layer_idx, real_kv_len);
+
+            ITensor *K = kv_cache_->get_k(layer_idx, 0);
+            ITensor *V = kv_cache_->get_v(layer_idx, 0);
+            auto *K_fp32 = dynamic_cast<FP32Tensor *>(K);
+            auto *V_fp32 = dynamic_cast<FP32Tensor *>(V);
+            ASSERT_NE(K_fp32, nullptr);
+            ASSERT_NE(V_fp32, nullptr);
+
+            float *q_data = Q_->mutable_data();
+            for (int head = 0; head < kNumHeads; ++head)
+            {
+                for (int dim = 0; dim < kHeadDim; ++dim)
+                {
+                    q_data[head * kHeadDim + dim] = 0.02f * static_cast<float>((head + 1) * (dim % 7 + 1));
+                }
+            }
+
+            float *k_data = K_fp32->mutable_data();
+            float *v_data = V_fp32->mutable_data();
+            for (int pos = 0; pos < real_kv_len; ++pos)
+            {
+                for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head)
+                {
+                    for (int dim = 0; dim < kHeadDim; ++dim)
+                    {
+                        const int index = pos * kKVDim + kv_head * kHeadDim + dim;
+                        const float sign = ((pos + kv_head + dim) % 2 == 0) ? 1.0f : -1.0f;
+                        k_data[index] = sign * 0.015f * static_cast<float>(1 + ((pos * 11 + kv_head * 5 + dim) % 9));
+                        v_data[index] = 0.025f * static_cast<float>((pos + 1) * (kv_head + 1)) +
+                                        0.001f * static_cast<float>(dim);
+                    }
+                }
+            }
+
+            // Padded rows are deliberately attractive to the query and carry large values.
+            // A stale bucket-length decode would include them and diverge from the prefix reference.
+            for (int pos = real_kv_len; pos < bucket_kv_len; ++pos)
+            {
+                for (int kv_head = 0; kv_head < kNumKVHeads; ++kv_head)
+                {
+                    for (int dim = 0; dim < kHeadDim; ++dim)
+                    {
+                        const int index = pos * kKVDim + kv_head * kHeadDim + dim;
+                        k_data[index] = 4.0f;
+                        v_data[index] = 25.0f + static_cast<float>(pos - real_kv_len) * 3.0f +
+                                        static_cast<float>(kv_head) + 0.1f * static_cast<float>(dim);
+                    }
+                }
+            }
+
+            const std::vector<float> expected_real_prefix = referenceSingleQueryGQAAttention(
+                q_data, k_data, v_data,
+                real_kv_len, kNumHeads, kNumKVHeads, kHeadDim);
+            const std::vector<float> expected_full_bucket = referenceSingleQueryGQAAttention(
+                q_data, k_data, v_data,
+                bucket_kv_len, kNumHeads, kNumKVHeads, kHeadDim);
+
+            AttentionComputeStage::Params params;
+            params.Q = Q_.get();
+            params.K = K;
+            params.V = V;
+            params.output = output_.get();
+            params.batch_size = 1;
+            params.seq_len = 1;
+            params.kv_len = bucket_kv_len; // Intentionally stale padded-bucket hint.
+            params.n_heads = kNumHeads;
+            params.n_kv_heads = kNumKVHeads;
+            params.head_dim = kHeadDim;
+            params.causal = false;
+            params.auto_detect_mode = true;
+            params.workspace_scores = workspace_scores_.get();
+            params.workspace_context = workspace_context_.get();
+            params.workspace_mask = workspace_mask_.get();
+            params.kv_cache = kv_cache_.get();
+            params.layer_idx = layer_idx;
+            params.position_offset = real_kv_len - 1;
+
+            auto stage = ComputeStageFactory::createAttentionCompute(params);
+            ASSERT_NE(stage, nullptr);
+            ASSERT_TRUE(stage->execute(nullptr));
+
+            const float *out_data = output_->data();
+            const float diff_from_real_prefix = maxAbsDiff(out_data, expected_real_prefix);
+            const float diff_from_full_bucket = maxAbsDiff(out_data, expected_full_bucket);
+
+            EXPECT_LT(diff_from_real_prefix, 5e-3f)
+                << "Decode should attend only the real KV-cache prefix";
+            EXPECT_GT(diff_from_full_bucket, 5.0f)
+                << "Hostile padded rows should materially change a stale bucket-length reference";
         }
 
         /**
@@ -677,6 +1004,83 @@ namespace llaminar2
                 sum += std::abs(out_data[i]);
             }
             EXPECT_GT(sum, 0.0f) << "Output should have contributions from all attended positions";
+        }
+
+        TEST(Test__AttentionComputeStage_ROCmCaptureContract, CapturedAttentionUsesPreuploadedDeviceParams)
+        {
+            const fs::path root = findRepoRoot();
+            const std::string source =
+                readFile(root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp");
+            ASSERT_FALSE(source.empty());
+
+            const size_t params_start =
+                source.find("// Wire device_params for graph-capture replay.");
+            ASSERT_NE(params_start, std::string::npos);
+            const size_t params_end =
+                source.find("void *d_buf = workspace_->getBuffer", params_start);
+            ASSERT_NE(params_end, std::string::npos);
+            const std::string params_section =
+                source.substr(params_start, params_end - params_start);
+
+            const size_t active_capture =
+                params_section.find("if (cap_status == hipStreamCaptureStatusActive)");
+            ASSERT_NE(active_capture, std::string::npos);
+            const size_t non_capture_else = params_section.find("else", active_capture);
+            ASSERT_NE(non_capture_else, std::string::npos);
+
+            const std::string active_capture_section =
+                params_section.substr(active_capture, non_capture_else - active_capture);
+            EXPECT_EQ(active_capture_section.find("setDynamicAttnParams("), std::string::npos)
+                << "Captured ROCm attention execution must not mutate or upload dynamic params";
+            EXPECT_NE(active_capture_section.find("Attention device params were not ready before HIP graph capture"),
+                      std::string::npos);
+            EXPECT_NE(active_capture_section.find("dynamic_attn_query_rows_ != query_rows_for_params"),
+                      std::string::npos)
+                << "Captured graphs may bucket kv_len, but verifier row count must match the prepared params";
+
+            const std::string non_capture_section = params_section.substr(non_capture_else);
+            EXPECT_NE(non_capture_section.find("setDynamicAttnParams("), std::string::npos)
+                << "Non-captured ROCm attention still prepares params lazily for eager execution";
+        }
+
+        TEST(Test__AttentionComputeStage_ROCmCaptureContract, MultiRowContinuationParamsMatchCudaContract)
+        {
+            const fs::path root = findRepoRoot();
+            const std::string source =
+                readFile(root / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp");
+            ASSERT_FALSE(source.empty());
+
+            EXPECT_NE(source.find("constexpr int MAX_SMALL_DECODE_ROWS = 4"),
+                      std::string::npos)
+                << "ROCm fixed-depth-3 MTP verification needs draft_count + 1 == 4 continuation rows on the decode path.";
+
+            const std::string stage_source =
+                readFile(root / "src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp");
+            ASSERT_FALSE(stage_source.empty());
+            EXPECT_NE(stage_source.find("logical_seq_len <= kMTPVerifierSmallDecodeMaxRows"),
+                      std::string::npos)
+                << "ROCm graph-capture preparation must pre-upload four-row verifier attention params.";
+            EXPECT_NE(stage_source.find("native-KV M=2..4 verifier path"),
+                      std::string::npos)
+                << "ROCm graph replay signatures must document and cover the four-row verifier path.";
+            EXPECT_NE(stage_source.find("params_.seq_len > kMTPVerifierSmallDecodeMaxRows"),
+                      std::string::npos)
+                << "ROCm graph replay signatures must be keyed for every MTP verifier row up to M=4.";
+
+            const std::string body = sliceFunction(
+                source,
+                "void ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(",
+                "bool ROCmFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(");
+
+            EXPECT_NE(body.find("h_attn_params_[row].position_offset = position_offset + row"),
+                      std::string::npos)
+                << "ROCm M=2..4 verifier rows must use absolute continuation positions.";
+            EXPECT_NE(body.find("h_attn_params_[row].mask_stride = kv_len"),
+                      std::string::npos)
+                << "ROCm M=2..4 verifier rows must keep the full verifier KV stride.";
+            EXPECT_EQ(body.find("h_attn_params_[row].position_offset = std::max(0, row_kv_len - 1)"),
+                      std::string::npos)
+                << "Row-local KV length must not replace the caller's continuation offset.";
         }
 
     } // namespace

@@ -18,6 +18,7 @@
 
 #include <gtest/gtest.h>
 #include <random>
+#include <vector>
 #include "kernels/KernelFactory.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorSlice.h"
@@ -47,12 +48,19 @@ namespace
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
     {
-        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
-        if (!prepared)
+        static std::vector<std::pair<const TensorBase *, std::shared_ptr<KernelFactory::PreparedGemmHandle>>> handles;
+        for (auto &[key, handle] : handles)
         {
-            return nullptr;
+            if (key == tensor && handle->device_id == device_id)
+                return KernelFactory::getOrCreateGemmEngine(handle.get());
         }
-        return KernelFactory::getOrCreateGemmEngine(prepared);
+
+        auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, device_id);
+        if (!prepared)
+            return nullptr;
+        auto *kernel = KernelFactory::getOrCreateGemmEngine(prepared.get());
+        handles.emplace_back(tensor, std::move(prepared));
+        return kernel;
     }
 } // namespace
 

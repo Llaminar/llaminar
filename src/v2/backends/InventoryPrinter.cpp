@@ -98,7 +98,7 @@ namespace llaminar2
             while (std::getline(stream, line))
             {
                 if (!line.empty())
-                    LOG_INFO(line);
+                    LOG_DEBUG(line);
             }
         }
 

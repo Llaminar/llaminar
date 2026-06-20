@@ -25,6 +25,7 @@
 #include <random>
 #include <cmath>
 #include <numeric>
+#include <cstdint>
 #include "kernels/cuda/kvcache/CUDARingKVCacheTQ.h"
 #include "kernels/cpu/turboquant/TurboQuantContext.h"
 #include "tensors/Tensors.h"
@@ -42,6 +43,48 @@ namespace
         int count = 0;
         cudaError_t err = cudaGetDeviceCount(&count);
         return (err == cudaSuccess && count > 0);
+    }
+
+    /**
+     * @brief Owns a non-default CUDA stream for tests that must exercise the explicit-stream cache path.
+     *
+     * TQ GPU cache appends reject the legacy no-stream API by design. Keeping a single stream alive for
+     * each test mirrors the graph/stage path and lets append, read, and clear operations synchronize in a
+     * predictable order.
+     */
+    class ScopedCudaStream
+    {
+    public:
+        ScopedCudaStream()
+        {
+            EXPECT_EQ(cudaStreamCreate(&stream_), cudaSuccess);
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream_)
+                cudaStreamDestroy(stream_);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream_); }
+        cudaStream_t stream() const { return stream_; }
+
+        void synchronize() const
+        {
+            ASSERT_NE(stream_, nullptr);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
+
+    /// @brief Append through the required explicit-stream API.
+    bool appendWithTestStream(CUDARingKVCacheTQ &cache, int layer, int seq_idx,
+                              const ITensor *K, const ITensor *V, int num_tokens,
+                              const ScopedCudaStream &stream)
+    {
+        return cache.appendWithStream(layer, seq_idx, K, V, num_tokens, stream.opaque());
     }
 
     std::vector<float> generateRandomFP32(size_t count, unsigned seed = 42)
@@ -111,11 +154,36 @@ namespace
 
     // Helper: create FP32Tensor from host data (for IKVCache::append(ITensor*))
     std::unique_ptr<FP32Tensor> createFP32Tensor(const std::vector<float> &data,
-                                                   size_t rows, size_t cols)
+                                                 size_t rows, size_t cols)
     {
         auto tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{rows, cols});
         std::memcpy(tensor->mutable_data(), data.data(), data.size() * sizeof(float));
         return tensor;
+    }
+
+    /**
+     * @brief Verify an empty converted read cannot leave stale K/V output pointers behind.
+     *
+     * The long-context handover points at survivor KV rows after request reset. This helper makes the
+     * no-survivor contract concrete: after clear operations, callers get kv_len=0 and null converted
+     * tensors even if they pass pre-filled output slots.
+     */
+    void expectConvertedEmpty(CUDARingKVCacheTQ &cache, int layer, int seq_idx)
+    {
+        ITensor *out_k = reinterpret_cast<ITensor *>(static_cast<uintptr_t>(0x1));
+        ITensor *out_v = reinterpret_cast<ITensor *>(static_cast<uintptr_t>(0x1));
+        int kv_len = -1;
+
+        ASSERT_TRUE(cache.get_kv_converted(layer, seq_idx, ActivationPrecision::FP16,
+                                           &out_k, &out_v, &kv_len, nullptr));
+        EXPECT_EQ(kv_len, 0);
+        EXPECT_EQ(out_k, nullptr);
+        EXPECT_EQ(out_v, nullptr);
+
+        const ITensor *raw_k = cache.get_k(layer, seq_idx);
+        ASSERT_NE(raw_k, nullptr);
+        ASSERT_FALSE(raw_k->shape().empty());
+        EXPECT_EQ(raw_k->shape()[0], 0u);
     }
 
 } // namespace
@@ -138,7 +206,8 @@ TEST(Test__CUDARingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, batch_size, max_seq_len,
-                             n_kv_heads, head_dim, &tq_ctx, 0);
+                            n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     EXPECT_EQ(cache.n_layers(), n_layers);
     EXPECT_EQ(cache.max_seq_len(), max_seq_len);
@@ -161,7 +230,8 @@ TEST(Test__CUDARingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
     auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
 
-    ASSERT_TRUE(cache.append(0, 0, k_view.get(), v_view.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_view.get(), v_view.get(), num_tokens, stream));
+    stream.synchronize();
     EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
 
     // Retrieve via get_k/get_v (returns FP16 shadow buffers)
@@ -202,7 +272,7 @@ TEST(Test__CUDARingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
     EXPECT_GT(min_cos_v, 0.78f) << "TQ4 V minimum cosine too low";
 
     LOG_INFO("[Test] Split TQ roundtrip: K cos=" << avg_cos_k << "/" << min_cos_k
-             << ", V cos=" << avg_cos_v << "/" << min_cos_v);
+                                                 << ", V cos=" << avg_cos_v << "/" << min_cos_v);
 
     cudaFree(d_K);
     cudaFree(d_V);
@@ -224,6 +294,7 @@ TEST(Test__CUDARingKVCacheTQ, WrapAround_PreservesNewest)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     // Append 12 tokens (overwrites first 4)
     const int num_tokens = 12;
@@ -236,13 +307,14 @@ TEST(Test__CUDARingKVCacheTQ, WrapAround_PreservesNewest)
 
     auto k1 = std::make_unique<GpuTensorView>(d_K, 8, kv_dim, TensorType::FP32, 0);
     auto v1 = std::make_unique<GpuTensorView>(d_V, 8, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, k1.get(), v1.get(), 8));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k1.get(), v1.get(), 8, stream));
 
     auto k2 = std::make_unique<GpuTensorView>(
         d_K + 8 * kv_dim, 4, kv_dim, TensorType::FP32, 0);
     auto v2 = std::make_unique<GpuTensorView>(
         d_V + 8 * kv_dim, 4, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, k2.get(), v2.get(), 4));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k2.get(), v2.get(), 4, stream));
+    stream.synchronize();
 
     // Should have max_seq_len tokens (wrapped)
     EXPECT_EQ(cache.get_cached_tokens(0, 0), max_seq_len);
@@ -272,6 +344,7 @@ TEST(Test__CUDARingKVCacheTQ, IncrementalAppend_DecodeLike)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     // Simulate decode: append one token at a time
     std::mt19937 rng(777);
@@ -293,7 +366,8 @@ TEST(Test__CUDARingKVCacheTQ, IncrementalAppend_DecodeLike)
         auto kv = std::make_unique<GpuTensorView>(d_K, 1, kv_dim, TensorType::FP32, 0);
         auto vv = std::make_unique<GpuTensorView>(d_V, 1, kv_dim, TensorType::FP32, 0);
 
-        ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), 1));
+        ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), 1, stream));
+        stream.synchronize();
         EXPECT_EQ(cache.get_cached_tokens(0, 0), step + 1);
 
         cudaFree(d_K);
@@ -336,6 +410,7 @@ TEST(Test__CUDARingKVCacheTQ, MultiLayer_IndependentData)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     // Append different data to each layer
     for (int layer = 0; layer < n_layers; ++layer)
@@ -348,7 +423,8 @@ TEST(Test__CUDARingKVCacheTQ, MultiLayer_IndependentData)
         auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
         auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
 
-        ASSERT_TRUE(cache.append(layer, 0, kv.get(), vv.get(), num_tokens));
+        ASSERT_TRUE(appendWithTestStream(cache, layer, 0, kv.get(), vv.get(), num_tokens, stream));
+        stream.synchronize();
         EXPECT_EQ(cache.get_cached_tokens(layer, 0), num_tokens);
 
         cudaFree(d_K);
@@ -373,7 +449,7 @@ TEST(Test__CUDARingKVCacheTQ, MultiLayer_IndependentData)
             float cos = computeCosineSimilarity(
                 layer_results[i].data(), layer_results[j].data(), num_tokens * kv_dim);
             EXPECT_LT(cos, 0.5f) << "Layers " << i << " and " << j
-                                  << " too similar (cos=" << cos << ")";
+                                 << " too similar (cos=" << cos << ")";
         }
     }
 }
@@ -395,6 +471,7 @@ TEST(Test__CUDARingKVCacheTQ, Clear_ResetsAllLayers)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(n_layers, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     // Fill some data
     auto h_K = generateRandomFP32(5 * kv_dim, 100);
@@ -406,7 +483,8 @@ TEST(Test__CUDARingKVCacheTQ, Clear_ResetsAllLayers)
     auto vv = std::make_unique<GpuTensorView>(d_V, 5, kv_dim, TensorType::FP32, 0);
 
     for (int l = 0; l < n_layers; ++l)
-        ASSERT_TRUE(cache.append(l, 0, kv.get(), vv.get(), 5));
+        ASSERT_TRUE(appendWithTestStream(cache, l, 0, kv.get(), vv.get(), 5, stream));
+    stream.synchronize();
 
     // Clear single sequence
     cache.clear_sequence(0, 0);
@@ -420,6 +498,158 @@ TEST(Test__CUDARingKVCacheTQ, Clear_ResetsAllLayers)
 
     cudaFree(d_K);
     cudaFree(d_V);
+}
+
+TEST(Test__CUDARingKVCacheTQ, AppendRequiresExplicitNonNullStream)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 3;
+
+    TurboQuantContext tq_ctx(head_dim, 42);
+    CUDARingKVCacheTQ cache(1, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
+
+    auto h_K = generateRandomFP32(num_tokens * kv_dim, 700);
+    auto h_V = generateRandomFP32(num_tokens * kv_dim, 701);
+    float *d_K = uploadToGPU(h_K);
+    float *d_V = uploadToGPU(h_V);
+    auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
+    auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+
+    EXPECT_FALSE(cache.append(0, 0, k_view.get(), v_view.get(), num_tokens));
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
+    EXPECT_FALSE(cache.appendWithStream(0, 0, k_view.get(), v_view.get(), num_tokens, nullptr));
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), 0);
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_view.get(), v_view.get(), num_tokens, stream));
+    stream.synchronize();
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
+
+    cudaFree(d_K);
+    cudaFree(d_V);
+}
+
+TEST(Test__CUDARingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    const int n_layers = 2;
+    const int batch_size = 2;
+    const int num_tokens = 4;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    TurboQuantContext tq_ctx(head_dim, 42);
+    CUDARingKVCacheTQ cache(n_layers, batch_size, 16, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
+
+    auto append_seeded = [&](int layer, int seq_idx, unsigned seed)
+    {
+        auto h_K = generateRandomFP32(num_tokens * kv_dim, seed);
+        auto h_V = generateRandomFP32(num_tokens * kv_dim, seed + 1000);
+        float *d_K = uploadToGPU(h_K);
+        float *d_V = uploadToGPU(h_V);
+        auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
+        auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+        ASSERT_TRUE(appendWithTestStream(cache, layer, seq_idx, k_view.get(), v_view.get(), num_tokens, stream));
+        stream.synchronize();
+        cudaFree(d_K);
+        cudaFree(d_V);
+    };
+
+    append_seeded(0, 0, 10);
+    append_seeded(0, 1, 20);
+    append_seeded(1, 0, 30);
+    append_seeded(1, 1, 40);
+
+    ITensor *out_k = nullptr;
+    ITensor *out_v = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache.get_kv_converted(0, 1, ActivationPrecision::FP16,
+                                       &out_k, &out_v, &kv_len, nullptr));
+    ASSERT_EQ(kv_len, num_tokens);
+    ASSERT_NE(out_k, nullptr);
+
+    cache.clear_sequence(0, 1);
+    expectConvertedEmpty(cache, 0, 1);
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
+    EXPECT_EQ(cache.get_cached_tokens(1, 0), num_tokens);
+    EXPECT_EQ(cache.get_cached_tokens(1, 1), num_tokens);
+
+    cache.clear_layer(1);
+    expectConvertedEmpty(cache, 1, 0);
+    expectConvertedEmpty(cache, 1, 1);
+    EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
+
+    cache.clear();
+    expectConvertedEmpty(cache, 0, 0);
+    expectConvertedEmpty(cache, 0, 1);
+}
+
+TEST(Test__CUDARingKVCacheTQ, ClearThenReappendConvertedScratchUsesNewRows)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    const int num_tokens = 6;
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const int kv_dim = n_kv_heads * head_dim;
+
+    TurboQuantContext tq_ctx(head_dim, 42);
+    CUDARingKVCacheTQ cache(1, 1, 16, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
+
+    auto append_host = [&](const std::vector<float> &h_K, const std::vector<float> &h_V)
+    {
+        float *d_K = uploadToGPU(h_K);
+        float *d_V = uploadToGPU(h_V);
+        auto k_view = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
+        auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
+        ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_view.get(), v_view.get(), num_tokens, stream));
+        stream.synchronize();
+        cudaFree(d_K);
+        cudaFree(d_V);
+    };
+
+    auto h_K_a = generateRandomFP32(num_tokens * kv_dim, 900);
+    auto h_V_a = generateRandomFP32(num_tokens * kv_dim, 901);
+    auto h_K_b = generateRandomFP32(num_tokens * kv_dim, 1900);
+    auto h_V_b = generateRandomFP32(num_tokens * kv_dim, 1901);
+
+    append_host(h_K_a, h_V_a);
+
+    ITensor *out_k_a = nullptr;
+    ITensor *out_v_a = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
+                                       &out_k_a, &out_v_a, &kv_len, nullptr));
+    ASSERT_EQ(kv_len, num_tokens);
+    auto k_a = downloadFP16ToFP32(out_k_a->gpu_data_ptr(), num_tokens * kv_dim);
+
+    cache.clear();
+    expectConvertedEmpty(cache, 0, 0);
+
+    append_host(h_K_b, h_V_b);
+    ITensor *out_k_b = nullptr;
+    ITensor *out_v_b = nullptr;
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
+                                       &out_k_b, &out_v_b, &kv_len, nullptr));
+    ASSERT_EQ(kv_len, num_tokens);
+    auto k_b = downloadFP16ToFP32(out_k_b->gpu_data_ptr(), num_tokens * kv_dim);
+    auto v_b = downloadFP16ToFP32(out_v_b->gpu_data_ptr(), num_tokens * kv_dim);
+
+    EXPECT_GT(computeCosineSimilarity(h_K_b.data(), k_b.data(), h_K_b.size()), 0.94f);
+    EXPECT_GT(computeCosineSimilarity(h_V_b.data(), v_b.data(), h_V_b.size()), 0.78f);
+    EXPECT_LT(computeCosineSimilarity(k_a.data(), k_b.data(), k_b.size()), 0.5f)
+        << "Converted scratch after clear/reappend still resembles the old request";
 }
 
 // =============================================================================
@@ -439,6 +669,7 @@ TEST(Test__CUDARingKVCacheTQ, QuantizationError_WithinBounds)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 314);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 271);
@@ -447,7 +678,8 @@ TEST(Test__CUDARingKVCacheTQ, QuantizationError_WithinBounds)
 
     auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
+    stream.synchronize();
 
     const ITensor *out_k = cache.get_k(0, 0);
     const ITensor *out_v = cache.get_v(0, 0);
@@ -483,12 +715,14 @@ TEST(Test__CUDARingKVCacheTQ, KQuality_StrictlyBetterThan_V)
 
     TurboQuantContext tq_ctx_7(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 64, n_kv_heads, head_dim, &tq_ctx_7, 0);
+    ScopedCudaStream stream;
 
     auto h_data = generateRandomFP32(num_tokens * kv_dim, 999);
     float *d_data = uploadToGPU(h_data);
 
     auto view = std::make_unique<GpuTensorView>(d_data, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, view.get(), view.get(), num_tokens)); // Same data for K and V
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, view.get(), view.get(), num_tokens, stream)); // Same data for K and V
+    stream.synchronize();
 
     const ITensor *out_k = cache.get_k(0, 0);
     const ITensor *out_v = cache.get_v(0, 0);
@@ -520,6 +754,7 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_WithRoPE)
 
     TurboQuantContext tq_ctx_8(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_8, 0);
+    ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 123);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 456);
@@ -528,14 +763,15 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_WithRoPE)
 
     auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
+    stream.synchronize();
 
     // Get without RoPE
     ITensor *out_k_noRoPE = nullptr;
     ITensor *out_v_noRoPE = nullptr;
     int kv_len = 0;
     ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                        &out_k_noRoPE, &out_v_noRoPE, &kv_len, nullptr));
+                                       &out_k_noRoPE, &out_v_noRoPE, &kv_len, nullptr));
     EXPECT_EQ(kv_len, num_tokens);
 
     auto result_noRoPE = downloadFP16ToFP32(out_k_noRoPE->gpu_data_ptr(), num_tokens * kv_dim);
@@ -550,7 +786,7 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_WithRoPE)
     ITensor *out_k_rope = nullptr;
     ITensor *out_v_rope = nullptr;
     ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                        &out_k_rope, &out_v_rope, &kv_len, &rope_params));
+                                       &out_k_rope, &out_v_rope, &kv_len, &rope_params));
     EXPECT_EQ(kv_len, num_tokens);
 
     auto result_withRoPE = downloadFP16ToFP32(out_k_rope->gpu_data_ptr(), num_tokens * kv_dim);
@@ -589,6 +825,7 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_DequantOnly)
 
     TurboQuantContext tq_ctx_9(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_9, 0);
+    ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 555);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 666);
@@ -597,13 +834,14 @@ TEST(Test__CUDARingKVCacheTQ, GetKVConverted_DequantOnly)
 
     auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
+    stream.synchronize();
 
     ITensor *out_k = nullptr;
     ITensor *out_v = nullptr;
     int kv_len = 0;
     ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                        &out_k, &out_v, &kv_len, nullptr));
+                                       &out_k, &out_v, &kv_len, nullptr));
     EXPECT_EQ(kv_len, num_tokens);
 
     auto result_K = downloadFP16ToFP32(out_k->gpu_data_ptr(), num_tokens * kv_dim);
@@ -636,6 +874,7 @@ TEST(Test__CUDARingKVCacheTQ, Eviction_ReducesCount)
 
     TurboQuantContext tq_ctx_10(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, max_seq_len, n_kv_heads, head_dim, &tq_ctx_10, 0);
+    ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 111);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 222);
@@ -644,7 +883,8 @@ TEST(Test__CUDARingKVCacheTQ, Eviction_ReducesCount)
 
     auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
+    stream.synchronize();
 
     EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
 
@@ -675,6 +915,7 @@ TEST(Test__CUDARingKVCacheTQ, ShadowInvalidation_AfterAppend)
 
     TurboQuantContext tq_ctx_11(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_11, 0);
+    ScopedCudaStream stream;
 
     // Append batch 1
     auto h_K1 = generateRandomFP32(5 * kv_dim, 100);
@@ -684,7 +925,8 @@ TEST(Test__CUDARingKVCacheTQ, ShadowInvalidation_AfterAppend)
 
     auto kv1 = std::make_unique<GpuTensorView>(d_K1, 5, kv_dim, TensorType::FP32, 0);
     auto vv1 = std::make_unique<GpuTensorView>(d_V1, 5, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv1.get(), vv1.get(), 5));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv1.get(), vv1.get(), 5, stream));
+    stream.synchronize();
 
     // Force shadow creation
     const ITensor *k1 = cache.get_k(0, 0);
@@ -699,7 +941,8 @@ TEST(Test__CUDARingKVCacheTQ, ShadowInvalidation_AfterAppend)
 
     auto kv2 = std::make_unique<GpuTensorView>(d_K2, 3, kv_dim, TensorType::FP32, 0);
     auto vv2 = std::make_unique<GpuTensorView>(d_V2, 3, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv2.get(), vv2.get(), 3));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv2.get(), vv2.get(), 3, stream));
+    stream.synchronize();
 
     // Shadow should be regenerated with new count
     const ITensor *k2 = cache.get_k(0, 0);
@@ -728,6 +971,7 @@ TEST(Test__CUDARingKVCacheTQ, HeadDim128_BasicRoundtrip)
 
     TurboQuantContext tq_ctx_12(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_12, 0);
+    ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 777);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 888);
@@ -736,7 +980,8 @@ TEST(Test__CUDARingKVCacheTQ, HeadDim128_BasicRoundtrip)
 
     auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
+    stream.synchronize();
 
     const ITensor *out_k = cache.get_k(0, 0);
     ASSERT_NE(out_k, nullptr);
@@ -775,6 +1020,7 @@ TEST(Test__CUDARingKVCacheTQ, RoPE_PositionCorrectness)
 
     TurboQuantContext tq_ctx_13(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_13, 0);
+    ScopedCudaStream stream;
 
     // Use simple predictable data
     std::vector<float> h_K(num_tokens * kv_dim, 1.0f);
@@ -785,7 +1031,8 @@ TEST(Test__CUDARingKVCacheTQ, RoPE_PositionCorrectness)
 
     auto kv = std::make_unique<GpuTensorView>(d_K, num_tokens, kv_dim, TensorType::FP32, 0);
     auto vv = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
-    ASSERT_TRUE(cache.append(0, 0, kv.get(), vv.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, kv.get(), vv.get(), num_tokens, stream));
+    stream.synchronize();
 
     // Get with two different position starts
     IKVCache::KVReadParams rope_params;
@@ -798,7 +1045,7 @@ TEST(Test__CUDARingKVCacheTQ, RoPE_PositionCorrectness)
     ITensor *out_v_pos0 = nullptr;
     int kv_len = 0;
     ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                        &out_k_pos0, &out_v_pos0, &kv_len, &rope_params));
+                                       &out_k_pos0, &out_v_pos0, &kv_len, &rope_params));
 
     auto result_pos0 = downloadFP16ToFP32(out_k_pos0->gpu_data_ptr(), num_tokens * kv_dim);
 
@@ -806,7 +1053,7 @@ TEST(Test__CUDARingKVCacheTQ, RoPE_PositionCorrectness)
     ITensor *out_k_pos10 = nullptr;
     ITensor *out_v_pos10 = nullptr;
     ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP16,
-                                        &out_k_pos10, &out_v_pos10, &kv_len, &rope_params));
+                                       &out_k_pos10, &out_v_pos10, &kv_len, &rope_params));
 
     auto result_pos10 = downloadFP16ToFP32(out_k_pos10->gpu_data_ptr(), num_tokens * kv_dim);
 
@@ -836,6 +1083,7 @@ TEST(Test__CUDARingKVCacheTQ, HostSideAppend_ViaCPUTensor)
 
     TurboQuantContext tq_ctx_14(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 32, n_kv_heads, head_dim, &tq_ctx_14, 0);
+    ScopedCudaStream stream;
 
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 111);
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 222);
@@ -843,7 +1091,8 @@ TEST(Test__CUDARingKVCacheTQ, HostSideAppend_ViaCPUTensor)
     auto k_tensor = createFP32Tensor(h_K, num_tokens, kv_dim);
     auto v_tensor = createFP32Tensor(h_V, num_tokens, kv_dim);
 
-    ASSERT_TRUE(cache.append(0, 0, k_tensor.get(), v_tensor.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_tensor.get(), v_tensor.get(), num_tokens, stream));
+    stream.synchronize();
     EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
 
     const ITensor *out_k = cache.get_k(0, 0);
@@ -876,6 +1125,7 @@ TEST(Test__CUDARingKVCacheTQ, CrossPath_CPUQuantize_GPUDequant)
 
     TurboQuantContext tq_ctx(head_dim, 42);
     CUDARingKVCacheTQ cache(1, 1, 64, n_kv_heads, head_dim, &tq_ctx, 0);
+    ScopedCudaStream stream;
 
     // Generate random FP32 data
     auto h_K = generateRandomFP32(num_tokens * kv_dim, 777);
@@ -895,7 +1145,8 @@ TEST(Test__CUDARingKVCacheTQ, CrossPath_CPUQuantize_GPUDequant)
     k_tq8->dequantize_to_fp32(k_cpu_deq.data(), layer_ctx);
 
     // --- GPU path: append TQ8/TQ4 blocks (fast path) ---
-    ASSERT_TRUE(cache.append(0, 0, k_tq8.get(), v_tq4.get(), num_tokens));
+    ASSERT_TRUE(appendWithTestStream(cache, 0, 0, k_tq8.get(), v_tq4.get(), num_tokens, stream));
+    stream.synchronize();
     EXPECT_EQ(cache.get_cached_tokens(0, 0), num_tokens);
 
     // --- GPU dequant via get_k ---
@@ -924,9 +1175,9 @@ TEST(Test__CUDARingKVCacheTQ, CrossPath_CPUQuantize_GPUDequant)
         float cos_xp = computeCosineSimilarity(
             k_cpu_deq.data() + t * kv_dim, k_gpu_deq.data() + t * kv_dim, kv_dim);
         LOG_INFO("[CrossPath] token=" << t
-                 << " orig_vs_cpu=" << cos_cpu
-                 << " orig_vs_gpu=" << cos_gpu
-                 << " cpu_vs_gpu=" << cos_xp);
+                                      << " orig_vs_cpu=" << cos_cpu
+                                      << " orig_vs_gpu=" << cos_gpu
+                                      << " cpu_vs_gpu=" << cos_xp);
     }
 
     // Print first few values for manual comparison

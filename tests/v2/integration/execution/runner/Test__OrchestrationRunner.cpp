@@ -14,10 +14,13 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <mpi.h>
+#include <csignal>
 
 #include "execution/runner/IOrchestrationRunner.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "execution/runner/OrchestrationRunner.h"
+#include "execution/runner/NamedDomainGlobalRunner.h"
 #include "config/OrchestrationConfig.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -526,4 +529,99 @@ namespace
         EXPECT_EQ(returned_config.tp_devices[1].device_type, DeviceType::CUDA);
     }
 
+    // =========================================================================
+    // Phase 5: NamedDomainGlobalRunner factory dispatch
+    // =========================================================================
+
+    TEST_F(Test__OrchestrationRunner, NamedDomainGlobalConfig_CreatesNamedDomainGlobalRunner)
+    {
+        // A config with named domains having scope=node_local should cause the
+        // factory to return a NamedDomainGlobalRunner rather than OrchestrationRunner.
+        OrchestrationConfig cfg;
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "rocm_domain=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+        cfg.domain_definitions.push_back(DomainDefinition::parse(
+            "cpu_domain=0:cpu:0,1:cpu:0;scope=node_local;ranks=0,1"));
+        cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("0=rocm_domain:0-13"));
+        cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("1=cpu_domain:14-27"));
+
+        // Verify shouldUse() predicate matches
+        EXPECT_TRUE(NamedDomainGlobalRunner::shouldUse(cfg));
+
+        auto runner = factory_->createFromOrchestrationConfig(cfg);
+        ASSERT_NE(runner, nullptr);
+
+        // Should be a NamedDomainGlobalRunner, not OrchestrationRunner
+        auto *named_runner = dynamic_cast<NamedDomainGlobalRunner *>(runner.get());
+        auto *orch_runner = dynamic_cast<OrchestrationRunner *>(runner.get());
+        EXPECT_NE(named_runner, nullptr)
+            << "Expected NamedDomainGlobalRunner but got OrchestrationRunner or other type";
+        EXPECT_EQ(orch_runner, nullptr)
+            << "Should not be an OrchestrationRunner for cross-rank named domain config";
+    }
+
+    TEST_F(Test__OrchestrationRunner, SimpleSingleDeviceConfig_DoesNotCreateNamedDomainRunner)
+    {
+        // Simple single-device config must still go through OrchestrationRunner
+        OrchestrationConfig cfg;
+        cfg.device_for_this_rank = GlobalDeviceAddress::cpu();
+
+        EXPECT_FALSE(NamedDomainGlobalRunner::shouldUse(cfg));
+
+        auto runner = factory_->createFromOrchestrationConfig(cfg);
+        ASSERT_NE(runner, nullptr);
+
+        auto *named_runner = dynamic_cast<NamedDomainGlobalRunner *>(runner.get());
+        EXPECT_EQ(named_runner, nullptr)
+            << "Simple single-device config should use OrchestrationRunner, not NamedDomainGlobalRunner";
+    }
+
 } // anonymous namespace
+
+#include <csignal>
+
+static volatile sig_atomic_t g_any_assertion_failed = 0;
+
+static void cleanup_crash_handler(int sig)
+{
+    if (!g_any_assertion_failed)
+        _exit(0);
+    struct sigaction sa = {};
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
+static void install_crash_handlers()
+{
+    struct sigaction sa = {};
+    sa.sa_handler = cleanup_crash_handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr);
+}
+
+class AssertionTracker : public ::testing::EmptyTestEventListener
+{
+    void OnTestPartResult(const ::testing::TestPartResult &result) override
+    {
+        if (result.failed())
+            g_any_assertion_failed = 1;
+    }
+};
+
+int main(int argc, char **argv)
+{
+    install_crash_handlers();
+
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+
+    ::testing::InitGoogleTest(&argc, argv);
+    ::testing::UnitTest::GetInstance()->listeners().Append(new AssertionTracker);
+    int result = RUN_ALL_TESTS();
+
+    MPI_Finalize();
+    _exit(result);
+}

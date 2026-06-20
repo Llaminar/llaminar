@@ -10,7 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -37,7 +37,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_GlobalStages)
 
 TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_AttentionStages)
 {
-    // Layer 0 attention stages - using actual graph stage names from Qwen2Graph.cpp
+    // Layer 0 attention stages - using actual graph stage names from QwenStandardGraph.cpp
     EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_attn_norm"),
               "layer0_ATTENTION_NORM");
     EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_q_proj"),
@@ -62,7 +62,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_AttentionStages
 
 TEST(Test__DeviceGraphOrchestratorSnapshots, StageNameConversion_FFNStages)
 {
-    // Layer 0 FFN stages - using actual graph stage names from Qwen2Graph.cpp
+    // Layer 0 FFN stages - using actual graph stage names from QwenStandardGraph.cpp
     EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_norm"),
               "layer0_FFN_NORM");
     EXPECT_EQ(DeviceGraphOrchestrator::convertStageNameToSnapshotKey("layer0_ffn_gate"),
@@ -116,7 +116,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_InitiallyDisabled)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr));
+    DeviceGraphOrchestrator orchestrator(std::make_shared<QwenStandardGraph>(config, nullptr));
 
     // Should be disabled by default
     EXPECT_FALSE(orchestrator.isSnapshotCaptureEnabled());
@@ -134,7 +134,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, SnapshotState_EnableDisable)
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr));
+    DeviceGraphOrchestrator orchestrator(std::make_shared<QwenStandardGraph>(config, nullptr));
 
     // Enable
     orchestrator.enableSnapshotCapture();
@@ -156,7 +156,7 @@ TEST(Test__DeviceGraphOrchestratorSnapshots, GetSnapshot_ReturnsNullForMissingKe
     config.vocab_size = 151936;
     config.max_seq_len = 2048;
 
-    DeviceGraphOrchestrator orchestrator(std::make_shared<Qwen2Graph>(config, nullptr));
+    DeviceGraphOrchestrator orchestrator(std::make_shared<QwenStandardGraph>(config, nullptr));
     orchestrator.enableSnapshotCapture();
 
     size_t size = 0;

@@ -74,7 +74,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[ReceiveActivationsStage] " << name_ << ": receiving " << count
+            LOG_DEBUG("[ReceiveActivationsStage] " << name_ << ": receiving " << count
                                                   << " floats (" << bytes << " bytes) from rank "
                                                   << (params_.src_rank < 0 ? "ANY" : std::to_string(params_.src_rank))
                                                   << " tag=" << params_.tag << " async=" << params_.async);
@@ -90,7 +90,7 @@ namespace llaminar2
 
             if (mpi_env.log_collectives)
             {
-                LOG_INFO("[ReceiveActivationsStage] " << name_ << ": irecv initiated");
+                LOG_DEBUG("[ReceiveActivationsStage] " << name_ << ": irecv initiated");
             }
         }
         else
@@ -107,12 +107,12 @@ namespace llaminar2
             {
                 double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
                 double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
-                LOG_INFO("[ReceiveActivationsStage] " << name_ << ": recv completed in "
+                LOG_DEBUG("[ReceiveActivationsStage] " << name_ << ": recv completed in "
                                                       << ms << " ms (" << bandwidth_gbps << " GB/s)");
             }
             else if (mpi_env.log_collectives)
             {
-                LOG_INFO("[ReceiveActivationsStage] " << name_ << ": recv completed");
+                LOG_DEBUG("[ReceiveActivationsStage] " << name_ << ": recv completed");
             }
         }
 
@@ -146,7 +146,7 @@ namespace llaminar2
             const auto &mpi_env = debugEnv().mpi_logging;
             if (mpi_env.log_collectives)
             {
-                LOG_INFO("[ReceiveActivationsStage] " << name_ << ": async recv completed via wait()");
+                LOG_DEBUG("[ReceiveActivationsStage] " << name_ << ": async recv completed via wait()");
             }
         }
     }

@@ -4,8 +4,8 @@
  *
  * The native-VNNI GEMM system has multiple kernel variants selected by a
  * dispatch heuristic based on N, K, and M.  This test file exercises every
- * dispatch path for correctness by comparing GPU output against a CPU FP32
- * reference (dequantize weights → dense FP32 matmul).
+ * dispatch path for correctness by comparing GPU output against a hipBLAS
+ * FP32 SGEMM reference (dequantize weights → dense FP32 matmul via hipBLAS).
  *
  * Dispatch paths tested:
  *
@@ -54,6 +54,7 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include <hipblas/hipblas.h>
 #endif
 
 using namespace llaminar2;
@@ -104,23 +105,53 @@ namespace
         return (lhs.size() == rhs.size()) ? lhs.size() : count;
     }
 
-    /// CPU FP32 reference GEMM: C[i,j] = sum_k(A[i,k] * W[j,k])
+#ifdef HAVE_ROCM
+    /// hipBLAS FP32 reference GEMM: C[i,j] = sum_k(A[i,k] * W[j,k])
     /// A is [M x K] row-major, W is [N x K] row-major (weight layout)
-    void cpuFP32Gemm(const float *A, const float *W, float *C,
-                     int M, int N, int K)
+    /// Row-major C = A * W^T is computed via the column-major identity:
+    ///   C' = W'^T * A'  (where X' denotes the col-major view of row-major X)
+    bool hipblasFP32Gemm(const float *A_host, const float *W_host, float *C_host,
+                         int M, int N, int K)
     {
-        for (int i = 0; i < M; ++i)
-        {
-            for (int j = 0; j < N; ++j)
-            {
-                double acc = 0.0;
-                for (int k = 0; k < K; ++k)
-                    acc += static_cast<double>(A[i * K + k]) *
-                           static_cast<double>(W[j * K + k]);
-                C[i * N + j] = static_cast<float>(acc);
-            }
-        }
+        hipblasHandle_t handle;
+        if (hipblasCreate(&handle) != HIPBLAS_STATUS_SUCCESS)
+            return false;
+
+        const size_t size_A = static_cast<size_t>(M) * K * sizeof(float);
+        const size_t size_W = static_cast<size_t>(N) * K * sizeof(float);
+        const size_t size_C = static_cast<size_t>(M) * N * sizeof(float);
+
+        float *d_A = nullptr, *d_W = nullptr, *d_C = nullptr;
+        hipMalloc(&d_A, size_A);
+        hipMalloc(&d_W, size_W);
+        hipMalloc(&d_C, size_C);
+
+        hipMemcpy(d_A, A_host, size_A, hipMemcpyHostToDevice);
+        hipMemcpy(d_W, W_host, size_W, hipMemcpyHostToDevice);
+
+        const float alpha = 1.0f, beta = 0.0f;
+        hipblasStatus_t status = hipblasSgemm(
+            handle,
+            HIPBLAS_OP_T,   // transpose W' (col-major view of row-major W[N,K])
+            HIPBLAS_OP_N,   // no transpose A' (col-major view of row-major A[M,K])
+            N, M, K,        // m=N, n=M, k=K
+            &alpha,
+            d_W, K,         // lda = K (W' is [K,N] col-major)
+            d_A, K,         // ldb = K (A' is [K,M] col-major)
+            &beta,
+            d_C, N          // ldc = N (C' is [N,M] col-major)
+        );
+
+        hipDeviceSynchronize();
+        hipMemcpy(C_host, d_C, size_C, hipMemcpyDeviceToHost);
+
+        (void)hipFree(d_A);
+        (void)hipFree(d_W);
+        (void)hipFree(d_C);
+        hipblasDestroy(handle);
+        return (status == HIPBLAS_STATUS_SUCCESS);
     }
+#endif
 
     // =============================================================================
     // Test parameter
@@ -223,6 +254,8 @@ namespace
             weights = TestTensorFactory::createQ4_0Random({sz.first, sz.second});
         else if (p.format == "IQ4_NL")
             weights = TestTensorFactory::createIQ4_NLRandom({sz.first, sz.second});
+        else if (p.format == "IQ4_XS")
+            weights = TestTensorFactory::createIQ4_XSRandom({sz.first, sz.second});
         else if (p.format == "Q4_1")
             weights = TestTensorFactory::createQ4_1Random({sz.first, sz.second});
         else if (p.format == "Q5_0")
@@ -288,10 +321,11 @@ namespace
         // 6b. Mark output device-dirty so data() triggers D2H sync
         output_gpu->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
 
-        // 7. CPU reference (use host copy of input before device upload)
+        // 7. hipBLAS FP32 reference (fast GPU-based ground truth)
         const float *input_host = input->data(); // triggers D2H if needed
         std::vector<float> ref(static_cast<size_t>(p.M) * p.N);
-        cpuFP32Gemm(input_host, W_fp32.data(), ref.data(), p.M, p.N, p.K);
+        ASSERT_TRUE(hipblasFP32Gemm(input_host, W_fp32.data(), ref.data(), p.M, p.N, p.K))
+            << p.name << ": hipBLAS reference GEMM failed";
 
         // 8. Compare — per-row cosine + overall
         const float *gpu = output_gpu->data();
@@ -580,6 +614,10 @@ namespace
         {"IQ4NL_N64M32x2_Attn05_M128", "IQ4_NL", 896, 896, 128, "N64_M32_2wave", 0.990f},
         {"IQ4NL_N64M32x2_FFNDn7B_M128", "IQ4_NL", 3584, 18944, 128, "N64_M32_2wave", 0.990f},
 
+        // --- IQ4_XS (Qwen3.6 MoE routed down-proj format) ---
+        {"IQ4XS_N64M32x2_Attn05_M128", "IQ4_XS", 896, 896, 128, "N64_M32_2wave", 0.985f},
+        {"IQ4XS_N64M32x2_FFNDn05_M128", "IQ4_XS", 896, 4864, 128, "N64_M32_2wave", 0.985f},
+
         // =====================================================================
         // PATH 7: N64 / M64 / 2-wave  (N <= K, M >= ~256 → m_tile=64)
         //   native_vnni_gemm_kernel, N_TILE=64, M_TILE=64, MIN_BLOCKS=2
@@ -593,6 +631,9 @@ namespace
 
         // --- IQ4_NL ---
         {"IQ4NL_N64M64x2_FFNDn7B_M256", "IQ4_NL", 3584, 18944, 256, "N64_M64_2wave", 0.990f},
+
+        // --- IQ4_XS (Qwen3.6 MoE routed down-proj format) ---
+        {"IQ4XS_N64M64x2_FFNDn05_M256", "IQ4_XS", 896, 4864, 256, "N64_M64_2wave", 0.985f},
 
         // =====================================================================
         // NEW FORMATS: representative coverage (streaming + cooperative paths)
@@ -608,6 +649,12 @@ namespace
         {"Q4_1_Stream_LM05B_M16", "Q4_1", LM_N, 896, 16, "Streaming", 0.990f},
         {"Q4_1_N128M16x3_FFNUp05_M16", "Q4_1", 4864, 896, 16, "N128_M16_3wave", 0.990f},
         {"Q4_1_N64M16x3_Attn05_M32", "Q4_1", 896, 896, 32, "N64_M16_3wave", 0.990f},
+
+        // --- IQ4_XS (Qwen3.6 MoE routed down-proj format) ---
+        {"IQ4XS_Qwen36MoEDown_M2", "IQ4_XS", 512, 256, 2, "Qwen36MoE_DownSmallM", 0.985f},
+        {"IQ4XS_Stream_LM05B_M16", "IQ4_XS", LM_N, 896, 16, "Streaming", 0.985f},
+        {"IQ4XS_N128M16x3_FFNUp05_M16", "IQ4_XS", 4864, 896, 16, "N128_M16_3wave", 0.985f},
+        {"IQ4XS_N64M16x3_Attn05_M32", "IQ4_XS", 896, 896, 32, "N64_M16_3wave", 0.985f},
 
         // --- Q5_0 (5-bit symmetric, Pattern S) ---
         {"Q5_0_Stream_LM05B_M16", "Q5_0", LM_N, 896, 16, "Streaming", 0.990f},
@@ -645,6 +692,7 @@ namespace
         {"IQ3XXS_N64M16x3_Attn05_M32", "IQ3_XXS", 896, 896, 32, "N64_M16_3wave", 0.980f},
 
         // --- IQ2_S (2-bit grid+signs, Pattern D) ---
+        {"IQ2_S_Qwen36MoEGateUp_M2", "IQ2_S", 256, 512, 2, "Qwen36MoE_GateUpSmallM", 0.960f},
         {"IQ2_S_Stream_LM05B_M16", "IQ2_S", LM_N, 896, 16, "Streaming", 0.960f},
         {"IQ2_S_N128M16x3_FFNUp05_M16", "IQ2_S", 4864, 896, 16, "N128_M16_3wave", 0.960f},
         {"IQ2_S_N64M16x3_Attn05_M32", "IQ2_S", 896, 896, 32, "N64_M16_3wave", 0.960f},

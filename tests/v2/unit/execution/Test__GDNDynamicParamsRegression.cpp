@@ -54,9 +54,6 @@ namespace
             d[i] = lo + range * (static_cast<float>(i % 97) / 97.0f);
         return t;
     }
-
-    CPUGatedDeltaNet g_cpu_gdn;
-    CPUShortConvolution g_cpu_conv;
 } // namespace
 
 // ============================================================================
@@ -65,6 +62,8 @@ namespace
 
 TEST(Test__GDNDynamicParams, GDNRecurrenceStage_HasDynamicParams)
 {
+    CPUGatedDeltaNet cpu_gdn;
+
     // Verify the stage reports it has dynamic params
     GDNRecurrenceStage::Params params;
     params.device_id = DeviceId::cpu();
@@ -76,7 +75,7 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_HasDynamicParams)
     // Need minimal valid state to construct (won't execute)
     std::vector<float> state(params.n_heads * params.d_k * params.d_v, 0.0f);
     params.recurrence_state = state.data();
-    params.kernel = &g_cpu_gdn;
+    params.kernel = &cpu_gdn;
 
     GDNRecurrenceStage stage(std::move(params));
 
@@ -86,6 +85,8 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_HasDynamicParams)
 
 TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ChangesSeqLen)
 {
+    CPUGatedDeltaNet cpu_gdn;
+
     // Build a stage with prefill seq_len, then update to decode seq_len
     const int n_heads = 4;
     const int d_k = 4;
@@ -102,7 +103,7 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ChangesSeqLe
     params.d_v = d_v;
     params.chunk_size = 64;
     params.use_qk_l2norm = true;
-    params.kernel = &g_cpu_gdn;
+    params.kernel = &cpu_gdn;
 
     std::vector<float> state(n_heads * d_k * d_v, 0.0f);
     params.recurrence_state = state.data();
@@ -139,6 +140,8 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ChangesSeqLe
 
 TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ExecutesDecodePath)
 {
+    CPUGatedDeltaNet cpu_gdn;
+
     // Full execution test: build stage with prefill seq_len=128, update to 1,
     // verify it calls recurrent_step (seq_len==1 path) successfully.
     const int n_heads = 2;
@@ -154,7 +157,7 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ExecutesDeco
     params.d_v = d_v;
     params.chunk_size = 64;
     params.use_qk_l2norm = true;
-    params.kernel = &g_cpu_gdn;
+    params.kernel = &cpu_gdn;
 
     std::vector<float> state(n_heads * d_k * d_v, 0.0f);
     params.recurrence_state = state.data();
@@ -207,15 +210,25 @@ TEST(Test__GDNDynamicParams, GDNRecurrenceStage_UpdateDynamicParams_ExecutesDeco
 
 TEST(Test__GDNDynamicParams, ShortConv1dStage_HasDynamicParams)
 {
+    CPUShortConvolution cpu_conv;
+
     ShortConv1dStage::Params params;
     params.device_id = DeviceId::cpu();
     params.seq_len = 512;
     params.channels = 32;
     params.kernel_size = 4;
-    params.kernel = &g_cpu_conv;
+    params.kernel = &cpu_conv;
 
     std::vector<float> conv_state(params.channels * (params.kernel_size - 1), 0.0f);
     params.conv_state = conv_state.data();
+    auto input = makeFP32({1, static_cast<size_t>(params.channels)}, 0.1f);
+    auto output = makeFP32({1, static_cast<size_t>(params.channels)});
+    auto weight = makeFP32({static_cast<size_t>(params.channels),
+                            static_cast<size_t>(params.kernel_size)},
+                           0.25f);
+    params.input = input.get();
+    params.output = output.get();
+    params.weight = weight.get();
 
     ShortConv1dStage stage(std::move(params));
 
@@ -225,6 +238,8 @@ TEST(Test__GDNDynamicParams, ShortConv1dStage_HasDynamicParams)
 
 TEST(Test__GDNDynamicParams, ShortConv1dStage_UpdateDynamicParams_ChangesSeqLen)
 {
+    CPUShortConvolution cpu_conv;
+
     const int channels = 16;
     const int kernel_size = 4;
     const int prefill_seq_len = 128;
@@ -235,7 +250,7 @@ TEST(Test__GDNDynamicParams, ShortConv1dStage_UpdateDynamicParams_ChangesSeqLen)
     params.seq_len = prefill_seq_len;
     params.channels = channels;
     params.kernel_size = kernel_size;
-    params.kernel = &g_cpu_conv;
+    params.kernel = &cpu_conv;
 
     std::vector<float> conv_state(channels * (kernel_size - 1), 0.0f);
     params.conv_state = conv_state.data();
@@ -260,6 +275,8 @@ TEST(Test__GDNDynamicParams, ShortConv1dStage_UpdateDynamicParams_ChangesSeqLen)
 
 TEST(Test__GDNDynamicParams, ShortConv1dStage_UpdateDynamicParams_ExecutesDecodePath)
 {
+    CPUShortConvolution cpu_conv;
+
     // Build stage with prefill seq_len, update to decode, execute successfully
     const int channels = 16;
     const int kernel_size = 4;
@@ -269,7 +286,7 @@ TEST(Test__GDNDynamicParams, ShortConv1dStage_UpdateDynamicParams_ExecutesDecode
     params.seq_len = 64; // <-- prefill value
     params.channels = channels;
     params.kernel_size = kernel_size;
-    params.kernel = &g_cpu_conv;
+    params.kernel = &cpu_conv;
 
     std::vector<float> conv_state(channels * (kernel_size - 1), 0.0f);
     params.conv_state = conv_state.data();

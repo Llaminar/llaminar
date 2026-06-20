@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/orchestrators/MTPSidecarStreamBinding.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
@@ -26,7 +27,12 @@
 #include "mocks/MockCollectiveContext.h"
 #include "mocks/MockComputeStage.h"
 #include "config/TPDomain.h"
+#include "utils/DebugEnv.h"
+#include <cstdlib>
 #include <future>
+#include <optional>
+#include <stdexcept>
+#include <vector>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -58,7 +64,10 @@ namespace
 
         void *createEvent() override { return reinterpret_cast<void *>(0xCAFEBABE); }
         void destroyEvent(void * /*event*/) override {}
-        void recordEvent(void * /*event*/, void * /*stream*/) override {}
+        void recordEvent(void * /*event*/, void *stream) override
+        {
+            recorded_event_streams_.push_back(stream);
+        }
         void waitEvent(void * /*event*/, void * /*stream*/) override {}
         void synchronizeEvent(void * /*event*/) override {}
         float eventElapsedTime(void * /*start*/, void * /*stop*/) override { return 0.0f; }
@@ -76,10 +85,72 @@ namespace
         std::unique_ptr<IGPUGraphCapture> createGraphCapture() override { return nullptr; }
         std::unique_ptr<IGPUGraphCapture> createGraphCapture(void * /*stream*/) override { return nullptr; }
 
+        const std::vector<void *> &recordedEventStreams() const { return recorded_event_streams_; }
+
     private:
         int device_ordinal_ = -1;
         void *default_stream_ = nullptr;
         void *collective_comm_ = nullptr;
+        std::vector<void *> recorded_event_streams_;
+    };
+
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *old = std::getenv(name))
+                old_value_ = old;
+            if (value)
+                ::setenv(name, value, 1);
+            else
+                ::unsetenv(name);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_)
+                ::setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
+    };
+
+    class DynamicParamStreamGuardStage final : public llaminar2::testing::MockComputeStage
+    {
+    public:
+        DynamicParamStreamGuardStage(std::string name, DeviceId device)
+            : MockComputeStage(ComputeStageType::ATTENTION, std::move(name), device) {}
+
+        bool hasDynamicParams() const override { return true; }
+
+        void updateDynamicParams(int pos_offset, int seq_len) override
+        {
+            ++update_count_;
+            last_pos_offset_ = pos_offset;
+            last_seq_len_ = seq_len;
+            if (!gpuStream())
+                throw std::runtime_error("dynamic-param update requires an explicit stream");
+        }
+
+        int updateCount() const { return update_count_; }
+        int lastPosOffset() const { return last_pos_offset_; }
+        int lastSeqLen() const { return last_seq_len_; }
+
+    private:
+        int update_count_ = 0;
+        int last_pos_offset_ = -1;
+        int last_seq_len_ = -1;
     };
 } // namespace
 
@@ -673,6 +744,34 @@ TEST_F(Test__GraphExecutorStreamBinding, NullStageStream_BindsToNodeDeviceDefaul
     EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
 }
 
+TEST_F(Test__GraphExecutorStreamBinding, NullWorkerStreamForGPUStage_FailsInsteadOfUsingDefaultDeviceStream)
+{
+    GPUDeviceContextPool::instance().shutdown();
+    GPUDeviceContextPool::instance().registerNvidiaFactory(
+        [](int ordinal)
+        {
+            return std::make_unique<MockWorkerGPUContext>(ordinal, nullptr);
+        },
+        1);
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "null_worker_stream_stage",
+        DeviceId::cuda(0));
+    auto *stage_raw = stage.get();
+
+    ComputeGraph graph;
+    graph.addNode("null_worker_stream_stage", std::move(stage), DeviceId::cuda(0));
+
+    EXPECT_FALSE(executor.execute(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), nullptr);
+}
+
 TEST_F(Test__GraphExecutorStreamBinding, PreBoundStageStream_IsNotOverwritten)
 {
     GraphExecutorConfig config;
@@ -738,4 +837,152 @@ TEST_F(Test__GraphExecutorStreamBinding, CudaContextUsedWhenNodeAndStageDevicesA
 
     ASSERT_TRUE(executor.execute(graph, &ctx));
     EXPECT_EQ(stage_raw->gpuStream(), cuda_default_stream_);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, TimelineEventsUsePreBoundStageStream)
+{
+    ScopedEnv timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+
+    GraphExecutorConfig config;
+    DeviceGraphExecutor executor(config);
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    void *capture_stream = reinterpret_cast<void *>(0xFACEB00C);
+
+    auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::GEMM,
+        "capture_stream_stage",
+        DeviceId::rocm(0));
+    auto *stage_raw = stage.get();
+    stage_raw->setGPUStream(capture_stream);
+
+    ComputeGraph graph;
+    graph.addNode("capture_stream_stage", std::move(stage), DeviceId::rocm(0));
+
+    ASSERT_TRUE(executor.executeFastDecode(graph, &ctx));
+    EXPECT_EQ(stage_raw->gpuStream(), capture_stream);
+
+    auto *worker = dynamic_cast<MockWorkerGPUContext *>(&GPUDeviceContextPool::instance().getContext(DeviceId::rocm(0)));
+    ASSERT_NE(worker, nullptr);
+    ASSERT_EQ(worker->recordedEventStreams().size(), 2u);
+    EXPECT_EQ(worker->recordedEventStreams()[0], capture_stream);
+    EXPECT_EQ(worker->recordedEventStreams()[1], capture_stream);
+    EXPECT_NE(worker->recordedEventStreams()[0], rocm_default_stream_);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarStagesBindToCaptureStream)
+{
+    const void *stale_stream = reinterpret_cast<void *>(0xBAD50000);
+    void *capture_stream = reinterpret_cast<void *>(0x1DECAFFE);
+
+    struct StageSpec
+    {
+        ComputeStageType type;
+        const char *name;
+    };
+
+    const std::vector<StageSpec> sidecar_stage_specs = {
+        {ComputeStageType::EMBEDDING, "mtp_embedding"},
+        {ComputeStageType::RMS_NORM, "mtp_input_norm"},
+        {ComputeStageType::MTP_CONCAT, "mtp_concat"},
+        {ComputeStageType::GEMM, "mtp_projection"},
+        {ComputeStageType::GDN_PROJECTION, "mtp_gdn_projection"},
+        {ComputeStageType::SHORT_CONV1D, "mtp_short_conv"},
+        {ComputeStageType::GDN_RECURRENCE, "mtp_gdn_recurrence"},
+        {ComputeStageType::ATTENTION, "mtp_attention"},
+        {ComputeStageType::KV_CACHE_APPEND, "mtp_kv_append"},
+        {ComputeStageType::GATED_RMS_NORM, "mtp_gated_norm"},
+        {ComputeStageType::LM_HEAD, "mtp_lm_head"},
+    };
+
+    ComputeGraph graph;
+    std::vector<llaminar2::testing::MockComputeStage *> stages;
+    std::string previous_node;
+    for (const StageSpec &spec : sidecar_stage_specs)
+    {
+        auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+            spec.type,
+            spec.name,
+            DeviceId::rocm(0));
+        auto *stage_raw = stage.get();
+        stage_raw->setGPUStream(const_cast<void *>(stale_stream));
+        stages.push_back(stage_raw);
+
+        graph.addNode(spec.name, std::move(stage), DeviceId::rocm(0));
+        if (!previous_node.empty())
+            graph.addDependency(spec.name, previous_node);
+        previous_node = spec.name;
+    }
+
+    std::string error;
+    ASSERT_TRUE(mtp_sidecar::bindStagesToCaptureStream(graph, capture_stream, &error)) << error;
+
+    std::string mismatch;
+    EXPECT_TRUE(mtp_sidecar::allStagesBoundToStream(graph, capture_stream, &mismatch)) << mismatch;
+    for (const auto *stage : stages)
+    {
+        ASSERT_NE(stage, nullptr);
+        EXPECT_EQ(stage->gpuStream(), capture_stream) << stage->name();
+    }
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarDynamicParamStagesBindBeforeUpdate)
+{
+    void *capture_stream = reinterpret_cast<void *>(0x1DAD1C01);
+
+    auto attention_stage = std::make_unique<DynamicParamStreamGuardStage>(
+        "mtp_attention_dynamic_params",
+        DeviceId::rocm(0));
+    auto *attention_stage_raw = attention_stage.get();
+
+    auto kv_append_stage = std::make_unique<llaminar2::testing::MockComputeStage>(
+        ComputeStageType::KV_CACHE_APPEND,
+        "mtp_kv_append",
+        DeviceId::rocm(0));
+    auto *kv_append_stage_raw = kv_append_stage.get();
+
+    ComputeGraph graph;
+    graph.addNode("mtp_attention_dynamic_params", std::move(attention_stage), DeviceId::rocm(0));
+    graph.addNode("mtp_kv_append", std::move(kv_append_stage), DeviceId::rocm(0));
+    graph.addDependency("mtp_kv_append", "mtp_attention_dynamic_params");
+
+    ASSERT_EQ(attention_stage_raw->gpuStream(), nullptr);
+    EXPECT_THROW(attention_stage_raw->updateDynamicParams(31, 2), std::runtime_error);
+
+    std::string error;
+    ASSERT_TRUE(mtp_sidecar::bindStagesToCaptureStream(graph, capture_stream, &error)) << error;
+
+    std::string mismatch;
+    EXPECT_TRUE(mtp_sidecar::allStagesBoundToStream(graph, capture_stream, &mismatch)) << mismatch;
+    ASSERT_EQ(attention_stage_raw->gpuStream(), capture_stream);
+    ASSERT_EQ(kv_append_stage_raw->gpuStream(), capture_stream);
+
+    EXPECT_NO_THROW(attention_stage_raw->updateDynamicParams(31, 2));
+    EXPECT_EQ(attention_stage_raw->updateCount(), 2);
+    EXPECT_EQ(attention_stage_raw->lastPosOffset(), 31);
+    EXPECT_EQ(attention_stage_raw->lastSeqLen(), 2);
+}
+
+TEST_F(Test__GraphExecutorStreamBinding, MTPSidecarDeferredSamplingUsesCaptureStream)
+{
+    void *capture_stream = reinterpret_cast<void *>(0x0DADA123);
+    void *sample_stream = nullptr;
+    std::string error;
+
+    EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(true, true, capture_stream, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, capture_stream);
+
+    sample_stream = reinterpret_cast<void *>(0xBADF00D);
+    error.clear();
+    EXPECT_FALSE(mtp_sidecar::deferredSamplingStream(true, true, nullptr, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, nullptr);
+    EXPECT_FALSE(error.empty());
+
+    sample_stream = reinterpret_cast<void *>(0xBADF00D);
+    EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(true, false, capture_stream, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, nullptr);
+
+    sample_stream = reinterpret_cast<void *>(0xBADF00D);
+    EXPECT_TRUE(mtp_sidecar::deferredSamplingStream(false, true, capture_stream, &sample_stream, &error));
+    EXPECT_EQ(sample_stream, nullptr);
 }

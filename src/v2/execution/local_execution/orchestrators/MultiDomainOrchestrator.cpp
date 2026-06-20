@@ -94,7 +94,7 @@ namespace llaminar2
         }
 
         // Create inner DeviceGraphOrchestrator
-        // Note: Full implementation would create Qwen2Graph and pass to DeviceGraphOrchestrator
+        // Note: Full implementation would create QwenStandardGraph and pass to DeviceGraphOrchestrator
         // For now, we require model loading which will be implemented in integration
         if (config_.model_path.empty())
         {
@@ -103,7 +103,7 @@ namespace llaminar2
         }
 
         // TODO: Create inner orchestrator from model path
-        // This requires ModelLoader and Qwen2Graph which are integration-level dependencies
+        // This requires ModelLoader and QwenStandardGraph which are integration-level dependencies
         // For unit testing, use createForTest() with a mock orchestrator
         LOG_WARN("Full initialization not yet implemented - use createForTest() for unit tests");
 

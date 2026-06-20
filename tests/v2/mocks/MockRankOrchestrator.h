@@ -25,6 +25,7 @@
 #include <string>
 #include <sstream>
 #include <cstring>
+#include <unordered_map>
 
 namespace llaminar2::test
 {
@@ -75,7 +76,14 @@ namespace llaminar2::test
         bool forward(const int *tokens, int seq_len) override
         {
             forward_calls_.fetch_add(1, std::memory_order_relaxed);
-            last_tokens_.assign(tokens, tokens + seq_len);
+            if (tokens && seq_len > 0)
+            {
+                last_tokens_.assign(tokens, tokens + seq_len);
+            }
+            else
+            {
+                last_tokens_.clear();
+            }
             last_seq_len_ = seq_len;
 
             if (config_.forward_should_fail)
@@ -222,9 +230,59 @@ namespace llaminar2::test
         void set_forward_fails(bool fails) { config_.forward_should_fail = fails; }
         void set_position(int pos) { config_.position = pos; }
 
+        void add_snapshot(const std::string &key,
+                          std::vector<float> data,
+                          size_t rows = 1,
+                          size_t cols = 0)
+        {
+            if (cols == 0)
+                cols = data.size();
+            snapshots_[key] = SnapshotStorage{std::move(data), rows, cols};
+        }
+
+        const float *getSnapshot(const std::string &key, size_t &out_size) const override
+        {
+            auto it = snapshots_.find(key);
+            if (it == snapshots_.end())
+            {
+                out_size = 0;
+                return nullptr;
+            }
+            out_size = it->second.data.size();
+            return it->second.data.data();
+        }
+
+        SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+        {
+            auto it = snapshots_.find(key);
+            if (it == snapshots_.end())
+            {
+                return {};
+            }
+            return {it->second.data.data(), it->second.data.size(), it->second.rows, it->second.cols};
+        }
+
+        std::vector<std::string> getSnapshotKeys() const override
+        {
+            std::vector<std::string> keys;
+            keys.reserve(snapshots_.size());
+            for (const auto &[key, _] : snapshots_)
+            {
+                keys.push_back(key);
+            }
+            return keys;
+        }
+
         const Config &config() const { return config_; }
 
     private:
+        struct SnapshotStorage
+        {
+            std::vector<float> data;
+            size_t rows = 0;
+            size_t cols = 0;
+        };
+
         Config config_;
         mutable std::atomic<size_t> forward_calls_{0};
         mutable std::atomic<size_t> clear_cache_calls_{0};
@@ -233,6 +291,7 @@ namespace llaminar2::test
         int last_seq_len_ = 0;
         std::shared_ptr<TensorBase> hidden_state_;  ///< Hidden state tensor (generated or set externally)
         bool hidden_state_was_set_ = false;         ///< True if setHiddenState was called
+        std::unordered_map<std::string, SnapshotStorage> snapshots_;
     };
 
     /**

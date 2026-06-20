@@ -22,7 +22,7 @@ namespace llaminar2
     // Constant Memory Codebook Upload
     // =========================================================================
 
-    void hip_tq_upload_codebooks(hipStream_t stream = 0);
+    void hip_tq_upload_codebooks(hipStream_t stream);
 
     // =========================================================================
     // Rotation Matrix Management
@@ -55,7 +55,7 @@ namespace llaminar2
     ROCmTurboQuantRotations hip_tq_create_rotations(
         int n_layers, int n_kv_heads, int head_dim,
         uint64_t rotation_seed, int device_id,
-        hipStream_t stream = 0);
+        hipStream_t stream);
 
     void hip_tq_free_rotations(ROCmTurboQuantRotations &rotations);
 
@@ -135,7 +135,7 @@ namespace llaminar2
      * Eliminates per-thread powf() in dequant kernels.
      * Thread-safe; skips if already uploaded for the same head_dim.
      */
-    void hip_tq_upload_rope_freqs(float rope_theta, int head_dim, hipStream_t stream = 0);
+    void hip_tq_upload_rope_freqs(float rope_theta, int head_dim, hipStream_t stream);
 
     // =========================================================================
     // Dynamic Params for Graph-Capturable Incremental Dequant
@@ -145,9 +145,9 @@ namespace llaminar2
      * @brief Device-side dynamic parameters for TQ incremental dequant.
      *
      * During HIP graph capture, kernel arguments are baked into the graph.
-     * This struct lives in device memory; the kernel reads from it at
-     * runtime. Between graph replays, the host writes new values to a
-     * pinned shadow buffer and a captured H2D memcpy re-copies them.
+     * This struct lives in device memory; the kernel reads from it at runtime.
+     * Between graph replays, host code uploads new values to that device buffer
+     * before graph launch on the explicit stage stream.
      */
     struct HIPTQDequantDynamicParams
     {

@@ -26,17 +26,18 @@
  * @author David Sanftenberg
  * @date January 2026
  */
-
 #pragma once
 
-#include "WeightTypes.h"
 #include "WeightManagerConfig.h"
+#include "WeightTypes.h"
 #include "../backends/DeviceId.h"
-#include <memory>
-#include <string>
+
 #include <vector>
 #include <cstddef>
 #include <functional>
+#include <memory>
+#include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -47,6 +48,7 @@ namespace llaminar2
     // Forward declarations
     class TensorBase;
     class TensorParallelConfig;
+    class ExpertWeightPayloadProvider;
 
     /**
      * @brief Interface for managing model weights with distribution strategies
@@ -323,6 +325,12 @@ namespace llaminar2
         virtual size_t releaseAllHostWeightData() { return 0; }
 
         /**
+         * @brief Mark graph materialization complete (enables host release).
+         * Phase 9: lifecycle gate control.
+         */
+        virtual void markGraphMaterializationComplete() {}
+
+        /**
          * @brief Release host data for tensors that were retained as host-resident
          *
          * Called after the first forward pass completes, when GPU kernels have
@@ -333,17 +341,37 @@ namespace llaminar2
          */
         virtual size_t releaseHostResidentWeightData() { return 0; }
 
-        /**
-         * @brief Query how many prepared embedding entries exist
-         *
-         * Used by releaseAllHostWeightData() to decide whether host-resident
-         * embedding tensors can be freed (because a GPU-side repack exists).
-         * Override in tests to control release decisions without depending
-         * on KernelFactory static state.
-         */
-        virtual size_t getPreparedEmbeddingCount() const { return 0; }
-
         virtual std::pair<size_t, size_t> preloadStats() const { return {0, 0}; }
+
+        // =========================================================================
+        // MoE Expert Support (default no-ops)
+        // =========================================================================
+
+        /**
+         * @brief Advise the OS to reclaim mmap physical pages
+         *
+         * Safe to call after all GEMM engines have packed their weight data.
+         *
+         * @return Total bytes advised
+         */
+        virtual size_t adviseMmapDontneed() { return 0; }
+
+        /**
+         * @brief Set expert weight payload provider for metadata-based host retention
+         *
+         * @param provider Model-context owned payload provider (may be nullptr)
+         */
+        virtual void setExpertPayloadProvider(ExpertWeightPayloadProvider * /*provider*/) {}
+
+        /**
+         * @brief Iterate ALL prepared tensors (cache_ + per_device_cache_)
+         *
+         * For PreparedWeightStore population: iterates both the primary cache
+         * and per-device cache (which holds TP-sliced tensors).
+         *
+         * @param visitor Callback receiving (canonical_name, raw_tensor_ptr)
+         */
+        virtual void forEachPreparedWeight(std::function<void(const std::string &, TensorBase *)> /*visitor*/) const {}
     };
 
 } // namespace llaminar2

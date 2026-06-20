@@ -197,5 +197,7 @@
     "chat.todoListTool.enabled": true,
     "markdown.validate.enabled": true,
     "github.copilot.selectedCompletionModel": "claude-haiku-4.5",
-    "github.copilot.chat.backgroundCompaction": true
+    "github.copilot.chat.backgroundCompaction": true,
+    "remote.autoForwardPorts": false,
+    "github.copilot.chat.exploreAgent.model": "gpt-5.4-mini"
 }

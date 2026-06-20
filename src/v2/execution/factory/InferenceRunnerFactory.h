@@ -69,8 +69,11 @@
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../config/PipelineConfig.h"
 #include "FactoryPPStageConfig.h"
+#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace llaminar2
 {
@@ -79,6 +82,14 @@ namespace llaminar2
     class ITPContext;
     class ILocalTPContext;
     class IRankOrchestrator;
+    class MoERebalanceController;
+    class PreparedWeightStore;
+    class MoEExpertOverlayRuntimePlan;
+    struct GraphConfig;
+    struct MoEExpertOverlayExecutionPlan;
+    struct MoEExpertParallelPlan;
+
+    using DomainTPContextMap = std::map<std::string, std::shared_ptr<ITPContext>>;
 
     // Note: FactoryPPStageConfig is now defined in FactoryPPStageConfig.h
     // to avoid circular dependencies with RankOrchestrator.h
@@ -89,6 +100,7 @@ namespace llaminar2
     struct InferenceRunnerConfig
     {
         int max_seq_len = 4096;
+        int activation_seq_len = 0;
         int batch_size = 1;
 
         // Explicit graph path selection (only graph path is supported)
@@ -112,6 +124,21 @@ namespace llaminar2
         // Explicit KV cache precision control.
         // AUTO preserves legacy behavior (derived from activation precision mode).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
+
+        /// Prefix-state cache feature gates and storage limits.
+        PrefixCacheRuntimeConfig prefix_cache;
+
+        /// Multi-token prediction feature gates and verification mode.
+        MTPRuntimeConfig mtp;
+
+        /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+        /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+        /// Decode histogram / dynamic rebalance settings.
+        MoERebalanceRuntimeConfig moe_rebalance;
 
         // Use mapped memory for GPU tensor allocation (zero-copy host access)
         // When true, FP32 activation buffers are allocated using cudaHostAllocMapped /
@@ -155,6 +182,24 @@ namespace llaminar2
         /// instead of relying purely on first-appearance ordering from MPI_Allgather.
         std::string hostfile;
 
+        /// Optional stage-local prepared store. When supplied, concrete factory
+        /// paths install this store before materializing/preparing weights.
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store;
+
+        /// Optional same-layer MoE expert overlay plan propagated into GraphConfig.
+        std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
+        /// Optional MPI context used by MoE overlay domain-worker commands.
+        std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
+
+        /// Optional graph-level cancellation hook. Queried before each stage,
+        /// usually backed by a TP collective abort flag.
+        std::function<bool()> cancellation_requested;
+
+        /// Optional stage failure hook. Invoked as soon as a graph stage fails,
+        /// before the device runner unwinds back to RankOrchestrator.
+        std::function<void(const std::string &, const std::string &)> stage_failure_callback;
+
         /**
          * @brief Canonical factory: build InferenceRunnerConfig from a RankExecutionPlan
          *
@@ -174,6 +219,11 @@ namespace llaminar2
             config.fused_attention_backend = plan.runtime.fused_attention_backend;
             config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
+            config.moe_expert_mode = plan.runtime.moe_expert_mode;
+            config.moe_hot_expert_cache = plan.runtime.moe_hot_expert_cache;
+            config.moe_rebalance = plan.runtime.moe_rebalance;
+            config.prefix_cache = plan.runtime.prefix_cache;
+            config.mtp = plan.runtime.mtp;
             return config;
         }
     };
@@ -218,6 +268,29 @@ namespace llaminar2
         std::shared_ptr<IModelContext> model_ctx,
         DeviceId device,
         const InferenceRunnerConfig &config = {});
+
+    std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config);
+
+    bool applyMoEExpertOverlayConfigToGraphForTesting(
+        IModelContext &model_ctx,
+        const InferenceRunnerConfig &config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        GraphConfig &graph_config,
+        DomainTPContextMap &owned_domain_tp_contexts,
+        const std::string &log_prefix = "[InferenceRunnerTest]");
+
+    DeviceId resolveMoEExpertOverlayExecutionDeviceForGraph(
+        GraphConfig &graph_config,
+        const std::shared_ptr<IMPIContext> &runner_mpi_ctx,
+        DeviceId requested_device,
+        const std::string &log_prefix = "[InferenceRunner]");
+
+    std::vector<std::unique_ptr<MoERebalanceController>> createMoERebalanceControllersForGraph(
+        const GraphConfig &graph_config,
+        const ILocalTPContext *local_tp_ctx,
+        const ITPContext *tp_ctx);
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner

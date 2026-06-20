@@ -11,11 +11,15 @@
  */
 
 #include "CUDARingKVCache.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../tensors/TensorClasses.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/KVCacheProfiler.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cuda_runtime.h>
 
@@ -48,6 +52,51 @@ namespace llaminar2
 
     bool ICUDARingKVCache::ensureConvScratch(size_t bytes)
     {
+        if (auto *consumer = dynamic_cast<IWorkspaceConsumer *>(this))
+        {
+            DeviceWorkspaceManager *workspace = consumer->getWorkspace();
+            if (workspace && workspace->isAllocated())
+            {
+                void *workspace_k = workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+                void *workspace_v = workspace->getBuffer(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+                const size_t workspace_k_size = workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_K);
+                const size_t workspace_v_size = workspace->getBufferSize(KVCacheWorkspaceBuffers::CONV_SCRATCH_V);
+                if (!workspace_k || !workspace_v || workspace_k_size < bytes || workspace_v_size < bytes)
+                {
+                    LOG_ERROR("[ICUDARingKVCache] Bound workspace is missing conversion scratch: required="
+                              << bytes << " bytes, K_available=" << workspace_k_size
+                              << " V_available=" << workspace_v_size);
+                    return false;
+                }
+
+                if (conv_scratch_k_ && !conv_scratch_workspace_backed_)
+                    cudaFree(conv_scratch_k_);
+                if (conv_scratch_v_ && !conv_scratch_workspace_backed_)
+                    cudaFree(conv_scratch_v_);
+
+                conv_scratch_k_ = workspace_k;
+                conv_scratch_v_ = workspace_v;
+                conv_scratch_capacity_ = std::min(workspace_k_size, workspace_v_size);
+                conv_scratch_workspace_backed_ = true;
+                return true;
+            }
+        }
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[ICUDARingKVCache] Refusing to allocate conversion scratch during CUDA graph capture; "
+                      "bind KV-cache conversion scratch through IWorkspaceConsumer");
+            return false;
+        }
+
+        if (conv_scratch_workspace_backed_)
+        {
+            conv_scratch_k_ = nullptr;
+            conv_scratch_v_ = nullptr;
+            conv_scratch_capacity_ = 0;
+            conv_scratch_workspace_backed_ = false;
+        }
+
         if (bytes <= conv_scratch_capacity_)
             return true;
 
@@ -85,6 +134,15 @@ namespace llaminar2
 
     void ICUDARingKVCache::freeConvScratch()
     {
+        if (conv_scratch_workspace_backed_)
+        {
+            conv_scratch_k_ = nullptr;
+            conv_scratch_v_ = nullptr;
+            conv_scratch_capacity_ = 0;
+            conv_scratch_workspace_backed_ = false;
+            return;
+        }
+
         if (conv_scratch_k_)
         {
             cudaFree(conv_scratch_k_);
@@ -109,50 +167,13 @@ namespace llaminar2
                                   const ITensor *K, const ITensor *V,
                                   int num_tokens)
     {
-        if (!K || !V)
-        {
-            LOG_DEBUG("[ICUDARingKVCache::append(ITensor)] Null K or V tensor");
-            return false;
-        }
-
-        const auto target = DeviceId::cuda(device_id());
-
-        // Try existing GPU pointers first
-        const void *d_k = K->gpu_data_ptr();
-        const void *d_v = V->gpu_data_ptr();
-
-        // If missing, force residency on cache device
-        if (!d_k)
-        {
-            auto *k_mut = const_cast<ITensor *>(K);
-            if (!k_mut->ensureOnDevice(target))
-            {
-                LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure K on "
-                          << target.toString());
-                return false;
-            }
-            d_k = K->gpu_data_ptr();
-        }
-        if (!d_v)
-        {
-            auto *v_mut = const_cast<ITensor *>(V);
-            if (!v_mut->ensureOnDevice(target))
-            {
-                LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Failed to ensure V on "
-                          << target.toString());
-                return false;
-            }
-            d_v = V->gpu_data_ptr();
-        }
-
-        if (!d_k || !d_v)
-        {
-            LOG_ERROR("[ICUDARingKVCache::append(ITensor)] K or V tensor lacks GPU data after ensureOnDevice().");
-            return false;
-        }
-
-        // Delegate to the device pointer version (with default stream 0)
-        return append(layer, seq_idx, d_k, d_v, num_tokens, 0);
+        (void)layer;
+        (void)seq_idx;
+        (void)K;
+        (void)V;
+        (void)num_tokens;
+        LOG_ERROR("[ICUDARingKVCache::append(ITensor)] Explicit CUDA stream required; use appendWithStream()");
+        return false;
     }
 
     bool ICUDARingKVCache::appendWithStream(int layer, int seq_idx,
@@ -164,6 +185,11 @@ namespace llaminar2
             LOG_DEBUG("[ICUDARingKVCache::appendWithStream] Null K or V tensor");
             return false;
         }
+        if (!gpu_stream)
+        {
+            LOG_ERROR("[ICUDARingKVCache::appendWithStream] Null CUDA stream is not allowed");
+            return false;
+        }
 
         const auto target = DeviceId::cuda(device_id());
 
@@ -173,7 +199,8 @@ namespace llaminar2
         if (!d_k)
         {
             auto *k_mut = const_cast<ITensor *>(K);
-            if (!k_mut->ensureOnDevice(target))
+            auto *k_tensor = dynamic_cast<TensorBase *>(k_mut);
+            if (!(k_tensor ? k_tensor->ensureOnDevice(target, gpu_stream) : k_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure K on "
                           << target.toString());
@@ -184,7 +211,8 @@ namespace llaminar2
         if (!d_v)
         {
             auto *v_mut = const_cast<ITensor *>(V);
-            if (!v_mut->ensureOnDevice(target))
+            auto *v_tensor = dynamic_cast<TensorBase *>(v_mut);
+            if (!(v_tensor ? v_tensor->ensureOnDevice(target, gpu_stream) : v_mut->ensureOnDevice(target)))
             {
                 LOG_ERROR("[ICUDARingKVCache::appendWithStream] Failed to ensure V on "
                           << target.toString());
@@ -716,12 +744,17 @@ namespace llaminar2
         const auto &entry = entries_[layer][seq_idx];
         if (entry.count == 0)
         {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
             if (out_kv_len)
                 *out_kv_len = 0;
             return true;
         }
 
-        // If no RoPE requested, fall back to raw cache tensors.
+        // If no RoPE is requested, the raw cache tensors already have the
+        // required representation.
         // Use qualified call to avoid virtual dispatch — CUDAHybridRingKVCache
         // overrides get_kv() with layer remapping, but the layer index passed here
         // has already been remapped by the hybrid override of get_kv_converted().
@@ -732,7 +765,8 @@ namespace llaminar2
         }
 
         cudaSetDevice(device_id_);
-        const cudaStream_t stream = getEffectiveStream(nullptr);
+        const cudaStream_t stream = getEffectiveStream(
+            rope ? static_cast<cudaStream_t>(rope->gpu_stream) : nullptr);
 
         ensureRoPEShadow(layer, seq_idx);
         auto &shadow = rope_shadows_[layer][seq_idx];

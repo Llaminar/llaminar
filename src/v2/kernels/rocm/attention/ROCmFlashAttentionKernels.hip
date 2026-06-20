@@ -42,6 +42,7 @@
 #include <vector>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../utils/DebugEnv.h"
 
 namespace
 {
@@ -68,6 +69,35 @@ namespace
     //   FP16: K/V are __half*   (2 bytes/element) — 2× BW savings + fdot2
     //   Q8_1: K/V are Q8_1Block* (36 bytes/32 elements) — ~3.5× BW savings
     enum class KVTypeTag { FP32, FP16, Q8_1 };
+
+    /**
+     * @brief Derive graph-captured attention params from live KV cache count.
+     *
+     * This tiny helper runs in graph order immediately before attention, after
+     * KV append has advanced the device-owned cache count. It avoids the old
+     * host-built `AttentionDeviceParams` upload for resident MTP replay.
+     */
+    __global__ void hip_derive_attention_params_from_cached_tokens_kernel(
+        llaminar2::attention::AttentionDeviceParams *__restrict__ out,
+        const int *__restrict__ post_append_cached_tokens,
+        int seq_len,
+        int query_rows)
+    {
+        const int row = static_cast<int>(threadIdx.x);
+        if (!out || !post_append_cached_tokens || row >= query_rows)
+            return;
+
+        const int raw_kv_len = *post_append_cached_tokens;
+        const int kv_len = raw_kv_len > 1 ? raw_kv_len : 1;
+        const int logical_seq_len = seq_len > 1 ? seq_len : 1;
+        const int base_position_raw = kv_len - logical_seq_len;
+        const int base_position = base_position_raw > 0 ? base_position_raw : 0;
+        const int row_kv_len_raw = kv_len - (query_rows - 1 - row);
+        const int row_kv_len = row_kv_len_raw > 1 ? row_kv_len_raw : 1;
+        out[row].kv_len = row_kv_len;
+        out[row].position_offset = base_position + row;
+        out[row].mask_stride = kv_len;
+    }
 
     // =========================================================================
     // Flash Attention 2 Configuration for MI50
@@ -401,6 +431,28 @@ namespace
             : FD_MAX_SPLITS_SUPPORTED;
         const int max_allowed = std::max(1, std::min(FD_MAX_SPLITS_SUPPORTED, workspace_limit));
 
+        const auto &rocm_env = llaminar2::debugEnv().rocm;
+        if (rocm_env.fa_decode_num_splits_present)
+        {
+            const int forced_splits = rocm_env.fa_decode_num_splits
+                ? clampInt(*rocm_env.fa_decode_num_splits, 1, max_allowed)
+                : heuristic_splits;
+            const int forced_tpb = rocm_env.fa_decode_tpb
+                ? clampInt(*rocm_env.fa_decode_tpb, 64, 256)
+                : chooseDecodeThreadsPerBlock(head_dim, kv_len, forced_splits);
+            selection.config = {forced_splits, forced_tpb};
+            return selection;
+        }
+
+        if (llaminar2::debugEnv().gemm.deterministic)
+        {
+            // Deterministic parity runs require a stable launch policy across
+            // fresh runners.  The autotuner is performance state, not model
+            // state, so rotating through trial TPB values can make two identical
+            // requests execute different kernels in one process.
+            return selection;
+        }
+
         const uint32_t key = makeDecodeAutotuneKey(kv_len, head_dim, max_allowed, n_heads);
 
         std::lock_guard<std::mutex> guard(decodeAutotuneMutex());
@@ -687,8 +739,13 @@ namespace
         const int lane_id = tid % WAVEFRONT_SIZE;
 
         // GQA mapping: multiple Q heads can share one KV head
+        // When gqa_n_rep > 0, KV heads are REPLICATED (each device has all KV heads),
+        // so use the global head position (head_start + head_idx). When gqa_n_rep == 0,
+        // KV heads are SHARDED (each device has only local_n_kv_heads), so use local indexing.
         const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
-        const int kv_head_idx = (head_start + head_idx) / effective_gqa_ratio;
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa_ratio
+            : head_idx / effective_gqa_ratio;
 
         // Q row range for this block
         const int q_block_start = q_tile_idx * tile_q;
@@ -1176,7 +1233,9 @@ namespace
         const int batch_idx = blockIdx.z;
 
         const int effective_gqa_ratio = (gqa_n_rep > 0) ? gqa_n_rep : (n_heads / n_kv_heads);
-        const int kv_head_idx = (head_start + head_idx) / effective_gqa_ratio;
+        const int kv_head_idx = (gqa_n_rep > 0)
+            ? (head_start + head_idx) / effective_gqa_ratio
+            : head_idx / effective_gqa_ratio;
 
         // Split range
         const int split_size = (kv_len_runtime + num_splits - 1) / num_splits;
@@ -1770,7 +1829,9 @@ void causal_softmax_inplace_kernel(
     int total_rows,
     int seq_len,
     int kv_len,
-    int position_offset)
+    int position_offset,
+    const float* __restrict__ mask,
+    int mask_stride)
 {
     const int row = blockIdx.x;
     if (row >= total_rows) return;
@@ -1785,8 +1846,9 @@ void causal_softmax_inplace_kernel(
     // Pass 1: Find row max (read-only — scores are pre-scaled by GEMM alpha)
     float local_max = -FLT_MAX;
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
-        if (j <= last_valid) {
-            local_max = fmaxf(local_max, row_data[j]);
+        const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
+        if (j <= last_valid && mask_val > -1.0e20f) {
+            local_max = fmaxf(local_max, row_data[j] + mask_val);
         }
     }
 
@@ -1822,8 +1884,11 @@ void causal_softmax_inplace_kernel(
     for (int i = 0; i < elems_per_thread; i++) {
         int j = threadIdx.x + i * blockDim.x;
         float val = 0.0f;
-        if (j < kv_len && j <= last_valid) {
-            val = exp2f((row_data[j] - row_max) * LOG2E);
+        if (j < kv_len) {
+            const float mask_val = mask ? mask[static_cast<size_t>(seq_pos) * mask_stride + j] : 0.0f;
+            if (j <= last_valid && mask_val > -1.0e20f) {
+                val = exp2f((row_data[j] + mask_val - row_max) * LOG2E);
+            }
         }
         local_exp[i] = val;
         local_sum += val;
@@ -1913,6 +1978,9 @@ static PrefillPoolState& get_stream_pool(int device_id) {
     auto it = s_stream_pools.find(device_id);
     if (it != s_stream_pools.end()) return it->second;
 
+    // Ensure streams/handles are created on the correct device for multi-GPU TP
+    hipSetDevice(device_id);
+
     auto& state = s_stream_pools[device_id];
     for (int i = 0; i < NUM_PREFILL_STREAMS; i++) {
         hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
@@ -1962,6 +2030,8 @@ static int rocblas_prefill_impl(
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
     hipStream_t hip_stream,
+    const float *mask = nullptr,
+    int mask_stride = 0,
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
@@ -2017,12 +2087,16 @@ static int rocblas_prefill_impl(
     const long long strideC_pv = head_dim;              // O: interleaved heads
 
     int pos_off = causal ? position_offset : (kv_len - 1);
+    if (mask && mask_stride <= 0) {
+        mask_stride = kv_len;
+    }
 
     for (int b = 0; b < batch_size; b++) {
         const float* Q_batch = Q + static_cast<size_t>(b) * seq_len * lda_q;
         const float* K_batch = K + static_cast<size_t>(b) * kv_len * lda_k;
         const float* V_batch = V + static_cast<size_t>(b) * kv_len * lda_v;
         float* O_batch = O + static_cast<size_t>(b) * seq_len * lda_o;
+        const float* mask_batch = mask ? mask + static_cast<size_t>(b) * seq_len * mask_stride : nullptr;
 
         for (int kh = 0; kh < n_kv_heads; kh++) {
             // TP-aware GQA mapping: compute which LOCAL Q heads map to this KV head
@@ -2072,7 +2146,8 @@ static int rocblas_prefill_impl(
             hipLaunchKernelGGL(
                 causal_softmax_inplace_kernel,
                 grid_sm, block_sm, 0, ctx.stream,
-                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off);
+                ctx.scores_buf, local_group_size * seq_len, seq_len, kv_len, pos_off,
+                mask_batch, mask_stride);
 
             // ─── Pass 3: O = P @ V ───
             status = hipblasSgemmStridedBatched(
@@ -2094,16 +2169,11 @@ static int rocblas_prefill_impl(
         // ─── Output fence: rejoin pool streams to caller's stream ───
         // Event fence: makes hip_stream aware of pool completion so
         // subsequent GPU work on hip_stream waits for attention output.
+        // No CPU-side sync needed — all downstream stages operate on hip_stream
+        // which will wait for the events before proceeding.
         for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
             hipEventRecord(pool[s].completion_event, pool[s].stream);
             hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
-        }
-        // CPU-side sync: ensures pool work is fully complete before the CPU
-        // returns. This is needed because hipStreamWaitEvent only creates a
-        // GPU-side dependency — CPU-side operations (e.g., hipMemcpy for
-        // coherence transfers) need the data to be globally visible.
-        for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-            hipStreamSynchronize(pool[s].stream);
         }
     }
 
@@ -2194,6 +2264,8 @@ static float* get_dequant_buffer(int device_id, size_t required_bytes) {
     std::lock_guard<std::mutex> lock(s_dequant_mtx);
     auto& buf = s_dequant_bufs[device_id];
     if (required_bytes > buf.cap) {
+        // Ensure allocation targets the correct device for multi-GPU TP
+        hipSetDevice(device_id);
         if (buf.ptr) hipFree(buf.ptr);
         hipError_t err = hipMalloc(&buf.ptr, required_bytes);
         if (err != hipSuccess) {
@@ -2220,6 +2292,8 @@ static int rocblas_prefill_fp16_impl(
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
     hipStream_t hip_stream,
+    const float *mask = nullptr,
+    int mask_stride = 0,
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
@@ -2253,6 +2327,7 @@ static int rocblas_prefill_fp16_impl(
         n_heads, n_kv_heads, head_dim,
         softmax_scale, causal, position_offset,
         hip_stream,
+        mask, mask_stride,
         head_start, gqa_n_rep);
 }
 
@@ -2267,6 +2342,8 @@ static int rocblas_prefill_q8_1_impl(
     int n_heads, int n_kv_heads, int head_dim,
     float softmax_scale, bool causal, int position_offset,
     hipStream_t hip_stream,
+    const float *mask = nullptr,
+    int mask_stride = 0,
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
@@ -2303,6 +2380,7 @@ static int rocblas_prefill_q8_1_impl(
         n_heads, n_kv_heads, head_dim,
         softmax_scale, causal, position_offset,
         hip_stream,
+        mask, mask_stride,
         head_start, gqa_n_rep);
 }
 
@@ -2352,7 +2430,7 @@ extern "C"
                 batch_size, seq_len, kv_len,
                 n_heads, n_kv_heads, head_dim,
                 softmax_scale, causal, position_offset,
-                hip_stream, head_start, gqa_n_rep);
+                hip_stream, mask, kv_len, head_start, gqa_n_rep);
         }
 
         // Fall through to existing tiled kernel for head_dim < 64
@@ -2492,6 +2570,7 @@ extern "C"
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, position_offset,
             hip_stream,
+            mask, kv_len,
             head_start, gqa_n_rep);
     }
 
@@ -2546,6 +2625,7 @@ extern "C"
             n_heads, n_kv_heads, head_dim,
             softmax_scale, causal, position_offset,
             hip_stream,
+            mask, kv_len,
             head_start, gqa_n_rep);
     }
 
@@ -2621,6 +2701,38 @@ extern "C"
             batch_size, kv_len, n_heads, n_kv_heads, head_dim,
             num_splits, device_params, static_cast<hipStream_t>(stream),
             head_start, gqa_n_rep);
+    }
+
+    /**
+     * @brief Derive AttentionDeviceParams from device-owned KV cache count.
+     */
+    int hipFlashAttn_prepare_device_params_from_count(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int seq_len,
+        int query_rows,
+        void *stream)
+    {
+        if (!device_params || !post_append_cached_tokens || seq_len <= 0 ||
+            query_rows <= 0 || !stream)
+        {
+            return -1;
+        }
+
+        hipLaunchKernelGGL(hip_derive_attention_params_from_cached_tokens_kernel,
+                           dim3(1), dim3(query_rows), 0, static_cast<hipStream_t>(stream),
+                           static_cast<llaminar2::attention::AttentionDeviceParams *>(device_params),
+                           post_append_cached_tokens,
+                           seq_len,
+                           query_rows);
+        const hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            printf("[hipFlashAttn_prepare_device_params_from_count] Kernel launch failed: %s\n",
+                   hipGetErrorString(err));
+            return -1;
+        }
+        return 0;
     }
 
     /**

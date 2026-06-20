@@ -1039,6 +1039,8 @@ TEST_F(WeightManagerInstanceTest, IsGemmWeight_IdentifiesNonGemm)
     EXPECT_FALSE(wm.isGemmWeight("blk.0.attn_norm.weight"));
     EXPECT_FALSE(wm.isGemmWeight("blk.0.ffn_norm.weight"));
     EXPECT_FALSE(wm.isGemmWeight("output_norm.weight"));
+    EXPECT_FALSE(wm.isGemmWeight("blk.64.nextn.hnorm.weight"));
+    EXPECT_FALSE(wm.isGemmWeight("blk.64.nextn.enorm.weight"));
     EXPECT_FALSE(wm.isGemmWeight("token_embd.weight"));
 }
 

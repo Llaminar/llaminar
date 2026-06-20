@@ -231,6 +231,29 @@ namespace llaminar2
         void setUseMmap(bool use_mmap) { use_mmap_ = use_mmap; }
 
         /**
+         * @brief Skip page cache eviction during NUMA mmap
+         *
+         * When enabled, MmapRegion::create() will NOT call POSIX_FADV_DONTNEED
+         * before the NUMA first-touch loop. Use this in multi-rank mode after
+         * MmapRegion::prepopulatePageCache() has warmed the page cache, so that
+         * the first-touch loop faults from cache (fast) instead of disk (slow).
+         *
+         * Must be called BEFORE loadModel().
+         */
+        void setSkipMmapCacheEviction(bool skip) { skip_mmap_cache_eviction_ = skip; }
+
+        /**
+         * @brief Indicate target device is GPU — skip NUMA mmap binding
+         *
+         * When enabled, mmap uses MAP_POPULATE (fast sequential kernel readahead)
+         * instead of NUMA-bound first-touch. For GPU inference, weights are uploaded
+         * to VRAM anyway, so NUMA placement of the host staging area doesn't matter.
+         *
+         * Must be called BEFORE loadModel().
+         */
+        void setTargetIsGpu(bool is_gpu) { target_is_gpu_ = is_gpu; }
+
+        /**
          * @brief Check if mmap is active (file successfully memory-mapped)
          */
         bool isMmapActive() const { return mmap_region_ != nullptr; }
@@ -359,6 +382,26 @@ namespace llaminar2
                                                           DeviceId device = DeviceId::cpu(),
                                                           WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
 
+        /**
+         * @brief Load an expert slice of a 3D MoE tensor from GGUF file
+         *
+         * Reads only experts [expert_start, expert_end) from a 3D tensor with shape
+         * [ne0, ne1, num_experts]. Each expert's data is contiguous in memory, so this
+         * reads a single contiguous byte range. Returns a 3D tensor with shape
+         * [ne0, ne1, expert_end - expert_start].
+         *
+         * @param tensor_name Name of tensor (e.g., "blk.0.ffn_gate_exps.weight")
+         * @param expert_start First expert to load (0-indexed)
+         * @param expert_end One past the last expert to load
+         * @param device Device for tensor placement (default: CPU)
+         * @param weight_precision How to load the weight (NATIVE recommended)
+         * @return Tensor with shape [ne0, ne1, local_count] or nullptr on error
+         */
+        std::shared_ptr<TensorBase> loadTensorExpertSlice(const std::string &tensor_name,
+                                                          size_t expert_start, size_t expert_end,
+                                                          DeviceId device = DeviceId::cpu(),
+                                                          WeightPrecision weight_precision = WeightPrecision::NATIVE) override;
+
         // =========================================================================
         // IModelLoader - Metadata Accessors
         // =========================================================================
@@ -380,16 +423,69 @@ namespace llaminar2
         uint64_t headCountKV() const override { return model_.head_count_kv; }
         uint64_t vocabSize() const override { return model_.vocab_size; }
         uint64_t contextLength() const override { return model_.context_length; }
-        uint64_t feedForwardLength() const override { return getUInt64("feed_forward_length", 0); }
+        uint64_t feedForwardLength() const override
+        {
+            uint64_t d_ff = getUInt64("feed_forward_length", 0);
+            if (d_ff == 0)
+            {
+                // MoE models may not have feed_forward_length; fall back to shared expert or per-expert FFN
+                d_ff = getUInt64("expert_shared_feed_forward_length", 0);
+            }
+            if (d_ff == 0)
+            {
+                d_ff = getUInt64("expert_feed_forward_length", 0);
+            }
+            return d_ff;
+        }
         uint64_t keyLength() const override { return model_.key_length; }
         float ropeTheta() const override { return model_.rope_theta; }
         float rmsNormEps() const override { return model_.rms_norm_eps; }
+
+        void releaseMmapRegions() override
+        {
+            if (mmap_region_)
+            {
+                LOG_DEBUG("[ModelLoader] Releasing mmap region ("
+                          << (mmap_region_->size() / (1024 * 1024)) << " MB)");
+                mmap_region_.reset();
+            }
+            for (auto &region : split_mmap_regions_)
+            {
+                if (region)
+                {
+                    LOG_DEBUG("[ModelLoader] Releasing split mmap region ("
+                              << (region->size() / (1024 * 1024)) << " MB)");
+                    region.reset();
+                }
+            }
+            split_mmap_regions_.clear();
+        }
+
+        size_t adviseMmapDontneed() override
+        {
+            size_t total = 0;
+            if (mmap_region_)
+            {
+                total += mmap_region_->adviseDontneed();
+            }
+            for (auto &region : split_mmap_regions_)
+            {
+                if (region)
+                    total += region->adviseDontneed();
+            }
+            if (total > 0)
+            {
+                LOG_DEBUG("[ModelLoader] Advised DONTNEED on mmap regions ("
+                          << (total / (1024 * 1024)) << " MB) — pages reclaimable by OS");
+            }
+            return total;
+        }
 
     private:
         // Tensor factory (created internally if not provided)
         TensorFactory *factory_;
         std::unique_ptr<TensorFactory> owned_factory_; // Owned factory if created internally
-        std::shared_ptr<IMPIContext> owned_mpi_ctx_;    // Owned MPI context for owned factory
+        std::shared_ptr<IMPIContext> owned_mpi_ctx_;   // Owned MPI context for owned factory
 
         // Parsing helpers
         bool parseHeader();
@@ -447,6 +543,8 @@ namespace llaminar2
 
         // mmap state (when use_mmap_ is true)
         bool use_mmap_ = true;
+        bool skip_mmap_cache_eviction_ = false;
+        bool target_is_gpu_ = false;
         std::shared_ptr<MmapRegion> mmap_region_;                     // Main file mmap (shared for zero-copy tensors)
         std::vector<std::shared_ptr<MmapRegion>> split_mmap_regions_; // Split file mmaps
 

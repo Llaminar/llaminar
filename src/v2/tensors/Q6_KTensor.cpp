@@ -76,9 +76,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     Q6_KTensor::Q6_KTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                           const uint8_t *mmap_data,
+                           size_t byte_size,
+                           std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -105,39 +105,58 @@ namespace llaminar2
         }
     }
 
-
     std::shared_ptr<TensorBase> Q6_KTensor::create_view(
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        // Validation: must be 2D
-        if (shape_.size() != 2 || new_shape.size() != 2)
+        // Validate: view must be 2D
+        if (new_shape.size() != 2)
         {
-            throw std::invalid_argument("Q6_KTensor::create_view: only 2D row-slice views supported");
+            throw std::invalid_argument("Q6_KTensor::create_view: only 2D views supported");
         }
 
-        // Validation: K dimension must match
-        if (new_shape[1] != shape_[1])
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
         {
-            throw std::invalid_argument("Q6_KTensor::create_view: column count (K) must match parent");
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: parent must be 2D or 3D");
         }
 
-        // Validation: offset must be row-aligned
-        if (offset % shape_[1] != 0)
+        // Validate: K dimension must match
+        if (new_shape[1] != K)
+        {
+            throw std::invalid_argument("Q6_KTensor::create_view: K dimension must match parent");
+        }
+
+        // Validate: offset must be row-aligned
+        if (offset % K != 0)
         {
             throw std::invalid_argument("Q6_KTensor::create_view: offset must be row-aligned");
         }
 
-        // Validation: bounds check
-        if (offset + new_shape[0] * new_shape[1] > shape_[0] * shape_[1])
+        // Validate: bounds check
+        size_t total_elements = total_rows * K;
+        if (offset + new_shape[0] * new_shape[1] > total_elements)
         {
             throw std::out_of_range("Q6_KTensor::create_view: view exceeds parent bounds");
         }
 
         // Calculate block offset
-        const size_t cols = shape_[1];
-        const size_t blocks_per_row = (cols + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
-        const size_t first_row = offset / cols;
+        const size_t blocks_per_row = (K + Q6_KBlock::BLOCK_SIZE - 1) / Q6_KBlock::BLOCK_SIZE;
+        const size_t first_row = offset / K;
         const size_t block_offset = first_row * blocks_per_row;
         const size_t byte_offset = block_offset * sizeof(Q6_KBlock);
 
@@ -311,8 +330,14 @@ namespace llaminar2
     }
 #endif
 
-    Q6_KTensor::~Q6_KTensor() {}
-
+    Q6_KTensor::~Q6_KTensor()
+    {
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
+    }
 
     const float *Q6_KTensor::data() const
     {
@@ -605,10 +630,18 @@ namespace llaminar2
         {
             switch (sub_in_half)
             {
-            case 0: raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4); break;
-            case 1: raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4); break;
-            case 2: raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4); break;
-            case 3: raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); break;
+            case 0:
+                raw6[l] = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+                break;
+            case 1:
+                raw6[l] = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+                break;
+            case 2:
+                raw6[l] = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+                break;
+            case 3:
+                raw6[l] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
+                break;
             }
         }
 

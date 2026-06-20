@@ -647,17 +647,25 @@ namespace llaminar2
                     float *O_ptr = O_base->mutable_data();
                     if (Q_ptr && O_ptr)
                     {
-                        const int position_offset = (kv_len > seq_len)
-                                                        ? (kv_len - seq_len)
-                                                        : 0;
-                        return compute_decode_fp16kv(
-                            Q_ptr,
-                            K_fp16->typed_data(),
-                            V_fp16->typed_data(),
-                            O_ptr,
-                            kv_len, n_heads, n_kv_heads, head_dim,
-                            causal, position_offset,
-                            head_start, gqa_n_rep);
+                        const int q_stride = n_heads * head_dim;
+                        const int base_position_offset = (kv_len > seq_len)
+                                                             ? (kv_len - seq_len)
+                                                             : 0;
+                        for (int row = 0; row < seq_len; ++row)
+                        {
+                            if (!compute_decode_fp16kv(
+                                    Q_ptr + static_cast<size_t>(row) * q_stride,
+                                    K_fp16->typed_data(),
+                                    V_fp16->typed_data(),
+                                    O_ptr + static_cast<size_t>(row) * q_stride,
+                                    kv_len, n_heads, n_kv_heads, head_dim,
+                                    causal, base_position_offset + row,
+                                    head_start, gqa_n_rep))
+                            {
+                                return false;
+                            }
+                        }
+                        return true;
                     }
                 }
             }
@@ -686,11 +694,21 @@ namespace llaminar2
                                                         : 0;
                         if (kv_len != seq_len)
                         {
-                            return compute_decode_q16kv(
-                                Q_ptr, K_q16, V_q16, O_ptr,
-                                kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, position_offset,
-                                head_start, gqa_n_rep);
+                            const int q_stride = n_heads * head_dim;
+                            for (int row = 0; row < seq_len; ++row)
+                            {
+                                if (!compute_decode_q16kv(
+                                        Q_ptr + static_cast<size_t>(row) * q_stride,
+                                        K_q16, V_q16,
+                                        O_ptr + static_cast<size_t>(row) * q_stride,
+                                        kv_len, n_heads, n_kv_heads, head_dim,
+                                        causal, position_offset + row,
+                                        head_start, gqa_n_rep))
+                                {
+                                    return false;
+                                }
+                            }
+                            return true;
                         }
                         else
                         {
@@ -723,14 +741,24 @@ namespace llaminar2
                     float *O_ptr = O_base->mutable_data();
                     if (Q_ptr && O_ptr)
                     {
-                        const int position_offset = (kv_len > seq_len)
-                                                        ? (kv_len - seq_len)
-                                                        : 0;
-                        return compute_decode_tqkv(
-                            Q_ptr, K_tq8, V_tq4, O_ptr,
-                            kv_len, n_heads, n_kv_heads, head_dim,
-                            causal, position_offset,
-                            head_start, gqa_n_rep);
+                        const int q_stride = n_heads * head_dim;
+                        const int base_position_offset = (kv_len > seq_len)
+                                                             ? (kv_len - seq_len)
+                                                             : 0;
+                        for (int row = 0; row < seq_len; ++row)
+                        {
+                            if (!compute_decode_tqkv(
+                                    Q_ptr + static_cast<size_t>(row) * q_stride,
+                                    K_tq8, V_tq4,
+                                    O_ptr + static_cast<size_t>(row) * q_stride,
+                                    kv_len, n_heads, n_kv_heads, head_dim,
+                                    causal, base_position_offset + row,
+                                    head_start, gqa_n_rep))
+                            {
+                                return false;
+                            }
+                        }
+                        return true;
                     }
                 }
             }
@@ -759,11 +787,21 @@ namespace llaminar2
                                                         : 0;
                         if (kv_len != seq_len)
                         {
-                            return compute_decode_q8kv(
-                                Q_ptr, K_q8, V_q8, O_ptr,
-                                kv_len, n_heads, n_kv_heads, head_dim,
-                                causal, position_offset,
-                                head_start, gqa_n_rep);
+                            const int q_stride = n_heads * head_dim;
+                            for (int row = 0; row < seq_len; ++row)
+                            {
+                                if (!compute_decode_q8kv(
+                                        Q_ptr + static_cast<size_t>(row) * q_stride,
+                                        K_q8, V_q8,
+                                        O_ptr + static_cast<size_t>(row) * q_stride,
+                                        kv_len, n_heads, n_kv_heads, head_dim,
+                                        causal, position_offset + row,
+                                        head_start, gqa_n_rep))
+                                {
+                                    return false;
+                                }
+                            }
+                            return true;
                         }
                     }
                 }
@@ -808,6 +846,155 @@ namespace llaminar2
                                           causal, window_size, 0, mask,
                                           head_start, gqa_n_rep);
             }
+        }
+
+        /**
+         * @brief Grouped CPU verifier attention for compact MTP rows.
+         *
+         * This is the CPU implementation of the Phase 9.8 verifier contract:
+         * compute all compact verifier rows in one grouped attention call while
+         * preserving the causal visibility of serial one-token decode.  The
+         * promoted Qwen3.6 CPU lane stores hybrid KV cache rows as Q16_1, so the
+         * first production implementation handles Q16_1 K/V directly and fails
+         * closed for other cache formats until their grouped kernels are added.
+         */
+        bool compute_verifier_rows_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
+            int verifier_rows,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size = -1,
+            const IMPIContext *mpi_ctx = nullptr,
+            int device_idx = -1,
+            int head_start = 0,
+            int gqa_n_rep = 0) override
+        {
+            (void)mpi_ctx;
+            (void)device_idx;
+
+            if constexpr (!std::is_same_v<ElementType, float>)
+            {
+                return false;
+            }
+
+            if (!Q || !K || !V || !output ||
+                verifier_rows < 2 || verifier_rows > 4 ||
+                kv_len <= verifier_rows ||
+                n_heads <= 0 || n_kv_heads <= 0 || head_dim <= 0 ||
+                !causal)
+            {
+                return false;
+            }
+
+            const auto *Q_base = dynamic_cast<const TensorBase *>(Q);
+            const auto *K_base = dynamic_cast<const TensorBase *>(K);
+            const auto *V_base = dynamic_cast<const TensorBase *>(V);
+            const auto *K_q16 = dynamic_cast<const Q16_1Tensor *>(K);
+            const auto *V_q16 = dynamic_cast<const Q16_1Tensor *>(V);
+            auto *O_base = dynamic_cast<TensorBase *>(output);
+            if (!Q_base || !K_base || !V_base || !O_base ||
+                output->native_type() != TensorType::FP32)
+            {
+                return false;
+            }
+
+            const float *q_src = Q_base->data();
+            float *out = O_base->mutable_data();
+            if (!q_src || !out)
+            {
+                return false;
+            }
+
+            const int q_stride = n_heads * head_dim;
+            const float *q_rows = q_src;
+            std::vector<float> row_major_q;
+
+            /*
+             * Hybrid Q16 CPU RoPE may leave Q in [head][row][dim] order so the
+             * single-row integer attention kernel can consume one head block.
+             * The grouped kernel operates over logical verifier rows and
+             * therefore gathers that layout once into [row][head][dim].
+             */
+            const auto &q_shape = Q_base->shape();
+            const bool head_major_q =
+                Q_base->native_type() == TensorType::Q16_1 &&
+                q_shape.size() >= 2 &&
+                q_shape[0] == static_cast<size_t>(n_heads * verifier_rows) &&
+                q_shape[1] == static_cast<size_t>(head_dim);
+            if (head_major_q)
+            {
+                row_major_q.assign(static_cast<size_t>(verifier_rows) *
+                                       static_cast<size_t>(q_stride),
+                                   0.0f);
+                for (int row = 0; row < verifier_rows; ++row)
+                {
+                    for (int h = 0; h < n_heads; ++h)
+                    {
+                        const size_t src_offset =
+                            (static_cast<size_t>(h) * static_cast<size_t>(verifier_rows) +
+                             static_cast<size_t>(row)) *
+                            static_cast<size_t>(head_dim);
+                        const size_t dst_offset =
+                            static_cast<size_t>(row) * static_cast<size_t>(q_stride) +
+                            static_cast<size_t>(h) * static_cast<size_t>(head_dim);
+                        std::copy_n(q_src + src_offset, head_dim,
+                                    row_major_q.data() + dst_offset);
+                    }
+                }
+                q_rows = row_major_q.data();
+            }
+
+            const int base_position_offset = kv_len - verifier_rows;
+            if (K_q16 && V_q16)
+            {
+                return compute_prefill_q16kv(
+                    q_rows,
+                    K_q16,
+                    V_q16,
+                    out,
+                    verifier_rows,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal,
+                    window_size,
+                    base_position_offset,
+                    head_start,
+                    gqa_n_rep,
+                    /*force_decode_tile_policy=*/true);
+            }
+
+            const float *k_fp32 = K_base->fp32_data();
+            const float *v_fp32 = V_base->fp32_data();
+            if (k_fp32 && v_fp32)
+            {
+                return compute_flash_fp32(
+                    q_rows,
+                    k_fp32,
+                    v_fp32,
+                    out,
+                    verifier_rows,
+                    kv_len,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    causal,
+                    window_size,
+                    base_position_offset,
+                    /*mask=*/nullptr,
+                    head_start,
+                    gqa_n_rep,
+                    /*force_decode_tile_policy=*/true);
+            }
+
+            return false;
         }
 
         /**
@@ -3074,7 +3261,8 @@ namespace llaminar2
             bool causal, int window_size, int position_offset,
             const float *mask,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            bool force_decode_tile_policy = false)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3097,9 +3285,22 @@ namespace llaminar2
 
             // --- Pre-compute constants ---
             const bool use_avx512 = cpu_supports_avx512();
-            const bool is_decode = (seq_len == 1 && kv_len >= 1);
+            const bool is_decode = ((seq_len == 1 || force_decode_tile_policy) && kv_len >= 1);
 
-            // Choose the KV tile size based on cache hierarchy.
+            // Choose the KV tile size based on cache hierarchy.  Ordinary
+            // decode/prefill uses one logical KV length for the whole call.
+            // The MTP verifier is different: row r is mathematically the same
+            // as a serial one-token decode at KV length
+            // `position_offset + r + 1`, even though the cache already contains
+            // the later speculative rows.  In that mode we compute a row-local
+            // tile below so the grouped verifier matches serial decode
+            // numerically instead of merely relying on causal masks.
+            const bool decode_equivalent_verifier_rows =
+                force_decode_tile_policy &&
+                seq_len > 1 &&
+                kv_len > seq_len &&
+                causal &&
+                mask == nullptr;
             const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(head_dim, n_kv_heads, kv_len, is_decode);
 
             // For Grouped Query Attention: how many Q heads share one KV head.
@@ -3233,7 +3434,7 @@ namespace llaminar2
             }
 
             // ---------------------------------------------------------------
-            // Phase 2: Main flash-attention loop (parallel over heads)
+            // Phase 2: Main flash-attention loop.
             // ---------------------------------------------------------------
             // Compute optimal thread count.  For small problems (short
             // sequences, decode), the per-head work may be too small to
@@ -3245,8 +3446,32 @@ namespace llaminar2
             auto work = [&]()
             {
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
+                for (int task = 0;
+                     task < (decode_equivalent_verifier_rows
+                                 ? n_heads * seq_len
+                                 : n_heads);
+                     ++task)
                 {
+                    /*
+                     * Ordinary prefill/decode parallelizes by head and keeps
+                     * all query rows for a head in one task.  MTP verifier
+                     * decode-equivalent groups are different: M is only 2..4,
+                     * each row performs a long causal decode, and keeping all
+                     * rows inside one head task makes long-context M=2 slower
+                     * than two serial decodes.  Splitting only this verifier
+                     * mode by (head,row) improves task balance without changing
+                     * per-row floating-point order.
+                     */
+                    const int h = decode_equivalent_verifier_rows
+                                      ? (task / seq_len)
+                                      : task;
+                    const int q_begin = decode_equivalent_verifier_rows
+                                            ? (task % seq_len)
+                                            : 0;
+                    const int q_end = decode_equivalent_verifier_rows
+                                          ? q_begin + 1
+                                          : seq_len;
+
                     // GQA mapping: which KV head does this Q head read from?
                     // When gqa_n_rep > 0, KV heads are REPLICATED (each rank has all KV heads),
                     // so we need the global head position (head_start + h) to index into the
@@ -3266,7 +3491,7 @@ namespace llaminar2
                                                           : nullptr;
 
                     // --- Loop over query positions for this head ---
-                    for (int q_pos = 0; q_pos < seq_len; ++q_pos)
+                    for (int q_pos = q_begin; q_pos < q_end; ++q_pos)
                     {
                         // Pointer to this (q_pos, head) slice of the output buffer.
                         float *out = output + static_cast<size_t>(q_pos) * q_stride + static_cast<size_t>(h) * head_dim;
@@ -3288,6 +3513,14 @@ namespace llaminar2
                         // Optional additive mask row for this query position.
                         const float *mask_row = mask ? (mask + static_cast<size_t>(q_pos) * kv_len) : nullptr;
 
+                        const int query_kv_len = decode_equivalent_verifier_rows
+                                                     ? std::min(kv_len, position_offset + q_pos + 1)
+                                                     : kv_len;
+                        const int query_kv_tile = decode_equivalent_verifier_rows
+                                                      ? detail::DefaultFlashKVTilePolicy::choose(
+                                                            head_dim, n_kv_heads, query_kv_len, /*is_decode=*/true)
+                                                      : kv_tile;
+
                         // Stack-allocated I16 quantised Q buffer.
                         alignas(64) int16_t q_i16[detail::kMaxI16RowStride];
                         float q_scale_i16 = 0.0f;
@@ -3305,9 +3538,9 @@ namespace llaminar2
                         //   (a) compute QK scores (the "QK phase")
                         //   (b) run the online softmax correction
                         //   (c) accumulate weighted V into the output (the "V phase")
-                        for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                        for (int k0 = 0; k0 < query_kv_len; k0 += query_kv_tile)
                         {
-                            const int k1 = std::min(k0 + kv_tile, kv_len); // End of this tile
+                            const int k1 = std::min(k0 + query_kv_tile, query_kv_len); // End of this tile
                             float block_max = -std::numeric_limits<float>::infinity();
 
                             // Stack-allocated score buffer (max tile size bounded by policy).
@@ -3650,7 +3883,8 @@ namespace llaminar2
             int n_heads, int n_kv_heads, int head_dim,
             bool causal, int window_size, int position_offset,
             int head_start = 0,
-            int gqa_n_rep = 0)
+            int gqa_n_rep = 0,
+            bool force_decode_tile_policy = false)
         {
             KERNEL_PROFILE_SCOPE(KernelType::ATTENTION);
 
@@ -3671,6 +3905,14 @@ namespace llaminar2
             const size_t blocks_per_kv_row = K_q16->blocks_per_row();
             constexpr size_t QS_OFFSET = sizeof(float) + sizeof(int32_t); // = 8 bytes
 
+            const size_t blocks_per_head_detect =
+                (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
+            const bool is_head_major =
+                (blocks_per_kv_row == blocks_per_head_detect && n_kv_heads > 1);
+            const size_t rows_per_head = is_head_major
+                                             ? (K_q16->rows() / static_cast<size_t>(n_kv_heads))
+                                             : 0;
+
             const uint8_t *k_raw = static_cast<const uint8_t *>(K_q16->raw_data());
             const uint8_t *v_raw = static_cast<const uint8_t *>(V_q16->raw_data());
             if (!k_raw || !v_raw)
@@ -3679,7 +3921,7 @@ namespace llaminar2
             const int q_stride = n_heads * head_dim;
 
             // KV tile size for prefill
-            const bool is_decode = (seq_len == 1 && kv_len >= 1);
+            const bool is_decode = ((seq_len == 1 || force_decode_tile_policy) && kv_len >= 1);
             const int kv_tile = detail::DefaultFlashKVTilePolicy::choose(
                 head_dim, n_kv_heads, kv_len, is_decode);
 
@@ -3706,10 +3948,16 @@ namespace llaminar2
                                          ? (head_start + h) / heads_per_kv
                                          : h / heads_per_kv;
 
-                    // Hoist per-head block layout invariants
+                    // Hoist per-head block layout invariants. Q16_1 KV caches
+                    // may be either [position][head][dim] or [head][position][dim].
+                    // The grouped verifier must read the same logical cache
+                    // rows as serial decode, so both layouts share the same
+                    // address formula as compute_decode_q16kv().
                     const size_t blocks_per_head = (static_cast<size_t>(head_dim) + block_elems - 1) / block_elems;
-                    const size_t head_block_start = static_cast<size_t>(kv_h) * blocks_per_head;
                     const size_t row_stride_bytes = blocks_per_kv_row * block_bytes;
+                    const size_t head_block_start = is_head_major
+                                                        ? (static_cast<size_t>(kv_h) * rows_per_head * blocks_per_head)
+                                                        : (static_cast<size_t>(kv_h) * blocks_per_head);
                     const size_t blk_off_bytes = head_block_start * block_bytes;
 
                     float block_scores[detail::kMaxKVTile];
@@ -4100,12 +4348,64 @@ namespace llaminar2
             uint64_t qk_duration_ns = 0;
             uint64_t v_duration_ns = 0;
 
-            const int attn_threads = computeOptimalAttentionThreads(
-                n_heads, 1, kv_len, head_dim, causal);
-
             // For VNNI QK: Q is quantized once per head to int16 (head_dim elements).
             // qmax=2047 ≈ 12 effective bits, matching the existing I12 scheme.
             constexpr int QMAX = 2047;
+
+            // =================================================================
+            // Split-KV parallelization (FlashDecoding-style)
+            //
+            // When n_heads << available threads, head-parallel attention wastes
+            // cores (e.g. 8 heads on 28 threads = 71% idle). Split-KV distributes
+            // KV chunks across surplus threads, then reduces partial online
+            // softmax states. Each (head, kv_chunk) pair is an independent work
+            // item. Q quantization is redundantly computed per-item (cheap: single
+            // row of head_dim int16s).
+            //
+            // Activation thresholds (conservative to avoid overhead on small KV):
+            //   - Thread utilization ≤50% (n_heads * 2 ≤ max_threads)
+            //   - Enough KV work per chunk (min 128 positions/chunk)
+            //   - KV length ≥ 512 to amortize scheduling + reduction overhead
+            // =================================================================
+            const int max_threads_avail = omp_get_max_threads();
+            const bool use_split_kv = (n_heads * 2 <= max_threads_avail) && (kv_len >= 512);
+
+            int kv_splits = 1;
+            int kv_chunk_size = kv_len;
+            int total_work_items = n_heads;
+            const int padded_hd = (head_dim + 15) & ~15; // 16-float aligned for AVX-512
+
+            // Persistent partial result storage — avoids per-call heap allocation.
+            // Safe: this static function is always called from the same executor
+            // thread (sequential stage execution), and OMP workers only access
+            // these via captured references inside the parallel region.
+            static std::vector<float> split_partial_out;
+            static std::vector<float> split_partial_m;
+            static std::vector<float> split_partial_l;
+
+            if (use_split_kv)
+            {
+                kv_splits = std::min(
+                    (max_threads_avail + n_heads - 1) / n_heads,
+                    std::max(1, kv_len / 128) // at least 128 KV positions per chunk
+                );
+                kv_chunk_size = (kv_len + kv_splits - 1) / kv_splits;
+                total_work_items = n_heads * kv_splits;
+
+                // Grow-only: avoid repeated alloc/dealloc across calls
+                const size_t out_need = static_cast<size_t>(total_work_items) * padded_hd;
+                if (split_partial_out.size() < out_need)
+                    split_partial_out.resize(out_need);
+                if (split_partial_m.size() < static_cast<size_t>(total_work_items))
+                    split_partial_m.resize(total_work_items);
+                if (split_partial_l.size() < static_cast<size_t>(total_work_items))
+                    split_partial_l.resize(total_work_items);
+                // No need to zero — each work item's std::fill and
+                // explicit writes to partial_m/partial_l handle initialization
+            }
+
+            const int attn_threads = computeOptimalAttentionThreads(
+                n_heads, 1, kv_len, head_dim, causal);
 
             auto work = [&]()
             {
@@ -4113,14 +4413,33 @@ namespace llaminar2
                 alignas(64) int16_t q_i16_buf[detail::kMaxI16RowStride];
 
 #pragma omp for schedule(static) reduction(+ : qk_duration_ns, v_duration_ns)
-                for (int h = 0; h < n_heads; ++h)
+                for (int item = 0; item < total_work_items; ++item)
                 {
+                    // Derive head index and KV range from work item
+                    const int h = use_split_kv ? (item / kv_splits) : item;
+                    const int kv_range_start = use_split_kv ? ((item % kv_splits) * kv_chunk_size) : 0;
+                    const int kv_range_end = use_split_kv
+                                                 ? std::min(kv_range_start + kv_chunk_size, kv_len)
+                                                 : kv_len;
+                    if (kv_range_start >= kv_len)
+                        continue;
+
                     // GQA mapping: replicated KV uses global head position;
                     // sharded KV uses local indexing (see compute_flash_fp32 comment).
                     const int kv_h = (gqa_n_rep > 0)
                                          ? (head_start + h) / heads_per_kv
                                          : h / heads_per_kv;
-                    float *out = output + static_cast<size_t>(h) * head_dim;
+
+                    // Output pointer: partial buffer for split-KV, direct output otherwise
+                    float *out;
+                    if (use_split_kv)
+                    {
+                        out = split_partial_out.data() + static_cast<size_t>(item) * padded_hd;
+                    }
+                    else
+                    {
+                        out = output + static_cast<size_t>(h) * head_dim;
+                    }
                     std::fill(out, out + head_dim, 0.0f);
 
                     float running_m = -std::numeric_limits<float>::infinity();
@@ -4151,9 +4470,9 @@ namespace llaminar2
 
                     float block_scores[detail::kMaxKVTile];
 
-                    for (int k0 = 0; k0 < kv_len; k0 += kv_tile)
+                    for (int k0 = kv_range_start; k0 < kv_range_end; k0 += kv_tile)
                     {
-                        const int k1 = std::min(k0 + kv_tile, kv_len);
+                        const int k1 = std::min(k0 + kv_tile, kv_range_end);
                         float block_max = -std::numeric_limits<float>::infinity();
 
                         const int blk = k1 - k0;
@@ -4431,31 +4750,131 @@ namespace llaminar2
                         running_l = new_l;
                     } // end KV tile loop
 
-                    // Final normalisation
-                    if (running_l > 0.0f)
+                    if (use_split_kv)
                     {
-                        const float inv_l = 1.0f / running_l;
-#if defined(__AVX512F__)
-                        const __m512 vi = _mm512_set1_ps(inv_l);
-                        int sd = 0;
-                        for (; sd + 15 < head_dim; sd += 16)
-                            _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
-                        for (; sd < head_dim; ++sd)
-                            out[sd] *= inv_l;
-#else
-                        const __m256 vi = _mm256_set1_ps(inv_l);
-                        int sd = 0;
-                        for (; sd + 7 < head_dim; sd += 8)
-                            _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
-                        for (; sd < head_dim; ++sd)
-                            out[sd] *= inv_l;
-#endif
+                        // Store partial online softmax state for reduction
+                        split_partial_m[item] = running_m;
+                        split_partial_l[item] = running_l;
+                        // out (partial buffer) already accumulated
                     }
-                } // end head loop
+                    else
+                    {
+                        // Final normalisation (original head-parallel path)
+                        if (running_l > 0.0f)
+                        {
+                            const float inv_l = 1.0f / running_l;
+#if defined(__AVX512F__)
+                            const __m512 vi = _mm512_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= inv_l;
+#else
+                            const __m256 vi = _mm256_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 7 < head_dim; sd += 8)
+                                _mm256_storeu_ps(out + sd, _mm256_mul_ps(vi, _mm256_loadu_ps(out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                out[sd] *= inv_l;
+#endif
+                        }
+                    }
+                } // end item loop
+
+                // =============================================================
+                // Split-KV reduction: merge partial online softmax per head
+                //
+                // For each head, we have kv_splits partial results with:
+                //   partial_m[i] = max score seen in chunk i
+                //   partial_l[i] = sum of exp(score - partial_m[i]) in chunk i
+                //   partial_out[i][d] = sum of exp(score_k - partial_m[i]) * V_k[d]
+                //
+                // To merge: global_m = max(partial_m), then rescale each chunk's
+                // contribution by exp(partial_m[i] - global_m) before summing.
+                // =============================================================
+                if (use_split_kv)
+                {
+                    // implicit barrier from the omp for above ensures all partials are written
+
+#pragma omp for schedule(static)
+                    for (int rh = 0; rh < n_heads; ++rh)
+                    {
+                        float *final_out = output + static_cast<size_t>(rh) * head_dim;
+
+                        // Pass 1: find global max across all splits for this head
+                        float global_m = -std::numeric_limits<float>::infinity();
+                        for (int s = 0; s < kv_splits; ++s)
+                        {
+                            const int idx = rh * kv_splits + s;
+                            if (idx < total_work_items && split_partial_m[idx] > global_m)
+                                global_m = split_partial_m[idx];
+                        }
+
+                        // Pass 2: merge with online softmax correction
+                        std::fill(final_out, final_out + head_dim, 0.0f);
+                        float global_l = 0.0f;
+
+                        for (int s = 0; s < kv_splits; ++s)
+                        {
+                            const int idx = rh * kv_splits + s;
+                            if (idx >= total_work_items || split_partial_l[idx] == 0.0f)
+                                continue;
+
+                            const float correction = std::exp(split_partial_m[idx] - global_m);
+                            global_l += split_partial_l[idx] * correction;
+
+                            const float *pout = split_partial_out.data() +
+                                                static_cast<size_t>(idx) * padded_hd;
+
+                            // Vectorized FMA: final_out[d] += correction * pout[d]
+#if defined(__AVX512F__)
+                            const __m512 vc = _mm512_set1_ps(correction);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(final_out + sd,
+                                                 _mm512_fmadd_ps(vc,
+                                                                 _mm512_loadu_ps(pout + sd),
+                                                                 _mm512_loadu_ps(final_out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                final_out[sd] += correction * pout[sd];
+#else
+                            for (int sd = 0; sd < head_dim; ++sd)
+                                final_out[sd] += correction * pout[sd];
+#endif
+                        }
+
+                        // Final normalization
+                        if (global_l > 0.0f)
+                        {
+                            const float inv_l = 1.0f / global_l;
+#if defined(__AVX512F__)
+                            const __m512 vi = _mm512_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 15 < head_dim; sd += 16)
+                                _mm512_storeu_ps(final_out + sd,
+                                                 _mm512_mul_ps(vi, _mm512_loadu_ps(final_out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                final_out[sd] *= inv_l;
+#else
+                            const __m256 vi = _mm256_set1_ps(inv_l);
+                            int sd = 0;
+                            for (; sd + 7 < head_dim; sd += 8)
+                                _mm256_storeu_ps(final_out + sd,
+                                                 _mm256_mul_ps(vi, _mm256_loadu_ps(final_out + sd)));
+                            for (; sd < head_dim; ++sd)
+                                final_out[sd] *= inv_l;
+#endif
+                        }
+                    } // end reduction loop
+                }     // end split-KV reduction
             };
 
-            // Same decode threading strategy — see detailed comment in compute_flash_fp32.
-            const bool force_full_pool_q16 = kv_len > 100;
+            // Threading strategy:
+            // - Split-KV: always use full thread pool (that's the whole point)
+            // - Large KV (>100): use full pool for head-parallel
+            // - Small KV: use computeOptimalAttentionThreads() cap
+            const bool force_full_pool_q16 = kv_len > 100 || use_split_kv;
 
             int actual_threads_q16;
             if (force_full_pool_q16)

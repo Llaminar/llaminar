@@ -62,6 +62,37 @@ TEST(Test__BufferArena, RegisterExternalBufferSucceeds)
     EXPECT_TRUE(arena.isRegistered(BufferId::LOGITS));
 }
 
+TEST(Test__BufferArena, BindExternalBufferCanReplaceDynamicScratch)
+{
+    auto first = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 128}, DeviceId::cpu());
+    auto second = std::make_shared<FP32Tensor>(std::vector<size_t>{3, 128}, DeviceId::cpu());
+
+    BufferArena arena;
+    ASSERT_TRUE(arena.bindExternalBuffer(BufferId::ALL_POSITION_LOGITS, first.get()));
+    EXPECT_TRUE(arena.isRegistered(BufferId::ALL_POSITION_LOGITS));
+    EXPECT_EQ(arena.getTensor(BufferId::ALL_POSITION_LOGITS), first.get());
+    EXPECT_EQ(arena.getRows(BufferId::ALL_POSITION_LOGITS), 2u);
+
+    arena.markWrittenFlagsOnly(BufferId::ALL_POSITION_LOGITS, DeviceId::cpu());
+    EXPECT_EQ(arena.getCoherenceState(BufferId::ALL_POSITION_LOGITS).authority,
+              CoherenceState::HOST);
+
+    ASSERT_TRUE(arena.bindExternalBuffer(BufferId::ALL_POSITION_LOGITS, second.get()));
+    EXPECT_EQ(arena.getTensor(BufferId::ALL_POSITION_LOGITS), second.get());
+    EXPECT_EQ(arena.getRows(BufferId::ALL_POSITION_LOGITS), 3u);
+    EXPECT_EQ(arena.getCoherenceState(BufferId::ALL_POSITION_LOGITS).authority,
+              CoherenceState::UNINITIALIZED);
+}
+
+TEST(Test__BufferArena, BindExternalBufferRejectsArenaOwnedSlot)
+{
+    BufferArena arena;
+    ASSERT_TRUE(arena.registerBuffer(BufferId::LOGITS, 1, 128, "FP32", DeviceId::cpu()));
+
+    auto external = std::make_shared<FP32Tensor>(std::vector<size_t>{2, 128}, DeviceId::cpu());
+    EXPECT_FALSE(arena.bindExternalBuffer(BufferId::LOGITS, external.get()));
+}
+
 TEST(Test__BufferArena, UnregisteredBufferReturnsNullTensor)
 {
     BufferArena arena;
@@ -708,6 +739,8 @@ TEST(Test__BufferId, NameRoundTrips)
     EXPECT_STREQ(bufferIdName(BufferId::HIDDEN_STATE), "HIDDEN_STATE");
     EXPECT_STREQ(bufferIdName(BufferId::Q_PROJ), "Q_PROJ");
     EXPECT_STREQ(bufferIdName(BufferId::ALLREDUCE_STAGING), "ALLREDUCE_STAGING");
+    EXPECT_STREQ(bufferIdName(BufferId::MTP_PROJECTED), "MTP_PROJECTED");
+    EXPECT_STREQ(bufferIdName(BufferId::MTP_LOGITS), "MTP_LOGITS");
 }
 
 TEST(Test__BufferId, CountIsReasonable)

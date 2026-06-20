@@ -26,7 +26,7 @@ namespace llaminar2
             throw std::invalid_argument("PPExecutionStrategy: pp_ctx cannot be null");
         }
 
-        LOG_INFO("PPExecutionStrategy: Created with " << pp_ctx_->numStages() << " stages");
+        LOG_DEBUG("PPExecutionStrategy: Created with " << pp_ctx_->numStages() << " stages");
     }
 
     bool PPExecutionStrategy::executeForward(

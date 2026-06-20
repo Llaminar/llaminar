@@ -1026,7 +1026,7 @@ namespace llaminar2::verification
             return "";
         }
 
-        LOG_INFO("[TensorVerification] Dumping stage buffers to: " << dump_path);
+        LOG_DEBUG("[TensorVerification] Dumping stage buffers to: " << dump_path);
 
         // Dump inputs
         for (const auto &input : dump_info.inputs)

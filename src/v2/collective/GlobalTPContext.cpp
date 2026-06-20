@@ -11,13 +11,18 @@
 
 #include "GlobalTPContext.h"
 #include "DeviceGroup.h"
+#include "backends/ShmemSpinBackend.h"
 #include "../config/TPDomain.h"
 #include "../tensors/Tensors.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/NodeDetection.h"
+#include <chrono>
 #include <mpi.h>
+#include <thread>
 #include <utility>
 #include <algorithm>
+#include <limits>
 #include <set>
 
 namespace llaminar2
@@ -57,12 +62,12 @@ namespace llaminar2
             node_count_ = domain_size_;
             all_same_node_ = (domain_size_ <= 1);
         }
-        // Create UPI backend for collective operations
+        // Create collective backend. Same-node UPI domains use ShmemSpin as an
+        // opportunistic fast path for supported allreduces, while retaining UPI
+        // as the fallback backend for unsupported collectives and init failures.
         if (domain_comm_ != MPI_COMM_NULL)
         {
-            backend_ = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
-
-            // Initialize the backend with a minimal device group for CPU TP
+            // Build the device group (needed by both backends)
             DeviceGroup group;
             group.name = "global_tp_domain_" + std::to_string(domain_id);
             group.scope = CollectiveScope::LOCAL; // Cross-socket on same node
@@ -70,14 +75,78 @@ namespace llaminar2
             {
                 group.devices.push_back(DeviceId::cpu());
             }
-            backend_->initialize(group);
 
-            LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
-                                                             << " with rank " << my_rank_in_domain_
-                                                             << "/" << domain_size_
-                                                             << " (owns_comm=" << owns_communicator_
-                                                             << ", all_same_node=" << all_same_node_
-                                                             << ", node_count=" << node_count_ << ")");
+            CollectiveBackendType effective_backend = backend_type_;
+            if (effective_backend == CollectiveBackendType::AUTO)
+                effective_backend = CollectiveBackendType::UPI;
+
+            auto create_upi_backend = [&]() -> std::unique_ptr<ICollectiveBackend>
+            {
+                auto upi = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
+                if (!upi->initialize(group))
+                {
+                    LOG_ERROR("GlobalTPContext: Failed to initialize UPICollectiveBackend for domain "
+                              << domain_id_ << " requested_backend="
+                              << collectiveBackendTypeToString(backend_type_)
+                              << " error=" << upi->lastError());
+                    return nullptr;
+                }
+                return upi;
+            };
+
+            if (effective_backend == CollectiveBackendType::UPI && all_same_node_ && domain_size_ > 1)
+            {
+                backend_type_ = effective_backend;
+                auto upi_fallback = std::make_unique<UPICollectiveBackend>(domain_comm_, nullptr);
+                auto shmem = std::make_unique<ShmemSpinBackend>(
+                    domain_id_, my_rank_in_domain_, std::move(upi_fallback));
+
+                if (shmem->initialize(group))
+                {
+                    backend_ = std::move(shmem);
+                    LOG_DEBUG("GlobalTPContext: Using ShmemSpinBackend for domain " << domain_id_
+                                                                                    << " (same-node UPI fast path, domain_size="
+                                                                                    << domain_size_ << ")");
+                }
+                else
+                {
+                    LOG_WARN("GlobalTPContext: ShmemSpinBackend unavailable for domain " << domain_id_
+                                                                                         << "; falling back to UPI (error="
+                                                                                         << shmem->lastError() << ")");
+                    backend_ = create_upi_backend();
+                }
+            }
+            else if (effective_backend == CollectiveBackendType::UPI ||
+                     effective_backend == CollectiveBackendType::MPI)
+            {
+                backend_type_ = effective_backend;
+                backend_ = create_upi_backend();
+                if (backend_)
+                {
+                    LOG_DEBUG("GlobalTPContext: Using UPICollectiveBackend for domain " << domain_id_
+                                                                                        << " (domain_size=" << domain_size_
+                                                                                        << ", all_same_node=" << all_same_node_
+                                                                                        << ", requested_backend="
+                                                                                        << collectiveBackendTypeToString(backend_type_) << ")");
+                }
+            }
+            else
+            {
+                LOG_ERROR("GlobalTPContext: Unsupported backend "
+                          << collectiveBackendTypeToString(backend_type_)
+                          << " for CPU cross-rank GlobalTP domain " << domain_id_);
+            }
+
+            if (backend_)
+            {
+                LOG_DEBUG("GlobalTPContext: Created for domain " << domain_id_
+                                                                 << " with rank " << my_rank_in_domain_
+                                                                 << "/" << domain_size_
+                                                                 << " (owns_comm=" << owns_communicator_
+                                                                 << ", all_same_node=" << all_same_node_
+                                                                 << ", node_count=" << node_count_
+                                                                 << ", backend=" << backend_->name() << ")");
+            }
         }
     }
 
@@ -142,7 +211,8 @@ namespace llaminar2
         int domain_id,
         int color,
         int key,
-        const std::string &hostfile_path)
+        const std::string &hostfile_path,
+        CollectiveBackendType backend_type)
     {
         if (base_comm == MPI_COMM_NULL)
         {
@@ -156,6 +226,15 @@ namespace llaminar2
         if (err != MPI_SUCCESS)
         {
             LOG_ERROR("GlobalTPContext::createWithSplit - MPI_Comm_split failed with error " << err);
+            return nullptr;
+        }
+
+        // Non-participant: color == MPI_UNDEFINED produces MPI_COMM_NULL.
+        // Return nullptr gracefully so the caller knows this rank is not in the domain.
+        if (new_comm == MPI_COMM_NULL)
+        {
+            LOG_DEBUG("GlobalTPContext::createWithSplit - rank excluded from domain " << domain_id
+                                                                                      << " (color=MPI_UNDEFINED)");
             return nullptr;
         }
 
@@ -192,7 +271,7 @@ namespace llaminar2
             domain_size,
             std::move(world_ranks),
             true, // owns_communicator = true (we created it)
-            CollectiveBackendType::UPI,
+            backend_type,
             std::move(detection.node_ids)));
     }
 
@@ -200,7 +279,8 @@ namespace llaminar2
         MPI_Comm comm,
         int domain_id,
         std::vector<int> world_ranks,
-        std::vector<int> node_ids)
+        std::vector<int> node_ids,
+        CollectiveBackendType backend_type)
     {
         if (comm == MPI_COMM_NULL)
         {
@@ -231,7 +311,7 @@ namespace llaminar2
             domain_size,
             std::move(world_ranks),
             false, // owns_communicator = false (test owns it)
-            CollectiveBackendType::UPI,
+            backend_type,
             std::move(node_ids)));
     }
 
@@ -244,8 +324,14 @@ namespace llaminar2
         // Free the communicator if we own it
         if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
         {
-            LOG_DEBUG("GlobalTPContext: Freeing owned communicator for domain " << domain_id_);
-            MPI_Comm_free(&domain_comm_);
+            // Guard against static destruction after MPI_Finalize
+            int mpi_finalized = 0;
+            MPI_Finalized(&mpi_finalized);
+            if (!mpi_finalized)
+            {
+                LOG_DEBUG("GlobalTPContext: Freeing owned communicator for domain " << domain_id_);
+                MPI_Comm_free(&domain_comm_);
+            }
             domain_comm_ = MPI_COMM_NULL;
         }
     }
@@ -255,7 +341,7 @@ namespace llaminar2
     // =============================================================================
 
     GlobalTPContext::GlobalTPContext(GlobalTPContext &&other) noexcept
-        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_(std::move(other.backend_))
+        : domain_comm_(other.domain_comm_), domain_id_(other.domain_id_), my_rank_in_domain_(other.my_rank_in_domain_), domain_size_(other.domain_size_), world_ranks_(std::move(other.world_ranks_)), node_ids_(std::move(other.node_ids_)), all_same_node_(other.all_same_node_), node_count_(other.node_count_), owns_communicator_(other.owns_communicator_), backend_type_(other.backend_type_), backend_(std::move(other.backend_)), abort_requested_(other.abort_requested_.load(std::memory_order_acquire))
     {
         // Clear source to prevent double-free
         other.domain_comm_ = MPI_COMM_NULL;
@@ -274,7 +360,10 @@ namespace llaminar2
             // Free our communicator if we own it
             if (owns_communicator_ && domain_comm_ != MPI_COMM_NULL)
             {
-                MPI_Comm_free(&domain_comm_);
+                int mpi_finalized = 0;
+                MPI_Finalized(&mpi_finalized);
+                if (!mpi_finalized)
+                    MPI_Comm_free(&domain_comm_);
             }
 
             // Transfer ownership
@@ -287,7 +376,9 @@ namespace llaminar2
             all_same_node_ = other.all_same_node_;
             node_count_ = other.node_count_;
             owns_communicator_ = other.owns_communicator_;
+            backend_type_ = other.backend_type_;
             backend_ = std::move(other.backend_);
+            abort_requested_.store(other.abort_requested_.load(std::memory_order_acquire), std::memory_order_release);
 
             // Clear source to prevent double-free
             other.domain_comm_ = MPI_COMM_NULL;
@@ -323,6 +414,12 @@ namespace llaminar2
     bool GlobalTPContext::allreduce(TensorBase *tensor, const std::string &stage_name, size_t count)
     {
         (void)stage_name; // Stage name currently not used by GLOBAL TP backend
+
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allreduce - abort already requested for domain " << domain_id_);
+            return false;
+        }
 
         if (!tensor)
         {
@@ -366,6 +463,12 @@ namespace llaminar2
 
     bool GlobalTPContext::broadcast(TensorBase *tensor, int source_index)
     {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::broadcast - abort already requested for domain " << domain_id_);
+            return false;
+        }
+
         if (!tensor)
         {
             LOG_ERROR("GlobalTPContext::broadcast - tensor is null");
@@ -406,6 +509,12 @@ namespace llaminar2
 
     bool GlobalTPContext::allgather(const TensorBase *local_shard, TensorBase *global_tensor)
     {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allgather - abort already requested for domain " << domain_id_);
+            return false;
+        }
+
         if (!local_shard)
         {
             LOG_ERROR("GlobalTPContext::allgather - local_shard is null");
@@ -456,6 +565,22 @@ namespace llaminar2
         return backend_->allgather(send_data, recv_data, local_count, CollectiveDataType::FLOAT32);
     }
 
+    void GlobalTPContext::requestAbort()
+    {
+        const bool was_set = abort_requested_.exchange(true, std::memory_order_acq_rel);
+        if (was_set)
+            return;
+
+        LOG_ERROR("GlobalTPContext: Abort requested for domain " << domain_id_
+                                                                 << " rank " << my_rank_in_domain_ << "/" << domain_size_
+                                                                 << "; aborting backend and MPI job to avoid rank desynchronization");
+        if (backend_)
+            backend_->abort();
+
+        if (domain_comm_ != MPI_COMM_NULL && domain_size_ > 1)
+            MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
     // =============================================================================
     // IGlobalTPContext Implementation
     // =============================================================================
@@ -498,10 +623,90 @@ namespace llaminar2
 
     void GlobalTPContext::barrier() const
     {
-        if (domain_comm_ != MPI_COMM_NULL)
+        if (domain_comm_ == MPI_COMM_NULL)
+            return;
+
+        const int timeout_ms = debugEnv().tp_collect_timeout_ms;
+        if (timeout_ms <= 0)
         {
             MPI_Barrier(domain_comm_);
+            return;
         }
+
+        MPI_Request request = MPI_REQUEST_NULL;
+        int result = MPI_Ibarrier(domain_comm_, &request);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("GlobalTPContext::barrier - MPI_Ibarrier failed with code " << result
+                                                                                  << " on domain " << domain_id_ << " rank " << my_rank_in_domain_
+                                                                                  << "/" << domain_size_);
+            return;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        int complete = 0;
+        while (!complete)
+        {
+            result = MPI_Test(&request, &complete, MPI_STATUS_IGNORE);
+            if (result != MPI_SUCCESS || complete)
+                break;
+
+            if (std::chrono::steady_clock::now() >= deadline)
+            {
+                LOG_ERROR("GlobalTPContext::barrier timed out after " << timeout_ms
+                                                                      << "ms on domain " << domain_id_ << " rank " << my_rank_in_domain_
+                                                                      << "/" << domain_size_
+                                                                      << "; aborting MPI job to avoid rank desynchronization");
+                if (backend_)
+                    backend_->abort();
+                MPI_Abort(MPI_COMM_WORLD, 1);
+                return;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("GlobalTPContext::barrier - MPI_Test failed with code " << result
+                                                                              << " on domain " << domain_id_ << " rank " << my_rank_in_domain_
+                                                                              << "/" << domain_size_);
+        }
+    }
+
+    bool GlobalTPContext::allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const
+    {
+        if (isAbortRequested())
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - abort already requested for domain "
+                      << domain_id_);
+            return false;
+        }
+        if (domain_comm_ == MPI_COMM_NULL || !send_data || !recv_data || byte_count == 0)
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - invalid arguments for domain "
+                      << domain_id_);
+            return false;
+        }
+        if (byte_count > static_cast<size_t>(std::numeric_limits<int>::max()))
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - byte_count too large for MPI_Allgather: "
+                      << byte_count);
+            return false;
+        }
+
+        const int count = static_cast<int>(byte_count);
+        const int result = MPI_Allgather(send_data, count, MPI_BYTE,
+                                         recv_data, count, MPI_BYTE,
+                                         domain_comm_);
+        if (result != MPI_SUCCESS)
+        {
+            LOG_ERROR("GlobalTPContext::allgatherBytes - MPI_Allgather failed with code "
+                      << result << " on domain " << domain_id_ << " rank "
+                      << my_rank_in_domain_ << "/" << domain_size_);
+            return false;
+        }
+        return true;
     }
 
     bool GlobalTPContext::send(const TensorBase *tensor, int dest_index)
@@ -659,6 +864,11 @@ namespace llaminar2
     int GlobalTPContext::nodeCount() const
     {
         return node_count_;
+    }
+
+    std::string GlobalTPContext::collectiveBackendNameForDiagnostics() const
+    {
+        return backend_ ? backend_->name() : "none";
     }
 
     void GlobalTPContext::detectNodeIds()

@@ -13,6 +13,9 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
 #include "kernels/cuda/gemm/CuBLASGemmKernel.h"
+#include "utils/PrefillGraphBucketDefaults.h"
+#include "../../../../utils/GpuPreparedGemmHarness.h"
+#include "../../../../utils/PreparedWeightTestHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -53,12 +56,18 @@ namespace llaminar2::test::native_vnni_gemm_perf
          { return TestTensorFactory::createQ4_0Random({n, k}); }},
         {"IQ4_NL", 4, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+        {"IQ4_XS", 4, [](size_t n, size_t k)
+         { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
         {"Q4_1", 5, [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
+        {"Q4_K", 5, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ4_KRandom({n, k}); }},
         {"Q5_0", 6, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_0Random({n, k}); }},
         {"Q5_1", 7, [](size_t n, size_t k)
          { return TestTensorFactory::createQ5_1Random({n, k}); }},
+        {"Q5_K", 7, [](size_t n, size_t k)
+         { return TestTensorFactory::createQ5_KRandom({n, k}); }},
         {"Q6_K", 8, [](size_t n, size_t k)
          { return TestTensorFactory::createQ6_KRandom({n, k}); }},
         {"Q3_K", 9, [](size_t n, size_t k)
@@ -91,6 +100,19 @@ namespace llaminar2::test::native_vnni_gemm_perf
     };
 
     inline const std::vector<Shape> kQwenShapes = {
+        // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
+        // These are the production hot-path GEMMs for the grouped MoE prefill/decode
+        // kernels (gate/up: N=512,K=2048; down: N=2048,K=512). The dense NativeVNNI
+        // kernel exercised here shares the same per-codebook decode_groups helpers as
+        // the grouped MoE kernel, so this is a valid A/B harness for decode tuning.
+        {"35BMoE_Expert_GateUp", 512, 2048},
+        {"35BMoE_Expert_Down", 2048, 512},
+        // Qwen3.6 MoE hybrid GDN verifier projections (hidden=2048).
+        // These buckets are distinct from the dense 27B GDN shapes and must be
+        // trained explicitly so M=2..4 verifier rows do not inherit dense-only
+        // dispatch decisions.
+        {"Qwen36MoE_GDN_QKVProjection", 8192, 2048},
+        {"Qwen36MoE_GDN_ZProjection", 4096, 2048},
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},
@@ -133,6 +155,20 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"7B_TP4_FFN_Up", 4736, 3584},
         {"7B_TP4_FFN_Down", 3584, 4736},
         {"7B_TP4_LM_Head", 38016, 3584},
+        {"9B_Attn", 4096, 4096},
+        {"9B_FFN_Up", 12288, 4096},
+        {"9B_FFN_Down", 4096, 12288},
+        {"9B_LM_Head", 248320, 4096},
+        {"Qwen36_Attn_Q", 5120, 5120},
+        {"Qwen36_Attn_KV", 1024, 5120},
+        {"Qwen36_Attn_Wo", 5120, 5120},
+        {"Qwen36_FFN_GateUp", 17408, 5120},
+        {"Qwen36_FFN_Down", 5120, 17408},
+        {"Qwen36_GDN_Inner", 10240, 5120},
+        {"Qwen36_GDN_Z", 6144, 5120},
+        {"Qwen36_GDN_Time", 1024, 5120},
+        {"Qwen36_GDN_Out", 5120, 6144},
+        {"Qwen36_LM_Head", 248320, 5120},
         {"14B_Attn", 5120, 5120},
         {"14B_FFN_Up", 13824, 5120},
         {"14B_FFN_Down", 5120, 13824},
@@ -149,7 +185,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         {"14B_TP4_LM_Head", 38016, 5120},
     };
 
-    inline const std::vector<int> kPrefillMValues = {32, 64, 128};
+    inline const std::vector<int> kPrefillMValues = defaultNativeVNNIDispatchTrainingRows();
 
     struct RunConfig
     {
@@ -501,14 +537,21 @@ namespace llaminar2::test::native_vnni_gemm_perf
             throw std::runtime_error("cudaSetDevice failed");
 
         DeviceId device = DeviceId::cuda(cuda_device_id);
-        if (!weights->ensureOnDevice(device))
-            throw std::runtime_error("Failed to upload weights to CUDA device");
 
-        auto kernel = KernelFactory::createGemm(weights, DeviceType::CUDA);
-        if (!kernel)
-            throw std::runtime_error("KernelFactory::createGemm returned null");
+        // Build the GEMM kernel via the production GPU weight load pipeline.
+        //
+        // NOTE on the API: KernelFactory::prepareGemmHandleLocal() (and therefore
+        // PreparedWeightStore::prepareGemm()) intentionally REJECT GPU INT8-packed
+        // weights — those device kernels must be constructed from VRAM-resident,
+        // VNNI-repacked payloads owned by a WeightVRAMPool. The shared helper
+        // makeGpuPreparedGemm() drives that exact pipeline (upload + GPU repack +
+        // pool-slot kernel construction) and registers the handle through the
+        // un-guarded registerPreparedGemmHandle() path. The returned struct owns
+        // the orchestrator + store and must stay alive while `kernel` is used.
+        auto prepared = makeGpuPreparedGemm(weights, device, "perf.cuda_native_vnni_gemm.weight");
+        ITensorGemm *kernel = prepared.kernel;
 
-        auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+        auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
         std::unique_ptr<DeviceWorkspaceManager> workspace;
         if (workspace_consumer)
         {
@@ -542,7 +585,7 @@ namespace llaminar2::test::native_vnni_gemm_perf
         std::memcpy(A_tensor->mutable_data(), input_ptr, static_cast<size_t>(m) * k * sizeof(float));
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
 
-        DeviceId gpu_device(DeviceType::CUDA, 0);
+        DeviceId gpu_device = DeviceId::cuda(cuda_device_id);
         if (!A_tensor->ensureOnDevice(gpu_device))
             throw std::runtime_error("ensureOnDevice A failed");
         if (!C_tensor->ensureOnDevice(gpu_device))
@@ -557,6 +600,13 @@ namespace llaminar2::test::native_vnni_gemm_perf
             {
                 throw std::runtime_error("CUDA native-vnni GEMM warmup failed");
             }
+        }
+
+        // Surface any sticky CUDA error from warmup before timing so that an
+        // illegal access cannot silently serialize as a 0.000 us row.
+        if (cudaError_t err = cudaDeviceSynchronize(); err != cudaSuccess)
+        {
+            throw std::runtime_error(std::string("CUDA error after warmup: ") + cudaGetErrorString(err));
         }
 
         for (int i = 0; i < bench_runs; ++i)
@@ -581,6 +631,13 @@ namespace llaminar2::test::native_vnni_gemm_perf
             if (!ok)
             {
                 throw std::runtime_error("CUDA native-vnni GEMM bench run failed");
+            }
+
+            // Detect kernel launch / execution errors that would otherwise produce
+            // a bogus ~0 us timing instead of a hard failure.
+            if (cudaError_t err = cudaGetLastError(); err != cudaSuccess)
+            {
+                throw std::runtime_error(std::string("CUDA error during bench run: ") + cudaGetErrorString(err));
             }
 
             times_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);

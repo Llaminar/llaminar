@@ -5,10 +5,12 @@
 
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
+#include "app/MPIShutdown.h"
 #include "app/ChatTemplateResolver.h"
 #include "backends/ComputeBackend.h"
 #include "backends/InventoryPrinter.h"
 #include "config/OrchestrationConfigParser.h"
+#include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
 #include "models/IGraphConfigBuilder.h"
 #include "utils/ChatTemplate.h"
@@ -95,8 +97,7 @@ namespace llaminar2
 
             const bool strict_assert = []()
             {
-                const char *value = std::getenv("LLAMINAR_ASSERT_THREAD_AFFINITY");
-                return value != nullptr && std::string(value) == "1";
+                return debugEnv().runtime_debug.assert_thread_affinity;
             }();
 
             if (!affinity_ok)
@@ -106,7 +107,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("[Main] Startup thread affinity verification failed: " << affinity_details);
                     LOG_ERROR("[Main] Fix launcher pinning (mpirun binding/cpu-set) or set LLAMINAR_ASSERT_THREAD_AFFINITY=0 to downgrade to warning");
-                    MPI_Finalize();
+                    mpiShutdown();
                     return std::nullopt;
                 }
 
@@ -114,7 +115,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_INFO("[Main] Startup thread affinity verification passed");
+                LOG_DEBUG("[Main] Startup thread affinity verification passed");
             }
         }
 
@@ -151,8 +152,8 @@ namespace llaminar2
 
             if (mpi_ctx->rank() == 0)
             {
-                LOG_INFO("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
-                         << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
+                LOG_DEBUG("[Main] CPU shorthand runtime mapping enabled: GLOBAL TP degree="
+                          << config.tp_degree << ", world_size=" << mpi_ctx->world_size());
             }
         }
 
@@ -226,10 +227,36 @@ namespace llaminar2
         // leaves other ranks out of the collective and causes subsequent
         // MPI collectives (e.g. syncInitStep Allreduce) to mis-match and
         // report MPI_ERR_TRUNCATE.
-        const auto &cluster = mpi_ctx->topology().clusterInventory();
+        const auto &cluster = mpi_ctx->concrete_topology().clusterInventory();
         if (mpi_ctx->rank() == 0)
         {
             InventoryPrinter::printClusterInventory(cluster);
+        }
+
+        std::optional<MoEExpertOverlayExecutionPlan> overlay_execution_plan;
+        if (config.moe_expert_parallel_plan && config.moe_expert_parallel_plan->isTieredOverlay())
+        {
+            try
+            {
+                overlay_execution_plan = resolveMoEExpertOverlayExecutionPlan(
+                    config.moe_expert_parallel_plan,
+                    MoEExpertOverlayExecutionPlanResolverOptions{
+                        .current_world_rank = mpi_ctx->rank(),
+                        .world_size = mpi_ctx->world_size(),
+                    });
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[Main] failed to resolve MoE expert overlay execution plan: " << e.what());
+                mpiShutdown();
+                return std::nullopt;
+            }
+
+            if (debugEnv().moe_expert_overlay.trace && mpi_ctx->rank() == 0)
+            {
+                LOG_INFO("[MoEExpertOverlayExecutionPlan]\n"
+                         << overlay_execution_plan->diagnostics());
+            }
         }
 
         // --explain-placement: dump the resolved orchestration config on rank 0.
@@ -237,6 +264,11 @@ namespace llaminar2
         {
             std::cout << "\n=== Placement Explanation ===\n"
                       << config.toString() << std::endl;
+            if (overlay_execution_plan)
+            {
+                std::cout << "\n=== MoE Expert Overlay Role Plan ===\n"
+                          << overlay_execution_plan->diagnostics() << std::endl;
+            }
         }
 
         // Dry-run check (post-MPI)
@@ -246,7 +278,7 @@ namespace llaminar2
             {
                 LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -258,7 +290,7 @@ namespace llaminar2
                 LOG_ERROR("Error: Model path required (-m)\n\n");
                 std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -272,7 +304,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Error: Failed to create orchestration runner");
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -282,7 +314,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to initialize: " << runner->lastError());
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -294,7 +326,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Failed to get tokenizer from runner");
             }
-            MPI_Finalize();
+            mpiShutdown();
             return std::nullopt;
         }
 
@@ -318,9 +350,9 @@ namespace llaminar2
                     {
                         if (mpi_ctx->rank() == 0)
                         {
-                            LOG_INFO("Using model-specific chat template override for '"
-                                     << architecture << "' ("
-                                     << model_template->size() << " bytes)");
+                            LOG_DEBUG("Using model-specific chat template override for '"
+                                      << architecture << "' ("
+                                      << model_template->size() << " bytes)");
                         }
                         tokenizer->setChatTemplate(
                             ChatTemplate::create(*model_template, "", ""));

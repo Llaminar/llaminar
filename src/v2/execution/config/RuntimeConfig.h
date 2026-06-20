@@ -15,6 +15,10 @@
 #include "../../utils/Logger.h"
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
+#include <cmath>
+#include <optional>
+#include <sstream>
 #include <string>
 
 namespace llaminar2
@@ -274,6 +278,351 @@ namespace llaminar2
         }
     }
 
+    inline std::string normalizeRuntimeConfigToken(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(value.begin(), value.end(), '-', '_');
+        return value;
+    }
+
+    enum class PrefixCacheStorageMode
+    {
+        Disabled,
+        Ram,
+        Device,
+        Tiered,
+    };
+
+    inline const char *prefixCacheStorageModeToString(PrefixCacheStorageMode mode)
+    {
+        switch (mode)
+        {
+        case PrefixCacheStorageMode::Disabled:
+            return "disabled";
+        case PrefixCacheStorageMode::Ram:
+            return "ram";
+        case PrefixCacheStorageMode::Device:
+            return "device";
+        case PrefixCacheStorageMode::Tiered:
+            return "tiered";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<PrefixCacheStorageMode> parsePrefixCacheStorageMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "disabled" || normalized == "off")
+            return PrefixCacheStorageMode::Disabled;
+        if (normalized == "ram")
+            return PrefixCacheStorageMode::Ram;
+        if (normalized == "device" || normalized == "vram")
+            return PrefixCacheStorageMode::Device;
+        if (normalized == "tiered")
+            return PrefixCacheStorageMode::Tiered;
+        return std::nullopt;
+    }
+
+    enum class PrefixCacheTerminalStateMode
+    {
+        Off,
+        Auto,
+        Always,
+    };
+
+    inline const char *prefixCacheTerminalStateModeToString(PrefixCacheTerminalStateMode mode)
+    {
+        switch (mode)
+        {
+        case PrefixCacheTerminalStateMode::Off:
+            return "off";
+        case PrefixCacheTerminalStateMode::Auto:
+            return "auto";
+        case PrefixCacheTerminalStateMode::Always:
+            return "always";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<PrefixCacheTerminalStateMode> parsePrefixCacheTerminalStateMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "off" || normalized == "disabled")
+            return PrefixCacheTerminalStateMode::Off;
+        if (normalized == "auto")
+            return PrefixCacheTerminalStateMode::Auto;
+        if (normalized == "always")
+            return PrefixCacheTerminalStateMode::Always;
+        return std::nullopt;
+    }
+
+    enum class PrefixCacheMoEPolicy
+    {
+        Disabled,
+        PlacementFingerprint,
+        InvalidateOnRebalance,
+    };
+
+    inline const char *prefixCacheMoEPolicyToString(PrefixCacheMoEPolicy policy)
+    {
+        switch (policy)
+        {
+        case PrefixCacheMoEPolicy::Disabled:
+            return "disabled";
+        case PrefixCacheMoEPolicy::PlacementFingerprint:
+            return "placement-fingerprint";
+        case PrefixCacheMoEPolicy::InvalidateOnRebalance:
+            return "invalidate-on-rebalance";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<PrefixCacheMoEPolicy> parsePrefixCacheMoEPolicy(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "disabled" || normalized == "off")
+            return PrefixCacheMoEPolicy::Disabled;
+        if (normalized == "placement_fingerprint" || normalized == "fingerprint")
+            return PrefixCacheMoEPolicy::PlacementFingerprint;
+        if (normalized == "invalidate_on_rebalance" || normalized == "invalidate")
+            return PrefixCacheMoEPolicy::InvalidateOnRebalance;
+        return std::nullopt;
+    }
+
+    struct PrefixCacheRuntimeConfig
+    {
+        bool enabled = false;
+        PrefixCacheStorageMode storage_mode = PrefixCacheStorageMode::Tiered;
+        int block_size = 64;
+        size_t ram_budget_bytes = 4ull * 1024ull * 1024ull * 1024ull;
+        size_t device_budget_bytes = 256ull * 1024ull * 1024ull;
+        size_t disk_budget_bytes = 0;
+        std::string disk_dir;
+        PrefixCacheTerminalStateMode terminal_state = PrefixCacheTerminalStateMode::Auto;
+        PrefixCacheMoEPolicy moe_policy = PrefixCacheMoEPolicy::PlacementFingerprint;
+    };
+
+    enum class MTPVerifyMode
+    {
+        Greedy,
+        SpeculativeSampling,
+    };
+
+    inline const char *mtpVerifyModeToString(MTPVerifyMode mode)
+    {
+        switch (mode)
+        {
+        case MTPVerifyMode::Greedy:
+            return "greedy";
+        case MTPVerifyMode::SpeculativeSampling:
+            return "speculative-sampling";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MTPVerifyMode> parseMTPVerifyMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "greedy")
+            return MTPVerifyMode::Greedy;
+        if (normalized == "speculative_sampling" || normalized == "sampling")
+            return MTPVerifyMode::SpeculativeSampling;
+        return std::nullopt;
+    }
+
+    enum class MTPDepthPolicyMode
+    {
+        Fixed,
+        Observe,
+        Dynamic,
+    };
+
+    inline const char *mtpDepthPolicyModeToString(MTPDepthPolicyMode mode)
+    {
+        switch (mode)
+        {
+        case MTPDepthPolicyMode::Fixed:
+            return "fixed";
+        case MTPDepthPolicyMode::Observe:
+            return "observe";
+        case MTPDepthPolicyMode::Dynamic:
+            return "dynamic";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MTPDepthPolicyMode> parseMTPDepthPolicyMode(const std::string &value)
+    {
+        const std::string normalized = normalizeRuntimeConfigToken(value);
+        if (normalized == "fixed" || normalized == "off")
+            return MTPDepthPolicyMode::Fixed;
+        if (normalized == "observe" || normalized == "profile")
+            return MTPDepthPolicyMode::Observe;
+        if (normalized == "dynamic" || normalized == "adaptive")
+            return MTPDepthPolicyMode::Dynamic;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Coarse execution backend used by the generated MTP depth policy.
+     *
+     * The online controller intentionally avoids clocks and backend-specific
+     * performance probes.  The offline trainer can still learn that CUDA,
+     * ROCm, and CPU prefer different speculative depths by keying generated
+     * rules on this small backend class.
+     */
+    enum class MTPDepthPolicyBackend
+    {
+        Any,
+        CPU,
+        CUDA,
+        ROCm,
+    };
+
+    /**
+     * @brief Coarse model family used by the generated MTP depth policy.
+     *
+     * Dynamic-depth economics differ between dense and MoE graphs even when
+     * token acceptance looks similar: MoE verifier cost, routed expert work,
+     * and condition-forward replay can make a depth profitable or unprofitable
+     * at different acceptance rates.  Keep this intentionally small so the
+     * runtime remains deterministic and the offline trainer can learn separate
+     * tables without depending on model-specific strings.
+     */
+    enum class MTPDepthPolicyModelClass
+    {
+        Any,
+        Dense,
+        MoE,
+    };
+
+    struct MTPDepthPolicyConfig
+    {
+        MTPDepthPolicyMode mode = MTPDepthPolicyMode::Fixed;
+        MTPDepthPolicyBackend backend = MTPDepthPolicyBackend::Any;
+        MTPDepthPolicyModelClass model_class = MTPDepthPolicyModelClass::Any;
+        int min_depth = 1;
+        int max_depth = 0;     ///< 0 derives from MTPRuntimeConfig::draft_tokens.
+        int initial_depth = 0; ///< 0 derives from a policy-specific default.
+        int window_size = 16;
+        int min_samples = 4;
+        int cooldown_steps = 8;
+        int promote_consecutive_windows = 3;
+        /**
+         * @brief Use the offline-trained depth policy table for dynamic mode.
+         *
+         * The generated table is deterministic C++ produced by the benchmark
+         * training pipeline. It can make earlier promote/demote decisions from
+         * the same rolling-window counters as the handwritten fallback policy.
+         * Fixed mode ignores this flag.
+         */
+        bool use_generated_policy = true;
+        double promote_full_accept_rate = 1.0;
+        double demote_zero_accept_rate = 0.30;
+        /**
+         * @brief Draft-token acceptance rate below which dynamic depth demotes.
+         *
+         * This threshold shrinks deeper speculative drafts toward depth 1.
+         * Depth 0 is an explicit bypass mode and is entered only through the
+         * zero-acceptance threshold. Keep the default conservative:
+         * stochastic requests can have noisy short windows, and over-eager
+         * demotion causes depth churn before the verifier path has enough
+         * samples to prove that a lower depth is actually faster.
+         */
+        double demote_acceptance_rate = 0.55;
+    };
+
+    /**
+     * @brief Resolve the effective initial MTP draft depth.
+     *
+     * Fixed mode pins to the configured fixed depth.  Greedy dynamic/observe
+     * starts at depth 2 when available because recent dense lanes show that as
+     * a cheap warm start below the risky deepest lane.  Stochastic
+     * dynamic/observe starts at depth 1: rejection sampling cannot legally
+     * produce ready logits after residual corrections, so a bad first window
+     * at depth 2 has an outsized condition-forward tax.  An explicit
+     * depth-zero bypass range still starts at zero so operators can force a
+     * conservative adaptive warmup.
+     */
+    inline int resolveMTPDepthPolicyInitialDepth(
+        const MTPDepthPolicyConfig &config,
+        int configured_draft_tokens,
+        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy)
+    {
+        const int effective_max_depth =
+            config.max_depth > 0 ? config.max_depth : configured_draft_tokens;
+        if (config.initial_depth > 0)
+            return config.initial_depth;
+        if (config.mode == MTPDepthPolicyMode::Fixed)
+            return configured_draft_tokens;
+        if (config.min_depth == 0)
+            return 0;
+        if (verify_mode == MTPVerifyMode::SpeculativeSampling)
+            return config.min_depth;
+        return std::clamp(2, config.min_depth, effective_max_depth);
+    }
+
+    struct MTPRuntimeConfig
+    {
+        bool enabled = false;
+        int draft_tokens = 1;
+        /**
+         * @brief Maximum number of requests to amortize in one speculative transaction.
+         *
+         * vLLM-style production MTP batches target verification rows across
+         * requests so tiny per-request verifier/condition forwards do not
+         * dominate MoE decode. Values greater than one are a real runner
+         * capacity request: planning must size request-local state and graph
+         * buffers for at least this many active verifier rows. Live decode may
+         * still hard-fail unsupported batched transaction paths until Phase 8
+         * wires the corresponding scheduler execution.
+         */
+        int max_request_batch = 1;
+        MTPVerifyMode verify_mode = MTPVerifyMode::Greedy;
+        bool require_terminal_hidden_for_full_hit = true;
+        MTPDepthPolicyConfig depth_policy;
+    };
+
+    /**
+     * @brief Resolve compact target-verifier row capacity for MTP graph buffers.
+     *
+     * A single request at depth 3 needs `draft_tokens + 1 == 4` target rows:
+     * one row per draft comparison plus the bonus row.  Request-batched MTP
+     * flattens those per-request rows into one compact LM-head input tensor, so
+     * the capacity scales with `max_request_batch`.  The historical four-row
+     * floor is kept so default single-request graphs preserve their shape.
+     */
+    inline int resolveMTPMaxTargetQueryRows(const MTPRuntimeConfig &config)
+    {
+        const int request_count = std::max(1, config.max_request_batch);
+        const int draft_count = std::max(1, config.draft_tokens);
+        return std::max(4, request_count * (draft_count + 1));
+    }
+
+    /**
+     * @brief Resolve the runner batch capacity required by MTP request batching.
+     *
+     * `batch_size` is the general runner capacity knob. `max_request_batch` is
+     * the MTP-specific request batching knob. When MTP is enabled, both knobs
+     * describe real capacity that must exist before speculative verification
+     * can publish per-request KV/GDN/hidden state without racing or
+     * over-indexing runner-owned buffers.
+     */
+    inline int resolveRuntimeBatchSizeForMTP(int configured_batch_size, const MTPRuntimeConfig &config)
+    {
+        const int base_batch_size = std::max(1, configured_batch_size);
+        if (!config.enabled)
+            return base_batch_size;
+        return std::max(base_batch_size, std::max(1, config.max_request_batch));
+    }
+
     /**
      * @brief Get bytes per element for ActivationPrecision
      *
@@ -380,6 +729,143 @@ namespace llaminar2
     }
 
     /**
+     * @brief Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
+     */
+    enum class MoEExpertMode
+    {
+        ExpertParallel, ///< Split whole expert ids across TP participants
+        TensorParallel, ///< Shard every selected expert internally (not implemented yet)
+        Replicated      ///< Keep routed expert tensors/execution fully replicated
+    };
+
+    inline const char *moeExpertModeToString(MoEExpertMode mode)
+    {
+        switch (mode)
+        {
+        case MoEExpertMode::ExpertParallel:
+            return "expert-parallel";
+        case MoEExpertMode::TensorParallel:
+            return "tensor-parallel";
+        case MoEExpertMode::Replicated:
+            return "replicated";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MoEExpertMode> parseMoEExpertMode(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(lower.begin(), lower.end(), '_', '-');
+
+        if (lower == "expert-parallel" || lower == "ep")
+            return MoEExpertMode::ExpertParallel;
+        if (lower == "tensor-parallel" || lower == "tp" || lower == "tensor-parallel-experts")
+            return MoEExpertMode::TensorParallel;
+        if (lower == "replicated" || lower == "replicate" || lower == "full")
+            return MoEExpertMode::Replicated;
+        return std::nullopt;
+    }
+
+    /**
+     * @brief User-facing bounded hot expert cache configuration.
+     */
+    struct MoEHotExpertCacheConfig
+    {
+        enum class Kind
+        {
+            Percent,
+            Count,
+            Off
+        };
+
+        Kind kind = Kind::Percent;
+        int count = 0;
+        float percent = 10.0f;
+
+        bool enabled() const { return kind != Kind::Off; }
+
+        int resolveCap(int num_experts, bool dynamic_rebalance_enabled) const
+        {
+            if (kind == Kind::Off || num_experts <= 0)
+                return 0;
+            if (kind == Kind::Count)
+                return std::max(0, std::min(count, num_experts));
+
+            const float clamped = std::max(0.0f, std::min(percent, 100.0f));
+            int resolved = static_cast<int>(std::floor(static_cast<float>(num_experts) * clamped / 100.0f));
+            if (dynamic_rebalance_enabled && clamped > 0.0f && resolved == 0)
+                resolved = 1;
+            return std::max(0, std::min(resolved, num_experts));
+        }
+
+        std::string toString() const
+        {
+            if (kind == Kind::Off)
+                return "off";
+            if (kind == Kind::Count)
+                return std::to_string(count);
+            std::ostringstream oss;
+            oss << percent << "%";
+            return oss.str();
+        }
+    };
+
+    /**
+     * @brief MoE decode histogram and dynamic rebalance configuration.
+     */
+    enum class MoERebalanceRuntimeMode
+    {
+        Off,
+        Observe,
+        Dynamic
+    };
+
+    inline const char *moeRebalanceRuntimeModeToString(MoERebalanceRuntimeMode mode)
+    {
+        switch (mode)
+        {
+        case MoERebalanceRuntimeMode::Off:
+            return "off";
+        case MoERebalanceRuntimeMode::Observe:
+            return "observe";
+        case MoERebalanceRuntimeMode::Dynamic:
+            return "dynamic";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MoERebalanceRuntimeMode> parseMoERebalanceRuntimeMode(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(lower.begin(), lower.end(), '_', '-');
+
+        if (lower == "off" || lower == "disabled" || lower == "false")
+            return MoERebalanceRuntimeMode::Off;
+        if (lower == "observe" || lower == "observer")
+            return MoERebalanceRuntimeMode::Observe;
+        if (lower == "dynamic" || lower == "on" || lower == "true")
+            return MoERebalanceRuntimeMode::Dynamic;
+        return std::nullopt;
+    }
+
+    struct MoERebalanceRuntimeConfig
+    {
+        MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::Dynamic;
+        int window_size = 256;
+        int max_window_size = 4096;
+        float window_growth_factor = 1.5f;
+        bool release_raw_expert_weights = false;
+    };
+
+    /**
      * @brief Canonical runtime configuration carried through the config chain
      *
      * RuntimeConfig holds pre-parsed runtime parameters that flow from
@@ -397,7 +883,7 @@ namespace llaminar2
         /// Maximum sequence length (buffer allocation sizing)
         int max_seq_len = 4096;
 
-        /// Batch size (currently must be 1)
+        /// Maximum active request batch size for runner-owned state.
         int batch_size = 1;
 
         /// Activation buffer precision
@@ -413,6 +899,21 @@ namespace llaminar2
         /// Explicit KV cache precision (AUTO defaults to FP16)
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Routed MoE expert execution mode.
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+        /// Bounded remote hot-expert cache configuration for dynamic EP.
+        MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+        /// MoE rebalance runtime configuration.
+        MoERebalanceRuntimeConfig moe_rebalance;
+
+        /// Cross-request prefix-state cache configuration.
+        PrefixCacheRuntimeConfig prefix_cache;
+
+        /// Multi-token prediction speculative decode configuration.
+        MTPRuntimeConfig mtp;
+
         RuntimeConfig() = default;
 
         explicit RuntimeConfig(int max_seq_len_) : max_seq_len(max_seq_len_) {}
@@ -422,15 +923,27 @@ namespace llaminar2
          */
         static RuntimeConfig fromOrchestrationConfig(
             int max_seq_len,
+            int batch_size,
             const std::string &activation_precision_str,
             const std::string &kv_cache_precision_str,
-            FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT)
+            FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
+            MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel,
+            MoEHotExpertCacheConfig moe_hot_expert_cache = {},
+            MoERebalanceRuntimeConfig moe_rebalance = {},
+            PrefixCacheRuntimeConfig prefix_cache = {},
+            MTPRuntimeConfig mtp = {})
         {
             RuntimeConfig rc;
             rc.max_seq_len = max_seq_len;
+            rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);
             rc.kv_cache_precision = parseKVCachePrecision(kv_cache_precision_str);
             rc.fused_attention_backend = fused_backend;
+            rc.moe_expert_mode = moe_expert_mode;
+            rc.moe_hot_expert_cache = moe_hot_expert_cache;
+            rc.moe_rebalance = moe_rebalance;
+            rc.prefix_cache = prefix_cache;
+            rc.mtp = mtp;
             return rc;
         }
     };

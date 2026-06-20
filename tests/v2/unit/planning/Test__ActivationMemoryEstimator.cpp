@@ -32,15 +32,23 @@ TEST(Test__ActivationMemoryEstimator, ScalesWithSeqLen)
     EXPECT_GT(bytes_4k, bytes_2k);
 }
 
-TEST(Test__ActivationMemoryEstimator, LargeVocabDominatedByLogits)
+TEST(Test__ActivationMemoryEstimator, LargeVocabDoesNotReserveAllPositionLogits)
 {
-    // With large vocab, logits buffer (B×S×V×4) dominates
-    size_t bytes_small_vocab = ActivationMemoryEstimator::estimate(
-        1, 4096, 896, 4864, 14, 2, 64, 1000, DeviceId::cuda(0));
-    size_t bytes_large_vocab = ActivationMemoryEstimator::estimate(
-        1, 4096, 896, 4864, 14, 2, 64, 151936, DeviceId::cuda(0));
+    constexpr size_t B = 1, S = 4096, D = 896, F = 4864;
+    constexpr size_t H = 14, HK = 2, HD = 64, V = 151936;
+    constexpr size_t FP32 = 4;
 
-    EXPECT_GT(bytes_large_vocab, bytes_small_vocab);
+    const size_t actual = ActivationMemoryEstimator::estimate(
+        static_cast<int>(B), static_cast<int>(S), static_cast<int>(D), static_cast<int>(F),
+        static_cast<int>(H), static_cast<int>(HK), static_cast<int>(HD), static_cast<int>(V),
+        DeviceId::cuda(0));
+
+    const size_t hidden_state = B * S * D * FP32;
+    const size_t terminal_logits = B * V * FP32;
+    const size_t all_position_logits = B * S * V * FP32;
+
+    EXPECT_LT(actual, hidden_state + all_position_logits);
+    EXPECT_GE(actual, hidden_state + terminal_logits);
 }
 
 TEST(Test__ActivationMemoryEstimator, CPUAndGPUSameEstimate)
@@ -72,7 +80,7 @@ TEST(Test__ActivationMemoryEstimator, PeakFormula_MatchesManualComputation)
     size_t ffn_gate = B * S * F * FP32;
     size_t ffn_up = B * S * F * FP32;
     size_t ffn_down = B * S * D * FP32;
-    size_t logits = B * S * V * FP32;
+    size_t logits = B * V * FP32;
 
     size_t attn_phase = hidden_state + residual + q_proj + k_proj + v_proj + attn_output + norm_scratch;
     size_t ffn_phase = hidden_state + residual + ffn_gate + ffn_up + ffn_down + norm_scratch;
@@ -85,19 +93,20 @@ TEST(Test__ActivationMemoryEstimator, PeakFormula_MatchesManualComputation)
     EXPECT_EQ(actual, expected_peak);
 }
 
-TEST(Test__ActivationMemoryEstimator, LargeVocab_LMHeadDominates)
+TEST(Test__ActivationMemoryEstimator, OneRowPrefill_LargeVocabLMHeadDominates)
 {
-    // With vocab=500000, lm_head_phase = B*S*(D+V)*4 should dominate
-    // Verify the peak comes from the lm_head phase
-    constexpr size_t B = 1, S = 4096, D = 256, F = 1024;
+    // With S=1 and vocab=500000, lm_head_phase = B*(S*D+V)*4
+    // dominates. This keeps the estimator honest about terminal-row logits.
+    constexpr size_t B = 1, S = 1, D = 256, F = 1024;
     constexpr size_t H = 4, HK = 2, HD = 64, V = 500000;
     constexpr size_t FP32 = 4;
 
-    size_t lm_head_phase = B * S * D * FP32 + B * S * V * FP32;
+    size_t lm_head_phase = B * S * D * FP32 + B * V * FP32;
 
     size_t actual = ActivationMemoryEstimator::estimate(
-        1, 4096, 256, 1024, 4, 2, 64, 500000, DeviceId::cuda(0));
+        static_cast<int>(B), static_cast<int>(S), static_cast<int>(D), static_cast<int>(F),
+        static_cast<int>(H), static_cast<int>(HK), static_cast<int>(HD), static_cast<int>(V),
+        DeviceId::cuda(0));
 
-    // lm_head_phase should be the peak when vocab is huge
     EXPECT_EQ(actual, lm_head_phase);
 }

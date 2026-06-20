@@ -8,15 +8,26 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../utils/PerfStatsCollector.h"
+#include "../../../loaders/PreparedWeightStore.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace
+    {
+        void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
+        {
+            if (!output || !device.is_gpu())
+                return;
+            output->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+        }
+    }
 
     // =============================================================================
     // FusedQKVGEMMStage Implementation
@@ -25,6 +36,66 @@ namespace llaminar2
     FusedQKVGEMMStage::FusedQKVGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool FusedQKVGEMMStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.wq && !params_.wk && !params_.wv)
+            return true;
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_q.has_value() ||
+            !params_.prepared_ref_k.has_value() ||
+            !params_.prepared_ref_v.has_value())
+        {
+            if (error) *error = "FusedQKVGEMMStage requires PreparedWeightStore and Q/K/V PreparedWeightRefs";
+            return false;
+        }
+        const bool has_q = params_.prepared_store->contains(params_.prepared_ref_q.value());
+        const bool has_k = params_.prepared_store->contains(params_.prepared_ref_k.value());
+        const bool has_v = params_.prepared_store->contains(params_.prepared_ref_v.value());
+        if (!has_q || !has_k || !has_v)
+        {
+            if (error)
+            {
+                *error = "FusedQKVGEMMStage has a PreparedWeightRef missing from PreparedWeightStore"
+                         " q=" + std::to_string(params_.prepared_ref_q->binding_id) + ":" + (has_q ? "1" : "0") +
+                         " k=" + std::to_string(params_.prepared_ref_k->binding_id) + ":" + (has_k ? "1" : "0") +
+                         " v=" + std::to_string(params_.prepared_ref_v->binding_id) + ":" + (has_v ? "1" : "0");
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool FusedQKVGEMMStage::resolveIndividualKernels(const char *caller)
+    {
+        if (cache_resolved_individual_)
+            return cached_gemm_q_ && cached_gemm_k_ && cached_gemm_v_;
+
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_q.has_value() ||
+            !params_.prepared_ref_k.has_value() ||
+            !params_.prepared_ref_v.has_value())
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and Q/K/V PreparedWeightRefs are required");
+            return false;
+        }
+
+        cached_gemm_q_ = params_.prepared_store->gemmKernel(params_.prepared_ref_q.value());
+        cached_gemm_k_ = params_.prepared_store->gemmKernel(params_.prepared_ref_k.value());
+        cached_gemm_v_ = params_.prepared_store->gemmKernel(params_.prepared_ref_v.value());
+
+        if (!cached_gemm_q_ || !cached_gemm_k_ || !cached_gemm_v_)
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightRefs were provided but one or more Q/K/V GEMM kernels were missing from PreparedWeightStore"
+                      << " q=" << static_cast<const void *>(cached_gemm_q_)
+                      << " k=" << static_cast<const void *>(cached_gemm_k_)
+                      << " v=" << static_cast<const void *>(cached_gemm_v_));
+            return false;
+        }
+
+        cache_resolved_individual_ = true;
+        return true;
     }
 
     bool FusedQKVGEMMStage::execute(IDeviceContext *ctx)
@@ -74,25 +145,8 @@ namespace llaminar2
             return false;
         }
 
-        // Cast weights to TensorBase for KernelFactory
-        auto *wq_base = requireTensorBase(params_.wq, "wq");
-        auto *wk_base = requireTensorBase(params_.wk, "wk");
-        auto *wv_base = requireTensorBase(params_.wv, "wv");
-
-        // Get the target device type from device_id
-        DeviceType target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-
-        // Get or cache individual Q/K/V kernels (avoid KernelFactory mutex per token)
-        if (!cache_resolved_individual_)
-        {
-            auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-            auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-            auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-            cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
-            cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
-            cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
-            cache_resolved_individual_ = true;
-        }
+        if (!resolveIndividualKernels("FusedQKVGEMMStage"))
+            return false;
         auto *gemm_q = cached_gemm_q_;
         auto *gemm_k = cached_gemm_k_;
         auto *gemm_v = cached_gemm_v_;
@@ -102,13 +156,19 @@ namespace llaminar2
             gemm_k->setGPUStream(gpuStream());
         if (gemm_v)
             gemm_v->setGPUStream(gpuStream());
-        const bool gpu_execution = (target_dev_type == DeviceType::CUDA || target_dev_type == DeviceType::ROCm);
+        const bool gpu_execution = params_.device_id.is_gpu();
         LOG_DEBUG("[FusedQKVGEMMStage] device_id=" << params_.device_id.to_string()
                                                    << " is_gpu=" << gpu_execution);
         bool success = false;
 
         if (gpu_execution)
         {
+            if (!gpuStream())
+            {
+                LOG_ERROR("[FusedQKVGEMMStage] GPU execution requires an explicit non-null stream");
+                return false;
+            }
+
             // GPU path: Use tensor-aware API - kernel handles device placement
             LOG_DEBUG("[FusedQKVGEMMStage] Using tensor-aware GPU path");
 
@@ -124,18 +184,29 @@ namespace llaminar2
                 return false;
             }
 
-            // Build tensor projection descriptors
-            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
-                {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
-                {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
+            if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+            {
+                success = executeDecodeEquivalentVerifierPrefill(
+                    input_base, output_q_base, output_k_base, output_v_base,
+                    gemm_q, gemm_k, gemm_v);
+            }
+            else
+            {
+                // Build tensor projection descriptors
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
+                    {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
+                    {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
 
-            // Use tensor-aware fused API - handles all device sync internally
-            success = gemm_q->multiply_fused_tensor(
-                input_base,
-                projections,
-                params_.m,
-                params_.k);
+                // Use tensor-aware fused API - handles all device sync internally
+                success = gemm_q->multiply_fused_tensor(
+                    input_base,
+                    projections,
+                    params_.m,
+                    params_.k,
+                    nullptr,
+                    bound_workspace_);
+            }
 
             if (success)
             {
@@ -159,17 +230,28 @@ namespace llaminar2
             LOG_DEBUG("[FusedQKVGEMMStage] input_type=" << params_.input->dtype_name()
                                                         << " output_type=" << params_.output_q->dtype_name());
 
-            // Build tensor projection descriptors
-            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
-                {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
-                {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
-                {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
+            if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+            {
+                success = executeDecodeEquivalentVerifierPrefill(
+                    input_base, output_q_base, output_k_base, output_v_base,
+                    gemm_q, gemm_k, gemm_v);
+            }
+            else
+            {
+                // Build tensor projection descriptors
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
+                    {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
+                    {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
 
-            success = gemm_q->multiply_fused_tensor(
-                input_base,
-                projections,
-                params_.m,
-                params_.k);
+                success = gemm_q->multiply_fused_tensor(
+                    input_base,
+                    projections,
+                    params_.m,
+                    params_.k,
+                    nullptr,
+                    bound_workspace_);
+            }
 
             if (success && Logger::getInstance().shouldLog(LogLevel::TRACE))
             {
@@ -191,6 +273,75 @@ namespace llaminar2
 
         LOG_DEBUG("[FusedQKVGEMMStage] Complete");
         return true;
+    }
+
+    bool FusedQKVGEMMStage::executeDecodeEquivalentVerifierPrefill(
+        TensorBase *input_base,
+        TensorBase *output_q_base,
+        TensorBase *output_k_base,
+        TensorBase *output_v_base,
+        ITensorGemm *gemm_q,
+        ITensorGemm *gemm_k,
+        ITensorGemm *gemm_v)
+    {
+        if (params_.m > 4)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << params_.m);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Grouped verifier GPU QKV requires an explicit stream");
+            return false;
+        }
+
+        /*
+         * Real verifier fast path: all rows and projections are grouped in the
+         * kernel layer.  The older scratch-row helper remains useful for
+         * diagnostics, but it must not be the production implementation.
+         */
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {gemm_q, output_q_base, params_.n_q, params_.bias_q, "Q"},
+            {gemm_k, output_k_base, params_.n_k, params_.bias_k, "K"},
+            {gemm_v, output_v_base, params_.n_v, params_.bias_v, "V"}};
+        const bool success = gemm_q->multiply_fused_verifier_rows_decode_equivalent(
+            input_base,
+            projections,
+            params_.m,
+            params_.k,
+            nullptr,
+            bound_workspace_);
+
+        if (success)
+        {
+            if (is_gpu)
+            {
+                markGpuTensorWritten(output_q_base, params_.device_id, stream);
+                markGpuTensorWritten(output_k_base, params_.device_id, stream);
+                markGpuTensorWritten(output_v_base, params_.device_id, stream);
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "qkv_decode_equivalent_verifier_prefill_rows",
+                static_cast<double>(params_.m),
+                {},
+                params_.device_id.to_string(),
+                {{"stage", "FusedQKVGEMM"},
+                 {"route", "grouped"}});
+        }
+        else
+        {
+            LOG_ERROR("[FusedQKVGEMMStage] Grouped decode-equivalent verifier QKV is unsupported or failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << params_.m
+                      << " k=" << params_.k);
+        }
+
+        return success;
     }
 
     size_t FusedQKVGEMMStage::estimatedFlops() const
@@ -328,9 +479,6 @@ namespace llaminar2
 
     IWorkspaceConsumer *FusedQKVGEMMStage::getKernelAsWorkspaceConsumer()
     {
-        // Get kernel from KernelFactory for the Q projection weight
-        // All three projections share the same workspace, so returning any one works.
-        // The Q kernel is always present, so use that.
         if (!params_.wq)
         {
             LOG_WARN("[FusedQKVGEMMStage::getKernelAsWorkspaceConsumer] Q weight tensor not set");
@@ -344,60 +492,41 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Use cached kernel if available, otherwise resolve
-        if (!cache_resolved_individual_)
-        {
-            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-            cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-            // Note: K/V will be resolved on first execute() or bindWorkspace()
-        }
+        if (!resolveIndividualKernels("FusedQKVGEMMStage::getKernelAsWorkspaceConsumer"))
+            return nullptr;
 
         return dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_);
     }
 
     WorkspaceRequirements FusedQKVGEMMStage::getWorkspaceRequirements(int m, int n, int k) const
     {
-        // Ensure all three kernels are resolved so we report ALL per-instance buffers.
+        // Ensure all three kernels are resolved so each projection contributes
+        // its actual N/K shape before workspace requirements are merged.
         auto *self = const_cast<FusedQKVGEMMStage *>(this);
-        if (!cache_resolved_individual_)
-        {
-            if (params_.wq)
-            {
-                auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
-                if (wq_base)
-                {
-                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-                    self->cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                }
-            }
-            if (params_.wk)
-            {
-                auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
-                if (wk_base)
-                {
-                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-                    self->cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                }
-            }
-            if (params_.wv)
-            {
-                auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
-                if (wv_base)
-                {
-                    auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-                    self->cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-                }
-            }
-            self->cache_resolved_individual_ = true;
-        }
+        if (!self->resolveIndividualKernels("FusedQKVGEMMStage::getWorkspaceRequirements"))
+            return {};
+
+        const int workspace_m = (m > 0) ? m : params_.m;
+        const int workspace_k = (k > 0) ? k : params_.k;
 
         WorkspaceRequirements combined;
         if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
-            combined.merge(consumer_q->getWorkspaceRequirements(m, n, k));
+            combined.merge(consumer_q->getWorkspaceRequirements(
+                workspace_m,
+                params_.n_q > 0 ? params_.n_q : n,
+                workspace_k));
         if (auto *consumer_k = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_k_))
-            combined.merge(consumer_k->getWorkspaceRequirements(m, n, k));
+            combined.merge(consumer_k->getWorkspaceRequirements(
+                workspace_m,
+                params_.n_k > 0 ? params_.n_k : n,
+                workspace_k));
         if (auto *consumer_v = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_v_))
-            combined.merge(consumer_v->getWorkspaceRequirements(m, n, k));
+            combined.merge(consumer_v->getWorkspaceRequirements(
+                workspace_m,
+                params_.n_v > 0 ? params_.n_v : n,
+                workspace_k));
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            combined, params_.device_id, workspace_m, /*projection_count=*/3);
         return combined;
     }
 
@@ -405,38 +534,8 @@ namespace llaminar2
     {
         // Bind workspace to ALL THREE kernels (Q, K, V)
         // Each kernel needs workspace for GPU execution
-        // Resolve and cache individual kernels if not already done
-        if (!cache_resolved_individual_)
-        {
-            if (params_.wq)
-            {
-                auto *wq_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wq));
-                if (wq_base)
-                {
-                    auto *prepared_q = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wq_base, params_.device_id);
-                    cached_gemm_q_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_q);
-                }
-            }
-            if (params_.wk)
-            {
-                auto *wk_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wk));
-                if (wk_base)
-                {
-                    auto *prepared_k = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wk_base, params_.device_id);
-                    cached_gemm_k_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_k);
-                }
-            }
-            if (params_.wv)
-            {
-                auto *wv_base = dynamic_cast<TensorBase *>(const_cast<ITensor *>(params_.wv));
-                if (wv_base)
-                {
-                    auto *prepared_v = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(wv_base, params_.device_id);
-                    cached_gemm_v_ = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared_v);
-                }
-            }
-            cache_resolved_individual_ = true;
-        }
+        if (!resolveIndividualKernels("FusedQKVGEMMStage::bindWorkspace"))
+            return;
 
         // Bind workspace using cached kernels
         if (auto *consumer_q = dynamic_cast<IWorkspaceConsumer *>(cached_gemm_q_))
@@ -479,10 +578,10 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build()
-            .addInput(*params_.input_buffer_id)
-            .addOutput(*params_.output_q_buffer_id)
-            .addOutput(*params_.output_k_buffer_id)
-            .addOutput(*params_.output_v_buffer_id);
+                            .addInput(*params_.input_buffer_id)
+                            .addOutput(*params_.output_q_buffer_id)
+                            .addOutput(*params_.output_k_buffer_id)
+                            .addOutput(*params_.output_v_buffer_id);
         // Model weights are not arena-managed
         if (params_.wq)
             contract.addWeight(const_cast<ITensor *>(params_.wq));

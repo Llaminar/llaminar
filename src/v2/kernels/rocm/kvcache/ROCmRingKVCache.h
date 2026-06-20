@@ -70,6 +70,10 @@ namespace llaminar2
         constexpr const char *TAILS = "kvcache_tails";
         /// Array of count values [batch_size × sizeof(int)]
         constexpr const char *COUNTS = "kvcache_counts";
+        /// K conversion scratch used by append/read precision adaptation.
+        constexpr const char *CONV_SCRATCH_K = "kvcache_conv_scratch_k";
+        /// V conversion scratch used by append/read precision adaptation.
+        constexpr const char *CONV_SCRATCH_V = "kvcache_conv_scratch_v";
     }
 
     // =========================================================================
@@ -163,7 +167,7 @@ namespace llaminar2
          */
         virtual bool append(int layer, int seq_idx,
                             const void *d_k, const void *d_v,
-                            int num_tokens, hipStream_t stream = 0) = 0;
+                            int num_tokens, hipStream_t stream) = 0;
 
         /**
          * @brief Capture-safe fused convert+append path (optional override)
@@ -190,7 +194,7 @@ namespace llaminar2
 
         // Convenience for single-sequence mode
         bool append(int layer, const void *d_k, const void *d_v,
-                    int num_tokens, hipStream_t stream = 0)
+                    int num_tokens, hipStream_t stream)
         {
             return append(layer, 0, d_k, d_v, num_tokens, stream);
         }
@@ -200,12 +204,12 @@ namespace llaminar2
          */
         virtual bool get_kv_for_attention(int layer, int seq_idx,
                                           const void **d_k_out, const void **d_v_out,
-                                          int *kv_len, hipStream_t stream = 0) = 0;
+                                          int *kv_len, hipStream_t stream) = 0;
 
         // Convenience for single-sequence mode
         bool get_kv_for_attention(int layer,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, hipStream_t stream = 0)
+                                  int *kv_len, hipStream_t stream)
         {
             return get_kv_for_attention(layer, 0, d_k_out, d_v_out, kv_len, stream);
         }
@@ -215,7 +219,7 @@ namespace llaminar2
          */
         virtual bool linearize_to(int layer, int seq_idx,
                                   void *d_k_out, void *d_v_out,
-                                  int *kv_len, hipStream_t stream = 0) = 0;
+                                  int *kv_len, hipStream_t stream) = 0;
 
         // =====================================================================
         // Eviction (O(1) - pointer arithmetic only)
@@ -237,7 +241,7 @@ namespace llaminar2
         virtual int gather_kv_batched(int layer, int num_seqs,
                                       void *d_k_out, void *d_v_out,
                                       int *kv_lens, int max_kv_len,
-                                      hipStream_t stream = 0) = 0;
+                                      hipStream_t stream) = 0;
 
         // Bring in IKVCache::gather_kv_batched(ITensor*) to avoid hiding
         using IKVCache::gather_kv_batched;
@@ -280,6 +284,7 @@ namespace llaminar2
         void *conv_scratch_k_ = nullptr;   ///< Scratch buffer for K conversion
         void *conv_scratch_v_ = nullptr;   ///< Scratch buffer for V conversion
         size_t conv_scratch_capacity_ = 0; ///< Current capacity in bytes (per buffer)
+        bool conv_scratch_workspace_backed_ = false;
     };
 
     // =========================================================================
@@ -341,11 +346,6 @@ namespace llaminar2
         // Ring buffer state
         int head = 0;  ///< Next write position
         int count = 0; ///< Number of valid tokens
-
-        // Per-sequence scratch buffers for linearization
-        DataT *d_K_scratch = nullptr; ///< Linearized K when wrapped
-        DataT *d_V_scratch = nullptr; ///< Linearized V when wrapped
-        bool scratch_valid = false;   ///< True if scratch contains current linearized data
 
         /**
          * @brief Get tail (oldest token) position
@@ -475,6 +475,16 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
+        /**
+         * @brief Reset ring metadata and scrub persistent device buffers.
+         *
+         * ROCm decode graph reuse keeps the KV cache object alive across chat
+         * requests. Host-side head/count reset is not sufficient when a stale
+         * device-side read path can observe old cache contents, so the ROCm
+         * cache clears its persistent K/V and scratch pool at request boundaries.
+         */
+        void clear() override;
+
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
@@ -496,6 +506,21 @@ namespace llaminar2
                               int *out_kv_len = nullptr,
                               const KVReadParams *rope = nullptr) override;
 
+        /**
+         * @brief Append grouped verifier rows with serial-decode cache semantics.
+         *
+         * ROCm MTP verifier rows can arrive as position-major rows or as
+         * head-major rows after grouped RoPE.  The grouped append kernel copies
+         * either source layout into the ring positions serial decode would have
+         * written, and it uses the caller-provided HIP stream for graph capture.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override;
+
         // Bring in IROCmRingKVCache overloads to avoid hiding
         using IROCmRingKVCache::append;
         using IROCmRingKVCache::clear_sequence;
@@ -509,18 +534,25 @@ namespace llaminar2
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
         int kv_head_start() const override { return kv_head_start_; }
         int local_kv_dim() const override { return kv_dim_; }
+        TensorLayout kv_layout() const override { return TensorLayout::KV_POS_HEAD_DIM; }
+
+        KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const override;
+        bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v) override;
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override;
 
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
-                    int num_tokens, hipStream_t stream = 0) override;
+                    int num_tokens, hipStream_t stream) override;
 
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, hipStream_t stream = 0) override;
+                                  int *kv_len, hipStream_t stream) override;
 
         bool linearize_to(int layer, int seq_idx,
                           void *d_k_out, void *d_v_out,
-                          int *kv_len, hipStream_t stream = 0) override;
+                          int *kv_len, hipStream_t stream) override;
 
         void evict_oldest(int layer, int seq_idx, int num_tokens) override;
         void evict_oldest_layer(int layer, int num_tokens) override;
@@ -528,7 +560,7 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_seqs,
                               void *d_k_out, void *d_v_out,
                               int *kv_lens, int max_kv_len,
-                              hipStream_t stream = 0) override;
+                              hipStream_t stream) override;
 
         int get_total_evicted() const override { return total_evicted_; }
         void reset_eviction_counter() override { total_evicted_ = 0; }
@@ -541,11 +573,11 @@ namespace llaminar2
 
         bool get_kv_typed(int layer, int seq_idx,
                           const DataT **d_k_out, const DataT **d_v_out,
-                          int *kv_len, hipStream_t stream = 0);
+                          int *kv_len, hipStream_t stream);
 
         bool append_typed(int layer, int seq_idx,
                           const DataT *d_k, const DataT *d_v,
-                          int num_tokens, hipStream_t stream = 0);
+                          int num_tokens, hipStream_t stream);
 
         bool appendConvertedWithStream(int layer, int seq_idx,
                                        const void *d_k_src, const void *d_v_src,
@@ -641,7 +673,6 @@ namespace llaminar2
         {
             entries_[layer][seq_idx].head = 0;
             entries_[layer][seq_idx].count = 0;
-            entries_[layer][seq_idx].scratch_valid = false;
         }
 
         void onEviction(int layer, int seq_idx, int num_evicted) override
@@ -654,7 +685,6 @@ namespace llaminar2
         }
         void onAdvanceComplete(int layer, int seq_idx) override
         {
-            entries_[layer][seq_idx].scratch_valid = false;
         }
 
     private:
@@ -675,9 +705,9 @@ namespace llaminar2
         std::vector<std::vector<EntryT>> entries_;
 
         // Pooled device memory for all KV cache entries.
-        // Single hipMalloc replaces n_layers × batch_size × 4 individual calls.
-        // Layout: [n_layers][batch_size][4_buffers][max_seq_len × kv_storage_dim]
-        // where 4 buffers are: K, V, K_scratch, V_scratch
+        // Single hipMalloc replaces n_layers × batch_size × 2 individual calls.
+        // Layout: [n_layers][batch_size][2_buffers][max_seq_len × kv_storage_dim]
+        // Wrapped-ring linearization uses the cache-level conversion scratch on demand.
         void *pool_base_ = nullptr;
         size_t pool_size_ = 0;
 
@@ -722,7 +752,7 @@ namespace llaminar2
         void allocate_entry(EntryT &entry); // Legacy: individual hipMalloc per entry
         void free_entry(EntryT &entry);     // Nulls pointers (no hipFree if pooled)
         void allocate_all_entries();        // Pool + assign entries + tensor_views + device_params
-        void linearize_entry(EntryT &entry, hipStream_t stream);
+        bool linearize_entry(EntryT &entry, hipStream_t stream);
 
         /**
          * @brief Get effective stream for kernel launches

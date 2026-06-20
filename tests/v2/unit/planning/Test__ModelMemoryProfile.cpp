@@ -1,6 +1,17 @@
 #include <gtest/gtest.h>
 #include "planning/ModelMemoryProfile.h"
 #include "loaders/ModelLoader.h"
+#include <string>
+#include <vector>
+
+/**
+ * @file Test__ModelMemoryProfile.cpp
+ * @brief Unit coverage for GGUF-to-planning model memory profiles.
+ *
+ * These tests validate tensor inventory extraction, layer ownership parsing,
+ * serialization, and preservation of GGUF quantization names used by downstream
+ * memory estimators.
+ */
 
 using namespace llaminar2;
 
@@ -140,6 +151,42 @@ namespace
         return model;
     }
 
+    struct ExpectedGGUFTypeName
+    {
+        GGUFTensorType type;
+        std::string name;
+    };
+
+    const std::vector<ExpectedGGUFTypeName> &supportedGGUFTypeNames()
+    {
+        static const std::vector<ExpectedGGUFTypeName> types = {
+            {GGUFTensorType::F32, "F32"},
+            {GGUFTensorType::F16, "F16"},
+            {GGUFTensorType::BF16, "BF16"},
+            {GGUFTensorType::Q4_0, "Q4_0"},
+            {GGUFTensorType::Q4_1, "Q4_1"},
+            {GGUFTensorType::Q5_0, "Q5_0"},
+            {GGUFTensorType::Q5_1, "Q5_1"},
+            {GGUFTensorType::Q8_0, "Q8_0"},
+            {GGUFTensorType::Q2_K, "Q2_K"},
+            {GGUFTensorType::Q3_K, "Q3_K"},
+            {GGUFTensorType::Q4_K, "Q4_K"},
+            {GGUFTensorType::Q5_K, "Q5_K"},
+            {GGUFTensorType::Q6_K, "Q6_K"},
+            {GGUFTensorType::Q8_K, "Q8_K"},
+            {GGUFTensorType::IQ4_NL, "IQ4_NL"},
+            {GGUFTensorType::IQ4_XS, "IQ4_XS"},
+            {GGUFTensorType::IQ2_XXS, "IQ2_XXS"},
+            {GGUFTensorType::IQ2_XS, "IQ2_XS"},
+            {GGUFTensorType::IQ3_XXS, "IQ3_XXS"},
+            {GGUFTensorType::IQ2_S, "IQ2_S"},
+            {GGUFTensorType::IQ3_S, "IQ3_S"},
+            {GGUFTensorType::IQ1_S, "IQ1_S"},
+            {GGUFTensorType::IQ1_M, "IQ1_M"},
+        };
+        return types;
+    }
+
 } // anonymous namespace
 
 TEST(Test__ModelMemoryProfile, FromGGUF_ExtractsArchitecture)
@@ -256,6 +303,33 @@ TEST(Test__ModelMemoryProfile, NormBytes_CountsNonLayerNorms)
 
     // output_norm.weight = 896 × 4 = 3584 bytes
     EXPECT_EQ(profile.normBytes(), 896u * 4);
+}
+
+TEST(Test__ModelMemoryProfile, FromGGUF_PreservesSupportedQuantTypeNames)
+{
+    GGUFModel model;
+    model.architecture = "qwen3moe";
+    model.block_count = 0;
+
+    for (size_t i = 0; i < supportedGGUFTypeNames().size(); ++i)
+    {
+        GGUFTensorInfo tensor;
+        tensor.name = "tensor." + std::to_string(i) + ".weight";
+        tensor.dimensions = {32, 32};
+        tensor.type = supportedGGUFTypeNames()[i].type;
+        tensor.size_bytes = 1024;
+        tensor.offset = 0;
+        model.tensors.push_back(tensor);
+    }
+
+    const auto profile = ModelMemoryProfile::fromGGUF(model);
+    ASSERT_EQ(profile.tensors.size(), supportedGGUFTypeNames().size());
+
+    for (size_t i = 0; i < supportedGGUFTypeNames().size(); ++i)
+    {
+        SCOPED_TRACE(supportedGGUFTypeNames()[i].name);
+        EXPECT_EQ(profile.tensors[i].quant_type, supportedGGUFTypeNames()[i].name);
+    }
 }
 
 // =========================================================================

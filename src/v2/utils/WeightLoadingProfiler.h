@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "DebugEnv.h"
+#include "PerfStatsCollector.h"
 #include "fort.hpp"
 
 namespace llaminar2
@@ -64,6 +65,25 @@ namespace llaminar2
         }
     }
 
+    inline const char *weightLoadPhaseKey(WeightLoadPhase phase)
+    {
+        switch (phase)
+        {
+        case WeightLoadPhase::GGUF_PARSE:
+            return "gguf_parse";
+        case WeightLoadPhase::TENSOR_LOAD:
+            return "tensor_load";
+        case WeightLoadPhase::GEMM_PACK:
+            return "gemm_pack";
+        case WeightLoadPhase::DEVICE_UPLOAD:
+            return "device_upload";
+        case WeightLoadPhase::GRAPH_BUILD:
+            return "graph_build";
+        default:
+            return "unknown";
+        }
+    }
+
     /**
      * @brief Singleton profiler for weight loading phases
      *
@@ -80,7 +100,7 @@ namespace llaminar2
 
         static bool isEnabled()
         {
-            return debugEnv().profile.enabled;
+            return debugEnv().profile.enabled || PerfStatsCollector::isEnabled();
         }
 
         static void begin(WeightLoadPhase phase)
@@ -100,8 +120,14 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(inst.mutex_);
             auto idx = static_cast<size_t>(phase);
             auto elapsed = Clock::now() - inst.starts_[idx];
-            inst.durations_ms_[idx] += std::chrono::duration<double, std::milli>(elapsed).count();
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+            inst.durations_ms_[idx] += elapsed_ms;
             inst.call_counts_[idx]++;
+            PerfStatsCollector::recordTimingNs(
+                "weight_loading",
+                weightLoadPhaseKey(phase),
+                static_cast<uint64_t>(elapsed_ms * 1.0e6),
+                "load");
         }
 
         static void beginDetail(const std::string &label)
@@ -123,9 +149,17 @@ namespace llaminar2
             if (it == inst.detail_starts_.end())
                 return;
             auto elapsed = Clock::now() - it->second;
-            inst.detail_durations_ms_[label] += std::chrono::duration<double, std::milli>(elapsed).count();
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(elapsed).count();
+            inst.detail_durations_ms_[label] += elapsed_ms;
             inst.detail_call_counts_[label] += 1;
             inst.detail_starts_.erase(it);
+            PerfStatsCollector::recordTimingNs(
+                "weight_loading",
+                label,
+                static_cast<uint64_t>(elapsed_ms * 1.0e6),
+                "load",
+                {},
+                {{"detail", "1"}});
         }
 
         static void addDetail(const std::string &label, double ms)
@@ -136,6 +170,13 @@ namespace llaminar2
             std::lock_guard<std::mutex> lock(inst.mutex_);
             inst.detail_durations_ms_[label] += ms;
             inst.detail_call_counts_[label] += 1;
+            PerfStatsCollector::recordTimingNs(
+                "weight_loading",
+                label,
+                static_cast<uint64_t>(ms * 1.0e6),
+                "load",
+                {},
+                {{"detail", "1"}});
         }
 
         static void reset()

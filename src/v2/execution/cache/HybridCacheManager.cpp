@@ -45,7 +45,7 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[HybridCacheManager] Created: " << n_layers << " layers"
+        LOG_DEBUG("[HybridCacheManager] Created: " << n_layers << " layers"
                                                   << " (" << kv_count << " KV cache, "
                                                   << gdn_count << " GDN state)");
     }

@@ -73,7 +73,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_INFO("[P2P Check] P2P available between all " << n << " devices");
+            LOG_DEBUG("[P2P Check] P2P available between all " << n << " devices");
             return true;
         }
 
@@ -87,10 +87,10 @@ namespace llaminar2
                 return true; // Nothing to do for single device
             }
 
-            LOG_INFO("[PeerAccess] Enabling peer access for " << n << " devices: ");
+            LOG_DEBUG("[PeerAccess] Enabling peer access for " << n << " devices: ");
             for (int i = 0; i < n; ++i)
             {
-                LOG_INFO("  device_ordinals[" << i << "] = GPU " << device_ordinals[i]);
+                LOG_DEBUG("  device_ordinals[" << i << "] = GPU " << device_ordinals[i]);
             }
 
             for (int i = 0; i < n; ++i)
@@ -131,11 +131,11 @@ namespace llaminar2
                     err = hipDeviceEnablePeerAccess(to_dev, 0);
                     if (err == hipSuccess)
                     {
-                        LOG_INFO("[PeerAccess] Enabled P2P access: GPU " << from_dev << " -> GPU " << to_dev);
+                        LOG_DEBUG("[PeerAccess] Enabled P2P access: GPU " << from_dev << " -> GPU " << to_dev);
                     }
                     else if (err == hipErrorPeerAccessAlreadyEnabled)
                     {
-                        LOG_INFO("[PeerAccess] P2P already enabled: GPU " << from_dev << " -> GPU " << to_dev);
+                        LOG_DEBUG("[PeerAccess] P2P already enabled: GPU " << from_dev << " -> GPU " << to_dev);
                     }
                     else
                     {
@@ -352,7 +352,7 @@ namespace llaminar2
             }
             else
             {
-                LOG_INFO("[RCCLBackend] P2P available between all devices - using direct GPU transfers");
+                LOG_DEBUG("[RCCLBackend] P2P available between all devices - using direct GPU transfers");
             }
 
             // Now load RCCL (it will see the environment variables we just set)

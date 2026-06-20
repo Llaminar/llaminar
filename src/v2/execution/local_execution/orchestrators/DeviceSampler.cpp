@@ -8,6 +8,7 @@
 #include "DeviceSampler.h"
 #include "IInferenceRunner.h"
 #include "../../../backends/BackendManager.h"
+#include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/Sampler.h"
 
@@ -23,11 +24,9 @@ namespace llaminar2
     int DeviceSampler::sampleGreedy(
         const std::vector<std::unique_ptr<IInferenceRunner>> &runners)
     {
-        // Need at least 2 GPU devices for device-side sampling
+        // Need at least 2 TP participants for cross-shard sampling.
         if (runners.size() < 2)
             return -1;
-
-        static bool logged_once = false;
 
         // Collect per-device logits info via IInferenceRunner interface
         std::vector<LogitsLocalInfo> infos;
@@ -38,17 +37,9 @@ namespace llaminar2
             if (!runner || !runner->hasLogitsLocal())
                 return -1;
 
-            auto info = runner->getLogitsLocalInfo();
+            auto info = runner->consumeLogitsLocalInfoForSampling();
             if (!info || info.vocab_local == 0)
                 return -1;
-
-            if (!info.gpu_ptr)
-            {
-                LOG_TRACE("[DeviceSampler::sampleGreedy] gpu_data_ptr() null for device "
-                          << runner->primaryDeviceId().toString());
-                return -1;
-            }
-
             LOG_TRACE("[DeviceSampler::sampleGreedy] Device "
                       << runner->primaryDeviceId().toString()
                       << " gpu_ptr=" << info.gpu_ptr << " vocab_local=" << info.vocab_local);
@@ -56,7 +47,19 @@ namespace llaminar2
             infos.push_back(info);
         }
 
-        // Per-device argmax on GPU, then cross-device max on host
+        return sampleGreedyFromLocalInfos(infos, 0);
+    }
+
+    int DeviceSampler::sampleGreedyFromLocalInfos(
+        const std::vector<LogitsLocalInfo> &infos,
+        int row)
+    {
+        if (infos.size() < 2 || row < 0)
+            return -1;
+
+        static bool logged_once = false;
+
+        // Per-device argmax, then cross-device max on host.
         struct DeviceResult
         {
             float value;
@@ -70,29 +73,83 @@ namespace llaminar2
 
         for (const auto &info : infos)
         {
-            if (!info.device.has_value())
-                return -1;
-
-            IBackend *backend = getBackendFor(*info.device);
-            if (!backend)
+            if (!info || info.vocab_local == 0)
                 return -1;
 
             float max_val = -std::numeric_limits<float>::infinity();
             int max_idx = 0;
 
-            if (!backend->argmaxF32(info.gpu_ptr,
-                                    static_cast<int>(info.vocab_local),
-                                    info.device->gpu_ordinal(),
-                                    &max_val, &max_idx))
+            if (info.device.has_value() && info.device->is_gpu())
             {
-                LOG_TRACE("[DeviceSampler::sampleGreedy] argmaxF32 failed for device "
-                          << info.device->toString());
-                return -1;
+                if (!info.gpu_ptr)
+                {
+                    LOG_TRACE("[DeviceSampler::sampleGreedyFromLocalInfos] gpu_data_ptr() null for device "
+                              << info.device->toString());
+                    return -1;
+                }
+
+                IBackend *backend = getBackendFor(*info.device);
+                if (!backend)
+                    return -1;
+                if (!info.stream)
+                {
+                    LOG_ERROR("[DeviceSampler::sampleGreedyFromLocalInfos] explicit GPU stream required for device "
+                              << info.device->toString());
+                    return -1;
+                }
+
+                const auto &shape = info.tensor->shape();
+                const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+                const size_t cols = info.vocab_local;
+                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                    return -1;
+
+                const auto *row_ptr =
+                    static_cast<const float *>(info.gpu_ptr) + static_cast<size_t>(row) * cols;
+
+                // Drive the multi-block argmax with the runner's arena-owned scratch
+                // (null/zero capacity -> argmaxF32 fails, and we degrade to host-side
+                // sampling below). No allocation happens on this hot path.
+                if (!backend->argmaxF32(row_ptr,
+                                        static_cast<int>(info.vocab_local),
+                                        info.device->gpu_ordinal(),
+                                        &max_val, &max_idx, info.stream,
+                                        info.argmax_partial_vals,
+                                        info.argmax_partial_idxs,
+                                        info.argmax_partial_capacity))
+                {
+                    LOG_TRACE("[DeviceSampler::sampleGreedyFromLocalInfos] argmaxF32 failed for device "
+                              << info.device->toString());
+                    return -1;
+                }
+            }
+            else
+            {
+                const auto &shape = info.tensor->shape();
+                const size_t rows = shape.size() >= 2 ? shape[0] : 1;
+                const size_t cols = info.vocab_local;
+                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                    return -1;
+
+                const float *data = info.tensor->fp32_data();
+                if (!data)
+                    return -1;
+
+                const float *row_data = data + static_cast<size_t>(row) * cols;
+                max_idx = 0;
+                max_val = row_data[0];
+                for (size_t i = 1; i < cols; ++i)
+                {
+                    if (row_data[i] > max_val)
+                    {
+                        max_val = row_data[i];
+                        max_idx = static_cast<int>(i);
+                    }
+                }
             }
 
-            LOG_TRACE("[DeviceSampler::sampleGreedy] Device " << info.device->toString()
-                                                              << " local_argmax=" << max_idx
-                                                              << " val=" << max_val);
+            LOG_TRACE("[DeviceSampler::sampleGreedyFromLocalInfos] local_argmax="
+                      << max_idx << " val=" << max_val << " offset=" << col_offset);
 
             results.push_back({max_val, max_idx, col_offset});
             col_offset += info.vocab_local;
@@ -103,21 +160,23 @@ namespace llaminar2
         float best_value = -std::numeric_limits<float>::infinity();
         for (const auto &r : results)
         {
-            if (r.value > best_value)
+            const int token = static_cast<int>(r.col_offset) + r.local_index;
+            if (r.value > best_value ||
+                (r.value == best_value && (best_token < 0 || token < best_token)))
             {
                 best_value = r.value;
-                best_token = static_cast<int>(r.col_offset) + r.local_index;
+                best_token = token;
             }
         }
 
-        LOG_TRACE("[DeviceSampler::sampleGreedy] Winner: token=" << best_token
-                                                                 << " val=" << best_value);
+        LOG_TRACE("[DeviceSampler::sampleGreedyFromLocalInfos] Winner: token=" << best_token
+                                                                               << " val=" << best_value);
 
         if (!logged_once)
         {
-            LOG_INFO("[DeviceSampler::sampleGreedy] GPU-side argmax active ("
-                     << runners.size() << " devices, vocab_local="
-                     << infos[0].vocab_local << " each)");
+            LOG_DEBUG("[DeviceSampler::sampleGreedyFromLocalInfos] cross-shard greedy argmax active ("
+                      << infos.size() << " participants, vocab_local="
+                      << infos[0].vocab_local << " each)");
             logged_once = true;
         }
 
@@ -154,7 +213,7 @@ namespace llaminar2
             if (!runner || !runner->hasLogitsLocal())
                 return -1;
 
-            auto info = runner->getLogitsLocalInfo();
+            auto info = runner->consumeLogitsLocalInfoForSampling();
             if (!info || info.vocab_local == 0)
                 return -1;
 
@@ -198,7 +257,7 @@ namespace llaminar2
                                   effective_k,
                                   info.device->gpu_ordinal(),
                                   topk_values.data(),
-                                  topk_indices.data()))
+                                  topk_indices.data(), info.stream))
             {
                 LOG_TRACE("[DeviceSampler::sample] topKF32 failed for device "
                           << info.device->toString());
@@ -300,9 +359,9 @@ namespace llaminar2
 
         if (!logged_once)
         {
-            LOG_INFO("[DeviceSampler::sample] GPU-side top-k/top-p active ("
-                     << runners.size() << " devices, k=" << effective_k
-                     << ", vocab_local=" << infos[0].vocab_local << " each)");
+            LOG_DEBUG("[DeviceSampler::sample] GPU-side top-k/top-p active ("
+                      << runners.size() << " devices, k=" << effective_k
+                      << ", vocab_local=" << infos[0].vocab_local << " each)");
             logged_once = true;
         }
 

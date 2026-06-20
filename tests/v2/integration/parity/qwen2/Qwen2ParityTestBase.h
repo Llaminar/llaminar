@@ -26,7 +26,7 @@
 
 #include "../ParityTestBase.h"
 #include "models/qwen/Qwen2Schema.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/runner/OrchestrationRunner.h"
@@ -274,6 +274,11 @@ namespace llaminar2::test::parity::qwen2
                     pp_children.push_back(Device(all_devices[i], owning_rank));
                 }
                 tree.root = PP("local_pp", std::move(pp_children));
+                // Apply proportional layer split weights if specified
+                if (!cfg.pp_weights.empty())
+                {
+                    tree.root.tp_weights = cfg.pp_weights;
+                }
             }
             break;
         }
@@ -767,6 +772,7 @@ namespace llaminar2::test::parity::qwen2
             config_.min_early_layers_passed = thresholds.min_early_layers_passed;
             config_.kl_threshold = thresholds.kl_threshold;
             config_.excluded_stages = thresholds.excluded_stages;
+            config_.allreduce_stages = thresholds.allreduce_stages;
             config_.min_top1_accuracy = thresholds.min_top1_accuracy;
             config_.min_top5_accuracy = thresholds.min_top5_accuracy;
             config_.min_decode_pass_rate = thresholds.min_decode_pass_rate;
@@ -1185,8 +1191,8 @@ namespace llaminar2::test::parity::qwen2
             model_ctx_ = ModelContext::create(
                 config_.model_path,
                 mpi_ctx_,
-                nullptr,            // placement_map
-                nullptr,            // factory
+                nullptr, // placement_map
+                nullptr, // factory
                 getWeightStrategy());
             if (!model_ctx_)
             {
@@ -1316,7 +1322,7 @@ namespace llaminar2::test::parity::qwen2
             go_config.rank = rank;
             go_config.world_size = world_size;
             go_config.mpi_ctx = mpi_ctx_.get();
-            go_config.rank_runner = std::move(runner_);  // Transfer ownership
+            go_config.rank_runner = std::move(runner_); // Transfer ownership
             go_config.vocab_size = vocab_size;
             go_config.d_model = d_model;
             go_config.architecture_name = arch_name;
@@ -1330,7 +1336,7 @@ namespace llaminar2::test::parity::qwen2
             runner_ = std::move(go);
 
             LOG_INFO("[Parity] GlobalOrchestrator setup complete (rank " << rank
-                     << "/" << world_size << ")");
+                                                                         << "/" << world_size << ")");
 
             // Step 5: Also create GlobalTPContext for infrastructure tests
             // (allreduce, broadcast, barrier verification).

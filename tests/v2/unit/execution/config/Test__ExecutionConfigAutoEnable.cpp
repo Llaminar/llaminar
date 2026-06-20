@@ -27,6 +27,7 @@
 #include <gtest/gtest.h>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 #include "v2/utils/DebugEnv.h"
 
@@ -117,6 +118,10 @@ namespace
             unsetenv("LLAMINAR_EXEC_RESIDUAL");
             unsetenv("LLAMINAR_EXEC_EMBEDDING");
             unsetenv("LLAMINAR_EXEC_LM_HEAD");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_BUCKETS");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID");
         }
 
         void TearDown() override
@@ -132,6 +137,10 @@ namespace
             unsetenv("LLAMINAR_EXEC_RESIDUAL");
             unsetenv("LLAMINAR_EXEC_EMBEDDING");
             unsetenv("LLAMINAR_EXEC_LM_HEAD");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_BUCKETS");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS");
+            unsetenv("LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID");
         }
     };
 
@@ -154,6 +163,8 @@ namespace
         EXPECT_TRUE(config.exec_residual);
         EXPECT_TRUE(config.exec_embedding);
         EXPECT_TRUE(config.exec_lm_head);
+        EXPECT_TRUE(config.gpu_graphs);
+        EXPECT_TRUE(config.prefill_graph_buckets);
     }
 
     // =============================================================================
@@ -329,6 +340,31 @@ namespace
         // Clean up
         unsetenv("LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT");
         unsetenv("LLAMINAR_EXEC_RMSNORM");
+    }
+
+    TEST_F(Test__ExecutionConfigAutoEnable, PrefillGraphBuckets_ParseAndNormalizeEnv)
+    {
+        EnvVarGuard guard1("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
+        EnvVarGuard guard2("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "512, 128, 512, -1, 64, 0, 256");
+        EnvVarGuard guard3("LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS", "3");
+        EnvVarGuard guard4("LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID", "151643");
+
+        llaminar2::ExecutionConfig config;
+
+        EXPECT_TRUE(config.prefill_graph_buckets);
+        EXPECT_EQ(config.prefill_graph_bucket_sizes, (std::vector<int>{64, 128, 256, 512}));
+        EXPECT_EQ(config.prefill_graph_max_cached_buckets, 3);
+        EXPECT_EQ(config.prefill_graph_pad_token_id, 151643);
+    }
+
+    TEST_F(Test__ExecutionConfigAutoEnable, PrefillGraphBuckets_EnvCanOptOut)
+    {
+        EnvVarGuard guard("LLAMINAR_PREFILL_GRAPH_BUCKETS", "0");
+
+        llaminar2::ExecutionConfig config;
+
+        EXPECT_FALSE(config.prefill_graph_buckets);
+        EXPECT_TRUE(config.gpu_graphs);
     }
 
     // =============================================================================

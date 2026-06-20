@@ -1,0 +1,88 @@
+/**
+ * @file ROCmRowSelectKernels.h
+ * @brief ROCm host wrappers for graph-capturable hidden-state row selection.
+ *
+ * This is the HIP counterpart to the CUDA row-select helper. The stage owns a
+ * pinned host scalar plus a device scalar; HIP graph capture records the scalar
+ * H2D copy and a fixed row-copy kernel so replay can change selected rows by
+ * updating the pinned host value before graph launch.
+ *
+ * Lifecycle: allocation/free are owned by HiddenStateRowSelectStage and should
+ * occur during warmup before stream capture begins.
+ */
+
+#pragma once
+
+namespace llaminar2::rocm
+{
+
+    /** @brief Allocate pinned host scalar storage for selected row. */
+    bool allocateRowSelectHostParam(
+        int device_ordinal,
+        int **host_selected_row);
+
+    /** @brief Allocate pinned host storage for several selected rows. */
+    bool allocateRowSelectHostParams(
+        int device_ordinal,
+        int **host_selected_rows,
+        int row_count);
+
+    /** @brief Free pinned host scalar storage allocated by allocateRowSelectHostParam(). */
+    void freeRowSelectHostParam(
+        int device_ordinal,
+        int *host_selected_row);
+
+    /** @brief Allocate pinned host and device scalar storage for selected row. */
+    bool allocateRowSelectParam(
+        int device_ordinal,
+        int **host_selected_row,
+        int **device_selected_row);
+
+    /** @brief Free scalar storage allocated by allocateRowSelectParam(). */
+    void freeRowSelectParam(
+        int device_ordinal,
+        int *host_selected_row,
+        int *device_selected_row);
+
+    /** @brief Upload selected-row scalar to its stable device address. */
+    bool uploadRowSelectParam(
+        int *device_selected_row,
+        const int *host_selected_row,
+        void *stream);
+
+    /** @brief Upload selected-row indices to their stable device address. */
+    bool uploadRowSelectParams(
+        int *device_selected_rows,
+        const int *host_selected_rows,
+        int row_count,
+        void *stream);
+
+    /** @brief Launch FP32 row-select copy: output[0, :] = input[selected_row, :]. */
+    bool launchRowSelectFP32(
+        const float *input,
+        float *output,
+        const int *device_selected_row,
+        int seq_len,
+        int d_model,
+        void *stream);
+
+    /** @brief Launch FP32 multi-row select: output[row, :] = input[selected_rows[row], :]. */
+    bool launchRowsSelectFP32(
+        const float *input,
+        float *output,
+        const int *device_selected_rows,
+        int seq_len,
+        int d_model,
+        int selected_row_count,
+        void *stream);
+
+    /** @brief Launch FP32 MTP concat: output[row] = [embedding[row], hidden[row]]. */
+    bool launchMTPConcatFP32(
+        const float *hidden,
+        const float *embedding,
+        float *output,
+        int rows,
+        int hidden_dim,
+        void *stream);
+
+} // namespace llaminar2::rocm

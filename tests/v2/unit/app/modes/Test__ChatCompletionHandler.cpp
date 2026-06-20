@@ -15,13 +15,17 @@
 #include "nlohmann/json.hpp"
 
 #include <ctime>
+#include <stdexcept>
 
 using namespace llaminar2;
 using namespace llaminar2::test;
 using json = nlohmann::json;
 using ::testing::_;
+using ::testing::AnyNumber;
+using ::testing::AtLeast;
 using ::testing::Invoke;
 using ::testing::Return;
+using ::testing::Throw;
 
 // =============================================================================
 // Test fixture
@@ -37,6 +41,19 @@ protected:
 
         // Default: runner is initialized
         runner_->simulateInitialized();
+        EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+            .Times(AnyNumber())
+            .WillRepeatedly(Return(true));
+        EXPECT_CALL(*runner_, prefixStateProbe())
+            .Times(AnyNumber())
+            .WillRepeatedly(Return(PrefixRuntimeStateSnapshot{}));
+
+        ON_CALL(*tokenizer_, encodeChat(_, _, _, _))
+            .WillByDefault(Invoke([this](const std::vector<ChatMessage> &messages,
+                                         bool add_generation_prompt,
+                                         const std::string &tools_json,
+                                         bool /*enable_thinking*/)
+                                  { return tokenizer_->encodeChat(messages, add_generation_prompt, tools_json); }));
     }
 
     /// Build a handler using the current mocks
@@ -63,6 +80,15 @@ protected:
         return r;
     }
 
+    static GenerationResult makeTokens(std::initializer_list<int32_t> token_ids,
+                                       bool is_complete = false)
+    {
+        GenerationResult r;
+        r.tokens.assign(token_ids.begin(), token_ids.end());
+        r.is_complete = is_complete;
+        return r;
+    }
+
     /// Helper: make an empty decode result (no more tokens)
     static GenerationResult makeEmpty()
     {
@@ -76,6 +102,29 @@ protected:
         GenerationResult r;
         r.error = error;
         return r;
+    }
+
+    /// Helper: make a minimal template with Qwen-style thinking tags.
+    static std::unique_ptr<ChatTemplate> makeThinkingTemplate()
+    {
+        return ChatTemplate::create(R"(
+{%- for message in messages %}
+<|im_start|>{{ message['role'] }}
+{{ message['content'] }}<|im_end|>
+{% endfor %}
+{%- if add_generation_prompt %}
+<|im_start|>assistant
+{%- if enable_thinking is defined and enable_thinking is true %}
+<think>
+{%- else %}
+<think>
+
+</think>
+
+{%- endif %}
+{%- endif %})",
+                                    "",
+                                    "");
     }
 
     std::unique_ptr<MockOrchestrationRunner> runner_;
@@ -317,7 +366,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_SetsSamplingParams_BeforePrefi
     // Track call order
     std::vector<std::string> call_order;
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3}));
 
     EXPECT_CALL(*runner_, setSamplingParams(_))
@@ -325,8 +374,11 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_SetsSamplingParams_BeforePrefi
                          { call_order.push_back("setSamplingParams"); }));
 
     EXPECT_CALL(*runner_, clearCache())
+        .Times(2)
         .WillOnce(Invoke([&]()
-                         { call_order.push_back("clearCache"); }));
+                         { call_order.push_back("clearCache"); }))
+        .WillOnce(Invoke([&]()
+                         { call_order.push_back("cleanupClearCache"); }));
 
     EXPECT_CALL(*runner_, prefill(_))
         .WillOnce(Invoke([&](const std::vector<int32_t> &) -> bool
@@ -357,7 +409,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_PassesSamplingParams_ToRunner)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -396,7 +448,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_GreedySampling_WhenTemp0)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -429,7 +481,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_UsesModelDefaultsWhenNoUser
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -466,7 +518,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_RegenerateWithTemp_NotGreed
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -497,7 +549,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseFormat_OpenAICompatibl
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -532,6 +584,117 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseFormat_OpenAICompatibl
     EXPECT_EQ(body["usage"]["total_tokens"], 6);
 }
 
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsumesMultiTokenDecodeStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("B"));
+    ON_CALL(*tokenizer_, decode_token(12))
+        .WillByDefault(Return("C"));
+
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeTokens({10, 11, 12})));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "greet")};
+    request.max_tokens = 2;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+
+    ASSERT_TRUE(response.ok);
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["message"]["content"], "AB");
+    EXPECT_EQ(body["usage"]["completion_tokens"], 2);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ProbesRuntimeStateForServeSummary)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+
+    PrefixRuntimeStateSnapshot snapshot;
+    snapshot.mtp_config_enabled = true;
+    snapshot.mtp_request.enabled = true;
+    snapshot.mtp_request.adaptive_depth_enabled = true;
+    snapshot.mtp_request.depth_policy_mode = "dynamic";
+    snapshot.mtp_request.current_depth = 1;
+    snapshot.mtp_request.min_depth = 1;
+    snapshot.mtp_request.max_depth = 3;
+    snapshot.mtp_request.draft_steps = 2;
+    snapshot.mtp_request.accepted_tokens = 1;
+    snapshot.mtp_request.rejected_tokens = 1;
+    snapshot.mtp_request.acceptance_rate = 0.5;
+    snapshot.mtp_verifier_runs = 2;
+    snapshot.mtp_verifier_token_count = 4;
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)));
+    EXPECT_CALL(*runner_, prefixStateProbe())
+        .Times(1)
+        .WillOnce(Return(snapshot));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ReplacesInvalidUtf8InGeneratedContent)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return(std::string(1, static_cast<char>(0xA2))));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "emit invalid byte")};
+    request.max_tokens = 4;
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
+
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["message"]["content"].get<std::string>(),
+              std::string("\xEF\xBF\xBD"));
+}
+
 // =============================================================================
 // Error handling tests
 // =============================================================================
@@ -540,7 +703,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_EncodeEmpty_Returns500)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{}));
 
     ChatCompletionRequest request;
@@ -559,7 +722,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_PrefillFails_Returns500)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
 
     std::string prefill_error = "Out of memory";
@@ -584,7 +747,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_DecodeFails_Returns500)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -612,7 +775,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_StopsOnStopToken)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -651,7 +814,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_StopsAtMaxTokens)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -675,11 +838,42 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_StopsAtMaxTokens)
     EXPECT_EQ(body["usage"]["completion_tokens"], 3);
 }
 
+TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterDecodeSteps)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Return("x"));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(3)
+        .WillRepeatedly(Return(makeToken(42, false)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        .Times(3)
+        .WillRepeatedly(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Hello")};
+    request.max_tokens = 3;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+}
+
 TEST_F(Test__ChatCompletionHandler, HandleRequest_EmptyDecode_StopsGracefully)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -702,16 +896,16 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_EmptyDecode_StopsGracefully)
 // Cache clearing test
 // =============================================================================
 
-TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeEachRequest)
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeAndAfterRequest)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
 
-    EXPECT_CALL(*runner_, clearCache()).Times(1);
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
     EXPECT_CALL(*runner_, decodeStep())
         .WillOnce(Return(makeToken(0, true)));
     ON_CALL(*tokenizer_, is_stop_token(_))
@@ -721,6 +915,87 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ClearsCacheBeforeEachRequest)
     request.messages = {ChatMessage("user", "test")};
 
     handler->handleRequest(request);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ConsecutiveRequestsResetCacheAndSamplingEachTime)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, getRecommendedSamplingParams())
+        .WillByDefault(Return(SamplingParams{}));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(4);
+    EXPECT_CALL(*runner_, setSamplingParams(_)).Times(2);
+    EXPECT_CALL(*runner_, prefill(_)).Times(2).WillRepeatedly(Return(true));
+    EXPECT_CALL(*runner_, decodeStep()).Times(2).WillRepeatedly(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 1;
+
+    auto first = handler->handleRequest(request);
+    auto second = handler->handleRequest(request);
+
+    EXPECT_TRUE(first.ok);
+    EXPECT_TRUE(second.ok);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ExceptionAfterBoundaryReturns500AndResetsCache)
+{
+    auto handler = makeHandler();
+
+    EXPECT_CALL(*runner_, clearCache()).Times(AtLeast(2));
+    EXPECT_CALL(*runner_, setSamplingParams(_))
+        .WillOnce(Throw(std::runtime_error("sampling setup exploded")));
+    EXPECT_CALL(*runner_, prefill(_)).Times(0);
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_FALSE(response.ok);
+    EXPECT_EQ(response.http_status, 500);
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["error"]["type"], "server_error");
+    EXPECT_NE(body["error"]["message"].get<std::string>().find("sampling setup exploded"), std::string::npos);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ForwardsThinkingModeToTokenizer)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(4);
+    EXPECT_CALL(*tokenizer_, encodeChat(_, true, "", false))
+        .WillOnce(Return(std::vector<int>{1}));
+    EXPECT_CALL(*tokenizer_, encodeChat(_, true, "", true))
+        .WillOnce(Return(std::vector<int>{1}));
+    EXPECT_CALL(*runner_, decodeStep())
+        .Times(2)
+        .WillRepeatedly(Return(makeToken(0, true)));
+
+    ChatCompletionRequest non_thinking;
+    non_thinking.messages = {ChatMessage("user", "test")};
+    non_thinking.enable_thinking = false;
+    non_thinking.max_tokens = 1;
+
+    ChatCompletionRequest thinking = non_thinking;
+    thinking.enable_thinking = true;
+
+    auto first = handler->handleRequest(non_thinking);
+    auto second = handler->handleRequest(thinking);
+
+    EXPECT_TRUE(first.ok);
+    EXPECT_TRUE(second.ok);
 }
 
 // =============================================================================
@@ -751,7 +1026,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_FullPipeline)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -891,7 +1166,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsMergedPerField
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -931,7 +1206,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ModelDefaultsMergedPerField
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -971,7 +1246,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_PenaltiesPassedToRunner)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1037,7 +1312,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingModel_ExtractsReasonin
         .WillByDefault(Return(true));
     ON_CALL(*tokenizer_, getChatTemplate())
         .WillByDefault(::testing::ReturnRef(*tmpl));
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20, 30}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1099,7 +1374,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_NonThinkingModel_NoReasoningFi
         .WillByDefault(Return(true));
     ON_CALL(*tokenizer_, getChatTemplate())
         .WillByDefault(::testing::ReturnRef(*tmpl));
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1135,7 +1410,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_NoChatTemplate_NoReasoningFiel
 
     ON_CALL(*tokenizer_, hasChatTemplate())
         .WillByDefault(Return(false));
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1169,7 +1444,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_ResponseContainsAllOpenAIFi
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20, 30}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1217,7 +1492,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_FinishReasonStop)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1242,7 +1517,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_FinishReasonLength)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1320,7 +1595,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_PromptExceedsContextWindow_Ret
     auto handler = makeHandler();
 
     // Encode returns 10 tokens > max_seq_len of 8
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
 
     ChatCompletionRequest request;
@@ -1349,7 +1624,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_PromptExactlyFitsContextWindow
     auto handler = makeHandler();
 
     // Encode returns exactly 5 tokens = max_seq_len
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3, 4, 5}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1379,7 +1654,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseContainsContextWindow)
 
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1409,7 +1684,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ResponseContainsContextUsed)
     auto handler = makeHandler();
 
     // 3 prompt tokens
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1441,7 +1716,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_ContextUsedEqualsPromptPlusCom
     auto handler = makeHandler();
 
     // 5 prompt tokens
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{10, 20, 30, 40, 50}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1480,7 +1755,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_PromptExceedsContext_Return
 
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1, 2, 3, 4, 5}));
 
     auto response = handler->handleRawRequest(minimalRequest());
@@ -1514,7 +1789,7 @@ TEST_F(Test__ChatCompletionHandler, ResponseMetadata_ModelFieldPresent)
 {
     auto handler = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_, "test-model");
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1540,7 +1815,7 @@ TEST_F(Test__ChatCompletionHandler, ResponseMetadata_CreatedTimestamp)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1569,7 +1844,7 @@ TEST_F(Test__ChatCompletionHandler, ResponseMetadata_SystemFingerprint)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1593,7 +1868,7 @@ TEST_F(Test__ChatCompletionHandler, ResponseMetadata_IdIsChatcmplFormat)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1616,7 +1891,7 @@ TEST_F(Test__ChatCompletionHandler, ResponseMetadata_ModelFromRequest_OverridesD
 {
     auto handler = std::make_unique<ChatCompletionHandler>(*runner_, *tokenizer_, "default-model");
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1707,7 +1982,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_FirstChunk_HasRoleAssistant)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1742,11 +2017,59 @@ TEST_F(Test__ChatCompletionHandler, Streaming_FirstChunk_HasRoleAssistant)
     EXPECT_EQ(first_json["object"], "chat.completion.chunk");
 }
 
+TEST_F(Test__ChatCompletionHandler, Streaming_ProbesRuntimeStateForServeSummary)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+
+    PrefixRuntimeStateSnapshot snapshot;
+    snapshot.prefix_cache_config_enabled = true;
+    snapshot.prefix_request.enabled = true;
+    snapshot.prefix_request.requested_tokens = 1;
+    snapshot.prefix_request.matched_tokens = 1;
+    snapshot.prefix_request.hit = true;
+    snapshot.prefix_request.storage_tier = "ram";
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)));
+    EXPECT_CALL(*runner_, prefixStateProbe())
+        .Times(1)
+        .WillOnce(Return(snapshot));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+    request.max_tokens = 1;
+    request.enable_thinking = false;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
+    ASSERT_FALSE(chunks.empty());
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
+}
+
 TEST_F(Test__ChatCompletionHandler, Streaming_TokenByToken_ContentInDelta)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1788,11 +2111,95 @@ TEST_F(Test__ChatCompletionHandler, Streaming_TokenByToken_ContentInDelta)
     EXPECT_EQ(c2["choices"][0]["delta"]["content"], " world");
 }
 
+TEST_F(Test__ChatCompletionHandler, Streaming_EmitsEachTokenFromMultiTokenDecodeStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("A"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("B"));
+    ON_CALL(*tokenizer_, decode_token(12))
+        .WillByDefault(Return("C"));
+
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*runner_, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeTokens({10, 11, 12})));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+    request.max_tokens = 2;
+    request.enable_thinking = false;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+    ASSERT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 4u);
+
+    auto c1 = json::parse(chunks[1].substr(6, chunks[1].find("\n\n") - 6));
+    auto c2 = json::parse(chunks[2].substr(6, chunks[2].find("\n\n") - 6));
+    EXPECT_EQ(c1["choices"][0]["delta"]["content"], "A");
+    EXPECT_EQ(c2["choices"][0]["delta"]["content"], "B");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_ReplacesInvalidUtf8InContentDelta)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return(std::string(1, static_cast<char>(0xAA))));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "stream invalid byte")};
+    request.stream = true;
+    request.max_tokens = 4;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 4u); // role, content, finish, [DONE]
+
+    auto content_chunk = json::parse(chunks[1].substr(6, chunks[1].find("\n\n") - 6));
+    EXPECT_EQ(content_chunk["choices"][0]["delta"]["content"].get<std::string>(),
+              std::string("\xEF\xBF\xBD"));
+}
+
 TEST_F(Test__ChatCompletionHandler, Streaming_FinalChunk_HasFinishReason)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1828,7 +2235,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_DoneSentinel_EmittedLast)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1859,7 +2266,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_ConsistentId_AcrossChunks)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1906,7 +2313,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_StopToken_FinishReasonIsStop)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1945,7 +2352,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_MaxTokens_FinishReasonIsLength)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -1981,7 +2388,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_PrefillFailure_ReturnsError)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     std::string prefill_error = "Out of memory";
     ON_CALL(*runner_, prefill(_))
@@ -2007,11 +2414,44 @@ TEST_F(Test__ChatCompletionHandler, Streaming_PrefillFailure_ReturnsError)
     EXPECT_TRUE(chunks.empty());
 }
 
+TEST_F(Test__ChatCompletionHandler, Streaming_ClearsCacheBeforeAndAfterRequest)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(1, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_FALSE(chunks.empty());
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
+}
+
 TEST_F(Test__ChatCompletionHandler, Streaming_ChunkObjectType)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -2048,7 +2488,7 @@ TEST_F(Test__ChatCompletionHandler, Streaming_SystemFingerprint_InChunks)
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -2136,6 +2576,32 @@ TEST_F(Test__ChatCompletionHandler, ThinkSplitter_AfterTransition_ContentField)
     EXPECT_EQ(r.text, "answer");
 }
 
+TEST_F(Test__ChatCompletionHandler, ThinkSplitter_DuplicateEndTagStopsContent)
+{
+    StreamingThinkSplitter splitter("</think>");
+
+    // The first marker closes reasoning; later markers are malformed answer
+    // text and should stop the stream before the marker is emitted.
+    auto r1 = splitter.process("reasoning</think>\n\nAnswer ");
+    EXPECT_EQ(r1.field, "reasoning_content");
+    EXPECT_FALSE(splitter.inThinking());
+
+    auto first_content = splitter.flush();
+    EXPECT_EQ(first_content.field, "content");
+    EXPECT_EQ(first_content.text, "Answer ");
+    EXPECT_FALSE(first_content.stop_generation);
+
+    auto r2 = splitter.process("</th");
+    EXPECT_EQ(r2.field, "content");
+    EXPECT_TRUE(r2.text.empty());
+    EXPECT_FALSE(r2.stop_generation);
+
+    auto r3 = splitter.process("ink>\n\nIgnored");
+    EXPECT_EQ(r3.field, "content");
+    EXPECT_TRUE(r3.text.empty());
+    EXPECT_TRUE(r3.stop_generation);
+}
+
 TEST_F(Test__ChatCompletionHandler, ThinkSplitter_EndTagOnly_EmptyReasoning)
 {
     StreamingThinkSplitter splitter("</think>");
@@ -2192,7 +2658,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_StreamTrue_WithCallback_Use
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -2223,7 +2689,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRawRequest_StreamTrue_NoCallback_Falls
 {
     auto handler = makeHandler();
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -2256,7 +2722,7 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_EnableThinkingFalse_NoReasonin
     // Create a mock chat template that reports thinking support
     auto mock_template = ChatTemplate::create(ChatTemplateType::CHATML);
 
-    ON_CALL(*tokenizer_, encodeChat(_, _))
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
         .WillByDefault(Return(std::vector<int>{1}));
     ON_CALL(*runner_, prefill(_))
         .WillByDefault(Return(true));
@@ -2285,4 +2751,537 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_EnableThinkingFalse_NoReasonin
     // No reasoning_content field should be present
     EXPECT_FALSE(body["choices"][0]["message"].contains("reasoning_content"))
         << "With enable_thinking=false, reasoning_content should not be extracted";
+}
+
+// =============================================================================
+// Thinking Budget tests
+// =============================================================================
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_InjectsStopSequence)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, hasChatTemplate())
+        .WillByDefault(Return(false));
+
+    // Stop-thinking prompt tokenizes to [90, 91, 92]
+    ON_CALL(*runner_, getStopThinkingPrompt())
+        .WillByDefault(Return("stop thinking now"));
+    ON_CALL(*tokenizer_, encode("stop thinking now", _, _))
+        .WillByDefault(Return(std::vector<int>{90, 91, 92}));
+    EXPECT_CALL(*tokenizer_, encode("stop thinking now", false, false))
+        .Times(1);
+
+    // Decode 2 thinking tokens, then budget exhaustion schedules the stop
+    // sequence for subsequent forced positions. The forced-token calls are the
+    // important regression guard: text injection without runner-state commits
+    // leaves later decode on the wrong KV/GDN state.
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("thinking1"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("thinking2"));
+    ON_CALL(*tokenizer_, decode_token(90))
+        .WillByDefault(Return("stop"));
+    ON_CALL(*tokenizer_, decode_token(91))
+        .WillByDefault(Return(" thinking"));
+    ON_CALL(*tokenizer_, decode_token(92))
+        .WillByDefault(Return(" now"));
+
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))       // Thinking token 1
+        .WillOnce(Return(makeToken(11)))       // Thinking token 2, then budget exhausted
+        .WillOnce(Return(makeToken(0, true))); // Normal completion
+    EXPECT_CALL(*runner_, forceDecodeToken(90))
+        .WillOnce(Return(makeToken(90)));
+    EXPECT_CALL(*runner_, forceDecodeToken(91))
+        .WillOnce(Return(makeToken(91)));
+    EXPECT_CALL(*runner_, forceDecodeToken(92))
+        .WillOnce(Return(makeToken(92)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "think about this")};
+    request.max_tokens = 20;
+    request.enable_thinking = true;
+    request.thinking_budget_tokens = 2; // Exhaust after 2 thinking tokens
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+
+    auto body = json::parse(response.json_body);
+    auto content = body["choices"][0]["message"]["content"].get<std::string>();
+
+    // Generated text should contain the injected stop tokens
+    EXPECT_NE(content.find("stop"), std::string::npos)
+        << "Injected stop-thinking tokens should appear in output";
+    EXPECT_NE(content.find(" thinking"), std::string::npos);
+    EXPECT_NE(content.find(" now"), std::string::npos);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_StopsAtDuplicateEndTag)
+{
+    auto handler = makeHandler();
+    auto tmpl = makeThinkingTemplate();
+    ASSERT_TRUE(tmpl->isThinkingModel());
+
+    ON_CALL(*tokenizer_, hasChatTemplate())
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, getChatTemplate())
+        .WillByDefault(::testing::ReturnRef(*tmpl));
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+
+    ON_CALL(*runner_, getStopThinkingPrompt())
+        .WillByDefault(Return("Considering the limited time.\n</think>\n\n"));
+    ON_CALL(*tokenizer_, encode("Considering the limited time.\n</think>\n\n", _, _))
+        .WillByDefault(Return(std::vector<int>{90}));
+    EXPECT_CALL(*tokenizer_, encode("Considering the limited time.\n</think>\n\n", false, false))
+        .Times(1);
+
+    ON_CALL(*tokenizer_, decode_token(10))
+        .WillByDefault(Return("reasoning"));
+    ON_CALL(*tokenizer_, decode_token(90))
+        .WillByDefault(Return("Considering the limited time.\n</think>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(11))
+        .WillByDefault(Return("13"));
+    ON_CALL(*tokenizer_, decode_token(12))
+        .WillByDefault(Return("\n</think>\n\n"));
+    ON_CALL(*tokenizer_, decode_token(13))
+        .WillByDefault(Return("13"));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10))) // Exhausts the thinking budget.
+        .WillOnce(Return(makeToken(11))) // First answer token after the forced close.
+        .WillOnce(Return(makeToken(12))); // Duplicate close tag stops generation.
+    EXPECT_CALL(*runner_, forceDecodeToken(90))
+        .WillOnce(Return(makeToken(90)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "think briefly")};
+    request.max_tokens = 20;
+    request.enable_thinking = true;
+    request.thinking_budget_tokens = 1;
+
+    auto response = handler->handleRequest(request);
+    ASSERT_TRUE(response.ok);
+
+    auto body = json::parse(response.json_body);
+    auto message = body["choices"][0]["message"];
+    const auto content = message["content"].get<std::string>();
+
+    EXPECT_EQ(content, "13\n");
+    EXPECT_EQ(content.find("</think>"), std::string::npos)
+        << "Duplicate thinking end tags must not leak into answer content";
+    ASSERT_TRUE(message.contains("reasoning_content"));
+    EXPECT_NE(message["reasoning_content"].get<std::string>().find("reasoning"),
+              std::string::npos);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_DisabledByDefault)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, hasChatTemplate())
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Return("tok"));
+
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+
+    // No thinking budget set — should decode normally without injection
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))
+        .WillOnce(Return(makeToken(11)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 10;
+    // thinking_budget_tokens is -1 by default (disabled)
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["usage"]["completion_tokens"], 3); // 10, 11, 0(stop)
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ThinkingBudget_NotActiveWhenThinkingDisabled)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, hasChatTemplate())
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Return("tok"));
+
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+
+    // Even with budget set, if enable_thinking=false, budget is inactive
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(10)))
+        .WillOnce(Return(makeToken(11)))
+        .WillOnce(Return(makeToken(12)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 10;
+    request.enable_thinking = false;
+    request.thinking_budget_tokens = 1; // Would trigger after 1 token if active
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+
+    auto body = json::parse(response.json_body);
+    // All 4 tokens decoded normally (no injection)
+    EXPECT_EQ(body["usage"]["completion_tokens"], 4);
+}
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_ThinkingBudgetTokens_Parsed)
+{
+    ChatCompletionResponse error;
+    auto result = ChatCompletionHandler::parseRequest(
+        minimalRequest({{"thinking_budget_tokens", 50}}), error);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->thinking_budget_tokens, 50);
+}
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_DRYParams_Parsed)
+{
+    ChatCompletionResponse error;
+    auto result = ChatCompletionHandler::parseRequest(
+        minimalRequest({{"dry_multiplier", 0.8},
+                        {"dry_base", 2.0},
+                        {"dry_allowed_length", 3},
+                        {"dry_penalty_last_n", 256},
+                        {"dry_sequence_breakers", json::array({"\\n", ":"})}}),
+        error);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_FLOAT_EQ(result->sampling.dry_multiplier, 0.8f);
+    EXPECT_FLOAT_EQ(result->sampling.dry_base, 2.0f);
+    EXPECT_EQ(result->sampling.dry_allowed_length, 3);
+    EXPECT_EQ(result->sampling.dry_penalty_last_n, 256);
+    EXPECT_EQ(result->sampling.dry_sequence_breakers.size(), 2u);
+    EXPECT_EQ(result->sampling.dry_sequence_breakers[0], "\\n");
+    EXPECT_EQ(result->sampling.dry_sequence_breakers[1], ":");
+}
+
+// =============================================================================
+// Tool calling tests
+// =============================================================================
+
+// --- Request parsing ---
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_ToolDefinitions_Parsed)
+{
+    auto body = json::parse(R"({
+        "messages": [{"role": "user", "content": "What's the weather?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get weather for a location",
+                "parameters": {"type": "object", "properties": {"location": {"type": "string"}}}
+            }
+        }],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true
+    })");
+
+    ChatCompletionResponse error;
+    auto result = ChatCompletionHandler::parseRequest(body.dump(), error);
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_TRUE(result->tools.is_array());
+    EXPECT_EQ(result->tools.size(), 1u);
+    EXPECT_EQ(result->tools[0]["function"]["name"], "get_weather");
+    EXPECT_EQ(result->tool_choice, "auto");
+    EXPECT_TRUE(result->parallel_tool_calls);
+}
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_ToolMessage_Parsed)
+{
+    auto body = json::parse(R"({
+        "messages": [
+            {"role": "user", "content": "What's the weather?"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"location\":\"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "content": "{\"temp\": 22}", "tool_call_id": "call_abc", "name": "get_weather"}
+        ]
+    })");
+
+    ChatCompletionResponse error;
+    auto result = ChatCompletionHandler::parseRequest(body.dump(), error);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->messages.size(), 3u);
+
+    // Assistant message with tool_calls
+    EXPECT_EQ(result->messages[1].role, "assistant");
+    EXPECT_TRUE(result->messages[1].content.empty());
+    EXPECT_TRUE(result->messages[1].hasToolCalls());
+    EXPECT_EQ(result->messages[1].tool_calls.size(), 1u);
+
+    // Tool result message
+    EXPECT_EQ(result->messages[2].role, "tool");
+    EXPECT_EQ(result->messages[2].tool_call_id, "call_abc");
+    EXPECT_EQ(result->messages[2].name, "get_weather");
+    EXPECT_EQ(result->messages[2].isToolResult(), true);
+}
+
+TEST_F(Test__ChatCompletionHandler, ParseRequest_ToolMessage_MissingToolCallId_Returns400)
+{
+    auto body = json::parse(R"({
+        "messages": [{"role": "tool", "content": "result data"}]
+    })");
+
+    ChatCompletionResponse error;
+    auto result = ChatCompletionHandler::parseRequest(body.dump(), error);
+
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(error.http_status, 400);
+}
+
+// --- Non-streaming response: tool calls detected ---
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_ToolCallsDetected_InResponse)
+{
+    auto handler = makeHandler();
+
+    // Model output contains Hermes 2 Pro tool call tags
+    std::string model_output = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>";
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::HERMES_2_PRO));
+
+    // Emit one token per character then stop
+    int call_count = 0;
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillRepeatedly(Invoke([&]() -> GenerationResult
+                               {
+            if (call_count < static_cast<int>(model_output.size()))
+            {
+                return makeToken(100 + call_count++);
+            }
+            return makeToken(0, true); }));
+
+    // Each token decodes to one character of the model output
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Invoke([&](int token_id) -> std::string
+                              {
+            int idx = token_id - 100;
+            if (idx >= 0 && idx < static_cast<int>(model_output.size()))
+                return std::string(1, model_output[idx]);
+            return ""; }));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "What's the weather?")};
+    request.max_tokens = 200;
+    request.tools = json::array({json{{"type", "function"}, {"function", {{"name", "get_weather"}}}}});
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_TRUE(response.ok);
+    EXPECT_EQ(response.http_status, 200);
+
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "tool_calls");
+
+    auto &message = body["choices"][0]["message"];
+    EXPECT_EQ(message["role"], "assistant");
+    EXPECT_TRUE(message.contains("tool_calls"));
+    EXPECT_TRUE(message["tool_calls"].is_array());
+    EXPECT_EQ(message["tool_calls"].size(), 1u);
+    EXPECT_EQ(message["tool_calls"][0]["type"], "function");
+    EXPECT_EQ(message["tool_calls"][0]["function"]["name"], "get_weather");
+    EXPECT_EQ(message["tool_calls"][0]["function"]["arguments"], R"({"location":"Paris"})");
+    EXPECT_FALSE(message["tool_calls"][0]["id"].get<std::string>().empty());
+}
+
+// --- Non-streaming: no tool calls in normal output ---
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_NoToolCalls_NormalResponse)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::HERMES_2_PRO));
+    ON_CALL(*tokenizer_, decode_token(100))
+        .WillByDefault(Return("The weather is sunny."));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(100)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "What's the weather?")};
+    request.max_tokens = 10;
+    request.tools = json::array({json{{"type", "function"}, {"function", {{"name", "get_weather"}}}}});
+
+    auto response = handler->handleRequest(request);
+
+    EXPECT_TRUE(response.ok);
+    auto body = json::parse(response.json_body);
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "stop");
+    EXPECT_EQ(body["choices"][0]["message"]["content"], "The weather is sunny.");
+    EXPECT_FALSE(body["choices"][0]["message"].contains("tool_calls"));
+}
+
+// --- Streaming: tool calls detected ---
+
+TEST_F(Test__ChatCompletionHandler, HandleStreamingRequest_ToolCallsDetected)
+{
+    auto handler = makeHandler();
+
+    std::string model_output = "<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"test\"}}\n</tool_call>";
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2, 3}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*runner_, getToolCallFormat())
+        .WillByDefault(Return(ToolCallFormat::HERMES_2_PRO));
+    ON_CALL(*tokenizer_, hasChatTemplate())
+        .WillByDefault(Return(false));
+
+    int call_count = 0;
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillRepeatedly(Invoke([&]() -> GenerationResult
+                               {
+            if (call_count < static_cast<int>(model_output.size()))
+                return makeToken(100 + call_count++);
+            return makeToken(0, true); }));
+
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Invoke([&](int token_id) -> std::string
+                              {
+            int idx = token_id - 100;
+            if (idx >= 0 && idx < static_cast<int>(model_output.size()))
+                return std::string(1, model_output[idx]);
+            return ""; }));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "search for test")};
+    request.max_tokens = 200;
+    request.stream = true;
+    request.tools = json::array({json{{"type", "function"}, {"function", {{"name", "search"}}}}});
+
+    // Collect SSE chunks
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &chunk) -> bool
+    {
+        chunks.push_back(chunk);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+    EXPECT_TRUE(response.ok);
+
+    // Find the chunk containing tool_calls delta
+    bool found_tool_calls = false;
+    bool found_tool_calls_finish = false;
+    for (const auto &chunk : chunks)
+    {
+        if (chunk.find("[DONE]") != std::string::npos)
+            continue;
+        if (chunk.substr(0, 6) != "data: ")
+            continue;
+
+        auto data = json::parse(chunk.substr(6));
+        auto &delta = data["choices"][0]["delta"];
+
+        if (delta.contains("tool_calls"))
+        {
+            found_tool_calls = true;
+            EXPECT_EQ(delta["tool_calls"][0]["function"]["name"], "search");
+            EXPECT_EQ(delta["tool_calls"][0]["function"]["arguments"], R"({"q":"test"})");
+        }
+
+        if (data["choices"][0].contains("finish_reason") &&
+            data["choices"][0]["finish_reason"] == "tool_calls")
+        {
+            found_tool_calls_finish = true;
+        }
+    }
+
+    EXPECT_TRUE(found_tool_calls) << "Expected tool_calls delta in SSE stream";
+    EXPECT_TRUE(found_tool_calls_finish) << "Expected finish_reason=tool_calls in SSE stream";
+}
+
+// --- Without tools in request, tool-like output is passed through as content ---
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_NoToolsRequested_ToolLikeOutputIsContent)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(100))
+        .WillByDefault(Return("<tool_call>{\"name\":\"fn\"}</tool_call>"));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(100)))
+        .WillOnce(Return(makeToken(0, true)));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.max_tokens = 10;
+    // No tools set — tool detection should NOT activate
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+
+    auto body = json::parse(response.json_body);
+    // Should be normal content, not parsed as tool_calls
+    EXPECT_EQ(body["choices"][0]["finish_reason"], "stop");
+    EXPECT_FALSE(body["choices"][0]["message"].contains("tool_calls"));
+    EXPECT_TRUE(body["choices"][0]["message"]["content"].get<std::string>().find("<tool_call>") != std::string::npos);
 }

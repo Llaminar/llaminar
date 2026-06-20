@@ -9,6 +9,7 @@
 #include "execution/compute_stages/ComputeStages.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
+#include <algorithm>
 #include <cmath>
 #include <vector>
 #include <numeric>
@@ -70,7 +71,8 @@ TEST_F(ComputeStageTest, StageTypeNames)
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::ADD_RESIDUAL), "ADD_RESIDUAL");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_ROUTER), "MOE_ROUTER");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_EXPERT_FFN), "MOE_EXPERT_FFN");
-    EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_COMBINE), "MOE_COMBINE");
+    EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_SHARED_EXPERT_FFN), "MOE_SHARED_EXPERT_FFN");
+    EXPECT_STREQ(computeStageTypeName(ComputeStageType::MOE_SHARED_EXPERT_GATE), "MOE_SHARED_EXPERT_GATE");
     EXPECT_STREQ(computeStageTypeName(ComputeStageType::ALLREDUCE), "ALLREDUCE");
 }
 
@@ -503,6 +505,84 @@ TEST_F(ComputeStageTest, RoPEExplicitPositionIds_OverridesPosOffset)
     EXPECT_TRUE(q1_differs) << "pos_offset=5 should produce different result than pos_offset=0";
 }
 
+TEST_F(ComputeStageTest, RoPEPartialRotaryKeepsFullHeadStride)
+{
+    const int seq_len = 1;
+    const int n_heads = 2;
+    const int n_kv_heads = 1;
+    const int head_dim = 8;
+    const int rotary_dim = 4;
+    const float theta_base = 10000.0f;
+    const std::vector<int> position_ids = {7};
+
+    // Use distinct values per head so a reduced head stride rotates the wrong
+    // portion of the row instead of merely producing a small numeric drift.
+    std::vector<float> q_data = {
+        1.0f, 2.0f, 3.0f, 4.0f, 50.0f, 51.0f, 52.0f, 53.0f,
+        -1.0f, -2.0f, -3.0f, -4.0f, 60.0f, 61.0f, 62.0f, 63.0f};
+    std::vector<float> k_data = {
+        5.0f, 6.0f, 7.0f, 8.0f, 70.0f, 71.0f, 72.0f, 73.0f};
+    std::vector<float> q_expected = q_data;
+    std::vector<float> k_expected = k_data;
+
+    auto apply_partial_reference = [&](std::vector<float> &data, int heads)
+    {
+        const int half_rotary = rotary_dim / 2;
+        for (int tok = 0; tok < seq_len; ++tok)
+        {
+            const int position = position_ids[static_cast<size_t>(tok)];
+            for (int head = 0; head < heads; ++head)
+            {
+                float *head_ptr = data.data() + tok * heads * head_dim + head * head_dim;
+                for (int i = 0; i < half_rotary; ++i)
+                {
+                    const float freq = 1.0f / std::pow(theta_base, static_cast<float>(2 * i) / rotary_dim);
+                    const float angle = static_cast<float>(position) * freq;
+                    const float cos_val = std::cos(angle);
+                    const float sin_val = std::sin(angle);
+                    const float x0 = head_ptr[i];
+                    const float x1 = head_ptr[i + half_rotary];
+                    head_ptr[i] = x0 * cos_val - x1 * sin_val;
+                    head_ptr[i + half_rotary] = x0 * sin_val + x1 * cos_val;
+                }
+            }
+        }
+    };
+
+    // Reference uses head_dim for memory stride and rotary_dim for the rotated
+    // prefix, matching HuggingFace partial RoPE layout semantics.
+    apply_partial_reference(q_expected, n_heads);
+    apply_partial_reference(k_expected, n_kv_heads);
+
+    auto Q = makeTensor(seq_len, n_heads * head_dim, q_data);
+    auto K = makeTensor(seq_len, n_kv_heads * head_dim, k_data);
+    RoPEStage::Params params{
+        .Q = Q.get(),
+        .K = K.get(),
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .pos_offset = position_ids[0],
+        .theta_base = theta_base,
+        .seq_len = seq_len,
+        .partial_rotary_factor = static_cast<float>(rotary_dim) / static_cast<float>(head_dim),
+        .position_ids = position_ids.data()};
+
+    RoPEStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const float *q_out = Q->data();
+    const float *k_out = K->data();
+    for (size_t i = 0; i < q_expected.size(); ++i)
+    {
+        EXPECT_NEAR(q_out[i], q_expected[i], 1e-5f) << "Q mismatch at index " << i;
+    }
+    for (size_t i = 0; i < k_expected.size(); ++i)
+    {
+        EXPECT_NEAR(k_out[i], k_expected[i], 1e-5f) << "K mismatch at index " << i;
+    }
+}
+
 // =============================================================================
 // ResidualAddStage Tests
 // =============================================================================
@@ -598,83 +678,6 @@ TEST_F(ComputeStageTest, BackendSupport)
 }
 
 // =============================================================================
-// MoE Stage Tests
-// =============================================================================
-
-TEST_F(ComputeStageTest, MoERouterBasic)
-{
-    const int seq_len = 2;
-    const int d_model = 4;
-    const int num_experts = 3;
-
-    // Simple hidden states using tensor helper
-    std::vector<float> hidden_data = {1.0f, 0.0f, 0.0f, 0.0f,  // Token 0
-                                      0.0f, 1.0f, 0.0f, 0.0f}; // Token 1
-    auto hidden = makeTensor(seq_len, d_model, hidden_data);
-
-    // Gate weights: each expert is a one-hot [num_experts, d_model]
-    std::vector<float> gate_data = {
-        1.0f, 0.0f, 0.0f, 0.0f, // Expert 0 responds to dim 0
-        0.0f, 1.0f, 0.0f, 0.0f, // Expert 1 responds to dim 1
-        0.0f, 0.0f, 1.0f, 0.0f  // Expert 2 responds to dim 2
-    };
-    auto gate_weights = makeTensor(num_experts, d_model, gate_data);
-
-    // Output router logits
-    auto router_logits = makeTensor(seq_len, num_experts);
-
-    MoERouterStage::Params params;
-    params.hidden = hidden.get();
-    params.gate_weights = gate_weights.get();
-    params.router_logits = router_logits.get();
-    params.seq_len = seq_len;
-    params.d_model = d_model;
-    params.num_experts = num_experts;
-
-    MoERouterStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::MOE_ROUTER);
-    EXPECT_TRUE(stage.execute(ctx_.get()));
-
-    // Get output data for verification
-    const float *output = router_logits->data();
-
-    // Token 0: [1,0,0,0] should have logit 1 for expert 0
-    EXPECT_NEAR(output[0], 1.0f, 1e-5f); // Expert 0
-    EXPECT_NEAR(output[1], 0.0f, 1e-5f); // Expert 1
-    EXPECT_NEAR(output[2], 0.0f, 1e-5f); // Expert 2
-
-    // Token 1: [0,1,0,0] should have logit 1 for expert 1
-    EXPECT_NEAR(output[3], 0.0f, 1e-5f); // Expert 0
-    EXPECT_NEAR(output[4], 1.0f, 1e-5f); // Expert 1
-    EXPECT_NEAR(output[5], 0.0f, 1e-5f); // Expert 2
-}
-
-TEST_F(ComputeStageTest, MoEExpertNoTokens)
-{
-    // Expert with no routed tokens should be a no-op
-    std::vector<int> empty_tokens;
-
-    MoEExpertStage::Params params;
-    params.expert_id = 5;
-    params.input = nullptr;
-    params.output = nullptr;
-    params.gate_w = nullptr;
-    params.up_w = nullptr;
-    params.down_w = nullptr;
-    params.token_indices = &empty_tokens;
-    params.d_model = 896;
-    params.intermediate_dim = 4864;
-
-    MoEExpertStage stage(params);
-
-    EXPECT_EQ(stage.type(), ComputeStageType::MOE_EXPERT_FFN);
-    EXPECT_EQ(stage.name(), "MOE_EXPERT_5");
-    EXPECT_TRUE(stage.execute(ctx_.get()));  // Should succeed (no-op)
-    EXPECT_EQ(stage.estimatedFlops(), 0ULL); // No tokens = no work
-}
-
-// =============================================================================
 // ComputeStageFactory Tests
 // =============================================================================
 
@@ -712,6 +715,84 @@ TEST_F(ComputeStageTest, FactoryCreateRoPE)
     auto stage = ComputeStageFactory::createRoPE(params);
     ASSERT_NE(stage, nullptr);
     EXPECT_EQ(stage->type(), ComputeStageType::ROPE);
+}
+
+TEST_F(ComputeStageTest, RoPEVerifierPrefillMatchesSerialDecodeRows)
+{
+    const int seq_len = 3;
+    const int n_heads = 4;
+    const int n_kv_heads = 2;
+    const int head_dim = 16;
+    const int q_cols = n_heads * head_dim;
+    const int k_cols = n_kv_heads * head_dim;
+    const int pos_offset = 17;
+
+    std::vector<float> q_input(static_cast<size_t>(seq_len) * q_cols);
+    std::vector<float> k_input(static_cast<size_t>(seq_len) * k_cols);
+    for (size_t i = 0; i < q_input.size(); ++i)
+        q_input[i] = std::sin(0.031f * static_cast<float>(i + 1));
+    for (size_t i = 0; i < k_input.size(); ++i)
+        k_input[i] = std::cos(0.017f * static_cast<float>(i + 3));
+
+    auto grouped_q = makeTensor(seq_len, q_cols, q_input);
+    auto grouped_k = makeTensor(seq_len, k_cols, k_input);
+    RoPEStage::Params grouped_params{
+        .device_id = DeviceId::cpu(),
+        .Q = grouped_q.get(),
+        .K = grouped_k.get(),
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .pos_offset = pos_offset,
+        .theta_base = 1000000.0f,
+        .seq_len = seq_len,
+        .force_decode_equivalent_verifier_prefill = true};
+
+    RoPEStage grouped_stage(grouped_params);
+    ASSERT_TRUE(grouped_stage.execute(ctx_.get()));
+
+    std::vector<float> serial_q(q_input.size(), 0.0f);
+    std::vector<float> serial_k(k_input.size(), 0.0f);
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto row_q = makeTensor(1, q_cols);
+        auto row_k = makeTensor(1, k_cols);
+        std::copy_n(q_input.data() + static_cast<size_t>(row) * q_cols,
+                    q_cols,
+                    row_q->mutable_data());
+        std::copy_n(k_input.data() + static_cast<size_t>(row) * k_cols,
+                    k_cols,
+                    row_k->mutable_data());
+
+        RoPEStage::Params row_params{
+            .device_id = DeviceId::cpu(),
+            .Q = row_q.get(),
+            .K = row_k.get(),
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .pos_offset = pos_offset + row,
+            .theta_base = 1000000.0f,
+            .seq_len = 1};
+        RoPEStage row_stage(row_params);
+        ASSERT_TRUE(row_stage.execute(ctx_.get())) << "row=" << row;
+
+        std::copy_n(row_q->data(), q_cols,
+                    serial_q.data() + static_cast<size_t>(row) * q_cols);
+        std::copy_n(row_k->data(), k_cols,
+                    serial_k.data() + static_cast<size_t>(row) * k_cols);
+    }
+
+    for (size_t i = 0; i < serial_q.size(); ++i)
+    {
+        EXPECT_NEAR(grouped_q->data()[i], serial_q[i], 1e-6f)
+            << "Q index=" << i;
+    }
+    for (size_t i = 0; i < serial_k.size(); ++i)
+    {
+        EXPECT_NEAR(grouped_k->data()[i], serial_k[i], 1e-6f)
+            << "K index=" << i;
+    }
 }
 
 // =============================================================================

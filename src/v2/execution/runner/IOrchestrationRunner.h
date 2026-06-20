@@ -22,8 +22,10 @@
 #pragma once
 
 #include "../../config/OrchestrationConfig.h"
+#include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
 #include "../../utils/Sampler.h"
+#include "../../utils/ToolCallTypes.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -32,6 +34,7 @@
 namespace llaminar2
 {
     class ITokenizer;          // Forward declaration
+    class IMPIContext;         // Forward declaration
     struct GraphExecutorStats; // Forward declaration
 }
 
@@ -58,6 +61,25 @@ namespace llaminar2
          * @brief Get number of tokens generated
          */
         size_t tokenCount() const { return tokens.size(); }
+    };
+
+    /**
+     * @brief Result of one request-batched decode step.
+     *
+     * `requests[i]` is the decode result for logical request `i` in the batch.
+     * `error` is reserved for batch-wide failures such as scheduler,
+     * publication, or collective errors that prevent per-request results from
+     * being trustworthy.
+     */
+    struct GenerationBatchResult
+    {
+        std::vector<GenerationResult> requests;
+        std::string error;
+
+        /**
+         * @brief Check if the whole batch step succeeded.
+         */
+        bool success() const { return error.empty(); }
     };
 
     /**
@@ -126,6 +148,34 @@ namespace llaminar2
         virtual bool prefill(const std::vector<int32_t> &tokens) = 0;
 
         /**
+         * @brief Whether prefillBatch() is implemented for this runner.
+         *
+         * A request-batched decode lane is valid only if every request slot has
+         * been initialized through the same ownership layer. This capability is
+         * intentionally separate from prefill() to avoid loops that mutate a
+         * single live request repeatedly.
+         */
+        virtual bool supportsPrefillBatch(int request_batch) const
+        {
+            (void)request_batch;
+            return false;
+        }
+
+        /**
+         * @brief Prefill a logical request batch.
+         *
+         * `token_batches[i]` is the prompt for logical request `i`.
+         * Implementations must initialize independent KV/state slots and leave
+         * all requests ready for a later decodeStepBatch() call.
+         */
+        virtual bool prefillBatch(
+            const std::vector<std::vector<int32_t>> &token_batches)
+        {
+            (void)token_batches;
+            return false;
+        }
+
+        /**
          * @brief Decode step: generate next token
          *
          * Generates a single token using the current KV cache state.
@@ -136,6 +186,57 @@ namespace llaminar2
          * @return GenerationResult with the generated token
          */
         virtual GenerationResult decodeStep() = 0;
+
+        /**
+         * @brief Commit a caller-selected token at the next decode position.
+         *
+         * This is used for protocol-level forced continuations such as
+         * thinking-budget stop prompts. Implementations must advance any live
+         * KV/GDN state needed to reach the token's position, discard the
+         * naturally sampled token for that position, and make @p token the
+         * authoritative last token for the following decode step.
+         *
+         * Unlike appending text at the HTTP layer, this keeps model state,
+         * sampler history, and later decode output coherent.
+         */
+        virtual GenerationResult forceDecodeToken(int32_t token)
+        {
+            (void)token;
+            GenerationResult result;
+            result.error = "forceDecodeToken unsupported";
+            return result;
+        }
+
+        /**
+         * @brief Whether decodeStepBatch() is implemented for this runner.
+         *
+         * Request batching is an explicit capability because it requires
+         * scheduler ownership, per-request publication, and rollback semantics
+         * that are stricter than a loop around decodeStep().
+         *
+         * @param request_batch Number of logical requests the caller wants to
+         *        advance together.
+         */
+        virtual bool supportsDecodeStepBatch(int request_batch) const
+        {
+            (void)request_batch;
+            return false;
+        }
+
+        /**
+         * @brief Decode step for a logical request batch.
+         *
+         * Implementations must honor setDecodeStepTokenBudget() as a
+         * per-request token limit and must publish or roll back all admitted
+         * requests atomically.
+         *
+         * @param request_batch Number of active logical requests.
+         */
+        virtual GenerationBatchResult decodeStepBatch(int request_batch)
+        {
+            (void)request_batch;
+            return GenerationBatchResult{{}, "decodeStepBatch unsupported"};
+        }
 
         /**
          * @brief Full generation loop
@@ -156,6 +257,25 @@ namespace llaminar2
             const std::vector<int32_t> &prompt_tokens,
             int max_new_tokens,
             const SamplingParams &sampling) = 0;
+
+        /**
+         * @brief Limit how many tokens the next decodeStep() may accept.
+         *
+         * A value <= 0 means unlimited. This is a no-op for runners that only
+         * ever return one token per decode step, but MTP/speculative runners use
+         * it to keep direct decode loops from advancing state past a caller's
+         * remaining token budget.
+         */
+        virtual void setDecodeStepTokenBudget(int max_tokens) { (void)max_tokens; }
+
+        /**
+         * @brief Apply any decode-boundary maintenance after a successful token step.
+         *
+         * Server and streaming paths drive decodeStep() directly instead of using
+         * generate(), so they call this hook to share maintenance such as dynamic
+         * MoE hot-expert replica updates.
+         */
+        virtual bool maybeApplyMoERebalance() { return true; }
 
         // =====================================================================
         // Configuration
@@ -216,11 +336,19 @@ namespace llaminar2
         virtual int currentPosition() const = 0;
 
         /**
-         * @brief Clear KV cache and reset position
+         * @brief Reset request/session state before starting a new sequence.
          *
-         * Call before starting a new sequence.
+         * This is a request-boundary reset. It must not destructively discard
+         * reusable graph caches, prepared weights, workspace bindings, or device
+         * contexts unless a lower-level implementation has detected a topology or
+         * workspace lifetime change.
          */
         virtual void clearCache() = 0;
+
+        /**
+         * @brief Read-only runtime state probe for prefix-cache/MTP development.
+         */
+        virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
 
         // =====================================================================
         // Advanced
@@ -385,6 +513,25 @@ namespace llaminar2
          */
         virtual SamplingParams getRecommendedSamplingParams() const { return {}; }
 
+        /**
+         * @brief Get the stop-thinking prompt for thinking budget enforcement
+         *
+         * Returns the model-specific string that forces the model out of
+         * thinking mode. Empty string means the model doesn't support thinking budgets.
+         */
+        virtual std::string getStopThinkingPrompt() const { return ""; }
+
+        /**
+         * @brief Get the tool call output format for this model
+         *
+         * Returns the format used by the loaded model to emit tool calls
+         * in raw text. Used by ChatCompletionHandler to parse tool calls
+         * from model output.
+         *
+         * @return ToolCallFormat enum value (default: HERMES_2_PRO)
+         */
+        virtual ToolCallFormat getToolCallFormat() const { return ToolCallFormat::HERMES_2_PRO; }
+
         // =====================================================================
         // MPI Worker Loop (for non-root ranks in server mode)
         // =====================================================================
@@ -405,6 +552,24 @@ namespace llaminar2
          * from runMPIWorkerLoop() after receiving this signal.
          */
         virtual void shutdownMPIWorkers() {}
+
+        /**
+         * @brief Signal MPI worker ranks to leave their worker loops after a fatal root-rank error.
+         *
+         * Implementations with a richer worker protocol may send an explicit
+         * abort command. The default keeps legacy runners safe by falling back
+         * to ordinary shutdown.
+         */
+        virtual void abortMPIWorkers(const std::string & /*reason*/) { shutdownMPIWorkers(); }
+
+        /**
+         * @brief Provide the real overlay-domain MPI context to nested runners.
+         *
+         * Composite overlay roots may intentionally use a local-only MPI context
+         * for the dense/root runner while still needing the global MPI context
+         * for same-layer expert domain-worker commands inside graph stages.
+         */
+        virtual void setMoEExpertOverlayMPIContext(std::shared_ptr<IMPIContext> /*mpi_ctx*/) {}
 
         /**
          * @brief Enable MPI coordinated mode.

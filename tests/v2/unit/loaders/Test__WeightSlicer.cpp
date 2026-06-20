@@ -801,6 +801,50 @@ TEST_F(Test__WeightSlicer, FusedQKV_GDN_AllDegrees_Qwen35_4B)
     }
 }
 
+TEST_F(Test__WeightSlicer, Qwen35GDNValueHeadWeights_4B_TP2_AreDStateAligned)
+{
+    // Regression guard for Qwen3.5-4B dense GDN: FA/Q attention uses 36 heads,
+    // but GDN value projections use 32 value heads. These weights must be sliced
+    // proportionally into value-head space, not by an integer 4096/36 head width.
+    constexpr int FA_HEADS = 36;
+    constexpr int GDN_K_HEADS = 16;
+    constexpr int GDN_V_HEADS = 32;
+    constexpr int D_STATE = 128;
+    constexpr size_t GDN_VALUE_ROWS = GDN_V_HEADS * D_STATE;
+
+    ModelDimensions dims{
+        .n_heads = FA_HEADS,
+        .n_kv_heads = 4,
+        .head_dim = D_STATE,
+        .gdn_n_k_heads = GDN_K_HEADS,
+        .gdn_n_v_heads = GDN_V_HEADS,
+        .gdn_d_state = D_STATE};
+    auto tp_cfg = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, FA_HEADS, 4, D_FF, VOCAB));
+    WeightSlicer slicer(dims, qwen35Config(), tp_cfg);
+
+    const auto &rank1 = tp_cfg->forRank(1);
+    ASSERT_EQ(rank1.head_start, 18);
+
+    auto gate = slicer.computeSliceForAssignment(
+        "blk.0.attn_gate.weight", GDN_VALUE_ROWS, rank1);
+    auto ssm_out = slicer.computeSliceForAssignment(
+        "blk.0.ssm_out.weight", GDN_VALUE_ROWS, rank1);
+
+    EXPECT_EQ(gate.start, 16u * D_STATE);
+    EXPECT_EQ(gate.count, 16u * D_STATE);
+    EXPECT_EQ(gate.start % D_STATE, 0u);
+
+    EXPECT_EQ(ssm_out.start, 16u * D_STATE);
+    EXPECT_EQ(ssm_out.count, 16u * D_STATE);
+    EXPECT_EQ(ssm_out.start % D_STATE, 0u);
+
+    const size_t stale_heads_start = static_cast<size_t>(rank1.head_start) *
+                                     (GDN_VALUE_ROWS / static_cast<size_t>(FA_HEADS));
+    EXPECT_NE(gate.start, stale_heads_start);
+    EXPECT_NE(ssm_out.start, stale_heads_start);
+}
+
 // =============================================================================
 // TP Degree == n_heads (one head per rank)
 // =============================================================================

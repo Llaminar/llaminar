@@ -28,9 +28,13 @@
 
 #pragma once
 
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../tensors/TensorKernels.h"
 #include <memory>
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -64,7 +68,7 @@ namespace llaminar2
          * - Single kernel instance should be used from one thread
          * - hipBLAS handle is per-kernel (not shared)
          */
-        class ROCmFloatingPointGemmKernel : public ITensorGemm
+        class ROCmFloatingPointGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
             /**
@@ -90,6 +94,26 @@ namespace llaminar2
                 const TensorBase *weights,
                 int rocm_device_id,
                 Precision precision = Precision::FP32);
+
+            /**
+             * @brief Construct kernel from raw device pointer (GPU pipeline path)
+             *
+             * Used when weights have been uploaded to a VRAM pool and the caller
+             * already has the device pointer. No TensorBase needed.
+             *
+             * @param d_weights Device pointer to weight data (already on GPU)
+             * @param N Output features (weight rows)
+             * @param K Input features (weight cols)
+             * @param rocm_device_id ROCm device ID
+             * @param precision Precision mode
+             * @param lifetime_owner Shared pointer that keeps the VRAM pool alive
+             */
+            ROCmFloatingPointGemmKernel(
+                const void *d_weights,
+                int N, int K,
+                int rocm_device_id,
+                Precision precision,
+                std::shared_ptr<void> lifetime_owner);
 
             ~ROCmFloatingPointGemmKernel() override;
 
@@ -135,6 +159,22 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
+            bool supports_fused_projection() const override { return precision_ == Precision::FP32; }
+
+            bool multiply_fused_tensor(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
             /**
              * @brief Activation-activation GEMM (not supported for FP ROCm kernel)
              *
@@ -170,6 +210,15 @@ namespace llaminar2
             void setGPUStream(void *stream) override;
 
             // =========================================================================
+            // IWorkspaceConsumer interface
+            // =========================================================================
+
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            bool hasWorkspace() const override;
+            DeviceWorkspaceManager *getWorkspace() const override;
+
+            // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
 
@@ -185,7 +234,7 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
         private:
-            const TensorBase *weights_; // Weight tensor (stored for metadata)
+            const TensorBase *weights_; // Weight tensor (stored for metadata, may be null for pool path)
             const void *d_weights_;     // Device pointer to weight data
             int rocm_device_id_;
             Precision precision_;
@@ -196,14 +245,30 @@ namespace llaminar2
             // Owned by DeviceKernelCache, not this kernel instance
             HipBLASGemmKernel *hipblas_kernel_ = nullptr;
 
+            // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
+            std::shared_ptr<void> lifetime_owner_;
+
             // GPU stream for profiling (set via setGPUStream)
             void *gpu_stream_ = nullptr;
 
-            // Cached HBM redirect buffer for mapped output memory
-            // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
-            // This provides an HBM staging buffer; we bulk-DMA to mapped memory after.
-            float *d_mapped_redirect_ = nullptr;
-            size_t mapped_redirect_capacity_ = 0;
+            // IWorkspaceConsumer state. Batched hipBLAS pointer arrays are
+            // borrowed from declared graph workspace buffers, never allocated
+            // by this kernel on the hot path.
+            DeviceWorkspaceManager *workspace_ = nullptr;
+            uint32_t slice_id_ = 0;
+            const float **d_batch_A_ptrs_ = nullptr;
+            const float **d_batch_B_ptrs_ = nullptr;
+            float **d_batch_C_ptrs_ = nullptr;
+
+            std::string batchAPtrsBufferName() const;
+            std::string batchBPtrsBufferName() const;
+            std::string batchCPtrsBufferName() const;
+            bool validateBatchedPointerWorkspace(DeviceWorkspaceManager *workspace, size_t required_count);
+            bool stageBatchedPointers(
+                const std::vector<const float *> &a_ptrs,
+                const std::vector<const float *> &b_ptrs,
+                const std::vector<float *> &c_ptrs,
+                DeviceWorkspaceManager *workspace);
         };
 
     } // namespace rocm

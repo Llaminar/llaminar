@@ -15,24 +15,24 @@ namespace llaminar2
     //
     // cudaErrorCudartUnloading is silenced because it's expected during process
     // exit when the CUDA runtime tears down before our cleanup code runs.
-#define CUDA_WARN_IF_FAIL(call)                                                            \
-    do                                                                                     \
-    {                                                                                      \
-        cudaError_t _err = (call);                                                         \
-        if (_err != cudaSuccess)                                                           \
-        {                                                                                  \
-            if (_err == cudaErrorCudartUnloading)                                          \
-            {                                                                              \
-                LOG_TRACE("[CUDAGraphCapture] " << #call                                   \
-                                                << " skipped: CUDA runtime shutting down");\
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                LOG_WARN("[CUDAGraphCapture] " << #call << " failed: "                     \
-                                               << cudaGetErrorString(_err) << " ("        \
-                                               << __FILE__ << ":" << __LINE__ << ")");    \
-            }                                                                              \
-        }                                                                                  \
+#define CUDA_WARN_IF_FAIL(call)                                                             \
+    do                                                                                      \
+    {                                                                                       \
+        cudaError_t _err = (call);                                                          \
+        if (_err != cudaSuccess)                                                            \
+        {                                                                                   \
+            if (_err == cudaErrorCudartUnloading)                                           \
+            {                                                                               \
+                LOG_TRACE("[CUDAGraphCapture] " << #call                                    \
+                                                << " skipped: CUDA runtime shutting down"); \
+            }                                                                               \
+            else                                                                            \
+            {                                                                               \
+                LOG_WARN("[CUDAGraphCapture] " << #call << " failed: "                      \
+                                               << cudaGetErrorString(_err) << " ("          \
+                                               << __FILE__ << ":" << __LINE__ << ")");      \
+            }                                                                               \
+        }                                                                                   \
     } while (0)
 
     CUDAGraphCapture::CUDAGraphCapture(cudaStream_t stream) : stream_(stream) {}
@@ -166,7 +166,7 @@ namespace llaminar2
         }
 
         // Use 4-arg version with cudaGraphExecUpdateResult for CUDA 10-12 compatibility
-        cudaGraphExecUpdateResult update_result;
+        cudaGraphExecUpdateResult update_result = cudaGraphExecUpdateError;
         cudaError_t err = cudaGraphExecUpdate(exec_, graph_, nullptr, &update_result);
 
         if (err == cudaSuccess && update_result == cudaGraphExecUpdateSuccess)

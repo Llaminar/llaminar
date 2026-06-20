@@ -19,6 +19,7 @@ namespace llaminar2
 {
 
     class IInferenceRunner;
+    struct LogitsLocalInfo;
     struct SamplingParams;
 
     /**
@@ -47,6 +48,16 @@ namespace llaminar2
          * @return Token ID (>= 0) if succeeded, -1 if not supported
          */
         static int sampleGreedy(const std::vector<std::unique_ptr<IInferenceRunner>> &runners);
+
+        /**
+         * @brief Greedy argmax across already-collected local logits views.
+         *
+         * This is used for main logits, MTP sidecar logits, and all-position
+         * verifier logits. GPU views use backend argmax when scratch is
+         * available; CPU views sample directly from the local tensor data.
+         */
+        static int sampleGreedyFromLocalInfos(const std::vector<LogitsLocalInfo> &infos,
+                                              int row = 0);
 
         /**
          * @brief GPU-side sampling with top-k/top-p support.

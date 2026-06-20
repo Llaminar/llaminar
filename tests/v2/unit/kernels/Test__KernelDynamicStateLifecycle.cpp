@@ -23,9 +23,14 @@
 #include "tensors/KernelSnapshotInfo.h"
 #include "backends/ComputeBackend.h"
 #include "backends/DeviceId.h"
+#include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "../../utils/TestTensorFactory.h"
+
+#ifdef HAVE_ROCM
+#include "kernels/rocm/ops/ROCmEmbeddingKernelT.h"
+#endif
 
 using namespace llaminar::v2::kernels;
 using namespace llaminar2;
@@ -78,6 +83,8 @@ protected:
         auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
         if (ws_consumer)
             ws_consumer->bindWorkspace(workspace.get());
+
+        kernel->setGPUStream(GPUDeviceContextPool::instance().getContext(device).defaultStream());
 
         return {std::move(kernel), std::move(workspace)};
     }
@@ -275,6 +282,37 @@ TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_ReactivateAfterReset)
         << "Kernel must be re-activatable after reset";
 }
 
+TEST_F(Test__KernelDynamicStateLifecycle, ROCmEmbedding_UnbindClearsDeviceSpecificWorkspace)
+{
+#ifndef HAVE_ROCM
+    GTEST_SKIP() << "ROCm backend not compiled";
+#else
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm GPU available";
+
+    ROCmEmbeddingKernelT kernel;
+    DeviceId device = DeviceId::rocm(0);
+    auto workspace = std::make_unique<DeviceWorkspaceManager>(device, 64 * 1024);
+
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({EmbeddingWorkspaceBuffers::TOKEN_IDS,
+                            512 * sizeof(int), 256, true});
+    ASSERT_TRUE(workspace->allocate(reqs));
+
+    kernel.bindWorkspace(workspace.get());
+
+    std::vector<int> tokens = {1, 5, 10};
+    kernel.setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    ASSERT_TRUE(kernel.hasDynamicStateActive());
+
+    kernel.bindWorkspace(nullptr);
+    kernel.setDynamicTokenIds(tokens.data(), static_cast<int>(tokens.size()));
+    EXPECT_FALSE(kernel.hasDynamicStateActive())
+        << "Unbind must clear device-specific workspace bindings, including "
+           "bindings created while device_idx_ was unspecified";
+#endif
+}
+
 // ============================================================================
 // KernelFactory::resetAllDynamicState() — Cache Interaction
 // ============================================================================
@@ -332,6 +370,7 @@ TEST_F(Test__KernelDynamicStateLifecycle, Factory_ResetClearsGPUEmbeddingDynamic
     auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(cached);
     ASSERT_NE(ws_consumer, nullptr);
     ws_consumer->bindWorkspace(workspace.get());
+    cached->setGPUStream(GPUDeviceContextPool::instance().getContext(device).defaultStream());
 
     // Activate dynamic state (simulates prefill preloading token IDs)
     std::vector<int> tokens = {1, 5, 10};

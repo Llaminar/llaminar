@@ -945,7 +945,7 @@ namespace llaminar2
  * @brief Scoped CUDA kernel profiling with stream
  */
 #define CUDA_KERNEL_PROFILE_SCOPE_STREAM(kernel_type, stream) \
-    ::llaminar2::ScopedCUDAKernelTimer _cuda_timer_##__LINE__(kernel_type, stream)
+    ::llaminar2::ScopedCUDAKernelTimer _cuda_timer_##__LINE__(kernel_type, static_cast<cudaStream_t>(stream))
 
 /**
  * @brief Manual CUDA kernel profiling begin

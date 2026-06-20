@@ -386,6 +386,36 @@ TEST_F(Test__GlobalTPContext_MPI, Allgather_LargerShards)
     }
 }
 
+/**
+ * @test AllgatherBytes_SmallControlRecord
+ * Rank-local scalar/control records gather through the GlobalTPContext domain,
+ * which is used by TP-aware MTP greedy-token coordination.
+ */
+TEST_F(Test__GlobalTPContext_MPI, AllgatherBytes_SmallControlRecord)
+{
+    auto ctx = createTwoRankContext();
+    ASSERT_NE(ctx, nullptr);
+
+    struct ControlRecord
+    {
+        int32_t token;
+        float score;
+    };
+
+    ControlRecord local{
+        static_cast<int32_t>(10 + world_rank_),
+        1.5f + static_cast<float>(world_rank_)};
+    std::vector<ControlRecord> gathered(2);
+
+    ASSERT_TRUE(ctx->allgatherBytes(&local, gathered.data(), sizeof(ControlRecord)))
+        << "allgatherBytes failed on rank " << world_rank_;
+
+    EXPECT_EQ(gathered[0].token, 10);
+    EXPECT_FLOAT_EQ(gathered[0].score, 1.5f);
+    EXPECT_EQ(gathered[1].token, 11);
+    EXPECT_FLOAT_EQ(gathered[1].score, 2.5f);
+}
+
 // =============================================================================
 // Point-to-Point Tests
 // =============================================================================
@@ -608,6 +638,29 @@ TEST_F(Test__GlobalTPContext_MPI, ScopeReflectsNodePlacement_AllRanks)
     EXPECT_TRUE(ctx->isNodeLocal()) << "Same-node ranks should be NODE_LOCAL on rank " << world_rank_;
     EXPECT_TRUE(ctx->isAllRanksOnSameNode()) << "Dev container has single node";
     EXPECT_EQ(ctx->nodeCount(), 1) << "Should detect 1 node in dev container";
+}
+
+TEST_F(Test__GlobalTPContext_MPI, SameNodeUPIUsesShmemSpinBackend)
+{
+    auto ctx = GlobalTPContext::createWithSplit(
+        MPI_COMM_WORLD,
+        /*domain_id=*/6060,
+        /*color=*/0,
+        /*key=*/world_rank_,
+        /*hostfile_path=*/"",
+        CollectiveBackendType::UPI);
+    ASSERT_NE(ctx, nullptr);
+
+    if (ctx->isAllRanksOnSameNode())
+    {
+        EXPECT_EQ(ctx->collectiveBackendNameForDiagnostics(), "ShmemSpin")
+            << "Same-node UPI GlobalTP domains should use the shared-memory fast path";
+    }
+    else
+    {
+        EXPECT_EQ(ctx->collectiveBackendNameForDiagnostics(), "UPI")
+            << "Cross-node UPI domains should stay on the MPI/UPI backend";
+    }
 }
 
 /**

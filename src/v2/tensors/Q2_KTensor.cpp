@@ -74,9 +74,9 @@ namespace llaminar2
     }
     // Zero-copy constructor for mmap-backed data
     Q2_KTensor::Q2_KTensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                           const uint8_t *mmap_data,
+                           size_t byte_size,
+                           std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -103,31 +103,47 @@ namespace llaminar2
         }
     }
 
-
     std::shared_ptr<TensorBase> Q2_KTensor::create_view(
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        if (shape_.size() != 2 || new_shape.size() != 2)
+        if (new_shape.size() != 2)
         {
-            throw std::invalid_argument("Q2_KTensor::create_view: only 2D row-slice views supported");
+            throw std::invalid_argument("Q2_KTensor::create_view: only 2D views supported");
         }
-        if (new_shape[1] != shape_[1])
+
+        size_t K = 0;
+        size_t total_rows = 0;
+        if (shape_.size() == 2)
         {
-            throw std::invalid_argument("Q2_KTensor::create_view: column count (K) must match parent");
+            K = shape_[1];
+            total_rows = shape_[0];
         }
-        if (offset % shape_[1] != 0)
+        else if (shape_.size() == 3)
+        {
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q2_KTensor::create_view: parent must be 2D or 3D");
+        }
+
+        if (new_shape[1] != K)
+        {
+            throw std::invalid_argument("Q2_KTensor::create_view: K dimension must match parent");
+        }
+        if (offset % K != 0)
         {
             throw std::invalid_argument("Q2_KTensor::create_view: offset must be row-aligned");
         }
-        if (offset + new_shape[0] * new_shape[1] > shape_[0] * shape_[1])
+        const size_t first_row = offset / K;
+        if (first_row + new_shape[0] > total_rows)
         {
             throw std::out_of_range("Q2_KTensor::create_view: view exceeds parent bounds");
         }
 
-        const size_t cols = shape_[1];
-        const size_t blocks_per_row = (cols + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
-        const size_t first_row = offset / cols;
+        const size_t blocks_per_row = (K + Q2_KBlock::BLOCK_SIZE - 1) / Q2_KBlock::BLOCK_SIZE;
         const size_t block_offset = first_row * blocks_per_row;
         const size_t byte_offset = block_offset * sizeof(Q2_KBlock);
 
@@ -357,8 +373,14 @@ namespace llaminar2
 #endif
     }
 
-    Q2_KTensor::~Q2_KTensor() {}
-
+    Q2_KTensor::~Q2_KTensor()
+    {
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
+    }
 
     const float *Q2_KTensor::data() const
     {
@@ -730,7 +752,6 @@ namespace llaminar2
         // Unpack all 8 sub-blocks (256 elements total)
         simd::unpack_q2_k_superblock_to_int8(block, output, scales, mins);
     }
-
 
     void Q2_KTensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

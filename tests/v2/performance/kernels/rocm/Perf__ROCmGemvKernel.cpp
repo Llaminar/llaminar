@@ -36,6 +36,14 @@
 #include <hip/hip_runtime.h>
 #endif
 
+// Stub for removed CK two-kernel GEMM (no longer built as separate symbol)
+extern "C" bool rocmQuantGemm_executeTwoKernel_cached(
+    const int8_t *, const int8_t *, float *, const float *, const float *,
+    int32_t *, int, int, int, int, void *)
+{
+    return false;
+}
+
 // GEMV + CK GEMM kernel C API
 extern "C"
 {
@@ -59,33 +67,23 @@ extern "C"
     void rocmGemv_int8_vnni_set_skip_memset(int skip);
     void rocmGemv_int8_vnni_set_force_pair(int force);
     bool rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
-        const int8_t* d_A_int8,
-        const float* d_scales_A_blockwise,
-        const int8_t* d_B0,
-        const int8_t* d_B1,
-        float* d_C0,
-        float* d_C1,
-        const float* d_scales_B0,
-        const float* d_scales_B1,
+        const int8_t *d_A_int8,
+        const float *d_scales_A_blockwise,
+        const int8_t *d_B0,
+        const int8_t *d_B1,
+        float *d_C0,
+        float *d_C1,
+        const float *d_scales_B0,
+        const float *d_scales_B1,
         int N0, int N1,
         int K,
         float alpha,
-        int device_id, void* stream);
+        int device_id, void *stream);
     void rocmGemv_int8_vnni_set_wide_tuning_overrides(
         int wide_tn,
         int wide_cpt,
         int wide_vec_load);
     void rocmGemv_int8_vnni_reset_wide_tuning_overrides();
-
-    bool rocmQuantGemm_executeTwoKernel_cached(
-        const int8_t *d_A_int8,
-        const int8_t *d_weights_int8,
-        float *d_C_fp32,
-        const float *d_scales_A,
-        const float *d_scales_B,
-        int32_t *d_C_int32,
-        int M, int N, int K,
-        int rocm_device_id, void *stream);
 
     bool rocmGemv_fused_scatter_fp32_int8_vnni(
         const float *d_A_fp32,
@@ -2913,7 +2911,7 @@ namespace
         // Sweep: TN × WK × Unroll × KB × ACT_BK
         const std::vector<int> tn_candidates = {128, 256};
         const std::vector<int> wk_candidates = {2, 3, 4, 6, 8};
-        const std::vector<int> unroll_candidates = {1, 2};  // 2 = 2x act_block unroll (TN=256 only)
+        const std::vector<int> unroll_candidates = {1, 2}; // 2 = 2x act_block unroll (TN=256 only)
         const std::vector<int> kb_candidates = {6, 8, 10, 12, 14};
         const std::vector<int> act_bk_candidates = {32, 64, 128};
 
@@ -2939,14 +2937,16 @@ namespace
             for (const int tn : tn_candidates)
             {
                 // ACT_BK > 32 only implemented for TN=128/unroll=2 path
-                if (act_bk > 32 && tn != 128) continue;
+                if (act_bk > 32 && tn != 128)
+                    continue;
 
                 for (const int wk : wk_candidates)
                 {
                     for (const int unroll : unroll_candidates)
                     {
                         // ACT_BK > 32 only implemented for unroll=2
-                        if (act_bk > 32 && unroll != 2) continue;
+                        if (act_bk > 32 && unroll != 2)
+                            continue;
 
                         for (const int kb : kb_candidates)
                         {
@@ -3237,7 +3237,12 @@ namespace
 
         fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
 
-        struct KVShape { const char* name; int N; int K; };
+        struct KVShape
+        {
+            const char *name;
+            int N;
+            int K;
+        };
         std::vector<KVShape> shapes = {
             {"3B K proj", kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.hidden},
             {"3B V proj", kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.hidden},
@@ -3248,7 +3253,7 @@ namespace
         const std::vector<int> kb_candidates = {1, 2, 4, 7, 8, 14, 16, 28, 56, 112};
         const std::vector<int> wk_candidates = {2, 4, 8};
 
-        for (const auto& shape : shapes)
+        for (const auto &shape : shapes)
         {
             rocmGemv_int8_vnni_reset_tuning_overrides();
             rocmGemv_int8_vnni_reset_qwo_overrides();
@@ -3276,7 +3281,8 @@ namespace
             {
                 for (const int kb : kb_candidates)
                 {
-                    if (kb > act_blocks) continue;
+                    if (kb > act_blocks)
+                        continue;
                     const int total_waves = grid_n * wk * kb;
                     const double acts_per_wave = static_cast<double>(act_blocks) / (wk * kb);
 
@@ -3358,7 +3364,12 @@ namespace
 
         fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
 
-        struct FFNDownShape { const char* name; int N; int K; };
+        struct FFNDownShape
+        {
+            const char *name;
+            int N;
+            int K;
+        };
         std::vector<FFNDownShape> shapes = {
             {"3B FFN Down", kQwen3B.hidden, kQwen3B.intermediate},
             {"7B FFN Down", kQwen7B.hidden, kQwen7B.intermediate},
@@ -3367,7 +3378,7 @@ namespace
         const std::vector<int> kb_candidates = {1, 2, 4, 7, 10, 14, 20, 30, 40, 50, 74};
         const std::vector<int> wk_candidates = {4, 6, 8};
 
-        for (const auto& shape : shapes)
+        for (const auto &shape : shapes)
         {
             rocmGemv_int8_vnni_reset_tuning_overrides();
             rocmGemv_int8_vnni_reset_qwo_overrides();
@@ -3465,7 +3476,12 @@ namespace
 
         fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
 
-        struct KVShape { const char* name; int N; int K; };
+        struct KVShape
+        {
+            const char *name;
+            int N;
+            int K;
+        };
         std::vector<KVShape> shapes = {
             {"3B K/V", kQwen3B.num_kv_heads * kQwen3B.head_dim, kQwen3B.hidden},
             {"7B K/V", kQwen7B.num_kv_heads * kQwen7B.head_dim, kQwen7B.hidden},
@@ -3474,7 +3490,7 @@ namespace
         constexpr int WARMUP = 5;
         constexpr int BENCH = 30;
 
-        for (const auto& shape : shapes)
+        for (const auto &shape : shapes)
         {
             const int N = shape.N;
             const int K = shape.K;
@@ -3489,21 +3505,26 @@ namespace
             std::uniform_real_distribution<float> dist_s(0.001f, 0.1f);
 
             std::vector<float> h_A(K);
-            for (auto &v : h_A) v = dist_a(rng);
+            for (auto &v : h_A)
+                v = dist_a(rng);
 
-            auto make_projection = [&](int proj_N) {
-                struct ProjData {
+            auto make_projection = [&](int proj_N)
+            {
+                struct ProjData
+                {
                     std::vector<int8_t> h_B_vnni;
                     std::vector<float> h_scale;
-                    int8_t* d_B = nullptr;
-                    float* d_scale = nullptr;
-                    float* d_C = nullptr;
+                    int8_t *d_B = nullptr;
+                    float *d_scale = nullptr;
+                    float *d_C = nullptr;
                 };
                 ProjData p;
                 std::vector<int8_t> h_B(static_cast<size_t>(K) * proj_N);
                 p.h_scale.resize(proj_N);
-                for (auto &v : h_B) v = static_cast<int8_t>(dist_b(rng));
-                for (auto &v : p.h_scale) v = dist_s(rng);
+                for (auto &v : h_B)
+                    v = static_cast<int8_t>(dist_b(rng));
+                for (auto &v : p.h_scale)
+                    v = dist_s(rng);
                 packVnniWeights(h_B, proj_N, K, p.h_B_vnni);
                 hipMalloc(&p.d_B, p.h_B_vnni.size() * sizeof(int8_t));
                 hipMalloc(&p.d_scale, proj_N * sizeof(float));
@@ -3540,14 +3561,15 @@ namespace
             hipStreamCreate(&stream2);
 
             // Batched API arrays
-            const int8_t* d_B_ptrs[2] = { proj_k.d_B, proj_v.d_B };
-            float* d_C_ptrs[2] = { proj_k.d_C, proj_v.d_C };
-            const float* d_scale_ptrs[2] = { proj_k.d_scale, proj_v.d_scale };
-            const float* d_bias_ptrs[2] = { nullptr, nullptr };
-            int N_per_proj[2] = { N, N };
+            const int8_t *d_B_ptrs[2] = {proj_k.d_B, proj_v.d_B};
+            float *d_C_ptrs[2] = {proj_k.d_C, proj_v.d_C};
+            const float *d_scale_ptrs[2] = {proj_k.d_scale, proj_v.d_scale};
+            const float *d_bias_ptrs[2] = {nullptr, nullptr};
+            int N_per_proj[2] = {N, N};
 
             // ---- Warmup all paths ----
-            for (int i = 0; i < WARMUP; ++i) {
+            for (int i = 0; i < WARMUP; ++i)
+            {
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, proj_k.d_B, proj_k.d_C, d_scale_A_bw, proj_k.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, nullptr);
@@ -3560,7 +3582,8 @@ namespace
             // ===== Approach 1: 2× serial on default stream =====
             std::vector<double> serial_times;
             serial_times.reserve(BENCH);
-            for (int i = 0; i < BENCH; ++i) {
+            for (int i = 0; i < BENCH; ++i)
+            {
                 hipDeviceSynchronize();
                 hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
@@ -3579,7 +3602,8 @@ namespace
             // ===== Approach 2: batched API (default — splits to 2 singles) =====
             std::vector<double> batched_split_times;
             batched_split_times.reserve(BENCH);
-            for (int i = 0; i < BENCH; ++i) {
+            for (int i = 0; i < BENCH; ++i)
+            {
                 hipDeviceSynchronize();
                 hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
@@ -3596,15 +3620,21 @@ namespace
             // ===== Approach 3: batched API with force_pair (grid_kpar_pair kernel) =====
             // Sweep KB values for the pair kernel
             std::vector<int> pair_kb_values = {2, 4, 7, 8, 14};
-            struct PairResult { int kb; double min_ms; };
+            struct PairResult
+            {
+                int kb;
+                double min_ms;
+            };
             std::vector<PairResult> pair_results;
 
-            for (int kb : pair_kb_values) {
+            for (int kb : pair_kb_values)
+            {
                 rocmGemv_int8_vnni_set_force_pair(1);
                 rocmGemv_int8_vnni_set_tuning_overrides(128, kb);
 
                 // Warmup
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 3; ++i)
+                {
                     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
                         d_A_int8, d_scale_A_bw, 2,
                         d_B_ptrs, d_C_ptrs, d_scale_ptrs, d_bias_ptrs, N_per_proj,
@@ -3614,7 +3644,8 @@ namespace
 
                 std::vector<double> times;
                 times.reserve(BENCH);
-                for (int i = 0; i < BENCH; ++i) {
+                for (int i = 0; i < BENCH; ++i)
+                {
                     hipDeviceSynchronize();
                     hipEventRecord(ev_start, 0);
                     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_batched(
@@ -3637,7 +3668,8 @@ namespace
 
             // ===== Approach 4: 2× on separate HIP streams (concurrent) =====
             // Warmup on stream2
-            for (int i = 0; i < WARMUP; ++i) {
+            for (int i = 0; i < WARMUP; ++i)
+            {
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
                     d_A_int8, proj_v.d_B, proj_v.d_C, d_scale_A_bw, proj_v.d_scale,
                     N, K, 1.0f, 0.0f, nullptr, nullptr, device_id_, stream2);
@@ -3646,7 +3678,8 @@ namespace
 
             std::vector<double> concurrent_times;
             concurrent_times.reserve(BENCH);
-            for (int i = 0; i < BENCH; ++i) {
+            for (int i = 0; i < BENCH; ++i)
+            {
                 hipDeviceSynchronize();
                 hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
@@ -3665,7 +3698,8 @@ namespace
 
             // ===== Approach 5: LDS K-reduce pair kernel =====
             // Warmup
-            for (int i = 0; i < WARMUP; ++i) {
+            for (int i = 0; i < WARMUP; ++i)
+            {
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
                     d_A_int8, d_scale_A_bw,
                     proj_k.d_B, proj_v.d_B,
@@ -3677,7 +3711,8 @@ namespace
 
             std::vector<double> lds_pair_times;
             lds_pair_times.reserve(BENCH);
-            for (int i = 0; i < BENCH; ++i) {
+            for (int i = 0; i < BENCH; ++i)
+            {
                 hipDeviceSynchronize();
                 hipEventRecord(ev_start, 0);
                 rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
@@ -3695,13 +3730,19 @@ namespace
 
             // Also sweep KB for the lds pair kernel
             std::vector<int> lds_pair_kb_values = {4, 7, 8, 14, 28};
-            struct LdsPairResult { int kb; double min_ms; };
+            struct LdsPairResult
+            {
+                int kb;
+                double min_ms;
+            };
             std::vector<LdsPairResult> lds_pair_results;
 
-            for (int kb : lds_pair_kb_values) {
+            for (int kb : lds_pair_kb_values)
+            {
                 rocmGemv_int8_vnni_set_tuning_overrides(128, kb);
 
-                for (int i = 0; i < 3; ++i) {
+                for (int i = 0; i < 3; ++i)
+                {
                     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
                         d_A_int8, d_scale_A_bw,
                         proj_k.d_B, proj_v.d_B,
@@ -3713,7 +3754,8 @@ namespace
 
                 std::vector<double> times;
                 times.reserve(BENCH);
-                for (int i = 0; i < BENCH; ++i) {
+                for (int i = 0; i < BENCH; ++i)
+                {
                     hipDeviceSynchronize();
                     hipEventRecord(ev_start, 0);
                     rocmGemv_int8_int8_fp32_vnni_blockwise_scaled_pair(
@@ -3735,10 +3777,12 @@ namespace
             }
 
             // --- Compute stats ---
-            auto min_of = [](const std::vector<double>& v) {
+            auto min_of = [](const std::vector<double> &v)
+            {
                 return *std::min_element(v.begin(), v.end());
             };
-            auto median_of = [](std::vector<double> v) {
+            auto median_of = [](std::vector<double> v)
+            {
                 std::sort(v.begin(), v.end());
                 return v[v.size() / 2];
             };
@@ -3758,8 +3802,10 @@ namespace
             // Find best pair result (grid_kpar_pair)
             double best_pair_min = std::numeric_limits<double>::max();
             int best_pair_kb = -1;
-            for (const auto& pr : pair_results) {
-                if (pr.min_ms < best_pair_min) {
+            for (const auto &pr : pair_results)
+            {
+                if (pr.min_ms < best_pair_min)
+                {
                     best_pair_min = pr.min_ms;
                     best_pair_kb = pr.kb;
                 }
@@ -3768,8 +3814,10 @@ namespace
             // Find best lds pair result
             double best_lds_pair_min = lds_pair_default_min;
             int best_lds_pair_kb = -1;
-            for (const auto& pr : lds_pair_results) {
-                if (pr.min_ms < best_lds_pair_min) {
+            for (const auto &pr : lds_pair_results)
+            {
+                if (pr.min_ms < best_lds_pair_min)
+                {
                     best_lds_pair_min = pr.min_ms;
                     best_lds_pair_kb = pr.kb;
                 }
@@ -3806,14 +3854,16 @@ namespace
             fprintf(stderr, "\n  LDS K-reduce pair KB sweep:\n");
             fprintf(stderr, "    default → %.3f ms (%.3fx vs serial)\n",
                     lds_pair_default_min, serial_min / std::max(1e-9, lds_pair_default_min));
-            for (const auto& pr : lds_pair_results) {
+            for (const auto &pr : lds_pair_results)
+            {
                 fprintf(stderr, "    KB=%2d → %.3f ms (%.3fx vs serial)\n",
                         pr.kb, pr.min_ms, serial_min / std::max(1e-9, pr.min_ms));
             }
 
             // Grid_kpar pair KB sweep detail
             fprintf(stderr, "\n  Force grid_kpar pair KB sweep:\n");
-            for (const auto& pr : pair_results) {
+            for (const auto &pr : pair_results)
+            {
                 fprintf(stderr, "    KB=%2d → %.3f ms (%.3fx vs serial)\n",
                         pr.kb, pr.min_ms, serial_min / std::max(1e-9, pr.min_ms));
             }
@@ -3885,6 +3935,200 @@ namespace
         }
 
         fprintf(stderr, "╚═══════════════════╩════════════╩════════════╩══════════╩═════════════════════════╝\n\n");
+#endif
+    }
+
+    // ============================================================================
+    // TEST: Qwen3.5-35B-A3B MoE Expert shapes TN×KB sweep
+    //
+    // Validates the GEMV heuristic for the very small expert projections in
+    // Qwen3.5-35B-A3B (d_model=2048, expert_intermediate=512, 256 experts).
+    // These are much smaller than dense model projections and may not be well
+    // served by the heuristic tuned for 7B shapes.
+    // ============================================================================
+
+    TEST_F(ROCmGemvPerfTest, Benchmark_INT8VNNI_MoE35B_ExpertSweep)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "No ROCm support";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device";
+
+        const char *run_sweep = std::getenv("LLAMINAR_RUN_MOE35B_EXPERT_SWEEP");
+        if (!run_sweep || std::string(run_sweep) != "1")
+        {
+            GTEST_SKIP() << "Set LLAMINAR_RUN_MOE35B_EXPERT_SWEEP=1 to run";
+        }
+
+        fprintf(stderr, "\nDevice: %s\n", device_name_.c_str());
+        fprintf(stderr, "\n=== Qwen3.5-35B-A3B MoE Expert GEMV Heuristic Validation ===\n");
+        fprintf(stderr, "Model: d_model=2048, expert_intermediate=512, 256 experts (top-8)\n");
+        fprintf(stderr, "       shared_intermediate=512, 40 layers (27 MoE + 10 GDN + 3 FA)\n\n");
+
+        // Qwen3.5-35B-A3B MoE dimensions
+        constexpr int kMoEDModel = 2048;
+        constexpr int kMoEIntermediate = 512; // per-expert intermediate
+        constexpr int kMoENumExperts = 256;
+        constexpr int kMoETopK = 8;
+        constexpr int kMoELayers = 27; // MoE layers only
+
+        struct SweepShape
+        {
+            const char *name;
+            int N;
+            int K;
+            int calls_per_layer; // how many times this shape is called per MoE layer
+        };
+
+        // Per-expert shapes (called top_k=8 times per token per MoE layer, grouped into 1 kernel)
+        // Shared expert shapes (called once per MoE layer)
+        const std::vector<SweepShape> shapes = {
+            {"Expert Gate", kMoEIntermediate, kMoEDModel, kMoETopK}, // 512×2048 ×8
+            {"Expert Up", kMoEIntermediate, kMoEDModel, kMoETopK},   // 512×2048 ×8
+            {"Expert Down", kMoEDModel, kMoEIntermediate, kMoETopK}, // 2048×512 ×8
+            {"Shared Gate", kMoEIntermediate, kMoEDModel, 1},        // 512×2048 ×1
+            {"Shared Up", kMoEIntermediate, kMoEDModel, 1},          // 512×2048 ×1
+            {"Shared Down", kMoEDModel, kMoEIntermediate, 1},        // 2048×512 ×1
+        };
+
+        const std::vector<int> tn_candidates = {128, 256};
+        const std::vector<int> kb_candidates = {2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 56, 64};
+
+        const double HBM2_PEAK_GBPS = 1000.0;
+
+        // Summary table at the end
+        fort::utf8_table summary;
+        summary.set_border_style(FT_DOUBLE2_STYLE);
+        summary << fort::header
+                << "Shape" << "N" << "K" << "×/layer"
+                << "Heuristic TN" << "Heuristic KB" << "Heuristic(ms)" << "Heuristic BW"
+                << "Best TN" << "Best KB" << "Best(ms)" << "Best BW"
+                << "Speedup" << fort::endr;
+
+        for (const auto &shape : shapes)
+        {
+            // First: get heuristic (auto) result
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            const auto heuristic = benchmarkGemvSplit(shape.N, shape.K, 5, 30);
+            ASSERT_TRUE(heuristic.success) << "Heuristic benchmark failed for " << shape.name;
+
+            const double weight_mb = static_cast<double>(shape.N) * shape.K / 1e6;
+
+            // Sweep TN×KB grid
+            fort::utf8_table table;
+            table.set_border_style(FT_DOUBLE2_STYLE);
+            table << fort::header
+                  << "TN" << "KB" << "Blocks" << "Waves/CU" << "Kgrp/Wave"
+                  << "GEMV min(ms)" << "BW(GB/s)" << "%Peak" << "vs Heuristic" << fort::endr;
+            for (int i = 0; i < 9; ++i)
+                table.column(i).set_cell_text_align(fort::text_align::right);
+
+            double best_gemv = heuristic.gemv_min_ms;
+            int best_tn = -1, best_kb = -1;
+
+            for (const int tn : tn_candidates)
+            {
+                for (const int kb : kb_candidates)
+                {
+                    const int grid_n = (shape.N + tn - 1) / tn;
+                    const int k_groups = shape.K / 4;
+                    const int total_blocks = grid_n * kb;
+                    const int waves_per_block = (tn == 256) ? 2 : 1;
+                    const double waves_per_cu = static_cast<double>(total_blocks * waves_per_block) / 60.0;
+                    const int kgrp_per_wave = k_groups / kb;
+
+                    if (kgrp_per_wave < 2)
+                        continue; // skip degenerate configs
+
+                    rocmGemv_int8_vnni_set_tuning_overrides(tn, kb);
+                    const auto r = benchmarkGemvSplit(shape.N, shape.K, 3, 20);
+                    if (!r.success)
+                        continue;
+
+                    const double bw = weight_mb / r.gemv_min_ms;
+                    const double pct = (bw / HBM2_PEAK_GBPS) * 100.0;
+                    const double speedup = heuristic.gemv_min_ms / std::max(1e-9, r.gemv_min_ms);
+
+                    char buf_wcu[32], buf_bw[32], buf_pct[32], buf_spd[32];
+                    snprintf(buf_wcu, sizeof(buf_wcu), "%.1f", waves_per_cu);
+                    snprintf(buf_bw, sizeof(buf_bw), "%.0f", bw);
+                    snprintf(buf_pct, sizeof(buf_pct), "%.1f%%", pct);
+                    snprintf(buf_spd, sizeof(buf_spd), "%.3fx", speedup);
+
+                    table << tn << kb << total_blocks << buf_wcu << kgrp_per_wave
+                          << formatMs(r.gemv_min_ms) << buf_bw << buf_pct << buf_spd << fort::endr;
+
+                    if (r.gemv_min_ms < best_gemv)
+                    {
+                        best_gemv = r.gemv_min_ms;
+                        best_tn = tn;
+                        best_kb = kb;
+                    }
+                }
+            }
+
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+
+            const double heuristic_bw = weight_mb / heuristic.gemv_min_ms;
+            const double best_bw = weight_mb / best_gemv;
+            const double speedup = heuristic.gemv_min_ms / std::max(1e-9, best_gemv);
+
+            fprintf(stderr, "\n=== %s (N=%d, K=%d, %.3f MB, ×%d/layer) ===\n",
+                    shape.name, shape.N, shape.K, weight_mb, shape.calls_per_layer);
+            fprintf(stderr, "Heuristic: %.6f ms (%.0f GB/s, %.1f%% peak)\n",
+                    heuristic.gemv_min_ms, heuristic_bw,
+                    (heuristic_bw / HBM2_PEAK_GBPS) * 100.0);
+            if (best_tn > 0)
+            {
+                fprintf(stderr, "Best:      TN=%d KB=%d → %.6f ms (%.0f GB/s, %.1f%% peak) [%.3fx]\n",
+                        best_tn, best_kb, best_gemv, best_bw,
+                        (best_bw / HBM2_PEAK_GBPS) * 100.0, speedup);
+            }
+            else
+            {
+                fprintf(stderr, "Best:      heuristic IS optimal\n");
+            }
+            fprintf(stderr, "%s\n", table.to_string().c_str());
+
+            // Add to summary
+            char h_bw_str[32], b_bw_str[32], spd_str[32];
+            snprintf(h_bw_str, sizeof(h_bw_str), "%.0f GB/s", heuristic_bw);
+            snprintf(b_bw_str, sizeof(b_bw_str), "%.0f GB/s", best_bw);
+            snprintf(spd_str, sizeof(spd_str), "%.3fx", speedup);
+            summary << shape.name << shape.N << shape.K << shape.calls_per_layer
+                    << 128 << "auto" << formatMs(heuristic.gemv_min_ms) << h_bw_str
+                    << (best_tn > 0 ? best_tn : 128) << (best_kb > 0 ? std::to_string(best_kb) : "auto")
+                    << formatMs(best_gemv) << b_bw_str
+                    << spd_str << fort::endr;
+        }
+
+        // Print full-model impact estimate
+        fprintf(stderr, "\n=== Full Model Impact Estimate (27 MoE layers) ===\n");
+        double heuristic_total_ms = 0;
+        double best_total_ms = 0;
+        for (const auto &shape : shapes)
+        {
+            rocmGemv_int8_vnni_reset_tuning_overrides();
+            const auto h = benchmarkGemvSplit(shape.N, shape.K, 3, 15);
+            heuristic_total_ms += h.gemv_min_ms * shape.calls_per_layer;
+
+            // Re-measure best (quick)
+            // (Using heuristic as approximation here; actual best was tracked above)
+            best_total_ms += h.gemv_min_ms * shape.calls_per_layer;
+        }
+        heuristic_total_ms *= kMoELayers;
+        best_total_ms *= kMoELayers;
+        fprintf(stderr, "Heuristic total MoE GEMV: %.3f ms/token (%d layers × per-layer)\n",
+                heuristic_total_ms, kMoELayers);
+        fprintf(stderr, "Theoretical throughput contribution: %.0f tok/s (GEMV-only)\n",
+                1000.0 / heuristic_total_ms);
+
+        fprintf(stderr, "\n=== Summary ===\n");
+        for (int i = 0; i < 13; ++i)
+            summary.column(i).set_cell_text_align(fort::text_align::right);
+        summary.column(0).set_cell_text_align(fort::text_align::left);
+        fprintf(stderr, "%s\n", summary.to_string().c_str());
 #endif
     }
 } // namespace

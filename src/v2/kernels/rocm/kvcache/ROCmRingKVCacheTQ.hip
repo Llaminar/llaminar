@@ -8,8 +8,10 @@
 
 #include "ROCmRingKVCacheTQ.h"
 #include "ROCmTurboQuantKernels.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../tensors/GpuTensorView.h"
 #include "../../../kernels/cpu/turboquant/TurboQuantContext.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include <hip/hip_runtime.h>
 #include <cstring>
@@ -96,6 +98,7 @@ namespace llaminar2
             hipHostMalloc(&h_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams),
                           hipHostMallocDefault);
             memset(h_dequant_params_, 0, n_layers_ * sizeof(HIPTQDequantDynamicParams));
+            dequant_params_device_valid_.assign(static_cast<size_t>(n_layers_), 0);
             LOG_DEBUG("ROCmRingKVCacheTQ: graph capture params allocated for " << n_layers_ << " layers");
         }
 
@@ -149,7 +152,8 @@ namespace llaminar2
                                     const ITensor *k, const ITensor *v,
                                     int num_tokens)
     {
-        return appendWithStream(layer, seq_idx, k, v, num_tokens, nullptr);
+        LOG_ERROR("[ROCmRingKVCacheTQ::append] Explicit stream required; use appendWithStream()");
+        return false;
     }
 
     bool ROCmRingKVCacheTQ::appendWithStream(
@@ -160,11 +164,17 @@ namespace llaminar2
             return false;
         if (!k || !v)
             return false;
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::appendWithStream] Null stream is not allowed");
+            return false;
+        }
 
         hipSetDevice(device_id_);
         const auto hip_stream = static_cast<hipStream_t>(stream);
-        cached_stream_ = hip_stream; // Cache for get_kv_converted()
+        cached_stream_ = hip_stream;
         auto &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
 
         const bool k_is_tq = (k->native_type() == TensorType::TQ8 || k->native_type() == TensorType::TQ4);
         const bool v_is_tq = (v->native_type() == TensorType::TQ4);
@@ -206,8 +216,11 @@ namespace llaminar2
                     v_row_bytes, hipMemcpyHostToDevice, hip_stream);
             }
 
-            entry.head = (entry.head + num_tokens) % max_seq_len_;
-            entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            if (!capture_active)
+            {
+                entry.head = (entry.head + num_tokens) % max_seq_len_;
+                entry.count = std::min(entry.count + num_tokens, max_seq_len_);
+            }
 
             // DON'T invalidate per-layer scratch here — dequant_to_scratch's
             // can_incremental() will detect count == cached_count + 1 and do
@@ -280,7 +293,7 @@ namespace llaminar2
             }
         }
 
-        if (ok)
+        if (ok && !capture_active)
         {
             entry.head = (entry.head + num_tokens) % max_seq_len_;
             entry.count = std::min(entry.count + num_tokens, max_seq_len_);
@@ -300,6 +313,182 @@ namespace llaminar2
     // =========================================================================
     // Per-Layer FP16 Scratch with Fused Incremental Dequant
     // =========================================================================
+
+    hipStream_t ROCmRingKVCacheTQ::clearStream() const
+    {
+        if (cached_stream_)
+            return cached_stream_;
+        return static_cast<hipStream_t>(
+            GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
+    }
+
+    void ROCmRingKVCacheTQ::clearEntryStorage(int layer, int seq_idx, hipStream_t stream)
+    {
+        auto &entry = entries_[layer][seq_idx];
+        const size_t k_bytes = static_cast<size_t>(max_seq_len_) * n_kv_heads_ * tq8_block_size_;
+        const size_t v_bytes = static_cast<size_t>(max_seq_len_) * n_kv_heads_ * tq4_block_size_;
+
+        if (entry.d_K)
+        {
+            hipError_t err = hipMemsetAsync(entry.d_K, 0, k_bytes, stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] K memset failed: " << hipGetErrorString(err));
+        }
+        if (entry.d_V)
+        {
+            hipError_t err = hipMemsetAsync(entry.d_V, 0, v_bytes, stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] V memset failed: " << hipGetErrorString(err));
+        }
+    }
+
+    void ROCmRingKVCacheTQ::clearScratchStorage(int layer, hipStream_t stream)
+    {
+        auto &scratch = layer_scratch_[layer];
+        const size_t scratch_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(_Float16);
+
+        if (scratch.d_K)
+        {
+            hipError_t err = hipMemsetAsync(scratch.d_K, 0, scratch_bytes, stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] scratch K memset failed: " << hipGetErrorString(err));
+        }
+        if (scratch.d_V)
+        {
+            hipError_t err = hipMemsetAsync(scratch.d_V, 0, scratch_bytes, stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] scratch V memset failed: " << hipGetErrorString(err));
+        }
+
+        scratch.k_view.reset();
+        scratch.v_view.reset();
+        scratch.invalidate();
+    }
+
+    void ROCmRingKVCacheTQ::clearDynamicParams(int layer, int seq_idx, hipStream_t stream)
+    {
+        const int entry_idx = layer * batch_size_ + seq_idx;
+        if (h_head_params_)
+            h_head_params_[entry_idx] = 0;
+        if (h_count_params_)
+            h_count_params_[entry_idx] = 0;
+        if (d_head_params_)
+        {
+            hipError_t err = hipMemsetAsync(&d_head_params_[entry_idx], 0, sizeof(int), stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] head param memset failed: " << hipGetErrorString(err));
+        }
+        if (d_count_params_)
+        {
+            hipError_t err = hipMemsetAsync(&d_count_params_[entry_idx], 0, sizeof(int), stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] count param memset failed: " << hipGetErrorString(err));
+        }
+
+        if (h_dequant_params_)
+            std::memset(&h_dequant_params_[layer], 0, sizeof(HIPTQDequantDynamicParams));
+        if (layer >= 0 && layer < static_cast<int>(dequant_params_device_valid_.size()))
+            dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
+        if (d_dequant_params_)
+        {
+            hipError_t err = hipMemsetAsync(&d_dequant_params_[layer], 0,
+                                            sizeof(HIPTQDequantDynamicParams), stream);
+            if (err != hipSuccess)
+                LOG_WARN("[ROCmRingKVCacheTQ::clear] dequant param memset failed: " << hipGetErrorString(err));
+        }
+    }
+
+    void ROCmRingKVCacheTQ::clear_sequence(int layer, int seq_idx)
+    {
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        hipSetDevice(device_id_);
+        hipStream_t stream = clearStream();
+        clearEntryStorage(layer, seq_idx, stream);
+        clearScratchStorage(layer, stream);
+        clearDynamicParams(layer, seq_idx, stream);
+
+        hipError_t sync_err = hipStreamSynchronize(stream);
+        if (sync_err != hipSuccess)
+            LOG_WARN("[ROCmRingKVCacheTQ::clear_sequence] sync failed: " << hipGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        ROCmRingKVCacheBase::clear_sequence(layer, seq_idx);
+    }
+
+    void ROCmRingKVCacheTQ::clear_layer(int layer)
+    {
+        if (layer < 0 || layer >= n_layers_)
+            return;
+
+        hipSetDevice(device_id_);
+        hipStream_t stream = clearStream();
+        for (int seq = 0; seq < batch_size_; ++seq)
+        {
+            clearEntryStorage(layer, seq, stream);
+            clearDynamicParams(layer, seq, stream);
+        }
+        clearScratchStorage(layer, stream);
+
+        hipError_t sync_err = hipStreamSynchronize(stream);
+        if (sync_err != hipSuccess)
+            LOG_WARN("[ROCmRingKVCacheTQ::clear_layer] sync failed: " << hipGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        for (int seq = 0; seq < batch_size_; ++seq)
+            ROCmRingKVCacheBase::clear_sequence(layer, seq);
+    }
+
+    void ROCmRingKVCacheTQ::clear_sequence(int seq_idx)
+    {
+        if (seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+
+        hipSetDevice(device_id_);
+        hipStream_t stream = clearStream();
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            clearEntryStorage(layer, seq_idx, stream);
+            clearScratchStorage(layer, stream);
+            clearDynamicParams(layer, seq_idx, stream);
+        }
+
+        hipError_t sync_err = hipStreamSynchronize(stream);
+        if (sync_err != hipSuccess)
+            LOG_WARN("[ROCmRingKVCacheTQ::clear_sequence] sync failed: " << hipGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        for (int layer = 0; layer < n_layers_; ++layer)
+            ROCmRingKVCacheBase::clear_sequence(layer, seq_idx);
+    }
+
+    void ROCmRingKVCacheTQ::clear()
+    {
+        hipSetDevice(device_id_);
+        hipStream_t stream = clearStream();
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                clearEntryStorage(layer, seq, stream);
+                clearDynamicParams(layer, seq, stream);
+            }
+            clearScratchStorage(layer, stream);
+        }
+
+        hipError_t sync_err = hipStreamSynchronize(stream);
+        if (sync_err != hipSuccess)
+            LOG_WARN("[ROCmRingKVCacheTQ::clear] sync failed: " << hipGetErrorString(sync_err));
+
+        cached_stream_ = nullptr;
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+                ROCmRingKVCacheBase::clear_sequence(layer, seq);
+        }
+    }
 
     bool ROCmRingKVCacheTQ::dequant_to_scratch(int layer, int seq_idx, float rope_theta, int position_start, hipStream_t stream) const
     {
@@ -340,14 +529,37 @@ namespace llaminar2
             bool ok;
             if (d_dequant_params_ && h_dequant_params_ && stream)
             {
-                // Graph-capturable path: H2D of dequant params + dynamic kernel.
-                h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
-                h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
-                h_dequant_params_[layer].rope_position =
-                    (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
+                // Graph-capturable path: the kernel reads dynamic params from
+                // device memory. Captured execution must not record H2D; params
+                // are pre-uploaded by setDynamicDequantParams().
+                if (isGraphCaptureActive())
+                {
+                    if (layer < 0 ||
+                        layer >= static_cast<int>(dequant_params_device_valid_.size()) ||
+                        !dequant_params_device_valid_[static_cast<size_t>(layer)])
+                    {
+                        LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] TQ dequant params were not ready before HIP graph capture");
+                        return false;
+                    }
+                }
+                else
+                {
+                    h_dequant_params_[layer].ring_pos = (tail + entry.count - 1) % max_seq_len_;
+                    h_dequant_params_[layer].out_offset_elems = static_cast<int>((entry.count - 1) * kv_dim_);
+                    h_dequant_params_[layer].rope_position =
+                        (rope_theta > 0.0f) ? position_start + entry.count - 1 : 0;
 
-                hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
-                                sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
+                    hipError_t copy_err =
+                        hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
+                                        sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
+                    if (copy_err != hipSuccess)
+                    {
+                        LOG_ERROR("[ROCmRingKVCacheTQ::dequant_to_scratch] hipMemcpyAsync failed: "
+                                  << hipGetErrorString(copy_err));
+                        return false;
+                    }
+                    dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
+                }
 
                 ok = hip_tq_incremental_single_fp16_dynamic(
                     scratch.d_K, scratch.d_V,
@@ -427,7 +639,7 @@ namespace llaminar2
             return nullptr;
 
         hipSetDevice(device_id_);
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, cached_stream_);
+        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
         auto &scratch = layer_scratch_[layer];
 
         if (!scratch.k_view)
@@ -450,7 +662,7 @@ namespace llaminar2
             return nullptr;
 
         hipSetDevice(device_id_);
-        dequant_to_scratch(layer, seq_idx, 0.0f, 0, cached_stream_);
+        dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
         auto &scratch = layer_scratch_[layer];
 
         if (!scratch.v_view)
@@ -516,6 +728,10 @@ namespace llaminar2
 
         if (entry.count == 0)
         {
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
             if (out_kv_len)
                 *out_kv_len = 0;
             return true;
@@ -523,7 +739,10 @@ namespace llaminar2
 
         const float rope_theta = (rope && rope->rope_theta > 0.0f) ? rope->rope_theta : 0.0f;
         const int position_start = (rope && rope_theta > 0.0f) ? rope->position_start : 0;
-        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, cached_stream_);
+        hipStream_t stream = (rope && rope->gpu_stream)
+                                 ? static_cast<hipStream_t>(rope->gpu_stream)
+                                 : clearStream();
+        bool ok = dequant_to_scratch(layer, seq_idx, rope_theta, position_start, stream);
         if (!ok)
             return false;
 
@@ -570,10 +789,58 @@ namespace llaminar2
         if (!d_dequant_params_ || !h_dequant_params_)
             return;
 
-        // The actual params are set in dequant_to_scratch() during the graph-captured path.
-        // setDynamicHead is called before graph replay to ensure the host buffer is ready.
-        // Nothing to do here — the dequant_to_scratch() graph-capturable path
-        // updates h_dequant_params_ and enqueues the H2D.
+        ROCmRingKVCacheBase::setDynamicHead(layer, seq_idx, gpu_stream);
+        // TQ dequant metadata is prepared through setDynamicDequantParams().
+    }
+
+    void ROCmRingKVCacheTQ::setDynamicDequantParams(
+        int layer, int seq_idx,
+        float rope_theta, int position_start,
+        void *gpu_stream)
+    {
+        if (!d_dequant_params_ || !h_dequant_params_)
+            return;
+        if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
+            return;
+        dequant_params_device_valid_[static_cast<size_t>(layer)] = 0;
+
+        const auto &entry = entries_[layer][seq_idx];
+        h_dequant_params_[layer].ring_pos = entry.head;
+        h_dequant_params_[layer].out_offset_elems = entry.count * kv_dim_;
+        h_dequant_params_[layer].rope_position =
+            (rope_theta > 0.0f) ? position_start + entry.count : 0;
+
+        auto *stream = static_cast<hipStream_t>(gpu_stream);
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] Explicit HIP stream required");
+            return;
+        }
+
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        const hipError_t cap_err = hipStreamIsCapturing(stream, &status);
+        if (cap_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] hipStreamIsCapturing failed: "
+                      << hipGetErrorString(cap_err));
+            return;
+        }
+        if (isGraphCaptureActive() || status == hipStreamCaptureStatusActive)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] Refusing to record TQ dequant-param H2D inside HIP graph capture");
+            return;
+        }
+
+        const hipError_t copy_err =
+            hipMemcpyAsync(&d_dequant_params_[layer], &h_dequant_params_[layer],
+                           sizeof(HIPTQDequantDynamicParams), hipMemcpyHostToDevice, stream);
+        if (copy_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmRingKVCacheTQ::setDynamicDequantParams] hipMemcpyAsync failed: "
+                      << hipGetErrorString(copy_err));
+            return;
+        }
+        dequant_params_device_valid_[static_cast<size_t>(layer)] = 1;
     }
 
     // advanceHead() is now provided by ROCmRingKVCacheBase.

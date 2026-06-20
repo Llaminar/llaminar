@@ -5,6 +5,7 @@
 
 #include "KVCacheAppendStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/SIMDHelpers.h"
@@ -18,10 +19,12 @@
 
 #include "../../../utils/KVCacheProfiler.h"
 #include "../../../tensors/GpuTensorView.h"
+#include "../../../backends/BackendManager.h"
 
 #include <immintrin.h>
 #include <cstring>
 #include <chrono>
+#include <algorithm>
 
 namespace
 {
@@ -64,6 +67,98 @@ namespace
             return 0;
         }
     }
+
+    static bool copyTensorBytesForDebugSnapshot(
+        const llaminar2::ITensor *tensor,
+        llaminar2::DeviceId device,
+        void *stream,
+        std::vector<uint8_t> &bytes)
+    {
+        if (!tensor || bytes.empty())
+        {
+            return false;
+        }
+
+        const void *device_ptr = tensor->gpu_data_ptr();
+        if (device_ptr && device.is_gpu())
+        {
+            llaminar2::IBackend *backend = llaminar2::getBackendFor(device);
+            if (!backend)
+            {
+                return false;
+            }
+
+            return backend->deviceToHostFast(
+                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
+        }
+
+        if (const void *host = tensor->raw_data())
+        {
+            std::memcpy(bytes.data(), host, bytes.size());
+            return true;
+        }
+
+        return false;
+    }
+
+    static bool tensorToFP32DebugSnapshot(
+        const llaminar2::ITensor *tensor,
+        llaminar2::DeviceId device,
+        void *stream,
+        size_t rows,
+        size_t cols,
+        std::vector<float> &out)
+    {
+        if (!tensor || rows == 0 || cols == 0)
+        {
+            out.clear();
+            return false;
+        }
+
+        const size_t count = rows * cols;
+        const size_t elem_size = elementSizeForTensorType(tensor->native_type());
+        if (elem_size == 0)
+        {
+            out.clear();
+            return false;
+        }
+
+        std::vector<uint8_t> bytes(count * elem_size);
+        if (!copyTensorBytesForDebugSnapshot(tensor, device, stream, bytes))
+        {
+            out.clear();
+            return false;
+        }
+
+        out.resize(count);
+        switch (tensor->native_type())
+        {
+        case llaminar2::TensorType::FP32:
+            std::memcpy(out.data(), bytes.data(), count * sizeof(float));
+            return true;
+        case llaminar2::TensorType::FP16:
+        {
+            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
+            for (size_t i = 0; i < count; ++i)
+            {
+                out[i] = llaminar2::fp16_to_fp32(src[i]);
+            }
+            return true;
+        }
+        case llaminar2::TensorType::BF16:
+        {
+            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
+            for (size_t i = 0; i < count; ++i)
+            {
+                out[i] = llaminar2::simd::bf16_to_fp32(src[i]);
+            }
+            return true;
+        }
+        default:
+            out.clear();
+            return false;
+        }
+    }
 }
 
 namespace llaminar2
@@ -76,6 +171,40 @@ namespace llaminar2
     KVCacheAppendStage::KVCacheAppendStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool KVCacheAppendStage::shouldUseDecodeEquivalentVerifierAppend(
+        int total_tokens,
+        int batch_size,
+        int seq_len) const
+    {
+        if (!params_.kv_cache)
+        {
+            return false;
+        }
+
+        if (batch_size != 1 || seq_len != total_tokens)
+        {
+            return false;
+        }
+
+        // Phase 9.8 verifier rows are bounded by the production MTP draft
+        // depth.  Larger shapes are true prefill and must keep the normal
+        // throughput path.
+        if (total_tokens < 2 || total_tokens > 4)
+        {
+            return false;
+        }
+
+        if (params_.layer_idx < 0 || params_.seq_idx < 0)
+        {
+            return false;
+        }
+
+        // This row-equivalent path is for decode/verifier continuation over an
+        // existing prefix.  Tiny prompt prefills should not pay the serial row
+        // cost, and they have no serial decode cache state to match.
+        return params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx) > 0;
     }
 
     bool KVCacheAppendStage::execute(IDeviceContext *ctx)
@@ -94,11 +223,26 @@ namespace llaminar2
             return false;
         }
 
-        // Determine total tokens to append
+        // Determine the graph-shaped token count first, then narrow to the real
+        // prefix for non-captured padded execution. Captured prefill records the
+        // fixed bucket kernel shape and advances host metadata by the real
+        // prefix while recording so later captured attention stages can see the
+        // just-appended cache view.
         int total_tokens = params_.num_tokens;
         if (total_tokens <= 0)
         {
             total_tokens = static_cast<int>(params_.K->shape()[0]);
+        }
+        const int bucket_tokens = total_tokens;
+        if (!isGraphCaptureActive() && params_.batch_size <= 1 && replay_advance_tokens_ > 0)
+        {
+            if (replay_advance_tokens_ > bucket_tokens)
+            {
+                LOG_ERROR("[KVCacheAppendStage] Replay token count exceeds bucket token count: real="
+                          << replay_advance_tokens_ << " bucket=" << bucket_tokens);
+                return false;
+            }
+            total_tokens = replay_advance_tokens_;
         }
 
         auto append_to_cache = [&](int seq_idx,
@@ -116,7 +260,59 @@ namespace llaminar2
 
             bool success = false;
             void *stream = gpuStream();
-            if (stream || params_.device_id.is_gpu())
+            if (params_.device_id.is_gpu() && !stream)
+            {
+                LOG_ERROR("[KVCacheAppendStage] GPU KV append requires an explicit non-null stage stream");
+                return false;
+            }
+
+            if (debugEnv().attention.debug_kv_append_source_snapshot &&
+                debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
+            {
+                const size_t rows = static_cast<size_t>(num_tokens);
+                const size_t k_cols = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
+                const size_t v_cols = v_tensor->shape().size() > 1 ? v_tensor->shape()[1] : v_tensor->cols();
+                const bool have_k = tensorToFP32DebugSnapshot(
+                    k_tensor, params_.device_id, stream, rows, k_cols,
+                    debug_append_source_k_snapshot_);
+                const bool have_v = tensorToFP32DebugSnapshot(
+                    v_tensor, params_.device_id, stream, rows, v_cols,
+                    debug_append_source_v_snapshot_);
+
+                debug_append_source_k_rows_ = have_k ? rows : 0;
+                debug_append_source_k_cols_ = have_k ? k_cols : 0;
+                debug_append_source_v_rows_ = have_v ? rows : 0;
+                debug_append_source_v_cols_ = have_v ? v_cols : 0;
+            }
+            else
+            {
+                debug_append_source_k_snapshot_.clear();
+                debug_append_source_v_snapshot_.clear();
+                debug_append_source_k_rows_ = 0;
+                debug_append_source_k_cols_ = 0;
+                debug_append_source_v_rows_ = 0;
+                debug_append_source_v_cols_ = 0;
+            }
+
+            if (shouldUseDecodeEquivalentVerifierAppend(num_tokens, params_.batch_size, params_.seq_len))
+            {
+                success = params_.kv_cache->appendVerifierRowsDecodeEquivalent(
+                    params_.layer_idx,
+                    seq_idx,
+                    k_tensor,
+                    v_tensor,
+                    num_tokens,
+                    stream);
+                if (!success)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] KV cache does not support grouped decode-equivalent verifier append"
+                              << " for layer=" << params_.layer_idx
+                              << " rows=" << num_tokens
+                              << " K=" << k_tensor->dtype_name()
+                              << " V=" << v_tensor->dtype_name());
+                }
+            }
+            else if (stream || params_.device_id.is_gpu())
             {
                 // GPU path: fine-grained profiling handled inside appendWithStream
                 success = params_.kv_cache->appendWithStream(
@@ -142,6 +338,40 @@ namespace llaminar2
                     estimateTensorAppendBytes(v_tensor, num_tokens));
                 const uint64_t tokens = static_cast<uint64_t>(num_tokens);
                 KVCacheProfiler::record(KVCacheOpType::APPEND, duration_ns, tokens, bytes);
+            }
+
+            if (success &&
+                isGraphCaptureActive() &&
+                isGraphCaptureHostBookkeepingActive() &&
+                params_.kv_cache->isGraphCaptureReady())
+            {
+                // Segmented decode capture records GPU append kernels, but the
+                // immediate launch-after-capture deliberately skips
+                // onGraphReplayed(). Advance host metadata during recording so
+                // subsequent captured stages see the appended token in
+                // get_cached_tokens()/dynamic dequant params, matching normal
+                // execution. Prefill capture and collective Phase-2 capture keep
+                // this guard disabled and continue to use replay callbacks or
+                // real post-capture execution instead.
+                const int advance_tokens = replay_advance_tokens_ > 0
+                                               ? replay_advance_tokens_
+                                               : num_tokens;
+                if (advance_tokens > num_tokens)
+                {
+                    LOG_ERROR("[KVCacheAppendStage] Capture bookkeeping token count exceeds append token count: real="
+                              << advance_tokens << " append=" << num_tokens);
+                    return false;
+                }
+                params_.kv_cache->advanceHead(params_.layer_idx, seq_idx, advance_tokens);
+            }
+
+            if (success)
+            {
+                // Snapshot callbacks may request KV cache contents from
+                // buildDumpInfoImpl().  The executor often builds dump info
+                // before execute() for coherence, so force a post-append
+                // rebuild when debug cache/source snapshots are enabled.
+                invalidateDumpInfoCache();
             }
 
             return success;
@@ -1337,6 +1567,54 @@ namespace llaminar2
         if (params_.V_dequant_out)
         {
             info.addOutput("V_dequant", params_.V_dequant_out, params_.V_dequant_out->rows(), params_.V_dequant_out->cols());
+        }
+
+        if (debugEnv().attention.debug_kv_append_source_snapshot &&
+            debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
+        {
+            if (!debug_append_source_k_snapshot_.empty() &&
+                debug_append_source_k_rows_ > 0 && debug_append_source_k_cols_ > 0)
+            {
+                info.addOutput("source_k", debug_append_source_k_snapshot_.data(),
+                               debug_append_source_k_rows_, debug_append_source_k_cols_);
+            }
+            if (!debug_append_source_v_snapshot_.empty() &&
+                debug_append_source_v_rows_ > 0 && debug_append_source_v_cols_ > 0)
+            {
+                info.addOutput("source_v", debug_append_source_v_snapshot_.data(),
+                               debug_append_source_v_rows_, debug_append_source_v_cols_);
+            }
+        }
+
+        if (debugEnv().attention.debug_kv_cache_snapshot &&
+            debugEnv().attention.debugKVCacheSnapshotLayerSelected(params_.layer_idx) &&
+            params_.kv_cache)
+        {
+            ITensor *cache_k = nullptr;
+            ITensor *cache_v = nullptr;
+            int kv_len = 0;
+            if (params_.kv_cache->get_kv(
+                    params_.layer_idx, params_.seq_idx, &cache_k, &cache_v, &kv_len) &&
+                kv_len > 0 && cache_k && cache_v)
+            {
+                const size_t rows = static_cast<size_t>(kv_len);
+                const size_t k_cols = cache_k->cols();
+                const size_t v_cols = cache_v->cols();
+                void *stream = gpuStream();
+                const bool have_k = tensorToFP32DebugSnapshot(
+                    cache_k, params_.device_id, stream, rows, k_cols, debug_cache_k_snapshot_);
+                const bool have_v = tensorToFP32DebugSnapshot(
+                    cache_v, params_.device_id, stream, rows, v_cols, debug_cache_v_snapshot_);
+
+                if (have_k)
+                {
+                    info.addOutput("cache_k", debug_cache_k_snapshot_.data(), rows, k_cols);
+                }
+                if (have_v)
+                {
+                    info.addOutput("cache_v", debug_cache_v_snapshot_.data(), rows, v_cols);
+                }
+            }
         }
 
         info.addScalarInt("layer_idx", params_.layer_idx);

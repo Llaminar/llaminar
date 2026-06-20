@@ -47,8 +47,6 @@ static_assert(StageParamsRequired<RoPEStage::Params>,
 // Attention Stages
 static_assert(StageParamsRequired<AttentionComputeStage::Params>,
               "AttentionComputeStage::Params must satisfy StageParamsRequired");
-static_assert(StageParamsRequired<AttentionWithKVCacheStage::Params>,
-              "AttentionWithKVCacheStage::Params must satisfy StageParamsRequired");
 
 // KV Cache Stages
 static_assert(StageParamsRequired<KVCacheAppendStage::Params>,
@@ -69,14 +67,6 @@ static_assert(StageParamsRequired<AllreduceStage::Params>,
               "AllreduceStage::Params must satisfy StageParamsRequired");
 static_assert(StageParamsRequired<AllGatherStage::Params>,
               "AllGatherStage::Params must satisfy StageParamsRequired");
-
-// MoE Stages
-static_assert(StageParamsRequired<MoERouterStage::Params>,
-              "MoERouterStage::Params must satisfy StageParamsRequired");
-static_assert(StageParamsRequired<MoEExpertStage::Params>,
-              "MoEExpertStage::Params must satisfy StageParamsRequired");
-static_assert(StageParamsRequired<MoECombineStage::Params>,
-              "MoECombineStage::Params must satisfy StageParamsRequired");
 
 // =============================================================================
 // Test Fixture
@@ -137,13 +127,6 @@ TEST_F(Test__StageParamsBase, AttentionComputeStage_DefaultsToDeviceCPU)
     EXPECT_EQ(params.mpi_ctx, nullptr);
 }
 
-TEST_F(Test__StageParamsBase, AttentionWithKVCacheStage_DefaultsToDeviceCPU)
-{
-    AttentionWithKVCacheStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
 TEST_F(Test__StageParamsBase, ResidualAddStage_DefaultsToDeviceCPU)
 {
     ResidualAddStage::Params params{};
@@ -189,27 +172,6 @@ TEST_F(Test__StageParamsBase, AllreduceStage_DefaultsToDeviceCPU)
 TEST_F(Test__StageParamsBase, AllGatherStage_DefaultsToDeviceCPU)
 {
     AllGatherStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
-TEST_F(Test__StageParamsBase, MoERouterStage_DefaultsToDeviceCPU)
-{
-    MoERouterStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
-TEST_F(Test__StageParamsBase, MoEExpertStage_DefaultsToDeviceCPU)
-{
-    MoEExpertStage::Params params{};
-    EXPECT_EQ(params.device_id.type, DeviceType::CPU);
-    EXPECT_EQ(params.mpi_ctx, nullptr);
-}
-
-TEST_F(Test__StageParamsBase, MoECombineStage_DefaultsToDeviceCPU)
-{
-    MoECombineStage::Params params{};
     EXPECT_EQ(params.device_id.type, DeviceType::CPU);
     EXPECT_EQ(params.mpi_ctx, nullptr);
 }
@@ -342,33 +304,6 @@ TEST_F(Test__StageParamsBase, AllGatherStage_DeviceMatchesParams)
     AllGatherStage stage(params);
 
     EXPECT_EQ(stage.device(), cuda1);
-}
-
-TEST_F(Test__StageParamsBase, MoERouterStage_DeviceMatchesParams)
-{
-    auto rocm0 = rocmDevice(0);
-    MoERouterStage::Params params{.device_id = rocm0};
-    MoERouterStage stage(params);
-
-    EXPECT_EQ(stage.device(), rocm0);
-}
-
-TEST_F(Test__StageParamsBase, MoEExpertStage_DeviceMatchesParams)
-{
-    auto cuda2 = cudaDevice(2);
-    MoEExpertStage::Params params{.device_id = cuda2};
-    MoEExpertStage stage(params);
-
-    EXPECT_EQ(stage.device(), cuda2);
-}
-
-TEST_F(Test__StageParamsBase, MoECombineStage_DeviceMatchesParams)
-{
-    auto rocm1 = rocmDevice(1);
-    MoECombineStage::Params params{.device_id = rocm1};
-    MoECombineStage stage(params);
-
-    EXPECT_EQ(stage.device(), rocm1);
 }
 
 // =============================================================================

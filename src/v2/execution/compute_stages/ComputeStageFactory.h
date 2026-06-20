@@ -14,18 +14,25 @@
 #include "stages/RMSNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/ResidualAddStage.h"
-#include "stages/AttentionWithKVCacheStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/EmbeddingStage.h"
+#include "stages/HiddenStateRowSelectStage.h"
+#include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AllGatherStage.h"
 #include "stages/AllGatherVStage.h"
 #include "stages/SendActivationsStage.h"
 #include "stages/ReceiveActivationsStage.h"
-#include "stages/MoEStages.h"
+#include "stages/MoEExpertComputeStage.h"
+#include "stages/MoEExpertDispatchStage.h"
+#include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoELocalExpertStage.h"
+#include "stages/MoESparseDispatchStage.h"
+#include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
 #include "stages/GDNProjectionStage.h"
@@ -34,6 +41,8 @@
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
 #include "stages/QGateSplitStage.h"
+#include "stages/FusedAddAllreduceStage.h"
+#include "stages/MTPConcatStage.h"
 
 namespace llaminar2
 {
@@ -117,21 +126,15 @@ namespace llaminar2
         static std::unique_ptr<IComputeStage> createFusedResidualNorm(
             const FusedResidualNormStage::Params &params);
 
+        /**
+         * @brief Create a fused residual-add + TP allreduce stage
+         */
+        static std::unique_ptr<IComputeStage> createFusedAddAllreduce(
+            const FusedAddAllreduceStage::Params &params);
+
         // =====================================================================
         // Attention Stages
         // =====================================================================
-
-        /**
-         * @brief Create a production attention stage with KV cache and MPI support
-         *
-         * This is the recommended factory for attention in production pipelines.
-         * For simple testing, use createAttention() instead.
-         *
-         * @param params Attention parameters including KV cache and MPI config
-         * @return AttentionWithKVCacheStage instance
-         */
-        static std::unique_ptr<IComputeStage> createAttentionWithKVCache(
-            const AttentionWithKVCacheStage::Params &params);
 
         /**
          * @brief Create a KV cache append stage for explicit cache management
@@ -164,7 +167,6 @@ namespace llaminar2
          * - Supports CPU and GPU backends transparently
          *
          * Use this with KVCacheAppendStage for composable DAG execution.
-         * For legacy integrated cache+attention, use createAttentionWithKVCache().
          *
          * @param params Attention compute parameters (Q, K, V, output, dimensions)
          * @return AttentionComputeStage instance
@@ -177,22 +179,55 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Create a MoE router stage for expert selection
+         * @brief Create a unified MoE expert compute stage (expert SwiGLU + combine, routing done externally)
          */
-        static std::unique_ptr<IComputeStage> createMoERouter(
-            const MoERouterStage::Params &params);
+        static std::unique_ptr<IComputeStage> createMoEExpertCompute(
+            const MoEExpertComputeStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoEFFN(
+            const MoEExpertComputeStage::Params &params);
 
         /**
-         * @brief Create an expert FFN stage for MoE
+         * @brief Create a MoE routing stage (softmax top-k expert selection)
+         *
+         * Extracted from MoEExpertComputeStage. Outputs raw routing results (indices as float,
+         * normalized weights) without EP masking.
          */
-        static std::unique_ptr<IComputeStage> createMoEExpert(
-            const MoEExpertStage::Params &params);
+        static std::unique_ptr<IComputeStage> createMoERouting(
+            const MoERoutingStage::Params &params);
 
         /**
-         * @brief Create a MoE combine stage for weighted expert output combination
+         * @brief Create a host-side MoE expert-parallel dispatch descriptor stage
          */
-        static std::unique_ptr<IComputeStage> createMoECombine(
-            const MoECombineStage::Params &params);
+        static std::unique_ptr<IComputeStage> createMoEExpertDispatch(
+            const MoEExpertDispatchStage::Params &params);
+
+        /**
+         * @brief Create a host-side dense partial reduce stage for MoE expert-parallel tiers
+         */
+        static std::unique_ptr<IComputeStage> createMoEExpertParallelReduce(
+            const MoEExpertParallelReduceStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoESparseDispatch(
+            const MoESparseDispatchStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoELocalExpert(
+            const MoELocalExpertStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoESparseReturnReduce(
+            const MoESparseReturnReduceStage::Params &params);
+
+        /**
+         * @brief Create a shared expert FFN stage (always-active dense SwiGLU)
+         */
+        static std::unique_ptr<IComputeStage> createSharedExpertFFN(
+            const SharedExpertFFNStage::Params &params);
+
+        /**
+         * @brief Create a shared expert sigmoid gate stage
+         */
+        static std::unique_ptr<IComputeStage> createSharedExpertGate(
+            const SharedExpertGateStage::Params &params);
 
         // =====================================================================
         // GDN (Gated Delta Net) Stages
@@ -233,6 +268,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createQGateSplit(
             const QGateSplitStage::Params &params);
+
+        /**
+         * @brief Create an MTP embedding/hidden concat stage
+         */
+        static std::unique_ptr<IComputeStage> createMTPConcat(
+            const MTPConcatStage::Params &params);
 
         // =====================================================================
         // MPI Communication Stages
@@ -313,6 +354,30 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createEmbedding(
             const EmbeddingStage::Params &params);
+
+        /**
+         * @brief Create a hidden-state row-select stage for bucketed prefill LM-head input.
+         *
+         * Copies one dynamic source row into a stable one-row scratch tensor so
+         * captured LM-head GEMM can always use activation offset zero.
+         *
+         * @param params Row-select parameters including source, scratch, and dimensions.
+         * @return HiddenStateRowSelectStage instance.
+         */
+        static std::unique_ptr<IComputeStage> createHiddenStateRowSelect(
+            const HiddenStateRowSelectStage::Params &params);
+
+        /**
+         * @brief Create a compact hidden-state rows-select stage for verifier LM-head input.
+         *
+         * Packs a fixed small row set into [rows, d_model] scratch so the
+         * verifier LM head can run one batched projection over selected rows.
+         *
+         * @param params Multi-row select parameters including source, scratch, and dimensions.
+         * @return HiddenStateRowsSelectStage instance.
+         */
+        static std::unique_ptr<IComputeStage> createHiddenStateRowsSelect(
+            const HiddenStateRowsSelectStage::Params &params);
 
         /**
          * @brief Create an LM head projection stage

@@ -63,8 +63,11 @@ public:
     mutable int ensureOnHost_calls = 0;
     mutable int allocateOnDevice_calls = 0;
     mutable int invalidateGpuData_calls = 0;
+    mutable int transitionTo_calls = 0;
     mutable DeviceId last_ensureOnDevice_target = DeviceId::cpu();
     mutable DeviceId last_allocateOnDevice_target = DeviceId::cpu();
+    mutable TensorCoherenceState last_transitionTo_state = TensorCoherenceState::HOST_ONLY;
+    mutable std::optional<DeviceId> last_transitionTo_device = std::nullopt;
 
     // Override coherence methods to track calls
     bool ensureOnDevice(DeviceId target_device, void *stream = nullptr) override
@@ -93,6 +96,16 @@ public:
         invalidateGpuData_calls++;
     }
 
+    void transitionTo(TensorCoherenceState new_state,
+                      std::optional<DeviceId> authoritative_dev = std::nullopt) override
+    {
+        transitionTo_calls++;
+        last_transitionTo_state = new_state;
+        last_transitionTo_device = authoritative_dev;
+        // Delegate to TensorBase (FP32Tensor) for real state machine
+        FP32Tensor::transitionTo(new_state, authoritative_dev);
+    }
+
     /// Inject a fake GPU pointer (simulates what ensureOnDevice does)
     void injectGpuDataPtr(void *ptr) { gpu_data_ptr_ = ptr; }
 
@@ -106,6 +119,7 @@ public:
         ensureOnHost_calls = 0;
         allocateOnDevice_calls = 0;
         invalidateGpuData_calls = 0;
+        transitionTo_calls = 0;
     }
 };
 
@@ -921,4 +935,100 @@ TEST_F(Test__TensorSliceCoherence, SharedPtrConstruction_InvalidateGpuDataDelega
 
     EXPECT_EQ(inner_ptr->invalidateGpuData_calls, 1)
         << "invalidateGpuData must delegate to inner with shared_ptr construction";
+}
+
+// =============================================================================
+// transitionTo Delegation Tests
+// =============================================================================
+
+TEST_F(Test__TensorSliceCoherence, TransitionTo_DelegatesToInner_DeviceAuthoritative)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    slice->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::rocm(0));
+
+    EXPECT_EQ(inner_ptr->transitionTo_calls, 1)
+        << "transitionTo must delegate to inner tensor";
+    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    EXPECT_TRUE(inner_ptr->last_transitionTo_device.has_value());
+    EXPECT_EQ(inner_ptr->last_transitionTo_device.value(), DeviceId::rocm(0));
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE)
+        << "Inner tensor coherence state must actually change";
+}
+
+TEST_F(Test__TensorSliceCoherence, TransitionTo_DelegatesToInner_HostAuthoritative)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    slice->transitionTo(TensorCoherenceState::HOST_AUTHORITATIVE);
+
+    EXPECT_EQ(inner_ptr->transitionTo_calls, 1);
+    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::HOST_AUTHORITATIVE);
+    EXPECT_FALSE(inner_ptr->last_transitionTo_device.has_value())
+        << "HOST_AUTHORITATIVE should not carry a device";
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::HOST_AUTHORITATIVE);
+}
+
+TEST_F(Test__TensorSliceCoherence, TransitionTo_DelegatesToInner_Synced)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+    auto slice = createSlice(std::move(inner));
+    inner_ptr->resetCallCounters();
+
+    slice->transitionTo(TensorCoherenceState::SYNCED);
+
+    EXPECT_EQ(inner_ptr->transitionTo_calls, 1);
+    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::SYNCED);
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::SYNCED);
+}
+
+TEST_F(Test__TensorSliceCoherence, TransitionTo_SharedPtrConstruction_Delegates)
+{
+    auto inner = std::make_shared<MockCoherenceTensor>(512, 256);
+    MockCoherenceTensor *inner_ptr = inner.get();
+
+    SliceMetadata meta;
+    meta.mode = SliceMode::ROW_PARALLEL;
+    meta.original_rows = 1024;
+    meta.original_cols = 256;
+    meta.slice_start = 0;
+    meta.slice_end = 512;
+    meta.rank = 0;
+    meta.world_size = 2;
+    meta.inner_is_presliced = true;
+
+    auto slice = std::make_unique<TensorSlice>(inner, std::move(meta));
+    inner_ptr->resetCallCounters();
+
+    slice->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::cuda(1));
+
+    EXPECT_EQ(inner_ptr->transitionTo_calls, 1)
+        << "transitionTo must delegate with shared_ptr construction";
+    EXPECT_EQ(inner_ptr->last_transitionTo_state, TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    EXPECT_EQ(inner_ptr->last_transitionTo_device.value(), DeviceId::cuda(1));
+}
+
+TEST_F(Test__TensorSliceCoherence, TransitionTo_NestedSlice_DelegatesToInnermost)
+{
+    auto inner = std::make_unique<MockCoherenceTensor>(512, 256);
+    auto *inner_ptr = inner.get();
+
+    // Wrap in first TensorSlice
+    auto slice1 = createSlice(std::move(inner));
+    // Wrap in second TensorSlice
+    auto slice2 = createSlice(std::move(slice1));
+    inner_ptr->resetCallCounters();
+
+    slice2->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, DeviceId::rocm(0));
+
+    EXPECT_EQ(inner_ptr->transitionTo_calls, 1)
+        << "Nested TensorSlice must delegate transitionTo all the way to innermost tensor";
+    EXPECT_EQ(inner_ptr->coherenceState(), TensorCoherenceState::DEVICE_AUTHORITATIVE);
 }

@@ -18,13 +18,18 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
 {
 
     class ITensorGemm;
+    class FP32Tensor;
+    class TensorBase;
+    class PreparedWeightStore;
 
     /**
      * @brief 4-projection stage for GDN layers
@@ -75,6 +80,26 @@ namespace llaminar2
             std::optional<BufferId> output_z_buffer_id;
             std::optional<BufferId> output_a_buffer_id;
             std::optional<BufferId> output_b_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_qkv;
+            std::optional<PreparedWeightRef> prepared_ref_z;
+            std::optional<PreparedWeightRef> prepared_ref_a;
+            std::optional<PreparedWeightRef> prepared_ref_b;
+            PreparedWeightStore *prepared_store = nullptr;
+
+            /**
+             * @brief Use grouped decode-equivalent kernels for tiny MTP verifier batches.
+             *
+             * GDN projection feeds recurrent state.  Publication-capable verifier
+             * graphs therefore require M=2..4 grouped kernels that preserve the
+             * same per-row quantization and accumulation contract as M=1 serial
+             * decode.  Unsupported backends must fail loudly instead of falling
+             * back to hidden row-wise replay.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
         };
 
         static_assert(StageParamsRequired<Params>);
@@ -82,6 +107,7 @@ namespace llaminar2
         explicit GDNProjectionStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GDN_PROJECTION; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -102,7 +128,7 @@ namespace llaminar2
         bool isGraphCapturable() const override { return true; }
 
     private:
-        /// Lazily resolve a GEMM kernel from a weight tensor via KernelFactory.
+        /// Lazily resolve a GEMM kernel from a prepared weight ref.
         /// Caches the result in @p cached for subsequent calls (like GEMMStage).
         ITensorGemm *resolveGemm(
             const ITensor *weight, ITensorGemm *&cached, const char *name);

@@ -3,18 +3,15 @@
  * @brief Device-side parameter buffer for graph-captured KV cache append stages
  *
  * Like RoPEDeviceParams and AttentionDeviceParams, this struct lives in a
- * device buffer and is updated via H2D memcpy before each graph replay.
- * The ring_append_kernel reads the head position from the device buffer
- * instead of a frozen scalar argument, allowing the write position to
- * change between graph replays.
+ * workspace-owned device buffer. It is updated before graph capture/replay,
+ * and the ring_append_kernel reads the head position from the device buffer
+ * instead of a frozen scalar argument.
  *
  * Flow:
- * 1. During graph capture: H2D memcpy (pinned host → device) + kernel launch
- *    with device_params pointer are recorded
- * 2. Between replays: setDynamicHead() updates pinned host copy +
- *    issues explicit H2D for stream-only mode
- * 3. During replay: captured H2D re-reads updated pinned host value →
- *    kernel sees new head position
+ * 1. Before capture/replay: setDynamicHead() uploads the latest value on the
+ *    explicit graph stream
+ * 2. During capture/replay: only the dynamic append kernel is recorded/launched
+ * 3. Replay callbacks advance host-side ring metadata after graph launch
  */
 
 #pragma once

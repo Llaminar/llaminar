@@ -70,6 +70,7 @@ namespace llaminar2
     {
         RankStageAction action;
         action.stage_id = stage.stage_id;
+        action.domain_name = stage.domain_name;
 
         if (!stage.rankParticipates(rank))
         {
@@ -82,6 +83,7 @@ namespace llaminar2
         action.last_layer = stage.last_layer;
         action.has_embedding = stage.has_embedding;
         action.has_lm_head = stage.has_lm_head;
+        action.backend = stage.backend;
 
         if (stage.is_global_tp)
         {
@@ -103,8 +105,18 @@ namespace llaminar2
             action.weight_shard.total_shards = action.tp_domain_size;
             action.weight_shard.work_fraction = 1.0f / static_cast<float>(action.tp_domain_size);
 
-            // Device for this rank
-            action.device = stage.per_rank_device;
+            // Device for this rank. Prefer explicit per-rank domain devices
+            // aligned with participating_ranks; fall back to the legacy single
+            // per_rank_device field for older specs/tests.
+            if (action.tp_rank_in_domain >= 0 &&
+                action.tp_rank_in_domain < static_cast<int>(stage.per_rank_devices.size()))
+            {
+                action.device = stage.per_rank_devices[action.tp_rank_in_domain];
+            }
+            else
+            {
+                action.device = stage.per_rank_device;
+            }
         }
         else
         {
@@ -145,7 +157,21 @@ namespace llaminar2
                 continue;
             }
 
-            // Skip no-op transfers
+            if (t.kind == GlobalPPTransferKind::LOCAL_HANDOFF)
+            {
+                if (t.sender_rank == rank && t.receiver_rank == rank)
+                {
+                    RankTransferAction ta;
+                    ta.direction = RankTransferAction::Direction::LOCAL_HANDOFF;
+                    ta.peer_rank = rank;
+                    ta.mpi_tag = t.mpi_tag;
+                    ta.from_stage = t.from_stage;
+                    ta.to_stage = t.to_stage;
+                    result.push_back(ta);
+                }
+                continue;
+            }
+
             if (t.isNoop())
             {
                 continue;

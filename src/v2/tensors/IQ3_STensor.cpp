@@ -59,9 +59,9 @@ namespace llaminar2
           view_byte_offset_(byte_offset), parent_(parent), device_(DeviceId::cpu()), device_blocks_(nullptr) {}
     // Zero-copy constructor for mmap-backed data
     IQ3_STensor::IQ3_STensor(const std::vector<size_t> &shape,
-          const uint8_t *mmap_data,
-          size_t byte_size,
-          std::shared_ptr<void> mmap_lifetime_owner)
+                             const uint8_t *mmap_data,
+                             size_t byte_size,
+                             std::shared_ptr<void> mmap_lifetime_owner)
         : shape_(shape), is_view_(true), raw_data_(), raw_data_ptr_(mmap_data),
           view_byte_offset_(0), parent_(nullptr), mmap_owner_(std::move(mmap_lifetime_owner)),
           data_byte_size_(byte_size), device_(DeviceId::cpu()), device_blocks_(nullptr)
@@ -88,25 +88,43 @@ namespace llaminar2
         }
     }
 
-
     std::shared_ptr<TensorBase> IQ3_STensor::create_view(
         const std::vector<size_t> &view_shape, size_t offset_elements)
     {
         if (view_shape.size() != 2)
             throw std::invalid_argument("IQ3_STensor::create_view: only 2D views supported");
-        if (view_shape[1] != shape_[1])
+
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
+        {
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("IQ3_STensor::create_view: parent must be 2D or 3D");
+        }
+
+        if (view_shape[1] != K)
             throw std::invalid_argument("IQ3_STensor::create_view: K dimension must match parent");
-        if (offset_elements % shape_[1] != 0)
+        if (offset_elements % K != 0)
             throw std::invalid_argument("IQ3_STensor::create_view: offset must be row-aligned");
 
-        size_t offset_rows = offset_elements / shape_[1];
+        size_t offset_rows = offset_elements / K;
         size_t view_end_row = offset_rows + view_shape[0];
-        size_t parent_rows = shape_[0];
-        if (view_end_row > parent_rows)
+        if (view_end_row > total_rows)
             throw std::out_of_range("IQ3_STensor::create_view: view exceeds parent bounds");
 
-        size_t k = shape_[1];
-        size_t blocks_per_row = (k + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
+        size_t blocks_per_row = (K + IQ3_SBlock::BLOCK_SIZE - 1) / IQ3_SBlock::BLOCK_SIZE;
         size_t byte_offset_in_parent = offset_rows * blocks_per_row * sizeof(IQ3_SBlock);
         size_t new_total_byte_offset = view_byte_offset_ + byte_offset_in_parent;
 
@@ -209,8 +227,14 @@ namespace llaminar2
     }
 #endif
 
-    IQ3_STensor::~IQ3_STensor() {}
-
+    IQ3_STensor::~IQ3_STensor()
+    {
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
+    }
 
     const float *IQ3_STensor::data() const
     {
@@ -433,7 +457,6 @@ namespace llaminar2
                 mins[i] = 0.0f;
         }
     }
-
 
     void IQ3_STensor::packVnniBlock(const VnniPackContext &ctx, int n, int b) const
     {

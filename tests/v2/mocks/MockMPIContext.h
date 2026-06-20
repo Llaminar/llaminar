@@ -15,6 +15,7 @@
 #pragma once
 
 #include "interfaces/IMPIContext.h"
+#include "interfaces/IMPITopology.h"
 #include <vector>
 #include <functional>
 #include <mutex>
@@ -119,6 +120,7 @@ namespace llaminar2::test
         int rank() const override { return config_.rank; }
         int world_size() const override { return config_.world_size; }
         bool is_root() const override { return config_.rank == 0; }
+        int local_rank() const override { return config_.rank; }
         MPI_Comm communicator() const override { return MPI_COMM_NULL; }
 
         // =========================================================================
@@ -248,11 +250,15 @@ namespace llaminar2::test
             // No-op in mock - data unchanged
         }
 
-        void broadcast_int32(int32_t * /*data*/, size_t /*count*/, int /*root*/) const override
+        void broadcast_int32(int32_t *data, size_t count, int /*root*/) const override
         {
             if (config_.track_calls)
             {
                 broadcast_calls_.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(broadcast_int32_mutex_);
+                broadcast_int32_payloads_.emplace_back(
+                    data,
+                    data ? data + count : data);
             }
             // No-op in mock - data unchanged
         }
@@ -532,6 +538,15 @@ namespace llaminar2::test
         }
 
         /**
+         * @brief Snapshot the int32 broadcast payloads observed so far.
+         */
+        std::vector<std::vector<int32_t>> broadcast_int32_payloads() const
+        {
+            std::lock_guard<std::mutex> lock(broadcast_int32_mutex_);
+            return broadcast_int32_payloads_;
+        }
+
+        /**
          * @brief Get the number of allgather() calls
          */
         size_t allgather_call_count() const
@@ -687,8 +702,41 @@ namespace llaminar2::test
          */
         const Config &config() const { return config_; }
 
+        // =========================================================================
+        // Test Utilities - Topology Wiring
+        // =========================================================================
+
+        /**
+         * @brief Attach a topology to this mock context
+         *
+         * When set, topology() returns a pointer to the attached topology and
+         * intra_node_comm() returns the configured intra-node communicator.
+         * When not set (default), topology() returns nullptr and intra_node_comm()
+         * returns MPI_COMM_NULL, triggering fallback behavior in callers.
+         *
+         * @param topo Shared pointer to an IMPITopology (typically MockMPITopology)
+         * @param intra_comm Optional intra-node communicator (default: MPI_COMM_NULL)
+         */
+        void set_topology(std::shared_ptr<IMPITopology> topo, MPI_Comm intra_comm = MPI_COMM_NULL)
+        {
+            topology_ = std::move(topo);
+            intra_node_comm_ = intra_comm;
+        }
+
+        const IMPITopology *topology() const override
+        {
+            return topology_.get();
+        }
+
+        MPI_Comm intra_node_comm() const override
+        {
+            return intra_node_comm_;
+        }
+
     private:
         Config config_;
+        std::shared_ptr<IMPITopology> topology_;   ///< Optional attached topology
+        MPI_Comm intra_node_comm_ = MPI_COMM_NULL; ///< Configurable intra-node communicator
 
         // Atomic call counters (thread-safe) - Collectives
         mutable std::atomic<size_t> barrier_calls_{0};
@@ -708,6 +756,9 @@ namespace llaminar2::test
         mutable std::atomic<size_t> irecv_calls_{0};
         mutable std::atomic<size_t> wait_calls_{0};
         mutable std::atomic<size_t> waitall_calls_{0};
+
+        mutable std::mutex broadcast_int32_mutex_;
+        mutable std::vector<std::vector<int32_t>> broadcast_int32_payloads_;
         mutable std::atomic<size_t> probe_calls_{0};
         mutable std::atomic<size_t> iprobe_calls_{0};
     };

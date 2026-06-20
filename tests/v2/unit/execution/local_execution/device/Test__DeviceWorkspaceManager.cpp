@@ -10,13 +10,76 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <cstdlib>
 #include <set>
 #include <cstring>
 
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "backends/BackendManager.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 
 using namespace llaminar2;
+
+namespace
+{
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            if (value)
+                setenv(name, value, 1);
+            else
+                unsetenv(name);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
+
+    const PerfStatRecord *findMemoryCounter(
+        const std::vector<PerfStatRecord> &records,
+        const std::string &name,
+        const std::string &tag_name = {},
+        const std::string &tag_value = {})
+    {
+        auto it = std::find_if(records.begin(), records.end(), [&](const PerfStatRecord &record)
+                               {
+                                   if (record.kind != PerfStatRecord::Kind::Counter ||
+                                       record.domain != "memory" ||
+                                       record.name != name)
+                                   {
+                                       return false;
+                                   }
+                                   if (tag_name.empty())
+                                       return true;
+                                   auto tag_it = record.tags.find(tag_name);
+                                   return tag_it != record.tags.end() && tag_it->second == tag_value;
+                               });
+        return it == records.end() ? nullptr : &(*it);
+    }
+}
 
 /**
  * @brief Test fixture for DeviceWorkspaceManager tests
@@ -61,6 +124,17 @@ TEST_F(Test__DeviceWorkspaceManager, ConstructionWithZeroBudget)
     EXPECT_EQ(mgr.budget(), 0);
     EXPECT_EQ(mgr.remaining(), 0);
     EXPECT_FALSE(mgr.isAllocated());
+}
+
+TEST_F(Test__DeviceWorkspaceManager, ManagerIdsAreUniqueAcrossInstances)
+{
+    DeviceWorkspaceManager first(device, budget);
+    DeviceWorkspaceManager second(device, budget);
+
+    EXPECT_NE(first.id(), 0u);
+    EXPECT_NE(second.id(), 0u);
+    EXPECT_NE(first.id(), second.id())
+        << "Kernel workspace scratch caches depend on manager identity, not just host pointer equality";
 }
 
 // ============================================================================
@@ -116,6 +190,44 @@ TEST_F(Test__DeviceWorkspaceManager, AllocateMultipleBuffers)
     EXPECT_EQ(mgr.getBufferSize("buffer_a"), 1024);
     EXPECT_EQ(mgr.getBufferSize("buffer_b"), 2048);
     EXPECT_EQ(mgr.getBufferSize("buffer_c"), 4096);
+}
+
+TEST_F(Test__DeviceWorkspaceManager, EmitsStructuredMemoryCountersForWorkspaceLayout)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    DeviceWorkspaceManager mgr(device, budget);
+
+    WorkspaceRequirements reqs;
+    reqs.buffers.push_back({"alpha_visible", 1024, 256, true});
+    reqs.buffers.push_back({"beta_visible", 2048, 512, false});
+
+    ASSERT_TRUE(mgr.allocate(reqs));
+    mgr.release();
+
+    const auto records = PerfStatsCollector::snapshot({"memory"});
+    const auto *block = findMemoryCounter(records, "workspace_block_bytes");
+    ASSERT_NE(block, nullptr);
+    EXPECT_EQ(block->device, device.to_string());
+    EXPECT_GE(block->value, 1024.0 + 2048.0);
+    EXPECT_EQ(block->tags.at("buffer_count"), "2");
+
+    const auto *alpha = findMemoryCounter(records, "workspace_suballoc_bytes", "name", "alpha_visible");
+    ASSERT_NE(alpha, nullptr);
+    EXPECT_DOUBLE_EQ(alpha->value, 1024.0);
+    EXPECT_EQ(alpha->tags.at("required"), "true");
+    EXPECT_EQ(alpha->tags.at("alignment"), "256");
+
+    const auto *beta = findMemoryCounter(records, "workspace_suballoc_bytes", "name", "beta_visible");
+    ASSERT_NE(beta, nullptr);
+    EXPECT_DOUBLE_EQ(beta->value, 2048.0);
+    EXPECT_EQ(beta->tags.at("required"), "false");
+    EXPECT_EQ(beta->tags.at("alignment"), "512");
+
+    const auto *release = findMemoryCounter(records, "workspace_release_bytes");
+    ASSERT_NE(release, nullptr);
+    EXPECT_EQ(release->tags.at("buffer_count"), "2");
 }
 
 // ============================================================================

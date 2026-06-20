@@ -835,6 +835,95 @@ TEST_F(Test__CUDAOpsParity, RoPE_FP32_Large)
     EXPECT_LE(l2_error_k, 0.01);
 }
 
+TEST_F(Test__CUDAOpsParity, RoPE_FP32_PartialRotaryKeepsFullHeadStride)
+{
+    SKIP_IF_NO_CUDA();
+
+    constexpr int seq_len = 5;
+    constexpr int n_heads = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 128;
+    constexpr int rotary_dim = 32;
+    constexpr float rope_theta = 1000000.0f;
+    const size_t total_q = seq_len * n_heads * head_dim;
+    const size_t total_k = seq_len * n_kv_heads * head_dim;
+
+    auto q_data = randomFP32(total_q);
+    auto k_data = randomFP32(total_k);
+    std::vector<float> original_q = q_data;
+    std::vector<float> original_k = k_data;
+    std::vector<float> cpu_q = q_data;
+    std::vector<float> cpu_k = k_data;
+    std::vector<float> cuda_q = q_data;
+    std::vector<float> cuda_k = k_data;
+    std::vector<int> position_ids = {1024, 1025, 1026, 1027, 1028};
+
+    CPURoPEKernelT<ActivationPrecision::FP32> cpu_kernel;
+    ASSERT_TRUE(cpu_kernel.apply_typed(cpu_q.data(), cpu_k.data(), position_ids.data(),
+                                       seq_len, n_heads, n_kv_heads, head_dim,
+                                       rope_theta, -1, rotary_dim));
+
+    llaminar2::cuda::CUDARoPEKernelT<ActivationPrecision::FP32> cuda_kernel;
+    DeviceWorkspaceManager workspace(DeviceId::cuda(0), 16 * 1024 * 1024); // 16MB
+    auto reqs = cuda_kernel.getWorkspaceRequirements(seq_len);
+    ASSERT_TRUE(workspace.allocate(reqs)) << "Failed to allocate RoPE workspace";
+    cuda_kernel.bindWorkspace(&workspace);
+
+    float *d_q, *d_k;
+    cudaMalloc(&d_q, total_q * sizeof(float));
+    cudaMalloc(&d_k, total_k * sizeof(float));
+
+    cudaMemcpy(d_q, cuda_q.data(), total_q * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_k, cuda_k.data(), total_k * sizeof(float), cudaMemcpyHostToDevice);
+
+    ASSERT_TRUE(cuda_kernel.apply_typed(d_q, d_k, position_ids.data(), seq_len,
+                                        n_heads, n_kv_heads, head_dim,
+                                        rope_theta, 0, 0, rotary_dim));
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(cuda_q.data(), d_q, total_q * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(cuda_k.data(), d_k, total_k * sizeof(float), cudaMemcpyDeviceToHost);
+
+    cudaFree(d_q);
+    cudaFree(d_k);
+
+    ASSERT_FALSE(hasNaNOrInf(cuda_q.data(), total_q));
+    ASSERT_FALSE(hasNaNOrInf(cuda_k.data(), total_k));
+
+    double cosine_q = cosineSimilarity(cuda_q.data(), cpu_q.data(), total_q);
+    double cosine_k = cosineSimilarity(cuda_k.data(), cpu_k.data(), total_k);
+    double l2_error_q = relativeL2Error(cuda_q.data(), cpu_q.data(), total_q);
+    double l2_error_k = relativeL2Error(cuda_k.data(), cpu_k.data(), total_k);
+
+    std::cout << "  RoPE FP32 Partial Q: cosine=" << cosine_q << ", L2_error=" << l2_error_q << std::endl;
+    std::cout << "  RoPE FP32 Partial K: cosine=" << cosine_k << ", L2_error=" << l2_error_k << std::endl;
+
+    EXPECT_GE(cosine_q, 0.9999);
+    EXPECT_GE(cosine_k, 0.9999);
+    EXPECT_LE(l2_error_q, 0.01);
+    EXPECT_LE(l2_error_k, 0.01);
+
+    for (int tok = 0; tok < seq_len; ++tok)
+    {
+        for (int h = 0; h < n_heads; ++h)
+        {
+            for (int d = rotary_dim; d < head_dim; ++d)
+            {
+                size_t idx = (static_cast<size_t>(tok) * n_heads + h) * head_dim + d;
+                EXPECT_FLOAT_EQ(cuda_q[idx], original_q[idx]);
+            }
+        }
+        for (int h = 0; h < n_kv_heads; ++h)
+        {
+            for (int d = rotary_dim; d < head_dim; ++d)
+            {
+                size_t idx = (static_cast<size_t>(tok) * n_kv_heads + h) * head_dim + d;
+                EXPECT_FLOAT_EQ(cuda_k[idx], original_k[idx]);
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Residual Add Parity Tests
 // ============================================================================

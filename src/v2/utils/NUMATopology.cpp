@@ -692,9 +692,9 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[NUMATopology] Estimated CPU memory bandwidth: " << info.bandwidth_gbps
-                                                                   << " GB/s (" << info.memory_channels << " channels × " << info.num_sockets
-                                                                   << " sockets, method=" << info.detection_method << ")");
+        LOG_DEBUG("[NUMATopology] Estimated CPU memory bandwidth: " << info.bandwidth_gbps
+                                                                    << " GB/s (" << info.memory_channels << " channels × " << info.num_sockets
+                                                                    << " sockets, method=" << info.detection_method << ")");
 
         return info;
     }

@@ -38,10 +38,11 @@ namespace llaminar2
      */
     enum class ShardingMode
     {
-        REPLICATE,       ///< Not sharded, full copy on each rank (norms, biases)
-        COLUMN_PARALLEL, ///< Split output dimension (rows of weight) - for Gate/Up, QKV
-        ROW_PARALLEL,    ///< Split output dimension (rows of weight) + allreduce - for Wo
-        INPUT_PARALLEL   ///< Split input dimension (columns of weight) + allreduce - for Down
+        REPLICATE,        ///< Not sharded, full copy on each rank (norms, biases)
+        COLUMN_PARALLEL,  ///< Split output dimension (rows of weight) - for Gate/Up, QKV
+        ROW_PARALLEL,     ///< Split output dimension (rows of weight) + allreduce - for Wo
+        INPUT_PARALLEL,   ///< Split input dimension (columns of weight) + allreduce - for Down
+        EXPERT_PARALLEL   ///< Split expert dimension of 3D MoE tensors - for expert weights
     };
 
     /**

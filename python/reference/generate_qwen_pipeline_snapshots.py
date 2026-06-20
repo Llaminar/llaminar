@@ -955,6 +955,7 @@ class QwenPipelineCapture:
         # Save metadata
         metadata_path = output_dir / "metadata.txt"
         with open(metadata_path, 'w') as f:
+            f.write(f"snapshot_version: 2\n")
             f.write(f"Model: {self.model_path}\n")
             config = self.model.config
             arch = getattr(config, 'architectures', [config.__class__.__name__])

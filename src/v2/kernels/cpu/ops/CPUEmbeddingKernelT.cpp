@@ -110,6 +110,18 @@ namespace llaminar2
             }
 
             // Direct memcpy for FP32 output (with vocab-parallel sharding support)
+            if (!vocab_parallel_)
+            {
+                for (int i = 0; i < num_tokens; ++i)
+                {
+                    int token_id = token_ids[i];
+                    std::memcpy(output + i * d_model,
+                                embed_data + token_id * d_model,
+                                d_model * sizeof(float));
+                }
+                return true;
+            }
+
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
@@ -157,8 +169,8 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
-                int local_id = token_id - vocab_offset_;
-                if (local_id < 0 || local_id >= local_vocab_size_)
+                int local_id = vocab_parallel_ ? token_id - vocab_offset_ : token_id;
+                if (vocab_parallel_ && (local_id < 0 || local_id >= local_vocab_size_))
                 {
                     // Token belongs to a different rank's shard — output zeros
                     std::memset(output + i * d_model, 0, d_model * sizeof(uint16_t));
@@ -205,8 +217,8 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
-                int local_id = token_id - vocab_offset_;
-                if (local_id < 0 || local_id >= local_vocab_size_)
+                int local_id = vocab_parallel_ ? token_id - vocab_offset_ : token_id;
+                if (vocab_parallel_ && (local_id < 0 || local_id >= local_vocab_size_))
                 {
                     // Token belongs to a different rank's shard — output zeros
                     std::memset(output + i * d_model, 0, d_model * sizeof(uint16_t));
@@ -262,10 +274,10 @@ namespace llaminar2
             for (int i = 0; i < num_tokens; ++i)
             {
                 int token_id = token_ids[i];
-                int local_id = token_id - vocab_offset_;
+                int local_id = vocab_parallel_ ? token_id - vocab_offset_ : token_id;
                 Q8_1Block *out_row = output_blocks + i * blocks_per_row;
 
-                if (local_id < 0 || local_id >= local_vocab_size_)
+                if (vocab_parallel_ && (local_id < 0 || local_id >= local_vocab_size_))
                 {
                     // Token belongs to a different rank's shard — output zero blocks
                     std::memset(out_row, 0, blocks_per_row * sizeof(Q8_1Block));
@@ -306,12 +318,22 @@ namespace llaminar2
         // When the embedding table is column-parallel sharded, each rank holds
         // vocab_size/tp_degree rows. Tokens outside the local range must produce zeros;
         // the subsequent AllReduce sums partial results across ranks.
-        local_vocab_size_ = static_cast<int>(embed_table->rows());
-        vocab_offset_ = 0;
-        if (mpi_ctx && mpi_ctx->world_size() > 1)
+        if (explicit_vocab_range_)
         {
-            vocab_offset_ = mpi_ctx->rank() * local_vocab_size_;
+            if (local_vocab_size_ <= 0)
+                local_vocab_size_ = static_cast<int>(embed_table->rows());
         }
+        else
+        {
+            local_vocab_size_ = static_cast<int>(embed_table->rows());
+            vocab_offset_ = 0;
+            if (mpi_ctx && mpi_ctx->world_size() > 1)
+            {
+                vocab_offset_ = mpi_ctx->rank() * local_vocab_size_;
+            }
+        }
+        vocab_parallel_ = vocab_offset_ != 0 ||
+                          local_vocab_size_ < static_cast<int>(embed_table->rows());
 
         // =====================================================================
         // Fast path: FP32 embedding table — no dequantization needed

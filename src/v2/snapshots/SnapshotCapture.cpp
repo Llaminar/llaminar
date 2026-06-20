@@ -7,8 +7,36 @@
 
 #include "SnapshotCapture.h"
 
+#include <cctype>
+
 namespace llaminar2
 {
+    namespace
+    {
+        std::string snapshotContextPrefix(const std::string &context)
+        {
+            std::string result;
+            result.reserve(context.size());
+            bool previous_underscore = false;
+            for (char c : context)
+            {
+                const unsigned char uc = static_cast<unsigned char>(c);
+                if (std::isalnum(uc))
+                {
+                    result.push_back(static_cast<char>(std::toupper(uc)));
+                    previous_underscore = false;
+                }
+                else if (!previous_underscore)
+                {
+                    result.push_back('_');
+                    previous_underscore = true;
+                }
+            }
+            while (!result.empty() && result.back() == '_')
+                result.pop_back();
+            return result.empty() ? "CONTEXT" : result;
+        }
+    } // namespace
 
     // =========================================================================
     // Stage capture routing
@@ -16,6 +44,18 @@ namespace llaminar2
 
     void SnapshotCapture::captureStage(const std::string &name, const StageDumpInfo &dump)
     {
+        if (const size_t context_sep = name.find("::"); context_sep != std::string::npos)
+        {
+            SnapshotCapture scoped_capture;
+            scoped_capture.captureStage(name.substr(context_sep + 2), dump);
+            const std::string prefix = snapshotContextPrefix(name.substr(0, context_sep));
+            for (const auto &entry : scoped_capture.all())
+            {
+                snapshots_[prefix + "_" + entry.first] = entry.second;
+            }
+            return;
+        }
+
         LOG_TRACE("[Snapshot] Callback invoked for stage: " << name
                                                             << " outputs.size=" << dump.outputs.size());
 
@@ -75,7 +115,131 @@ namespace llaminar2
                 storeOutput(prefix + "_QKV_PROJECTION", dump.outputs[0]);
             if (dump.outputs.size() >= 2 && dump.outputs[1].data)
                 storeOutput(prefix + "_GDN_Z_PROJECTION", dump.outputs[1]);
-            // alpha and beta are small per-head tensors, skip for now
+            if (dump.outputs.size() >= 3 && dump.outputs[2].data)
+                storeOutput(prefix + "_GDN_ALPHA", dump.outputs[2]);
+            if (dump.outputs.size() >= 4 && dump.outputs[3].data)
+                storeOutput(prefix + "_GDN_BETA", dump.outputs[3]);
+            return;
+        }
+
+        // Handle Qwen3.5 full-attention Q/gate split. The raw q_proj snapshot
+        // remains Q_PROJECTION because it matches HuggingFace q_proj output;
+        // this extra key exposes the sigmoid gate consumed before Wo.
+        if (name.find("_q_gate_split") != std::string::npos)
+        {
+            size_t pos = name.find("_q_gate_split");
+            std::string prefix = name.substr(0, pos);
+
+            if (dump.outputs.size() >= 2 && dump.outputs[1].data)
+                storeOutput(prefix + "_FA_GATE", dump.outputs[1]);
+            return;
+        }
+
+        // Handle debug-only KV append cache snapshots. These outputs are
+        // populated only when LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT is enabled and
+        // expose the post-append persistent cache rows that attention consumes.
+        if (name.find("_kv_append") != std::string::npos)
+        {
+            size_t pos = name.find("_kv_append");
+            std::string prefix = name.substr(0, pos);
+
+            auto storeRowsForSmallAppendSource = [&](const std::string &base_key,
+                                                     const StageDumpInfo::OutputBuffer &output)
+            {
+                if (!output.data || output.rows == 0 || output.cols == 0 || output.rows > 16)
+                    return;
+                if (std::string(output.dtype ? output.dtype : "") != "FP32")
+                    return;
+
+                const auto *fp32 = static_cast<const float *>(output.data);
+                for (size_t row = 0; row < output.rows; ++row)
+                {
+                    auto row_output = output;
+                    row_output.data = fp32 + row * output.cols;
+                    row_output.rows = 1;
+                    row_output.byte_size = output.cols * sizeof(float);
+                    row_output.element_size = sizeof(float);
+                    storeOutput(base_key + "_ROW" + std::to_string(row), row_output);
+                }
+            };
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "cache_k" && output.data)
+                    storeOutput(prefix + "_KV_CACHE_K", output);
+                else if (output_name == "cache_v" && output.data)
+                    storeOutput(prefix + "_KV_CACHE_V", output);
+                else if (output_name == "source_k" && output.data)
+                {
+                    storeOutput(prefix + "_KV_APPEND_SOURCE_K", output);
+                    storeRowsForSmallAppendSource(prefix + "_KV_APPEND_SOURCE_K", output);
+                }
+                else if (output_name == "source_v" && output.data)
+                {
+                    storeOutput(prefix + "_KV_APPEND_SOURCE_V", output);
+                    storeRowsForSmallAppendSource(prefix + "_KV_APPEND_SOURCE_V", output);
+                }
+            }
+            return;
+        }
+
+        // Handle Qwen3.5 full-attention output gate. This is the gated context
+        // immediately before Wo, matching HuggingFace o_proj's pre-hook input.
+        if (name.find("_attn_output_gate") != std::string::npos)
+        {
+            size_t pos = name.find("_attn_output_gate");
+            std::string prefix = name.substr(0, pos);
+
+            if (!dump.outputs.empty() && dump.outputs[0].data)
+                storeOutput(prefix + "_ATTENTION_CONTEXT_GATED", dump.outputs[0]);
+            return;
+        }
+
+        // Handle attention stage debug snapshots. The normal output is the
+        // attention context; optional named outputs expose effective K/V after
+        // cache read/conversion, immediately before the attention kernel.
+        if (name.find("_attention") != std::string::npos)
+        {
+            size_t pos = name.find("_attention");
+            std::string prefix = name.substr(0, pos);
+
+            auto storeRowsForSmallEffectiveKV = [&](const std::string &base_key,
+                                                    const StageDumpInfo::OutputBuffer &output)
+            {
+                if (!output.data || output.rows == 0 || output.cols == 0 || output.rows > 16)
+                    return;
+                if (std::string(output.dtype ? output.dtype : "") != "FP32")
+                    return;
+
+                const auto *fp32 = static_cast<const float *>(output.data);
+                for (size_t row = 0; row < output.rows; ++row)
+                {
+                    auto row_output = output;
+                    row_output.data = fp32 + row * output.cols;
+                    row_output.rows = 1;
+                    row_output.byte_size = output.cols * sizeof(float);
+                    row_output.element_size = sizeof(float);
+                    storeOutput(base_key + "_ROW" + std::to_string(row), row_output);
+                }
+            };
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "output" && output.data)
+                    storeOutput(prefix + "_ATTENTION_CONTEXT", output);
+                else if (output_name == "effective_k" && output.data)
+                {
+                    storeOutput(prefix + "_ATTENTION_EFFECTIVE_K", output);
+                    storeRowsForSmallEffectiveKV(prefix + "_ATTENTION_EFFECTIVE_K", output);
+                }
+                else if (output_name == "effective_v" && output.data)
+                {
+                    storeOutput(prefix + "_ATTENTION_EFFECTIVE_V", output);
+                    storeRowsForSmallEffectiveKV(prefix + "_ATTENTION_EFFECTIVE_V", output);
+                }
+            }
             return;
         }
 
@@ -108,6 +272,77 @@ namespace llaminar2
                 if (!data.empty())
                     snapshots_[key] = {std::move(data), dump.outputs[1].rows, dump.outputs[1].cols};
             }
+            return;
+        }
+
+        // Handle fused MoE FFN stage — split into expert output + routing data
+        if (name.find("_moe_ffn") != std::string::npos && dump.outputs.size() >= 4)
+        {
+            size_t pos = name.find("_moe_ffn");
+            std::string prefix = name.substr(0, pos);
+
+            // outputs[0] = expert output [seq_len, d_model]
+            // outputs[1] = router logits [seq_len, num_experts]
+            // outputs[2] = routing indices [seq_len, top_k] (int as float)
+            // outputs[3] = routing weights [seq_len, top_k]
+            storeOutput(prefix + "_MOE_EXPERT_OUTPUT", dump.outputs[0]);
+            storeOutput(prefix + "_MOE_ROUTER_OUTPUT", dump.outputs[1]);
+            storeOutput(prefix + "_MOE_ROUTING_INDICES", dump.outputs[2]);
+            storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", dump.outputs[3]);
+            return;
+        }
+
+        /*
+         * The Qwen3.6 MoE combined shared-verifier path can fuse routed expert
+         * and shared expert output inside MoEExpertComputeStage.  The stage name
+         * is still `_moe_expert_ffn`, so route by output name before the generic
+         * suffix map labels it as routed-only expert output.
+         */
+        if (name.find("_moe_expert_ffn") != std::string::npos)
+        {
+            size_t pos = name.find("_moe_expert_ffn");
+            std::string prefix = name.substr(0, pos);
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "combined_output" && output.data)
+                {
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+                    return;
+                }
+            }
+        }
+
+        // Handle shared-expert gate. In the ordinary path the stage has one
+        // output, the gated shared contribution. In the fused gate-add path it
+        // publishes both that gated contribution and the final routed+shared
+        // combined row. Route by output name so both paths keep the same
+        // semantic snapshot keys.
+        if (name.find("_shared_expert_gate") != std::string::npos)
+        {
+            size_t pos = name.find("_shared_expert_gate");
+            std::string prefix = name.substr(0, pos);
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "shared_output" && output.data)
+                    storeOutput(prefix + "_MOE_SHARED_GATE_OUTPUT", output);
+                else if (output_name == "combined_output" && output.data)
+                    storeOutput(prefix + "_MOE_COMBINED_OUTPUT", output);
+            }
+            return;
+        }
+
+        // Handle standalone MoE routing stage — split router logits, indices, and weights
+        if (name.find("_moe_routing") != std::string::npos && dump.outputs.size() >= 3)
+        {
+            size_t pos = name.find("_moe_routing");
+            std::string prefix = name.substr(0, pos);
+
+            storeOutput(prefix + "_MOE_ROUTER_OUTPUT", dump.outputs[0]);
+            storeOutput(prefix + "_MOE_ROUTING_INDICES", dump.outputs[1]);
+            storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", dump.outputs[2]);
             return;
         }
 
@@ -230,6 +465,14 @@ namespace llaminar2
 
     std::string SnapshotCapture::convertStageNameToSnapshotKey(const std::string &stage_name)
     {
+        if (stage_name.find("_moe_expert_ffn_tier") != std::string::npos)
+        {
+            std::string result = stage_name;
+            for (char &c : result)
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return result;
+        }
+
         // Ordered vector: longest/most-specific suffixes FIRST to ensure correct
         // prefix extraction. E.g. "_gdn_wo_allreduce" must match before "_wo_allreduce"
         // so the prefix is "layerN" (not "layerN_gdn").
@@ -238,6 +481,7 @@ namespace llaminar2
             {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT"},
             {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
             {"_gdn_proj", "_QKV_PROJECTION"},
+            {"_short_conv", "_GDN_CONV1D_OUTPUT"},
             {"_gdn_recurrence", "_GDN_DELTA_RULE_OUTPUT"},
             {"_gated_norm", "_GDN_NORM_GATE_OUTPUT"},
             // Standard attention stages
@@ -247,11 +491,13 @@ namespace llaminar2
             {"_wo_proj", "_ATTENTION_OUTPUT"},
             {"_q_norm", "_Q_NORM"},
             {"_k_norm", "_K_NORM"},
+            {"_q_gate_split", "_FA_GATE"},
             {"_q_proj", "_Q_PROJECTION"},
             {"_k_proj", "_K_PROJECTION"},
             {"_v_proj", "_V_PROJECTION"},
             {"_q_rope", "_Q_ROPE"},
             {"_k_rope", "_K_ROPE"},
+            {"_attn_output_gate", "_ATTENTION_CONTEXT_GATED"},
             {"_attention", "_ATTENTION_CONTEXT"},
             // FFN stages
             {"_down_allreduce", "_FFN_DOWN"},
@@ -261,6 +507,15 @@ namespace llaminar2
             {"_swiglu", "_FFN_SWIGLU"},
             {"_down_proj", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
+            // MoE stages
+            {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
+            {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
+            {"_moe_expert_parallel_reduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_expert_ffn", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_combine", "_MOE_COMBINED_OUTPUT"},
+            {"_moe_ffn", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_add", "_MOE_COMBINED_OUTPUT"},
         };
 
         // Global stages

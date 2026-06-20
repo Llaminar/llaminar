@@ -21,6 +21,21 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool setAMDDeviceForResource(int device_ordinal, const char *context)
+        {
+            hipError_t err = hipSetDevice(device_ordinal);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[AMDDeviceContext] hipSetDevice(" << device_ordinal
+                                                             << ") failed in " << context
+                                                             << ": " << hipGetErrorString(err));
+                return false;
+            }
+            return true;
+        }
+    } // namespace
 
     // ============================================================================
     // Helper Macros for HIP Error Checking
@@ -111,8 +126,8 @@ namespace llaminar2
                 throw std::runtime_error("Failed to initialize HIP context on worker thread");
             }
 
-            LOG_INFO("[AMDDeviceContext] Created context for ROCm device " << device_ordinal
-                                                                           << " (" << device_name_ << ")");
+            LOG_DEBUG("[AMDDeviceContext] Created context for ROCm device " << device_ordinal
+                                                                            << " (" << device_name_ << ")");
         }
         catch (const std::exception &e)
         {
@@ -384,6 +399,11 @@ namespace llaminar2
 
     void *AMDDeviceContext::createStream()
     {
+        if (!setAMDDeviceForResource(device_ordinal_, "createStream"))
+        {
+            return nullptr;
+        }
+
         hipStream_t stream;
         // Use non-blocking stream for graph capture compatibility.
         // HIP graph replay requires non-blocking streams to avoid implicit
@@ -413,6 +433,11 @@ namespace llaminar2
             return;
         }
 
+        if (!setAMDDeviceForResource(device_ordinal_, "destroyStream"))
+        {
+            return;
+        }
+
         HIP_CHECK_VOID(hipStreamDestroy(hip_stream));
     }
 
@@ -422,6 +447,11 @@ namespace llaminar2
 
     void *AMDDeviceContext::createEvent()
     {
+        if (!setAMDDeviceForResource(device_ordinal_, "createEvent"))
+        {
+            return nullptr;
+        }
+
         hipEvent_t event;
         hipError_t err = hipEventCreate(&event);
         if (err != hipSuccess)
@@ -440,6 +470,10 @@ namespace llaminar2
         }
 
         hipEvent_t hip_event = static_cast<hipEvent_t>(event);
+        if (!setAMDDeviceForResource(device_ordinal_, "destroyEvent"))
+        {
+            return;
+        }
         HIP_CHECK_VOID(hipEventDestroy(hip_event));
     }
 
@@ -573,10 +607,15 @@ namespace llaminar2
 
     void AMDDeviceContext::synchronizeStream(void *stream)
     {
+        (void)synchronizeStreamChecked(stream);
+    }
+
+    bool AMDDeviceContext::synchronizeStreamChecked(void *stream)
+    {
         // During graph capture, stream sync is illegal on the capture stream.
         if (capture_active_.load(std::memory_order_acquire))
         {
-            return;
+            return true;
         }
 
         hipStream_t hip_stream = stream ? static_cast<hipStream_t>(stream) : hipStream_t(0);
@@ -590,11 +629,13 @@ namespace llaminar2
                 LOG_DEBUG("[AMDDeviceContext] Skipping hipStreamSynchronize during "
                           "concurrent graph capture (ordinal="
                           << device_ordinal_ << ")");
-                return;
+                return true;
             }
             LOG_ERROR("[AMDDeviceContext] hipStreamSynchronize failed: "
                       << hipGetErrorString(err));
+            return false;
         }
+        return true;
     }
 
     void AMDDeviceContext::insertStreamDependency(void *dependent_stream, void *dependency_stream)

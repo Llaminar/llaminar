@@ -28,8 +28,12 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 
+#include <cstdint>
+#include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace llaminar2
@@ -49,9 +53,14 @@ namespace llaminar2
      *
      * Delegates to ITensorGatedDeltaNet* kernel for the core recurrence math.
      */
-    class GDNRecurrenceStage : public IComputeStage
+    class GDNRecurrenceStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
+        static constexpr const char *WS_DEINTERLEAVE_SCRATCH = "gdn_deinterleave_scratch";
+        static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_effective_seq_len_scalar";
+        static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_speculative_state_slots";
+        static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_speculative_state_work";
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -75,6 +84,8 @@ namespace llaminar2
             float *recurrence_state = nullptr;
 
             int seq_len = 0;
+            int request_count = 1;   ///< Number of independent requests in the flattened verifier tensor.
+            int request_seq_len = 0; ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
             int n_heads = 0;     ///< Value head count (recurrence operates with this)
             int n_k_heads = 0;   ///< Key head count (for QKV split; 0 = same as n_heads)
             int d_k = 0;         ///< Key head dimension
@@ -84,28 +95,38 @@ namespace llaminar2
             bool use_qk_l2norm = true; ///< Apply L2 normalization to Q and K
 
             /// Global V-head offset for TP-aware Q/K selection.
-            /// Under tensor parallelism with GDN modular repeat (repeat_type=1),
-            /// Q/K are replicated across ranks while V is sharded. Each local
-            /// v_head j maps to k_head (j + global_v_head_offset) % n_k_heads.
-            /// Set to rank * n_v_heads_local by the graph builder. Default 0
-            /// (single-device or TP=1).
+            /// Global V-head offset for TP-aware Q/K selection. Qwen GDN uses
+            /// modular Q/K tiling: local V-head j maps to
+            /// (j + global_v_head_offset) % n_k_heads.
             int global_v_head_offset = 0;
 
             int layer_idx = -1; ///< Layer index for logging
+            /**
+             * @brief Stable graph/workspace namespace for capture-sensitive buffers.
+             *
+             * Main verifier graphs and MTP sidecar graphs can both contain a GDN
+             * recurrence stage for the same logical layer.  Their verifier-row
+             * snapshot slots must not alias, so graph builders pass a role prefix
+             * such as `layer12` or `MTP0` here.
+             */
+            std::string workspace_namespace;
+            int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
+            int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 
             /// Kernel implementation (set during graph construction)
             ITensorGatedDeltaNet *kernel = nullptr;
 
             // Optional BufferIds for contract-based coherence
-            std::optional<BufferId> qkv_buffer_id;    ///< Arena: merged QKV tensor
-            std::optional<BufferId> alpha_buffer_id;  ///< Arena: alpha projection
-            std::optional<BufferId> beta_buffer_id;   ///< Arena: beta projection
+            std::optional<BufferId> qkv_buffer_id;   ///< Arena: merged QKV tensor
+            std::optional<BufferId> alpha_buffer_id; ///< Arena: alpha projection
+            std::optional<BufferId> beta_buffer_id;  ///< Arena: beta projection
             std::optional<BufferId> output_buffer_id;
         };
 
         static_assert(StageParamsRequired<Params>);
 
         explicit GDNRecurrenceStage(Params params);
+        ~GDNRecurrenceStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::GDN_RECURRENCE; }
@@ -116,25 +137,137 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             (void)pos_offset; // GDN layers don't use position offsets
             params_.seq_len = seq_len;
         }
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+            {
+                params_.kernel->setGPUStream(nullptr);
+                clearKernelVerifierStateWorkspace();
+            }
+        }
 
-        // GDN recurrence operates fully on-device when GPU is active — graph-capturable
-        bool isGraphCapturable() const override { return true; }
+        /**
+         * @brief Reset request-local GDN metadata while preserving capture slots.
+         *
+         * Prefill graphs capture recurrent-state snapshot buffers and the
+         * effective-length scalar by address. The replay prelude refreshes the
+         * scalar before launch, and onGraphReplayed() rebinds the kernel for
+         * publication. Do not clear the verifier workspace binding while a
+         * Ready prefill executable is being preserved.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+                params_.kernel->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed GDN workspaces for a fresh capture attempt.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
+        bool hasPrefillReplayParams() const override { return true; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
+        bool supportsPaddedPrefillRealLengthContract() const override;
+        bool hasVerifierStateCapture() const override;
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return verifierStateCaptureWorkspaceRequired();
+        }
+        bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream) override;
+        /**
+         * @brief Restore one captured recurrent state row per request.
+         *
+         * This is the request-batched companion to the scalar device-indexed
+         * restore path.  It deliberately delegates to the backend tensor-kernel
+         * contract rather than looping scalar restores, because GDN recurrence
+         * state must be request-owned before batched publication is correct.
+         */
+        bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream) override;
+        void onGraphReplayed() override;
+        bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
+        /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
+        bool supportsPaddedPrefillGraphCapturePreflight() const override;
+
+        bool isGraphCapturable() const override;
 
         const Params &getParams() const { return params_; }
 
     private:
+        struct GpuEffectiveSeqLenState;
+
         Params params_;
+        int prefill_effective_seq_len_ = 0;
+        int prefill_bucket_seq_len_ = 0;
+        bool prefill_replay_params_set_ = false;
+        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        uint32_t workspace_slice_id_ = 0;
+        bool verifier_capture_workspace_bound_ = false;
+        bool speculative_state_work_bound_ = false;
+        int verifier_capture_rows_bound_ = 0;
+        int verifier_capture_state_size_bound_ = 0;
+        std::unique_ptr<float[]> host_verifier_state_slots_;
+        size_t host_verifier_state_slot_capacity_ = 0;
 
         // Reusable scratch for QKV deinterleaving (grow-only)
         mutable std::vector<float> q_deinterleave_;
         mutable std::vector<float> k_deinterleave_;
         mutable std::vector<float> v_deinterleave_;
+
+        int effectivePrefillSeqLen() const;
+        bool shouldUseRealLengthContract() const;
+        std::string workspaceStableId() const;
+        std::string effectiveSeqLenScalarBufferName() const;
+        std::string speculativeStateSlotsBufferName() const;
+        std::string speculativeStateWorkBufferName() const;
+        int requestedSpeculativeStateSlotRows() const;
+        bool verifierStateCaptureWorkspaceRequired() const;
+        bool ensureVerifierStateCaptureWorkspaceBound() const;
+        bool ensureGpuEffectiveSeqLenStateInitialized();
+        bool uploadGpuEffectiveSeqLen();
+        void refreshPinnedEffectiveSeqLen();
+        void releaseGpuEffectiveSeqLenState();
+        void bindKernelWorkspace();
+        void clearKernelVerifierStateWorkspace();
+        const float *cpuVerifierStateCaptureSource() const;
+        bool restoreCPUVerifierStateCaptureRowDirect(int row);
+        size_t deinterleaveScratchFloats(int seq_len) const;
+        bool ensureGpuDeinterleaveWorkspaceBound(int seq_len) const;
     };
 
 } // namespace llaminar2

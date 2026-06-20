@@ -21,15 +21,35 @@ namespace llaminar2
 
     /**
      * @brief Represents a single message in a chat conversation
+     *
+     * Supports standard roles (system, user, assistant) and tool-calling
+     * roles (tool) per the OpenAI chat completions API.
      */
     struct ChatMessage
     {
-        std::string role;    ///< Role: "system", "user", "assistant"
-        std::string content; ///< Message content
+        std::string role;    ///< Role: "system", "user", "assistant", "tool"
+        std::string content; ///< Message content (may be empty for tool-call assistant messages)
+
+        /// Tool calls emitted by the assistant (role="assistant" only).
+        /// Each entry is a serialized JSON string of an OpenAI-format tool_call object:
+        ///   {"id": "call_xxx", "type": "function", "function": {"name": "...", "arguments": "..."}}
+        std::vector<std::string> tool_calls;
+
+        /// Tool call ID this message is responding to (role="tool" only).
+        std::string tool_call_id;
+
+        /// Function name for tool result messages (role="tool" only, optional).
+        std::string name;
 
         ChatMessage() = default;
         ChatMessage(const std::string &r, const std::string &c)
             : role(r), content(c) {}
+
+        /// Check if this message has tool calls
+        bool hasToolCalls() const { return !tool_calls.empty(); }
+
+        /// Check if this is a tool result message
+        bool isToolResult() const { return role == "tool" && !tool_call_id.empty(); }
     };
 
     /**
@@ -123,11 +143,13 @@ namespace llaminar2
          * @param add_generation_prompt If true, adds the assistant prompt prefix
          *                              for the model to complete
          * @param enable_thinking If true, enable thinking mode for thinking models
+         * @param tools Optional JSON string of tool definitions array (OpenAI format)
          * @return Formatted prompt string ready for tokenization
          */
         std::string apply(const std::vector<ChatMessage> &messages,
                           bool add_generation_prompt = true,
-                          bool enable_thinking = true) const;
+                          bool enable_thinking = true,
+                          const std::string &tools_json = "") const;
 
         /**
          * @brief Get the detected template type
@@ -190,7 +212,8 @@ namespace llaminar2
          */
         std::string renderJinja(const std::vector<ChatMessage> &messages,
                                 bool add_generation_prompt,
-                                bool enable_thinking) const;
+                                bool enable_thinking,
+                                const std::string &tools_json = "") const;
 
         /**
          * @brief Render without the enable_thinking variable in context

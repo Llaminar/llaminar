@@ -9,14 +9,19 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
 {
 
-    // Forward declaration
+    // Forward declarations
     class ITensorGemm;
+    class FP32Tensor;
+    class PreparedWeightStore;
+    class TensorBase;
 
     /**
      * @brief Language model head projection stage
@@ -48,6 +53,19 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             int vocab_size = 0;
+            int effective_last_row_idx = -1;           ///< Dynamic last real token row for padded prefill replay.
+            bool use_prefill_replay_row_offset = true; ///< False when input is already a one-row scratch.
+            bool compute_all_positions = false;        ///< Compute logits for every input row instead of only the selected row.
+            /**
+             * @brief Execute tiny all-position verifier rows through grouped LM-head GEMVs.
+             *
+             * Logit equivalence tests compare grouped verifier rows against
+             * serial decode. When enabled, compact all-position rows are still
+             * materialized in the same output tensor, but the backend must use a
+             * graph-capturable grouped M=2..4 implementation with strict
+             * distribution-level equivalence proof.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // Optional bias tensor [vocab_size] - passed to GEMM for fused addition
             const TensorBase *bias_tensor = nullptr;
@@ -55,11 +73,18 @@ namespace llaminar2
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit LMHeadStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::LM_HEAD; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -67,6 +92,23 @@ namespace llaminar2
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+
+        bool hasPrefillReplayParams() const override { return params_.use_prefill_replay_row_offset; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override
+        {
+            if (!params_.use_prefill_replay_row_offset)
+                return;
+            // Padded bucket replay executes a fixed bucket shape, but sampling
+            // must read logits for the final real token, not the bucket tail.
+            const bool padded = replay.real_seq_len > 0 &&
+                                replay.bucket_seq_len > 0 &&
+                                replay.real_seq_len < replay.bucket_seq_len;
+            params_.effective_last_row_idx = padded ? replay.real_seq_len - 1 : -1;
+        }
+
+        /// @brief Returns the hidden-state row offset used for the one-row LM-head GEMM.
+        int activationRowOffsetForLogits() const;
 
         /**
          * @brief Return FULL policy - cohere inputs AND allocate output GPU buffers
@@ -88,7 +130,7 @@ namespace llaminar2
         /**
          * @brief Get the GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Fetches the kernel from KernelFactory (which caches by tensor+device).
+         * Fetches the prepared kernel from PreparedWeightStore.
          * The same kernel is returned on every call for this stage.
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
@@ -97,6 +139,16 @@ namespace llaminar2
 
     private:
         Params params_;
+        ITensorGemm *cached_gemm_ = nullptr;
+        std::shared_ptr<FP32Tensor> verifier_hidden_row_;
+        std::shared_ptr<FP32Tensor> verifier_logits_row_;
+
+        ITensorGemm *resolvePreparedKernel(const char *caller);
+        bool executeDecodeEquivalentVerifierPrefill(
+            const TensorBase *hidden_states,
+            TensorBase *logits,
+            ITensorGemm *lm_gemm,
+            int lm_m);
     };
 
 } // namespace llaminar2

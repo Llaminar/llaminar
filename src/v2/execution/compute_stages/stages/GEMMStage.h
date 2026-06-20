@@ -10,14 +10,18 @@
 #include "../StageParamsBase.h"
 #include "../../../utils/GemmContext.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
 {
 
-    // Forward declaration
+    // Forward declarations
     class ITensorGemm;
+    class FP32Tensor;
+    class PreparedWeightStore;
 
     /**
      * @brief GEMM stage: C = alpha * A * B + beta * C
@@ -28,7 +32,7 @@ namespace llaminar2
      *
      * **Tensor Parallelism Support (Phase 2)**:
      * When `output_range` is set, executes a row-sliced GEMM for tensor parallelism:
-     * - Uses `KernelFactory::getOrCreateGemmSliced()` to create sliced kernel
+      * - Uses `PreparedWeightStore::slicedGemmKernel()` to resolve a prepared slice
      * - Only computes output rows in [output_range.start, output_range.end)
      * - Caller is responsible for MPI AllReduce after execution if needed
      *
@@ -113,12 +117,43 @@ namespace llaminar2
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> a_buffer_id;
+            std::optional<BufferId> gate_buffer_id;
             std::optional<BufferId> c_buffer_id;
+
+            /**
+             * @brief Execute tiny verifier batches with decode-equivalent grouped GEMV.
+             *
+             * MTP all-position publication restores state from individual verifier
+             * rows. Quantized kernels may choose different M=2..4 dispatches than
+             * serial decode's M=1 route, and even tiny output-projection drift can
+             * flip later MoE routes. When enabled, this stage preserves the same
+             * graph-level output tensor but requires the kernel layer to prove and
+             * use a grouped M=2..4 path with the serial-decode numerical contract.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+
+            /**
+             * @brief Prepared weight reference for this GEMM's weight tensor.
+             * When set (together with prepared_store), the stage resolves its
+             * kernel via PreparedWeightStore::gemmKernel() or slicedGemmKernel().
+             */
+            std::optional<PreparedWeightRef> prepared_ref;
+
+            /**
+             * @brief PreparedWeightStore for resolving prepared_ref.
+             * Lifetime managed by DeviceGraphOrchestrator.
+             */
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit GEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -139,8 +174,8 @@ namespace llaminar2
         /**
          * @brief Get the GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Fetches the kernel from KernelFactory (which caches by tensor+device).
-         * The same kernel is returned on every call for this stage.
+         * Fetches the prepared kernel from PreparedWeightStore. The same kernel
+         * is returned on every call for this stage.
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
          */
@@ -154,8 +189,19 @@ namespace llaminar2
         // The KernelFactory owns the lifetime of these objects (they're in
         // registry maps), so raw pointers are safe here.
         ITensorGemm *cached_gemm_ = nullptr;
-        const void *cached_prepared_ = nullptr; // PreparedGemmHandle*
         bool cache_resolved_ = false;
+
+        bool executeDecodeEquivalentVerifierPrefill(
+            const TensorBase *A_base,
+            TensorBase *C_base,
+            ITensorGemm *gemm,
+            int effective_n);
+
+        // Reused one-row verifier scratch. Keeping this state on the stage avoids
+        // allocating transient tensors while the hot verifier path is iterating rows.
+        std::shared_ptr<FP32Tensor> verifier_gate_row_;
+        std::shared_ptr<FP32Tensor> verifier_input_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_row_;
     };
 
 } // namespace llaminar2

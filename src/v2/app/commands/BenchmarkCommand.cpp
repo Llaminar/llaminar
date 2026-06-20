@@ -8,6 +8,7 @@
 
 #include "app/commands/BenchmarkCommand.h"
 #include "app/AppContext.h"
+#include "app/commands/CommandValidation.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/Splash.h"
@@ -47,6 +48,17 @@ namespace llaminar2
         // Force benchmark mode — this is the whole point of this subcommand
         config.benchmark_mode = true;
 
+        if (!command_validation::printConfigErrors(config))
+        {
+            return 1;
+        }
+
+        if (config.validate_only)
+        {
+            command_validation::printValidateOnlySuccess(config);
+            return 0;
+        }
+
         if (config.model_path.empty())
         {
             std::cerr << "Error: Model path required (-m)\n\n"
@@ -75,8 +87,13 @@ namespace llaminar2
         RuntimeInitPhase init;
         auto ctx_opt = init.execute(config, argc, argv);
         if (!ctx_opt)
-            return 1;
+            return config.dry_run ? 0 : 1;
         auto ctx = std::move(*ctx_opt);
+        // RuntimeInitPhase reparses argv after MPI_Init. The benchmark
+        // subcommand is represented by command dispatch rather than a required
+        // --benchmark flag, so re-apply the mode bit to the runtime config that
+        // benchmark summaries and JSON artifacts report.
+        ctx.config.benchmark_mode = true;
 
         // Run benchmark directly — no mode chain needed
         BenchmarkMode mode;

@@ -74,6 +74,11 @@ namespace llaminar2
             size_t estimatedFlops() const override { return estimated_flops_; }
             size_t estimatedMemoryBytes() const override { return estimated_memory_; }
             bool requiresAllreduce() const override { return requires_allreduce_; }
+            void resetSessionState() override
+            {
+                IComputeStage::resetSessionState();
+                reset_session_state_count_++;
+            }
 
             bool supportsBackend(ComputeBackendType backend) const override
             {
@@ -142,11 +147,15 @@ namespace llaminar2
             /// Last device context passed to execute()
             IDeviceContext *lastContext() const { return last_ctx_; }
 
+            /// Number of request-boundary stage resets observed.
+            int resetSessionStateCount() const { return reset_session_state_count_; }
+
             /// Reset execution tracking
             void reset()
             {
                 execution_count_ = 0;
                 last_ctx_ = nullptr;
+                reset_session_state_count_ = 0;
             }
 
         private:
@@ -164,6 +173,7 @@ namespace llaminar2
 
             // Execution tracking
             int execution_count_ = 0;
+            int reset_session_state_count_ = 0;
             IDeviceContext *last_ctx_ = nullptr;
             std::vector<std::string> *execution_log_ = nullptr;
             std::function<void(IDeviceContext *)> on_execute_;

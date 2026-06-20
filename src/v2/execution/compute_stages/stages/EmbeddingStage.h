@@ -10,11 +10,13 @@
 #include "../StageParamsBase.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
 #include <optional>
 
 namespace llaminar2
 {
+    class PreparedWeightStore;
 
     /**
      * @brief Embedding lookup stage
@@ -38,12 +40,15 @@ namespace llaminar2
             // Input/output tensors
             const ITensor *embed_table = nullptr;
             const int *token_ids = nullptr;
+            const void *token_ids_device = nullptr; ///< Optional GPU INT32 token IDs [num_tokens]
             ITensor *output = nullptr;
 
             // Dimensions
             int num_tokens = 0;
             int d_model = 0;
             int vocab_size = 0;
+            int vocab_offset = 0;
+            int local_vocab_size = 0;
 
             // Batched input (alternative to token_ids)
             const std::vector<std::vector<int>> *token_batches = nullptr;
@@ -51,6 +56,10 @@ namespace llaminar2
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> output_buffer_id;
+
+            // Phase 7/8: Prepared embedding data owned by PreparedWeightStore.
+            std::optional<PreparedWeightRef> prepared_ref;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit EmbeddingStage(Params params);
@@ -60,8 +69,13 @@ namespace llaminar2
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
+        bool validatePreparedWeights(std::string *error) const override;
         bool isGraphCapturable() const override { return true; }
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         /// In vocab-parallel TP, each device only embeds tokens in its shard;
         /// tokens outside the shard produce all-zero output (summed via AllReduce).
         /// This applies to both MPI-based TP (world_size > 1) and LOCAL TP
@@ -79,11 +93,78 @@ namespace llaminar2
         {
             (void)pos_offset;
             (void)seq_len;
-            if (cached_kernel_ && params_.token_ids && params_.num_tokens > 0)
+            if (cached_kernel_ && params_.num_tokens > 0)
             {
                 cached_kernel_->setGPUStream(gpuStream());
-                cached_kernel_->setDynamicTokenIds(params_.token_ids, params_.num_tokens);
+                if (params_.token_ids_device)
+                {
+                    cached_kernel_->setDynamicDeviceTokenIds(
+                        params_.token_ids_device,
+                        params_.num_tokens);
+                }
+                else if (params_.token_ids)
+                {
+                    cached_kernel_->setDynamicTokenIds(params_.token_ids, params_.num_tokens);
+                }
             }
+        }
+
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            if (cached_kernel_)
+            {
+                cached_kernel_->resetDynamicState();
+                cached_kernel_->setGPUStream(nullptr);
+            }
+        }
+
+        /**
+         * @brief Clear request stream ownership while preserving captured token buffers.
+         *
+         * Prefill graph replay captures the embedding kernel's dynamic token-id
+         * device slot by address. The forward engine refreshes that slot before
+         * every replay/capture, so request reset should drop only the stream
+         * binding here. Resetting kernel dynamic state would mark a preserved
+         * executable cold even though its backing workspace remains valid.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            if (cached_kernel_)
+                cached_kernel_->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed embedding resources across request reset.
+         *
+         * Initialized prefill buckets still need a strict capture preflight, but
+         * they should not lose the kernel/workspace objects that the warmup just
+         * prepared. Token contents are overwritten in the stable buffer before
+         * the next capture attempt.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
+        /// Check if this stage is ready for prefill graph capture.
+        /// Requires: GPU device, workspace bound, kernel created.
+        bool isPrefillGraphCaptureReady() const
+        {
+            if (!params_.device_id.is_gpu())
+                return false;
+            if (!cached_kernel_)
+                return false;
+            auto *ws = dynamic_cast<const IWorkspaceConsumer *>(cached_kernel_);
+            return ws && ws->hasWorkspace();
+        }
+
+        /// Update the token_ids pointer to point at stable graph cache storage.
+        /// Called when the graph cache takes ownership of the token buffer.
+        void setStableTokenPointer(const int *stable_token_ids)
+        {
+            params_.token_ids = stable_token_ids;
         }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;

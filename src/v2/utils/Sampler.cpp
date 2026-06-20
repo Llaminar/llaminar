@@ -6,6 +6,8 @@
  */
 
 #include "Sampler.h"
+#include "kernels/cpu/sampling/CPUSamplerPrimitives.h"
+#include "kernels/common/SamplingMath.h"
 #include <limits>
 #include <stdexcept>
 
@@ -49,42 +51,8 @@ namespace llaminar2
             return sample_greedy(logits, vocab_size);
         }
 
-        // Non-greedy paths (or greedy with penalties) need a mutable vector
-        std::vector<float> logits_vec(logits, logits + vocab_size);
-
-        // Apply presence/frequency penalties before temperature and filtering
-        if (params.has_penalties())
-        {
-            apply_penalties(logits_vec, params);
-        }
-
-        // Greedy with penalties: argmax on penalized logits
-        if (params.is_greedy())
-        {
-            return sample_greedy(logits_vec);
-        }
-
-        // Apply top-k if specified
-        if (params.top_k > 0 && params.top_k < static_cast<int>(vocab_size))
-        {
-            return sample_top_k(logits_vec, params.top_k, params.temperature);
-        }
-
-        // Apply top-p if specified
-        if (params.top_p < 1.0f)
-        {
-            return sample_top_p(logits_vec, params.top_p, params.temperature);
-        }
-
-        // Temperature sampling only
-        if (params.temperature != 1.0f)
-        {
-            return sample_temperature(logits_vec, params.temperature);
-        }
-
-        // Standard sampling (temperature = 1.0, no filtering)
-        auto probs = softmax(logits_vec);
-        return sample_from_probs(probs);
+        auto distribution = compute_distribution(logits, vocab_size, params);
+        return sample_from_distribution(distribution);
     }
 
     int Sampler::sample_greedy(const std::vector<float> &logits)
@@ -241,6 +209,280 @@ namespace llaminar2
         return indices[sampled_idx];
     }
 
+    std::vector<SamplingDistributionEntry> Sampler::compute_distribution(
+        const float *logits,
+        size_t vocab_size,
+        const SamplingParams &params)
+    {
+        if (!logits || vocab_size == 0)
+        {
+            throw std::invalid_argument("Cannot build distribution from empty logits");
+        }
+
+        const float *effective_logits = logits;
+        std::vector<float> logits_vec;
+        if (params.has_penalties())
+        {
+            logits_vec.assign(logits, logits + vocab_size);
+            apply_penalties(logits_vec, params);
+            effective_logits = logits_vec.data();
+        }
+
+        if (params.is_greedy())
+        {
+            return {{sample_greedy(effective_logits, vocab_size), 1.0f}};
+        }
+
+        float temperature = params.temperature;
+        if (temperature <= 0.0f)
+        {
+            temperature = 1.0f;
+        }
+
+        if (params.top_k > 0 &&
+            params.top_k <= sampling_math::kMaxTopK &&
+            params.top_k <= static_cast<int>(vocab_size))
+        {
+            const int k = params.top_k;
+            std::vector<float> sorted_logits(static_cast<size_t>(k));
+            std::vector<int> sorted_ids(static_cast<size_t>(k));
+            const int selected = cpu_sampling::select_topk(
+                effective_logits,
+                static_cast<int>(vocab_size),
+                k,
+                sorted_logits.data(),
+                sorted_ids.data());
+            if (selected <= 0)
+            {
+                return {{sample_greedy(effective_logits, vocab_size), 1.0f}};
+            }
+
+            std::vector<float> scratch(static_cast<size_t>(selected), 0.0f);
+            std::vector<int> out_ids(static_cast<size_t>(selected), -1);
+            std::vector<float> out_probs(static_cast<size_t>(selected), 0.0f);
+            sampling_math::build_topk_topp_distribution_from_sorted(
+                sorted_logits.data(),
+                sorted_ids.data(),
+                selected,
+                params.top_p,
+                temperature,
+                out_ids.data(),
+                out_probs.data(),
+                scratch.data());
+
+            std::vector<SamplingDistributionEntry> distribution;
+            distribution.reserve(static_cast<size_t>(selected));
+            for (int i = 0; i < selected; ++i)
+            {
+                if (out_ids[static_cast<size_t>(i)] >= 0 &&
+                    out_probs[static_cast<size_t>(i)] > 0.0f)
+                {
+                    distribution.push_back({
+                        out_ids[static_cast<size_t>(i)],
+                        out_probs[static_cast<size_t>(i)]});
+                }
+            }
+            if (!distribution.empty())
+            {
+                return distribution;
+            }
+            return {{sorted_ids.front(), 1.0f}};
+        }
+
+        std::vector<std::pair<int, float>> candidates;
+        candidates.reserve(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i)
+        {
+            candidates.emplace_back(static_cast<int>(i), effective_logits[i] / temperature);
+        }
+
+        int candidate_count = static_cast<int>(candidates.size());
+        if (params.top_k > 0 && params.top_k < candidate_count)
+        {
+            candidate_count = params.top_k;
+            std::partial_sort(
+                candidates.begin(),
+                candidates.begin() + candidate_count,
+                candidates.end(),
+                [](const auto &a, const auto &b)
+                {
+                    return a.second > b.second;
+                });
+            candidates.resize(static_cast<size_t>(candidate_count));
+        }
+        else
+        {
+            std::sort(
+                candidates.begin(),
+                candidates.end(),
+                [](const auto &a, const auto &b)
+                {
+                    return a.second > b.second;
+                });
+        }
+
+        const float max_logit = candidates.front().second;
+        std::vector<float> exp_vals(candidates.size(), 0.0f);
+        float total_exp = 0.0f;
+        for (size_t i = 0; i < candidates.size(); ++i)
+        {
+            exp_vals[i] = std::exp(candidates[i].second - max_logit);
+            total_exp += exp_vals[i];
+        }
+        if (!(total_exp > 0.0f))
+        {
+            return {{candidates.front().first, 1.0f}};
+        }
+
+        size_t nucleus_count = candidates.size();
+        if (params.top_p > 0.0f && params.top_p < 1.0f)
+        {
+            float cumulative = 0.0f;
+            for (size_t i = 0; i < candidates.size(); ++i)
+            {
+                cumulative += exp_vals[i] / total_exp;
+                if (cumulative >= params.top_p)
+                {
+                    nucleus_count = i + 1;
+                    break;
+                }
+            }
+        }
+
+        float nucleus_exp = 0.0f;
+        for (size_t i = 0; i < nucleus_count; ++i)
+        {
+            nucleus_exp += exp_vals[i];
+        }
+        if (!(nucleus_exp > 0.0f))
+        {
+            return {{candidates.front().first, 1.0f}};
+        }
+
+        std::vector<SamplingDistributionEntry> distribution;
+        distribution.reserve(nucleus_count);
+        for (size_t i = 0; i < nucleus_count; ++i)
+        {
+            distribution.push_back({candidates[i].first, exp_vals[i] / nucleus_exp});
+        }
+        return distribution;
+    }
+
+    int Sampler::sample_from_distribution(
+        const std::vector<SamplingDistributionEntry> &distribution)
+    {
+        if (distribution.empty())
+        {
+            throw std::invalid_argument("Cannot sample from empty distribution");
+        }
+
+        const float r = random_uniform_01();
+        std::vector<int> token_ids(distribution.size(), -1);
+        std::vector<float> probs(distribution.size(), 0.0f);
+        for (size_t i = 0; i < distribution.size(); ++i)
+        {
+            token_ids[i] = distribution[i].token_id;
+            probs[i] = distribution[i].probability;
+        }
+
+        const int sampled = sampling_math::sample_distribution_with_threshold(
+            token_ids.data(),
+            probs.data(),
+            static_cast<int>(distribution.size()),
+            r);
+        return sampled >= 0 ? sampled : distribution.back().token_id;
+    }
+
+    int Sampler::sample_from_residual_distribution(
+        const std::vector<SamplingDistributionEntry> &target,
+        const std::vector<SamplingDistributionEntry> &draft)
+    {
+        if (target.empty())
+        {
+            throw std::invalid_argument("Cannot sample residual from empty target distribution");
+        }
+
+        auto residual = residual_distribution(target, draft);
+        if (residual.empty())
+        {
+            return sample_from_distribution(target);
+        }
+        return sample_from_distribution(residual);
+    }
+
+    std::vector<SamplingDistributionEntry> Sampler::residual_distribution(
+        const std::vector<SamplingDistributionEntry> &target,
+        const std::vector<SamplingDistributionEntry> &draft)
+    {
+        if (target.empty())
+        {
+            throw std::invalid_argument("Cannot compute residual from empty target distribution");
+        }
+
+        std::unordered_map<int, float> draft_probs;
+        draft_probs.reserve(draft.size());
+        for (const auto &entry : draft)
+        {
+            draft_probs[entry.token_id] = entry.probability;
+        }
+
+        std::vector<SamplingDistributionEntry> residual;
+        residual.reserve(target.size());
+        float total = 0.0f;
+        for (const auto &entry : target)
+        {
+            const auto it = draft_probs.find(entry.token_id);
+            const float q = it == draft_probs.end() ? 0.0f : it->second;
+            const float p = std::max(0.0f, entry.probability - q);
+            if (p > 0.0f)
+            {
+                residual.push_back({entry.token_id, p});
+                total += p;
+            }
+        }
+
+        if (!(total > 0.0f))
+        {
+            return {};
+        }
+        for (auto &entry : residual)
+        {
+            entry.probability /= total;
+        }
+        return residual;
+    }
+
+    float Sampler::speculative_accept_probability(
+        float target_probability,
+        float draft_probability)
+    {
+        return draft_probability > 0.0f
+                   ? sampling_math::speculative_accept_probability(
+                         target_probability,
+                         draft_probability)
+                   : 0.0f;
+    }
+
+    float Sampler::probability_of_token(
+        const std::vector<SamplingDistributionEntry> &distribution,
+        int token_id)
+    {
+        for (const auto &entry : distribution)
+        {
+            if (entry.token_id == token_id)
+            {
+                return entry.probability;
+            }
+        }
+        return 0.0f;
+    }
+
+    float Sampler::random_uniform_01()
+    {
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        return dist(rng_);
+    }
+
     std::vector<float> Sampler::apply_temperature(const std::vector<float> &logits, float temperature)
     {
         if (temperature == 1.0f)
@@ -293,8 +535,7 @@ namespace llaminar2
         }
 
         // Generate random value in [0, 1)
-        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
-        float r = dist(rng_);
+        float r = random_uniform_01();
 
         // Cumulative sampling
         float cumsum = 0.0f;
@@ -314,36 +555,217 @@ namespace llaminar2
     void Sampler::record_token(int token_id)
     {
         token_counts_[token_id]++;
+        dry_token_history_.push_back(token_id);
     }
 
     void Sampler::reset_history()
     {
         token_counts_.clear();
+        dry_token_history_.clear();
+    }
+
+    void Sampler::initDryBreakers(const std::vector<std::string> &breaker_strings,
+                                   const TokenizeFunc &tokenize)
+    {
+        dry_breakers_.clear();
+        for (const auto &s : breaker_strings)
+        {
+            auto tokens = tokenize(s);
+            if (tokens.empty())
+                continue;
+            int head = tokens.back(); // Match from end of history
+            std::vector<int> tail(tokens.begin(), tokens.end() - 1);
+            dry_breakers_.emplace(head, std::move(tail));
+        }
+        dry_breakers_initialized_ = true;
+    }
+
+    void Sampler::compute_dry_penalties(std::unordered_map<int, float> &penalty_map,
+                                         const SamplingParams &params, int vocab_size)
+    {
+        if (params.dry_multiplier == 0.0f || params.dry_base < 1.0f || params.dry_penalty_last_n == 0)
+            return;
+
+        const auto &history = dry_token_history_;
+        if (history.empty())
+            return;
+
+        int history_size = static_cast<int>(history.size());
+
+        // Window: how far back to look
+        int window = params.dry_penalty_last_n;
+        if (window < 0 || window > history_size)
+            window = history_size;
+
+        // We need at least 1 token of history to detect repeats
+        if (window < 1)
+            return;
+
+        // Build reversed view of the history window for Z-algorithm
+        std::vector<int> reversed(window);
+        for (int i = 0; i < window; ++i)
+            reversed[i] = history[history_size - 1 - i];
+
+        // Step 1: Scan for sequence breakers to compute rep_limit
+        // (Aligned with llama.cpp's breaker scan approach)
+        int rep_limit = window;
+        if (dry_breakers_initialized_)
+        {
+            for (int i = 0; i < window; ++i)
+            {
+                int token = reversed[i]; // = history[history_size - 1 - i]
+                auto its = dry_breakers_.equal_range(token);
+                if (its.first == dry_breakers_.end())
+                    continue;
+                int longest_match = -1;
+                for (auto it = its.first; it != its.second; ++it)
+                {
+                    int seq_len = static_cast<int>(it->second.size());
+                    if (seq_len > longest_match && seq_len <= i)
+                    {
+                        bool match = true;
+                        for (int offset = 0; offset < seq_len; ++offset)
+                        {
+                            // reversed[i - offset - 1] = history token preceding the head
+                            if (it->second[offset] != reversed[i - offset - 1])
+                            {
+                                match = false;
+                                break;
+                            }
+                        }
+                        if (match)
+                            longest_match = seq_len;
+                    }
+                }
+                if (longest_match >= 0)
+                {
+                    rep_limit = i - longest_match;
+                    break;
+                }
+            }
+        }
+        if (rep_limit < params.dry_allowed_length)
+            return;
+
+        // Step 2: Z-algorithm on reversed history
+        int n = static_cast<int>(reversed.size());
+        std::vector<int> z(n, 0);
+        int l = 0, r = 0;
+        for (int i = 1; i < n; ++i)
+        {
+            if (i < r)
+                z[i] = std::min(r - i, z[i - l]);
+            while (i + z[i] < n && reversed[z[i]] == reversed[i + z[i]])
+                z[i]++;
+            if (i + z[i] > r)
+            {
+                l = i;
+                r = i + z[i];
+            }
+        }
+
+        // Step 3: Collect max repeat length per token that would extend a repeat
+        std::unordered_map<int, int> dry_max_token_repeat;
+        for (int i = 1; i < n; ++i)
+        {
+            int repeat_len = std::min(z[i], rep_limit);
+            if (repeat_len < params.dry_allowed_length)
+                continue;
+
+            // The token that would extend the repeat = reversed[i-1] = history[n-i]
+            int penalty_token = reversed[i - 1];
+
+            if (penalty_token < 0 || penalty_token >= vocab_size)
+                continue;
+
+            auto it = dry_max_token_repeat.find(penalty_token);
+            if (it == dry_max_token_repeat.end() || it->second < repeat_len)
+                dry_max_token_repeat[penalty_token] = repeat_len;
+        }
+
+        // Step 4: Apply penalties, with overflow protection and breaker exemption
+        // Prevent pow() overflow by clamping exponent
+        static const float FLOAT_MAX_LOG = 88.7228391f;
+        int max_exponent = 0;
+        if (params.dry_base > 1.000001f)
+            max_exponent = static_cast<int>(FLOAT_MAX_LOG / std::log(params.dry_base));
+
+        for (const auto &[token, repeat_len] : dry_max_token_repeat)
+        {
+            // Exempt single-token sequence breakers from penalty (aligned with llama.cpp)
+            if (dry_breakers_initialized_)
+            {
+                auto range = dry_breakers_.equal_range(token);
+                bool is_single_token_breaker = false;
+                for (auto it = range.first; it != range.second; ++it)
+                {
+                    if (it->second.empty())
+                    {
+                        is_single_token_breaker = true;
+                        break;
+                    }
+                }
+                if (is_single_token_breaker)
+                    continue;
+            }
+
+            int repeat_exp = repeat_len - params.dry_allowed_length;
+            if (max_exponent > 0 && repeat_exp > max_exponent)
+                repeat_exp = max_exponent;
+
+            float penalty = params.dry_multiplier *
+                            std::pow(params.dry_base, static_cast<float>(repeat_exp));
+
+            // Add DRY penalty on top of any existing presence/frequency penalty
+            auto it = penalty_map.find(token);
+            if (it == penalty_map.end())
+                penalty_map[token] = penalty;
+            else
+                it->second += penalty;
+        }
+    }
+
+    std::vector<LogitPenalty> Sampler::compute_penalty_map(const SamplingParams &params, int vocab_size)
+    {
+        std::unordered_map<int, float> penalty_map;
+
+        // Presence + frequency penalties
+        if (params.presence_penalty != 0.0f || params.frequency_penalty != 0.0f)
+        {
+            for (const auto &[token_id, count] : token_counts_)
+            {
+                if (token_id < 0 || token_id >= vocab_size)
+                    continue;
+                float p = 0.0f;
+                if (params.presence_penalty != 0.0f)
+                    p += params.presence_penalty;
+                if (params.frequency_penalty != 0.0f)
+                    p += params.frequency_penalty * static_cast<float>(count);
+                if (p != 0.0f)
+                    penalty_map[token_id] = p;
+            }
+        }
+
+        // DRY penalty
+        compute_dry_penalties(penalty_map, params, vocab_size);
+
+        // Convert to sparse vector
+        std::vector<LogitPenalty> result;
+        result.reserve(penalty_map.size());
+        for (const auto &[token_id, penalty] : penalty_map)
+        {
+            result.push_back({token_id, penalty});
+        }
+        return result;
     }
 
     void Sampler::apply_penalties(std::vector<float> &logits, const SamplingParams &params)
     {
-        if (token_counts_.empty())
+        // Compute the full penalty map and apply it
+        auto penalties = compute_penalty_map(params, static_cast<int>(logits.size()));
+        for (const auto &entry : penalties)
         {
-            return; // No history, nothing to penalize
-        }
-
-        // OpenAI-style penalties (applied additively to logits):
-        //   logit[t] -= presence_penalty * (1 if t in history else 0)
-        //   logit[t] -= frequency_penalty * count(t)
-        for (const auto &[token_id, count] : token_counts_)
-        {
-            if (token_id >= 0 && token_id < static_cast<int>(logits.size()))
-            {
-                if (params.presence_penalty != 0.0f)
-                {
-                    logits[token_id] -= params.presence_penalty;
-                }
-                if (params.frequency_penalty != 0.0f)
-                {
-                    logits[token_id] -= params.frequency_penalty * static_cast<float>(count);
-                }
-            }
+            logits[entry.token_id] -= entry.penalty;
         }
     }
 

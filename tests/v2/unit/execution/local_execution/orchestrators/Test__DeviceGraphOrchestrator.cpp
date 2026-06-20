@@ -10,21 +10,31 @@
 
 #include <gtest/gtest.h>
 #include "backends/DeviceId.h"
+#include "config/TensorParallelConfig.h"
 #include "execution/local_execution/collective/CollectiveContext.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/config/RuntimeConfig.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
-#include "models/qwen/Qwen2Graph.h"
+#include "models/qwen/QwenStandardGraph.h"
+#include "models/qwen35moe/Qwen35MoEGraph.h"
+#include "loaders/WeightPlan.h"
+#include "loaders/PreparedWeightStore.h"
 #include "backends/ComputeBackend.h"
 #include "utils/Logger.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
 #include "kernels/cpu/CPURingKVCache.h"
+#include <cstdlib>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -52,12 +62,256 @@ protected:
         config_.default_device = DeviceId::cpu();
 
         // Create graph builder
-        graph_builder_ = std::make_shared<Qwen2Graph>(config_, nullptr);
+        graph_builder_ = std::make_shared<QwenStandardGraph>(config_, nullptr);
     }
 
     GraphConfig config_;
-    std::shared_ptr<Qwen2Graph> graph_builder_;
+    std::shared_ptr<QwenStandardGraph> graph_builder_;
 };
+
+class CapturingQwenStandardGraph : public QwenStandardGraph
+{
+public:
+    CapturingQwenStandardGraph(const GraphConfig &config, std::shared_ptr<IMPIContext> mpi_ctx)
+        : QwenStandardGraph(config, std::move(mpi_ctx)) {}
+
+    void setWeights(const ModelWeights &weights) override
+    {
+        captured_weights = weights;
+        QwenStandardGraph::setWeights(weights);
+    }
+
+    void setWeightBindings(const ModelWeightBindings &bindings) override
+    {
+        ++binding_set_count;
+        captured_bindings = bindings;
+        QwenStandardGraph::setWeightBindings(bindings);
+    }
+
+    TensorContext exposeTensorContext() const { return buildTensorContext(); }
+    LayerWeights exposeLayerWeightsForGraph(int layer_idx) const { return layerWeightsForGraph(layer_idx); }
+    std::optional<PreparedWeightRef> exposePreparedRefForGraphWeight(
+        const WeightBinding *binding,
+        DeviceId device) const
+    {
+        return preparedRefForGraphWeight(binding, device);
+    }
+
+    int binding_set_count = 0;
+    ModelWeights captured_weights;
+    ModelWeightBindings captured_bindings;
+};
+
+namespace
+{
+    bool canReuseCachedFFNGraphForTest(
+        const LayerGraphCache &cache,
+        int seq_len,
+        bool all_position_logits)
+    {
+        return cache.ffn_decode &&
+               cache.valid &&
+               cache.ffn_cached_seq_len == seq_len &&
+               cache.ffn_cached_all_position_logits == all_position_logits;
+    }
+
+    TEST(Test__LayerGraphCache, FFNVariantKeyIsIndependentFromAttentionVariant)
+    {
+        LayerGraphCache cache;
+        cache.valid = true;
+        cache.ffn_decode = std::make_unique<ComputeGraph>();
+        cache.ffn_cached_seq_len = 1;
+        cache.ffn_cached_all_position_logits = false;
+
+        EXPECT_TRUE(canReuseCachedFFNGraphForTest(cache, 1, false));
+        EXPECT_FALSE(canReuseCachedFFNGraphForTest(cache, 2, false));
+        EXPECT_FALSE(canReuseCachedFFNGraphForTest(cache, 1, true));
+
+        cache.attention_decode = std::make_unique<ComputeGraph>();
+        cache.cached_seq_len = 2;
+        cache.attention_cached_seq_len = 2;
+        cache.attention_cached_all_position_logits = true;
+
+        EXPECT_FALSE(canReuseCachedFFNGraphForTest(cache, 2, true))
+            << "Updating the attention cache variant must not make a stale FFN graph reusable";
+    }
+
+    TEST_F(Test__DeviceGraphOrchestrator, PendingLogitsStreamHandoffIsOneShotPerRole)
+    {
+        DeviceGraphOrchestrator orchestrator(graph_builder_, nullptr);
+        IForwardExecutionHost &host = orchestrator;
+
+        int main_stream_a = 0;
+        int main_stream_b = 0;
+        int verifier_stream = 0;
+
+        ASSERT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_a));
+        EXPECT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_a))
+            << "A producer may republish the same explicit stream after in-place logits mutation.";
+        EXPECT_THROW(host.setPendingMainDecodeStream(&main_stream_b), std::logic_error)
+            << "Publishing a different stream before consumption would race the pending consumer.";
+
+        EXPECT_NO_THROW(host.setPendingAllPositionVerifierStream(&verifier_stream))
+            << "Different logits roles must have independent one-shot slots.";
+
+        ASSERT_NO_THROW(host.setPendingMainDecodeStream(nullptr));
+        EXPECT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_b))
+            << "Explicit clear transfers ownership back to the next producer.";
+    }
+
+    TEST_F(Test__DeviceGraphOrchestrator, ClearCacheReleasesPendingLogitsStreamHandoffs)
+    {
+        DeviceGraphOrchestrator orchestrator(graph_builder_, nullptr);
+        IForwardExecutionHost &host = orchestrator;
+
+        int main_stream_before_reset = 0;
+        int main_stream_after_reset = 0;
+        int verifier_stream_before_reset = 0;
+        int verifier_stream_after_reset = 0;
+
+        ASSERT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_before_reset));
+        ASSERT_NO_THROW(host.setPendingAllPositionVerifierStream(&verifier_stream_before_reset));
+
+        orchestrator.clear_cache();
+
+        EXPECT_NO_THROW(host.setPendingMainDecodeStream(&main_stream_after_reset))
+            << "Request reset must release stale main-decode stream ownership.";
+        EXPECT_NO_THROW(host.setPendingAllPositionVerifierStream(&verifier_stream_after_reset))
+            << "Request reset must release stale verifier stream ownership.";
+    }
+
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name),
+              had_old_(std::getenv(name) != nullptr),
+              old_value_(had_old_ ? std::getenv(name) : "")
+        {
+            setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
+
+    class FakeGlobalTPContext : public IGlobalTPContext
+    {
+    public:
+        FakeGlobalTPContext(int domain_id, int my_index, int degree)
+            : domain_id_(domain_id), my_index_(my_index), degree_(degree)
+        {
+            for (int rank = 0; rank < degree_; ++rank)
+                world_ranks_.push_back(100 + rank);
+        }
+
+        int degree() const override { return degree_; }
+        int myIndex() const override { return my_index_; }
+        CollectiveBackendType backend() const override { return CollectiveBackendType::MPI; }
+        MPI_Comm communicator() const override { return MPI_COMM_SELF; }
+        int domainId() const override { return domain_id_; }
+        const std::vector<int> &worldRanks() const override { return world_ranks_; }
+        GlobalDeviceAddress localDevice() const override { return GlobalDeviceAddress::cpu(0); }
+        void barrier() const override {}
+        bool allreduce(TensorBase *) override { return false; }
+        bool broadcast(TensorBase *, int = 0) override { return false; }
+        bool allgather(const TensorBase *, TensorBase *) override { return false; }
+        bool send(const TensorBase *, int) override { return false; }
+        bool recv(TensorBase *, int) override { return false; }
+
+    private:
+        int domain_id_ = 0;
+        int my_index_ = 0;
+        int degree_ = 1;
+        std::vector<int> world_ranks_;
+    };
+
+    MoERebalanceController::Config makeMaintenanceMoEConfig(
+        MoERebalanceMode mode,
+        int num_experts = 8,
+        int num_sockets = 2,
+        int num_layers = 2,
+        int top_k = 2,
+        int window_size = 16)
+    {
+        MoERebalanceController::Config cfg;
+        cfg.mode = mode;
+        cfg.num_layers = num_layers;
+        cfg.num_experts = num_experts;
+        cfg.top_k = top_k;
+        cfg.window_size = window_size;
+
+        for (int s = 0; s < num_sockets; ++s)
+            cfg.sockets.push_back(DeviceId(DeviceType::CPU, s));
+
+        cfg.initial_expert_to_socket.resize(num_experts);
+        for (int e = 0; e < num_experts; ++e)
+            cfg.initial_expert_to_socket[e] = e % num_sockets;
+
+        cfg.rebalance_config.imbalance_threshold = 1.3f;
+        cfg.rebalance_config.max_swaps_per_layer = 4;
+        cfg.rebalance_config.max_total_swaps = 16;
+        cfg.rebalance_config.min_improvement_ratio = 0.05f;
+        cfg.rebalance_config.layer_cooldown_generations = 0;
+        cfg.rebalance_config.min_window_activations = 1;
+        return cfg;
+    }
+
+    GraphConfig makeMaintenanceMoEGraphConfig()
+    {
+        GraphConfig cfg;
+        cfg.d_model = 8;
+        cfg.d_ff = 16;
+        cfg.n_heads = 2;
+        cfg.n_kv_heads = 2;
+        cfg.head_dim = 4;
+        cfg.n_layers = 2;
+        cfg.total_n_layers = 2;
+        cfg.vocab_size = 32;
+        cfg.rms_norm_eps = 1e-6f;
+        cfg.default_device = DeviceId::cpu();
+        cfg.moe.num_experts = 8;
+        cfg.moe.top_k = 2;
+        cfg.moe.intermediate_size = 8;
+        cfg.prefix_cache.enabled = true;
+        cfg.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        cfg.prefix_cache.block_size = 2;
+        cfg.prefix_cache.ram_budget_bytes = 1 << 20;
+        cfg.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Off;
+        return cfg;
+    }
+
+    void fillMaintenanceWindowSkewed(DecodeExpertHistogram &hist,
+                                     int window_size,
+                                     int num_layers,
+                                     int top_k)
+    {
+        for (int t = 0; t < window_size; ++t)
+        {
+            for (int layer = 0; layer < num_layers; ++layer)
+            {
+                std::vector<int> experts(static_cast<size_t>(top_k));
+                std::vector<float> weights(static_cast<size_t>(top_k));
+                for (int k = 0; k < top_k; ++k)
+                {
+                    experts[static_cast<size_t>(k)] = k;
+                    weights[static_cast<size_t>(k)] = 1.0f / static_cast<float>(top_k);
+                }
+                hist.record(layer, experts.data(), weights.data(), top_k);
+            }
+        }
+    }
+}
 
 // =============================================================================
 // Construction Tests
@@ -76,7 +330,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ConstructWithGraphBuilder)
 TEST_F(Test__DeviceGraphOrchestrator, ConstructWithConfig)
 {
     // Test construction with config (creates internal graph builder)
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     EXPECT_NE(orchestrator, nullptr);
     EXPECT_NE(std::as_const(*orchestrator).graphBuilder(), nullptr);
@@ -98,8 +352,329 @@ TEST_F(Test__DeviceGraphOrchestrator, NullGraphBuilderThrows)
 {
     // Construction with null graph builder should throw
     EXPECT_THROW(
-        DeviceGraphOrchestrator(std::shared_ptr<Qwen2Graph>(nullptr), nullptr),
+        DeviceGraphOrchestrator(std::shared_ptr<QwenStandardGraph>(nullptr), nullptr),
         std::invalid_argument);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedAndTopologyBounded)
+{
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    moe_config.mtp.enabled = true;
+    moe_config.moe.expert_mode = MoEExpertMode::ExpertParallel;
+    moe_config.moe.local_expert_start = 0;
+    moe_config.moe.local_expert_count = -1;
+    DeviceGraphOrchestrator moe_orchestrator(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(moe_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    EXPECT_FALSE(moe_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "MoE all-position verifier row parity is not enough to prove that the "
+           "preceding sidecar left every routed live-state surface untouched.";
+    EXPECT_FALSE(moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
+        << "MoE must publish the first shifted MTP row from the target verifier "
+           "accepted row, not reuse sidecar-local routed expert state.";
+    const auto cpu_moe_capability = moe_orchestrator.mtpVerifierRowCapability();
+    EXPECT_TRUE(cpu_moe_capability.supportsMoEDecodeEquivalentRows(4, true))
+        << "CPU MoE keeps the shared decode-equivalent verifier proof.";
+    EXPECT_FALSE(cpu_moe_capability.supportsMoEDirectAllPositionRows(4, true))
+        << "CPU MoE direct publication is not proven by the GPU resident-mailbox "
+           "continuation gate.";
+    EXPECT_FALSE(moe_orchestrator.supportsMTPSpecStatePublication())
+        << "CPU MoE must remain replay-published until it has a resident-state "
+           "publication proof of its own.";
+    const auto cpu_moe_economy =
+        moe_orchestrator.mtpVerifierEconomyCapability();
+    EXPECT_TRUE(cpu_moe_economy.supportsMoERows(4, true));
+    EXPECT_TRUE(cpu_moe_economy.moe.serial_decode_equivalent_fallback)
+        << "CPU MoE remains on serial replay until it has a grouped full-model proof.";
+    EXPECT_FALSE(cpu_moe_economy.moe.grouped_decode_equivalent);
+    EXPECT_FALSE(cpu_moe_economy.hasEconomicalMoEPath(4, true));
+
+    DeviceId gpu_device = DeviceId::invalid();
+    if (DeviceManager::instance().cuda_device_count() > 0)
+    {
+        gpu_device = DeviceId::cuda(0);
+    }
+    else if (DeviceManager::instance().rocm_device_count() > 0)
+    {
+        gpu_device = DeviceId::rocm(0);
+    }
+    if (gpu_device.is_valid())
+    {
+        auto gpu_moe_config = moe_config;
+        gpu_moe_config.default_device = gpu_device;
+        DeviceGraphOrchestrator gpu_moe_orchestrator(
+            std::make_shared<Qwen35MoEGraph>(gpu_moe_config, nullptr),
+            nullptr);
+        ASSERT_TRUE(gpu_moe_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
+        EXPECT_TRUE(gpu_moe_orchestrator.supportsMTPSidecarPreservesMainState())
+            << "Full-owner GPU MoE sidecars are now covered by the runtime-state "
+               "preservation gate: main KV, GDN/conv, positions, and sequence "
+               "lengths must match the verifier base after sidecar execution.";
+        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
+            << "MoE may skip the verifier-base restore, but its first shifted MTP "
+               "row is still published from accepted verifier rows rather than "
+               "reusing the sidecar-local draft row.";
+        const auto gpu_moe_capability =
+            gpu_moe_orchestrator.mtpVerifierRowCapability();
+        EXPECT_TRUE(gpu_moe_capability.supportsMoEDecodeEquivalentRows(4, true))
+            << "Phase 9.7 proves MoE shared decode-equivalent verifier rows "
+               "for M=1..4 on every backend.";
+        EXPECT_FALSE(gpu_moe_capability.supportsMoEDirectAllPositionRows(4, true))
+            << "Grouped verifier-row math does not prove live-state publication; "
+               "KV, GDN/conv, shifted MTP KV, and logical state still need the "
+               "stronger transaction gate.";
+        EXPECT_FALSE(gpu_moe_capability.device_resident_direct_publication)
+            << "The old all-position publication capability remains disabled "
+               "for MoE; compact grouped outcomes publish through the separate "
+               "device-resident handoff.";
+        EXPECT_FALSE(gpu_moe_orchestrator.supportsMTPSpecStatePublication());
+        EXPECT_TRUE(gpu_moe_orchestrator.supportsDeviceResidentMTPSpecStatePublication())
+            << "Grouped MoE outcomes now have a resident accepted-state "
+               "publication handoff even though the stronger all-position "
+               "state-publication policy remains disabled.";
+        const auto gpu_moe_economy =
+            gpu_moe_orchestrator.mtpVerifierEconomyCapability();
+        EXPECT_TRUE(gpu_moe_economy.supportsMoERows(4, true));
+        EXPECT_TRUE(gpu_moe_economy.moe.serial_decode_equivalent_fallback)
+            << "Serial replay remains the correctness oracle and fallback "
+               "contract, but the promoted grouped lane must not use it.";
+        EXPECT_TRUE(gpu_moe_economy.moe.grouped_decode_equivalent)
+            << "GPU MoE exposes the strict grouped verifier outcome proof.";
+        EXPECT_TRUE(gpu_moe_economy.moe.row_indexed_lm_head);
+        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_input);
+        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_outcome);
+        EXPECT_TRUE(gpu_moe_economy.moe.device_resident_publication);
+        EXPECT_FALSE(gpu_moe_economy.moe.host_bridge_free_hot_path);
+        EXPECT_TRUE(gpu_moe_economy.moe.graph_capturable);
+        EXPECT_STREQ(
+            gpu_moe_economy.moe.perf_gate_status.c_str(),
+            "grouped_outcome_economics_pending");
+        EXPECT_FALSE(gpu_moe_economy.hasEconomicalMoEPath(4, true))
+            << "The grouped outcome lane is a middle contract; it cannot be "
+               "counted as economical until the grouped verifier graph and "
+               "host-bridge-free hot path are speed-accepted.";
+    }
+
+    auto dense_config = config_;
+    dense_config.mtp.enabled = true;
+    DeviceGraphOrchestrator dense_orchestrator(
+        std::make_shared<QwenStandardGraph>(dense_config, nullptr),
+        nullptr);
+    EXPECT_FALSE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "The capability requires initialized KV/MTP cache state, not just config.";
+    ASSERT_TRUE(dense_orchestrator.initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    /*
+     * Dense sidecars use MTP-prefixed activation buffers and request-local MTP
+     * KV.  Real-model ROCm preservation coverage compares verifier rows before
+     * and after sidecar execution; this unit guard keeps the advertised
+     * capability narrow enough for that proof to remain meaningful.
+     */
+    EXPECT_TRUE(dense_orchestrator.supportsMTPSidecarPreservesMainState())
+        << "Initialized dense MTP runners can skip the full verifier-base restore; "
+           "speculative MTP KV rows are discarded by the shifted-row commit path.";
+    EXPECT_TRUE(dense_orchestrator.supportsMTPShiftedRowReuseFromSidecar())
+        << "Dense sidecars append a first shifted row that is equivalent to the "
+           "accepted target-row commit.";
+    EXPECT_FALSE(dense_orchestrator.supportsMTPSpecStatePublication())
+        << "CPU dense MTP must stay on the decode-equivalent verifier until "
+           "CPU all-position GDN/KV publication has a continuation-equivalence "
+           "proof.";
+    const auto cpu_dense_capability =
+        dense_orchestrator.mtpVerifierRowCapability();
+    EXPECT_TRUE(cpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true))
+        << "CPU dense has a proven shared decode-equivalent verifier row "
+           "contract for M=1..4.";
+    EXPECT_FALSE(cpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
+        << "CPU dense direct publication is intentionally not promoted.";
+    const auto cpu_dense_economy =
+        dense_orchestrator.mtpVerifierEconomyCapability();
+    EXPECT_TRUE(cpu_dense_economy.supportsDenseRows(4, true));
+    EXPECT_TRUE(cpu_dense_economy.dense.serial_decode_equivalent_fallback);
+    EXPECT_FALSE(cpu_dense_economy.hasEconomicalDensePath(4, false));
+
+    if (gpu_device.is_valid())
+    {
+        auto gpu_dense_config = dense_config;
+        gpu_dense_config.default_device = gpu_device;
+        DeviceGraphOrchestrator gpu_dense_orchestrator(
+            std::make_shared<QwenStandardGraph>(gpu_dense_config, nullptr),
+            nullptr);
+        ASSERT_TRUE(gpu_dense_orchestrator.initializeInferenceStateFromArena(1, 16, gpu_device));
+        EXPECT_FALSE(gpu_dense_orchestrator.supportsMTPSpecStatePublication())
+            << "GPU dense direct all-position publication must stay disabled "
+               "until it has a continuation-equivalence proof for recurrent "
+               "GDN/short-conv state, not just matching verifier row logits.";
+        const auto gpu_dense_capability =
+            gpu_dense_orchestrator.mtpVerifierRowCapability();
+        EXPECT_TRUE(gpu_dense_capability.supportsDenseDecodeEquivalentRows(4, true));
+        EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(1, false))
+            << "The proven M=1..4 contract is the shared decode-equivalent "
+               "path; direct publication remains fail-closed.";
+        EXPECT_FALSE(gpu_dense_capability.supportsDenseDirectAllPositionRows(4, true))
+            << "Stochastic direct publication also requires its own proof.";
+        const auto gpu_dense_economy =
+            gpu_dense_orchestrator.mtpVerifierEconomyCapability();
+        EXPECT_TRUE(gpu_dense_economy.supportsDenseRows(4, true));
+        EXPECT_TRUE(gpu_dense_economy.dense.serial_decode_equivalent_fallback)
+            << "The serial replay contract remains the correctness fallback "
+               "while the grouped GPU lane is still economy-pending.";
+        EXPECT_TRUE(gpu_dense_economy.dense.grouped_decode_equivalent)
+            << "GPU dense must expose the M=1..4 grouped verifier-row proof "
+               "so SingleDevice stochastic MTP can use the resident outcome path.";
+        EXPECT_TRUE(gpu_dense_economy.dense.row_indexed_lm_head);
+        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_input);
+        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_outcome);
+        EXPECT_TRUE(gpu_dense_economy.dense.device_resident_publication);
+        EXPECT_FALSE(gpu_dense_economy.dense.host_bridge_free_hot_path)
+            << "Grouped dense publication is not fully economical until the "
+               "whole transaction is benchmark-accepted.";
+        EXPECT_TRUE(gpu_dense_economy.dense.graph_capturable);
+        EXPECT_STREQ(
+            gpu_dense_economy.dense.perf_gate_status.c_str(),
+            "grouped_outcome_economics_pending");
+        EXPECT_FALSE(gpu_dense_economy.hasEconomicalDensePath(4, true))
+            << "Grouped/resident verifier promotion is Phase 9.8 work, even "
+               "when Phase 9.7 row correctness is green.";
+    }
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, SetWeightsFreezesBindingsAndDoesNotExposeLazyCallback)
+{
+    config_.n_layers = 3;
+    auto capturing_builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator orchestrator(capturing_builder, nullptr);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto ssm_alpha = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto moe_gate_exps = std::make_shared<FP32Tensor>(std::vector<size_t>{4, 8, 2});
+
+    int callback_calls = 0;
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.get_layer_weights = [&](int layer_idx)
+    {
+        ++callback_calls;
+        LayerWeights layer;
+        layer.wq = attn_q.get();
+        layer.ssm_alpha = ssm_alpha.get();
+        layer.moe_gate_exps = moe_gate_exps.get();
+        return layer;
+    };
+
+    orchestrator.setWeights(weights);
+
+    EXPECT_EQ(callback_calls, config_.n_layers);
+    ASSERT_EQ(capturing_builder->binding_set_count, 1);
+    ASSERT_TRUE(capturing_builder->captured_bindings.get_layer_weights != nullptr);
+    ASSERT_TRUE(capturing_builder->captured_weights.get_layer_weights != nullptr);
+
+    const FrozenModelWeightSet *frozen = orchestrator.frozenWeightSet();
+    ASSERT_NE(frozen, nullptr);
+    EXPECT_NE(frozen->optionalLayer(0, "attn_q.weight"), nullptr);
+    EXPECT_NE(frozen->optionalLayer(0, "ssm_alpha.weight"), nullptr);
+    EXPECT_NE(frozen->optionalLayer(0, "ffn_gate_exps.weight"), nullptr);
+
+    auto binding_layer = capturing_builder->captured_bindings.get_layer_weights(0);
+    ASSERT_NE(binding_layer.ssm_alpha, nullptr);
+    ASSERT_NE(binding_layer.moe_gate_exps, nullptr);
+    EXPECT_EQ(binding_layer.ssm_alpha->tensor, ssm_alpha.get());
+    EXPECT_EQ(binding_layer.moe_gate_exps->tensor, moe_gate_exps.get());
+
+    auto legacy_layer = capturing_builder->captured_weights.get_layer_weights(0);
+    EXPECT_EQ(legacy_layer.wq, attn_q.get());
+    EXPECT_EQ(legacy_layer.ssm_alpha, ssm_alpha.get());
+    EXPECT_EQ(legacy_layer.moe_gate_exps, moe_gate_exps.get());
+
+    callback_calls = 0;
+    (void)capturing_builder->captured_weights.get_layer_weights(1);
+    EXPECT_EQ(callback_calls, 0);
+
+    callback_calls = 0;
+    auto helper_layer = capturing_builder->exposeLayerWeightsForGraph(1);
+    EXPECT_EQ(helper_layer.ssm_alpha, ssm_alpha.get());
+    EXPECT_EQ(callback_calls, 0);
+
+    TensorContext tensor_context = capturing_builder->exposeTensorContext();
+    ASSERT_NE(tensor_context.model_weight_bindings["embedding_table"], nullptr);
+    EXPECT_EQ(tensor_context.model_weight_bindings["embedding_table"]->tensor, embedding.get());
+    ASSERT_TRUE(tensor_context.get_layer_weight_binding != nullptr);
+    const WeightBinding *gdn_binding = tensor_context.get_layer_weight_binding(0, "ssm_alpha");
+    ASSERT_NE(gdn_binding, nullptr);
+    EXPECT_EQ(gdn_binding->identity.canonical_name, "blk.0.ssm_alpha.weight");
+    EXPECT_EQ(gdn_binding->tensor, ssm_alpha.get());
+
+    PreparedWeightStore store;
+    auto registered_ref = store.registerPreparedForTest(
+        *gdn_binding,
+        PreparedWeightKind::CpuPackedGemm,
+        DeviceId::cpu());
+    capturing_builder->setPreparedWeightStore(&store);
+
+    auto graph_ref = capturing_builder->exposePreparedRefForGraphWeight(
+        gdn_binding,
+        DeviceId::cpu());
+    ASSERT_TRUE(graph_ref.has_value());
+    EXPECT_EQ(graph_ref->binding_id, registered_ref.binding_id);
+    EXPECT_EQ(graph_ref->binding_id, gdn_binding->binding_id);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirectly)
+{
+    config_.n_layers = 1;
+    auto capturing_builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator orchestrator(capturing_builder, nullptr);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+
+    auto make_binding = [](const std::string &name, WeightRole role, TensorBase *tensor)
+    {
+        WeightBinding binding;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{42});
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        return binding;
+    };
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{42};
+    strategy.devices = {DeviceId::cpu()};
+
+    ModelWeightSetBuilder builder(strategy);
+    builder.addBinding(make_binding("token_embd.weight", WeightRole::Embedding, embedding.get()));
+    builder.addBinding(make_binding("output_norm.weight", WeightRole::OutputNorm, final_norm.get()));
+    builder.addBinding(make_binding("output.weight", WeightRole::LMHead, lm_head.get()));
+    builder.addBinding(make_binding("blk.0.attn_q.weight", WeightRole::AttentionQ, attn_q.get()));
+
+    auto frozen = std::make_unique<FrozenModelWeightSet>(strategy, builder.freezeBindings());
+    orchestrator.setFrozenWeightSet(std::move(frozen));
+
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    ASSERT_EQ(capturing_builder->binding_set_count, 1);
+    ASSERT_NE(capturing_builder->captured_bindings.embedding_table, nullptr);
+    ASSERT_NE(capturing_builder->captured_bindings.final_norm, nullptr);
+    ASSERT_NE(capturing_builder->captured_bindings.lm_head, nullptr);
+    EXPECT_EQ(capturing_builder->captured_bindings.embedding_table->tensor, embedding.get());
+    EXPECT_EQ(capturing_builder->captured_weights.embedding_table, embedding.get());
+
+    ASSERT_TRUE(capturing_builder->captured_bindings.get_layer_weights != nullptr);
+    auto layer_bindings = capturing_builder->captured_bindings.get_layer_weights(0);
+    ASSERT_NE(layer_bindings.wq, nullptr);
+    EXPECT_EQ(layer_bindings.wq->tensor, attn_q.get());
+
+    ASSERT_TRUE(capturing_builder->captured_weights.get_layer_weights != nullptr);
+    auto legacy_layer = capturing_builder->captured_weights.get_layer_weights(0);
+    EXPECT_EQ(legacy_layer.wq, attn_q.get());
 }
 
 // =============================================================================
@@ -135,13 +710,13 @@ TEST_F(Test__DeviceGraphOrchestrator, SetGraphCachingEnabled)
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, ClearCacheResetsCacheStats)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateExecutionCachesResetsCacheStats)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator->initializeGraphCache(24);
 
-    // Clear cache
-    orchestrator->clearCache();
+    // Destructively invalidate execution caches
+    orchestrator->invalidateExecutionCaches();
 
     // Verify stats are reset
     auto stats = orchestrator->getCacheStats();
@@ -209,7 +784,7 @@ TEST_F(Test__DeviceGraphOrchestrator, GetDeviceContextMultipleDevices)
     }
 }
 
-TEST_F(Test__DeviceGraphOrchestrator, ClearCacheClearsDeviceContexts)
+TEST_F(Test__DeviceGraphOrchestrator, InvalidateExecutionCachesClearsDeviceContexts)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
 
@@ -220,8 +795,8 @@ TEST_F(Test__DeviceGraphOrchestrator, ClearCacheClearsDeviceContexts)
         GTEST_SKIP() << "DeviceContext creation not available in this environment";
     }
 
-    // Clear all caches
-    orchestrator->clearCache();
+    // Destructively invalidate all execution caches
+    orchestrator->invalidateExecutionCaches();
 
     // New context should be created (different pointer)
     IDeviceContext *ctx_after = orchestrator->getDeviceContext(DeviceId::cpu());
@@ -348,7 +923,7 @@ TEST_F(Test__DeviceGraphOrchestrator, MoveAssignment)
     auto orchestrator1 = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
     orchestrator1->initializeGraphCache(24);
 
-    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator2 = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     // Move assign
     *orchestrator2 = std::move(*orchestrator1);
@@ -616,6 +1191,434 @@ TEST_F(Test__DeviceGraphOrchestrator, InferenceStateMultipleBatches)
     }
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, DisabledPrefixCacheDoesNotRecordBypassStats)
+{
+    auto custom_config = config_;
+    custom_config.prefix_cache.enabled = false;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2});
+    EXPECT_FALSE(hit.cache_enabled);
+    EXPECT_FALSE(hit.supported);
+
+    PrefixRuntimeStateSnapshot probe = orchestrator->prefixStateProbe();
+    EXPECT_FALSE(probe.prefix_cache_config_enabled);
+    EXPECT_FALSE(probe.prefix_cache_ready);
+    EXPECT_FALSE(probe.prefix_cache_bypassed);
+    EXPECT_TRUE(probe.prefix_cache_bypass_reason.empty());
+    EXPECT_EQ(probe.prefix_cache_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_unsupported_backend_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_fingerprint_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_terminal_state_bypasses, 0u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefixCacheBudgetBypassIsReportedInProbe)
+{
+    auto custom_config = config_;
+    custom_config.prefix_cache.enabled = true;
+    custom_config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    custom_config.prefix_cache.block_size = 2;
+    custom_config.prefix_cache.ram_budget_bytes = 1;
+    custom_config.mtp.enabled = false;
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(custom_config, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult hit = orchestrator->lookupPrefix({1, 2});
+    EXPECT_TRUE(hit.cache_enabled);
+    EXPECT_FALSE(hit.supported);
+    EXPECT_NE(hit.bypass_reason.find("RAM budget"), std::string::npos);
+
+    PrefixRuntimeStateSnapshot probe = orchestrator->prefixStateProbe();
+    EXPECT_TRUE(probe.prefix_cache_config_enabled);
+    EXPECT_FALSE(probe.prefix_cache_ready);
+    EXPECT_TRUE(probe.prefix_cache_bypassed);
+    EXPECT_NE(probe.prefix_cache_bypass_reason.find("RAM budget"), std::string::npos);
+    EXPECT_EQ(probe.prefix_cache_bypasses, 1u);
+    EXPECT_EQ(probe.prefix_cache_unsupported_backend_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_fingerprint_bypasses, 0u);
+    EXPECT_EQ(probe.prefix_cache_terminal_state_bypasses, 0u);
+
+    PrefixLookupResult second_hit = orchestrator->lookupPrefix({1, 2});
+    EXPECT_FALSE(second_hit.supported);
+    EXPECT_EQ(orchestrator->prefixStateProbe().prefix_cache_bypasses, 1u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, TPPrefixFingerprintIsDomainLevelAcrossParticipants)
+{
+    const auto tp = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            /*world_size=*/2,
+            config_.n_heads,
+            config_.n_kv_heads,
+            config_.d_ff,
+            config_.vocab_size,
+            std::vector<DeviceId>{DeviceId::cuda(0), DeviceId::cuda(1)}));
+
+    auto make_participant_config = [&](int rank)
+    {
+        GraphConfig cfg = config_;
+        cfg.prefix_cache.enabled = true;
+        cfg.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+        cfg.prefix_cache.block_size = 2;
+        cfg.prefix_cache.ram_budget_bytes = 1 << 20;
+        cfg.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Off;
+        cfg.tp_config = tp;
+        cfg.local_rank = rank;
+        cfg.qkv_column_parallel = true;
+        cfg.ffn_column_parallel = true;
+        cfg.lm_head_column_parallel = true;
+
+        const auto &assignment = tp->forRank(rank);
+        cfg.head_start = assignment.head_start;
+        cfg.local_n_heads = assignment.head_count;
+        cfg.local_n_kv_heads = assignment.kv_head_count;
+        cfg.d_ff_local = assignment.d_ff_count;
+        cfg.vocab_local = assignment.vocab_count;
+        return cfg;
+    };
+
+    auto rank0_config = make_participant_config(0);
+    auto rank1_config = make_participant_config(1);
+
+    auto rank0 = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(rank0_config, nullptr),
+        nullptr);
+    auto rank1 = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<QwenStandardGraph>(rank1_config, nullptr),
+        nullptr);
+
+    ASSERT_TRUE(rank0->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+    ASSERT_TRUE(rank1->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    PrefixLookupResult hit0 = rank0->lookupPrefix({1, 2});
+    PrefixLookupResult hit1 = rank1->lookupPrefix({1, 2});
+
+    ASSERT_TRUE(hit0.supported) << hit0.bypass_reason;
+    ASSERT_TRUE(hit1.supported) << hit1.bypass_reason;
+    ASSERT_NE(hit0.fingerprint_key, 0u);
+    EXPECT_EQ(hit0.fingerprint_key, hit1.fingerprint_key)
+        << "TP prefix participants must use one domain-level logical key; "
+           "local payload layout still guards shard compatibility.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoEPlacementEpochRefreshesPrefixFingerprint)
+{
+    auto moe_config = makeMaintenanceMoEGraphConfig();
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(
+        std::make_shared<Qwen35MoEGraph>(moe_config, nullptr),
+        nullptr);
+    ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 16, DeviceId::cpu()));
+
+    auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    for (int expert = 0; expert < 8; ++expert)
+        controller_config.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+
+    auto controller = std::make_unique<MoERebalanceController>(controller_config);
+    auto *controller_ptr = controller.get();
+    orchestrator->setMoERebalanceController(std::move(controller));
+
+    PrefixLookupResult before = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(before.supported);
+    ASSERT_NE(before.fingerprint_key, 0u);
+    EXPECT_EQ(before.placement_epoch, 0u);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
+
+    fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
+                                /*window_size=*/16,
+                                /*num_layers=*/2,
+                                /*top_k=*/2);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 8;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceDecision decision;
+    decision.ok = true;
+    decision.can_run = true;
+    IForwardExecutionHost &host = *orchestrator;
+    ASSERT_TRUE(host.onPrefillChunkMaintenance(chunk, decision));
+    ASSERT_EQ(controller_ptr->placementEpoch(), 1u);
+
+    PrefixLookupResult after = orchestrator->lookupPrefix({1, 2});
+    ASSERT_TRUE(after.supported);
+    EXPECT_EQ(after.placement_epoch, 1u);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 1u);
+    EXPECT_NE(after.fingerprint_key, before.fingerprint_key)
+        << "MoE placement epoch changes must invalidate prefix-cache key material";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    controller_config.domain_id = "single_cpu_moe";
+    auto controller = std::make_unique<MoERebalanceController>(controller_config);
+    auto *controller_ptr = controller.get();
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+
+    auto controllers = orchestrator->moeRebalanceControllers();
+    ASSERT_EQ(controllers.size(), 1u);
+    EXPECT_EQ(controllers.front(), controller_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), controller_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("other_domain"), nullptr);
+
+    IForwardExecutionHost &host = *orchestrator;
+    EXPECT_EQ(host.prefillGraphDomainId(), "single_cpu_moe")
+        << "Prefill graph observations must report the active MoE domain.";
+    EXPECT_EQ(host.prefillGraphParticipantId(), 0);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRoutedOverlayDomains)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    auto base_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    base_config.domain_id = "single_cpu_moe";
+    auto base_controller = std::make_unique<MoERebalanceController>(base_config);
+    auto *base_ptr = base_controller.get();
+    orchestrator->setMoERebalanceController(std::move(base_controller));
+
+    auto overlay_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    overlay_config.domain_id = "overlay_routed_cpu_cold";
+    auto overlay_controller = std::make_unique<MoERebalanceController>(overlay_config);
+    auto *overlay_ptr = overlay_controller.get();
+    orchestrator->addMoERebalanceController(std::move(overlay_controller));
+
+    auto controllers = orchestrator->moeRebalanceControllers();
+    ASSERT_EQ(controllers.size(), 2u);
+    EXPECT_EQ(controllers[0], base_ptr)
+        << "legacy first-controller access should remain stable";
+    EXPECT_EQ(controllers[1], overlay_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("single_cpu_moe"), base_ptr);
+    EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("overlay_routed_cpu_cold"), overlay_ptr);
+
+    ExpertReplicaSet replicas;
+    replicas.domain_id = "overlay_routed_cpu_cold";
+    EXPECT_NO_THROW(
+        orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0))
+        << "domain validation must accept non-primary routed overlay controllers";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainIndex)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    orchestrator->setGlobalTPContext(
+        std::make_shared<FakeGlobalTPContext>(
+            /*domain_id=*/42,
+            /*my_index=*/1,
+            /*degree=*/3));
+
+    EXPECT_EQ(orchestrator->moeRebalanceParticipantId(), 1)
+        << "GlobalTP rebalance must use rank-in-domain, not MPI local rank";
+    IForwardExecutionHost &host = *orchestrator;
+    EXPECT_EQ(host.prefillGraphParticipantId(), 1)
+        << "Prefill graph observations must use the same domain-local participant id.";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutation)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+
+    auto controller_config = makeMaintenanceMoEConfig(MoERebalanceMode::OBSERVE);
+    controller_config.domain_id = "single_cpu_moe";
+    orchestrator->setMoERebalanceController(
+        std::make_unique<MoERebalanceController>(controller_config));
+
+    ASSERT_EQ(orchestrator->expertPayloadProvider(), nullptr);
+
+    const std::vector<std::vector<bool>> masks = {
+        std::vector<bool>(static_cast<size_t>(controller_config.num_experts), true)};
+    EXPECT_THROW(
+        orchestrator->applyExpertMasksForDomain("other_domain", masks, ReceivedWeightsMap{}),
+        std::runtime_error);
+    EXPECT_EQ(orchestrator->expertPayloadProvider(), nullptr)
+        << "domain validation must happen before payload-provider initialization or mask mutation";
+
+    ExpertReplicaSet replicas;
+    replicas.domain_id = "other_domain";
+    EXPECT_THROW(
+        orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0),
+        std::runtime_error);
+
+    replicas.domain_id = "single_cpu_moe";
+    EXPECT_NO_THROW(
+        orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0));
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 7;
+
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_EQ(state.chunk_index, 7);
+    EXPECT_TRUE(state.histograms_merged);
+    EXPECT_TRUE(state.manual_boundaries_complete);
+    EXPECT_FALSE(state.graph_capture_active);
+    EXPECT_FALSE(state.graph_replay_active);
+    EXPECT_TRUE(state.participants_at_same_boundary);
+    EXPECT_FALSE(state.rebalance_requested);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateReportsGraphCapture)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 2;
+
+    GraphCaptureGuard guard;
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_TRUE(state.graph_capture_active);
+    EXPECT_TRUE(state.histograms_merged);
+    EXPECT_FALSE(state.rebalance_requested);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateSyncsMoERuntimeHistograms)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto controller = std::make_unique<MoERebalanceController>(
+        makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC,
+                                 /*num_experts=*/2,
+                                 /*num_sockets=*/2,
+                                 /*num_layers=*/1,
+                                 /*top_k=*/1,
+                                 /*window_size=*/1));
+    auto *controller_ptr = controller.get();
+
+    bool sync_called = false;
+    controller_ptr->histogram()->registerRuntimeHistogramSync(
+        [controller_ptr, &sync_called]()
+        {
+            sync_called = true;
+            int expert = 0;
+            float weight = 1.0f;
+            controller_ptr->histogram()->record(0, &expert, &weight, 1);
+            return true;
+        });
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 3;
+
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_TRUE(sync_called);
+    EXPECT_TRUE(state.histograms_merged);
+    EXPECT_TRUE(state.rebalance_requested);
+    EXPECT_TRUE(controller_ptr->shouldRebalance());
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateBlocksOnHistogramSyncFailure)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto controller = std::make_unique<MoERebalanceController>(
+        makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC,
+                                 /*num_experts=*/2,
+                                 /*num_sockets=*/2,
+                                 /*num_layers=*/1,
+                                 /*top_k=*/1,
+                                 /*window_size=*/1));
+    controller->histogram()->registerRuntimeHistogramSync([]()
+                                                          { return false; });
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 4;
+    chunk.rebalance_allowed_after = true;
+
+    auto state = host.prefillChunkMaintenanceState(chunk);
+    EXPECT_FALSE(state.histograms_merged);
+    EXPECT_FALSE(state.rebalance_requested);
+
+    auto decision = evaluatePrefillChunkMaintenance(chunk, state);
+    EXPECT_FALSE(decision.can_run);
+    EXPECT_EQ(decision.reason, "histograms_not_merged");
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceHookAppliesLocalMoERebalance)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto cfg = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    for (int expert = 0; expert < 8; ++expert)
+        cfg.initial_expert_to_socket[static_cast<size_t>(expert)] = expert < 6 ? 0 : 1;
+
+    auto controller = std::make_unique<MoERebalanceController>(cfg);
+    auto *controller_ptr = controller.get();
+
+    fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
+                                /*window_size=*/16,
+                                /*num_layers=*/2,
+                                /*top_k=*/2);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 5;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceDecision decision;
+    decision.ok = true;
+    decision.can_run = true;
+
+    EXPECT_TRUE(host.onPrefillChunkMaintenance(chunk, decision));
+    EXPECT_FALSE(controller_ptr->shouldRebalance());
+    EXPECT_EQ(controller_ptr->placementEpoch(), 1u);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceHookSkipsOptionalReplicaMaintenance)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    auto cfg = makeMaintenanceMoEConfig(MoERebalanceMode::DYNAMIC);
+    cfg.max_replicas = 1;
+
+    auto controller = std::make_unique<MoERebalanceController>(cfg);
+    auto *controller_ptr = controller.get();
+    fillMaintenanceWindowSkewed(*controller_ptr->histogram(),
+                                /*window_size=*/16,
+                                /*num_layers=*/2,
+                                /*top_k=*/2);
+    ASSERT_TRUE(controller_ptr->shouldRebalance());
+
+    orchestrator->setMoERebalanceController(std::move(controller));
+    IForwardExecutionHost &host = *orchestrator;
+
+    PrefillChunkPlan chunk;
+    chunk.chunk_index = 6;
+    chunk.rebalance_allowed_after = true;
+
+    PrefillChunkMaintenanceDecision optional_decision;
+    optional_decision.ok = true;
+    optional_decision.can_run = true;
+    optional_decision.required = false;
+
+    EXPECT_TRUE(host.onPrefillChunkMaintenance(chunk, optional_decision));
+    EXPECT_TRUE(controller_ptr->shouldRebalance());
+
+    PrefillChunkMaintenanceDecision required_decision = optional_decision;
+    required_decision.required = true;
+    EXPECT_FALSE(host.onPrefillChunkMaintenance(chunk, required_decision));
+}
+
 // =============================================================================
 // KV Cache Layout Mode Tests
 // =============================================================================
@@ -625,7 +1628,7 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_FP32_AutoDefaultsToQ16He
     // Create config with FP32 precision, AUTO KV cache (default)
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(fp32_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -646,7 +1649,7 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheImplementation_FP32Activation_Defau
 {
     auto fp32_config = config_;
     fp32_config.activation_precision = ActivationPrecision::FP32;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(fp32_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(fp32_config, nullptr), nullptr);
 
     ASSERT_TRUE(orchestrator->initializeInferenceStateFromArena(1, 64, DeviceId::cpu()));
     ASSERT_TRUE(orchestrator->hasInferenceState());
@@ -664,7 +1667,7 @@ TEST_F(Test__DeviceGraphOrchestrator, KVCacheLayoutMode_BF16_AutoDefaultsToQ16He
     // Create config with BF16 precision, AUTO KV cache (default)
     auto bf16_config = config_;
     bf16_config.activation_precision = ActivationPrecision::BF16;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(bf16_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(bf16_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -687,7 +1690,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_KVCacheLayoutMode_HybridQ16_UsesH
     // Create config with HybridQ16 precision - this resolves KV cache to Q16_1
     auto hybrid_config = config_;
     hybrid_config.activation_precision = ActivationPrecision::HybridQ16;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(hybrid_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(hybrid_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -710,7 +1713,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_KVCacheLayoutMode_Hybrid_UsesPosi
     // Create config with Hybrid precision - KV cache should be BF16
     auto hybrid_config = config_;
     hybrid_config.activation_precision = ActivationPrecision::Hybrid;
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(hybrid_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(hybrid_config, nullptr), nullptr);
 
     // Initialize state
     int batch_size = 1;
@@ -862,6 +1865,7 @@ namespace
             last_m_ = m;
             last_n_ = n;
             last_k_ = k;
+            saw_decode_m1_ = saw_decode_m1_ || (m == 1);
             getRequirements_called_++;
             WorkspaceRequirements reqs;
             reqs.buffers.push_back(WorkspaceDescriptor{
@@ -903,6 +1907,7 @@ namespace
         int getLastM() const { return last_m_; }
         int getLastN() const { return last_n_; }
         int getLastK() const { return last_k_; }
+        bool sawDecodeM1() const { return saw_decode_m1_; }
 
     private:
         std::string name_;
@@ -913,6 +1918,7 @@ namespace
         mutable int last_m_ = -1;
         mutable int last_n_ = -1;
         mutable int last_k_ = -1;
+        mutable bool saw_decode_m1_ = false;
     };
 
     /**
@@ -1213,7 +2219,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
     auto custom_config = config_;
     custom_config.max_seq_len = 2048; // Non-default value
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1230,6 +2236,47 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualMaxSeqLen)
 
     // Verify that max_seq_len was passed as m (first argument)
     EXPECT_EQ(gpu_ptr->getLastM(), 2048) << "max_seq_len should be passed as m dimension";
+    EXPECT_TRUE(gpu_ptr->sawDecodeM1())
+        << "Prefill-sized graph workspaces should also include decode-only scratch";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesExplicitRequestWhenProvided)
+{
+    DeviceId gpu_device = DeviceId::cpu();
+    if (DeviceManager::instance().cuda_device_count() > 0)
+    {
+        gpu_device = DeviceId::cuda(0);
+    }
+    else if (DeviceManager::instance().rocm_device_count() > 0)
+    {
+        gpu_device = DeviceId::rocm(0);
+    }
+    else
+    {
+        GTEST_SKIP() << "No GPU backend available for workspace allocation sizing test";
+    }
+
+    auto custom_config = config_;
+    custom_config.max_seq_len = 2048;
+
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
+
+    ComputeGraph graph;
+    auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("bucket_gemm", gpu_device, 4096);
+    auto *gpu_ptr = gpu_stage.get();
+    graph.addNode("bucket_node", std::move(gpu_stage), gpu_device);
+
+    IForwardExecutionHost &host = *orchestrator;
+    ASSERT_TRUE(host.ensureDeviceWorkspaceAllocated(graph, 768));
+
+    // Bucketed prefill passes the active bucket shape so ROCm long-context
+    // warmup can avoid reserving the full configured max context up front.
+    // ForwardExecutionEngine handles later workspace growth by rebinding cached
+    // graphs and invalidating captured replay state.
+    EXPECT_EQ(gpu_ptr->getLastM(), 768);
+    EXPECT_TRUE(gpu_ptr->sawDecodeM1())
+        << "Bucketed graph workspaces should also include decode-only scratch";
+    EXPECT_TRUE(gpu_ptr->wasBound());
 }
 
 // NOTE: The following tests are DISABLED because they test an aspirational feature
@@ -1247,7 +2294,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_UsesActualNHeads)
     auto custom_config = config_;
     custom_config.n_heads = 32; // Non-default value
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_attn", DeviceId::cuda(0), 4096);
@@ -1274,7 +2321,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_CalculatesHeadDim
     custom_config.n_heads = 32;
     // Expected head_dim = 4096 / 32 = 128
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_attn", DeviceId::cuda(0), 4096);
@@ -1308,7 +2355,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_AllDimensionsFrom
     qwen_config.max_seq_len = 32768;
     qwen_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(qwen_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(qwen_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("qwen_gemm", DeviceId::cuda(0), 4096);
@@ -1344,7 +2391,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LlamaStyleConfig)
     llama_config.max_seq_len = 8192;
     llama_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(llama_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(llama_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("llama_gemm", DeviceId::cuda(0), 4096);
@@ -1377,7 +2424,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
     auto custom_config = config_;
     custom_config.max_seq_len = 0; // Should fallback to 4096
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1395,6 +2442,8 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_FallbackWhenMaxSeqLenZero)
 
     // Verify fallback to default (4096)
     EXPECT_EQ(gpu_ptr->getLastM(), 4096) << "max_seq_len=0 should fallback to 4096";
+    EXPECT_TRUE(gpu_ptr->sawDecodeM1())
+        << "Fallback graph workspaces should also include decode-only scratch";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHeadsZero)
@@ -1404,7 +2453,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenNHead
     auto custom_config = config_;
     custom_config.n_heads = 0; // Should fallback to 128
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1432,7 +2481,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_FallbackWhenDMode
     custom_config.d_model = 0;
     custom_config.n_heads = 32;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1460,7 +2509,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
     custom_config.n_heads = -1;
     custom_config.d_model = -1;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("gpu_gemm", DeviceId::cuda(0), 4096);
@@ -1488,7 +2537,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_NoCrashOnNegativeValues)
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
     auto cuda_stage = std::make_unique<MockWorkspaceConsumerStage>("cuda_gemm", DeviceId::cuda(0), 4096);
@@ -1511,7 +2560,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CUDAStage_GetsDimensions)
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
     auto rocm_stage = std::make_unique<MockWorkspaceConsumerStage>("rocm_gemm", DeviceId::rocm(0), 4096);
@@ -1534,7 +2583,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_ROCmStage_GetsDimensions)
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_CPUStage_SkipsWorkspace)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
     auto cpu_stage = std::make_unique<MockWorkspaceConsumerStage>("cpu_gemm", DeviceId::cpu(), 4096);
@@ -1565,7 +2614,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWor
         GTEST_SKIP() << "Neither CUDA nor ROCm backend available";
     }
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     ComputeGraph graph;
 
@@ -1620,7 +2669,7 @@ TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_MixedDevices_OnlyGPUGetWor
 
 TEST_F(Test__DeviceGraphOrchestrator, WorkspaceSizing_UsesActualBatchSizeFromInferenceState)
 {
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     // Initialize inference state with specific batch size
     const int batch_size = 8;
@@ -1658,7 +2707,7 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceSizing_LargeModelConfig_
     large_config.max_seq_len = 131072; // 128K context
     large_config.default_device = DeviceId::cpu();
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(large_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(large_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("large_gemm", DeviceId::cuda(0), 4096);
@@ -1693,7 +2742,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_FP32_WorkspaceAllocati
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::FP32;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("fp32_gemm", DeviceId::cuda(0), 4096);
@@ -1715,7 +2764,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_BF16_WorkspaceAllocati
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::BF16;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("bf16_gemm", DeviceId::cuda(0), 4096);
@@ -1737,7 +2786,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAlloca
     auto custom_config = config_;
     custom_config.activation_precision = ActivationPrecision::Hybrid;
 
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(custom_config, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(custom_config, nullptr), nullptr);
 
     ComputeGraph graph;
     auto gpu_stage = std::make_unique<MockWorkspaceConsumerStage>("hybrid_gemm", DeviceId::cuda(0), 4096);
@@ -1763,7 +2812,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ActivationPrecision_Hybrid_WorkspaceAlloca
 TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceConsistency_SameDimensionsAcrossExecutions)
 {
     // DISABLED: Tests unimplemented feature (passing n_heads/head_dim to workspace consumers)
-    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<Qwen2Graph>(config_, nullptr), nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(std::make_shared<QwenStandardGraph>(config_, nullptr), nullptr);
 
     // First graph with workspace consumer
     ComputeGraph graph1;
@@ -1793,4 +2842,224 @@ TEST_F(Test__DeviceGraphOrchestrator, DISABLED_WorkspaceConsistency_SameDimensio
 // IWorkspaceConsumer should be in tests/v2/integration/ as they require:
 // - GPU device availability
 // - Actual GEMM stages with workspace requirements
+
+// =============================================================================
+// Weight Pre-Resolution Tests (PP Layer Offset)
+// =============================================================================
+
+/**
+ * @brief Test fixture using MockGraphBuilder for weight pre-resolution tests
+ */
+class Test__DeviceGraphOrchestrator_WeightPreResolution : public ::testing::Test
+{
+protected:
+    void SetUp() override
+    {
+        DeviceManager::instance().initialize(-1);
+    }
+
+    std::shared_ptr<MockGraphBuilder> createMockBuilder(int n_layers, int pp_layer_offset = 0)
+    {
+        GraphConfig cfg;
+        cfg.d_model = 896;
+        cfg.d_ff = 4864;
+        cfg.n_heads = 14;
+        cfg.n_kv_heads = 2;
+        cfg.head_dim = 64;
+        cfg.n_layers = n_layers;
+        cfg.pp_layer_offset = pp_layer_offset;
+        cfg.vocab_size = 151936;
+        cfg.rms_norm_eps = 1e-6f;
+        cfg.rope_theta = 1000000.0f;
+        cfg.default_device = DeviceId::cpu();
+
+        auto mock = std::make_shared<MockGraphBuilder>();
+        mock->setConfig(cfg);
+        return mock;
+    }
+};
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, SingleDeviceResolvesLocalIndices)
+{
+    // SingleDevice: pp_layer_offset=0, n_layers=4
+    // Should resolve indices 0, 1, 2, 3
+    auto mock = createMockBuilder(4, 0);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    std::vector<int> resolved_indices;
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights
+    {
+        resolved_indices.push_back(idx);
+        LayerWeights lw;
+        // Use attn_norm as a marker to verify which layer was resolved
+        // (we'll use a unique pointer value per layer)
+        return lw;
+    };
+
+    orchestrator->setWeights(weights);
+
+    // Should have resolved indices 0, 1, 2, 3
+    ASSERT_EQ(resolved_indices.size(), 4u);
+    EXPECT_EQ(resolved_indices[0], 0);
+    EXPECT_EQ(resolved_indices[1], 1);
+    EXPECT_EQ(resolved_indices[2], 2);
+    EXPECT_EQ(resolved_indices[3], 3);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPStage1ResolvesGlobalIndices)
+{
+    // PP Stage 1: pp_layer_offset=20, n_layers=20
+    // Should resolve indices 20, 21, ..., 39
+    auto mock = createMockBuilder(20, 20);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    std::vector<int> resolved_indices;
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights
+    {
+        resolved_indices.push_back(idx);
+        return LayerWeights{};
+    };
+
+    orchestrator->setWeights(weights);
+
+    // Should have resolved indices 20..39
+    ASSERT_EQ(resolved_indices.size(), 20u);
+    EXPECT_EQ(resolved_indices.front(), 20);
+    EXPECT_EQ(resolved_indices.back(), 39);
+    for (int i = 0; i < 20; ++i)
+    {
+        EXPECT_EQ(resolved_indices[i], 20 + i);
+    }
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, FrozenLambdaReturnsCorrectWeightsForGlobalIndices)
+{
+    // PP Stage 1: pp_layer_offset=12, n_layers=12 (layers 12..23)
+    // After freezing, the graph builder's get_layer_weights should return
+    // the correct LayerWeights when queried with global indices.
+    auto mock = createMockBuilder(12, 12);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    // Create unique marker tensors per layer
+    std::vector<std::unique_ptr<FP32Tensor>> markers;
+    for (int i = 0; i < 12; ++i)
+    {
+        markers.push_back(std::make_unique<FP32Tensor>(
+            std::vector<size_t>{1}, DeviceId::cpu()));
+    }
+
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&markers](int idx) -> LayerWeights
+    {
+        // Map global index 12..23 to marker 0..11
+        int local = idx - 12;
+        if (local < 0 || local >= 12)
+            return LayerWeights{};
+        LayerWeights lw;
+        lw.attn_norm = markers[local].get();
+        return lw;
+    };
+
+    orchestrator->setWeights(weights);
+
+    // Now query the graph builder's frozen weights with global indices
+    const auto &frozen = mock->storedWeights();
+    ASSERT_TRUE(frozen.get_layer_weights);
+
+    // Global index 12 should return marker[0]
+    auto lw12 = frozen.get_layer_weights(12);
+    EXPECT_EQ(lw12.attn_norm, markers[0].get());
+
+    // Global index 23 should return marker[11]
+    auto lw23 = frozen.get_layer_weights(23);
+    EXPECT_EQ(lw23.attn_norm, markers[11].get());
+
+    // Global index 17 should return marker[5]
+    auto lw17 = frozen.get_layer_weights(17);
+    EXPECT_EQ(lw17.attn_norm, markers[5].get());
+
+    // Out-of-range indices should return empty LayerWeights
+    auto lw_below = frozen.get_layer_weights(11);
+    EXPECT_EQ(lw_below.attn_norm, nullptr);
+
+    auto lw_above = frozen.get_layer_weights(24);
+    EXPECT_EQ(lw_above.attn_norm, nullptr);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPStage0ResolvesFromZero)
+{
+    // PP Stage 0: pp_layer_offset=0, n_layers=20 (layers 0..19)
+    // Equivalent to single-device with 20 layers
+    auto mock = createMockBuilder(20, 0);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    std::vector<int> resolved_indices;
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [&resolved_indices](int idx) -> LayerWeights
+    {
+        resolved_indices.push_back(idx);
+        return LayerWeights{};
+    };
+
+    orchestrator->setWeights(weights);
+
+    ASSERT_EQ(resolved_indices.size(), 20u);
+    EXPECT_EQ(resolved_indices[0], 0);
+    EXPECT_EQ(resolved_indices[19], 19);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator_WeightPreResolution, PPCallbackRejectingOutOfRangeDoesNotCrash)
+{
+    // Simulates the real PP weight callback from InferenceRunnerFactory
+    // which returns empty LayerWeights{} for indices outside its stage range.
+    // This test verifies that our frozen lambda doesn't crash even when the
+    // original callback would have returned empty (shouldn't happen with
+    // correct offset, but tests resilience).
+    auto mock = createMockBuilder(20, 20);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(mock, nullptr);
+
+    // Simulate the real PP wrapper: only accepts indices [20, 40)
+    ModelWeights weights;
+    weights.embedding_table = nullptr;
+    weights.final_norm = nullptr;
+    weights.lm_head = nullptr;
+    weights.get_layer_weights = [](int idx) -> LayerWeights
+    {
+        if (idx < 20 || idx >= 40)
+            return LayerWeights{}; // Reject out-of-range
+        LayerWeights lw;
+        // Use a non-null pointer to distinguish valid from empty
+        lw.wq = reinterpret_cast<TensorBase *>(static_cast<uintptr_t>(idx + 1));
+        return lw;
+    };
+
+    // Should NOT crash — this was the original bug
+    EXPECT_NO_THROW(orchestrator->setWeights(weights));
+
+    // Verify the frozen lambda returns correct pointers for valid indices
+    const auto &frozen = mock->storedWeights();
+    auto lw20 = frozen.get_layer_weights(20);
+    EXPECT_EQ(lw20.wq, reinterpret_cast<TensorBase *>(21));
+
+    auto lw39 = frozen.get_layer_weights(39);
+    EXPECT_EQ(lw39.wq, reinterpret_cast<TensorBase *>(40));
+
+    // Out-of-range returns null
+    auto lw0 = frozen.get_layer_weights(0);
+    EXPECT_EQ(lw0.wq, nullptr);
+}
 // - DeviceWorkspaceManager allocation verification

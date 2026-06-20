@@ -80,7 +80,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllGatherStage] Using CollectiveContext, seq_len=" << seq_len
+            LOG_DEBUG("[AllGatherStage] Using CollectiveContext, seq_len=" << seq_len
                                                                           << " local_dim=" << local_shape[1]
                                                                           << " full_dim=" << full_shape[1]);
         }
@@ -98,7 +98,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllGatherStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
+            LOG_DEBUG("[AllGatherStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
         }
 
         return success;
@@ -269,7 +269,7 @@ namespace llaminar2
         // Log MPI collective start
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[MPI] AllGather START: seq_len=" << seq_len
+            LOG_DEBUG("[MPI] AllGather START: seq_len=" << seq_len
                                                        << " vocab_local=" << vocab_local
                                                        << " vocab_full=" << vocab_full
                                                        << " world_size=" << world_size);
@@ -309,13 +309,13 @@ namespace llaminar2
             size_t total_elements = seq_len * vocab_local;
             double bytes = total_elements * sizeof(float) * world_size; // Total bytes gathered
             double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
-            LOG_INFO("[MPI] AllGather timing: " << ms << " ms for " << total_elements
+            LOG_DEBUG("[MPI] AllGather timing: " << ms << " ms for " << total_elements
                                                 << " elements/rank (" << bandwidth_gbps << " GB/s aggregate)");
         }
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[MPI] AllGather END: result=SUCCESS");
+            LOG_DEBUG("[MPI] AllGather END: result=SUCCESS");
         }
 
         // Debug: dump gathered logits at last position

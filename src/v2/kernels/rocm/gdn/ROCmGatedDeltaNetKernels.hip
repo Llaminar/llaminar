@@ -18,6 +18,37 @@
 #include <hip/hip_fp16.h>
 #include <cstdio>
 #include <cstdint>
+#include "../../../utils/DebugEnv.h"
+
+namespace {
+
+const char *memory_type_name(hipMemoryType type)
+{
+    switch (type)
+    {
+    case hipMemoryTypeHost: return "host";
+    case hipMemoryTypeDevice: return "device";
+    case hipMemoryTypeArray: return "array";
+    case hipMemoryTypeUnified: return "unified";
+    default: return "unknown";
+    }
+}
+
+void print_pointer_attrs(const char *label, const void *ptr)
+{
+    hipPointerAttribute_t attrs{};
+    hipError_t err = hipPointerGetAttributes(&attrs, ptr);
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmGDN_ptr] %s=%p attrs=%s\n", label, ptr, hipGetErrorString(err));
+        return;
+    }
+    fprintf(stderr, "[rocmGDN_ptr] %s=%p type=%s device=%d devicePointer=%p hostPointer=%p\n",
+            label, ptr, memory_type_name(attrs.type), attrs.device,
+            attrs.devicePointer, attrs.hostPointer);
+}
+
+} // anonymous namespace (diagnostics)
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 
@@ -26,16 +57,18 @@ namespace { // anonymous namespace to avoid symbol conflicts with CUDA kernels
 // =========================================================================
 // Decode Recurrence Kernel (seq_len=1, multi-block per head)
 //
-// Optimizations vs V1:
-//   1. Fused decay into per-column loops — eliminates separate decay pass
-//      and one full traversal of the d_k×d_v state matrix
-//   2. Two-pass column processing: Pass 1 reads state (decay+kv), Pass 2
-//      reads+writes (decay+update+output). Saves 50% memory traffic vs
-//      original 3-pass + decay.
-//   3. 2D grid: (n_heads, col_blocks) for better CU utilization on gfx906
-//      (was: 16 blocks / 60 CUs = 27%, now: 32+ blocks = 53%+)
-//   4. Single-wavefront blocks (64 threads) — L2 norm reduction is
-//      intra-wavefront shuffle only, no cross-warp shared memory needed
+// V3 Optimizations:
+//   1. ROW_SPLIT=4: 256 threads/block (4 wavefronts) — each column
+//      processed by 4 threads splitting d_k rows. Increases occupancy
+//      from 0.53 to 2.1 waves/CU on gfx906 (32→128 total wavefronts).
+//   2. Fused decay into per-column loops — eliminates separate decay pass
+//   3. Two-pass column processing: Pass 1 reads state (decay+kv), Pass 2
+//      reads+writes (decay+update+output). 50% traffic savings.
+//   4. 2D grid: (n_heads, col_blocks) with col_blocks = d_v / 64
+//   5. Shared-memory reduction for cross-wavefront kv/output sums
+//
+// Memory: d_k × d_v × 4 bytes per head = 64KB state
+// Occupancy: 128 wavefronts / 60 CUs = 2.1 waves/CU (was 0.53)
 // =========================================================================
 
 __global__ void rocm_gdn_recurrent_step_kernel(
@@ -49,7 +82,9 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     float *__restrict__ output,
     float *__restrict__ state,
     int n_heads, int d_k, int d_v,
-    bool use_qk_l2norm)
+    bool use_qk_l2norm,
+    const int *__restrict__ effective_seq_len_ptr,
+    int effective_row_idx)
 {
     const int h = blockIdx.x;
     if (h >= n_heads) return;
@@ -57,8 +92,12 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Column this thread handles (2D grid: blockIdx.y selects column tile)
-    const int vi = blockIdx.y * block_size + tid;
+    // ROW_SPLIT=4: 4 threads collaborate on each column, splitting d_k rows
+    constexpr int ROW_SPLIT = 4;
+    const int cols_per_block = block_size / ROW_SPLIT; // 64
+    const int split_id = tid / cols_per_block;         // 0..3
+    const int col_in_block = tid % cols_per_block;     // 0..63
+    const int vi = blockIdx.y * cols_per_block + col_in_block;
 
     const float *q_head = q + h * d_k;
     const float *k_head = k + h * d_k;
@@ -67,12 +106,25 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     float *o_head = output + h * d_v;
 
     extern __shared__ float smem[];
-    float *q_local = smem;
-    float *k_local = smem + d_k;
+    float *q_local = smem;                              // [d_k]
+    float *k_local = smem + d_k;                        // [d_k]
+    float *warp_sums = smem + 2 * d_k;                  // [4] for norm reduction
+    float *reduce_kv = smem + 2 * d_k + 4;             // [block_size]
+    float *reduce_out = smem + 2 * d_k + 4 + block_size; // [block_size]
 
     const float scale = rsqrtf((float)d_k);
+    const int warp_id = tid / 64;
+    const int lane_id = tid % 64;
+    const int num_warps = block_size / 64; // 4
 
-    // Load Q and K into shared memory (all threads cooperate)
+    if (effective_seq_len_ptr && effective_row_idx >= *effective_seq_len_ptr)
+    {
+        if (vi < d_v && split_id == 0)
+            o_head[vi] = 0.0f;
+        return;
+    }
+
+    // Load Q and K into shared memory (all 256 threads cooperate)
     for (int i = tid; i < d_k; i += block_size) {
         q_local[i] = q_head[i];
         k_local[i] = k_head[i];
@@ -80,26 +132,40 @@ __global__ void rocm_gdn_recurrent_step_kernel(
     __syncthreads();
 
     if (use_qk_l2norm) {
-        // Single-wavefront reduction — no cross-warp shared memory needed
-        // Q norm
+        // Multi-wavefront Q norm reduction
         float q_sum = 0.0f;
         for (int i = tid; i < d_k; i += block_size)
             q_sum += q_local[i] * q_local[i];
         for (int offset = 32; offset > 0; offset >>= 1)
             q_sum += __shfl_xor(q_sum, offset);
-        // All lanes in wavefront now have the full sum
-        float q_inv = scale / fmaxf(sqrtf(q_sum), 1e-6f);
+        if (lane_id == 0) warp_sums[warp_id] = q_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < num_warps; w++) total += warp_sums[w];
+            warp_sums[0] = total;
+        }
+        __syncthreads();
+        float q_inv = scale / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
         for (int i = tid; i < d_k; i += block_size)
             q_local[i] *= q_inv;
         __syncthreads();
 
-        // K norm
+        // Multi-wavefront K norm reduction
         float k_sum = 0.0f;
         for (int i = tid; i < d_k; i += block_size)
             k_sum += k_local[i] * k_local[i];
         for (int offset = 32; offset > 0; offset >>= 1)
             k_sum += __shfl_xor(k_sum, offset);
-        float k_inv = 1.0f / fmaxf(sqrtf(k_sum), 1e-6f);
+        if (lane_id == 0) warp_sums[warp_id] = k_sum;
+        __syncthreads();
+        if (tid == 0) {
+            float total = 0.0f;
+            for (int w = 0; w < num_warps; w++) total += warp_sums[w];
+            warp_sums[0] = total;
+        }
+        __syncthreads();
+        float k_inv = 1.0f / fmaxf(sqrtf(warp_sums[0]), 1e-6f);
         for (int i = tid; i < d_k; i += block_size)
             k_local[i] *= k_inv;
         __syncthreads();
@@ -109,58 +175,86 @@ __global__ void rocm_gdn_recurrent_step_kernel(
         __syncthreads();
     }
 
-    // Gate and beta — compute on lane 0, broadcast via shuffle
+    // Gate and beta — compute on thread 0, broadcast via shared memory
     float decay, beta_h;
     if (tid == 0) {
         float x = alpha[h] + dt_bias[h];
         float sp = (x > 20.0f) ? x : log1pf(expf(x));
-        decay = expf(A_log[h] * sp);
-        beta_h = 1.0f / (1.0f + expf(-beta_raw[h]));
+        warp_sums[0] = expf(A_log[h] * sp);
+        warp_sums[1] = 1.0f / (1.0f + expf(-beta_raw[h]));
     }
-    decay = __shfl(decay, 0);
-    beta_h = __shfl(beta_h, 0);
+    __syncthreads();
+    decay = warp_sums[0];
+    beta_h = warp_sums[1];
 
-    // Fused per-column processing — NO separate decay pass
-    // Each thread owns one column vi and processes it end-to-end.
-    // Columns are independent so no sync needed between them.
-    if (vi < d_v) {
-        // Pass 1: Fused decay + kv dot product (read-only, no write-back)
-        // Saves writing the decayed state back to global memory
-        float kv = 0.0f;
-        for (int j = 0; j < d_k; j++) {
-            float s_decayed = S[j * d_v + vi] * decay;
-            kv += s_decayed * k_local[j];
+    // Row-split column processing: ROW_SPLIT=4 threads collaborate on each
+    // column, splitting d_k rows. Shared-memory reduction for kv and output.
+    {
+        const int rows_per_split = d_k / ROW_SPLIT;
+        const int j_start = split_id * rows_per_split;
+        const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
+
+        // Pass 1: Fused decay + partial kv dot product (read-only)
+        float partial_kv = 0.0f;
+        if (vi < d_v) {
+            for (int j = j_start; j < j_end; j++) {
+                float s_decayed = S[j * d_v + vi] * decay;
+                partial_kv += s_decayed * k_local[j];
+            }
+        }
+        reduce_kv[tid] = partial_kv;
+        __syncthreads();
+
+        // Reduce kv across splits and compute delta
+        float delta = 0.0f;
+        if (vi < d_v) {
+            float kv = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                kv += reduce_kv[col_in_block + s * cols_per_block];
+            delta = (v_head[vi] - kv) * beta_h;
         }
 
-        float delta = (v_head[vi] - kv) * beta_h;
-
-        // Pass 2: Fused decay + delta update + output (read-modify-write)
-        // Re-applies decay to avoid intermediate write-back
-        float out_vi = 0.0f;
-        for (int j = 0; j < d_k; j++) {
-            float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-            S[j * d_v + vi] = s_new;
-            out_vi += s_new * q_local[j];
+        // Pass 2: Fused decay + update + partial output (read-modify-write)
+        float partial_out = 0.0f;
+        if (vi < d_v) {
+            for (int j = j_start; j < j_end; j++) {
+                float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
+                S[j * d_v + vi] = s_new;
+                partial_out += s_new * q_local[j];
+            }
         }
-        o_head[vi] = out_vi;
+        reduce_out[tid] = partial_out;
+        __syncthreads();
+
+        // Reduce output across splits — only split_id=0 writes final output
+        if (vi < d_v && split_id == 0) {
+            float out_vi = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                out_vi += reduce_out[col_in_block + s * cols_per_block];
+            o_head[vi] = out_vi;
+        }
     }
 }
 
 // =========================================================================
-// Prefill Recurrence Kernel (seq_len>1, multi-block per head)
+// Prefill Recurrence Kernel (seq_len>1, register-cached state)
 //
-// Optimizations vs V1:
-//   1. 2D grid: dim3(n_heads, col_blocks) — each column block processes
-//      a subset of the d_v columns. Columns are fully independent in the
-//      delta-rule recurrence, so no cross-block sync is needed.
-//   2. Fused 2-pass column processing (same as decode kernel):
-//      Pass 1: decay + kv (read-only); Pass 2: decay + update + output
-//      (read-modify-write). Eliminates the separate decay pass.
-//   3. Each thread owns one column vi — all per-column operations are
-//      independent, so no __syncthreads() in the column processing body.
+// V4 optimizations:
+//   1. State cached in registers: each thread keeps its 32 state values
+//      in VGPRs across all 595 timesteps. State is loaded from global
+//      ONCE at kernel start and written back ONCE at end.
+//   2. Single-pass per timestep: kv dot product → delta → state update →
+//      output accumulation in ONE loop over the 32 cached rows.
+//   3. 2D grid: dim3(n_heads, col_blocks) with ROW_SPLIT=4 for parity.
+//   4. Eliminates ~1190 global memory state R/W passes per thread.
+//
+// Register budget: 32 state floats + ~20 other = 52 VGPRs per thread.
+// gfx906 has 256 VGPRs → max occupancy = 4 waves/SIMD = 16 waves/CU.
+// (Currently only 4 waves/CU from 1 block, so this is occupancy-neutral.)
 // =========================================================================
 
-__global__ void rocm_gdn_chunk_forward_kernel(
+__global__ __launch_bounds__(256, 2)
+void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ Q,
     const float *__restrict__ K,
     const float *__restrict__ V,
@@ -170,6 +264,10 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     const float *__restrict__ dt_bias,
     float *__restrict__ output,
     float *__restrict__ state,
+    const int *__restrict__ effective_seq_len_ptr,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm)
 {
@@ -179,11 +277,6 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
 
-    // Row-split parallelism: ROW_SPLIT threads collaborate on each
-    // column, splitting the d_k rows between them. With ROW_SPLIT=4 and
-    // 256 threads/block: 4 wavefronts/block — matches CUDA's reduction
-    // structure to minimize per-step rounding error that compounds through
-    // the GDN recurrence (ROW_SPLIT=8 caused 10-40x worse parity vs CUDA).
     constexpr int ROW_SPLIT = 4;
     const int cols_per_block = block_size / ROW_SPLIT;
     const int split_id = tid / cols_per_block;   // 0..ROW_SPLIT-1
@@ -200,7 +293,6 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     float *q_local = smem;
     float *k_local = smem + d_k;
     float *warp_sums = smem + 2 * d_k; // [16] for warp reduction
-    // Double-buffered reduction arrays for row-split partial sums
     float *reduce_kv = smem + 2 * d_k + 16;            // [block_size]
     float *reduce_out = smem + 2 * d_k + 16 + block_size; // [block_size]
 
@@ -218,11 +310,80 @@ __global__ void rocm_gdn_chunk_forward_kernel(
     }
     __syncthreads();
 
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
+
+    // =====================================================================
+    // REGISTER-CACHED STATE: Load state into registers ONCE
+    // Each thread owns rows_per_split (=d_k/ROW_SPLIT) state values for
+    // its column vi. With d_k=128, ROW_SPLIT=4: 32 floats per thread.
+    // =====================================================================
+    const int rows_per_split = d_k / ROW_SPLIT;
+    const int j_start = split_id * rows_per_split;
+
+    // Use individual variables in groups of 8 to help the compiler
+    // keep them in VGPRs (AMD compiler more likely to register-allocate
+    // fixed-size unrolled groups than a single large array).
+    float sc0, sc1, sc2, sc3, sc4, sc5, sc6, sc7;
+    float sc8, sc9, sc10, sc11, sc12, sc13, sc14, sc15;
+    float sc16, sc17, sc18, sc19, sc20, sc21, sc22, sc23;
+    float sc24, sc25, sc26, sc27, sc28, sc29, sc30, sc31;
+
+    if (vi < d_v) {
+        sc0  = S[(j_start +  0) * d_v + vi];
+        sc1  = S[(j_start +  1) * d_v + vi];
+        sc2  = S[(j_start +  2) * d_v + vi];
+        sc3  = S[(j_start +  3) * d_v + vi];
+        sc4  = S[(j_start +  4) * d_v + vi];
+        sc5  = S[(j_start +  5) * d_v + vi];
+        sc6  = S[(j_start +  6) * d_v + vi];
+        sc7  = S[(j_start +  7) * d_v + vi];
+        sc8  = S[(j_start +  8) * d_v + vi];
+        sc9  = S[(j_start +  9) * d_v + vi];
+        sc10 = S[(j_start + 10) * d_v + vi];
+        sc11 = S[(j_start + 11) * d_v + vi];
+        sc12 = S[(j_start + 12) * d_v + vi];
+        sc13 = S[(j_start + 13) * d_v + vi];
+        sc14 = S[(j_start + 14) * d_v + vi];
+        sc15 = S[(j_start + 15) * d_v + vi];
+        sc16 = S[(j_start + 16) * d_v + vi];
+        sc17 = S[(j_start + 17) * d_v + vi];
+        sc18 = S[(j_start + 18) * d_v + vi];
+        sc19 = S[(j_start + 19) * d_v + vi];
+        sc20 = S[(j_start + 20) * d_v + vi];
+        sc21 = S[(j_start + 21) * d_v + vi];
+        sc22 = S[(j_start + 22) * d_v + vi];
+        sc23 = S[(j_start + 23) * d_v + vi];
+        sc24 = S[(j_start + 24) * d_v + vi];
+        sc25 = S[(j_start + 25) * d_v + vi];
+        sc26 = S[(j_start + 26) * d_v + vi];
+        sc27 = S[(j_start + 27) * d_v + vi];
+        sc28 = S[(j_start + 28) * d_v + vi];
+        sc29 = S[(j_start + 29) * d_v + vi];
+        sc30 = S[(j_start + 30) * d_v + vi];
+        sc31 = S[(j_start + 31) * d_v + vi];
+    } else {
+        sc0=sc1=sc2=sc3=sc4=sc5=sc6=sc7=0.0f;
+        sc8=sc9=sc10=sc11=sc12=sc13=sc14=sc15=0.0f;
+        sc16=sc17=sc18=sc19=sc20=sc21=sc22=sc23=0.0f;
+        sc24=sc25=sc26=sc27=sc28=sc29=sc30=sc31=0.0f;
+    }
+
     for (int t = 0; t < seq_len; t++) {
         const float *q_src = Q + t * qk_stride + h * d_k;
         const float *k_src = K + t * qk_stride + h * d_k;
         const float *v_src = V + t * v_stride + h * d_v;
         float *o_dst = output + t * v_stride + h * d_v;
+
+        if (t >= effective_seq_len) {
+            if (vi < d_v && split_id == 0)
+                o_dst[vi] = 0.0f;
+            continue;
+        }
 
         // Load Q and K into shared memory (all threads cooperate)
         for (int i = tid; i < d_k; i += block_size) {
@@ -287,62 +448,183 @@ __global__ void rocm_gdn_chunk_forward_kernel(
         decay = warp_sums[0];
         beta_h = warp_sums[1];
 
-        // Row-split column processing: each column is processed by
-        // ROW_SPLIT threads. Double-buffered shared memory reduction.
-        // NOTE: Register caching tested but regressed on gfx906 (AMD compiler
-        // places arrays in scratch memory). 2-pass approach is faster here.
-        {
-            const int rows_per_split = d_k / ROW_SPLIT;
-            const int j_start = split_id * rows_per_split;
-            const int j_end = (split_id == ROW_SPLIT - 1) ? d_k : j_start + rows_per_split;
+        // =================================================================
+        // SINGLE-PASS register-cached state processing
+        // Pass 1: decay state + accumulate kv dot product (from registers)
+        // =================================================================
+        float partial_kv = 0.0f;
+        if (vi < d_v) {
+            // Apply decay to cached state and compute kv dot product
+            sc0 *= decay; partial_kv += sc0 * k_local[j_start + 0];
+            sc1 *= decay; partial_kv += sc1 * k_local[j_start + 1];
+            sc2 *= decay; partial_kv += sc2 * k_local[j_start + 2];
+            sc3 *= decay; partial_kv += sc3 * k_local[j_start + 3];
+            sc4 *= decay; partial_kv += sc4 * k_local[j_start + 4];
+            sc5 *= decay; partial_kv += sc5 * k_local[j_start + 5];
+            sc6 *= decay; partial_kv += sc6 * k_local[j_start + 6];
+            sc7 *= decay; partial_kv += sc7 * k_local[j_start + 7];
+            sc8 *= decay; partial_kv += sc8 * k_local[j_start + 8];
+            sc9 *= decay; partial_kv += sc9 * k_local[j_start + 9];
+            sc10 *= decay; partial_kv += sc10 * k_local[j_start + 10];
+            sc11 *= decay; partial_kv += sc11 * k_local[j_start + 11];
+            sc12 *= decay; partial_kv += sc12 * k_local[j_start + 12];
+            sc13 *= decay; partial_kv += sc13 * k_local[j_start + 13];
+            sc14 *= decay; partial_kv += sc14 * k_local[j_start + 14];
+            sc15 *= decay; partial_kv += sc15 * k_local[j_start + 15];
+            sc16 *= decay; partial_kv += sc16 * k_local[j_start + 16];
+            sc17 *= decay; partial_kv += sc17 * k_local[j_start + 17];
+            sc18 *= decay; partial_kv += sc18 * k_local[j_start + 18];
+            sc19 *= decay; partial_kv += sc19 * k_local[j_start + 19];
+            sc20 *= decay; partial_kv += sc20 * k_local[j_start + 20];
+            sc21 *= decay; partial_kv += sc21 * k_local[j_start + 21];
+            sc22 *= decay; partial_kv += sc22 * k_local[j_start + 22];
+            sc23 *= decay; partial_kv += sc23 * k_local[j_start + 23];
+            sc24 *= decay; partial_kv += sc24 * k_local[j_start + 24];
+            sc25 *= decay; partial_kv += sc25 * k_local[j_start + 25];
+            sc26 *= decay; partial_kv += sc26 * k_local[j_start + 26];
+            sc27 *= decay; partial_kv += sc27 * k_local[j_start + 27];
+            sc28 *= decay; partial_kv += sc28 * k_local[j_start + 28];
+            sc29 *= decay; partial_kv += sc29 * k_local[j_start + 29];
+            sc30 *= decay; partial_kv += sc30 * k_local[j_start + 30];
+            sc31 *= decay; partial_kv += sc31 * k_local[j_start + 31];
+        }
+        reduce_kv[tid] = partial_kv;
+        __syncthreads();
 
-            // Pass 1: Fused decay + partial kv dot product
-            float partial_kv = 0.0f;
-            if (vi < d_v)
-            {
-                for (int j = j_start; j < j_end; j++)
-                {
-                    float s_decayed = S[j * d_v + vi] * decay;
-                    partial_kv += s_decayed * k_local[j];
-                }
-            }
-            reduce_kv[tid] = partial_kv;
-            __syncthreads();
+        // Reduce kv across splits and compute delta
+        float delta = 0.0f;
+        if (vi < d_v) {
+            float kv = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                kv += reduce_kv[col_in_block + s * cols_per_block];
+            delta = (v_src[vi] - kv) * beta_h;
+        }
 
-            // Reduce kv across all splits and compute delta
-            float delta = 0.0f;
-            if (vi < d_v)
-            {
-                float kv = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    kv += reduce_kv[col_in_block + s * cols_per_block];
-                delta = (v_src[vi] - kv) * beta_h;
-            }
+        // =================================================================
+        // Pass 2: Update state + accumulate output (all in registers)
+        // =================================================================
+        float partial_out = 0.0f;
+        if (vi < d_v) {
+            sc0 += k_local[j_start + 0] * delta; partial_out += sc0 * q_local[j_start + 0];
+            sc1 += k_local[j_start + 1] * delta; partial_out += sc1 * q_local[j_start + 1];
+            sc2 += k_local[j_start + 2] * delta; partial_out += sc2 * q_local[j_start + 2];
+            sc3 += k_local[j_start + 3] * delta; partial_out += sc3 * q_local[j_start + 3];
+            sc4 += k_local[j_start + 4] * delta; partial_out += sc4 * q_local[j_start + 4];
+            sc5 += k_local[j_start + 5] * delta; partial_out += sc5 * q_local[j_start + 5];
+            sc6 += k_local[j_start + 6] * delta; partial_out += sc6 * q_local[j_start + 6];
+            sc7 += k_local[j_start + 7] * delta; partial_out += sc7 * q_local[j_start + 7];
+            sc8 += k_local[j_start + 8] * delta; partial_out += sc8 * q_local[j_start + 8];
+            sc9 += k_local[j_start + 9] * delta; partial_out += sc9 * q_local[j_start + 9];
+            sc10 += k_local[j_start + 10] * delta; partial_out += sc10 * q_local[j_start + 10];
+            sc11 += k_local[j_start + 11] * delta; partial_out += sc11 * q_local[j_start + 11];
+            sc12 += k_local[j_start + 12] * delta; partial_out += sc12 * q_local[j_start + 12];
+            sc13 += k_local[j_start + 13] * delta; partial_out += sc13 * q_local[j_start + 13];
+            sc14 += k_local[j_start + 14] * delta; partial_out += sc14 * q_local[j_start + 14];
+            sc15 += k_local[j_start + 15] * delta; partial_out += sc15 * q_local[j_start + 15];
+            sc16 += k_local[j_start + 16] * delta; partial_out += sc16 * q_local[j_start + 16];
+            sc17 += k_local[j_start + 17] * delta; partial_out += sc17 * q_local[j_start + 17];
+            sc18 += k_local[j_start + 18] * delta; partial_out += sc18 * q_local[j_start + 18];
+            sc19 += k_local[j_start + 19] * delta; partial_out += sc19 * q_local[j_start + 19];
+            sc20 += k_local[j_start + 20] * delta; partial_out += sc20 * q_local[j_start + 20];
+            sc21 += k_local[j_start + 21] * delta; partial_out += sc21 * q_local[j_start + 21];
+            sc22 += k_local[j_start + 22] * delta; partial_out += sc22 * q_local[j_start + 22];
+            sc23 += k_local[j_start + 23] * delta; partial_out += sc23 * q_local[j_start + 23];
+            sc24 += k_local[j_start + 24] * delta; partial_out += sc24 * q_local[j_start + 24];
+            sc25 += k_local[j_start + 25] * delta; partial_out += sc25 * q_local[j_start + 25];
+            sc26 += k_local[j_start + 26] * delta; partial_out += sc26 * q_local[j_start + 26];
+            sc27 += k_local[j_start + 27] * delta; partial_out += sc27 * q_local[j_start + 27];
+            sc28 += k_local[j_start + 28] * delta; partial_out += sc28 * q_local[j_start + 28];
+            sc29 += k_local[j_start + 29] * delta; partial_out += sc29 * q_local[j_start + 29];
+            sc30 += k_local[j_start + 30] * delta; partial_out += sc30 * q_local[j_start + 30];
+            sc31 += k_local[j_start + 31] * delta; partial_out += sc31 * q_local[j_start + 31];
+        }
+        reduce_out[tid] = partial_out;
+        __syncthreads();
 
-            // Pass 2: Fused decay + update + partial output
-            float partial_out = 0.0f;
-            if (vi < d_v)
-            {
-                for (int j = j_start; j < j_end; j++)
-                {
-                    float s_new = S[j * d_v + vi] * decay + k_local[j] * delta;
-                    S[j * d_v + vi] = s_new;
-                    partial_out += s_new * q_local[j];
-                }
-            }
-            reduce_out[tid] = partial_out;
-            __syncthreads();
-
-            // Reduce output and write (only split_id=0 writes)
-            if (vi < d_v && split_id == 0)
-            {
-                float out_vi = 0.0f;
-                for (int s = 0; s < ROW_SPLIT; s++)
-                    out_vi += reduce_out[col_in_block + s * cols_per_block];
-                o_dst[vi] = out_vi;
-            }
+        // Reduce output and write (only split_id=0 writes)
+        if (vi < d_v && split_id == 0) {
+            float out_vi = 0.0f;
+            for (int s = 0; s < ROW_SPLIT; s++)
+                out_vi += reduce_out[col_in_block + s * cols_per_block];
+            o_dst[vi] = out_vi;
+        }
+        if (state_snapshots && t < max_snapshot_rows && vi < d_v) {
+            float *snapshot =
+                state_snapshots +
+                (size_t)t * snapshot_stride_floats +
+                (size_t)h * d_k * d_v;
+            snapshot[(j_start +  0) * d_v + vi] = sc0;
+            snapshot[(j_start +  1) * d_v + vi] = sc1;
+            snapshot[(j_start +  2) * d_v + vi] = sc2;
+            snapshot[(j_start +  3) * d_v + vi] = sc3;
+            snapshot[(j_start +  4) * d_v + vi] = sc4;
+            snapshot[(j_start +  5) * d_v + vi] = sc5;
+            snapshot[(j_start +  6) * d_v + vi] = sc6;
+            snapshot[(j_start +  7) * d_v + vi] = sc7;
+            snapshot[(j_start +  8) * d_v + vi] = sc8;
+            snapshot[(j_start +  9) * d_v + vi] = sc9;
+            snapshot[(j_start + 10) * d_v + vi] = sc10;
+            snapshot[(j_start + 11) * d_v + vi] = sc11;
+            snapshot[(j_start + 12) * d_v + vi] = sc12;
+            snapshot[(j_start + 13) * d_v + vi] = sc13;
+            snapshot[(j_start + 14) * d_v + vi] = sc14;
+            snapshot[(j_start + 15) * d_v + vi] = sc15;
+            snapshot[(j_start + 16) * d_v + vi] = sc16;
+            snapshot[(j_start + 17) * d_v + vi] = sc17;
+            snapshot[(j_start + 18) * d_v + vi] = sc18;
+            snapshot[(j_start + 19) * d_v + vi] = sc19;
+            snapshot[(j_start + 20) * d_v + vi] = sc20;
+            snapshot[(j_start + 21) * d_v + vi] = sc21;
+            snapshot[(j_start + 22) * d_v + vi] = sc22;
+            snapshot[(j_start + 23) * d_v + vi] = sc23;
+            snapshot[(j_start + 24) * d_v + vi] = sc24;
+            snapshot[(j_start + 25) * d_v + vi] = sc25;
+            snapshot[(j_start + 26) * d_v + vi] = sc26;
+            snapshot[(j_start + 27) * d_v + vi] = sc27;
+            snapshot[(j_start + 28) * d_v + vi] = sc28;
+            snapshot[(j_start + 29) * d_v + vi] = sc29;
+            snapshot[(j_start + 30) * d_v + vi] = sc30;
+            snapshot[(j_start + 31) * d_v + vi] = sc31;
         }
         __syncthreads();
+    }
+
+    // =====================================================================
+    // Write state back to global memory ONCE at the end
+    // =====================================================================
+    if (vi < d_v) {
+        S[(j_start +  0) * d_v + vi] = sc0;
+        S[(j_start +  1) * d_v + vi] = sc1;
+        S[(j_start +  2) * d_v + vi] = sc2;
+        S[(j_start +  3) * d_v + vi] = sc3;
+        S[(j_start +  4) * d_v + vi] = sc4;
+        S[(j_start +  5) * d_v + vi] = sc5;
+        S[(j_start +  6) * d_v + vi] = sc6;
+        S[(j_start +  7) * d_v + vi] = sc7;
+        S[(j_start +  8) * d_v + vi] = sc8;
+        S[(j_start +  9) * d_v + vi] = sc9;
+        S[(j_start + 10) * d_v + vi] = sc10;
+        S[(j_start + 11) * d_v + vi] = sc11;
+        S[(j_start + 12) * d_v + vi] = sc12;
+        S[(j_start + 13) * d_v + vi] = sc13;
+        S[(j_start + 14) * d_v + vi] = sc14;
+        S[(j_start + 15) * d_v + vi] = sc15;
+        S[(j_start + 16) * d_v + vi] = sc16;
+        S[(j_start + 17) * d_v + vi] = sc17;
+        S[(j_start + 18) * d_v + vi] = sc18;
+        S[(j_start + 19) * d_v + vi] = sc19;
+        S[(j_start + 20) * d_v + vi] = sc20;
+        S[(j_start + 21) * d_v + vi] = sc21;
+        S[(j_start + 22) * d_v + vi] = sc22;
+        S[(j_start + 23) * d_v + vi] = sc23;
+        S[(j_start + 24) * d_v + vi] = sc24;
+        S[(j_start + 25) * d_v + vi] = sc25;
+        S[(j_start + 26) * d_v + vi] = sc26;
+        S[(j_start + 27) * d_v + vi] = sc27;
+        S[(j_start + 28) * d_v + vi] = sc28;
+        S[(j_start + 29) * d_v + vi] = sc29;
+        S[(j_start + 30) * d_v + vi] = sc30;
+        S[(j_start + 31) * d_v + vi] = sc31;
     }
 }
 
@@ -388,32 +670,185 @@ __global__ void rocm_short_conv1d_prefill_kernel(
     const float *__restrict__ bias,
     float *__restrict__ output,
     float *__restrict__ conv_state,
+    const int *__restrict__ effective_seq_len_ptr,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int seq_len, int channels, int kernel_size,
     bool apply_silu)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int ks_minus1 = kernel_size - 1;
     int total = seq_len * channels;
     if (idx >= total) return;
+
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
 
     int t = idx / channels;
     int ch = idx % channels;
 
     float sum = 0.0f;
-    for (int k = 0; k < kernel_size; k++) {
-        int src_t = t - (kernel_size - 1) + k;
-        float val = (src_t >= 0) ? input[src_t * channels + ch] : 0.0f;
-        sum += val * weight[ch * kernel_size + k];
-    }
+    if (t < effective_seq_len) {
+        for (int k = 0; k < kernel_size; k++) {
+            int src_t = t - ks_minus1 + k;
+            float val = 0.0f;
+            if (src_t >= 0)
+                val = input[src_t * channels + ch];
+            else if (conv_state)
+                val = conv_state[ch * ks_minus1 + ks_minus1 + src_t];
+            sum += val * weight[ch * kernel_size + k];
+        }
 
-    if (bias) sum += bias[ch];
-    if (apply_silu)
-        sum = sum / (1.0f + expf(-sum));
+        if (bias) sum += bias[ch];
+        if (apply_silu)
+            sum = sum / (1.0f + expf(-sum));
+    }
     output[t * channels + ch] = sum;
 
+    if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows) {
+        float *snapshot =
+            state_snapshots +
+            (size_t)t * snapshot_stride_floats +
+            (size_t)ch * ks_minus1;
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx) {
+            int src_t = t - ks_minus1 + 1 + state_idx;
+            snapshot[state_idx] =
+                (src_t >= 0) ? input[src_t * channels + ch]
+                             : (conv_state ? conv_state[ch * ks_minus1 + ks_minus1 + src_t] : 0.0f);
+        }
+    }
+}
+
+/**
+ * @brief Decode-equivalent grouped short-conv kernel for MTP verifier rows.
+ *
+ * The verifier only uses very small row counts (currently M=2..4).  The
+ * ordinary prefill route needs two launches so the final live state cannot race
+ * with threads that still read the old state.  This kernel avoids that launch
+ * tax by assigning one lane to each channel, walking the tiny row group in
+ * causal order, publishing each post-row state snapshot, then updating the live
+ * state once all reads from the old state for that channel are complete.
+ */
+__global__ void rocm_short_conv1d_small_m_kernel(
+    const float *__restrict__ input,
+    const float *__restrict__ weight,
+    const float *__restrict__ bias,
+    float *__restrict__ output,
+    float *__restrict__ conv_state,
+    const int *__restrict__ effective_seq_len_ptr,
+    float *__restrict__ state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int seq_len, int channels, int kernel_size,
+    bool apply_silu)
+{
+    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels)
+        return;
+
+    const int ks_minus1 = kernel_size - 1;
+    if (ks_minus1 <= 0)
+        return;
+
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len =
+            raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
+
+    const float *channel_weight = weight + static_cast<size_t>(ch) * kernel_size;
+    const float *initial_state =
+        conv_state ? conv_state + static_cast<size_t>(ch) * ks_minus1 : nullptr;
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        float sum = 0.0f;
+        if (t < effective_seq_len)
+        {
+            for (int k = 0; k < kernel_size; ++k)
+            {
+                const int src_t = t - ks_minus1 + k;
+                const float val =
+                    (src_t >= 0)
+                        ? input[static_cast<size_t>(src_t) * channels + ch]
+                        : (initial_state
+                               ? initial_state[ks_minus1 + src_t]
+                               : 0.0f);
+                sum += val * channel_weight[k];
+            }
+
+            if (bias)
+                sum += bias[ch];
+            if (apply_silu)
+                sum = sum / (1.0f + expf(-sum));
+        }
+        output[static_cast<size_t>(t) * channels + ch] = sum;
+
+        if (state_snapshots && t < effective_seq_len && t < max_snapshot_rows)
+        {
+            float *snapshot =
+                state_snapshots +
+                static_cast<size_t>(t) * snapshot_stride_floats +
+                static_cast<size_t>(ch) * ks_minus1;
+            for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+            {
+                const int src_t = t - ks_minus1 + 1 + state_idx;
+                snapshot[state_idx] =
+                    (src_t >= 0)
+                        ? input[static_cast<size_t>(src_t) * channels + ch]
+                        : (initial_state
+                               ? initial_state[ks_minus1 + src_t]
+                               : 0.0f);
+            }
+        }
+    }
+
+    if (conv_state)
+    {
+        float *state = conv_state + static_cast<size_t>(ch) * ks_minus1;
+        for (int state_idx = 0; state_idx < ks_minus1; ++state_idx)
+        {
+            const int src_t = effective_seq_len - ks_minus1 + state_idx;
+            state[state_idx] =
+                (src_t >= 0 && src_t < effective_seq_len)
+                    ? input[static_cast<size_t>(src_t) * channels + ch]
+                    : initial_state[ks_minus1 + src_t];
+        }
+    }
+}
+
+__global__ void rocm_short_conv1d_state_update_kernel(
+    const float *__restrict__ input,
+    float *__restrict__ conv_state,
+    const int *__restrict__ effective_seq_len_ptr,
+    int seq_len, int channels, int kernel_size)
+{
+    int ch = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ch >= channels || !conv_state) return;
+
     int ks_minus1 = kernel_size - 1;
-    if (t >= seq_len - ks_minus1 && conv_state) {
-        int state_idx = t - (seq_len - ks_minus1);
-        conv_state[ch * ks_minus1 + state_idx] = input[t * channels + ch];
+    if (ks_minus1 <= 0) return;
+
+    int effective_seq_len = seq_len;
+    if (effective_seq_len_ptr)
+    {
+        const int raw_effective = *effective_seq_len_ptr;
+        effective_seq_len = raw_effective < 1 ? 1 : (raw_effective > seq_len ? seq_len : raw_effective);
+    }
+
+    float *state = conv_state + ch * ks_minus1;
+    for (int state_idx = 0; state_idx < ks_minus1; ++state_idx) {
+        int src_t = effective_seq_len - ks_minus1 + state_idx;
+        state[state_idx] =
+            (src_t >= 0 && src_t < effective_seq_len) ? input[src_t * channels + ch]
+                                                       : state[ks_minus1 + src_t];
     }
 }
 
@@ -535,6 +970,9 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
     int seq_len, int n_k_heads, int n_v_heads,
     int d_k, int d_v, int global_v_offset)
 {
+    if (n_k_heads <= 0 || n_v_heads <= 0 || d_k <= 0 || d_v <= 0)
+        return;
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     int q_src_dim = n_k_heads * d_k;
@@ -560,6 +998,8 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
         int j = rem / d_k;
         int d = rem % d_k;
         int k_idx = (j + global_v_offset) % n_k_heads;
+        if (k_idx < 0)
+            k_idx += n_k_heads;
         out_q[idx] = merged[t * stride + k_idx * d_k + d];
     }
     else if (idx < q_total + k_total)
@@ -570,6 +1010,8 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
         int j = rem / d_k;
         int d = rem % d_k;
         int k_idx = (j + global_v_offset) % n_k_heads;
+        if (k_idx < 0)
+            k_idx += n_k_heads;
         out_k[local] = merged[t * stride + q_src_dim + k_idx * d_k + d];
     }
     else
@@ -578,6 +1020,76 @@ __global__ void rocm_gdn_deinterleave_qkv_kernel(
         int t = local / v_dim;
         int d = local % v_dim;
         out_v[local] = merged[t * stride + q_src_dim + k_src_dim + d];
+    }
+}
+
+/**
+ * Copy one captured verifier state row selected by a device scalar.
+ *
+ * The accepted-row selector is produced by GPU stochastic verifier metadata.
+ * Reading it here keeps GDN/short-conv state publication on the verifier stream
+ * and avoids a host synchronization just to discover the row index.
+ */
+__global__ void rocm_gdn_copy_capture_row_from_device_index_kernel(
+    float *__restrict__ dst,
+    const float *__restrict__ capture,
+    const int *__restrict__ row_index,
+    int rows,
+    int state_size)
+{
+    if (!dst || !capture || !row_index || rows <= 0 || state_size <= 0)
+        return;
+    const int row = *row_index;
+    if (row < 0 || row >= rows)
+        return;
+
+    const float *src =
+        capture + static_cast<size_t>(row) * static_cast<size_t>(state_size);
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x;
+         i < state_size;
+         i += stride)
+    {
+        dst[i] = src[i];
+    }
+}
+
+/**
+ * Copy one captured verifier state row into each request's live-state slot.
+ *
+ * A negative row index leaves that request untouched. This lets the compact
+ * device-side MTP metadata publish only accepted requests without a host sync.
+ */
+__global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
+    float *__restrict__ dst,
+    const float *__restrict__ capture,
+    const int *__restrict__ row_indices,
+    int request_count,
+    int row_index_stride,
+    int rows,
+    int state_size)
+{
+    if (!dst || !capture || !row_indices ||
+        request_count <= 0 || row_index_stride <= 0 ||
+        rows <= 0 || state_size <= 0)
+    {
+        return;
+    }
+
+    const int total = request_count * state_size;
+    const int stride = blockDim.x * gridDim.x;
+    for (int linear = blockIdx.x * blockDim.x + threadIdx.x;
+         linear < total;
+         linear += stride)
+    {
+        const int request = linear / state_size;
+        const int state_offset = linear - request * state_size;
+        const int row = row_indices[request * row_index_stride];
+        if (row < 0 || row >= rows)
+            continue;
+        dst[linear] =
+            capture[static_cast<size_t>(row) * static_cast<size_t>(state_size) +
+                    static_cast<size_t>(state_offset)];
     }
 }
 
@@ -640,6 +1152,99 @@ void rocmGDN_stream_synchronize(void *stream)
     hipStreamSynchronize((hipStream_t)stream);
 }
 
+bool rocmGDN_gpu_copy_capture_row_from_device_index(
+    float *dst,
+    const float *capture,
+    const int *device_row_index,
+    int rows,
+    int state_size,
+    int device_idx,
+    void *stream)
+{
+    if (!dst || !capture || !device_row_index ||
+        rows <= 0 || state_size <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = (state_size + threads - 1) / threads;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+    hipLaunchKernelGGL(
+        rocm_gdn_copy_capture_row_from_device_index_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        (hipStream_t)stream,
+        dst,
+        capture,
+        device_row_index,
+        rows,
+        state_size);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_gpu_copy_capture_row_from_device_index] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
+    float *dst,
+    const float *capture,
+    const int *device_row_indices,
+    int request_count,
+    int row_index_stride,
+    int rows,
+    int state_size,
+    int device_idx,
+    void *stream)
+{
+    if (!dst || !capture || !device_row_indices ||
+        request_count <= 0 || row_index_stride <= 0 ||
+        rows <= 0 || state_size <= 0 || !stream)
+    {
+        return false;
+    }
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    constexpr int threads = 256;
+    int blocks = ((request_count * state_size) + threads - 1) / threads;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+    hipLaunchKernelGGL(
+        rocm_gdn_copy_capture_rows_from_device_indices_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        (hipStream_t)stream,
+        dst,
+        capture,
+        device_row_indices,
+        request_count,
+        row_index_stride,
+        rows,
+        state_size);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
 } // extern "C" (memory helpers)
 
 // =========================================================================
@@ -655,6 +1260,14 @@ bool rocmGDN_deinterleave_qkv(
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
+    {
+        print_pointer_attrs("merged", merged);
+        print_pointer_attrs("out_q", out_q);
+        print_pointer_attrs("out_k", out_k);
+        print_pointer_attrs("out_v", out_v);
+    }
 
     int q_dst_dim = n_v_heads * d_k;
     int k_dst_dim = n_v_heads * d_k;
@@ -674,6 +1287,15 @@ bool rocmGDN_deinterleave_qkv(
     {
         fprintf(stderr, "[rocmGDN_deinterleave_qkv] %s\n", hipGetErrorString(err));
         return false;
+    }
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_deinterleave_qkv_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -697,35 +1319,122 @@ bool rocmGDN_recurrent_step(
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
-    // 2D grid: x=heads, y=column tiles (64 threads = 1 wavefront per block)
-    int col_threads = 64;
-    int num_col_blocks = (d_v + col_threads - 1) / col_threads;
-    int smem_size = 2 * d_k * sizeof(float);
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
+    {
+        print_pointer_attrs("q", q);
+        print_pointer_attrs("k", k);
+        print_pointer_attrs("v", v);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+    }
+
+    // ROW_SPLIT=4: 256 threads/block (4 wavefronts), 64 columns per block.
+    // Increases occupancy from 0.53 to 2.1 waves/CU on gfx906 (32→128 wavefronts).
+    // Shared memory: q[d_k] + k[d_k] + warp_sums[4] + reduce_kv[256] + reduce_out[256]
+    int col_threads = 256;
+    int cols_per_block = col_threads / 4; // 64 columns with ROW_SPLIT=4
+    int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    int smem_size = (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
 
     hipLaunchKernelGGL(rocm_gdn_recurrent_step_kernel,
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         q, k, v, alpha, beta_raw, A_log, dt_bias,
         output, state,
-        n_heads, d_k, d_v, use_qk_l2norm);
+        n_heads, d_k, d_v, use_qk_l2norm,
+        nullptr,
+        -1);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "[rocmGDN_recurrent_step] %s\n", hipGetErrorString(err));
         return false;
     }
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_recurrent_step_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
     return true;
 }
 
-bool rocmGDN_chunk_forward(
+bool rocmGDN_recurrent_step_effective_row(
+    const float *q, const float *k, const float *v,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    const int *device_effective_seq_len,
+    int row_idx,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    int col_threads = 256;
+    const int cols_per_block = col_threads / 4;
+    const int num_col_blocks = (d_v + cols_per_block - 1) / cols_per_block;
+    const int smem_size = (2 * d_k + 4 + 2 * col_threads) * sizeof(float);
+
+    hipLaunchKernelGGL(rocm_gdn_recurrent_step_kernel,
+        dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
+        q, k, v, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        n_heads, d_k, d_v, use_qk_l2norm,
+        device_effective_seq_len,
+        row_idx);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "[rocmGDN_recurrent_step_effective_row] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_recurrent_step_effective_row_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmGDN_chunk_forward_kernel_route(
     const float *Q, const float *K, const float *V,
     const float *alpha, const float *beta_raw,
     const float *A_log, const float *dt_bias,
     float *output, float *state,
     int seq_len, int n_heads, int d_k, int d_v,
     bool use_qk_l2norm,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    const int *device_effective_seq_len,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
+    {
+        print_pointer_attrs("Q", Q);
+        print_pointer_attrs("K", K);
+        print_pointer_attrs("V", V);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+    }
 
     // Row-split: 256 threads per block, 4 threads per column = 64 cols/block.
     // 4 wavefronts/block — matches CUDA's ROW_SPLIT=4 to reduce per-step
@@ -745,12 +1454,111 @@ bool rocmGDN_chunk_forward(
         dim3(n_heads, num_col_blocks), dim3(col_threads), smem_size, (hipStream_t)stream,
         Q, K, V, alpha, beta_raw, A_log, dt_bias,
         output, state,
+        device_effective_seq_len,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
         seq_len, n_heads, d_k, d_v, use_qk_l2norm);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "[rocmGDN_chunk_forward] %s\n", hipGetErrorString(err));
         return false;
+    }
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_chunk_forward_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool rocmGDN_chunk_forward(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    /*
+     * MTP verifier chunks are tiny, but routing them through one kernel per row
+     * loses the speedup we need.  The chunk kernel processes timesteps
+     * sequentially inside one launch, keeps each thread's recurrence-state
+     * slice resident in registers, and publishes the post-row state snapshots.
+     * That is the desired grouped/concurrent contract: no hidden serial launch
+     * loop, while preserving the same recurrence order as serial decode.
+     */
+    return rocmGDN_chunk_forward_kernel_route(
+        Q, K, V, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
+        nullptr,
+        device_idx, stream);
+}
+
+bool rocmGDN_chunk_forward_effective(
+    const float *Q, const float *K, const float *V,
+    const float *alpha, const float *beta_raw,
+    const float *A_log, const float *dt_bias,
+    float *output, float *state,
+    int seq_len, int n_heads, int d_k, int d_v,
+    bool use_qk_l2norm,
+    const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (llaminar2::debugEnv().rocm.gdn_ptr_trace)
+    {
+        print_pointer_attrs("Q", Q);
+        print_pointer_attrs("K", K);
+        print_pointer_attrs("V", V);
+        print_pointer_attrs("alpha", alpha);
+        print_pointer_attrs("beta", beta_raw);
+        print_pointer_attrs("A_log", A_log);
+        print_pointer_attrs("dt_bias", dt_bias);
+        print_pointer_attrs("output", output);
+        print_pointer_attrs("state", state);
+        print_pointer_attrs("effective_seq_len", device_effective_seq_len);
+    }
+
+    const bool ok = rocmGDN_chunk_forward_kernel_route(
+        Q, K, V, alpha, beta_raw, A_log, dt_bias,
+        output, state,
+        seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+        state_snapshots,
+        snapshot_stride_floats,
+        max_snapshot_rows,
+        device_effective_seq_len,
+        device_idx, stream);
+    if (!ok)
+        return false;
+
+    if (llaminar2::debugEnv().rocm.gdn_sync)
+    {
+        hipError_t err = hipStreamSynchronize((hipStream_t)stream);
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmGDN_chunk_forward_effective_sync] %s\n", hipGetErrorString(err));
+            return false;
+        }
     }
     return true;
 }
@@ -760,6 +1568,9 @@ bool rocmGDN_short_conv1d(
     float *output, float *conv_state,
     int seq_len, int channels, int kernel_size,
     bool apply_silu,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
@@ -771,6 +1582,17 @@ bool rocmGDN_short_conv1d(
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
             channels, kernel_size, apply_silu);
+    } else if (seq_len <= 4) {
+        int threads = 256;
+        int blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            nullptr,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            seq_len, channels, kernel_size, apply_silu);
     } else {
         int total = seq_len * channels;
         int threads = 256;
@@ -778,12 +1600,79 @@ bool rocmGDN_short_conv1d(
         hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
             dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
             input, weight, bias, output, conv_state,
+            nullptr,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
             seq_len, channels, kernel_size, apply_silu);
+        int state_blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
+            dim3(state_blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, conv_state, nullptr,
+            seq_len, channels, kernel_size);
     }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess) {
         fprintf(stderr, "[rocmGDN_short_conv1d] %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_short_conv1d_effective(
+    const float *input, const float *weight, const float *bias,
+    float *output, float *conv_state,
+    int seq_len, int channels, int kernel_size,
+    bool apply_silu,
+    const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    if (seq_len == 1) {
+        int threads = 256;
+        int blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_decode_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            channels, kernel_size, apply_silu);
+    } else if (seq_len <= 4) {
+        int threads = 256;
+        int blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_small_m_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            seq_len, channels, kernel_size, apply_silu);
+    } else {
+        int total = seq_len * channels;
+        int threads = 256;
+        int blocks = (total + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_prefill_kernel,
+            dim3(blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, weight, bias, output, conv_state,
+            device_effective_seq_len,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows,
+            seq_len, channels, kernel_size, apply_silu);
+        int state_blocks = (channels + threads - 1) / threads;
+        hipLaunchKernelGGL(rocm_short_conv1d_state_update_kernel,
+            dim3(state_blocks), dim3(threads), 0, (hipStream_t)stream,
+            input, conv_state, device_effective_seq_len,
+            seq_len, channels, kernel_size);
+    }
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess) {
+        fprintf(stderr, "[rocmGDN_short_conv1d_effective] %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

@@ -56,6 +56,12 @@ namespace llaminar2
         const std::string &node_name,
         const StageDumpInfo &dump_info)>;
 
+    using StageFailureCallback = std::function<void(
+        const std::string &node_name,
+        const std::string &reason)>;
+
+    using ExecutionCancellationCallback = std::function<bool()>;
+
     /**
      * @brief Configuration for DeviceGraphExecutor
      */
@@ -68,6 +74,15 @@ namespace llaminar2
 
         /// Callback invoked after each stage executes (for snapshot capture)
         StageSnapshotCallback snapshot_callback = nullptr;
+
+        /// Callback invoked immediately when a stage fails. TP runners use this
+        /// to abort shared collective contexts before sibling workers enter the
+        /// next collective.
+        StageFailureCallback stage_failure_callback = nullptr;
+
+        /// Callback queried before each stage. Return true to cancel this graph
+        /// pass because a peer worker or rank already failed.
+        ExecutionCancellationCallback cancellation_requested = nullptr;
 
         // Context for stage dumping (set by pipeline before each layer)
         int current_layer_idx = -1; ///< Current layer being executed
@@ -214,6 +229,9 @@ namespace llaminar2
 
         /// Print a formatted profiling summary to stdout
         void printProfilingSummary(size_t prefill_tokens, size_t decode_tokens) const;
+
+        /// Export host-side executor stage/profile attribution into PerfStatsCollector.
+        void recordPerfStats(const std::string &device_name = {}) const;
 
     private:
         static thread_local ExecutionPhase current_phase_;

@@ -88,6 +88,44 @@ namespace llaminar2
     // GlobalPPTopology
     // =========================================================================
 
+    namespace
+    {
+        std::vector<int> ranksForStage(const GlobalPPStageSpec &stage)
+        {
+            std::vector<int> ranks;
+            if (stage.is_global_tp)
+            {
+                ranks = stage.participating_ranks;
+            }
+            else if (stage.owning_rank >= 0)
+            {
+                ranks.push_back(stage.owning_rank);
+            }
+
+            std::sort(ranks.begin(), ranks.end());
+            ranks.erase(std::unique(ranks.begin(), ranks.end()), ranks.end());
+            return ranks;
+        }
+
+        int sourceRankForStage(const GlobalPPStageSpec &stage, const std::vector<int> &stage_ranks)
+        {
+            if (!stage.is_global_tp)
+            {
+                return stage.owning_rank;
+            }
+            return stage_ranks.empty() ? -1 : stage_ranks.front();
+        }
+
+        int tagForTransfer(size_t transition_index, int receiver_rank, bool single_receiver)
+        {
+            if (single_receiver)
+            {
+                return 1000 + static_cast<int>(transition_index);
+            }
+            return 1000 + static_cast<int>(transition_index) * 100 + receiver_rank;
+        }
+    }
+
     GlobalPPTopology GlobalPPTopology::build(std::vector<GlobalPPStageSpec> specs,
                                             int num_layers, int num_ranks)
     {
@@ -107,100 +145,48 @@ namespace llaminar2
         {
             const auto &from_stage = topo.stages[i];
             const auto &to_stage = topo.stages[i + 1];
+            const auto from_ranks = ranksForStage(from_stage);
+            const auto to_ranks = ranksForStage(to_stage);
 
-            GlobalPPTransfer transfer;
-            transfer.from_stage = from_stage.stage_id;
-            transfer.to_stage = to_stage.stage_id;
-            transfer.mpi_tag = 1000 + static_cast<int>(i); // Unique tag per transfer
-
-            // Determine sender and receiver ranks
-            if (from_stage.is_global_tp && to_stage.is_global_tp)
+            if (from_ranks.empty() || to_ranks.empty())
             {
-                // Both are global TP — check which receiver ranks need data
-                std::set<int> sender_set(from_stage.participating_ranks.begin(),
-                                         from_stage.participating_ranks.end());
+                continue;
+            }
 
-                std::vector<int> needs_data;
-                for (int r : to_stage.participating_ranks)
+            std::set<int> from_set(from_ranks.begin(), from_ranks.end());
+            for (int rank : to_ranks)
+            {
+                if (from_set.find(rank) != from_set.end())
                 {
-                    if (sender_set.find(r) == sender_set.end())
-                    {
-                        needs_data.push_back(r);
-                    }
+                    GlobalPPTransfer handoff;
+                    handoff.kind = GlobalPPTransferKind::LOCAL_HANDOFF;
+                    handoff.from_stage = from_stage.stage_id;
+                    handoff.to_stage = to_stage.stage_id;
+                    handoff.sender_rank = rank;
+                    handoff.receiver_rank = rank;
+                    handoff.mpi_tag = tagForTransfer(i, rank, false);
+                    topo.transfers.push_back(handoff);
                 }
+            }
 
-                if (needs_data.empty())
+            const int src = sourceRankForStage(from_stage, from_ranks);
+            const bool single_receiver = to_ranks.size() == 1;
+            for (int target_rank : to_ranks)
+            {
+                if (from_set.find(target_rank) != from_set.end())
                 {
-                    // All receiver ranks already have data — no transfer needed
                     continue;
                 }
 
-                // Fan-out from designated sender (first rank in sender domain)
-                int src = from_stage.participating_ranks[0];
-                for (int target_rank : needs_data)
-                {
-                    GlobalPPTransfer fan_out;
-                    fan_out.from_stage = from_stage.stage_id;
-                    fan_out.to_stage = to_stage.stage_id;
-                    fan_out.sender_rank = src;
-                    fan_out.receiver_rank = target_rank;
-                    fan_out.mpi_tag = 1000 + static_cast<int>(i) * 100 + target_rank;
-                    topo.transfers.push_back(fan_out);
-                }
-                continue;
+                GlobalPPTransfer transfer;
+                transfer.kind = GlobalPPTransferKind::MPI;
+                transfer.from_stage = from_stage.stage_id;
+                transfer.to_stage = to_stage.stage_id;
+                transfer.sender_rank = src;
+                transfer.receiver_rank = target_rank;
+                transfer.mpi_tag = tagForTransfer(i, target_rank, single_receiver);
+                topo.transfers.push_back(transfer);
             }
-            else if (from_stage.is_global_tp)
-            {
-                // Global TP → single-rank: the owning rank of the next stage
-                // already participated in global TP (or needs data from it)
-                int dest = to_stage.owning_rank;
-                if (from_stage.rankParticipates(dest))
-                {
-                    // Destination rank already has the data — no transfer needed
-                    transfer.sender_rank = dest;
-                    transfer.receiver_rank = dest;
-                }
-                else
-                {
-                    // Need to pick a sender from the global TP participants
-                    transfer.sender_rank = from_stage.participating_ranks[0];
-                    transfer.receiver_rank = dest;
-                }
-            }
-            else if (to_stage.is_global_tp)
-            {
-                // Single-rank → global TP: the owning rank needs to send to all others
-                // Actually, we only need to send to participants that DON'T have the data
-                int src = from_stage.owning_rank;
-
-                // Each non-source participant needs to receive
-                // We create one transfer per non-source participant
-                // For simplicity, we just record the primary transfer here;
-                // the rank plan builder handles fan-out
-                for (int target_rank : to_stage.participating_ranks)
-                {
-                    if (target_rank != src)
-                    {
-                        GlobalPPTransfer fan_out;
-                        fan_out.from_stage = from_stage.stage_id;
-                        fan_out.to_stage = to_stage.stage_id;
-                        fan_out.sender_rank = src;
-                        fan_out.receiver_rank = target_rank;
-                        fan_out.mpi_tag = 1000 + static_cast<int>(i) * 100 + target_rank;
-                        topo.transfers.push_back(fan_out);
-                    }
-                }
-                // Mark the primary transfer as handled (skip the push below)
-                continue;
-            }
-            else
-            {
-                // Single-rank → single-rank
-                transfer.sender_rank = from_stage.owning_rank;
-                transfer.receiver_rank = to_stage.owning_rank;
-            }
-
-            topo.transfers.push_back(transfer);
         }
 
         return topo;
@@ -458,6 +444,8 @@ namespace llaminar2
             oss << "  Stage " << stage.stage_id << ": layers ["
                 << stage.first_layer << "-" << stage.last_layer << "]";
 
+            if (!stage.domain_name.empty()) oss << " domain=" << stage.domain_name;
+
             if (stage.has_embedding) oss << " +embedding";
             if (stage.has_lm_head) oss << " +lm_head";
 
@@ -492,10 +480,13 @@ namespace llaminar2
 
         for (const auto &t : transfers)
         {
-            oss << "  Transfer: stage " << t.from_stage << " → " << t.to_stage
+            oss << "  Transfer: " << globalPPTransferKindName(t.kind)
+                << " stage " << t.from_stage << " → " << t.to_stage
                 << " (rank " << t.sender_rank << " → " << t.receiver_rank
                 << " tag=" << t.mpi_tag;
-            if (t.isNoop()) oss << " NO-OP";            if (t.locality != TransferLocality::UNKNOWN) oss << " " << transferLocalityName(t.locality);            oss << ")\n";
+            if (t.isNoop()) oss << " NO-OP";
+            if (t.locality != TransferLocality::UNKNOWN) oss << " " << transferLocalityName(t.locality);
+            oss << ")\n";
         }
 
         oss << "}";
@@ -511,12 +502,12 @@ namespace llaminar2
         table.set_border_style(FT_DOUBLE2_STYLE);
 
         table << fort::header
-              << "Stage" << "Layers" << "Rank(s)" << "Embed" << "LM Head"
+              << "Stage" << "Domain" << "Layers" << "Rank(s)" << "Embed" << "LM Head"
               << "Mode" << "Device(s)" << fort::endr;
 
         table.column(0).set_cell_text_align(fort::text_align::center);
-        table.column(3).set_cell_text_align(fort::text_align::center);
         table.column(4).set_cell_text_align(fort::text_align::center);
+        table.column(5).set_cell_text_align(fort::text_align::center);
 
         for (const auto &stage : stages)
         {
@@ -560,6 +551,7 @@ namespace llaminar2
             }
 
             table << std::to_string(stage.stage_id)
+                  << (stage.domain_name.empty() ? "-" : stage.domain_name)
                   << layer_range
                   << ranks
                   << (stage.has_embedding ? "Y" : "-")
@@ -581,14 +573,15 @@ namespace llaminar2
             ttable.set_border_style(FT_DOUBLE2_STYLE);
 
             ttable << fort::header
-                   << "From" << "To" << "Sender" << "Receiver"
+                   << "Type" << "From" << "To" << "Sender" << "Receiver"
                    << "Locality" << "Tag" << fort::endr;
 
             ttable.column(0).set_cell_text_align(fort::text_align::center);
             ttable.column(1).set_cell_text_align(fort::text_align::center);
             ttable.column(2).set_cell_text_align(fort::text_align::center);
             ttable.column(3).set_cell_text_align(fort::text_align::center);
-            ttable.column(5).set_cell_text_align(fort::text_align::center);
+            ttable.column(4).set_cell_text_align(fort::text_align::center);
+            ttable.column(6).set_cell_text_align(fort::text_align::center);
 
             for (const auto &t : transfers)
             {
@@ -599,7 +592,8 @@ namespace llaminar2
                 else
                     locality = "-";
 
-                ttable << ("Stage " + std::to_string(t.from_stage))
+                ttable << globalPPTransferKindName(t.kind)
+                       << ("Stage " + std::to_string(t.from_stage))
                        << ("Stage " + std::to_string(t.to_stage))
                        << ("Rank " + std::to_string(t.sender_rank))
                        << ("Rank " + std::to_string(t.receiver_rank))

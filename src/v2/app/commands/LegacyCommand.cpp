@@ -17,10 +17,13 @@
 #include "app/modes/ServerMode.h"
 #include "app/modes/CompletionMode.h"
 #include "config/OrchestrationConfigParser.h"
+#include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "utils/Logger.h"
 #include "utils/MPIBootstrap.h"
+#include <algorithm>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <vector>
 
 namespace llaminar2
@@ -49,6 +52,70 @@ namespace llaminar2
 
         if (config.show_topology)
         {
+            if (config.usesNamedDomains() && !config.pp_stage_definitions.empty())
+            {
+                ModelConfig model_config;
+                for (const auto &stage : config.pp_stage_definitions)
+                {
+                    model_config.n_layers = std::max(model_config.n_layers, stage.last_layer + 1);
+                }
+                if (model_config.n_layers <= 0)
+                    model_config.n_layers = 1;
+
+                std::set<int> ranks{0};
+                for (const auto &domain : config.domain_definitions)
+                {
+                    if (domain.owner_rank.has_value())
+                        ranks.insert(*domain.owner_rank);
+                    for (int r : domain.explicit_ranks)
+                        ranks.insert(r);
+                    for (const auto &device : domain.devices)
+                    {
+                        if (device.isCPU() && device.hasValidNuma())
+                            ranks.insert(device.numa_node);
+                    }
+                }
+
+                ClusterInventory inventory;
+                inventory.world_size = *ranks.rbegin() + 1;
+                inventory.ranks.reserve(static_cast<size_t>(inventory.world_size));
+                for (int rank = 0; rank < inventory.world_size; ++rank)
+                {
+                    RankInventory rank_inv;
+                    rank_inv.rank = rank;
+                    rank_inv.node_id = 0;
+                    rank_inv.local_rank = rank;
+                    rank_inv.hostname = "localhost";
+                    rank_inv.numa_nodes = inventory.world_size;
+
+                    for (const auto &domain : config.domain_definitions)
+                    {
+                        if (!domain.owner_rank.has_value() || *domain.owner_rank != rank)
+                            continue;
+                        for (const auto &device : domain.devices)
+                        {
+                            if (!device.isGPU())
+                                continue;
+                            DeviceInfo gpu;
+                            gpu.type = device.device_type;
+                            gpu.local_device_id = device.device_ordinal;
+                            gpu.numa_node = device.numa_node;
+                            rank_inv.gpus.push_back(gpu);
+                        }
+                    }
+
+                    inventory.ranks.push_back(std::move(rank_inv));
+                }
+                inventory.buildNodeAggregations();
+
+                ExecutionPlanBuilder builder;
+                auto topology = builder.buildGlobalPPTopology(config, model_config, inventory);
+                std::cout << "\n=== Multi-Domain Pipeline Topology ===\n"
+                          << renderMultiDomainTopologyInfo(topology, inventory.world_size)
+                          << std::endl;
+                return 0;
+            }
+
             auto topo = MPIBootstrap::detectCPUTopology();
             std::cout << "\n=== CPU Topology ===\n"
                       << "  Detection method  : " << topo.detection_method << "\n"

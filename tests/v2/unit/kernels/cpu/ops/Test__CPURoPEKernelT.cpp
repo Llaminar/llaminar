@@ -81,6 +81,52 @@ namespace llaminar2
         }
 
         /**
+         * @brief Reference partial RoPE implementation using full head stride.
+         *
+         * Partial RoPE rotates only the first rotary_dim values in each head,
+         * but the physical head still has head_dim values. This mirrors Qwen3.5
+         * style partial rotary embeddings and catches stride/denominator mixups.
+         */
+        void reference_partial_rope(
+            float *data,
+            int seq_len,
+            int n_heads,
+            int head_dim,
+            int rotary_dim,
+            const int *position_ids,
+            float rope_theta)
+        {
+            const int half_rotary = rotary_dim / 2;
+            const int token_stride = n_heads * head_dim;
+
+            for (int tok = 0; tok < seq_len; ++tok)
+            {
+                int position = position_ids ? position_ids[tok] : tok;
+                if (position < 0)
+                    continue;
+
+                for (int h = 0; h < n_heads; ++h)
+                {
+                    float *head_data = data + tok * token_stride + h * head_dim;
+
+                    for (int i = 0; i < half_rotary; ++i)
+                    {
+                        float freq = 1.0f / std::pow(rope_theta, static_cast<float>(2 * i) / rotary_dim);
+                        float angle = position * freq;
+                        float cos_val = std::cos(angle);
+                        float sin_val = std::sin(angle);
+
+                        float x = head_data[i];
+                        float y = head_data[i + half_rotary];
+
+                        head_data[i] = x * cos_val - y * sin_val;
+                        head_data[i + half_rotary] = x * sin_val + y * cos_val;
+                    }
+                }
+            }
+        }
+
+        /**
          * @brief Generate random FP32 data
          */
         std::vector<float> generate_random_fp32(size_t count, float min_val = -2.0f, float max_val = 2.0f)
@@ -258,6 +304,254 @@ namespace llaminar2
 
         float max_diff = max_abs_diff(q_data.data(), q_expected.data(), q_size);
         EXPECT_LT(max_diff, FP32_TOLERANCE);
+    }
+
+    TEST_F(CPURoPEKernelTTest, FP32_partial_rotary_keeps_full_head_stride)
+    {
+        constexpr int local_seq_len = 3;
+        constexpr int local_n_heads = 4;
+        constexpr int local_n_kv_heads = 2;
+        constexpr int local_head_dim = 16;
+        constexpr int local_rotary_dim = 4;
+
+        const size_t q_size = local_seq_len * local_n_heads * local_head_dim;
+        const size_t k_size = local_seq_len * local_n_kv_heads * local_head_dim;
+
+        auto q_data = generate_random_fp32(q_size);
+        auto k_data = generate_random_fp32(k_size);
+        std::vector<float> q_original = q_data;
+        std::vector<float> k_original = k_data;
+        std::vector<float> q_expected = q_data;
+        std::vector<float> k_expected = k_data;
+        std::vector<int> position_ids = {7, 8, 9};
+
+        reference_partial_rope(q_expected.data(), local_seq_len, local_n_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+        reference_partial_rope(k_expected.data(), local_seq_len, local_n_kv_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        ASSERT_TRUE(kernel.apply_typed(q_data.data(), k_data.data(), position_ids.data(),
+                                       local_seq_len, local_n_heads, local_n_kv_heads,
+                                       local_head_dim, ROPE_THETA, -1, local_rotary_dim));
+
+        EXPECT_LT(max_abs_diff(q_data.data(), q_expected.data(), q_size), FP32_TOLERANCE);
+        EXPECT_LT(max_abs_diff(k_data.data(), k_expected.data(), k_size), FP32_TOLERANCE);
+
+        for (int tok = 0; tok < local_seq_len; ++tok)
+        {
+            for (int h = 0; h < local_n_heads; ++h)
+            {
+                for (int d = local_rotary_dim; d < local_head_dim; ++d)
+                {
+                    size_t idx = (static_cast<size_t>(tok) * local_n_heads + h) * local_head_dim + d;
+                    EXPECT_FLOAT_EQ(q_data[idx], q_original[idx]);
+                }
+            }
+            for (int h = 0; h < local_n_kv_heads; ++h)
+            {
+                for (int d = local_rotary_dim; d < local_head_dim; ++d)
+                {
+                    size_t idx = (static_cast<size_t>(tok) * local_n_kv_heads + h) * local_head_dim + d;
+                    EXPECT_FLOAT_EQ(k_data[idx], k_original[idx]);
+                }
+            }
+        }
+    }
+
+    TEST_F(CPURoPEKernelTTest, FP32_partial_rotary_handles_non_contiguous_positions)
+    {
+        constexpr int local_seq_len = 3;
+        constexpr int local_n_heads = 3;
+        constexpr int local_n_kv_heads = 2;
+        constexpr int local_head_dim = 16;
+        constexpr int local_rotary_dim = 8;
+
+        const size_t q_size = local_seq_len * local_n_heads * local_head_dim;
+        const size_t k_size = local_seq_len * local_n_kv_heads * local_head_dim;
+
+        auto q_data = generate_random_fp32(q_size);
+        auto k_data = generate_random_fp32(k_size);
+        std::vector<float> q_expected = q_data;
+        std::vector<float> k_expected = k_data;
+        std::vector<int> position_ids = {11, -1, 4};
+
+        reference_partial_rope(q_expected.data(), local_seq_len, local_n_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+        reference_partial_rope(k_expected.data(), local_seq_len, local_n_kv_heads,
+                               local_head_dim, local_rotary_dim,
+                               position_ids.data(), ROPE_THETA);
+
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        ASSERT_TRUE(kernel.apply_typed(q_data.data(), k_data.data(), position_ids.data(),
+                                       local_seq_len, local_n_heads, local_n_kv_heads,
+                                       local_head_dim, ROPE_THETA, -1, local_rotary_dim));
+
+        EXPECT_LT(max_abs_diff(q_data.data(), q_expected.data(), q_size), FP32_TOLERANCE);
+        EXPECT_LT(max_abs_diff(k_data.data(), k_expected.data(), k_size), FP32_TOLERANCE);
+    }
+
+    TEST_F(CPURoPEKernelTTest, FP32_grouped_verifier_rows_match_serial_decode_contract)
+    {
+        constexpr int local_n_heads = 4;
+        constexpr int local_n_kv_heads = 2;
+        constexpr int local_head_dim = 32;
+        const int q_cols = local_n_heads * local_head_dim;
+        const int k_cols = local_n_kv_heads * local_head_dim;
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+
+        for (int rows : {2, 3, 4})
+        {
+            SCOPED_TRACE("rows=" + std::to_string(rows));
+            const size_t q_size = static_cast<size_t>(rows) * q_cols;
+            const size_t k_size = static_cast<size_t>(rows) * k_cols;
+            auto q_seed = generate_random_fp32(q_size, -1.5f, 1.5f);
+            auto k_seed = generate_random_fp32(k_size, -1.5f, 1.5f);
+            std::vector<int> positions(static_cast<size_t>(rows));
+            for (int r = 0; r < rows; ++r)
+                positions[static_cast<size_t>(r)] = 101 + r;
+
+            FP32Tensor q_serial({static_cast<size_t>(rows), static_cast<size_t>(q_cols)});
+            FP32Tensor k_serial({static_cast<size_t>(rows), static_cast<size_t>(k_cols)});
+            FP32Tensor q_grouped({static_cast<size_t>(rows), static_cast<size_t>(q_cols)});
+            FP32Tensor k_grouped({static_cast<size_t>(rows), static_cast<size_t>(k_cols)});
+            std::copy(q_seed.begin(), q_seed.end(), q_serial.mutable_data());
+            std::copy(k_seed.begin(), k_seed.end(), k_serial.mutable_data());
+            std::copy(q_seed.begin(), q_seed.end(), q_grouped.mutable_data());
+            std::copy(k_seed.begin(), k_seed.end(), k_grouped.mutable_data());
+
+            /*
+             * Serial reference: copy one row into a one-token tensor and call
+             * the public decode contract. This mirrors the old verifier stage
+             * behavior without keeping that behavior in production code.
+             */
+            for (int r = 0; r < rows; ++r)
+            {
+                FP32Tensor q_row({1, static_cast<size_t>(q_cols)});
+                FP32Tensor k_row({1, static_cast<size_t>(k_cols)});
+                std::copy_n(q_serial.data() + static_cast<size_t>(r) * q_cols,
+                            q_cols,
+                            q_row.mutable_data());
+                std::copy_n(k_serial.data() + static_cast<size_t>(r) * k_cols,
+                            k_cols,
+                            k_row.mutable_data());
+                const int row_pos[1] = {positions[static_cast<size_t>(r)]};
+                ASSERT_TRUE(kernel.apply_tensor(
+                    &q_row,
+                    &k_row,
+                    row_pos,
+                    1,
+                    local_n_heads,
+                    local_n_kv_heads,
+                    local_head_dim,
+                    ROPE_THETA,
+                    nullptr,
+                    -1,
+                    row_pos[0],
+                    0));
+                std::copy_n(q_row.data(),
+                            q_cols,
+                            q_serial.mutable_data() + static_cast<size_t>(r) * q_cols);
+                std::copy_n(k_row.data(),
+                            k_cols,
+                            k_serial.mutable_data() + static_cast<size_t>(r) * k_cols);
+            }
+
+            ASSERT_TRUE(kernel.apply_verifier_rows_decode_equivalent(
+                &q_grouped,
+                &k_grouped,
+                positions.data(),
+                rows,
+                local_n_heads,
+                local_n_kv_heads,
+                local_head_dim,
+                ROPE_THETA,
+                nullptr,
+                -1,
+                positions.front(),
+                0));
+
+            EXPECT_LT(max_abs_diff(q_grouped.data(), q_serial.data(), q_size), 1e-6f);
+            EXPECT_LT(max_abs_diff(k_grouped.data(), k_serial.data(), k_size), 1e-6f);
+        }
+    }
+
+    TEST_F(CPURoPEKernelTTest, FP32_grouped_verifier_partial_rope_matches_serial_decode_contract)
+    {
+        constexpr int rows = 4;
+        constexpr int local_n_heads = 3;
+        constexpr int local_n_kv_heads = 2;
+        constexpr int local_head_dim = 32;
+        constexpr int local_rotary_dim = 8;
+        const int q_cols = local_n_heads * local_head_dim;
+        const int k_cols = local_n_kv_heads * local_head_dim;
+        const size_t q_size = static_cast<size_t>(rows) * q_cols;
+        const size_t k_size = static_cast<size_t>(rows) * k_cols;
+        auto q_seed = generate_random_fp32(q_size, -1.5f, 1.5f);
+        auto k_seed = generate_random_fp32(k_size, -1.5f, 1.5f);
+        const std::vector<int> positions = {23, 24, 25, 26};
+
+        FP32Tensor q_serial({static_cast<size_t>(rows), static_cast<size_t>(q_cols)});
+        FP32Tensor k_serial({static_cast<size_t>(rows), static_cast<size_t>(k_cols)});
+        FP32Tensor q_grouped({static_cast<size_t>(rows), static_cast<size_t>(q_cols)});
+        FP32Tensor k_grouped({static_cast<size_t>(rows), static_cast<size_t>(k_cols)});
+        std::copy(q_seed.begin(), q_seed.end(), q_serial.mutable_data());
+        std::copy(k_seed.begin(), k_seed.end(), k_serial.mutable_data());
+        std::copy(q_seed.begin(), q_seed.end(), q_grouped.mutable_data());
+        std::copy(k_seed.begin(), k_seed.end(), k_grouped.mutable_data());
+
+        CPURoPEKernelT<ActivationPrecision::FP32> kernel;
+        for (int r = 0; r < rows; ++r)
+        {
+            FP32Tensor q_row({1, static_cast<size_t>(q_cols)});
+            FP32Tensor k_row({1, static_cast<size_t>(k_cols)});
+            std::copy_n(q_serial.data() + static_cast<size_t>(r) * q_cols,
+                        q_cols,
+                        q_row.mutable_data());
+            std::copy_n(k_serial.data() + static_cast<size_t>(r) * k_cols,
+                        k_cols,
+                        k_row.mutable_data());
+            const int row_pos[1] = {positions[static_cast<size_t>(r)]};
+            ASSERT_TRUE(kernel.apply_tensor(
+                &q_row,
+                &k_row,
+                row_pos,
+                1,
+                local_n_heads,
+                local_n_kv_heads,
+                local_head_dim,
+                ROPE_THETA,
+                nullptr,
+                -1,
+                row_pos[0],
+                local_rotary_dim));
+            std::copy_n(q_row.data(),
+                        q_cols,
+                        q_serial.mutable_data() + static_cast<size_t>(r) * q_cols);
+            std::copy_n(k_row.data(),
+                        k_cols,
+                        k_serial.mutable_data() + static_cast<size_t>(r) * k_cols);
+        }
+
+        ASSERT_TRUE(kernel.apply_verifier_rows_decode_equivalent(
+            &q_grouped,
+            &k_grouped,
+            positions.data(),
+            rows,
+            local_n_heads,
+            local_n_kv_heads,
+            local_head_dim,
+            ROPE_THETA,
+            nullptr,
+            -1,
+            positions.front(),
+            local_rotary_dim));
+
+        EXPECT_LT(max_abs_diff(q_grouped.data(), q_serial.data(), q_size), 1e-6f);
+        EXPECT_LT(max_abs_diff(k_grouped.data(), k_serial.data(), k_size), 1e-6f);
     }
 
     // =========================================================================

@@ -14,13 +14,118 @@
 #include <gtest/gtest.h>
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "execution/compute_stages/IWorkspaceConsumerStage.h"
+#include "execution/local_execution/device/DeviceContext.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
+#include "../../../../utils/PreparedWeightTestHarness.h"
 #include <memory>
+#include <optional>
 
 using namespace llaminar2;
+using namespace llaminar2::test;
+
+namespace
+{
+    class RecordingFusedSwigluGemm final : public ITensorGemm, public IWorkspaceConsumer
+    {
+    public:
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(
+            const TensorBase *,
+            TensorBase *,
+            int,
+            int,
+            int,
+            bool,
+            float,
+            float,
+            const TensorBase *,
+            const IMPIContext *,
+            int,
+            DeviceWorkspaceManager *,
+            int) override
+        {
+            return false;
+        }
+
+        bool multiply_tensor_with_fused_swiglu(
+            const TensorBase *,
+            const TensorBase *,
+            TensorBase *,
+            int m,
+            int n,
+            int k,
+            float alpha = 1.0f,
+            float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            ++call_count;
+            observed_m = m;
+            observed_n = n;
+            observed_k = k;
+            observed_alpha = alpha;
+            observed_beta = beta;
+            observed_workspace = workspace;
+            return true;
+        }
+
+        WorkspaceRequirements getWorkspaceRequirements(int, int = 0, int = 0) const override
+        {
+            return WorkspaceRequirements{};
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override { bound_workspace = workspace; }
+        void unbindWorkspace() override { bound_workspace = nullptr; }
+        bool hasWorkspace() const override { return bound_workspace != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace; }
+
+        int call_count = 0;
+        int observed_m = 0;
+        int observed_n = 0;
+        int observed_k = 0;
+        float observed_alpha = 0.0f;
+        float observed_beta = 0.0f;
+        DeviceWorkspaceManager *observed_workspace = nullptr;
+        DeviceWorkspaceManager *bound_workspace = nullptr;
+    };
+
+    PreparedWeightRef registerRecordingGemm(
+        PreparedWeightStore &store,
+        TensorBase *tensor,
+        std::shared_ptr<RecordingFusedSwigluGemm> kernel,
+        const std::string &canonical_name,
+        ModelContextId model_id = ModelContextId{9901})
+    {
+        auto binding = makePreparedWeightTestBinding(
+            tensor,
+            DeviceId::cpu(),
+            canonical_name,
+            model_id);
+
+        auto prepared_weights =
+            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+        prepared_weights->kind =
+            llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+        prepared_weights->kernel = kernel.get();
+        prepared_weights->owned_kernel = kernel;
+
+        auto handle =
+            std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+        handle->tensor = tensor;
+        handle->device_id = DeviceId::cpu();
+        handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CPU_PACKED;
+        handle->prepared_weights = std::move(prepared_weights);
+
+        return store.registerPreparedGemmHandle(
+            binding,
+            PreparedWeightKind::CpuPackedGemm,
+            DeviceId::cpu(),
+            std::move(handle));
+    }
+}
 
 // =============================================================================
 // Test Fixture
@@ -43,6 +148,11 @@ protected:
         std::fill_n(A_->mutable_data(), 4 * 8, 0.0f);
         std::fill_n(B_->mutable_data(), 16 * 8, 0.0f);
         std::fill_n(C_->mutable_data(), 4 * 16, 0.0f);
+
+        prepared_B_.emplace(makePreparedGemmFixture(
+            B_.get(),
+            DeviceId::cpu(),
+            "blk.0.test_gemm.weight"));
     }
 
     // Helper to create valid params
@@ -59,10 +169,13 @@ protected:
         params.beta = 0.0f;
         params.transpose_B = true;
         params.device_id = DeviceId::cpu();
+        params.prepared_ref = prepared_B_->ref;
+        params.prepared_store = prepared_B_->store.get();
         return params;
     }
 
     std::unique_ptr<FP32Tensor> A_, B_, C_;
+    std::optional<PreparedGemmFixture> prepared_B_;
 };
 
 // =============================================================================
@@ -455,6 +568,21 @@ TEST_F(Test__GEMMStage, GetBufferRequirementsWithValidParams)
     });
 }
 
+TEST_F(Test__GEMMStage, GetBufferRequirementsUsesKForFusedSwigluGateInput)
+{
+    auto params = makeValidParams();
+    params.gate_input = A_.get();
+
+    GEMMStage stage(params);
+    StageBufferRequirements reqs = stage.getBufferRequirements();
+
+    const BufferDescriptor *gate = reqs.getByName("gate_input");
+    ASSERT_NE(gate, nullptr);
+    ASSERT_EQ(gate->shape.size(), 2u);
+    EXPECT_EQ(gate->shape[0], static_cast<size_t>(params.m));
+    EXPECT_EQ(gate->shape[1], static_cast<size_t>(params.k));
+}
+
 TEST_F(Test__GEMMStage, GetBufferRequirementsEmptyWithNullTensors)
 {
     GEMMStage::Params params;
@@ -471,6 +599,37 @@ TEST_F(Test__GEMMStage, GetBufferRequirementsEmptyWithNullTensors)
     // With null tensors, requirements should be empty
     StageBufferRequirements reqs = stage.getBufferRequirements();
     // Just verify no crash
+}
+
+TEST_F(Test__GEMMStage, ExecutePassesBoundWorkspaceToFusedSwigluKernel)
+{
+    auto params = makeValidParams();
+    auto gate = std::make_unique<FP32Tensor>(std::vector<size_t>{4, 8}, DeviceId::cpu());
+    std::fill_n(gate->mutable_data(), 4 * 8, 0.0f);
+
+    auto store = std::make_unique<PreparedWeightStore>(ModelContextId{9901});
+    auto kernel = std::make_shared<RecordingFusedSwigluGemm>();
+    params.prepared_store = store.get();
+    params.prepared_ref = registerRecordingGemm(
+        *store,
+        B_.get(),
+        kernel,
+        "blk.0.ffn_down.weight");
+    params.gate_input = gate.get();
+
+    GEMMStage stage(params);
+    DeviceWorkspaceManager workspace(DeviceId::cpu(), 1024);
+    stage.bindWorkspace(&workspace);
+
+    CPUDeviceContext ctx(DeviceId::cpu(), 1);
+    ASSERT_TRUE(stage.execute(&ctx));
+
+    EXPECT_EQ(kernel->call_count, 1);
+    EXPECT_EQ(kernel->observed_workspace, &workspace);
+    EXPECT_EQ(kernel->bound_workspace, &workspace);
+    EXPECT_EQ(kernel->observed_m, params.m);
+    EXPECT_EQ(kernel->observed_n, params.n);
+    EXPECT_EQ(kernel->observed_k, params.k);
 }
 
 // =============================================================================

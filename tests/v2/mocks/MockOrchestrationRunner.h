@@ -45,6 +45,21 @@ namespace llaminar2::test
             ON_CALL(*this, lastError()).WillByDefault(testing::ReturnRef(empty_error_));
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
+            ON_CALL(*this, supportsPrefillBatch(testing::_)).WillByDefault(testing::Return(false));
+            ON_CALL(*this, prefillBatch(testing::_)).WillByDefault(testing::Return(false));
+            ON_CALL(*this, supportsDecodeStepBatch(testing::_)).WillByDefault(testing::Return(false));
+            ON_CALL(*this, decodeStepBatch(testing::_))
+                .WillByDefault(testing::Return(GenerationBatchResult{{}, "decodeStepBatch unsupported"}));
+            ON_CALL(*this, forceDecodeToken(testing::_))
+                .WillByDefault(testing::Invoke([](int32_t token)
+                                               {
+                                                   GenerationResult r;
+                                                   r.tokens.push_back(token);
+                                                   return r;
+                                               }));
+            ON_CALL(*this, setDecodeStepTokenBudget(testing::_)).WillByDefault(testing::Return());
+            ON_CALL(*this, maybeApplyMoERebalance()).WillByDefault(testing::Return(true));
+            ON_CALL(*this, prefixStateProbe()).WillByDefault(testing::Return(PrefixRuntimeStateSnapshot{}));
         }
 
         // Lifecycle
@@ -53,12 +68,20 @@ namespace llaminar2::test
 
         // Inference
         MOCK_METHOD(bool, prefill, (const std::vector<int32_t> &tokens), (override));
+        MOCK_METHOD(bool, supportsPrefillBatch, (int request_batch), (const, override));
+        MOCK_METHOD(bool, prefillBatch,
+                    (const std::vector<std::vector<int32_t>> &token_batches), (override));
         MOCK_METHOD(GenerationResult, decodeStep, (), (override));
+        MOCK_METHOD(GenerationResult, forceDecodeToken, (int32_t token), (override));
+        MOCK_METHOD(bool, supportsDecodeStepBatch, (int request_batch), (const, override));
+        MOCK_METHOD(GenerationBatchResult, decodeStepBatch, (int request_batch), (override));
         MOCK_METHOD(GenerationResult, generate,
                     (const std::vector<int32_t> &prompt_tokens,
                      int max_new_tokens,
                      const SamplingParams &sampling),
                     (override));
+        MOCK_METHOD(void, setDecodeStepTokenBudget, (int max_tokens), (override));
+        MOCK_METHOD(bool, maybeApplyMoERebalance, (), (override));
 
         // Configuration
         MOCK_METHOD(const RankExecutionPlan &, executionPlan, (), (const, override));
@@ -90,6 +113,15 @@ namespace llaminar2::test
         MOCK_METHOD(void, flushStageTimeline, (), (override));
         MOCK_METHOD(void, setSkipLogitsGatherDecode, (bool skip), (override));
         MOCK_METHOD(void, setSkipLogitsGatherPrefill, (bool skip), (override));
+        MOCK_METHOD(std::string, getStopThinkingPrompt, (), (const, override));
+        MOCK_METHOD(ToolCallFormat, getToolCallFormat, (), (const, override));
+        MOCK_METHOD(PrefixRuntimeStateSnapshot, prefixStateProbe, (), (const, override));
+
+        // MPI worker coordination
+        MOCK_METHOD(void, runMPIWorkerLoop, (), (override));
+        MOCK_METHOD(void, shutdownMPIWorkers, (), (override));
+        MOCK_METHOD(void, abortMPIWorkers, (const std::string &reason), (override));
+        MOCK_METHOD(void, setMPICoordinatedMode, (bool enabled), (override));
 
         // =====================================================================
         // Test Helpers

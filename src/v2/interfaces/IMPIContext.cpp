@@ -41,6 +41,7 @@ namespace llaminar2
         int rank() const override { return rank_; }
         int world_size() const override { return world_size_; }
         bool is_root() const override { return rank_ == 0; }
+        int local_rank() const override { return rank_; }
         MPI_Comm communicator() const override { return MPI_COMM_NULL; }
 
         void barrier() const override

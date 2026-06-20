@@ -82,6 +82,22 @@ namespace llaminar2
         /// Handles all memory residency variants (standard, mapped).
         TransferResult transferActivation(TensorBase *tensor, DeviceId target_device);
 
+        /// Copy activation data from one tensor INTO another tensor's buffer on
+        /// dst_device, choosing the optimal transport automatically:
+        ///   - same physical GPU            → device-to-device copy (intra-VRAM)
+        ///   - same-vendor, different GPU   → peer copy (NCCL/RCCL or peer DMA)
+        ///   - cross-vendor GPU (CUDA↔ROCm) → host-staged bounce (no direct path)
+        ///   - source on host / mapped       → direct H2D (or host memcpy for mapped)
+        /// On success, dst becomes authoritative on dst_device.
+        ///
+        /// Unlike transferActivation() (which moves a single tensor between
+        /// devices), this performs a tensor→tensor copy where source and
+        /// destination are distinct buffers. Used for the PP hidden-state
+        /// handoff, where the producer's output must land in the consumer
+        /// graph's working buffer without a redundant device→host→device trip.
+        TransferResult copyActivation(TensorBase *src, TensorBase *dst,
+                                      DeviceId dst_device, size_t bytes);
+
         /// Full upload lifecycle: replaces TensorBase::ensureOnDevice() logic.
         /// Handles mapped, event wait, device migration, allocation, H2D.
         /// Caller must hold coherence_mutex_ and check graph-capture/CPU bailouts.

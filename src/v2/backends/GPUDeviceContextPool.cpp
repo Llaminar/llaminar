@@ -51,8 +51,8 @@ namespace llaminar2
         nvidia_factory_ = std::move(factory);
         cuda_device_count_ = device_count;
 
-        LOG_INFO("[GPUDeviceContextPool] Registered NVIDIA factory with "
-                 << device_count << " devices available");
+        LOG_DEBUG("[GPUDeviceContextPool] Registered NVIDIA factory with "
+                  << device_count << " devices available");
     }
 
     void GPUDeviceContextPool::registerAMDFactory(GPUContextFactory factory, int device_count)
@@ -62,8 +62,8 @@ namespace llaminar2
         amd_factory_ = std::move(factory);
         rocm_device_count_ = device_count;
 
-        LOG_INFO("[GPUDeviceContextPool] Registered AMD factory with "
-                 << device_count << " devices available");
+        LOG_DEBUG("[GPUDeviceContextPool] Registered AMD factory with "
+                  << device_count << " devices available");
     }
 
     // =============================================================================

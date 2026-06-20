@@ -2,7 +2,7 @@
  * @file Qwen35GraphConfigBuilder.h
  * @brief Qwen3.5-specific graph configuration builder
  *
- * Extends Qwen2GraphConfigBuilder with:
+ * Extends QwenStandardGraphConfigBuilder with:
  * - GDN-specific GGUF metadata parsing (ssm.*, full_attention_interval)
  * - Heterogeneous layer type assignment (GDN vs FA)
  * - GDN weight loading (attn_qkv, attn_gate, ssm_*)
@@ -12,7 +12,7 @@
 
 #pragma once
 
-#include "../qwen/Qwen2GraphConfigBuilder.h"
+#include "../qwen/QwenStandardGraphConfigBuilder.h"
 
 #include <optional>
 #include <string>
@@ -23,12 +23,12 @@ namespace llaminar2
     /**
      * @brief Qwen3.5-specific implementation of IGraphConfigBuilder
      *
-     * Inherits all TP/PP/device configuration from Qwen2GraphConfigBuilder.
+     * Inherits all TP/PP/device configuration from QwenStandardGraphConfigBuilder.
      * Overrides only the methods that differ for Qwen3.5:
      * - populateFromModelContext: reads GDN/hybrid metadata
      * - buildWeights: handles per-layer GDN vs FA weights
      */
-    class Qwen35GraphConfigBuilder : public Qwen2GraphConfigBuilder
+    class Qwen35GraphConfigBuilder : public QwenStandardGraphConfigBuilder
     {
     public:
         Qwen35GraphConfigBuilder() = default;

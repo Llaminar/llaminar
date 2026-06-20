@@ -48,10 +48,76 @@ extern "C" bool rocmInitIQGridTables_gemm(
     const void *h_iq2s_grid, const void *h_iq2xs_grid,
     const void *h_iq2xxs_grid, const void *h_iq1s_grid);
 
+// IQ grid table initialization for MoE grouped prefill TU (implemented in ROCmMoEGroupedPrefillKernels.hip)
+extern "C" bool rocmInitIQGridTables_moe_prefill(
+    int device_id,
+    const void *h_iq3s_grid, const void *h_iq3xxs_grid,
+    const void *h_iq2s_grid, const void *h_iq2xs_grid,
+    const void *h_iq2xxs_grid, const void *h_iq1s_grid);
+
 namespace llaminar2
 {
     namespace rocm
     {
+        bool ensureIQGridTablesInitialized(int device_id)
+        {
+#ifdef HAVE_ROCM
+            static std::mutex iq_grid_mutex;
+            static std::set<int> iq_grids_initialized_devices;
+
+            {
+                std::lock_guard<std::mutex> lock(iq_grid_mutex);
+                if (iq_grids_initialized_devices.find(device_id) != iq_grids_initialized_devices.end())
+                    return true;
+            }
+
+            LOG_DEBUG("[ROCmWeightPacker] Initializing IQ grid LUT tables on device "
+                      << device_id);
+            if (!rocmInitIQGridTables(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR("[ROCmWeightPacker] IQ grid GEMV init failed on device " << device_id);
+                return false;
+            }
+            if (!rocmInitIQGridTables_gemm(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR("[ROCmWeightPacker] IQ grid GEMM init failed on device " << device_id);
+                return false;
+            }
+            if (!rocmInitIQGridTables_moe_prefill(
+                    device_id,
+                    llaminar2::iq3s_grid,
+                    llaminar2::iq3xxs_grid,
+                    llaminar2::iq2s_grid,
+                    llaminar2::iq2xs_grid,
+                    llaminar2::iq2xxs_grid,
+                    llaminar2::iq1s_grid))
+            {
+                LOG_ERROR("[ROCmWeightPacker] IQ grid MoE prefill init failed on device " << device_id);
+                return false;
+            }
+
+            std::lock_guard<std::mutex> lock(iq_grid_mutex);
+            iq_grids_initialized_devices.insert(device_id);
+            return true;
+#else
+            (void)device_id;
+            return false;
+#endif
+        }
 
         // =================================================================
         // packNativeVNNI: polymorphic metadata + polymorphic block packing
@@ -75,54 +141,13 @@ namespace llaminar2
             // Lazy-initialize IQ grid lookup tables in GPU __constant__ memory
             if (info->codebook_id >= 11 && info->codebook_id <= 17)
             {
-                static std::mutex iq_grid_mutex;
-                static std::set<int> iq_grids_initialized_devices;
-
                 int current_device = 0;
 #ifdef HAVE_ROCM
                 hipGetDevice(&current_device);
-#elif defined(HAVE_CUDA)
-                cudaGetDevice(&current_device);
 #endif
 
-                bool needs_init = false;
-                {
-                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                    needs_init = (iq_grids_initialized_devices.find(current_device) ==
-                                  iq_grids_initialized_devices.end());
-                }
-
-                if (needs_init)
-                {
-                    LOG_INFO("[packNativeVNNI] Initializing IQ grid LUT tables on device "
-                             << current_device);
-                    if (!rocmInitIQGridTables(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] IQ grid GEMV init failed on device " << current_device);
-                        return false;
-                    }
-                    if (!rocmInitIQGridTables_gemm(
-                            current_device,
-                            llaminar2::iq3s_grid,
-                            llaminar2::iq3xxs_grid,
-                            llaminar2::iq2s_grid,
-                            llaminar2::iq2xs_grid,
-                            llaminar2::iq2xxs_grid,
-                            llaminar2::iq1s_grid))
-                    {
-                        LOG_ERROR("[packNativeVNNI] IQ grid GEMM init failed on device " << current_device);
-                        return false;
-                    }
-                    std::lock_guard<std::mutex> lock(iq_grid_mutex);
-                    iq_grids_initialized_devices.insert(current_device);
-                }
+                if (!ensureIQGridTablesInitialized(current_device))
+                    return false;
             }
 
             const int N = static_cast<int>(tensor->rows());
@@ -314,6 +339,232 @@ namespace llaminar2
                       << tensorTypeName(wt));
             return false;
         }
+
+    // =========================================================================
+    // MoE Batch Packing — pack all experts into one contiguous slab for ROCm
+    // =========================================================================
+
+    extern "C"
+    {
+        void rocmQuantGemm_freeDevice(void *d_ptr, int rocm_device_id);
+    }
+
+    MoEBatchPackedWeightsROCm::~MoEBatchPackedWeightsROCm()
+    {
+#ifdef HAVE_ROCM
+        for (auto &[device_id, upload] : device_uploads)
+        {
+            if (upload.d_native_vnni)
+                rocmQuantGemm_freeDevice(upload.d_native_vnni, device_id);
+            if (upload.d_native_scales)
+                rocmQuantGemm_freeDevice(upload.d_native_scales, device_id);
+            if (upload.d_native_mins)
+                rocmQuantGemm_freeDevice(upload.d_native_mins, device_id);
+            if (upload.d_native_emins)
+                rocmQuantGemm_freeDevice(upload.d_native_emins, device_id);
+        }
+#endif
+    }
+
+    bool MoEBatchPackedWeightsROCm::uploadToDevice(int rocm_device_id)
+    {
+#ifdef HAVE_ROCM
+        std::lock_guard<std::mutex> lock(upload_mutex);
+
+        auto it = device_uploads.find(rocm_device_id);
+        if (it != device_uploads.end())
+            return true;
+
+        DeviceUpload upload;
+
+        auto uploadBuffer = [&](const void *host_data, size_t bytes, void **d_ptr) -> bool
+        {
+            *d_ptr = nullptr;
+            if (!host_data || bytes == 0)
+                return true;
+            hipError_t err = hipSetDevice(rocm_device_id);
+            if (err != hipSuccess)
+                return false;
+            err = hipMalloc(d_ptr, bytes);
+            if (err != hipSuccess || !*d_ptr)
+                return false;
+            err = hipMemcpy(*d_ptr, host_data, bytes, hipMemcpyHostToDevice);
+            if (err != hipSuccess)
+            {
+                hipFree(*d_ptr);
+                *d_ptr = nullptr;
+                return false;
+            }
+            return true;
+        };
+
+        void *d_vnni = nullptr, *d_scales = nullptr, *d_mins = nullptr, *d_emins = nullptr;
+
+        if (!uploadBuffer(all_native_vnni.data(),
+                          all_native_vnni.size() * sizeof(uint8_t), &d_vnni) ||
+            !uploadBuffer(all_native_scales.data(),
+                          all_native_scales.size() * sizeof(uint16_t), &d_scales) ||
+            !uploadBuffer(all_native_mins.empty() ? nullptr : all_native_mins.data(),
+                          all_native_mins.size() * sizeof(uint16_t), &d_mins) ||
+            !uploadBuffer(all_native_emins.empty() ? nullptr : all_native_emins.data(),
+                          all_native_emins.size() * sizeof(uint32_t), &d_emins))
+        {
+            if (d_vnni) hipFree(d_vnni);
+            if (d_scales) hipFree(d_scales);
+            if (d_mins) hipFree(d_mins);
+            if (d_emins) hipFree(d_emins);
+            return false;
+        }
+
+        upload.d_native_vnni = reinterpret_cast<uint8_t *>(d_vnni);
+        upload.d_native_scales = d_scales;
+        upload.d_native_mins = d_mins;
+        upload.d_native_emins = d_emins;
+        device_uploads.emplace(rocm_device_id, upload);
+        return true;
+#else
+        (void)rocm_device_id;
+        return false;
+#endif
+    }
+
+    MoEBatchPackedWeightsROCm::DeviceUpload
+    MoEBatchPackedWeightsROCm::getExpertDevicePointers(int rocm_device_id, int expert_id) const
+    {
+        auto it = device_uploads.find(rocm_device_id);
+        if (it == device_uploads.end())
+            return {};
+
+        const auto &base = it->second;
+        DeviceUpload expert;
+        expert.d_native_vnni = base.d_native_vnni
+                                   ? base.d_native_vnni + expert_id * vnni_bytes_per_expert
+                                   : nullptr;
+        expert.d_native_scales = base.d_native_scales
+                                     ? reinterpret_cast<uint16_t *>(base.d_native_scales) + expert_id * scales_per_expert
+                                     : nullptr;
+        expert.d_native_mins = base.d_native_mins
+                                   ? reinterpret_cast<uint16_t *>(base.d_native_mins) + expert_id * mins_per_expert
+                                   : nullptr;
+        expert.d_native_emins = base.d_native_emins
+                                    ? reinterpret_cast<uint32_t *>(base.d_native_emins) + expert_id * emins_per_expert
+                                    : nullptr;
+        return expert;
+    }
+
+    void MoEBatchPackedWeightsROCm::freeHostBuffers()
+    {
+        const size_t freed = all_native_vnni.capacity() +
+                             all_native_scales.capacity() * sizeof(uint16_t) +
+                             all_native_mins.capacity() * sizeof(uint16_t) +
+                             all_native_emins.capacity() * sizeof(uint32_t);
+        all_native_vnni.clear();
+        all_native_vnni.shrink_to_fit();
+        all_native_scales.clear();
+        all_native_scales.shrink_to_fit();
+        all_native_mins.clear();
+        all_native_mins.shrink_to_fit();
+        all_native_emins.clear();
+        all_native_emins.shrink_to_fit();
+        if (freed > 0)
+        {
+            LOG_DEBUG("[MoEBatchPackedWeightsROCm] Released host buffers: "
+                      << (freed / (1024 * 1024)) << " MB");
+        }
+    }
+
+    std::shared_ptr<MoEBatchPackedWeightsROCm> packMoEExpertsROCm(
+        const std::vector<std::shared_ptr<TensorBase>> &expert_views,
+        int num_experts, int rows_per_expert)
+    {
+        if (expert_views.empty() || num_experts <= 0 || rows_per_expert <= 0)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] Invalid arguments");
+            return nullptr;
+        }
+
+        const auto *quant = dynamic_cast<const IINT8Unpackable *>(expert_views[0].get());
+        if (!quant)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] Expert view does not implement IINT8Unpackable");
+            return nullptr;
+        }
+        const auto *info = quant->vnniFormatInfo();
+        if (!info)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] Expert view has no VNNI format info");
+            return nullptr;
+        }
+
+        const int K = static_cast<int>(expert_views[0]->cols());
+        if ((K % 32) != 0)
+        {
+            LOG_ERROR("[packMoEExpertsROCm] K=" << K << " not divisible by 32");
+            return nullptr;
+        }
+
+        const int blocks_per_row = K / 32;
+
+        auto batch = std::make_shared<MoEBatchPackedWeightsROCm>();
+        batch->num_experts = num_experts;
+        batch->rows_per_expert = rows_per_expert;
+        batch->K = K;
+        batch->blocks_per_row = blocks_per_row;
+        batch->codebook_id = info->codebook_id;
+
+        batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
+        batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
+        batch->mins_per_expert = info->is_asymmetric ? batch->scales_per_expert : 0;
+        batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
+
+        batch->all_native_vnni.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
+        batch->all_native_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
+        if (info->is_asymmetric)
+            batch->all_native_mins.assign(static_cast<size_t>(num_experts) * batch->mins_per_expert, uint16_t{0});
+        if (info->has_emins)
+            batch->all_native_emins.assign(static_cast<size_t>(num_experts) * batch->emins_per_expert, uint32_t{0});
+
+        for (int e = 0; e < num_experts; ++e)
+        {
+            const auto *eq = dynamic_cast<const IINT8Unpackable *>(expert_views[e].get());
+            if (!eq)
+            {
+                LOG_ERROR("[packMoEExpertsROCm] Expert " << e << " not IINT8Unpackable");
+                return nullptr;
+            }
+
+            VnniPackContext ctx{};
+            ctx.raw_bytes = nullptr;
+            ctx.N = rows_per_expert;
+            ctx.K = K;
+            ctx.blocks_per_row = blocks_per_row;
+            ctx.payload_bytes = info->payload_bytes;
+            ctx.payload_array = batch->all_native_vnni.data() + e * batch->vnni_bytes_per_expert;
+            ctx.scales_array = batch->all_native_scales.data() + e * batch->scales_per_expert;
+            ctx.mins_array = info->is_asymmetric
+                                 ? batch->all_native_mins.data() + e * batch->mins_per_expert
+                                 : nullptr;
+            ctx.emins_array = info->has_emins
+                                  ? batch->all_native_emins.data() + e * batch->emins_per_expert
+                                  : nullptr;
+
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < rows_per_expert; ++n)
+            {
+                for (int b = 0; b < blocks_per_row; ++b)
+                {
+                    eq->packVnniBlock(ctx, n, b);
+                }
+            }
+        }
+
+        LOG_DEBUG("[packMoEExpertsROCm] Packed " << num_experts << " experts ("
+                 << rows_per_expert << "x" << K << " each), total slab "
+                 << (batch->all_native_vnni.size() / (1024 * 1024)) << " MB vnni + "
+                 << (batch->all_native_scales.size() * 2 / (1024 * 1024)) << " MB scales");
+
+        return batch;
+    }
 
     } // namespace rocm
 } // namespace llaminar2

@@ -23,6 +23,12 @@ namespace llaminar2::primitives
      */
     void compute_swiglu(const float *gate, const float *up, float *output, int size);
 
+    /// Serial (non-OMP) variant of compute_swiglu for small element counts
+    /// where OMP fork/join overhead exceeds the compute cost (e.g. M=1 MoE
+    /// experts with intermediate=512). Uses the same ISA-dispatched SIMD
+    /// implementations as compute_swiglu.
+    void compute_swiglu_serial(const float *gate, const float *up, float *output, int size);
+
     void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size);
     void compute_swiglu_fp16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size);
     void compute_swiglu_q8_1(const void *gate, const void *up, void *output, int size);

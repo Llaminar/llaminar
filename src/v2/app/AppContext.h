@@ -9,8 +9,8 @@
 #include "execution/runner/IOrchestrationRunner.h"
 #include "utils/Tokenizer.h"
 #include "utils/MPIContext.h"
+#include "app/MPIShutdown.h"
 #include <memory>
-#include <mpi.h>
 
 namespace llaminar2
 {
@@ -32,7 +32,7 @@ namespace llaminar2
         {
             if (runner)
                 runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
         }
     };
 

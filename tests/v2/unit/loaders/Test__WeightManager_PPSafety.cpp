@@ -25,13 +25,11 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 
 // ============================================================================
-// TestableWeightManager — overrides getPreparedEmbeddingCount for test control
+// TestableWeightManager — opens lifecycle gates for release decision tests
 // ============================================================================
 
 class PPSafetyTestableWeightManager : public WeightManager
 {
-    size_t mock_embedding_count_ = 0;
-
 public:
     PPSafetyTestableWeightManager(IModelLoader &loader,
                                   WeightPrecision precision = WeightPrecision::NATIVE)
@@ -39,14 +37,11 @@ public:
                         WeightDistributionStrategy::LAYER_PARTITIONED,
                         precision)
     {
+        // Mark all lifecycle gates open so release decision logic is testable
+        markMaterializationComplete();
+        markDevicePreparationComplete();
+        markGraphMaterializationComplete();
     }
-
-    size_t getPreparedEmbeddingCount() const override
-    {
-        return mock_embedding_count_;
-    }
-
-    void setMockEmbeddingCount(size_t n) { mock_embedding_count_ = n; }
 };
 
 // ============================================================================
@@ -187,6 +182,44 @@ TEST_F(Test__WeightManager_PPSafety, LMHeadStage_LoadsLayerWeightsInRange)
     EXPECT_EQ(l11, nullptr) << "Layer 11 should NOT be in range";
 }
 
+/**
+ * @test Qwen3.6 trailing nextn sidecar weights load only on the terminal PP stage.
+ *
+ * The main graph excludes the trailing nextn/MTP block from ordinary decoder
+ * execution. MTP sidecar initialization still needs that block's local
+ * attention/FFN tensors, but only on the stage that owns terminal hidden,
+ * final norm, and LM head.
+ */
+TEST_F(Test__WeightManager_PPSafety, LayerRange_AllowsTrailingNextNSidecarWeightsOnlyOnTerminalStage)
+{
+    mock_loader_ = MockModelLoader::createMinimal();
+    mock_loader_->addFP32RandomTensor("blk.64.nextn.eh_proj.weight", {8, 8});
+    mock_loader_->addFP32RandomTensor("blk.64.attn_k.weight", {8, 8});
+    mock_loader_->addFP32RandomTensor("blk.65.attn_k.weight", {8, 8});
+
+    PPSafetyTestableWeightManager non_terminal(*mock_loader_);
+    non_terminal.setLayerRange(0, 32, true, false);
+    EXPECT_EQ(non_terminal.getWeightForDevice("blk.64.nextn.eh_proj.weight", DeviceId::cpu(), 0), nullptr)
+        << "Non-terminal PP stages must not load the MTP sidecar projection";
+    EXPECT_EQ(non_terminal.getWeightForDevice("blk.64.attn_k.weight", DeviceId::cpu(), 0), nullptr)
+        << "Non-terminal PP stages must not load MTP sidecar attention weights";
+
+    PPSafetyTestableWeightManager terminal(*mock_loader_);
+    terminal.setLayerRange(32, 64, false, true);
+
+    auto sidecar_fc = terminal.getWeightForDevice("blk.64.nextn.eh_proj.weight", DeviceId::cpu(), 0);
+    EXPECT_NE(sidecar_fc, nullptr)
+        << "Terminal PP stage should load the MTP nextn projection outside the main graph range";
+
+    auto sidecar_attn = terminal.getWeightForDevice("blk.64.attn_k.weight", DeviceId::cpu(), 0);
+    EXPECT_NE(sidecar_attn, nullptr)
+        << "Terminal PP stage should load MTP sidecar attention weights outside the main graph range";
+
+    auto unrelated_out_of_range = terminal.getWeightForDevice("blk.65.attn_k.weight", DeviceId::cpu(), 0);
+    EXPECT_EQ(unrelated_out_of_range, nullptr)
+        << "Non-sidecar out-of-range layers must remain filtered";
+}
+
 // ============================================================================
 // Host Release Safety Tests
 // ============================================================================
@@ -203,7 +236,6 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyFP32Tensor)
     mock_loader_->addFP32RandomTensor("test_weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(0); // No prepared embeddings
 
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
@@ -229,7 +261,6 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)
     mock_loader_->addQ8_0RandomTensor("test_weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(0);
 
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
@@ -242,7 +273,7 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_RetainsCPUOnlyQuantizedTensor)
 }
 
 /**
- * @test Host-resident tensor IS released when prepared embeddings exist
+ * @test Host-resident tensor IS released when prepared device state exists
  *
  * Verifies the safety fix doesn't break the normal release path for
  * tensors that have been explicitly marked as host-resident (mmap-backed).
@@ -253,16 +284,16 @@ TEST_F(Test__WeightManager_PPSafety, ReleaseAll_ReleasesHostResidentWithPrepared
     mock_loader_->addQ8_0RandomTensor("test_weight", {64, 64});
 
     PPSafetyTestableWeightManager wm(*mock_loader_);
-    wm.setMockEmbeddingCount(1); // Has prepared embeddings
 
     auto tensor = wm.getWeightForDevice("test_weight", DeviceId::cpu(), 0);
     ASSERT_NE(tensor, nullptr);
     tensor->setHostResident();
+    tensor->has_prepared_device_state_ = true;
 
     size_t released = wm.releaseAllHostWeightData();
     EXPECT_GE(released, 1);
     EXPECT_TRUE(tensor->is_raw_data_released())
-        << "Host-resident tensor with prepared embeddings should be released";
+        << "Host-resident tensor with prepared device state should be released";
 }
 
 // ============================================================================

@@ -4,6 +4,7 @@
  */
 
 #include "StageTimeline.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "fort.hpp"
 #include <iostream>
 
@@ -25,7 +26,7 @@ namespace llaminar2
         // Title row
         {
             std::ostringstream title;
-            title << "GPU STAGE TIMELINE: " << phase_name;
+            title << "GPU STAGE EVENTS: " << phase_name;
             if (device_name)
                 title << " [" << device_name << "]";
             if (token_count > 0)
@@ -39,19 +40,19 @@ namespace llaminar2
         {
             std::ostringstream info;
             info << std::fixed << std::setprecision(2);
-            info << "GPU Total: " << total_gpu_ms << " ms";
+            info << "Event Total: " << total_gpu_ms << " ms";
             if (wall_ms > 0.0)
             {
                 info << "  |  Wall: " << wall_ms << " ms";
                 double gap = wall_ms - total_gpu_ms;
-                info << "  |  Gap: " << gap << " ms";
+                info << "  |  Non-event wall: " << gap << " ms";
                 if (wall_ms > 0.0)
-                    info << " (" << std::setprecision(1) << (gap / wall_ms * 100.0) << "% overhead)";
+                    info << " (" << std::setprecision(1) << (gap / wall_ms * 100.0) << "%)";
             }
             if (token_count > 0 && total_gpu_ms > 0.0f)
             {
                 double tok_per_sec = token_count / (total_gpu_ms / 1000.0);
-                info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+                info << "  |  Event-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
             }
             table << info.str() << "" << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(5);
@@ -134,7 +135,7 @@ namespace llaminar2
         // Title row
         {
             std::ostringstream title;
-            title << "GPU STAGE TIMELINE: " << phase_name;
+            title << "GPU STAGE EVENTS: " << phase_name;
             if (device_name)
                 title << " [" << device_name << "]";
             title << " (avg of " << accumulated_iterations_ << " iterations)";
@@ -147,14 +148,14 @@ namespace llaminar2
         {
             std::ostringstream info;
             info << std::fixed << std::setprecision(2);
-            info << "GPU Avg: " << avg_gpu_ms << " ms";
+            info << "Event Avg: " << avg_gpu_ms << " ms";
             info << "  |  Wall Avg: " << avg_wall_ms << " ms";
             double gap = avg_wall_ms - avg_gpu_ms;
-            info << "  |  Gap: " << gap << " ms";
+            info << "  |  Non-event wall: " << gap << " ms";
             if (avg_wall_ms > 0.0)
-                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "% overhead)";
+                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "%)";
             double tok_per_sec = 1000.0 / avg_gpu_ms;
-            info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+            info << "  |  Event-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
             table << info.str() << "" << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(5);
         }
@@ -242,7 +243,7 @@ namespace llaminar2
         // Title row
         {
             std::ostringstream title;
-            title << "GPU STAGE TIMELINE: PREFILL";
+            title << "GPU STAGE EVENTS: PREFILL";
             if (device_name)
                 title << " [" << device_name << "]";
             title << " (avg of " << prefill_accumulated_iterations_ << " iterations, "
@@ -256,16 +257,16 @@ namespace llaminar2
         {
             std::ostringstream info;
             info << std::fixed << std::setprecision(2);
-            info << "GPU Avg: " << avg_gpu_ms << " ms";
+            info << "Event Avg: " << avg_gpu_ms << " ms";
             info << "  |  Wall Avg: " << avg_wall_ms << " ms";
             double gap = avg_wall_ms - avg_gpu_ms;
-            info << "  |  Gap: " << gap << " ms";
+            info << "  |  Non-event wall: " << gap << " ms";
             if (avg_wall_ms > 0.0)
-                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "% overhead)";
+                info << " (" << std::setprecision(1) << (gap / avg_wall_ms * 100.0) << "%)";
             if (avg_tokens > 0 && avg_gpu_ms > 0.0f)
             {
                 double tok_per_sec = avg_tokens / (avg_gpu_ms / 1000.0);
-                info << "  |  GPU-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
+                info << "  |  Event-limited: " << std::setprecision(1) << tok_per_sec << " tok/s";
             }
             table << info.str() << "" << "" << "" << "" << fort::endr;
             table[1][0].set_cell_span(5);
@@ -334,7 +335,7 @@ namespace llaminar2
 
         {
             std::ostringstream title;
-            title << "GPU DETAILED TIMELINE: " << phase_name;
+            title << "GPU DETAILED STAGE EVENTS: " << phase_name;
             if (device_name)
                 title << " [" << device_name << "]";
             table << title.str() << "" << "" << "" << fort::endr;
@@ -376,6 +377,67 @@ namespace llaminar2
         }
 
         std::cout << table.to_string() << std::flush;
+    }
+
+    void StageTimeline::recordPerfStats(const char *phase_name,
+                                        const char *device_name,
+                                        const char *domain,
+                                        std::map<std::string, std::string> tags) const
+    {
+        if (!PerfStatsCollector::isEnabled())
+            return;
+
+        const std::string phase = phase_name ? phase_name : "";
+        const std::string device = device_name ? device_name : "";
+        const std::string perf_domain = domain ? domain : "stage_gpu";
+        auto merge_tags = [&](PerfStatsCollector::Tags record_tags = {}) {
+            record_tags.emplace("attribution", "gpu_event");
+            record_tags.emplace("source", "stage_timeline");
+            record_tags.emplace("graph_capture_scope", "eager_per_stage_events");
+            record_tags.insert(tags.begin(), tags.end());
+            return record_tags;
+        };
+
+        const float total_ms = totalGpuMs();
+        if (total_ms > 0.0f)
+        {
+            PerfStatsCollector::recordTimingNs(
+                perf_domain,
+                "total",
+                static_cast<uint64_t>(static_cast<double>(total_ms) * 1.0e6),
+                phase,
+                device,
+                merge_tags());
+        }
+
+        auto agg = aggregateByType();
+        for (const auto &entry : agg)
+        {
+            if (entry.total_ms <= 0.0f)
+                continue;
+            PerfStatsCollector::recordTimingNs(
+                perf_domain,
+                std::string("type.") + entry.type_name,
+                static_cast<uint64_t>(static_cast<double>(entry.total_ms) * 1.0e6),
+                phase,
+                device,
+                merge_tags({{"stage_count", std::to_string(entry.count)}}));
+        }
+
+        for (size_t i = 0; i < records_.size(); ++i)
+        {
+            const auto &rec = records_[i];
+            if (!rec.valid || rec.gpu_ms <= 0.0f)
+                continue;
+            PerfStatsCollector::recordTimingNs(
+                perf_domain,
+                rec.name.empty() ? "(unnamed)" : rec.name,
+                static_cast<uint64_t>(static_cast<double>(rec.gpu_ms) * 1.0e6),
+                phase,
+                device,
+                merge_tags({{"type", computeStageTypeName(rec.type)},
+                            {"index", std::to_string(i)}}));
+        }
     }
 
 } // namespace llaminar2

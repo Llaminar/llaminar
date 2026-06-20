@@ -9,6 +9,7 @@
 #include "../StageParamsBase.h"
 #include "kernels/IKVCache.h"
 #include "../../../memory/BufferId.h"
+#include "../../../utils/Logger.h"
 
 #include <optional>
 #include <memory>
@@ -20,6 +21,7 @@ namespace llaminar2
     class Q8_1Tensor;
     class TQ4Tensor;
     class TQ8Tensor;
+    class TensorBase;
     class TurboQuantContext;
     class ActivationRotation;
 
@@ -30,10 +32,6 @@ namespace llaminar2
      * - Pipelined execution: Append on one device while attending on another
      * - Explicit control: Manual cache management for advanced use cases
      * - Cross-device caches: Cache on GPU while computing on CPU
-     *
-     * For most use cases, prefer AttentionWithKVCacheStage which handles
-     * cache operations internally. Use this stage when you need fine-grained
-     * control over cache timing.
      *
      * VNNI-Safe Quantization (Q16_1 cache):
      * When the cache is Q16_1, this stage uses FIXED-SCALE quantization with
@@ -95,28 +93,52 @@ namespace llaminar2
         ComputeStageType type() const override { return ComputeStageType::KV_CACHE_APPEND; }
         StageBufferContract bufferContract() const override;
         // KV cache append is graph-capturable when the KV cache supports
-        // device-side head parameters. The H2D memcpy + dynamic kernel are
-        // captured once; on replay, updateDynamicParams() writes the new head
-        // to the same pinned host buffer, which the captured H2D re-reads.
+        // device-side head parameters. updateDynamicParams() uploads the head
+        // to a stable device scalar before capture/replay; captured append
+        // records only the dynamic kernel that reads that scalar.
         bool isGraphCapturable() const override
         {
             return params_.kv_cache && params_.kv_cache->isGraphCaptureReady();
         }
-        bool hasDynamicParams() const override { return true; }
+        bool hasDynamicParams() const override
+        {
+            return params_.kv_cache && params_.kv_cache->supportsDynamicAppendState();
+        }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
+            (void)pos_offset;
             params_.seq_len = seq_len;
-            if (params_.kv_cache)
+            if (params_.kv_cache && params_.kv_cache->supportsDynamicAppendState())
             {
-                // Write current head position to the pinned host buffer and issue
-                // H2D async copy. The captured graph's H2D will re-read this value.
-                // NOTE: Do NOT advanceHead here — that happens in onGraphReplayed()
-                // after the graph launches. This preserves the invariant that
-                // get_cached_tokens() returns the previous step's count when
-                // AttentionComputeStage::updateDynamicParams() reads it.
+                // Upload current ring state and the real append length to
+                // graph-owned device scalars. Padded prefill buckets keep a
+                // bucket-shaped kernel for reuse, but sequence metadata must
+                // advance by the real prompt length so padding never becomes
+                // visible cache state.
                 void *stream = gpuStream();
-                params_.kv_cache->setDynamicHead(params_.layer_idx, params_.seq_idx, stream);
+                int append_tokens = params_.seq_len > 0 ? params_.seq_len : params_.num_tokens;
+                if (params_.batch_size <= 1 && replay_advance_tokens_ > 0)
+                {
+                    append_tokens = replay_advance_tokens_;
+                }
+                if (!params_.kv_cache->setDynamicAppendState(
+                        params_.layer_idx, params_.seq_idx, append_tokens, stream))
+                {
+                    LOG_ERROR("[KVCacheAppendStage] KV cache refused dynamic append state for graph replay");
+                }
             }
+        }
+        bool hasPrefillReplayParams() const override { return true; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override
+        {
+            // Captured prefill append kernels may execute a padded bucket in a
+            // later phase. Host cache metadata must advance by the real prompt
+            // prefix only so padded rows remain invisible to attention/decode.
+            replay_advance_tokens_ = replay.real_seq_len > 0 ? replay.real_seq_len : 0;
         }
         void onGraphReplayed() override
         {
@@ -124,10 +146,43 @@ namespace llaminar2
             // Called by DeviceGraphExecutor AFTER the captured graph segment replays.
             if (params_.kv_cache)
             {
-                params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, params_.num_tokens);
+                const int advance_tokens = replay_advance_tokens_ > 0
+                                               ? replay_advance_tokens_
+                                               : params_.num_tokens;
+                params_.kv_cache->advanceHead(params_.layer_idx, params_.seq_idx, advance_tokens);
             }
         }
         bool needsOnGraphReplayed() const override { return true; }
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            replay_advance_tokens_ = 0;
+            debug_append_source_k_snapshot_.clear();
+            debug_append_source_v_snapshot_.clear();
+            debug_append_source_k_rows_ = 0;
+            debug_append_source_k_cols_ = 0;
+            debug_append_source_v_rows_ = 0;
+            debug_append_source_v_cols_ = 0;
+        }
+        /**
+         * @brief Clear host-side append bookkeeping for preserved graph replay.
+         *
+         * The captured append kernel reads stable tensor/cache pointers, while
+         * replay_advance_tokens_ is restamped from PrefillReplayParams before
+         * each launch. Normal request bookkeeping can therefore be cleared
+         * without discarding the preserved prefill executable.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            resetSessionState();
+        }
+        /**
+         * @brief Keep append topology warm for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionState();
+        }
         bool supportsBackend(ComputeBackendType backend) const override { return true; }
         StageBufferRequirements getBufferRequirements() const override;
         std::vector<BufferDescriptor> getDeclaredOutputs() const override;
@@ -137,6 +192,20 @@ namespace llaminar2
         const Params &getParams() const { return params_; }
 
     private:
+        /**
+         * @brief Returns true when a tiny verifier append needs grouped
+         * decode-equivalent cache publication.
+         *
+         * Grouped MTP verifier rows are mathematically decode rows, not prompt
+         * prefill rows.  Cache publication must therefore use a dedicated
+         * cache-level grouped contract that handles backend source layout and
+         * updates ring metadata atomically.  Stage-level serial replay is not a
+         * production implementation for Phase 9.8.
+         */
+        bool shouldUseDecodeEquivalentVerifierAppend(int total_tokens,
+                                                     int batch_size,
+                                                     int seq_len) const;
+
         Params params_;
         std::unique_ptr<FP16Tensor> fp16_k_scratch_;
         std::unique_ptr<FP16Tensor> fp16_v_scratch_;
@@ -149,6 +218,26 @@ namespace llaminar2
         /// Workspace for kv_rotation: holds FP32 copy for in-place rotation
         /// before Q16_1 quantization. Lazy-allocated, reused across calls.
         std::vector<float> kv_rotation_scratch_;
+
+        /// Debug-only post-append KV snapshots. Populated only when
+        /// LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT is enabled, so normal dump/coherence
+        /// paths do not copy persistent cache state back to host.
+        mutable std::vector<float> debug_cache_k_snapshot_;
+        mutable std::vector<float> debug_cache_v_snapshot_;
+
+        /// Debug-only source K/V copies captured immediately before append.
+        /// This avoids reading persistent cache views while still proving what
+        /// each request wrote into the cache append path.
+        std::vector<float> debug_append_source_k_snapshot_;
+        std::vector<float> debug_append_source_v_snapshot_;
+        size_t debug_append_source_k_rows_ = 0;
+        size_t debug_append_source_k_cols_ = 0;
+        size_t debug_append_source_v_rows_ = 0;
+        size_t debug_append_source_v_cols_ = 0;
+
+        /// Real token count to advance after prefill graph replay; 0 falls
+        /// back to params_.num_tokens for decode and legacy exact-shape replay.
+        int replay_advance_tokens_ = 0;
     };
 
 } // namespace llaminar2

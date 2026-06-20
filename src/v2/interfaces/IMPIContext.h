@@ -23,7 +23,8 @@
 namespace llaminar2
 {
 
-    // Forward declarations for quantized block types
+    // Forward declarations
+    class IMPITopology;
     struct Q8_1Block;
     struct Q16_1Block;
     struct Q16_1Block_64;
@@ -68,6 +69,16 @@ namespace llaminar2
          */
         virtual bool is_root() const = 0;
 
+        /**
+         * @brief Get the node-local rank (0..ranks_per_node-1)
+         *
+         * Maps to the physical socket index under Llaminar's 1-rank-per-socket
+         * binding invariant. Defaults to global rank() for single-node setups.
+         *
+         * @return Local rank within the physical node
+         */
+        virtual int local_rank() const { return rank(); }
+
         // =========================================================================
         // MPI Communicator Access
         // =========================================================================
@@ -81,6 +92,30 @@ namespace llaminar2
          * @return MPI_Comm handle
          */
         virtual MPI_Comm communicator() const = 0;
+
+        // =========================================================================
+        // Topology Access
+        // =========================================================================
+
+        /**
+         * @brief Get the MPI topology for node-local queries and placement
+         *
+         * Returns nullptr if topology is not available (e.g., in simple mocks).
+         * Callers should check for nullptr and use fallback behavior.
+         *
+         * @return Pointer to IMPITopology, or nullptr if unavailable
+         */
+        virtual const IMPITopology *topology() const { return nullptr; }
+
+        /**
+         * @brief Get communicator for ranks on the same physical node
+         *
+         * Used for node-local coordination (e.g., page cache prepopulation).
+         * Returns MPI_COMM_NULL if not available (mocks, or single-node).
+         *
+         * @return MPI_Comm for intra-node ranks, or MPI_COMM_NULL
+         */
+        virtual MPI_Comm intra_node_comm() const { return MPI_COMM_NULL; }
 
         // =========================================================================
         // Synchronization

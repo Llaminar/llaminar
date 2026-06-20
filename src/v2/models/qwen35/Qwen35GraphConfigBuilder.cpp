@@ -6,19 +6,19 @@
 #include "Qwen35GraphConfigBuilder.h"
 #include "qwen/qwen35/Qwen35ChatTemplate.generated.h"
 #include "../GraphTypes.h"
+#include "../../execution/mtp/MTPWeightManifest.h"
 #include "../../interfaces/IModelContext.h"
 #include "../../loaders/IModelLoader.h"
 #include "../../utils/Logger.h"
 
 namespace llaminar2
 {
-
     bool Qwen35GraphConfigBuilder::populateFromModelContext(
         IModelContext &ctx,
         GraphConfig &config)
     {
         // Base Qwen2 fields (n_layers, d_model, n_heads, etc.)
-        if (!Qwen2GraphConfigBuilder::populateFromModelContext(ctx, config))
+        if (!QwenStandardGraphConfigBuilder::populateFromModelContext(ctx, config))
         {
             return false;
         }
@@ -31,6 +31,28 @@ namespace llaminar2
         }
 
         const std::string arch = ctx.architecture();
+
+        // Some Qwen3.6 GGUFs include the trailing next-token-prediction
+        // sidecar block(s) in block_count. Those blocks must remain visible to
+        // weight loading, but the main graph must not execute them as ordinary
+        // transformer layers.
+        const int raw_layer_count = config.n_layers;
+        const int main_layer_count = mainLayerCountExcludingMTP(
+            *loader,
+            arch,
+            raw_layer_count);
+        if (main_layer_count != raw_layer_count)
+        {
+            config.n_layers = main_layer_count;
+            if (config.total_n_layers == raw_layer_count)
+            {
+                config.total_n_layers = config.n_layers;
+            }
+            LOG_INFO("[Qwen35GraphConfigBuilder] Excluding "
+                     << (raw_layer_count - main_layer_count)
+                     << " trailing nextn/MTP block(s) from main graph layers: "
+                     << raw_layer_count << " -> " << config.n_layers);
+        }
 
         // =====================================================================
         // GDN / SSM metadata
@@ -66,21 +88,46 @@ namespace llaminar2
             int gdn_count = 0;
             for (int i = 0; i < total_layers; ++i)
             {
-                // Pattern: every Nth layer is full attention (1-indexed check)
-                // Layer indices 3, 7, 11, ... are FA when interval=4
-                if ((i + 1) % config.gdn.full_attention_interval == 0)
+                const std::string prefix = "blk." + std::to_string(i) + ".";
+                const bool has_gdn_qkv = loader->hasTensor(prefix + "attn_qkv.weight");
+                const bool has_fa_attention =
+                    loader->hasTensor(prefix + "attn_q.weight") ||
+                    loader->hasTensor(prefix + "attn_k.weight") ||
+                    loader->hasTensor(prefix + "attn_v.weight") ||
+                    loader->hasTensor(prefix + "attn_output.weight");
+
+                // Prefer the actual tensor inventory when present. Qwen3.6 GGUFs
+                // can include a final nextn/source block whose attention tensors
+                // are full-attention even when the simple interval rule says GDN.
+                if (has_gdn_qkv)
+                {
+                    config.layer_types[i] = "gdn";
+                    ++gdn_count;
+                }
+                else if (has_fa_attention)
                 {
                     config.layer_types[i] = "full_attention";
                     ++fa_count;
                 }
                 else
                 {
-                    config.layer_types[i] = "gdn";
-                    ++gdn_count;
+                    // Pattern fallback: every Nth layer is full attention
+                    // (1-indexed check). Layer indices 3, 7, 11, ... are FA
+                    // when interval=4.
+                    if ((i + 1) % config.gdn.full_attention_interval == 0)
+                    {
+                        config.layer_types[i] = "full_attention";
+                        ++fa_count;
+                    }
+                    else
+                    {
+                        config.layer_types[i] = "gdn";
+                        ++gdn_count;
+                    }
                 }
             }
 
-            LOG_INFO("[Qwen35GraphConfigBuilder] Hybrid architecture:"
+            LOG_DEBUG("[Qwen35GraphConfigBuilder] Hybrid architecture:"
                      << " " << gdn_count << " GDN layers + "
                      << fa_count << " FA layers"
                      << " (interval=" << config.gdn.full_attention_interval << ")");
@@ -90,6 +137,17 @@ namespace llaminar2
         // Attention output gate (always present in Qwen3.5)
         // =====================================================================
         config.has_attention_output_gate = true;
+
+        // =====================================================================
+        // KV cache scales for FA layers (QK-norm produces large V activations)
+        // =====================================================================
+        // Qwen3.5 FA layers share the same attention mechanism as Qwen3
+        // (QK-norm, same value growth pattern in later layers).
+        // Parent sets Qwen2 defaults (K=512, V=32) which clip badly:
+        //   V absmax ~64 at later layers → 13.5% clip rate with V=32
+        //   K absmax ~417 post-RoPE → clips at ±256 with K=512
+        config.kv_cache_scale_k = 1024.0f; // K: ±512 representable
+        config.kv_cache_scale_v = 256.0f;  // V: ±128 representable
 
         // =====================================================================
         // Partial RoPE for FA layers
@@ -140,7 +198,7 @@ namespace llaminar2
         // Tied embeddings: if output.weight is missing, reuse token_embd.weight
         if (!lm_head && embedding)
         {
-            LOG_INFO("[Qwen35GraphConfigBuilder] output.weight not found, using tied embeddings");
+            LOG_DEBUG("[Qwen35GraphConfigBuilder] output.weight not found, using tied embeddings");
             lm_head = embedding;
         }
 

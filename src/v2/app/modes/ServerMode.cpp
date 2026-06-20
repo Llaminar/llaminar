@@ -10,6 +10,7 @@
 #include "app/modes/ServerMode.h"
 #include "app/modes/ChatCompletionHandler.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "utils/Logger.h"
 
 // cpp-httplib (header-only)
@@ -18,7 +19,6 @@
 // nlohmann/json (header-only)
 #include "nlohmann/json.hpp"
 
-#include <mpi.h>
 #include <iostream>
 #include <mutex>
 #include <atomic>
@@ -27,12 +27,35 @@
 #include <fstream>
 #endif
 #include <csignal>
+#include <exception>
 #include <filesystem>
+#include <string>
 
 using json = nlohmann::json;
 
 namespace llaminar2
 {
+    namespace
+    {
+        int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
+        {
+            const bool has_mpi = ctx.mpi_ctx != nullptr;
+            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+
+            if (is_root)
+                LOG_ERROR("Server mode failed with unhandled exception: " << detail);
+
+            if (ctx.runner)
+            {
+                if (notify_workers)
+                    ctx.runner->abortMPIWorkers(detail);
+                ctx.runner->shutdown();
+            }
+            mpiShutdown();
+            return 1;
+        }
+    } // namespace
 
     // Global signal handling for clean shutdown
     static std::atomic<bool> g_shutdown_requested{false};
@@ -50,7 +73,13 @@ namespace llaminar2
         return config.serve_mode;
     }
 
+    std::unique_ptr<httplib::TaskQueue> createSerializedInferenceTaskQueue()
+    {
+        return std::make_unique<httplib::ThreadPool>(1);
+    }
+
     int ServerMode::execute(AppContext &ctx)
+    try
     {
         auto &config = ctx.config;
         auto &mpi_ctx = ctx.mpi_ctx;
@@ -62,12 +91,12 @@ namespace llaminar2
             // Non-root ranks: enter MPI worker loop to participate in
             // inference collectives (allreduce for Global TP) when rank 0
             // initiates them. Returns when rank 0 sends SHUTDOWN.
-            LOG_INFO("Rank " << mpi_ctx->rank()
-                             << " entering MPI worker loop for inference participation");
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
+                              << " entering MPI worker loop for inference participation");
             runner->setMPICoordinatedMode(true);
             runner->runMPIWorkerLoop();
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 0;
         }
 
@@ -77,7 +106,7 @@ namespace llaminar2
             if (mpi_ctx->world_size() > 1)
                 runner->shutdownMPIWorkers();
             runner->shutdown();
-            MPI_Finalize();
+            mpiShutdown();
             return 1;
         }
 
@@ -90,6 +119,12 @@ namespace llaminar2
 
         httplib::Server svr;
         g_server_ptr = &svr;
+
+        // Inference is serialized on a single model instance. Keep HTTP handling
+        // on one stable worker so OpenMP does not initialize per-request teams
+        // on a large rotating httplib thread pool.
+        svr.new_task_queue = []
+        { return createSerializedInferenceTaskQueue().release(); };
 
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
@@ -197,7 +232,7 @@ namespace llaminar2
                 if (mpi_ctx->world_size() > 1)
                     runner->shutdownMPIWorkers();
                 runner->shutdown();
-                MPI_Finalize();
+                mpiShutdown();
                 return 1;
             }
         }
@@ -210,8 +245,16 @@ namespace llaminar2
             runner->shutdownMPIWorkers();
 
         runner->shutdown();
-        MPI_Finalize();
+        mpiShutdown();
         return 0;
+    }
+    catch (const std::exception &e)
+    {
+        return finalizeAfterUnhandledException(ctx, e.what());
+    }
+    catch (...)
+    {
+        return finalizeAfterUnhandledException(ctx, "unknown exception");
     }
 
 } // namespace llaminar2

@@ -566,14 +566,6 @@ namespace llaminar2
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
 
-        // Generic cache for CUDA kernel state (e.g. packed INT8 weights)
-        // Separate from cache_ to allow both CPU and CUDA paths to coexist
-        mutable std::any cuda_cache_;
-
-        // Generic cache for ROCm kernel state (e.g. packed INT8 weights for CK)
-        // Separate from cache_ and cuda_cache_ to allow CPU, CUDA, and ROCm paths to coexist
-        mutable std::any rocm_cache_;
-
         // Shape and type - each concrete tensor class has its own shape_ member
         // and overrides shape() to return it.
         virtual TensorType native_type() const = 0;

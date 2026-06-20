@@ -46,7 +46,7 @@ namespace llaminar2
                 plan.has_embedding,
                 plan.has_lm_head);
 
-            LOG_INFO("[PartialWeightLoader] Loading " << needed.size()
+            LOG_DEBUG("[PartialWeightLoader] Loading " << needed.size()
                                                       << " weights for rank " << plan.rank
                                                       << " (layers " << plan.first_layer << "-" << plan.last_layer
                                                       << ", embedding=" << (plan.has_embedding ? "yes" : "no")
@@ -73,7 +73,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_INFO("[PartialWeightLoader] Successfully loaded " << loaded.size()
+            LOG_DEBUG("[PartialWeightLoader] Successfully loaded " << loaded.size()
                                                                   << "/" << needed.size() << " weights");
 
             return loaded;

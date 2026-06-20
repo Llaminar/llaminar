@@ -607,13 +607,13 @@ namespace llaminar2
         }
 
         // Log placement summary
-        LOG_INFO("[GPUFirstLayerPlacementStrategy] Placing " << layers_assigned_to_gpu << "/"
+        LOG_DEBUG("[GPUFirstLayerPlacementStrategy] Placing " << layers_assigned_to_gpu << "/"
                                                              << input.n_layers << " layers on GPU(s)");
         for (int g = 0; g < total_gpus; ++g)
         {
             if (!all_gpus[g].assigned_layers.empty())
             {
-                LOG_INFO("[GPUFirstLayerPlacementStrategy] Rank " << all_gpus[g].rank
+                LOG_DEBUG("[GPUFirstLayerPlacementStrategy] Rank " << all_gpus[g].rank
                                                                   << " GPU_" << all_gpus[g].local_gpu_idx << ": "
                                                                   << all_gpus[g].assigned_layers.size()
                                                                   << " layers, "
@@ -825,7 +825,7 @@ namespace llaminar2
             // Put compute-heavy attention on GPU, memory-heavy FFN can spill to CPU
             // Heuristic: use GPU for up to 75% of capacity
             int optimal_gpu = static_cast<int>(max_gpu_layers * 0.75);
-            LOG_INFO("[HybridOptimalLayerPlacementStrategy] CPU is " << static_cast<int>(cpu_efficiency * 100)
+            LOG_DEBUG("[HybridOptimalLayerPlacementStrategy] CPU is " << static_cast<int>(cpu_efficiency * 100)
                                                                      << "% as efficient as GPU, using hybrid split");
             return std::max(optimal_gpu, 1);
         }
@@ -924,7 +924,7 @@ namespace llaminar2
             gpu_layers = std::min(gpu_layers, input.max_gpu_layers);
         }
 
-        LOG_INFO("[HybridOptimalLayerPlacementStrategy] Placing " << gpu_layers << "/" << input.n_layers
+        LOG_DEBUG("[HybridOptimalLayerPlacementStrategy] Placing " << gpu_layers << "/" << input.n_layers
                                                                   << " layers on " << total_gpus << " GPU(s) (hybrid optimal)");
 
         // Estimate bytes per layer for distribution
@@ -980,7 +980,7 @@ namespace llaminar2
         auto [decode_gpu_weight, decode_cpu_weight] = input.getPhaseDeviceWeights(InferencePhase::DECODE);
         bool cpu_should_decode = input.cpuShouldParticipate(InferencePhase::DECODE);
 
-        LOG_INFO("[HybridOptimalLayerPlacementStrategy] Phase-aware decode: CPU_weight="
+        LOG_DEBUG("[HybridOptimalLayerPlacementStrategy] Phase-aware decode: CPU_weight="
                  << decode_cpu_weight << ", GPU_weight=" << decode_gpu_weight
                  << ", CPU_participates=" << (cpu_should_decode ? "yes" : "no"));
 

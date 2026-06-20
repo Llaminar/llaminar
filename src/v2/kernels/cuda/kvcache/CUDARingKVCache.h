@@ -68,6 +68,10 @@ namespace llaminar2
         constexpr const char *BATCH_TAILS = "kvcache_batch_tails";
         /// Array of count values [batch_size × sizeof(int)]
         constexpr const char *BATCH_COUNTS = "kvcache_batch_counts";
+        /// K conversion scratch used by append/read precision adaptation.
+        constexpr const char *CONV_SCRATCH_K = "kvcache_conv_scratch_k";
+        /// V conversion scratch used by append/read precision adaptation.
+        constexpr const char *CONV_SCRATCH_V = "kvcache_conv_scratch_v";
     }
 
     // =========================================================================
@@ -162,11 +166,11 @@ namespace llaminar2
          */
         virtual bool append(int layer, int seq_idx,
                             const void *d_k, const void *d_v,
-                            int num_tokens, cudaStream_t stream = 0) = 0;
+                            int num_tokens, cudaStream_t stream) = 0;
 
         // Convenience for single-sequence mode
         bool append(int layer, const void *d_k, const void *d_v,
-                    int num_tokens, cudaStream_t stream = 0)
+                    int num_tokens, cudaStream_t stream)
         {
             return append(layer, 0, d_k, d_v, num_tokens, stream);
         }
@@ -176,12 +180,12 @@ namespace llaminar2
          */
         virtual bool get_kv_for_attention(int layer, int seq_idx,
                                           const void **d_k_out, const void **d_v_out,
-                                          int *kv_len, cudaStream_t stream = 0) = 0;
+                                          int *kv_len, cudaStream_t stream) = 0;
 
         // Convenience for single-sequence mode
         bool get_kv_for_attention(int layer,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0)
+                                  int *kv_len, cudaStream_t stream)
         {
             return get_kv_for_attention(layer, 0, d_k_out, d_v_out, kv_len, stream);
         }
@@ -191,7 +195,7 @@ namespace llaminar2
          */
         virtual bool linearize_to(int layer, int seq_idx,
                                   void *d_k_out, void *d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0) = 0;
+                                  int *kv_len, cudaStream_t stream) = 0;
 
         // =====================================================================
         // Eviction (O(1) - pointer arithmetic only)
@@ -213,7 +217,7 @@ namespace llaminar2
         virtual int gather_kv_batched(int layer, int num_seqs,
                                       void *d_k_out, void *d_v_out,
                                       int *kv_lens, int max_kv_len,
-                                      cudaStream_t stream = 0) = 0;
+                                      cudaStream_t stream) = 0;
 
         // Bring in IKVCache::gather_kv_batched(ITensor*) to avoid hiding
         using IKVCache::gather_kv_batched;
@@ -254,6 +258,7 @@ namespace llaminar2
         void *conv_scratch_k_ = nullptr;   ///< Scratch buffer for K conversion
         void *conv_scratch_v_ = nullptr;   ///< Scratch buffer for V conversion
         size_t conv_scratch_capacity_ = 0; ///< Current capacity in bytes (per buffer)
+        bool conv_scratch_workspace_backed_ = false;
     };
 
     // =========================================================================
@@ -442,6 +447,16 @@ namespace llaminar2
 
         ActivationPrecision k_precision() const override { return Precision; }
 
+        /**
+         * @brief Reset ring metadata and request-scoped CUDA sidecar buffers.
+         *
+         * Clears host/device dynamic head params, conversion scratch, RoPE shadow
+         * views, tensor wrappers, and persistent K/V storage. This preserves the
+         * same empty-cache invariant as reconstructing the cache while keeping
+         * stable device pointers for cached compute graphs.
+         */
+        void clear() override;
+
         // ITensor Access (IKVCache interface via get_k/get_v)
         ITensor *get_k(int layer, int seq_idx = 0) override;
         const ITensor *get_k(int layer, int seq_idx = 0) const override;
@@ -456,6 +471,23 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override;
 
+        /**
+         * @brief Append grouped verifier rows with serial-decode cache semantics.
+         *
+         * The verifier can produce K/V in either position-major
+         * `[rows, local_kv_heads * head_dim]` or head-major
+         * `[local_kv_heads * rows, head_dim]` order.  This method maps both
+         * forms into the CUDA ring cache in the same physical positions that
+         * serial one-token decode would have used, while preserving graph
+         * capture by requiring an explicit CUDA stream.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override;
+
         // Bring in IKVCache overloads to avoid hiding
         using ICUDARingKVCache::append;
         using ICUDARingKVCache::clear_sequence;
@@ -469,18 +501,25 @@ namespace llaminar2
         int local_n_kv_heads() const override { return local_n_kv_heads_; }
         int kv_head_start() const override { return kv_head_start_; }
         int local_kv_dim() const override { return kv_dim_; }
+        TensorLayout kv_layout() const override { return TensorLayout::KV_POS_HEAD_DIM; }
+
+        KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override;
+        KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override;
+        bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const override;
+        bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v) override;
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override;
 
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
-                    int num_tokens, cudaStream_t stream = 0) override;
+                    int num_tokens, cudaStream_t stream) override;
 
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0) override;
+                                  int *kv_len, cudaStream_t stream) override;
 
         bool linearize_to(int layer, int seq_idx,
                           void *d_k_out, void *d_v_out,
-                          int *kv_len, cudaStream_t stream = 0) override;
+                          int *kv_len, cudaStream_t stream) override;
 
         void evict_oldest(int layer, int seq_idx, int num_tokens) override;
         void evict_oldest_layer(int layer, int num_tokens) override;
@@ -488,7 +527,7 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_seqs,
                               void *d_k_out, void *d_v_out,
                               int *kv_lens, int max_kv_len,
-                              cudaStream_t stream = 0) override;
+                              cudaStream_t stream) override;
 
         int get_total_evicted() const override { return total_evicted_; }
         void reset_eviction_counter() override { total_evicted_ = 0; }
@@ -501,11 +540,11 @@ namespace llaminar2
 
         bool get_kv_typed(int layer, int seq_idx,
                           const DataT **d_k_out, const DataT **d_v_out,
-                          int *kv_len, cudaStream_t stream = 0);
+                          int *kv_len, cudaStream_t stream);
 
         bool append_typed(int layer, int seq_idx,
                           const DataT *d_k, const DataT *d_v,
-                          int num_tokens, cudaStream_t stream = 0);
+                          int num_tokens, cudaStream_t stream);
 
         // =====================================================================
         // IWorkspaceConsumer Interface
@@ -514,9 +553,9 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements for batched gather operations
          *
-         * Returns buffer requirements for pointer arrays used in launch_gather_kernel().
-         * When workspace is bound, gather operations use pre-allocated buffers
-         * instead of cudaMalloc/cudaFree per call.
+         * Returns required buffer requirements for pointer arrays used in
+         * launch_gather_kernel(). Gather operations must use workspace buffers;
+         * raw per-call cudaMalloc/cudaFree is not allowed in the inference path.
          *
          * @param m Batch size (number of sequences)
          * @param n Unused
@@ -529,8 +568,7 @@ namespace llaminar2
         /**
          * @brief Bind workspace manager for managed mode
          *
-         * When bound, gather operations use pre-allocated buffers instead of
-         * per-call cudaMalloc/cudaFree.
+         * Gather operations require this workspace binding before execution.
          *
          * @param workspace Pointer to workspace manager (NOT owned, must outlive cache)
          */
@@ -582,8 +620,8 @@ namespace llaminar2
         // When set, provides default stream for methods that accept optional streams
         IWorkerGPUContext *device_ctx_ = nullptr;
 
-        // Workspace manager for batched gather operations
-        // When bound, launch_gather_kernel() uses pre-allocated buffers instead of cudaMalloc/cudaFree
+        // Workspace manager for batched gather operations.
+        // launch_gather_kernel() requires these pre-allocated buffers.
         DeviceWorkspaceManager *workspace_ = nullptr;
 
         // Entry storage: [n_layers][batch_size]
@@ -621,7 +659,7 @@ namespace llaminar2
                                           const int *d_head, int num_tokens, cudaStream_t stream);
         void launch_linearize_kernel(const EntryT &entry, DataT *d_k_out, DataT *d_v_out,
                                      cudaStream_t stream);
-        void launch_gather_kernel(const std::vector<EntryT *> &entries,
+        bool launch_gather_kernel(const std::vector<EntryT *> &entries,
                                   DataT *d_k_out, DataT *d_v_out,
                                   int *kv_lens, int max_kv_len,
                                   int num_seqs, cudaStream_t stream);

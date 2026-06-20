@@ -103,6 +103,55 @@ TEST(Test__SnapshotCapture_KeyConversion, HighLayerIndex)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer127_ffn_gate"), "layer127_FFN_GATE");
 }
 
+TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
+{
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_ffn"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_ffn"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_allreduce"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_parallel_reduce"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert"), "layer0_MOE_SHARED_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_gate"), "layer0_MOE_SHARED_GATE_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_add"), "layer0_MOE_COMBINED_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combine"), "layer0_MOE_COMBINED_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_ffn"), "layer39_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_add"), "layer39_MOE_COMBINED_OUTPUT");
+}
+
+TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
+{
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attn_norm"), "MTP0_ATTENTION_NORM");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_q_proj"), "MTP0_Q_PROJECTION");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attention"), "MTP0_ATTENTION_CONTEXT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_attn_output_gate"), "MTP0_ATTENTION_CONTEXT_GATED");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_wo_proj"), "MTP0_ATTENTION_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_ffn_norm"), "MTP0_FFN_NORM");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_moe_expert_ffn"), "MTP0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_shared_expert_ffn"), "MTP0_MOE_SHARED_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_shared_expert_gate"), "MTP0_MOE_SHARED_GATE_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("MTP0_moe_combine"), "MTP0_MOE_COMBINED_OUTPUT");
+}
+
+TEST(Test__SnapshotCapture_Capture, SharedExpertGateFusedOutputsUseSemanticKeys)
+{
+    const std::vector<float> gated_shared = {1.0f, 2.0f, 3.0f, 4.0f};
+    const std::vector<float> combined = {5.0f, 6.0f, 7.0f, 8.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("shared_output", gated_shared.data(), 1, 4));
+    dump.outputs.push_back(makeFP32Output("combined_output", combined.data(), 1, 4));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_shared_expert_gate", dump);
+
+    const auto *shared_snap = capture.get("MTP0_MOE_SHARED_GATE_OUTPUT");
+    ASSERT_NE(shared_snap, nullptr);
+    EXPECT_EQ(shared_snap->data, gated_shared);
+
+    const auto *combined_snap = capture.get("MTP0_MOE_COMBINED_OUTPUT");
+    ASSERT_NE(combined_snap, nullptr);
+    EXPECT_EQ(combined_snap->data, combined);
+}
+
 TEST(Test__SnapshotCapture_KeyConversion, FallbackUpperCase)
 {
     // Unknown suffix: just uppercase the whole thing
@@ -261,6 +310,108 @@ TEST(Test__SnapshotCapture_Extract, FP16Conversion)
     EXPECT_NEAR(result[1], -0.5f, 0.001f);
     EXPECT_NEAR(result[2], 3.14f, 0.01f);
     EXPECT_FLOAT_EQ(result[3], 0.0f);
+}
+
+TEST(Test__SnapshotCapture_Capture, MTPSidecarFusedQKVUsesMTPKeys)
+{
+    std::vector<float> q = {1.0f, 2.0f};
+    std::vector<float> k = {3.0f, 4.0f};
+    std::vector<float> v = {5.0f, 6.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("q", q.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("k", k.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("v", v.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_qkv_proj", dump);
+
+    const auto *q_snapshot = capture.get("MTP0_Q_PROJECTION");
+    const auto *k_snapshot = capture.get("MTP0_K_PROJECTION");
+    const auto *v_snapshot = capture.get("MTP0_V_PROJECTION");
+    ASSERT_NE(q_snapshot, nullptr);
+    ASSERT_NE(k_snapshot, nullptr);
+    ASSERT_NE(v_snapshot, nullptr);
+    EXPECT_EQ(q_snapshot->data, q);
+    EXPECT_EQ(k_snapshot->data, k);
+    EXPECT_EQ(v_snapshot->data, v);
+}
+
+TEST(Test__SnapshotCapture_Capture, GDNProjectionSplitsAlphaAndBeta)
+{
+    std::vector<float> qkv = {1.0f, 2.0f};
+    std::vector<float> z = {3.0f, 4.0f};
+    std::vector<float> alpha = {5.0f, 6.0f};
+    std::vector<float> beta = {7.0f, 8.0f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("qkv", qkv.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("z", z.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("alpha", alpha.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("beta", beta.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("layer0_gdn_proj", dump);
+
+    const auto *qkv_snapshot = capture.get("layer0_QKV_PROJECTION");
+    const auto *z_snapshot = capture.get("layer0_GDN_Z_PROJECTION");
+    const auto *alpha_snapshot = capture.get("layer0_GDN_ALPHA");
+    const auto *beta_snapshot = capture.get("layer0_GDN_BETA");
+
+    ASSERT_NE(qkv_snapshot, nullptr);
+    ASSERT_NE(z_snapshot, nullptr);
+    ASSERT_NE(alpha_snapshot, nullptr);
+    ASSERT_NE(beta_snapshot, nullptr);
+    EXPECT_EQ(qkv_snapshot->data, qkv);
+    EXPECT_EQ(z_snapshot->data, z);
+    EXPECT_EQ(alpha_snapshot->data, alpha);
+    EXPECT_EQ(beta_snapshot->data, beta);
+}
+
+TEST(Test__SnapshotCapture_Capture, MTPSidecarMoERoutingUsesMTPKeys)
+{
+    std::vector<float> logits = {1.0f, 2.0f, 3.0f};
+    std::vector<float> indices = {2.0f, 1.0f};
+    std::vector<float> weights = {0.75f, 0.25f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(makeFP32Output("logits", logits.data(), 1, 3));
+    dump.outputs.push_back(makeFP32Output("indices", indices.data(), 1, 2));
+    dump.outputs.push_back(makeFP32Output("weights", weights.data(), 1, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("MTP0_moe_routing", dump);
+
+    const auto *router_snapshot = capture.get("MTP0_MOE_ROUTER_OUTPUT");
+    const auto *indices_snapshot = capture.get("MTP0_MOE_ROUTING_INDICES");
+    const auto *weights_snapshot = capture.get("MTP0_MOE_ROUTING_WEIGHTS");
+    ASSERT_NE(router_snapshot, nullptr);
+    ASSERT_NE(indices_snapshot, nullptr);
+    ASSERT_NE(weights_snapshot, nullptr);
+    EXPECT_EQ(router_snapshot->data, logits);
+    EXPECT_EQ(indices_snapshot->data, indices);
+    EXPECT_EQ(weights_snapshot->data, weights);
+}
+
+TEST(Test__SnapshotCapture_Capture, ContextQualifiedMTPKeysRemainDisambiguated)
+{
+    std::vector<float> decode_embedding = {1.0f, 2.0f};
+    std::vector<float> catchup_embedding = {3.0f, 4.0f};
+
+    SnapshotCapture capture;
+    capture.captureStage(
+        "mtp_decode_sidecar::MTP0_embedding",
+        makeSingleOutputDump("output", decode_embedding.data(), 1, 2));
+    capture.captureStage(
+        "mtp_decode_catchup::MTP0_embedding",
+        makeSingleOutputDump("output", catchup_embedding.data(), 1, 2));
+
+    const auto *decode_snapshot = capture.get("MTP_DECODE_SIDECAR_MTP0_EMBEDDING");
+    const auto *catchup_snapshot = capture.get("MTP_DECODE_CATCHUP_MTP0_EMBEDDING");
+    ASSERT_NE(decode_snapshot, nullptr);
+    ASSERT_NE(catchup_snapshot, nullptr);
+    EXPECT_EQ(decode_snapshot->data, decode_embedding);
+    EXPECT_EQ(catchup_snapshot->data, catchup_embedding);
 }
 
 // =========================================================================

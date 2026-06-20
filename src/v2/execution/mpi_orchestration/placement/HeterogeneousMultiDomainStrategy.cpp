@@ -782,14 +782,14 @@ namespace llaminar2
         HeterogeneousPlan het_plan = generatePlan(input.cluster_inventory, input.n_layers);
 
         // Log the plan
-        LOG_INFO("[HeterogeneousMultiDomainStrategy] Generated plan:");
-        LOG_INFO("[HeterogeneousMultiDomainStrategy]   " << het_plan.node_count
+        LOG_DEBUG("[HeterogeneousMultiDomainStrategy] Generated plan:");
+        LOG_DEBUG("[HeterogeneousMultiDomainStrategy]   " << het_plan.node_count
                                                          << " nodes, " << het_plan.world_size << " ranks");
-        LOG_INFO("[HeterogeneousMultiDomainStrategy]   " << het_plan.domains.size()
+        LOG_DEBUG("[HeterogeneousMultiDomainStrategy]   " << het_plan.domains.size()
                                                          << " TP domains");
         for (const auto &domain : het_plan.domains)
         {
-            LOG_INFO("[HeterogeneousMultiDomainStrategy]   " << domain.toString());
+            LOG_DEBUG("[HeterogeneousMultiDomainStrategy]   " << domain.toString());
         }
 
         // Convert to PlacementPlan format

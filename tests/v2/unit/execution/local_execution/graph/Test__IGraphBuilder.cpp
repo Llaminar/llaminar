@@ -102,6 +102,7 @@ TEST_F(Test__IGraphBuilder, BuildForwardGraph_RecordsInput)
     input.seq_len = 128;
     input.batch_size = 4;
     input.device = DeviceId::cuda(0);
+    input.token_ids_device = reinterpret_cast<const void *>(0x1000);
     ForwardOutput output;
 
     mock_->buildForwardGraph(input, output);
@@ -110,6 +111,7 @@ TEST_F(Test__IGraphBuilder, BuildForwardGraph_RecordsInput)
     EXPECT_EQ(mock_->lastForwardInput()->seq_len, 128);
     EXPECT_EQ(mock_->lastForwardInput()->batch_size, 4);
     EXPECT_EQ(mock_->lastForwardInput()->device, DeviceId::cuda(0));
+    EXPECT_EQ(mock_->lastForwardInput()->token_ids_device, input.token_ids_device);
 }
 
 TEST_F(Test__IGraphBuilder, BuildForwardGraph_RecordsOutput)
@@ -403,6 +405,7 @@ TEST_F(Test__IGraphBuilder, ForwardInput_DefaultValues)
     ForwardInput input;
 
     EXPECT_EQ(input.token_ids, nullptr);
+    EXPECT_EQ(input.token_ids_device, nullptr);
     EXPECT_EQ(input.position_ids, nullptr);
     EXPECT_EQ(input.batch_size, 1);
     EXPECT_EQ(input.seq_len, 0);

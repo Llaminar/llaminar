@@ -8,11 +8,85 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
+#include "../../../loaders/PreparedWeightStore.h"
+
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool validateMatrixExtent(
+            const TensorBase *tensor,
+            const char *tensor_name,
+            int required_rows,
+            int required_cols)
+        {
+            if (!tensor)
+            {
+                LOG_ERROR("[GEMMStage] " << tensor_name << " is not a TensorBase");
+                return false;
+            }
+
+            const auto &shape = tensor->shape();
+            const size_t rows = shape.empty() ? 0 : shape[0];
+            const size_t cols = shape.size() < 2 ? 1 : shape[1];
+            if (rows < static_cast<size_t>(required_rows) ||
+                cols < static_cast<size_t>(required_cols))
+            {
+                LOG_ERROR("[GEMMStage] Tensor extent mismatch for " << tensor_name
+                                                                    << ": required >= ["
+                                                                    << required_rows << ", " << required_cols
+                                                                    << "], actual=[" << rows << ", " << cols << "]");
+                return false;
+            }
+            return true;
+        }
+
+        ITensorGemm *resolvePreparedGemmForStage(
+            const char *caller,
+            const GEMMStage::Params &params,
+            bool is_sliced)
+        {
+            if (!params.prepared_store || !params.prepared_ref.has_value())
+            {
+                LOG_ERROR("[" << caller << "] PreparedWeightStore and PreparedWeightRef are required for model GEMM resolution");
+                return nullptr;
+            }
+
+            ITensorGemm *gemm = nullptr;
+            if (is_sliced)
+            {
+                gemm = params.prepared_store->slicedGemmKernel(
+                    params.prepared_ref.value(),
+                    params.output_range.start,
+                    params.output_range.end);
+            }
+            else
+            {
+                gemm = params.prepared_store->gemmKernel(params.prepared_ref.value());
+            }
+
+            if (!gemm)
+            {
+                LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
+            }
+            return gemm;
+        }
+
+        void markDeviceOutputWritten(TensorBase *tensor, DeviceId device, void *stream)
+        {
+            if (tensor && device.is_gpu())
+            {
+                tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, device, stream);
+            }
+        }
+
+    }
 
     // =============================================================================
     // GEMMStage::Params Implementation
@@ -99,6 +173,23 @@ namespace llaminar2
     {
     }
 
+    bool GEMMStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.B)
+            return true;
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            if (error) *error = "GEMMStage requires PreparedWeightStore and PreparedWeightRef";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref.value()))
+        {
+            if (error) *error = "GEMMStage PreparedWeightRef is not present in PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
     bool GEMMStage::execute(IDeviceContext *ctx)
     {
         ScopedGemmContext gemm_ctx(params_.gemm_context);
@@ -137,6 +228,20 @@ namespace llaminar2
         const bool is_sliced = !params_.output_range.empty();
         const int effective_n = is_sliced ? static_cast<int>(params_.output_range.size()) : params_.n;
 
+        const auto *A_extent = requireTensorBase(params_.A, "input A");
+        auto *C_extent = asTensorBase(params_.C, "output C");
+        if (!validateMatrixExtent(A_extent, "A", params_.m, params_.k) ||
+            !validateMatrixExtent(C_extent, "C", params_.m, effective_n))
+        {
+            return false;
+        }
+        if (params_.gate_input)
+        {
+            const auto *gate_extent = requireTensorBase(params_.gate_input, "gate input");
+            if (!validateMatrixExtent(gate_extent, "gate_input", params_.m, params_.k))
+                return false;
+        }
+
         LOG_DEBUG("[GEMMStage] Execute GEMM: " << params_.m << "x" << effective_n << "x" << params_.k
                                                << (is_sliced ? " (SLICED)" : "")
                                                << " weight ptr=" << static_cast<const void *>(params_.B)
@@ -166,13 +271,10 @@ namespace llaminar2
         }
 #endif
 
-        // Cast weights to TensorBase for KernelFactory
+        // Cast weights to TensorBase for diagnostics and tensor-aware kernel calls.
         auto *B_base = requireTensorBase(params_.B, "weight B");
 
-        // Get kernel — use stage-level cache to avoid KernelFactory mutex per call.
-        // KernelFactory caches are append-only (never evict), so raw pointers are
-        // valid for the entire program lifetime after first resolve.
-        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
+        // Get kernel — use stage-level cache to avoid store lookup per call.
         llaminar2::ITensorGemm *gemm = nullptr;
 
         if (cache_resolved_)
@@ -180,24 +282,18 @@ namespace llaminar2
             // Fast path: reuse previously-resolved kernel (no mutex)
             gemm = cached_gemm_;
         }
-        else if (is_sliced)
-        {
-            // Use sliced kernel for tensor parallelism
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
-                B_base, params_.output_range.start, params_.output_range.end);
-            cached_gemm_ = gemm;
-            cache_resolved_ = true;
-            LOG_DEBUG("[GEMMStage] Using sliced kernel for rows [" << params_.output_range.start
-                                                                   << ", " << params_.output_range.end << ")");
-        }
         else
         {
-            // Use device-targeted kernel creation
-            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+            gemm = resolvePreparedGemmForStage("GEMMStage", params_, is_sliced);
+            if (!gemm)
+                return false;
             cached_gemm_ = gemm;
-            cached_prepared_ = prepared;
             cache_resolved_ = true;
+            if (is_sliced)
+            {
+                LOG_DEBUG("[GEMMStage] Using prepared sliced kernel for rows [" << params_.output_range.start
+                                                                                << ", " << params_.output_range.end << ")");
+            }
         }
 
         if (!gemm)
@@ -213,6 +309,14 @@ namespace llaminar2
                                                 << " for weight ITensor*=" << static_cast<const void *>(params_.B)
                                                 << " TensorBase*=" << static_cast<const void *>(B_base));
 
+        if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
+        {
+            auto *A_base = requireTensorBase(params_.A, "input A");
+            auto *C_base = asTensorBase(params_.C, "output C");
+            return executeDecodeEquivalentVerifierPrefill(
+                A_base, C_base, gemm, effective_n);
+        }
+
         // Fused SwiGLU + GEMM: output = W @ (silu(gate) * up)
         // Both CPU and GPU kernels implement multiply_tensor_with_fused_swiglu().
         if (params_.gate_input)
@@ -224,15 +328,58 @@ namespace llaminar2
             if (gemm->multiply_tensor_with_fused_swiglu(
                     gate_base, A_base_up, C_base,
                     params_.m, effective_n, params_.k,
-                    params_.alpha, params_.beta))
+                    params_.alpha, params_.beta,
+                    getWorkspace()))
             {
+                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
                 LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM completed via ITensorGemm");
                 traceOutput("C", params_.C);
                 return true;
             }
-            LOG_ERROR("[GEMMStage] multiply_tensor_with_fused_swiglu() failed — "
-                      "kernel does not support fused SwiGLU+GEMM");
-            return false;
+
+            LOG_DEBUG("[GEMMStage] Fused SwiGLU+GEMM unavailable; falling back to separate SwiGLU + GEMM");
+            auto *swiglu_output = const_cast<TensorBase *>(A_base_up);
+            auto *activation = dynamic_cast<IActivationTensor *>(swiglu_output);
+            if (!activation)
+            {
+                LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: up tensor is not an activation tensor");
+                return false;
+            }
+
+            auto swiglu = activation->createSwiGLU();
+            if (!swiglu)
+            {
+                LOG_ERROR("[GEMMStage] Cannot run SwiGLU fallback: failed to create SwiGLU kernel");
+                return false;
+            }
+            swiglu->setGPUStream(gpuStream());
+
+            if (!swiglu->apply_tensor(
+                    gate_base, A_base_up, swiglu_output,
+                    params_.m, params_.k,
+                    /*add_residual=*/false,
+                    params_.mpi_ctx,
+                    params_.device_id.toKernelDeviceIndex()))
+            {
+                LOG_ERROR("[GEMMStage] SwiGLU fallback activation failed");
+                return false;
+            }
+            markDeviceOutputWritten(swiglu_output, params_.device_id, gpuStream());
+
+            bool success = gemm->multiply_tensor(
+                swiglu_output, C_base,
+                params_.m, effective_n, params_.k,
+                params_.transpose_B,
+                params_.alpha, params_.beta,
+                nullptr, // bias
+                params_.mpi_ctx, params_.device_id.toKernelDeviceIndex(),
+                getWorkspace());
+            if (success)
+            {
+                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
+                traceOutput("C", params_.C);
+            }
+            return success;
         }
 
         // Primary path: use tensor-aware multiply_tensor for type-aware dispatch.
@@ -254,9 +401,109 @@ namespace llaminar2
                 getWorkspace());
 
             if (success)
+            {
+                markDeviceOutputWritten(C_base, params_.device_id, gpuStream());
                 traceOutput("C", params_.C);
+            }
             return success;
         }
+    }
+
+    bool GEMMStage::executeDecodeEquivalentVerifierPrefill(
+        const TensorBase *A_base,
+        TensorBase *C_base,
+        ITensorGemm *gemm,
+        int effective_n)
+    {
+        if (!A_base || !C_base || !gemm)
+            return false;
+        if (params_.m > 4)
+        {
+            LOG_ERROR("[GEMMStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << params_.m);
+            return false;
+        }
+        if (params_.alpha != 1.0f || params_.beta != 0.0f)
+        {
+            LOG_ERROR("[GEMMStage] Grouped verifier GEMM supports alpha=1,beta=0 only; got alpha="
+                      << params_.alpha << " beta=" << params_.beta);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[GEMMStage] Grouped verifier GPU GEMM requires an explicit stream");
+            return false;
+        }
+
+        const auto *gate_base = params_.gate_input
+                                    ? requireTensorBase(params_.gate_input, "gate input")
+                                    : nullptr;
+        if (params_.gate_input && !gate_base)
+            return false;
+
+        /*
+         * Phase 9.8 verifier GEMM is a real grouped contract.  The previous
+         * implementation copied one row into scratch and replayed M=1 GEMV in
+         * a loop.  That is a useful diagnostic oracle, but it cannot be the
+         * production verifier path because it serializes exactly the work MTP
+         * is supposed to amortize.
+         */
+        bool success = false;
+        if (params_.gate_input)
+        {
+            success = gemm->multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                gate_base,
+                A_base,
+                C_base,
+                params_.m,
+                effective_n,
+                params_.k,
+                params_.alpha,
+                params_.beta,
+                getWorkspace());
+        }
+        else
+        {
+            const TensorBase *bias_tensor = nullptr;
+            if (params_.bias_tensor)
+                bias_tensor = dynamic_cast<const TensorBase *>(params_.bias_tensor);
+            std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                {gemm, C_base, effective_n, bias_tensor, "GEMM"}};
+            success = gemm->multiply_fused_verifier_rows_decode_equivalent(
+                A_base,
+                projections,
+                params_.m,
+                params_.k,
+                params_.mpi_ctx,
+                getWorkspace());
+        }
+
+        if (!success)
+        {
+            LOG_ERROR("[GEMMStage] Grouped decode-equivalent verifier GEMM is unsupported or failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << params_.m
+                      << " n=" << effective_n
+                      << " k=" << params_.k
+                      << " swiglu=" << (params_.gate_input != nullptr));
+            return false;
+        }
+
+        if (is_gpu)
+            markDeviceOutputWritten(C_base, params_.device_id, stream);
+        PerfStatsCollector::addCounter(
+            "mtp",
+            "gemm_grouped_decode_equivalent_verifier_prefill_rows",
+            static_cast<double>(params_.m),
+            {},
+            params_.device_id.to_string(),
+            {{"stage", "GEMM"},
+             {"swiglu", params_.gate_input ? "1" : "0"}});
+        traceOutput("C", params_.C);
+        return true;
     }
 
     size_t GEMMStage::estimatedFlops() const
@@ -381,7 +628,7 @@ namespace llaminar2
         if (params_.gate_input)
         {
             BufferTensorType gate_type = toBufferTensorType(params_.gate_input->native_type());
-            reqs.addInput("gate_input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.n)}, gate_type);
+            reqs.addInput("gate_input", {static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)}, gate_type);
         }
 
         return reqs;
@@ -393,7 +640,6 @@ namespace llaminar2
 
     IWorkspaceConsumer *GEMMStage::getKernelAsWorkspaceConsumer()
     {
-        // Get kernel from KernelFactory (which caches by tensor + device)
         if (!params_.B)
         {
             LOG_WARN("[GEMMStage::getKernelAsWorkspaceConsumer] Weight tensor B not set");
@@ -407,21 +653,9 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto target_dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
-        ITensorGemm *gemm = nullptr;
-
-        if (!params_.output_range.empty())
-        {
-            // Sliced kernel for tensor parallelism
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmSliced(
-                B_base, params_.output_range.start, params_.output_range.end);
-        }
-        else
-        {
-            // Standard GEMM kernel
-            auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(B_base, params_.device_id);
-            gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
-        }
+        const bool is_sliced = !params_.output_range.empty();
+        ITensorGemm *gemm = resolvePreparedGemmForStage(
+            "GEMMStage::getKernelAsWorkspaceConsumer", params_, is_sliced);
 
         return dynamic_cast<IWorkspaceConsumer *>(gemm);
     }
@@ -432,8 +666,10 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build()
-            .addInput(*params_.a_buffer_id)
-            .addOutput(*params_.c_buffer_id);
+            .addInput(*params_.a_buffer_id);
+        if (params_.gate_input && params_.gate_buffer_id)
+            contract.addInput(*params_.gate_buffer_id);
+        contract.addOutput(*params_.c_buffer_id);
         // Model weight B is not arena-managed
         if (params_.B)
             contract.addWeight(const_cast<ITensor *>(params_.B));

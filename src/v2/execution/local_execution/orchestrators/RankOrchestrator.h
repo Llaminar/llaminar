@@ -50,6 +50,7 @@
 #include "../../../backends/GlobalDeviceAddress.h"
 #include "../../../config/OrchestrationConfig.h"
 #include "../../../collective/ILocalPPContext.h"
+#include "../../moe/MoERebalanceController.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
 #include "../../factory/FactoryPPStageConfig.h" // For FactoryPPStageConfig (circular-dependency-safe)
@@ -72,7 +73,10 @@ namespace llaminar2
     class TensorBase;
     class LogitsGatherer;
     class DeviceSampler;
+    class IMPIContext;
+    class PreparedWeightStore;
     struct GraphExecutorStats;
+    struct MoEExpertParallelPlan;
     struct PlacementPlan;
     struct PPActivationContract;
 
@@ -207,6 +211,21 @@ namespace llaminar2
             /// Explicit KV cache precision mode (AUTO preserves legacy behavior)
             KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+            /// Prefix-state cache feature gates and storage limits.
+            PrefixCacheRuntimeConfig prefix_cache;
+
+            /// Multi-token prediction feature gates and verification mode.
+            MTPRuntimeConfig mtp;
+
+            /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
+            MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+            /// Bounded hot remote expert cache for dynamic expert-parallel execution.
+            MoEHotExpertCacheConfig moe_hot_expert_cache;
+
+            /// Decode histogram / dynamic rebalance settings.
+            MoERebalanceRuntimeConfig moe_rebalance;
+
             /// Use mapped memory for GPU tensors (zero-copy host access)
             /// Required for correct coherence with column-parallel LM head
             bool use_mapped_memory = false;
@@ -219,6 +238,16 @@ namespace llaminar2
             /// When set, the TP device runners will build partial graphs instead of full graphs.
             /// Set by the parent MDO when creating a nested TP MDO for a PP stage.
             std::optional<FactoryPPStageConfig> nested_pp_stage_config;
+
+            /// Optional stage-local prepared store shared by this RankOrchestrator
+            /// and its per-device runners.
+            std::shared_ptr<PreparedWeightStore> prepared_weight_store;
+
+            /// Optional same-layer MoE expert overlay plan propagated to child graph runners.
+            std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
+
+            /// Optional MPI context used by MoE overlay domain-worker commands.
+            std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
 
             // =================================================================
             // Helper Methods
@@ -337,6 +366,11 @@ namespace llaminar2
             std::unique_ptr<ILocalTPContext> tp_ctx,
             const Config &config);
 
+        static std::unique_ptr<RankOrchestrator> createForTestWithPipelineStages(
+            std::shared_ptr<IModelContext> model_ctx,
+            std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners,
+            const Config &config);
+
         // =====================================================================
         // Constructors
         // =====================================================================
@@ -380,6 +414,7 @@ namespace llaminar2
          * @return true if forward pass succeeded on all devices
          */
         bool forward(const int *tokens, int seq_len) override;
+        DeviceId primaryDeviceId() const override;
 
         /**
          * @brief Get combined logits from last forward pass
@@ -389,6 +424,264 @@ namespace llaminar2
          * @return Pointer to combined logits [vocab_size], or nullptr if unavailable
          */
         const float *logits() const override;
+        bool forwardMTP(int32_t draft_condition_token) override;
+        bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override;
+        /**
+         * @brief True when every LocalTP participant can consume a previous
+         *        MTP sidecar hidden row as the next draft input.
+         *
+         * Depth-2/3 MTP is only valid for a rank when all child runners can
+         * keep their shifted MTP KV and sidecar hidden state in lockstep.
+         */
+        bool supportsChainedMTPDrafts() const override;
+
+        /**
+         * @brief Run one chained MTP sidecar step on every LocalTP participant.
+         *
+         * The token and logical shifted-cache position are rank-wide scalar
+         * decisions.  Every child receives the same values and must complete
+         * before the rank reports success, preserving the vLLM-style
+         * participant-symmetric graph sequence.
+         */
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
+        bool forwardMTPFromLastDraftForDeviceSampling(
+            int32_t draft_condition_token,
+            int position_id) override;
+        bool forwardMTPFromDeviceDraftForDeviceSampling(
+            int draft_sample_slot,
+            int position_id) override;
+        bool forwardMTPFromDeviceTargetForDeviceSampling(
+            int target_sample_slot,
+            int position_id) override;
+        bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
+        bool commitMTPShiftedRowsFromLastForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens) override;
+        bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceResidentLogicalState(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool flushPendingMTPWork() override;
+        bool ensureMTPCheckpointTerminalHidden() override;
+        const float *mtpLogits() const override;
+        bool setComputeAllPositionLogits(bool enabled) override;
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override;
+        void clearMTPSpecVerifierInputPlan() override;
+        bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
+        /**
+         * @brief True when every active LocalTP participant can publish accepted
+         *        verifier state from the current MTP target verifier graph.
+         *
+         * Rank-level publication is an all-participant contract.  The rank must
+         * not advertise this capability unless each child runner can restore its
+         * own KV/recurrent/terminal-hidden slice from the same speculative step.
+         */
+        bool supportsMTPSpecStatePublication() const override;
+        MTPVerifierRowCapability mtpVerifierRowCapability() const override;
+        MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
+
+        /**
+         * @brief Publish accepted MTP verifier state on every LocalTP child.
+         *
+         * The same logical step plan is coordinated through the shared
+         * common-prefix contract before fan-out.  Today LocalTP receives one
+         * accepted-count decision from the rank-level verifier; this hook keeps
+         * the publication path symmetric so future per-participant plans can be
+         * clamped at the same boundary instead of growing a special case.
+         */
+        bool publishAcceptedMTPSpecState(
+            const MTPSpecStepPlan &plan,
+            std::string *error = nullptr) override;
+        /**
+         * @brief Publish accepted MTP verifier state for a request batch on
+         *        every LocalTP or LocalPP participant.
+         *
+         * The batch form is the canonical vLLM-style publication contract.  A
+         * rank-level runner must clamp every request to a common accepted
+         * prefix across the topology before any child mutates live KV,
+         * recurrent state, or terminal hidden buffers.
+         */
+        bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        const float *getAllPositionLogits() const override;
+        std::string mtpDecodeUnsupportedReason() const override;
+        bool supportsMTPSidecarLogitsStreamHandoff() const override;
+        bool supportsMTPDeviceDraftTokenInput() const override;
+        bool supportsMTPSidecarPreservesMainState() const override;
+        bool supportsMTPShiftedRowReuseFromSidecar() const override;
+        bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
+        bool applyPenaltiesOnDevice(
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
+        bool applyPenaltiesToMTPLogitsOnDevice(
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
+        bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+            int row,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
+        bool supportsRowLocalAllPositionPenaltyApplication() const override;
+        int sampleGreedyFromMTPLogitsOnDevice() override;
+        bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        bool sampleGreedyFromMainLogitsToDeviceTargetSlot(
+            int target_sample_slot,
+            int32_t *out_token) override;
+        int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens) override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDevice(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        bool supportsDeviceStochasticMTPVerification() const override;
+        bool buildStochasticDistributionOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticDistributionsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        int sampleStochasticDraftProposalOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        bool sampleStochasticDraftProposalOnDeviceDeferred(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        int sampleStochasticDistributionOnDevice(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        bool sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        bool stageStochasticDraftTokensForDeviceVerification(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot = 0) override;
+        const void *prepareMTPVerifierInputTokensOnDevice(
+            int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+            const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        bool verifyStochasticDistributionsOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
 
         /**
          * @brief GPU-side greedy sampling for decode
@@ -407,6 +700,7 @@ namespace llaminar2
          * per device, then host-side merge + softmax + top-p + sample.
          */
         int sampleOnDevice(const SamplingParams &params) override;
+        bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
 
         /**
          * @brief Enable GPU-side decode sampling (skip D2H gatherLogits for seq_len=1)
@@ -474,7 +768,13 @@ namespace llaminar2
         ParallelismMode effectiveMode() const { return mode_; }
 
         /**
-         * @brief Clear KV cache on all devices
+         * @brief Reset request-scoped live inference state on every participant.
+         *
+         * This is the multi-device request boundary corresponding to
+         * IInferenceRunner::clear_cache().  It must clear KV/recurrent state,
+         * logical positions, pending handoffs, and request-local metadata across
+         * all child runners in lockstep while preserving child graph topology,
+         * prepared weights, workspaces, and device contexts.
          */
         void clear_cache() override;
 
@@ -492,6 +792,21 @@ namespace llaminar2
          * @brief Get architecture name
          */
         const char *architecture() const override;
+        uint64_t moePlacementEpoch() const override;
+
+        /**
+         * @brief Aggregate per-runner runtime state for prefix-cache/MTP probes.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+
+        PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
+        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
+        bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
 
         // =====================================================================
         // Hidden State API (for Pipeline Parallelism nesting)
@@ -682,6 +997,16 @@ namespace llaminar2
          */
         void synchronizeDevices() override;
 
+        MoERebalanceController *moeRebalanceController() const;
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const override;
+        void applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller);
+        void applyMoEExpertMasksForAllDevices(
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+            const std::string &domain_id = {});
+        void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
+
     private:
         // =====================================================================
         // Private Constructor (for createForTest)
@@ -746,6 +1071,22 @@ namespace llaminar2
         bool forwardPP(const int *tokens, int seq_len);
 
         /**
+         * @brief Return the PP stage that owns MTP sidecar execution.
+         *
+         * In pipeline-parallel decode the normal verifier/replay path still
+         * runs through every PP stage via forwardPP().  The Qwen3.6 MTP
+         * sidecar, however, consumes the terminal hidden row and produces
+         * sidecar logits, so it belongs to the final PP stage: the same stage
+         * that owns output norm and the LM head.  Keeping this helper explicit
+         * avoids accidentally treating PP stages like TP participants.
+         */
+        IInferenceRunner *finalPPSidecarRunner();
+
+        /**
+         * @brief Const overload of finalPPSidecarRunner().
+         */
+        const IInferenceRunner *finalPPSidecarRunner() const;
+
         /**
          * @brief Aggregate stats from all device runners
          */
@@ -779,11 +1120,17 @@ namespace llaminar2
         /// Only used in TP+PP mode - in pure PP mode, device_runners_ holds stage runners
         std::vector<std::unique_ptr<IInferenceRunner>> pp_stage_runners_;
 
+        /// Per-child prefix hits captured during the last rank-level lookup.
+        std::vector<PrefixLookupResult> last_device_prefix_hits_;
+        std::vector<PrefixLookupResult> last_pp_prefix_hits_;
+
         /// Configuration
         Config config_;
 
         /// Logits buffer management and D2H gather operations (extracted helper)
         std::unique_ptr<LogitsGatherer> logits_gatherer_;
+        mutable std::unique_ptr<LogitsGatherer> mtp_logits_gatherer_;
+        mutable std::unique_ptr<LogitsGatherer> all_position_logits_gatherer_;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;
@@ -797,12 +1144,17 @@ namespace llaminar2
         /// Padded sequence length for current batch
         int current_padded_seq_len_ = 0;
 
+        /// Compact all-position verifier rows requested by the current MTP path.
+        /// A value of zero means gather every row from current_padded_seq_len_.
+        int current_all_position_logit_rows_ = 0;
+
         /// Sequence lengths for current batch
         std::vector<int> current_sequence_lengths_;
 
         /// Flag indicating if stats need re-aggregation
         mutable bool stats_dirty_ = true;
         bool host_resident_released_ = false; ///< Whether host-resident weight data has been released after first prefill
+        bool mmap_dontneed_advised_ = false;  ///< Whether mmap pages were advised away after first prefill
 
         /// Stage type → sharding mode map from the model's schema factory.
         /// Initialized at construction from SchemaFactoryRegistry::getStageShardingConfig().

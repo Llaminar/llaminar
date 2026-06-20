@@ -15,7 +15,9 @@
 #include "../coherence/StageCoherence.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
 #include "../../../memory/BufferArena.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../backends/IGPUGraphCapture.h"
 #include "../../../backends/IWorkerGPUContext.h"
 
@@ -26,10 +28,71 @@ namespace llaminar2
     // GraphSegmentCache — capture stream management
     // =========================================================================
 
-    bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureStream(IWorkerGPUContext *ctx)
+    IWorkerGPUContext *DeviceGraphExecutor::GraphSegmentCache::resolveLifecycleContext(
+        const char *operation)
+    {
+        if (capture_device.is_gpu() && capture_context_from_pool)
+        {
+            try
+            {
+                IWorkerGPUContext &resolved =
+                    GPUDeviceContextPool::instance().getContext(capture_device);
+                gpu_ctx_ref = &resolved;
+                return &resolved;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[GraphSegmentCache] Failed to resolve GPU context for "
+                          << operation << " on " << capture_device.toString()
+                          << ": " << e.what());
+                return nullptr;
+            }
+        }
+
+        return gpu_ctx_ref;
+    }
+
+    namespace
+    {
+        bool graphSegmentContextIsPoolOwned(IWorkerGPUContext *ctx, const DeviceId &device)
+        {
+            if (!ctx || !device.is_gpu())
+                return false;
+            try
+            {
+                return &GPUDeviceContextPool::instance().getContext(device) == ctx;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
+        }
+    }
+
+    bool DeviceGraphExecutor::GraphSegmentCache::ensureCaptureStream(
+        IWorkerGPUContext *ctx,
+        DeviceId device)
     {
         if (capture_stream)
+        {
+            if (capture_device.is_valid() &&
+                device.is_valid() &&
+                !(capture_device == device))
+            {
+                LOG_ERROR("[GraphSegmentCache] Capture stream already belongs to "
+                          << capture_device.toString() << ", cannot reuse for "
+                          << device.toString());
+                return false;
+            }
+            if (!capture_device.is_valid() && device.is_gpu())
+            {
+                capture_device = device;
+                capture_context_from_pool = graphSegmentContextIsPoolOwned(ctx, device);
+            }
+            if (!gpu_ctx_ref)
+                gpu_ctx_ref = ctx;
             return true;
+        }
         if (!ctx)
         {
             LOG_ERROR("[GraphSegmentCache] No GPU context for stream creation");
@@ -42,18 +105,71 @@ namespace llaminar2
             return false;
         }
         gpu_ctx_ref = ctx;
-        LOG_DEBUG("[GraphSegmentCache] Created local capture stream");
+        capture_device = device.is_gpu() ? device : DeviceId::invalid();
+        capture_context_from_pool = graphSegmentContextIsPoolOwned(ctx, capture_device);
+        LOG_DEBUG("[GraphSegmentCache] Created local capture stream"
+                  << (capture_device.is_valid()
+                          ? std::string(" for ") + capture_device.toString()
+                          : std::string{}));
         return true;
+    }
+
+    void DeviceGraphExecutor::GraphSegmentCache::synchronizeCaptureStream()
+    {
+        if (!capture_stream)
+            return;
+
+        IWorkerGPUContext *ctx = resolveLifecycleContext("capture stream synchronization");
+        if (!ctx)
+        {
+            LOG_ERROR("[GraphSegmentCache] Cannot synchronize capture stream: no live GPU context");
+            return;
+        }
+
+        try
+        {
+            if (!ctx->synchronizeStreamChecked(capture_stream))
+            {
+                LOG_ERROR("[GraphSegmentCache] Capture stream synchronization failed");
+            }
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[GraphSegmentCache] Capture stream synchronization threw: " << e.what());
+        }
     }
 
     void DeviceGraphExecutor::GraphSegmentCache::destroyCaptureStream()
     {
         if (!capture_stream)
+        {
+            gpu_ctx_ref = nullptr;
+            capture_device = DeviceId::invalid();
+            capture_context_from_pool = false;
             return;
-        if (gpu_ctx_ref)
-            gpu_ctx_ref->destroyStream(capture_stream);
+        }
+
+        IWorkerGPUContext *ctx = resolveLifecycleContext("capture stream destruction");
+        if (ctx)
+        {
+            try
+            {
+                ctx->destroyStream(capture_stream);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[GraphSegmentCache] Capture stream destruction threw: " << e.what());
+            }
+        }
+        else
+        {
+            LOG_ERROR("[GraphSegmentCache] Dropping capture stream handle without destruction "
+                      "because its GPU context is unavailable");
+        }
         capture_stream = nullptr;
         gpu_ctx_ref = nullptr;
+        capture_device = DeviceId::invalid();
+        capture_context_from_pool = false;
     }
 
     bool DeviceGraphExecutor::GraphSegmentCache::ensureSyncEvent(IWorkerGPUContext *ctx)
@@ -68,6 +184,8 @@ namespace llaminar2
             LOG_ERROR("[GraphSegmentCache] Failed to create sync event");
             return false;
         }
+        if (!gpu_ctx_ref)
+            gpu_ctx_ref = ctx;
         return true;
     }
 
@@ -75,8 +193,23 @@ namespace llaminar2
     {
         if (!sync_event)
             return;
-        if (gpu_ctx_ref)
-            gpu_ctx_ref->destroyEvent(sync_event);
+        IWorkerGPUContext *ctx = resolveLifecycleContext("sync event destruction");
+        if (ctx)
+        {
+            try
+            {
+                ctx->destroyEvent(sync_event);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[GraphSegmentCache] Sync event destruction threw: " << e.what());
+            }
+        }
+        else
+        {
+            LOG_ERROR("[GraphSegmentCache] Dropping sync event handle without destruction "
+                      "because its GPU context is unavailable");
+        }
         sync_event = nullptr;
     }
 
@@ -102,6 +235,35 @@ namespace llaminar2
             return executeFastDecode(graph, ctx, collective_nodes);
         }
 
+        const auto &order = graph.getExecutionOrder();
+
+        // Set GPU stream on all stages before any capture starts. Some stages
+        // own tiny graph metadata buffers and must upload them on this explicit
+        // stream before beginCapture(); doing so from execute() would record an
+        // illegal H2D operation into the graph.
+        if (gpu_stream)
+        {
+            for (const auto &name : order)
+            {
+                auto *node = graph.getNode(name);
+                if (node && node->stage)
+                    node->stage->setGPUStream(gpu_stream);
+            }
+        }
+
+        for (const auto &name : order)
+        {
+            auto *node = graph.getNode(name);
+            if (!node || !node->stage || !node->stage->needsGraphLaunchPreparation())
+                continue;
+            if (!node->stage->prepareGraphLaunch(ctx, gpu_stream))
+            {
+                LOG_ERROR("[DeviceGraphExecutor] Graph launch metadata preparation failed before capture: "
+                          << name);
+                return executeFastDecode(graph, ctx, collective_nodes);
+            }
+        }
+
         // Step 1: Begin capture
         if (!capture->beginCapture())
         {
@@ -113,19 +275,7 @@ namespace llaminar2
         // Set GPU device once before the loop (same as executeFastDecode)
         DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
 
-        const auto &order = graph.getExecutionOrder();
         bool exec_success = true;
-
-        // Set GPU stream on all stages so kernels dispatch to the capture stream
-        if (gpu_stream)
-        {
-            for (const auto &name : order)
-            {
-                auto *node = graph.getNode(name);
-                if (node && node->stage)
-                    node->stage->setGPUStream(gpu_stream);
-            }
-        }
 
         for (const auto &name : order)
         {
@@ -266,7 +416,9 @@ namespace llaminar2
                 gpu_stream,
                 gpu_ctx,
                 collective_nodes,
-                policy.collectives_graph_capturable);
+                policy.collectives_graph_capturable,
+                policy.force_recapture,
+                policy.defer_final_sync);
 
             if (success)
             {
@@ -294,7 +446,9 @@ namespace llaminar2
                                                                void *gpu_stream,
                                                                IWorkerGPUContext *gpu_ctx,
                                                                const std::unordered_set<std::string> *collective_nodes,
-                                                               bool collectives_graph_capturable)
+                                                               bool collectives_graph_capturable,
+                                                               bool force_recapture,
+                                                               bool defer_final_sync)
     {
         if (!gpu_stream || !gpu_ctx)
         {
@@ -304,27 +458,144 @@ namespace llaminar2
 
         const bool has_collective_nodes = (collective_nodes && !collective_nodes->empty());
 
+        const uint64_t current_variant_signature =
+            DeviceGraphCaptureController::computeCaptureVariantSignature(graph);
+        if (segment_cache.initialized &&
+            segment_cache.capture_variant_signature != current_variant_signature)
+        {
+            LOG_DEBUG("[DeviceGraphExecutor] Segmented graph launch-topology variant changed from "
+                      << segment_cache.capture_variant_signature << " to "
+                      << current_variant_signature << "; recapturing");
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_segmented_variant_recapture",
+                1.0,
+                "decode",
+                ctx ? ctx->deviceId().toString() : std::string{},
+                {{"old_signature", std::to_string(segment_cache.capture_variant_signature)},
+                 {"new_signature", std::to_string(current_variant_signature)},
+                 {"context", segment_cache.perf_context}});
+            segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
+            segment_cache.capture_variant_signature = current_variant_signature;
+            segment_cache.variant_recapture_count++;
+        }
+        else if (!segment_cache.initialized)
+        {
+            segment_cache.capture_variant_signature = current_variant_signature;
+        }
+
         // Monotonic step counter + phase transition selection for segmented mode.
         const auto phase_transition = DeviceGraphCaptureController::beginStep(
             segment_cache.initialized,
             segment_cache.needs_capture,
             segment_cache.decode_step);
         const uint64_t current_step = phase_transition.decode_step;
+        const char *phase_name = "unknown";
+        switch (phase_transition.phase)
+        {
+        case DeviceGraphCaptureController::Phase::Warmup:
+            phase_name = "warmup";
+            break;
+        case DeviceGraphCaptureController::Phase::Capture:
+            phase_name = "capture";
+            break;
+        case DeviceGraphCaptureController::Phase::Replay:
+            phase_name = "replay";
+            break;
+        }
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "decode_segmented_phase",
+            1.0,
+            "decode",
+            ctx ? ctx->deviceId().toString() : std::string{},
+            {{"context", segment_cache.perf_context},
+             {"phase", phase_name}});
+        PerfStatsCollector::addCounter(
+            "forward_graph",
+            "decode_graph_phase",
+            1.0,
+            "decode",
+            ctx ? ctx->deviceId().toString() : std::string{},
+            {{"context", segment_cache.perf_context},
+             {"phase", phase_name}});
 
-        auto mark_stage_outputs_dirty = [&](ComputeNode &node, void *stream)
+        auto mark_arena_write_dirty = [&](BufferId id, DeviceId device)
         {
             if (!arena_)
                 return;
-            const StageBufferContract contract = node.stage->bufferContract();
-            if (contract.empty())
-                return;
-            DeviceId target_device = node.device.is_valid() ? node.device : node.stage->device();
-            for (const auto &binding : contract.allWrites())
-            {
-                arena_->markWritten(binding.id, target_device, stream);
-            }
+
+            /*
+             * Steady-state graph replay normally stays fully device-owned, so a
+             * flags-only transition is enough and avoids an event per stage.
+             * Parity snapshot callbacks are different: they immediately read
+             * intermediate outputs on the host after replay.  Record the same
+             * stream event used by the non-captured execution path so
+             * ensureOnHost() waits for the captured kernels that produced the
+             * tensor instead of racing a stale host copy.
+             */
+            if (config_.snapshot_callback && segment_cache.capture_stream)
+                arena_->markWritten(id, device, segment_cache.capture_stream);
+            else
+                arena_->markWrittenFlagsOnly(id, device);
         };
 
+        // ===== FAST PATH: Phase 3 (Replay) =====
+        // During steady-state replay, only the post_launch hook is invoked
+        // (cohere_inputs is skipped for capturable segments, execute_node is
+        // unused). Avoid constructing unused lambdas and skip phase 1/2 checks
+        // to minimize host overhead on the hot decode path.
+        const auto &exec_env = debugEnv().execution;
+        const bool replay_diagnostics_enabled =
+            exec_env.gpu_graph_verify || exec_env.gpu_graph_recapture || force_recapture;
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay &&
+            !replay_diagnostics_enabled)
+        {
+            DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+
+            DeviceGraphCaptureController::ReplayHooks fast_hooks{
+                nullptr, // cohere_inputs — skipped during normal replay (skip_coherence=true)
+                [&](ComputeNode &node) -> bool
+                {
+                    return executeNode(node, ctx);
+                },
+                [&](DeviceGraphExecutor::GraphSegment &seg, void *stream)
+                {
+                    DeviceGraphCaptureController::postCapturedSegmentLaunch(
+                        graph, seg, current_step, stream,
+                        [&](BufferId id, DeviceId device)
+                        {
+                            mark_arena_write_dirty(id, device);
+                        });
+                }};
+
+            const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
+                graph, segment_cache, ctx, gpu_ctx,
+                has_collective_nodes, current_step, fast_hooks,
+                /*force_recapture=*/false,
+                defer_final_sync);
+
+            if (!replay_result.success)
+            {
+                if (replay_result.launch_failure_fallback)
+                {
+                    segment_cache.consecutive_failures++;
+                    if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
+                    {
+                        LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
+                        segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
+                    }
+                    graph.reset();
+                    return executeFastDecode(graph, ctx, collective_nodes);
+                }
+                return false;
+            }
+
+            segment_cache.consecutive_failures = 0;
+            return true;
+        }
+
+        // ===== SLOW PATH: Phase 1 (Warmup) or Phase 2 (Capture) =====
         auto post_captured_segment_launch = [&](GraphSegment &seg, void *stream)
         {
             DeviceGraphCaptureController::postCapturedSegmentLaunch(
@@ -332,9 +603,9 @@ namespace llaminar2
                 seg,
                 current_step,
                 stream,
-                [&](ComputeNode &node, void *node_stream)
+                [&](BufferId id, DeviceId device)
                 {
-                    mark_stage_outputs_dirty(node, node_stream);
+                    mark_arena_write_dirty(id, device);
                 });
         };
 
@@ -432,12 +703,39 @@ namespace llaminar2
                     segment,
                     current_step,
                     stream,
-                    [&](ComputeNode &node, void *node_stream)
+                    [&](BufferId id, DeviceId device)
                     {
-                        mark_stage_outputs_dirty(node, node_stream);
+                        mark_arena_write_dirty(id, device);
                     },
                     /*skip_replay_callbacks=*/true);
             }};
+
+        if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay)
+        {
+            const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
+                graph, segment_cache, ctx, gpu_ctx,
+                has_collective_nodes, current_step, replay_hooks, force_recapture,
+                defer_final_sync);
+
+            if (!replay_result.success)
+            {
+                if (replay_result.launch_failure_fallback)
+                {
+                    segment_cache.consecutive_failures++;
+                    if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
+                    {
+                        LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
+                        segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
+                    }
+                    graph.reset();
+                    return executeFastDecode(graph, ctx, collective_nodes);
+                }
+                return false;
+            }
+
+            segment_cache.consecutive_failures = 0;
+            return true;
+        }
 
         // ===== Phase 1: Warmup (first call) — build segments, execute normally =====
         // We do NOT capture on the first call. Some kernels lazily initialize workspace
@@ -459,7 +757,9 @@ namespace llaminar2
                 collectives_graph_capturable);
 
             // Create the capture stream early so warmup runs on it.
-            if (segment_cache.ensureCaptureStream(gpu_ctx))
+            if (segment_cache.ensureCaptureStream(
+                    gpu_ctx,
+                    ctx ? ctx->deviceId() : DeviceId::invalid()))
             {
                 void *warmup_stream = segment_cache.capture_stream;
 
@@ -484,10 +784,15 @@ namespace llaminar2
                 }
             }
 
-            // Warmup executes all stages normally (no capture) to ensure
-            // lazy kernel initialization and workspace allocation complete
-            // on the capture stream.
-            return executeFastDecode(graph, ctx, collective_nodes);
+            // Warmup executes all stages normally (no capture) to ensure lazy
+            // kernel initialization and workspace allocation complete on the
+            // capture stream.  Preserve the capture-stream assignment above:
+            // the generic fast-decode entry point intentionally rebinds eager
+            // fallback passes to the worker stream to avoid stale stream
+            // ownership of live device state.
+            auto warmup_policy = StageRunPolicy::fastDecode();
+            warmup_policy.preserve_gpu_streams = true;
+            return runStages(graph, ctx, warmup_policy, collective_nodes);
         }
 
         // ===== Phase 2: Capture (second call) — record capturable segments =====
@@ -504,7 +809,7 @@ namespace llaminar2
 
             if (capture_result.reset_cache)
             {
-                segment_cache.reset();
+                segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
             }
 
             if (!capture_result.success)
@@ -522,46 +827,10 @@ namespace llaminar2
             return true;
         }
 
-        // ===== Phase 3: Replay — just launch() capturable segments directly =====
-        // SYNCHRONIZATION STRATEGY (Unified-Stream):
-        // ALL work — both graph launches and manual stages — runs on capture_stream.
-        // Since all GPU operations are on the SAME stream, the GPU guarantees
-        // in-order execution. NO intermediate CPU-side synchronization is needed.
-        //
-        // Manual stages' CPU code (metadata reads, mask creation) doesn't depend
-        // on GPU results being visible — it only reads CPU-side state that was
-        // updated during previous execute() calls (e.g., KV cache entry.count).
-        //
-        // The ONLY sync point is the final device sync after all segments,
-        // ensuring GPU work completes before the caller reads output tensors.
-
-        const auto replay_phase_result = DeviceGraphCaptureController::executeReplayPhase(
-            graph,
-            segment_cache,
-            ctx,
-            gpu_ctx,
-            has_collective_nodes,
-            current_step,
-            replay_hooks);
-
-        if (!replay_phase_result.success)
-        {
-            if (replay_phase_result.launch_failure_fallback)
-            {
-                segment_cache.consecutive_failures++;
-                if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
-                {
-                    LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
-                    segment_cache.reset();
-                }
-                graph.reset();
-                return executeFastDecode(graph, ctx, collective_nodes);
-            }
-            return false;
-        }
-
-        segment_cache.consecutive_failures = 0;
-        return true;
+        // Phase 3 is handled by the fast path above; this point is unreachable
+        // after Phase 1 and Phase 2 both early-return.
+        LOG_ERROR("[DeviceGraphExecutor] Unexpected phase in segmented graph capture");
+        return false;
     }
 
 } // namespace llaminar2

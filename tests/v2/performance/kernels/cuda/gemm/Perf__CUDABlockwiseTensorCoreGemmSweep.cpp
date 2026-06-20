@@ -14,6 +14,7 @@
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "backends/DeviceId.h"
+#include "../../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <sys/wait.h>
 #include <tuple>
@@ -61,40 +63,90 @@ namespace
         std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create;
     };
 
+    /**
+     * @brief Build a deterministic, structurally valid quantized weight tensor for dispatch sweeps.
+     *
+     * Dispatch-table training only needs each candidate to see the production tensor
+     * class, NativeVNNI metadata, upload path, and packed byte count.  It does not
+     * need statistically realistic random model weights.  The regular
+     * TestTensorFactory random quantizers are excellent correctness fixtures, but on
+     * LM-head shapes they spend minutes generating per-element host random data
+     * before the first kernel timing row is emitted.  This helper fills valid block
+     * payloads in O(weight_bytes) with no RNG so giant-shape refreshes stay turnkey.
+     */
+    template <typename TensorT, typename BlockT>
+    std::unique_ptr<TensorBase> createFastSweepTensor(size_t n, size_t k)
+    {
+        const size_t blocks_per_row = (k + BlockT::BLOCK_SIZE - 1) / BlockT::BLOCK_SIZE;
+        std::vector<uint8_t> raw(n * blocks_per_row * sizeof(BlockT), 0);
+
+        // Half-precision 1.0.  For formats whose first bytes are not a scale
+        // (for example IQ1_M/Q8_K), this is just benign deterministic payload.
+        static constexpr uint16_t kHalfOne = 0x3c00;
+        for (size_t block = 0; block < n * blocks_per_row; ++block)
+        {
+            uint8_t *dst = raw.data() + block * sizeof(BlockT);
+            std::memcpy(dst, &kHalfOne, std::min(sizeof(kHalfOne), sizeof(BlockT)));
+
+            // Add a tiny row/block-dependent pattern after the scale field.  The
+            // values are still valid packed indices/bitfields, but avoid a single
+            // all-zero buffer that could mask future accidental value-dependent code.
+            for (size_t byte = sizeof(kHalfOne); byte < sizeof(BlockT); ++byte)
+                dst[byte] = static_cast<uint8_t>((block + byte) & 0x3);
+        }
+
+        return std::make_unique<TensorT>(std::vector<size_t>{n, k}, raw);
+    }
+
     const std::vector<FormatSpec> kFormats = {
         {"Q4_0", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ4_0Random({n, k}); }},
+         { return createFastSweepTensor<Q4_0Tensor, Q4_0Block>(n, k); }},
         {"IQ4_NL", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+         { return createFastSweepTensor<IQ4_NLTensor, IQ4_NLBlock>(n, k); }},
+        {"IQ4_XS", [](size_t n, size_t k)
+         { return createFastSweepTensor<IQ4_XSTensor, IQ4_XSBlock>(n, k); }},
         {"Q4_1", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ4_1Random({n, k}); }},
+         { return createFastSweepTensor<Q4_1Tensor, Q4_1Block>(n, k); }},
+        {"Q4_K", [](size_t n, size_t k)
+         { return createFastSweepTensor<Q4_KTensor, Q4_KBlock>(n, k); }},
         {"Q5_0", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ5_0Random({n, k}); }},
+         { return createFastSweepTensor<Q5_0Tensor, Q5_0Block>(n, k); }},
         {"Q5_1", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ5_1Random({n, k}); }},
+         { return createFastSweepTensor<Q5_1Tensor, Q5_1Block>(n, k); }},
+        {"Q5_K", [](size_t n, size_t k)
+         { return createFastSweepTensor<Q5_KTensor, Q5_KBlock>(n, k); }},
         {"Q6_K", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ6_KRandom({n, k}); }},
+         { return createFastSweepTensor<Q6_KTensor, Q6_KBlock>(n, k); }},
         {"Q3_K", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ3_KRandom({n, k}); }},
+         { return createFastSweepTensor<Q3_KTensor, Q3_KBlock>(n, k); }},
         {"Q2_K", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ2_KRandom({n, k}); }},
+         { return createFastSweepTensor<Q2_KTensor, Q2_KBlock>(n, k); }},
         {"IQ3_S", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ3_SRandom({n, k}); }},
+         { return createFastSweepTensor<IQ3_STensor, IQ3_SBlock>(n, k); }},
         {"IQ3_XXS", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
+         { return createFastSweepTensor<IQ3_XXSTensor, IQ3_XXSBlock>(n, k); }},
         {"IQ2_S", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ2_SRandom({n, k}); }},
+         { return createFastSweepTensor<IQ2_STensor, IQ2_SBlock>(n, k); }},
         {"IQ2_XS", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ2_XSRandom({n, k}); }},
+         { return createFastSweepTensor<IQ2_XSTensor, IQ2_XSBlock>(n, k); }},
         {"IQ2_XXS", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
+         { return createFastSweepTensor<IQ2_XXSTensor, IQ2_XXSBlock>(n, k); }},
         {"IQ1_S", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
+         { return createFastSweepTensor<IQ1_STensor, IQ1_SBlock>(n, k); }},
         {"IQ1_M", [](size_t n, size_t k)
-         { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+         { return createFastSweepTensor<IQ1_MTensor, IQ1_MBlock>(n, k); }},
         {"Q8_0", [](size_t n, size_t k)
-         { return TestTensorFactory::createQ8_0Random({n, k}); }},
+         { return createFastSweepTensor<Q8_0Tensor, Q8_0Block>(n, k); }},
     };
+
+    const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+        const NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("CUDA decode sweep format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
 
     struct Shape
     {
@@ -104,6 +156,11 @@ namespace
     };
 
     const std::vector<Shape> kQwenShapes = {
+        // Qwen3.5-35B-A3B MoE expert FFN shapes (d_model=2048, expert_intermediate=512).
+        // These are the production hot-path GEMVs for grouped MoE decode and mirror the
+        // CUDA NativeVNNI prefill sweep inventory.
+        {"35BMoE_Expert_GateUp", 512, 2048},
+        {"35BMoE_Expert_Down", 2048, 512},
         {"0.5B_Attn", 896, 896},
         {"0.5B_FFN_Up", 4864, 896},
         {"0.5B_FFN_Down", 896, 4864},
@@ -146,6 +203,10 @@ namespace
         {"7B_TP4_FFN_Up", 4736, 3584},
         {"7B_TP4_FFN_Down", 3584, 4736},
         {"7B_TP4_LM_Head", 38016, 3584},
+        {"9B_Attn", 4096, 4096},
+        {"9B_FFN_Up", 12288, 4096},
+        {"9B_FFN_Down", 4096, 12288},
+        {"9B_LM_Head", 248320, 4096},
         {"14B_Attn", 5120, 5120},
         {"14B_FFN_Up", 13824, 5120},
         {"14B_FFN_Down", 5120, 13824},
@@ -160,6 +221,16 @@ namespace
         {"14B_TP4_FFN_Up", 3456, 5120},
         {"14B_TP4_FFN_Down", 5120, 3456},
         {"14B_TP4_LM_Head", 38016, 5120},
+        // Qwen3.6 27B dense / hybrid GDN production shapes
+        // (d_model=5120, d_ff=17408, fused attention QKV, and GDN projections).
+        {"Qwen36_Attn_QKVProjection", 12288, 5120},
+        {"Qwen36_FFN_GateUp", 17408, 5120},
+        {"Qwen36_FFN_DownProjection", 5120, 17408},
+        {"Qwen36_GDN_InnerProjection", 10240, 5120},
+        {"Qwen36_GDN_ZProjection", 6144, 5120},
+        {"Qwen36_GDN_TimeProjection", 1024, 5120},
+        {"Qwen36_GDN_OutputProjection", 5120, 6144},
+        {"Qwen36_LM_Head", 248320, 5120},
     };
 
     enum class SweepFamily
@@ -193,6 +264,7 @@ namespace
     {
         int warmup_runs = kDefaultWarmupRuns;
         int bench_runs = kDefaultBenchRuns;
+        std::vector<int> m_values = {1};
         std::set<std::string> format_filters;
         std::set<std::string> shape_filters;
         std::set<std::string> family_filters;
@@ -370,6 +442,19 @@ namespace
         if (const auto value = getEnvInt("LLAMINAR_CUDA_TC_MAX_CASES"))
             cfg.max_cases = std::max(1, *value);
 
+        const auto m_values = getEnvCsvInts("LLAMINAR_CUDA_TC_SWEEP_M");
+        if (!m_values.empty())
+        {
+            cfg.m_values.clear();
+            for (const int m : m_values)
+            {
+                if (m > 0)
+                    cfg.m_values.push_back(m);
+            }
+            if (cfg.m_values.empty())
+                cfg.m_values.push_back(1);
+        }
+
         const auto formats = getEnvCsvSet("LLAMINAR_CUDA_TC_FORMATS");
         if (!formats.empty())
             cfg.format_filters = formats;
@@ -465,6 +550,39 @@ namespace
         return candidates;
     }
 
+    bool candidateSupportedByGpuPreparedSweepPath(const TuneCandidate &candidate, int m)
+    {
+        /**
+         * The CUDA decode trainer uses makeGpuPreparedGemm(), which mirrors the
+         * production VRAM-pool upload path.  That path owns native-VNNI payloads
+         * and workspace buffers, but it does not own the optional row-major
+         * transpose required by ROWPAR.  Do not emit ROWPAR training rows from
+         * this harness until a row-major-owner preparation mode is added.
+         *
+         * The specialized verifier kernels for M=2..4 currently provide KPAR
+         * implementations.  WIDE/DIRECT are M=1 decode candidates only.  This
+         * guard prevents the trainer from timing one route while labelling the
+         * CSV as another candidate.
+         */
+        if (candidate.family == SweepFamily::RowPar)
+            return false;
+        if (m > 1)
+            return candidate.family == SweepFamily::KPar;
+        return true;
+    }
+
+    size_t workspaceBudgetFor(const WorkspaceRequirements &requirements)
+    {
+        /*
+         * DeviceWorkspaceManager enforces the budget before allocating.  The
+         * decode trainer should size that budget from each kernel's declared
+         * IWorkspaceConsumer requirements, especially for giant LM-head small-M
+         * cases where partial buffers can legitimately exceed a fixed 512 MiB.
+         */
+        static constexpr size_t kMinimumBudget = 64ull * 1024ull * 1024ull;
+        return std::max(kMinimumBudget, requirements.total_bytes_with_alignment());
+    }
+
     std::string shellQuote(const std::string &value)
     {
         std::string quoted = "'";
@@ -522,7 +640,7 @@ namespace
     {
         const std::string path = getEnvString("LLAMINAR_CUDA_TC_HEURISTIC_SCRIPT");
         return path.empty()
-                   ? "/workspaces/llaminar/tests/v2/performance/kernels/cuda/gemm/analyze_cuda_tc_gemv_dispatch.py"
+                   ? "/workspaces/llaminar/tests/v2/performance/kernels/cuda/gemm/infer_gemv_dispatch_heuristic.py"
                    : path;
     }
 
@@ -553,7 +671,8 @@ namespace
         }
 
         RunResult runTunedGemv(
-            TensorBase *weights,
+            ITensorGemm *kernel,
+            int m,
             int n,
             int k,
             const SweepConfig &cfg,
@@ -570,55 +689,82 @@ namespace
                 candidate.max_kb,
                 candidate.force_two_phase);
 
-            EXPECT_TRUE(weights->ensureOnDevice(device_));
-            auto kernel = KernelFactory::createGemm(weights, DeviceType::CUDA);
             if (!kernel)
             {
                 cudaNativeVNNIGemvSweep_clearConfig();
-                throw std::runtime_error("KernelFactory::createGemm returned null");
+                throw std::runtime_error("CUDA NativeVNNI sweep has no prepared GEMM kernel");
             }
 
-            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+            cudaStream_t stream = nullptr;
+            if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess)
+            {
+                cudaNativeVNNIGemvSweep_clearConfig();
+                throw std::runtime_error("cudaStreamCreateWithFlags failed");
+            }
+            kernel->setGPUStream(static_cast<void *>(stream));
+
+            auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
             std::unique_ptr<DeviceWorkspaceManager> workspace;
+            auto cleanup = [&]()
+            {
+                if (ws_consumer)
+                    ws_consumer->unbindWorkspace();
+                kernel->setGPUStream(nullptr);
+                cudaStreamDestroy(stream);
+                cudaNativeVNNIGemvSweep_clearConfig();
+            };
+
             if (ws_consumer)
             {
-                workspace = std::make_unique<DeviceWorkspaceManager>(device_, 512ull * 1024ull * 1024ull);
-                const auto reqs = ws_consumer->getWorkspaceRequirements(1, n, k);
+                const auto reqs = ws_consumer->getWorkspaceRequirements(m, n, k);
+                workspace = std::make_unique<DeviceWorkspaceManager>(device_, workspaceBudgetFor(reqs));
                 if (!workspace->allocate(reqs))
                 {
-                    cudaNativeVNNIGemvSweep_clearConfig();
+                    cleanup();
                     throw std::runtime_error("Failed to allocate CUDA GEMM workspace");
                 }
                 ws_consumer->bindWorkspace(workspace.get());
             }
 
-            auto h_input = TestTensorFactory::createFP32Random({1u, static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
+            auto h_input = TestTensorFactory::createFP32Random(
+                {static_cast<size_t>(m), static_cast<size_t>(k)}, -0.25f, 0.25f, 7);
 
             // Create tensor wrappers and upload to GPU
-            auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1u, static_cast<size_t>(k)});
-            std::memcpy(A_tensor->mutable_data(), h_input->data(), static_cast<size_t>(k) * sizeof(float));
-            auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{1u, static_cast<size_t>(n)});
+            auto A_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(k)});
+            std::memcpy(
+                A_tensor->mutable_data(),
+                h_input->data(),
+                static_cast<size_t>(m) * static_cast<size_t>(k) * sizeof(float));
+            auto C_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(m), static_cast<size_t>(n)});
 
             if (!A_tensor->ensureOnDevice(device_))
             {
-                cudaNativeVNNIGemvSweep_clearConfig();
+                cleanup();
                 throw std::runtime_error("ensureOnDevice A failed");
             }
             if (!C_tensor->ensureOnDevice(device_))
             {
-                cudaNativeVNNIGemvSweep_clearConfig();
+                cleanup();
                 throw std::runtime_error("ensureOnDevice C failed");
+            }
+
+            // Tensor upload helpers are outside this microbenchmark's timed region.
+            // Synchronize once so the explicit benchmark stream only measures GEMV.
+            if (cudaDeviceSynchronize() != cudaSuccess)
+            {
+                cleanup();
+                throw std::runtime_error("cudaDeviceSynchronize before benchmark failed");
             }
 
             for (int i = 0; i < cfg.warmup_runs; ++i)
             {
-                if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), 1, n, k))
+                if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k))
                 {
                     // Some candidate/codebook combos are unsupported (e.g. ROWPAR
                     // for Q8_0).  Return a sentinel so the caller can skip them.
-                    if (ws_consumer)
-                        ws_consumer->unbindWorkspace();
-                    cudaNativeVNNIGemvSweep_clearConfig();
+                    cleanup();
                     return RunResult{.min_us = std::numeric_limits<double>::infinity()};
                 }
             }
@@ -631,13 +777,13 @@ namespace
                 cudaEvent_t stop = nullptr;
                 if (cudaEventCreate(&start) != cudaSuccess || cudaEventCreate(&stop) != cudaSuccess)
                 {
-                    cudaNativeVNNIGemvSweep_clearConfig();
+                    cleanup();
                     throw std::runtime_error("cudaEventCreate failed");
                 }
 
-                cudaEventRecord(start);
-                const bool run_ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), 1, n, k);
-                cudaEventRecord(stop);
+                cudaEventRecord(start, stream);
+                const bool run_ok = kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), m, n, k);
+                cudaEventRecord(stop, stream);
                 cudaEventSynchronize(stop);
 
                 float elapsed_ms = 0.0f;
@@ -647,16 +793,14 @@ namespace
 
                 if (!run_ok)
                 {
-                    cudaNativeVNNIGemvSweep_clearConfig();
+                    cleanup();
                     throw std::runtime_error("CUDA native payload GEMV bench run failed");
                 }
 
                 times_us.push_back(static_cast<double>(elapsed_ms) * 1000.0);
             }
 
-            if (ws_consumer)
-                ws_consumer->unbindWorkspace();
-            cudaNativeVNNIGemvSweep_clearConfig();
+            cleanup();
 
             RunResult result;
             result.min_us = *std::min_element(times_us.begin(), times_us.end());
@@ -676,7 +820,7 @@ namespace
         std::FILE *csv = std::fopen(cfg.csv_path.c_str(), "w");
         ASSERT_NE(csv, nullptr) << "Failed to open CSV: " << cfg.csv_path;
         std::fprintf(csv,
-                     "format,shape,n,k,weight_bytes,family,tile_n,cpt,target_waves,mkg,max_kb,force_two_phase,min_us,eff_bw_gbs,pct_peak,is_best\n");
+                     "format,codebook,shape,m,n,k,weight_bytes,family,tile_n,cpt,target_waves,mkg,max_kb,force_two_phase,min_us,eff_bw_gbs,pct_peak,is_best\n");
 
         int executed_cases = 0;
         int executed_rows = 0;
@@ -696,66 +840,98 @@ namespace
                     break;
 
                 auto weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
                 const size_t weight_bytes = weights->size_bytes();
-                const size_t total_bytes = weight_bytes + static_cast<size_t>(shape.k) * sizeof(float) + static_cast<size_t>(shape.n) * sizeof(float);
 
-                std::vector<TuneResult> results;
-                results.reserve(candidates.size());
+                /*
+                 * Prepare/upload/repack once per format+shape.  Candidate tuning is
+                 * a launch-configuration decision read from the global sweep override;
+                 * rebuilding the production VRAM payload for every candidate makes
+                 * giant LM-head refreshes CPU-bound before the first CSV row.
+                 */
+                auto prepared = makeGpuPreparedGemm(
+                    weights.get(),
+                    device_,
+                    "perf.cuda_native_vnni_gemv_sweep.weight");
+                ASSERT_NE(prepared.kernel, nullptr) << "makeGpuPreparedGemm returned null GEMM kernel";
 
-                for (const auto &candidate : candidates)
+                for (const int m : cfg.m_values)
                 {
-                    const RunResult run = runTunedGemv(weights.get(), shape.n, shape.k, cfg, candidate);
-                    if (std::isinf(run.min_us))
-                        continue; // Unsupported candidate for this codebook
-                    const double eff_bw = static_cast<double>(total_bytes) / (run.min_us * 1e-6) / 1e9;
-                    const double pct_peak = (peak_bw_GB_s_ > 0.0) ? (eff_bw / peak_bw_GB_s_ * 100.0) : 0.0;
-                    results.push_back({candidate, run.min_us, eff_bw, pct_peak});
-                }
+                    const size_t total_bytes = weight_bytes +
+                                               static_cast<size_t>(m) * static_cast<size_t>(shape.k) * sizeof(float) +
+                                               static_cast<size_t>(m) * static_cast<size_t>(shape.n) * sizeof(float);
 
-                const auto best_it = std::min_element(
-                    results.begin(), results.end(),
-                    [](const TuneResult &lhs, const TuneResult &rhs)
+                    std::vector<TuneResult> results;
+                    results.reserve(candidates.size());
+
+                    for (const auto &candidate : candidates)
                     {
-                        return lhs.min_us < rhs.min_us;
-                    });
-                ASSERT_NE(best_it, results.end());
+                        if (!candidateSupportedByGpuPreparedSweepPath(candidate, m))
+                            continue;
 
-                for (const auto &result : results)
-                {
-                    const int is_best = (&result == &(*best_it)) ? 1 : 0;
-                    std::fprintf(csv,
-                                 "%s,%s,%d,%d,%zu,%s,%d,%d,%d,%d,%d,%d,%.3f,%.1f,%.1f,%d\n",
-                                 format.name.c_str(), shape.name.c_str(), shape.n, shape.k,
-                                 weight_bytes,
-                                 familyName(result.candidate.family).c_str(),
-                                 result.candidate.tile_n,
-                                 result.candidate.cpt,
-                                 result.candidate.target_waves,
-                                 result.candidate.mkg,
-                                 result.candidate.max_kb,
-                                 result.candidate.force_two_phase,
-                                 result.min_us,
-                                 result.eff_bw,
-                                 result.pct_peak,
-                                 is_best);
-                    ++executed_rows;
+                        const RunResult run = runTunedGemv(prepared.kernel, m, shape.n, shape.k, cfg, candidate);
+                        if (std::isinf(run.min_us))
+                            continue; // Unsupported candidate for this codebook
+                        const double eff_bw = static_cast<double>(total_bytes) / (run.min_us * 1e-6) / 1e9;
+                        const double pct_peak = (peak_bw_GB_s_ > 0.0) ? (eff_bw / peak_bw_GB_s_ * 100.0) : 0.0;
+                        results.push_back({candidate, run.min_us, eff_bw, pct_peak});
+                    }
+
+                    const auto best_it = std::min_element(
+                        results.begin(), results.end(),
+                        [](const TuneResult &lhs, const TuneResult &rhs)
+                        {
+                            return lhs.min_us < rhs.min_us;
+                        });
+                    ASSERT_NE(best_it, results.end());
+
+                    for (const auto &result : results)
+                    {
+                        const int is_best = (&result == &(*best_it)) ? 1 : 0;
+                        std::fprintf(csv,
+                                     "%s,%u,%s,%d,%d,%d,%zu,%s,%d,%d,%d,%d,%d,%d,%.3f,%.1f,%.1f,%d\n",
+                                     format.name.c_str(),
+                                     static_cast<unsigned>(codebook_id),
+                                     shape.name.c_str(),
+                                     m,
+                                     shape.n,
+                                     shape.k,
+                                     weight_bytes,
+                                     familyName(result.candidate.family).c_str(),
+                                     result.candidate.tile_n,
+                                     result.candidate.cpt,
+                                     result.candidate.target_waves,
+                                     result.candidate.mkg,
+                                     result.candidate.max_kb,
+                                     result.candidate.force_two_phase,
+                                     result.min_us,
+                                     result.eff_bw,
+                                     result.pct_peak,
+                                     is_best);
+                        ++executed_rows;
+                    }
+                    std::fflush(csv);
+
+                    std::fprintf(stderr,
+                                 "[CUDABlockwiseTC][SWEEP][BEST] format=%s codebook=%u shape=%s M=%d family=%s tile=%dx%d waves=%d mkg=%d force_phase=%d time_us=%.3f eff_bw=%.1fGB/s pct_peak=%.1f%%\n",
+                                 format.name.c_str(),
+                                 static_cast<unsigned>(codebook_id),
+                                 shape.name.c_str(),
+                                 m,
+                                 familyName(best_it->candidate.family).c_str(),
+                                 best_it->candidate.tile_n,
+                                 best_it->candidate.cpt,
+                                 best_it->candidate.target_waves,
+                                 best_it->candidate.mkg,
+                                 best_it->candidate.force_two_phase,
+                                 best_it->min_us,
+                                 best_it->eff_bw,
+                                 best_it->pct_peak);
+
+                    ++executed_cases;
+                    if (executed_cases >= cfg.max_cases)
+                        break;
                 }
-                std::fflush(csv);
-
-                std::fprintf(stderr,
-                             "[CUDABlockwiseTC][SWEEP][BEST] format=%s shape=%s family=%s tile=%dx%d waves=%d mkg=%d force_phase=%d time_us=%.3f eff_bw=%.1fGB/s pct_peak=%.1f%%\n",
-                             format.name.c_str(), shape.name.c_str(),
-                             familyName(best_it->candidate.family).c_str(),
-                             best_it->candidate.tile_n,
-                             best_it->candidate.cpt,
-                             best_it->candidate.target_waves,
-                             best_it->candidate.mkg,
-                             best_it->candidate.force_two_phase,
-                             best_it->min_us,
-                             best_it->eff_bw,
-                             best_it->pct_peak);
-
-                ++executed_cases;
             }
 
             if (executed_cases >= cfg.max_cases)
@@ -787,16 +963,21 @@ namespace
         std::filesystem::create_directories(std::filesystem::path(output_path).parent_path());
         std::filesystem::create_directories(std::filesystem::path(summary_path).parent_path());
 
-        const std::string command =
+        std::string command =
             "python3 " + shellQuote(script_path) +
             " --input " + shellQuote(input_csv) +
             " --output " + shellQuote(output_path) +
-            " --summary " + shellQuote(summary_path) +
-            " --min-overall-family-pct 99.0" +
-            " --min-overall-exact-pct 99.0" +
-            " --min-fallback-family-pct 97.0" +
-            " --min-fallback-exact-pct 30.0" +
-            " 2>&1";
+            " --summary " + shellQuote(summary_path);
+
+        if (script_path.find("analyze_cuda_tc_gemv_dispatch.py") != std::string::npos)
+        {
+            command +=
+                " --min-overall-family-pct 99.0"
+                " --min-overall-exact-pct 99.0"
+                " --min-fallback-family-pct 97.0"
+                " --min-fallback-exact-pct 30.0";
+        }
+        command += " 2>&1";
 
         FILE *pipe = popen(command.c_str(), "r");
         ASSERT_NE(pipe, nullptr) << "Failed to spawn heuristic generator";

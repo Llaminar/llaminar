@@ -32,14 +32,21 @@
 #include <mpi.h>
 #include <omp.h>
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <csignal>
 #include <cstring>
 #include <iomanip>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <set>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -170,6 +177,7 @@ namespace
 
     // Cached calibrated bandwidth (computed once, shared across all tests)
     static double s_calibrated_bw_gbs = 0;
+    static volatile int64_t s_vnni_floor_sink = 0;
 
     static double systemBandwidthGB()
     {
@@ -207,6 +215,533 @@ namespace
         {"14B", 5120, 40, 8, 128, 13824, 152064},
         {"32B", 5120, 40, 8, 128, 27648, 152064},
     };
+
+    struct FormatSpec
+    {
+        std::string name;
+    };
+
+    static const std::vector<FormatSpec> MTP_SMALL_M_FORMATS = {
+        {"Q4_0"}, {"Q4_1"}, {"Q5_0"}, {"Q5_1"},
+        {"Q8_0"}, {"Q8_1"}, {"Q2_K"}, {"Q3_K"},
+        {"Q4_K"}, {"Q5_K"}, {"Q6_K"}, {"IQ4_NL"},
+        {"IQ4_XS"}, {"IQ3_S"}, {"IQ3_XXS"}, {"IQ2_S"},
+        {"IQ2_XS"}, {"IQ2_XXS"}, {"IQ1_S"}, {"IQ1_M"},
+    };
+
+    std::string trim(std::string value)
+    {
+        const auto begin = value.find_first_not_of(" \t\n\r");
+        if (begin == std::string::npos)
+            return {};
+        const auto end = value.find_last_not_of(" \t\n\r");
+        return value.substr(begin, end - begin + 1);
+    }
+
+    std::string toLower(std::string value)
+    {
+        std::transform(
+            value.begin(),
+            value.end(),
+            value.begin(),
+            [](unsigned char c)
+            {
+                return static_cast<char>(std::tolower(c));
+            });
+        return value;
+    }
+
+    /**
+     * @brief Read an optional environment variable as a trimmed string.
+     */
+    std::string getEnvString(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return {};
+        return trim(raw);
+    }
+
+    /**
+     * @brief Read an optional environment variable as an integer.
+     */
+    std::optional<int> getEnvInt(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return std::nullopt;
+        return std::atoi(raw);
+    }
+
+    /**
+     * @brief Read an optional environment variable as a floating-point value.
+     */
+    std::optional<double> getEnvDouble(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return std::nullopt;
+        return std::atof(raw);
+    }
+
+    /**
+     * @brief Keep standalone verifier microbench runs on a representative CPU team.
+     *
+     * Production inference and CTest normally enter through the launcher/MPI
+     * wrapper, which sets socket-aware OpenMP placement.  Directly launching
+     * this perf binary on a large dual-socket host leaves libgomp free to use
+     * every hardware thread, turning the tiny M=2..4 verifier probe into a
+     * scheduler and cross-socket migration benchmark.  Explicit user settings
+     * remain authoritative; this helper only supplies a sane local default for
+     * the verifier-row microbench when no threading policy was provided.
+     */
+    void applyVerifierRowsThreadCapForStandalonePerf()
+    {
+        if (const auto forced = getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_THREADS");
+            forced.has_value() && *forced > 0)
+        {
+            omp_set_num_threads(*forced);
+            return;
+        }
+
+        const char *omp_threads = std::getenv("OMP_NUM_THREADS");
+        if (omp_threads && *omp_threads)
+            return;
+
+        constexpr int kStandaloneThreadCap = 32;
+        const int max_threads = omp_get_max_threads();
+        if (max_threads > kStandaloneThreadCap)
+        {
+            omp_set_num_threads(kStandaloneThreadCap);
+            std::fprintf(
+                stderr,
+                "[CPUNativeVNNI][VERIFIER_ROWS] OMP_NUM_THREADS unset; "
+                "capping standalone perf probe from %d to %d threads. "
+                "Set OMP_NUM_THREADS or LLAMINAR_CPU_NVNNI_VERIFIER_THREADS "
+                "to override.\n",
+                max_threads,
+                kStandaloneThreadCap);
+        }
+    }
+
+    /**
+     * @brief Read a comma-separated environment variable as lowercase tokens.
+     */
+    std::set<std::string> getEnvCsvSet(const char *name)
+    {
+        std::set<std::string> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+
+        std::stringstream ss(raw);
+        std::string item;
+        while (std::getline(ss, item, ','))
+        {
+            item = toLower(trim(item));
+            if (!item.empty())
+                values.insert(item);
+        }
+        return values;
+    }
+
+    /**
+     * @brief Return true when a test case name is allowed by an optional filter.
+     */
+    bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
+    {
+        return filters.empty() || filters.count(toLower(name)) > 0;
+    }
+
+    struct VectorMetrics
+    {
+        double cosine = 1.0;
+        double relative_l2 = 0.0;
+        double symmetric_kl = 0.0;
+        double max_abs = 0.0;
+    };
+
+    /**
+     * @brief Compare two verifier output tensors with distribution-aware metrics.
+     *
+     * Relative L2 alone can miss row permutations and near-tie shifts that are
+     * obvious once the values are interpreted as logits.  The verifier-row
+     * microbench therefore tracks cosine similarity and symmetric KL as well,
+     * mirroring the stricter Phase 9.8 acceptance checks.
+     */
+    VectorMetrics computeVectorMetrics(const float *actual, const float *expected, size_t count)
+    {
+        VectorMetrics metrics{};
+        if (count == 0)
+            return metrics;
+
+        double dot = 0.0;
+        double actual_norm = 0.0;
+        double expected_norm = 0.0;
+        double diff_norm = 0.0;
+        metrics.max_abs = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double a = actual[i];
+            const double e = expected[i];
+            const double d = a - e;
+            dot += a * e;
+            actual_norm += a * a;
+            expected_norm += e * e;
+            diff_norm += d * d;
+            metrics.max_abs = std::max(metrics.max_abs, std::abs(d));
+        }
+        if (actual_norm <= 1.0e-30 && expected_norm <= 1.0e-30)
+        {
+            metrics.cosine = 1.0;
+        }
+        else
+        {
+            metrics.cosine =
+                dot / (std::sqrt(actual_norm) * std::sqrt(expected_norm) + 1.0e-30);
+        }
+        metrics.relative_l2 =
+            std::sqrt(diff_norm) / (std::sqrt(expected_norm) + 1.0e-30);
+
+        const double actual_max =
+            static_cast<double>(*std::max_element(actual, actual + count));
+        const double expected_max =
+            static_cast<double>(*std::max_element(expected, expected + count));
+        double actual_sum = 0.0;
+        double expected_sum = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            actual_sum += std::exp(static_cast<double>(actual[i]) - actual_max);
+            expected_sum += std::exp(static_cast<double>(expected[i]) - expected_max);
+        }
+
+        constexpr double eps = 1.0e-300;
+        double kl_actual_expected = 0.0;
+        double kl_expected_actual = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double p =
+                std::exp(static_cast<double>(actual[i]) - actual_max) /
+                (actual_sum + eps);
+            const double q =
+                std::exp(static_cast<double>(expected[i]) - expected_max) /
+                (expected_sum + eps);
+            kl_actual_expected += p * std::log((p + eps) / (q + eps));
+            kl_expected_actual += q * std::log((q + eps) / (p + eps));
+        }
+        metrics.symmetric_kl = 0.5 * (kl_actual_expected + kl_expected_actual);
+        return metrics;
+    }
+
+    void assertVerifierMetricsStrict(
+        const VectorMetrics &metrics,
+        const std::string &label)
+    {
+        EXPECT_GE(metrics.cosine, 0.999999)
+            << label << " cosine=" << metrics.cosine
+            << " relative_l2=" << metrics.relative_l2
+            << " symmetric_kl=" << metrics.symmetric_kl
+            << " max_abs=" << metrics.max_abs;
+        EXPECT_LE(metrics.relative_l2, 1.0e-6)
+            << label << " cosine=" << metrics.cosine
+            << " symmetric_kl=" << metrics.symmetric_kl
+            << " max_abs=" << metrics.max_abs;
+        EXPECT_LE(metrics.symmetric_kl, 1.0e-9)
+            << label << " cosine=" << metrics.cosine
+            << " relative_l2=" << metrics.relative_l2
+            << " max_abs=" << metrics.max_abs;
+    }
+
+    struct TimingSummary
+    {
+        double min_us = 0.0;
+        double mean_us = 0.0;
+        double stddev_us = 0.0;
+    };
+
+    template <typename Fn>
+    TimingSummary timeMicrobench(int warmup, int iterations, Fn &&fn)
+    {
+        for (int i = 0; i < warmup; ++i)
+            fn();
+
+        std::vector<double> samples;
+        samples.reserve(static_cast<size_t>(iterations));
+        for (int i = 0; i < iterations; ++i)
+        {
+            const auto t0 = std::chrono::high_resolution_clock::now();
+            fn();
+            const auto t1 = std::chrono::high_resolution_clock::now();
+            samples.push_back(
+                std::chrono::duration<double, std::micro>(t1 - t0).count());
+        }
+
+        TimingSummary summary{};
+        summary.min_us = *std::min_element(samples.begin(), samples.end());
+        summary.mean_us =
+            std::accumulate(samples.begin(), samples.end(), 0.0) /
+            static_cast<double>(samples.size());
+        double variance = 0.0;
+        for (double value : samples)
+        {
+            const double delta = value - summary.mean_us;
+            variance += delta * delta;
+        }
+        summary.stddev_us = std::sqrt(variance / static_cast<double>(samples.size()));
+        return summary;
+    }
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    /**
+     * @brief Convert a ZMM INT32 accumulator into a cheap scalar checksum.
+     *
+     * The instruction-floor microbench intentionally avoids full GEMV metadata
+     * work.  It still needs a visible result so the compiler cannot remove the
+     * VPDPBUSD loops.  Summing one stored ZMM per accumulator gives us a stable
+     * checksum while keeping the diagnostic focused on dot-product throughput.
+     */
+    int64_t checksumAccumulator(__m512i acc)
+    {
+        alignas(64) int32_t values[16];
+        _mm512_store_si512(reinterpret_cast<__m512i *>(values), acc);
+        int64_t sum = 0;
+        for (int value : values)
+            sum += value;
+        return sum;
+    }
+
+    /**
+     * @brief Minimal NativeVNNI row-scaling diagnostic for MTP verifier rows.
+     *
+     * This is not a production kernel.  It strips the verifier GEMV down to the
+     * invariant inner operation: signed packed-B vectors reused across M
+     * independent verifier rows via VPDPBUSD.  The result acts as a ceiling test
+     * for the current packed layout.  If this diagnostic cannot approach the
+     * desired M=4 speedup, a production rewrite needs a different B layout or a
+     * different matrix ISA rather than only local loop polish.
+     */
+    struct VNNIFloorResult
+    {
+        int rows = 0;
+        double grouped_us = 0.0;
+        double serial_us = 0.0;
+        double speedup = 0.0;
+        bool checksums_match = false;
+    };
+
+    VNNIFloorResult runVerifierRowsVNNIFloor(int rows, int work_blocks, int warmup, int iterations)
+    {
+        if (rows < 1 || rows > 4 || work_blocks <= 0)
+        {
+            ADD_FAILURE()
+                << "Invalid VNNI floor diagnostic shape: rows=" << rows
+                << " work_blocks=" << work_blocks;
+            return {};
+        }
+
+        alignas(64) std::array<std::array<uint8_t, 4>, 4> a_bytes{};
+        alignas(64) std::array<std::array<int8_t, 64>, 8> b_bytes{};
+        for (int row = 0; row < 4; ++row)
+        {
+            for (int group = 0; group < 4; ++group)
+                a_bytes[row][group] = static_cast<uint8_t>(1 + row + group);
+        }
+        for (int group = 0; group < 8; ++group)
+        {
+            for (int lane = 0; lane < 64; ++lane)
+                b_bytes[group][lane] = static_cast<int8_t>(((group + lane) % 5) - 2);
+        }
+
+        alignas(64) __m512i a_broadcasts[4];
+        for (int row = 0; row < 4; ++row)
+        {
+            uint32_t packed = 0;
+            std::memcpy(&packed, a_bytes[row].data(), sizeof(packed));
+            a_broadcasts[row] = _mm512_set1_epi32(static_cast<int32_t>(packed));
+        }
+
+        alignas(64) __m512i b_vectors[8];
+        for (int group = 0; group < 8; ++group)
+        {
+            b_vectors[group] =
+                _mm512_load_si512(reinterpret_cast<const __m512i *>(b_bytes[group].data()));
+        }
+
+        auto run_serial = [&]() -> int64_t
+        {
+            int64_t checksum = 0;
+            for (int row = 0; row < rows; ++row)
+            {
+                __m512i acc0 = _mm512_setzero_si512();
+                __m512i acc1 = _mm512_setzero_si512();
+                __m512i acc2 = _mm512_setzero_si512();
+                __m512i acc3 = _mm512_setzero_si512();
+                for (int block = 0; block < work_blocks; ++block)
+                {
+                    for (int group = 0; group < 8; ++group)
+                    {
+                        const __m512i b = b_vectors[(group + block) & 7];
+                        const __m512i a = a_broadcasts[row];
+                        acc0 = _mm512_dpbusd_epi32(acc0, a, b);
+                        acc1 = _mm512_dpbusd_epi32(acc1, a, b);
+                        acc2 = _mm512_dpbusd_epi32(acc2, a, b);
+                        acc3 = _mm512_dpbusd_epi32(acc3, a, b);
+                    }
+                }
+                checksum += checksumAccumulator(acc0);
+                checksum += checksumAccumulator(acc1);
+                checksum += checksumAccumulator(acc2);
+                checksum += checksumAccumulator(acc3);
+            }
+            s_vnni_floor_sink += checksum;
+            return checksum;
+        };
+
+        auto run_grouped = [&]() -> int64_t
+        {
+            alignas(64) __m512i acc0[4];
+            alignas(64) __m512i acc1[4];
+            alignas(64) __m512i acc2[4];
+            alignas(64) __m512i acc3[4];
+            for (int row = 0; row < 4; ++row)
+            {
+                acc0[row] = _mm512_setzero_si512();
+                acc1[row] = _mm512_setzero_si512();
+                acc2[row] = _mm512_setzero_si512();
+                acc3[row] = _mm512_setzero_si512();
+            }
+            for (int block = 0; block < work_blocks; ++block)
+            {
+                for (int group = 0; group < 8; ++group)
+                {
+                    const __m512i b = b_vectors[(group + block) & 7];
+                    for (int row = 0; row < rows; ++row)
+                    {
+                        const __m512i a = a_broadcasts[row];
+                        acc0[row] = _mm512_dpbusd_epi32(acc0[row], a, b);
+                        acc1[row] = _mm512_dpbusd_epi32(acc1[row], a, b);
+                        acc2[row] = _mm512_dpbusd_epi32(acc2[row], a, b);
+                        acc3[row] = _mm512_dpbusd_epi32(acc3[row], a, b);
+                    }
+                }
+            }
+
+            int64_t checksum = 0;
+            for (int row = 0; row < rows; ++row)
+            {
+                checksum += checksumAccumulator(acc0[row]);
+                checksum += checksumAccumulator(acc1[row]);
+                checksum += checksumAccumulator(acc2[row]);
+                checksum += checksumAccumulator(acc3[row]);
+            }
+            s_vnni_floor_sink += checksum;
+            return checksum;
+        };
+
+        const int64_t serial_checksum = run_serial();
+        const int64_t grouped_checksum = run_grouped();
+
+        const TimingSummary grouped_timing =
+            timeMicrobench(warmup, iterations, [&]()
+                           { (void)run_grouped(); });
+        const TimingSummary serial_timing =
+            timeMicrobench(warmup, iterations, [&]()
+                           { (void)run_serial(); });
+
+        VNNIFloorResult result{};
+        result.rows = rows;
+        result.grouped_us = grouped_timing.min_us;
+        result.serial_us = serial_timing.min_us;
+        result.speedup =
+            grouped_timing.min_us > 0.0 ? serial_timing.min_us / grouped_timing.min_us : 0.0;
+        result.checksums_match = serial_checksum == grouped_checksum;
+        return result;
+    }
+#endif
+
+    ISAPath parseISAPathForVerifierBench()
+    {
+        const std::string raw = toLower(getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_ISA"));
+        if (raw == "avx512")
+            return ISAPath::AVX512;
+        if (raw == "avx2")
+            return ISAPath::AVX2;
+        if (raw == "scalar")
+            return ISAPath::SCALAR;
+        return ISAPath::AUTO;
+    }
+
+    const char *isaPathName(ISAPath path)
+    {
+        switch (path)
+        {
+        case ISAPath::AVX512:
+            return "AVX512";
+        case ISAPath::AVX2:
+            return "AVX2";
+        case ISAPath::SCALAR:
+            return "SCALAR";
+        case ISAPath::AUTO:
+        default:
+            return "AUTO";
+        }
+    }
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    bool verifierBenchUsesAVX512(ISAPath path)
+    {
+        const ISALevel active_isa = activeISALevel();
+        return (path == ISAPath::AUTO && active_isa >= ISALevel::AVX512) ||
+               path == ISAPath::AVX512;
+    }
+
+#endif
+
+    std::unique_ptr<TensorBase> createWeightsForFormat(
+        const std::string &fmt_name, size_t N, size_t K)
+    {
+        if (fmt_name == "Q4_0")
+            return TestTensorFactory::createQ4_0Random({N, K});
+        if (fmt_name == "Q4_1")
+            return TestTensorFactory::createQ4_1Random({N, K});
+        if (fmt_name == "Q5_0")
+            return TestTensorFactory::createQ5_0Random({N, K});
+        if (fmt_name == "Q5_1")
+            return TestTensorFactory::createQ5_1Random({N, K});
+        if (fmt_name == "Q8_0")
+            return TestTensorFactory::createQ8_0Random({N, K});
+        if (fmt_name == "Q8_1")
+            return TestTensorFactory::createQ8_1Random({N, K});
+        if (fmt_name == "Q2_K")
+            return TestTensorFactory::createQ2_KRandom({N, K});
+        if (fmt_name == "Q3_K")
+            return TestTensorFactory::createQ3_KRandom({N, K});
+        if (fmt_name == "Q4_K")
+            return TestTensorFactory::createQ4_KRandom({N, K});
+        if (fmt_name == "Q5_K")
+            return TestTensorFactory::createQ5_KRandom({N, K});
+        if (fmt_name == "Q6_K")
+            return TestTensorFactory::createQ6_KRandom({N, K});
+        if (fmt_name == "IQ4_NL")
+            return TestTensorFactory::createIQ4_NLRandom({N, K});
+        if (fmt_name == "IQ4_XS")
+            return TestTensorFactory::createIQ4_XSRandom({N, K});
+        if (fmt_name == "IQ3_S")
+            return TestTensorFactory::createIQ3_SRandom({N, K});
+        if (fmt_name == "IQ3_XXS")
+            return TestTensorFactory::createIQ3_XXSRandom({N, K});
+        if (fmt_name == "IQ2_S")
+            return TestTensorFactory::createIQ2_SRandom({N, K});
+        if (fmt_name == "IQ2_XS")
+            return TestTensorFactory::createIQ2_XSRandom({N, K});
+        if (fmt_name == "IQ2_XXS")
+            return TestTensorFactory::createIQ2_XXSRandom({N, K});
+        if (fmt_name == "IQ1_S")
+            return TestTensorFactory::createIQ1_SRandom({N, K});
+        if (fmt_name == "IQ1_M")
+            return TestTensorFactory::createIQ1_MRandom({N, K});
+        return nullptr;
+    }
 
     // =========================================================================
     // Shape definitions
@@ -965,6 +1500,763 @@ namespace
                   << "VNNI = packed INT8 path (FP32\xe2\x86\x92Q8_1 quant + VNNI compute)\n"
                   << "Q8_0 = native blocks (FP32 dequant + FMA)\n\n"
                   << table.to_string() << std::endl;
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_FusedProjection_AllFormats)
+    {
+        constexpr int K = 512;
+        constexpr int N0 = 768;
+        constexpr int N1 = 512;
+        constexpr int LOCAL_WARMUP = 3;
+        constexpr int LOCAL_ITERS = 10;
+        const std::array<int, 3> rows = {2, 3, 4};
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "Format" << "M" << "K" << "N0" << "N1"
+              << "Fused us" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int c = 1; c <= 5; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        for (const auto &fmt : MTP_SMALL_M_FORMATS)
+        {
+            auto weights0 = createWeightsForFormat(fmt.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << fmt.name;
+            ASSERT_NE(weights1, nullptr) << fmt.name;
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt.name;
+            ASSERT_TRUE(kernel1.isValid()) << fmt.name;
+
+            for (int M : rows)
+            {
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    static_cast<uint32_t>(3000 + M + fmt.name.size()));
+                FP32Tensor out0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor out1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &out0, N0, nullptr, "mtp_projection_0"},
+                    {&kernel1, &out1, N1, nullptr, "mtp_projection_1"}};
+
+                for (int i = 0; i < LOCAL_WARMUP; ++i)
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+
+                std::vector<double> times;
+                times.reserve(LOCAL_ITERS);
+                for (int i = 0; i < LOCAL_ITERS; ++i)
+                {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                }
+                std::sort(times.begin(), times.end());
+                const double p10 = times[std::max(0, static_cast<int>(times.size() / 10) - 1)];
+
+                char fused_us[32];
+                std::snprintf(fused_us, sizeof(fused_us), "%.1f", p10);
+                table << fmt.name << M << K << N0 << N1 << fused_us << fort::endr;
+            }
+        }
+
+        std::cout << "\n=== MTP Small-M CPU NativeVNNI Fused Projection Perf ===\n"
+                  << "Rows M=2/3/4, two projections, activation quantized once per fused call.\n\n"
+                  << table.to_string() << std::endl;
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_TrainerCsv_AllFormats)
+    {
+        /**
+         * This is the CPU analogue of the CUDA/ROCm NativeVNNI trainer smoke:
+         * emit stable, machine-readable rows for the current default CPU small-M
+         * route. CPU does not yet consume a generated dispatch include, so the
+         * only variant is "DEFAULT"; later analyzer work can add override
+         * candidates without changing the CSV schema.
+         *
+         * Useful knobs:
+         * - LLAMINAR_CPU_NVNNI_SMALL_M_FORMATS=Q4_0,IQ4_XS
+         * - LLAMINAR_CPU_NVNNI_SMALL_M_M=2,3,4
+         * - LLAMINAR_CPU_NVNNI_SMALL_M_CSV=/tmp/cpu_small_m.csv
+         */
+        constexpr int K = 512;
+        constexpr int N0 = 768;
+        constexpr int N1 = 512;
+        const std::array<int, 3> default_rows = {2, 3, 4};
+
+        const std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_SMALL_M_FORMATS");
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_SMALL_M_M");
+        const int max_cases =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_SMALL_M_MAX_CASES").value_or(1000000));
+        const int warmup =
+            std::max(0, getEnvInt("LLAMINAR_CPU_NVNNI_SMALL_M_WARMUP").value_or(3));
+        const int iters =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_SMALL_M_ITERS").value_or(10));
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_SMALL_M_CSV");
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr)
+                << "Failed to open CPU NativeVNNI small-M trainer CSV: " << csv_path;
+            std::fprintf(
+                csv,
+                "backend,phase,format,codebook,shape,k,m,projections,total_n,projection_ns,variant,min_us,mean_us,stddev_us,correctness_pass,is_best\n");
+        }
+
+        int executed_cases = 0;
+        int emitted_rows = 0;
+        for (const auto &fmt : MTP_SMALL_M_FORMATS)
+        {
+            if (!shouldRunName(format_filters, fmt.name))
+                continue;
+
+            auto weights0 = createWeightsForFormat(fmt.name, N0, K);
+            auto weights1 = createWeightsForFormat(fmt.name, N1, K);
+            ASSERT_NE(weights0, nullptr) << fmt.name;
+            ASSERT_NE(weights1, nullptr) << fmt.name;
+
+            CPUNativeVNNIGemmKernel kernel0(weights0.get());
+            CPUNativeVNNIGemmKernel kernel1(weights1.get());
+            ASSERT_TRUE(kernel0.isValid()) << fmt.name;
+            ASSERT_TRUE(kernel1.isValid()) << fmt.name;
+            const uint8_t codebook = kernel0.packedWeights().codebook_id;
+
+            for (int M : default_rows)
+            {
+                if (!m_filters.empty() && m_filters.count(std::to_string(M)) == 0)
+                    continue;
+                if (executed_cases >= max_cases)
+                    break;
+
+                auto input = TestTensorFactory::createFP32Random(
+                    {static_cast<size_t>(M), static_cast<size_t>(K)},
+                    -1.0f,
+                    1.0f,
+                    static_cast<uint32_t>(9000 + M + fmt.name.size()));
+                FP32Tensor out0({static_cast<size_t>(M), static_cast<size_t>(N0)});
+                FP32Tensor out1({static_cast<size_t>(M), static_cast<size_t>(N1)});
+                std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+                    {&kernel0, &out0, N0, nullptr, "mtp_projection_0"},
+                    {&kernel1, &out1, N1, nullptr, "mtp_projection_1"}};
+
+                for (int i = 0; i < warmup; ++i)
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+
+                std::vector<double> times;
+                times.reserve(static_cast<size_t>(iters));
+                for (int i = 0; i < iters; ++i)
+                {
+                    auto t0 = std::chrono::high_resolution_clock::now();
+                    ASSERT_TRUE(kernel0.multiply_fused_tensor(input.get(), projections, M, K));
+                    auto t1 = std::chrono::high_resolution_clock::now();
+                    times.push_back(std::chrono::duration<double, std::micro>(t1 - t0).count());
+                }
+                const double min_us = *std::min_element(times.begin(), times.end());
+                const double mean_us =
+                    std::accumulate(times.begin(), times.end(), 0.0) / static_cast<double>(times.size());
+                double variance = 0.0;
+                for (double value : times)
+                {
+                    const double delta = value - mean_us;
+                    variance += delta * delta;
+                }
+                variance /= static_cast<double>(times.size());
+                const double stddev_us = std::sqrt(variance);
+
+                if (csv)
+                {
+                    std::fprintf(
+                        csv,
+                        "cpu,small_m_fused_projection,%s,%u,SmallM_FusedProjection,%d,%d,2,%d,%d+%d,DEFAULT,%.3f,%.3f,%.3f,1,1\n",
+                        fmt.name.c_str(),
+                        static_cast<unsigned>(codebook),
+                        K,
+                        M,
+                        N0 + N1,
+                        N0,
+                        N1,
+                        min_us,
+                        mean_us,
+                        stddev_us);
+                    std::fflush(csv);
+                    ++emitted_rows;
+                }
+
+                std::fprintf(
+                    stderr,
+                    "[CPUNativeVNNI][SMALL_M][TRAINER] format=%s codebook=%u M=%d variant=DEFAULT time_us=%.3f\n",
+                    fmt.name.c_str(),
+                    static_cast<unsigned>(codebook),
+                    M,
+                    min_us);
+                ++executed_cases;
+            }
+
+            if (executed_cases >= max_cases)
+                break;
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            ASSERT_GT(emitted_rows, 0)
+                << "CPU NativeVNNI small-M trainer CSV had no rows.";
+        }
+        ASSERT_GT(executed_cases, 0)
+            << "No CPU NativeVNNI small-M trainer cases selected.";
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRows_GroupedVsSerial_Synthetic)
+    {
+        /**
+         * Tight feedback loop for Phase 9.8 CPU verifier-row kernels.
+         *
+         * The full Qwen3.6 verifier economy benchmark is still the acceptance
+         * gate, but it is too expensive for microkernel iteration.  This test
+         * isolates the exact primitive we are tuning: pre-quantized M=2..4
+         * grouped verifier rows versus M individual decode GEMVs.  It keeps
+         * correctness strict with cosine, relative L2, and symmetric KL while
+         * exporting timing rows that can be fed into the same trainer/dashboard
+         * workflow used by the GPU dispatch sweeps.
+         *
+         * Useful knobs:
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS=Q4_K,Q6_K or "all"
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_M=2,3,4
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME=Qwen36_FFN_DownProjection
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_N=5120
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_K=5120
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=20
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_CSV=/tmp/cpu_verifier_rows.csv
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS=1 for M=3/4 forced wide vs pairwise A/B
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_MIN_SPEEDUP=1.0 to require economy
+         * - LLAMINAR_CPU_NVNNI_VERIFIER_THREADS=28 to override standalone thread cap
+         */
+        applyVerifierRowsThreadCapForStandalonePerf();
+
+        struct VerifierShape
+        {
+            std::string name;
+            int N = 0;
+            int K = 0;
+        };
+
+        const int default_N = 5120;
+        const int default_K = 5120;
+        const int N =
+            getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_N").value_or(default_N);
+        const int K =
+            getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_K").value_or(default_K);
+        ASSERT_GT(N, 0);
+        ASSERT_GT(K, 0);
+        ASSERT_EQ(K % 32, 0)
+            << "NativeVNNI verifier microbench expects K to be block-aligned";
+
+        /*
+         * The refresh/training wrapper drives this test once per production
+         * projection shape.  Preserve that shape name in CSV output so the
+         * generated policy table can be audited later; otherwise different
+         * Qwen3.6 shapes with the same codebook/M bucket become indistinguishable
+         * in summaries and generated comments.
+         */
+        std::string shape_name =
+            getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_SHAPE_NAME");
+        if (shape_name.empty())
+            shape_name = "Qwen36Verifier";
+        const std::vector<VerifierShape> shapes = {
+            {shape_name, N, K},
+        };
+
+        const std::string format_filter_raw =
+            getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS");
+        std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_VERIFIER_FORMATS");
+        if (format_filter_raw.empty())
+        {
+            /*
+             * Compact default for local iteration: one K-quant, one INT8
+             * predecoded K-quant, and one IQ path.  Set the env var to "all"
+             * before generating broad training data.
+             */
+            format_filters = {toLower("Q4_K"), toLower("Q6_K"), toLower("IQ4_XS")};
+        }
+        const bool run_all_formats = format_filters.count("all") > 0;
+        if (run_all_formats)
+            format_filters.clear();
+
+        const std::set<std::string> m_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_VERIFIER_M");
+        const int warmup =
+            std::max(0, getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_WARMUP").value_or(2));
+        const int iterations =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_ITERS").value_or(5));
+        const int max_cases =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_MAX_CASES").value_or(1000000));
+        const ISAPath isa_path = parseISAPathForVerifierBench();
+        const std::array<int, 3> rows = {2, 3, 4};
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_VERIFIER_CSV");
+        const bool run_m4_variants =
+            getEnvInt("LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS").value_or(0) != 0;
+        const double min_required_speedup =
+            getEnvDouble("LLAMINAR_CPU_NVNNI_VERIFIER_MIN_SPEEDUP")
+                .value_or(csv_path.empty() ? 1.0 : 0.0);
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr)
+                << "Failed to open CPU NativeVNNI verifier CSV: " << csv_path;
+            std::fprintf(
+                csv,
+                "backend,phase,format,codebook,is_nibble_lut,payload_bytes,is_asymmetric,is_superblock,shape,n,k,m,isa,grouped_min_us,serial_min_us,speedup,grouped_mean_us,serial_mean_us,cosine,relative_l2,symmetric_kl,max_abs,correctness_pass\n");
+        }
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "Format" << "M" << "N" << "K" << "ISA"
+              << "Grouped us" << "Serial us" << "Speedup"
+              << "Cos" << "RelL2" << "SymKL" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int c = 1; c <= 10; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        int executed_cases = 0;
+        int emitted_rows = 0;
+        for (const auto &shape : shapes)
+        {
+            for (const auto &fmt : MTP_SMALL_M_FORMATS)
+            {
+                if (!shouldRunName(format_filters, fmt.name))
+                    continue;
+
+                auto weights = createWeightsForFormat(
+                    fmt.name,
+                    static_cast<size_t>(shape.N),
+                    static_cast<size_t>(shape.K));
+                ASSERT_NE(weights, nullptr) << fmt.name;
+
+                CPUNativeVNNIGemmKernel kernel(weights.get());
+                ASSERT_TRUE(kernel.isValid()) << fmt.name;
+                const auto &packed = kernel.packedWeights();
+                const int K_blocks = packed.blocks_per_row;
+
+                for (int M : rows)
+                {
+                    if (!m_filters.empty() && m_filters.count(std::to_string(M)) == 0)
+                        continue;
+                    if (executed_cases >= max_cases)
+                        break;
+
+                    std::mt19937 rng(
+                        static_cast<uint32_t>(17000 + M + shape.N + shape.K + fmt.name.size()));
+                    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+                    std::vector<float> input(static_cast<size_t>(M) * shape.K);
+                    for (float &value : input)
+                        value = dist(rng);
+
+                    std::vector<Q8_1Block> q8_rows(
+                        static_cast<size_t>(M) * static_cast<size_t>(K_blocks));
+                    quantize_activations_to_q8_1(
+                        input.data(),
+                        q8_rows.data(),
+                        M,
+                        shape.K,
+                        K_blocks);
+
+                    std::vector<float> grouped(
+                        static_cast<size_t>(M) * static_cast<size_t>(shape.N),
+                        0.0f);
+                    std::vector<float> serial(
+                        static_cast<size_t>(M) * static_cast<size_t>(shape.N),
+                        0.0f);
+
+                    auto run_grouped = [&]()
+                    {
+                        gemm_native_vnni_preq_decode_equivalent_rows(
+                            packed,
+                            q8_rows.data(),
+                            grouped.data(),
+                            M,
+                            shape.N,
+                            isa_path);
+                    };
+                    auto run_serial = [&]()
+                    {
+                        for (int row = 0; row < M; ++row)
+                        {
+                            gemv_native_vnni_preq(
+                                packed,
+                                q8_rows.data() + static_cast<size_t>(row) * K_blocks,
+                                serial.data() + static_cast<size_t>(row) * shape.N,
+                                isa_path);
+                        }
+                    };
+
+                    run_grouped();
+                    run_serial();
+                    const VectorMetrics metrics =
+                        computeVectorMetrics(
+                            grouped.data(),
+                            serial.data(),
+                            grouped.size());
+                    const std::string label =
+                        fmt.name + " " + shape.name + " M=" + std::to_string(M);
+                    assertVerifierMetricsStrict(metrics, label);
+
+                    const TimingSummary grouped_timing =
+                        timeMicrobench(warmup, iterations, run_grouped);
+                    const TimingSummary serial_timing =
+                        timeMicrobench(warmup, iterations, run_serial);
+                    const double speedup =
+                        grouped_timing.min_us > 0.0
+                            ? serial_timing.min_us / grouped_timing.min_us
+                            : 0.0;
+
+                    char grouped_us[32], serial_us[32], speed[32];
+                    char cos_buf[32], l2_buf[32], kl_buf[32];
+                    std::snprintf(grouped_us, sizeof(grouped_us), "%.1f", grouped_timing.min_us);
+                    std::snprintf(serial_us, sizeof(serial_us), "%.1f", serial_timing.min_us);
+                    std::snprintf(speed, sizeof(speed), "%.2fx", speedup);
+                    std::snprintf(cos_buf, sizeof(cos_buf), "%.9f", metrics.cosine);
+                    std::snprintf(l2_buf, sizeof(l2_buf), "%.3e", metrics.relative_l2);
+                    std::snprintf(kl_buf, sizeof(kl_buf), "%.3e", metrics.symmetric_kl);
+
+                    table << fmt.name << M << shape.N << shape.K << isaPathName(isa_path)
+                          << grouped_us << serial_us << speed
+                          << cos_buf << l2_buf << kl_buf << fort::endr;
+
+                    if (csv)
+                    {
+                        std::fprintf(
+                            csv,
+                            "cpu,verifier_rows,%s,%u,%d,%d,%d,%d,%s,%d,%d,%d,%s,%.3f,%.3f,%.6f,%.3f,%.3f,%.9f,%.9e,%.9e,%.9e,1\n",
+                            fmt.name.c_str(),
+                            static_cast<unsigned>(packed.codebook_id),
+                            packed.is_nibble_lut ? 1 : 0,
+                            packed.payload_bytes,
+                            packed.is_asymmetric ? 1 : 0,
+                            packed.is_superblock ? 1 : 0,
+                            shape.name.c_str(),
+                            shape.N,
+                            shape.K,
+                            M,
+                            isaPathName(isa_path),
+                            grouped_timing.min_us,
+                            serial_timing.min_us,
+                            speedup,
+                            grouped_timing.mean_us,
+                            serial_timing.mean_us,
+                            metrics.cosine,
+                            metrics.relative_l2,
+                            metrics.symmetric_kl,
+                            metrics.max_abs);
+                        std::fflush(csv);
+                        ++emitted_rows;
+                    }
+
+                    std::fprintf(
+                        stderr,
+                        "[CPUNativeVNNI][VERIFIER_ROWS] format=%s codebook=%u nibble=%d payload=%d asymmetric=%d superblock=%d shape=%s N=%d K=%d M=%d isa=%s grouped_us=%.3f serial_us=%.3f speedup=%.3f cosine=%.9f rel_l2=%.9e symmetric_kl=%.9e\n",
+                        fmt.name.c_str(),
+                        static_cast<unsigned>(packed.codebook_id),
+                        packed.is_nibble_lut ? 1 : 0,
+                        packed.payload_bytes,
+                        packed.is_asymmetric ? 1 : 0,
+                        packed.is_superblock ? 1 : 0,
+                        shape.name.c_str(),
+                        shape.N,
+                        shape.K,
+                        M,
+                        isaPathName(isa_path),
+                        grouped_timing.min_us,
+                        serial_timing.min_us,
+                        speedup,
+                        metrics.cosine,
+                        metrics.relative_l2,
+                        metrics.symmetric_kl);
+
+                    EXPECT_GT(grouped_timing.min_us, 0.0);
+                    EXPECT_GT(serial_timing.min_us, 0.0);
+                    if (min_required_speedup > 0.0)
+                    {
+                        EXPECT_GT(speedup, min_required_speedup)
+                            << label << " verifier rows are decode-equivalent "
+                            << "but not economical enough for MTP.";
+                    }
+
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+                    if (run_m4_variants && M >= 3)
+                    {
+                        if (!verifierBenchUsesAVX512(isa_path))
+                        {
+                            FAIL()
+                                << "LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS requires "
+                                << "an active AVX512-VNNI verifier path";
+                        }
+
+                        std::vector<float> wide_rows(
+                            static_cast<size_t>(M) * static_cast<size_t>(shape.N),
+                            0.0f);
+                        std::vector<float> pairwise_rows(
+                            static_cast<size_t>(M) * static_cast<size_t>(shape.N),
+                            0.0f);
+
+                        /*
+                         * Force both policies through the production verifier
+                         * entrypoint.  Unlike the older direct M=4 probe, this
+                         * also exercises k-tiled long-K shapes, so the trainer
+                         * can learn the policy that matters for real verifier
+                         * projections.
+                         */
+                        auto run_wide_policy = [&]()
+                        {
+                            gemm_native_vnni_preq_decode_equivalent_rows(
+                                packed,
+                                q8_rows.data(),
+                                wide_rows.data(),
+                                M,
+                                shape.N,
+                                isa_path,
+                                VerifierRowsPolicy::WideRows);
+                        };
+                        auto run_pairwise_policy = [&]()
+                        {
+                            gemm_native_vnni_preq_decode_equivalent_rows(
+                                packed,
+                                q8_rows.data(),
+                                pairwise_rows.data(),
+                                M,
+                                shape.N,
+                                isa_path,
+                                VerifierRowsPolicy::Pairwise);
+                        };
+
+                        run_wide_policy();
+                        run_pairwise_policy();
+                        const VectorMetrics wide_metrics =
+                            computeVectorMetrics(
+                                wide_rows.data(),
+                                serial.data(),
+                                wide_rows.size());
+                        const VectorMetrics pairwise_metrics =
+                            computeVectorMetrics(
+                                pairwise_rows.data(),
+                                serial.data(),
+                                pairwise_rows.size());
+                        assertVerifierMetricsStrict(
+                            wide_metrics,
+                            label + " forced wide verifier policy");
+                        assertVerifierMetricsStrict(
+                            pairwise_metrics,
+                            label + " forced pairwise verifier policy");
+
+                        const TimingSummary wide_timing =
+                            timeMicrobench(warmup, iterations, run_wide_policy);
+                        const TimingSummary pairwise_timing =
+                            timeMicrobench(warmup, iterations, run_pairwise_policy);
+                        const double wide_speedup =
+                            wide_timing.min_us > 0.0
+                                ? serial_timing.min_us / wide_timing.min_us
+                                : 0.0;
+                        const double pairwise_speedup =
+                            pairwise_timing.min_us > 0.0
+                                ? serial_timing.min_us / pairwise_timing.min_us
+                                : 0.0;
+
+                        if (csv)
+                        {
+                            auto emit_variant = [&](const char *phase,
+                                                    const TimingSummary &timing,
+                                                    double variant_speedup,
+                                                    const VectorMetrics &variant_metrics)
+                            {
+                                std::fprintf(
+                                    csv,
+                                    "cpu,%s,%s,%u,%d,%d,%d,%d,%s,%d,%d,%d,%s,%.3f,%.3f,%.6f,%.3f,%.3f,%.9f,%.9e,%.9e,%.9e,1\n",
+                                    phase,
+                                    fmt.name.c_str(),
+                                    static_cast<unsigned>(packed.codebook_id),
+                                    packed.is_nibble_lut ? 1 : 0,
+                                    packed.payload_bytes,
+                                    packed.is_asymmetric ? 1 : 0,
+                                    packed.is_superblock ? 1 : 0,
+                                    shape.name.c_str(),
+                                    shape.N,
+                                    shape.K,
+                                    M,
+                                    isaPathName(isa_path),
+                                    timing.min_us,
+                                    serial_timing.min_us,
+                                    variant_speedup,
+                                    timing.mean_us,
+                                    serial_timing.mean_us,
+                                    variant_metrics.cosine,
+                                    variant_metrics.relative_l2,
+                                    variant_metrics.symmetric_kl,
+                                    variant_metrics.max_abs);
+                                std::fflush(csv);
+                                ++emitted_rows;
+                            };
+                            emit_variant(
+                                "verifier_rows_wide_policy",
+                                wide_timing,
+                                wide_speedup,
+                                wide_metrics);
+                            emit_variant(
+                                "verifier_rows_pairwise_policy",
+                                pairwise_timing,
+                                pairwise_speedup,
+                                pairwise_metrics);
+                        }
+
+                        std::fprintf(
+                            stderr,
+                            "[CPUNativeVNNI][VERIFIER_ROWS_POLICY_VARIANT] "
+                            "format=%s shape=%s M=%d wide_us=%.3f pairwise_us=%.3f "
+                            "serial_us=%.3f wide_speedup=%.3f pairwise_speedup=%.3f "
+                            "wide_vs_pairwise=%.3f cosine=%.9f rel_l2=%.9e symmetric_kl=%.9e\n",
+                            fmt.name.c_str(),
+                            shape.name.c_str(),
+                            M,
+                            wide_timing.min_us,
+                            pairwise_timing.min_us,
+                            serial_timing.min_us,
+                            wide_speedup,
+                            pairwise_speedup,
+                            pairwise_timing.min_us > 0.0
+                                ? pairwise_timing.min_us / wide_timing.min_us
+                                : 0.0,
+                            wide_metrics.cosine,
+                            wide_metrics.relative_l2,
+                            wide_metrics.symmetric_kl);
+                    }
+#else
+                    if (run_m4_variants && M >= 3)
+                    {
+                        FAIL()
+                            << "LLAMINAR_CPU_NVNNI_VERIFIER_VARIANTS requires an AVX512-VNNI build";
+                    }
+#endif
+                    ++executed_cases;
+                }
+
+                if (executed_cases >= max_cases)
+                    break;
+            }
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            ASSERT_GT(emitted_rows, 0)
+                << "CPU NativeVNNI verifier-row CSV had no rows.";
+        }
+
+        ASSERT_GT(executed_cases, 0)
+            << "No CPU NativeVNNI verifier-row microbench cases selected.";
+
+        std::cout << "\n=== CPU NativeVNNI Verifier Rows: Grouped vs Serial Decode GEMVs ===\n"
+                  << "Pre-quantized Q8_1 activations; strict cosine/L2/KL equivalence against serial M decode GEMVs.\n\n"
+                  << table.to_string() << std::endl;
+    }
+
+    TEST_F(CPUNativeVNNIGemvTest, MTP_VerifierRows_VNNIInstructionFloor_Synthetic)
+    {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__) && defined(__AVX512BW__)
+        if (activeISALevel() < ISALevel::AVX512)
+        {
+            GTEST_SKIP() << "AVX512-VNNI instruction-floor diagnostic requires AVX512-VNNI.";
+        }
+
+        const int work_blocks =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_FLOOR_BLOCKS").value_or(4096));
+        const int warmup =
+            std::max(0, getEnvInt("LLAMINAR_CPU_NVNNI_FLOOR_WARMUP").value_or(5));
+        const int iterations =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_FLOOR_ITERS").value_or(20));
+        const std::string csv_path =
+            getEnvString("LLAMINAR_CPU_NVNNI_FLOOR_CSV");
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr)
+                << "Failed to open CPU NativeVNNI floor CSV: " << csv_path;
+            std::fprintf(
+                csv,
+                "backend,phase,m,work_blocks,grouped_min_us,serial_min_us,speedup,checksums_match\n");
+        }
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "M" << "Blocks" << "Grouped us"
+              << "Serial us" << "Speedup" << "Checksum" << fort::endr;
+        for (int c = 0; c <= 5; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        for (int rows : {2, 3, 4})
+        {
+            const VNNIFloorResult result =
+                runVerifierRowsVNNIFloor(rows, work_blocks, warmup, iterations);
+            EXPECT_TRUE(result.checksums_match)
+                << "Grouped VNNI floor checksum diverged at M=" << rows;
+            EXPECT_GT(result.grouped_us, 0.0);
+            EXPECT_GT(result.serial_us, 0.0);
+
+            char grouped_us[32], serial_us[32], speedup[32];
+            std::snprintf(grouped_us, sizeof(grouped_us), "%.3f", result.grouped_us);
+            std::snprintf(serial_us, sizeof(serial_us), "%.3f", result.serial_us);
+            std::snprintf(speedup, sizeof(speedup), "%.3fx", result.speedup);
+            table << rows << work_blocks << grouped_us << serial_us
+                  << speedup << (result.checksums_match ? "yes" : "no")
+                  << fort::endr;
+
+            std::fprintf(
+                stderr,
+                "[CPUNativeVNNI][VNNI_FLOOR] M=%d blocks=%d grouped_us=%.3f serial_us=%.3f speedup=%.3f checksums_match=%d\n",
+                rows,
+                work_blocks,
+                result.grouped_us,
+                result.serial_us,
+                result.speedup,
+                result.checksums_match ? 1 : 0);
+
+            if (csv)
+            {
+                std::fprintf(
+                    csv,
+                    "cpu,vnni_instruction_floor,%d,%d,%.3f,%.3f,%.6f,%d\n",
+                    rows,
+                    work_blocks,
+                    result.grouped_us,
+                    result.serial_us,
+                    result.speedup,
+                    result.checksums_match ? 1 : 0);
+                std::fflush(csv);
+            }
+        }
+
+        std::cout << "\n=== CPU NativeVNNI Verifier Rows: VPDPBUSD Instruction Floor ===\n"
+                  << "Diagnostic only: packed-B reuse without GEMV metadata, scaling, or output writes.\n\n"
+                  << table.to_string() << std::endl;
+
+        if (csv)
+            std::fclose(csv);
+#else
+        GTEST_SKIP() << "AVX512-VNNI instruction-floor diagnostic is unavailable in this build.";
+#endif
     }
 
 } // anonymous namespace

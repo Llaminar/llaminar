@@ -20,7 +20,9 @@
 #include <cmath>
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/Tensors.h"
 #include "utils/Logger.h"
 
@@ -35,6 +37,36 @@ namespace
         cudaError_t err = cudaGetDeviceCount(&count);
         return (err == cudaSuccess && count > 0);
     }
+
+    /**
+     * @brief Owns a CUDA stream for integration tests that exercise stream-aware KV APIs.
+     */
+    class ScopedCudaStream
+    {
+    public:
+        ScopedCudaStream()
+        {
+            EXPECT_EQ(cudaStreamCreate(&stream_), cudaSuccess);
+        }
+
+        ~ScopedCudaStream()
+        {
+            if (stream_)
+                cudaStreamDestroy(stream_);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream_); }
+        cudaStream_t stream() const { return stream_; }
+
+        void synchronize() const
+        {
+            ASSERT_NE(stream_, nullptr);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+        }
+
+    private:
+        cudaStream_t stream_ = nullptr;
+    };
 
     // Generate random FP32 data
     std::vector<float> generateRandomFP32(size_t count, unsigned seed = 42)
@@ -59,6 +91,21 @@ namespace
             max_err = std::max(max_err, std::abs(a[i] - b[i]));
         }
         return max_err;
+    }
+
+    std::unique_ptr<DeviceWorkspaceManager> bindRequiredWorkspace(
+        IWorkspaceConsumer *consumer,
+        int m,
+        int n = 0,
+        int k = 0)
+    {
+        auto reqs = consumer->getWorkspaceRequirements(m, n, k);
+        const size_t budget = reqs.total_bytes_with_alignment() + 4096;
+        auto workspace = std::make_unique<DeviceWorkspaceManager>(DeviceId::cuda(0), budget);
+        EXPECT_TRUE(workspace->allocate(reqs));
+        consumer->bindWorkspace(workspace.get());
+        EXPECT_TRUE(consumer->hasWorkspace());
+        return workspace;
     }
 
 } // namespace
@@ -87,6 +134,7 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedCudaStream stream;
 
     // Generate test data (10 tokens)
     const int num_tokens = 10;
@@ -101,14 +149,14 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
     cudaMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
     EXPECT_FALSE(cache->is_wrapped(0, 0)); // Should not be wrapped yet
 
     // Retrieve K/V
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Copy back and verify
@@ -130,6 +178,139 @@ TEST(Test__CUDARingKVCache, BasicAppendRetrieve_FP32)
     cudaFree(d_V);
 
     LOG_INFO("[BasicAppendRetrieve_FP32] PASSED");
+}
+
+/**
+ * @brief Device publication advances GPU-visible KV metadata before host adoption.
+ *
+ * Phase 9.5 makes GPU KV head/count metadata the source of truth for MTP live
+ * state.  This regression proves the split explicitly: the publication kernel
+ * updates the device count/head mirrors on an explicit stream, while legacy host
+ * getters remain stale until the compatibility adoption call runs.
+ */
+TEST(Test__CUDARingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirrorStaleUntilAdoption)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    constexpr int n_layers = 1;
+    constexpr int batch_size = 1;
+    constexpr int max_seq_len = 8;
+    constexpr int n_kv_heads = 2;
+    constexpr int head_dim = 16;
+    constexpr int kv_dim = n_kv_heads * head_dim;
+    constexpr int initial_tokens = 6;
+    constexpr int target_cached_tokens = 5;
+    constexpr int accepted_state_count = 1;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP32,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+    ASSERT_TRUE(cache->supportsDeviceResidentSequenceStatePublication());
+    ScopedCudaStream stream;
+
+    auto h_K = generateRandomFP32(initial_tokens * kv_dim, 20260615);
+    auto h_V = generateRandomFP32(initial_tokens * kv_dim, 20260616);
+
+    float *d_K = nullptr;
+    float *d_V = nullptr;
+    ASSERT_EQ(cudaMalloc(&d_K, initial_tokens * kv_dim * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_V, initial_tokens * kv_dim * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_K,
+                  h_K.data(),
+                  initial_tokens * kv_dim * sizeof(float),
+                  cudaMemcpyHostToDevice,
+                  stream.stream()),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  d_V,
+                  h_V.data(),
+                  initial_tokens * kv_dim * sizeof(float),
+                  cudaMemcpyHostToDevice,
+                  stream.stream()),
+              cudaSuccess);
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, initial_tokens, stream.stream()));
+    stream.synchronize();
+
+    const int host_count_before = cache->get_cached_tokens(0, 0);
+    const int host_head_before = cache->ring_head(0, 0);
+    ASSERT_EQ(host_count_before, initial_tokens);
+
+    int32_t *d_target = nullptr;
+    int32_t *d_accepted = nullptr;
+    int32_t *d_ok = nullptr;
+    const int32_t h_target = target_cached_tokens;
+    const int32_t h_accepted = accepted_state_count;
+    const int32_t h_ok = 1;
+    ASSERT_EQ(cudaMalloc(&d_target, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_accepted, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_ok, sizeof(int32_t)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_target, &h_target, sizeof(int32_t), cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_accepted, &h_accepted, sizeof(int32_t), cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(d_ok, &h_ok, sizeof(int32_t), cudaMemcpyHostToDevice, stream.stream()), cudaSuccess);
+
+    IKVCache::DeviceSequenceStatePublicationRequest device_request;
+    device_request.request_count = 1;
+    device_request.first_seq_idx = 0;
+    device_request.target_cached_tokens_device = d_target;
+    device_request.accepted_state_counts_device = d_accepted;
+    device_request.publication_ok_flags_device = d_ok;
+    device_request.stream = stream.opaque();
+    std::string device_error;
+    ASSERT_TRUE(cache->publishSequenceStateFromDeviceMetadata(device_request, &device_error))
+        << device_error;
+    stream.synchronize();
+
+    const int host_tail_before =
+        (host_head_before - host_count_before + max_seq_len) % max_seq_len;
+    const int expected_device_head =
+        (host_tail_before + target_cached_tokens) % max_seq_len;
+    int device_count = -1;
+    int device_head = -1;
+    ASSERT_NE(cache->deviceCachedTokenCountPtr(0, 0), nullptr);
+    ASSERT_NE(cache->deviceRingHeadPtr(0, 0), nullptr);
+    ASSERT_EQ(cudaMemcpyAsync(&device_count,
+                              cache->deviceCachedTokenCountPtr(0, 0),
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost,
+                              stream.stream()),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemcpyAsync(&device_head,
+                              cache->deviceRingHeadPtr(0, 0),
+                              sizeof(int),
+                              cudaMemcpyDeviceToHost,
+                              stream.stream()),
+              cudaSuccess);
+    stream.synchronize();
+
+    EXPECT_EQ(device_count, target_cached_tokens);
+    EXPECT_EQ(device_head, expected_device_head);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), host_count_before)
+        << "Device publication must not silently adopt host KV mirrors.";
+    EXPECT_EQ(cache->ring_head(0, 0), host_head_before)
+        << "Host ring-head mirrors are stale until adoption is explicit.";
+
+    IKVCache::HostSequenceStatePublicationRequest host_request;
+    host_request.request_count = 1;
+    host_request.first_seq_idx = 0;
+    host_request.target_cached_tokens = {target_cached_tokens};
+    host_request.accepted_state_counts = {accepted_state_count};
+    host_request.publication_ok_flags = {1};
+    std::string host_error;
+    ASSERT_TRUE(cache->adoptSequenceStateFromHostMetadata(host_request, &host_error))
+        << host_error;
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), target_cached_tokens);
+    EXPECT_EQ(cache->ring_head(0, 0), expected_device_head);
+
+    cudaFree(d_ok);
+    cudaFree(d_accepted);
+    cudaFree(d_target);
+    cudaFree(d_V);
+    cudaFree(d_K);
 }
 
 // =============================================================================
@@ -168,7 +349,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     cudaMemcpy(d_K, h_K1.data(), phase1_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V1.data(), phase1_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase1_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase1_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 6);
     EXPECT_EQ(cache->get_head_position(0, 0), 6);
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -184,7 +365,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     cudaMemcpy(d_K, h_K2.data(), phase2_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V2.data(), phase2_tokens * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase2_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, phase2_tokens, 0));
 
     // Should have evicted 2 tokens (T0, T1), keeping 8
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
@@ -202,7 +383,7 @@ TEST(Test__CUDARingKVCache, WrapAround_FP32)
     // Retrieve and verify linearization happens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 8);
     EXPECT_EQ(cache->get_linearization_count(), 1); // Should have linearized
 
@@ -274,7 +455,7 @@ TEST(Test__CUDARingKVCache, Eviction_O1)
     cudaMemcpy(d_K, h_K.data(), 50 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), 50 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cache->append(0, 0, d_K, d_V, 50);
+    cache->append(0, 0, d_K, d_V, 50, 0);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 50);
 
     // Evict 20 tokens - should be O(1), no kernel launch
@@ -289,7 +470,7 @@ TEST(Test__CUDARingKVCache, Eviction_O1)
     // Retrieve remaining 30 tokens
     const void *d_K_out, *d_V_out;
     int kv_len;
-    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len);
+    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0);
     EXPECT_EQ(kv_len, 30);
 
     // Verify content: should have T20-T49
@@ -350,7 +531,7 @@ TEST(Test__CUDARingKVCache, SlidingWindow)
         cudaMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
         // Append 1 token
-        cache->append(0, 0, d_K, d_V, 1);
+        cache->append(0, 0, d_K, d_V, 1, 0);
 
         // Cache should never exceed window size (auto-evicts)
         EXPECT_LE(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -389,6 +570,11 @@ TEST(Test__CUDARingKVCache, BatchedGather)
     auto cache = createCUDARingKVCache(
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    auto workspace = bindRequiredWorkspace(workspace_consumer, batch_size);
+    ASSERT_NE(workspace, nullptr);
+    ScopedCudaStream stream;
 
     // Fill each sequence with different lengths
     int seq_lens[] = {10, 20, 15, 25};
@@ -407,8 +593,9 @@ TEST(Test__CUDARingKVCache, BatchedGather)
         cudaMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-        cache->append(0, seq, d_K, d_V, seq_lens[seq]);
+        cache->append(0, seq, d_K, d_V, seq_lens[seq], stream.stream());
     }
+    stream.synchronize();
 
     // Verify individual sequence lengths
     for (int seq = 0; seq < batch_size; ++seq)
@@ -425,7 +612,8 @@ TEST(Test__CUDARingKVCache, BatchedGather)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len);
+                                              kv_lens.data(), max_kv_len, stream.stream());
+    stream.synchronize();
 
     EXPECT_EQ(actual_max, 25); // Max across sequences
 
@@ -492,7 +680,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     cudaMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
-    cache->append(0, 0, d_K, d_V, 30);
+    cache->append(0, 0, d_K, d_V, 30, 0);
 
     // Should NOT be wrapped
     EXPECT_FALSE(cache->is_wrapped(0, 0));
@@ -500,7 +688,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     // Get K/V - should return direct pointer (no linearization)
     const void *d_K_out, *d_V_out;
     int kv_len;
-    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len);
+    cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0);
 
     // No linearizations should have occurred
     EXPECT_EQ(cache->get_linearization_count(), 0);
@@ -508,7 +696,7 @@ TEST(Test__CUDARingKVCache, ContiguousOptimization)
     // Multiple retrievals should still not linearize
     for (int i = 0; i < 10; ++i)
     {
-        cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len);
+        cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0);
     }
     EXPECT_EQ(cache->get_linearization_count(), 0);
 
@@ -554,7 +742,7 @@ TEST(Test__CUDARingKVCache, ClearOperations)
     {
         for (int seq = 0; seq < batch_size; ++seq)
         {
-            cache->append(layer, seq, d_K, d_V, 10);
+            cache->append(layer, seq, d_K, d_V, 10, 0);
         }
     }
 
@@ -635,12 +823,12 @@ TEST(Test__CUDARingKVCache, MultiPrecision_FP16)
     cudaMemcpy(d_K, h_K_fp16.data(), 10 * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_fp16.data(), 10 * kv_dim * sizeof(__half), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 10);
 
     // Verify content
@@ -720,20 +908,21 @@ TEST(Test__CUDARingKVCache, AppendWithStream_FP32_to_FP16_Conversion)
     ASSERT_NE(K_tensor->gpu_data_ptr(), nullptr);
     ASSERT_NE(V_tensor->gpu_data_ptr(), nullptr);
 
-    // Use appendWithStream (the correct GPU path)
-    // This should detect FP32→FP16 mismatch and convert on GPU
-    cudaStream_t stream = nullptr; // default stream
+    // Use appendWithStream (the correct GPU path). This should detect
+    // FP32→FP16 mismatch and convert on the caller's explicit stream.
+    ScopedCudaStream stream;
     ASSERT_TRUE(cache->appendWithStream(0, 0,
                                         static_cast<const ITensor *>(K_tensor.get()),
                                         static_cast<const ITensor *>(V_tensor.get()),
-                                        num_tokens, stream));
+                                        num_tokens, stream.opaque()));
+    stream.synchronize();
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     // Retrieve cached data
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Read back FP16 data from cache
@@ -789,18 +978,12 @@ TEST(Test__CUDARingKVCache, AppendWithStream_FP32_to_FP16_Conversion)
 // =============================================================================
 // REGRESSION TEST: FP32 ITensor → FP16 cache via append (non-stream)
 //
-// Validates that the non-stream append(ITensor*) path also correctly handles
-// FP32 data being written to an FP16 cache. Without appendWithStream, the
-// data flows through the raw pointer path which should still produce valid
-// results (the raw FP32 pointer would be passed directly, potentially causing
-// corruption if no conversion occurs).
-//
-// This test serves as a canary: if it starts producing large errors, the
-// non-stream append path has a type mismatch bug similar to the one fixed
-// in appendWithStream.
+// Locks in the fail-fast behavior for the legacy non-stream GPU append path.
+// GPU cache writes must use appendWithStream() so residency, format conversion,
+// and graph-capture ordering all happen on the caller's explicit stream.
 // =============================================================================
 
-TEST(Test__CUDARingKVCache, Append_ITensor_FP32_to_FP16_DetectsCorruption)
+TEST(Test__CUDARingKVCache, Append_ITensor_FP32_to_FP16_RequiresExplicitStream)
 {
     if (!hasCUDA())
     {
@@ -836,43 +1019,199 @@ TEST(Test__CUDARingKVCache, Append_ITensor_FP32_to_FP16_DetectsCorruption)
     ASSERT_TRUE(K_tensor->ensureOnDevice(cuda_dev));
     ASSERT_TRUE(V_tensor->ensureOnDevice(cuda_dev));
 
-    // Use the non-stream ITensor append path
-    // NOTE: This path passes raw GPU pointers without type conversion!
-    // The cache sees FP32 bytes as FP16 - this WILL produce wrong values.
-    // We test this to document the known limitation: only appendWithStream()
-    // performs the conversion correctly.
+    // The non-stream ITensor append path used to reinterpret FP32 bytes as
+    // FP16 and write corrupted cache rows. It now fails before touching cache
+    // state, forcing callers onto appendWithStream().
     bool append_ok = cache->append(0, 0,
                                    static_cast<const ITensor *>(K_tensor.get()),
                                    static_cast<const ITensor *>(V_tensor.get()),
                                    num_tokens);
-    ASSERT_TRUE(append_ok) << "append(ITensor) should succeed";
+    ASSERT_FALSE(append_ok) << "GPU append(ITensor) must require appendWithStream()";
+}
 
-    // Read back and verify the data is corrupted (raw FP32→FP16 reinterpret)
-    const void *d_K_out, *d_V_out;
-    int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+TEST(Test__CUDARingKVCache, AppendWithStream_RejectsNullAndAcceptsExplicitStream)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
 
-    std::vector<uint16_t> h_K_out(num_tokens * kv_dim);
-    cudaMemcpy(h_K_out.data(), d_K_out,
-               num_tokens * kv_dim * sizeof(uint16_t), cudaMemcpyDeviceToHost);
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 32;
+    const int n_kv_heads = 2;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 4;
 
-    // The non-stream path passes raw FP32 pointers to the FP16 ring buffer.
-    // This reinterprets 4-byte floats as pairs of 2-byte __half values.
-    // 0.5f = 0x3F000000 → first half = 0x0000 (0.0), second half = 0x3F00 (1.875)
-    // So the data will be garbage - not matching the original 0.5f values.
-    float k_cached = fp16_to_fp32(h_K_out[0]);
-    float expected_correct = 0.5f;
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP16,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
 
-    // Document the known limitation: non-stream append does NOT convert types
-    LOG_INFO("[Append_ITensor_FP32_to_FP16] first cached value=" << k_cached
-                                                                 << " (expected if correct: " << expected_correct << ")");
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < num_tokens * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.125f * static_cast<float>((i % 7) - 3);
+        V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>((i % 5) - 2);
+    }
 
-    // If someone fixes the non-stream path to also convert, this test
-    // should be updated to check for correctness instead.
-    // For now, we just verify the call doesn't crash.
+    EXPECT_FALSE(cache->appendWithStream(0, 0,
+                                         static_cast<const ITensor *>(K_tensor.get()),
+                                         static_cast<const ITensor *>(V_tensor.get()),
+                                         num_tokens, nullptr));
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
-    LOG_INFO("[Append_ITensor_FP32_to_FP16_DetectsCorruption] PASSED - "
-             "append(ITensor) completed without crash");
+    ScopedCudaStream stream;
+    ASSERT_TRUE(cache->appendWithStream(0, 0,
+                                        static_cast<const ITensor *>(K_tensor.get()),
+                                        static_cast<const ITensor *>(V_tensor.get()),
+                                        num_tokens, stream.opaque()));
+    stream.synchronize();
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+}
+
+TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16AppendRequiresBoundConversionScratch)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 16;
+    const int n_kv_heads = 1;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 4;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP16,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    ASSERT_FALSE(workspace_consumer->hasWorkspace());
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < static_cast<size_t>(num_tokens) * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.125f * static_cast<float>(static_cast<int>(i % 7) - 3);
+        V_tensor->mutable_data()[i] = -0.0625f * static_cast<float>(static_cast<int>(i % 5) - 2);
+    }
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    stream.synchronize();
+
+    GraphCaptureGuard guard;
+    EXPECT_FALSE(cache->appendWithStream(0, 0,
+                                         static_cast<const ITensor *>(K_tensor.get()),
+                                         static_cast<const ITensor *>(V_tensor.get()),
+                                         num_tokens, stream.opaque()))
+        << "Graph-captured FP32->FP16 append must not allocate conversion scratch ad hoc";
+}
+
+TEST(Test__CUDARingKVCache, GraphCapturedFP32ToFP16AppendReplaysAfterClearWithWorkspaceScratch)
+{
+    if (!hasCUDA())
+    {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+
+    const int n_layers = 1;
+    const int batch_size = 1;
+    const int max_seq_len = 16;
+    const int n_kv_heads = 1;
+    const int head_dim = 32;
+    const int kv_dim = n_kv_heads * head_dim;
+    const int num_tokens = 6;
+
+    auto cache = createCUDARingKVCache(
+        ActivationPrecision::FP16,
+        n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
+    ASSERT_NE(cache, nullptr);
+
+    auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
+    ASSERT_NE(workspace_consumer, nullptr);
+    auto workspace = bindRequiredWorkspace(workspace_consumer, num_tokens, batch_size, 0);
+    ASSERT_NE(workspace, nullptr);
+
+    auto K_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    auto V_tensor = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(num_tokens), static_cast<size_t>(kv_dim)});
+    for (size_t i = 0; i < static_cast<size_t>(num_tokens) * kv_dim; ++i)
+    {
+        K_tensor->mutable_data()[i] = 0.03125f * static_cast<float>(static_cast<int>(i % 17) - 8);
+        V_tensor->mutable_data()[i] = -0.015625f * static_cast<float>(static_cast<int>(i % 13) - 6);
+    }
+
+    ScopedCudaStream stream;
+    ASSERT_TRUE(K_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    ASSERT_TRUE(V_tensor->ensureOnDevice(DeviceId::cuda(0), stream.opaque()));
+    stream.synchronize();
+
+    cache->setDynamicHead(0, 0, stream.opaque());
+    stream.synchronize();
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaStreamBeginCapture(stream.stream(), cudaStreamCaptureModeGlobal), cudaSuccess);
+    bool capture_append_ok = false;
+    {
+        GraphCaptureGuard guard;
+        capture_append_ok = cache->appendWithStream(0, 0,
+                                                    static_cast<const ITensor *>(K_tensor.get()),
+                                                    static_cast<const ITensor *>(V_tensor.get()),
+                                                    num_tokens, stream.opaque());
+    }
+    ASSERT_EQ(cudaStreamEndCapture(stream.stream(), &graph), cudaSuccess);
+    ASSERT_TRUE(capture_append_ok);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+
+    cache->clear();
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
+    cache->setDynamicHead(0, 0, stream.opaque());
+    stream.synchronize();
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream.stream()), cudaSuccess);
+    stream.synchronize();
+    cache->advanceHead(0, 0, num_tokens);
+    EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
+
+    const void *d_K_out = nullptr;
+    const void *d_V_out = nullptr;
+    int kv_len = 0;
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
+    ASSERT_EQ(kv_len, num_tokens);
+
+    std::vector<uint16_t> h_K_out(static_cast<size_t>(num_tokens) * kv_dim);
+    ASSERT_EQ(cudaMemcpyAsync(h_K_out.data(), d_K_out,
+                              h_K_out.size() * sizeof(uint16_t),
+                              cudaMemcpyDeviceToHost, stream.stream()),
+              cudaSuccess);
+    stream.synchronize();
+
+    for (size_t i = 0; i < h_K_out.size(); ++i)
+    {
+        EXPECT_NEAR(fp16_to_fp32(h_K_out[i]), K_tensor->data()[i], 0.001f) << "i=" << i;
+    }
+
+    EXPECT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    EXPECT_EQ(cudaGraphDestroy(graph), cudaSuccess);
 }
 
 // =============================================================================
@@ -917,12 +1256,12 @@ TEST(Test__CUDARingKVCache, MultiPrecision_BF16)
     cudaMemcpy(d_K, h_K_bf16.data(), 10 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
     cudaMemcpy(d_V, h_V_bf16.data(), 10 * kv_dim * sizeof(__nv_bfloat16), cudaMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 10, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 10);
 
     // Verify content
@@ -970,11 +1309,12 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
 
     // Get workspace requirements with default batch size
     auto reqs = workspace_consumer->getWorkspaceRequirements(0);
-    EXPECT_EQ(reqs.buffers.size(), 4u); // K_PTRS, V_PTRS, TAILS, COUNTS
+    EXPECT_EQ(reqs.buffers.size(), 6u); // K_PTRS, V_PTRS, TAILS, COUNTS, conversion scratch K/V
 
     // Verify buffer names and sizes
     bool found_k_ptrs = false, found_v_ptrs = false;
     bool found_tails = false, found_counts = false;
+    bool found_conv_scratch_k = false, found_conv_scratch_v = false;
 
     for (const auto &buf : reqs.buffers)
     {
@@ -982,25 +1322,37 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
         {
             found_k_ptrs = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(void *));
-            EXPECT_FALSE(buf.required); // Optional buffer
+            EXPECT_TRUE(buf.required);
         }
         else if (buf.name == KVCacheWorkspaceBuffers::BATCH_V_PTRS)
         {
             found_v_ptrs = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(void *));
-            EXPECT_FALSE(buf.required);
+            EXPECT_TRUE(buf.required);
         }
         else if (buf.name == KVCacheWorkspaceBuffers::BATCH_TAILS)
         {
             found_tails = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
-            EXPECT_FALSE(buf.required);
+            EXPECT_TRUE(buf.required);
         }
         else if (buf.name == KVCacheWorkspaceBuffers::BATCH_COUNTS)
         {
             found_counts = true;
             EXPECT_EQ(buf.size_bytes, batch_size * sizeof(int));
-            EXPECT_FALSE(buf.required);
+            EXPECT_TRUE(buf.required);
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K)
+        {
+            found_conv_scratch_k = true;
+            EXPECT_GE(buf.size_bytes, static_cast<size_t>(max_seq_len) * n_kv_heads * head_dim * sizeof(uint16_t));
+            EXPECT_TRUE(buf.required);
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V)
+        {
+            found_conv_scratch_v = true;
+            EXPECT_GE(buf.size_bytes, static_cast<size_t>(max_seq_len) * n_kv_heads * head_dim * sizeof(uint16_t));
+            EXPECT_TRUE(buf.required);
         }
     }
 
@@ -1008,6 +1360,8 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
     EXPECT_TRUE(found_v_ptrs) << "Missing BATCH_V_PTRS buffer";
     EXPECT_TRUE(found_tails) << "Missing BATCH_TAILS buffer";
     EXPECT_TRUE(found_counts) << "Missing BATCH_COUNTS buffer";
+    EXPECT_TRUE(found_conv_scratch_k) << "Missing CONV_SCRATCH_K buffer";
+    EXPECT_TRUE(found_conv_scratch_v) << "Missing CONV_SCRATCH_V buffer";
 
     // Test with explicit batch size
     auto reqs2 = workspace_consumer->getWorkspaceRequirements(8);
@@ -1022,6 +1376,11 @@ TEST(Test__CUDARingKVCache, WorkspaceRequirements)
                  buf.name == KVCacheWorkspaceBuffers::BATCH_COUNTS)
         {
             EXPECT_EQ(buf.size_bytes, 8u * sizeof(int));
+        }
+        else if (buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_K ||
+                 buf.name == KVCacheWorkspaceBuffers::CONV_SCRATCH_V)
+        {
+            EXPECT_GE(buf.size_bytes, static_cast<size_t>(max_seq_len) * n_kv_heads * head_dim * sizeof(uint16_t));
         }
     }
 
@@ -1065,7 +1424,7 @@ TEST(Test__CUDARingKVCache, WorkspaceBinding)
 }
 
 // =============================================================================
-// Test: BatchedGather works without workspace (backward compatibility)
+// Test: BatchedGather fails without workspace
 // =============================================================================
 
 TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
@@ -1086,6 +1445,7 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
         ActivationPrecision::FP32,
         n_layers, batch_size, max_seq_len, n_kv_heads, head_dim);
     ASSERT_NE(cache, nullptr);
+    ScopedCudaStream stream;
 
     // Verify no workspace bound
     auto *workspace_consumer = dynamic_cast<IWorkspaceConsumer *>(cache.get());
@@ -1105,10 +1465,12 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
         int seq_len = 5 + seq * 3; // 5 and 8 tokens
         cudaMemcpy(d_K, h_K.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_V, h_V.data(), seq_len * kv_dim * sizeof(float), cudaMemcpyHostToDevice);
-        cache->append(0, seq, d_K, d_V, seq_len);
+        cache->append(0, seq, d_K, d_V, seq_len, stream.stream());
     }
+    stream.synchronize();
 
-    // Gather without workspace - should fall back to per-call allocation
+    // Gather without workspace should hard-fail instead of allocating hidden
+    // scratch with cudaMalloc.
     int max_kv_len = 10;
     float *d_K_gathered, *d_V_gathered;
     cudaMalloc(&d_K_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
@@ -1117,16 +1479,14 @@ TEST(Test__CUDARingKVCache, BatchedGatherWithoutWorkspace)
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
                                               d_K_gathered, d_V_gathered,
-                                              kv_lens.data(), max_kv_len);
+                                              kv_lens.data(), max_kv_len, stream.stream());
 
-    EXPECT_GT(actual_max, 0);
-    EXPECT_EQ(kv_lens[0], 5);
-    EXPECT_EQ(kv_lens[1], 8);
+    EXPECT_EQ(actual_max, -1);
 
     cudaFree(d_K);
     cudaFree(d_V);
     cudaFree(d_K_gathered);
     cudaFree(d_V_gathered);
 
-    LOG_INFO("[BatchedGatherWithoutWorkspace] PASSED - backward compatibility verified");
+    LOG_INFO("[BatchedGatherWithoutWorkspace] PASSED - hard failure verified");
 }

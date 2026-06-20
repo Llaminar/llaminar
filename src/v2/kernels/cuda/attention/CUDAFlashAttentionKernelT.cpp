@@ -14,8 +14,10 @@
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/CUDAKernelProfiler.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <cuda_runtime_api.h>
+#include <algorithm>
 #include <cstring>
 #include <stdexcept>
 
@@ -48,15 +50,6 @@ extern "C"
         int device_idx,
         int head_start,
         int gqa_n_rep);
-
-    // cuBLAS-based unfused attention for prefill with FP16 KV
-    int cudaFlashAttn_prefill_cublas_fp16kv(
-        const float *Q, const void *K_fp16, const void *V_fp16, float *O,
-        int batch_size, int seq_len, int kv_len,
-        int n_heads, int n_kv_heads, int head_dim,
-        bool causal, int position_offset,
-        void *stream,
-        int device_idx);
 
     // Flash Decoding for single-token decode with split-K parallelism
     int cudaFlashAttn_decode_fp32(
@@ -114,11 +107,12 @@ extern "C"
         int head_start,
         int gqa_n_rep);
 
-    int cudaFlashAttn_allocWorkspace(
-        void **partial_output, void **partial_m, void **partial_l,
-        int batch_size, int n_heads, int head_dim, int num_splits);
-
-    void cudaFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l);
+    int cudaFlashAttn_prepare_device_params_from_count(
+        void *device_params,
+        const int *post_append_cached_tokens,
+        int seq_len,
+        int query_rows,
+        void *stream);
 
     int cudaFlashAttn_setDevice(int device_idx);
     int cudaFlashAttn_synchronize();
@@ -145,6 +139,8 @@ namespace llaminar2
         // Maximum number of splits for Flash Decoding
         constexpr int MAX_NUM_SPLITS = 32;
 
+        constexpr int MAX_SMALL_DECODE_ROWS = kMaxDynamicAttentionParamRows;
+
         // Minimum KV positions per split to avoid excessive overhead
         constexpr int MIN_KV_PER_SPLIT = 16;
 
@@ -159,6 +155,9 @@ namespace llaminar2
          */
         static int computeNumSplitsForDevice(int kv_len, int n_heads, int device_idx)
         {
+            if (debugEnv().gemm.deterministic)
+                return 1;
+
             if (kv_len <= 1)
                 return 1;
 
@@ -194,6 +193,11 @@ namespace llaminar2
                 num_splits = 1;
 
             return num_splits;
+        }
+
+        static int sanitizeSmallDecodeQueryRows(int query_rows)
+        {
+            return (query_rows > 1 && query_rows <= MAX_SMALL_DECODE_ROWS) ? query_rows : 1;
         }
 
         // =====================================================================
@@ -245,11 +249,6 @@ namespace llaminar2
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::~CUDAFlashAttentionKernelT()
         {
             freeWorkspace();
-            if (h_attn_params_)
-            {
-                cudaFreeHost(h_attn_params_);
-                h_attn_params_ = nullptr;
-            }
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::CUDAFlashAttentionKernelT(
@@ -262,7 +261,15 @@ namespace llaminar2
               max_splits_(other.max_splits_),
               workspace_(other.workspace_),
               device_ctx_(other.device_ctx_),
-              h_attn_params_(other.h_attn_params_)
+              h_attn_params_(other.h_attn_params_),
+              h_attn_params_capacity_(other.h_attn_params_capacity_),
+              dynamic_attn_kv_len_(other.dynamic_attn_kv_len_),
+              dynamic_attn_position_offset_(other.dynamic_attn_position_offset_),
+              dynamic_attn_query_rows_(other.dynamic_attn_query_rows_),
+              dynamic_attn_param_rows_(other.dynamic_attn_param_rows_),
+              dynamic_attn_host_valid_(other.dynamic_attn_host_valid_),
+              dynamic_attn_device_valid_(other.dynamic_attn_device_valid_),
+              dynamic_attn_device_derived_(other.dynamic_attn_device_derived_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -272,7 +279,10 @@ namespace llaminar2
             other.max_splits_ = 0;
             other.workspace_ = nullptr;
             other.device_ctx_ = nullptr;
-            other.h_attn_params_ = nullptr;
+            other.h_attn_params_capacity_ = 0;
+            other.dynamic_attn_host_valid_ = false;
+            other.dynamic_attn_device_valid_ = false;
+            other.dynamic_attn_device_derived_ = false;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP32> &
@@ -282,11 +292,6 @@ namespace llaminar2
             if (this != &other)
             {
                 freeWorkspace();
-                if (h_attn_params_)
-                {
-                    cudaFreeHost(h_attn_params_);
-                    h_attn_params_ = nullptr;
-                }
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
@@ -297,6 +302,14 @@ namespace llaminar2
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
                 h_attn_params_ = other.h_attn_params_;
+                h_attn_params_capacity_ = other.h_attn_params_capacity_;
+                dynamic_attn_kv_len_ = other.dynamic_attn_kv_len_;
+                dynamic_attn_position_offset_ = other.dynamic_attn_position_offset_;
+                dynamic_attn_query_rows_ = other.dynamic_attn_query_rows_;
+                dynamic_attn_param_rows_ = other.dynamic_attn_param_rows_;
+                dynamic_attn_host_valid_ = other.dynamic_attn_host_valid_;
+                dynamic_attn_device_valid_ = other.dynamic_attn_device_valid_;
+                dynamic_attn_device_derived_ = other.dynamic_attn_device_derived_;
 
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
@@ -306,50 +319,78 @@ namespace llaminar2
                 other.max_splits_ = 0;
                 other.workspace_ = nullptr;
                 other.device_ctx_ = nullptr;
-                other.h_attn_params_ = nullptr;
+                other.h_attn_params_capacity_ = 0;
+                other.dynamic_attn_host_valid_ = false;
+                other.dynamic_attn_device_valid_ = false;
+                other.dynamic_attn_device_derived_ = false;
             }
             return *this;
         }
 
-        void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::allocateWorkspace(
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::allocateWorkspace(
             int n_heads, int head_dim, int num_splits)
         {
             if (num_splits <= max_splits_ && partial_output_buf_ != nullptr)
             {
-                return; // Already have enough workspace
+                return true; // Already have enough workspace
             }
 
             freeWorkspace();
 
-            // Allocate for batch_size=1 (resize if needed)
-            int batch_size = 1;
-            if (cudaFlashAttn_allocWorkspace(
-                    &partial_output_buf_, &partial_m_buf_, &partial_l_buf_,
-                    batch_size, n_heads, head_dim, num_splits) != 0)
+            if (!workspace_)
             {
-                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to allocate workspace");
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Flash decode requires bound graph workspace");
+                return false;
+            }
+
+            partial_output_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT);
+            partial_m_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M);
+            partial_l_buf_ = workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L);
+
+            const size_t required_partial_output =
+                static_cast<size_t>(std::max(1, n_heads)) *
+                static_cast<size_t>(std::max(1, num_splits)) *
+                static_cast<size_t>(std::max(1, head_dim)) * sizeof(float);
+            const size_t required_partial_meta =
+                static_cast<size_t>(std::max(1, n_heads)) *
+                static_cast<size_t>(std::max(1, num_splits)) * sizeof(float);
+            if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_ ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT) < required_partial_output ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_M) < required_partial_meta ||
+                workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_L) < required_partial_meta)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Bound attention workspace is too small: "
+                          << "required partial_output=" << required_partial_output
+                          << " partial_m/l=" << required_partial_meta
+                          << " bytes for n_heads=" << n_heads
+                          << " head_dim=" << head_dim
+                          << " num_splits=" << num_splits
+                          << "; available partial_output="
+                          << workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_OUTPUT)
+                          << " partial_m="
+                          << workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_M)
+                          << " partial_l="
+                          << workspace_->getBufferSize(AttentionWorkspaceBuffers::PARTIAL_L));
                 partial_output_buf_ = nullptr;
                 partial_m_buf_ = nullptr;
                 partial_l_buf_ = nullptr;
-                return;
+                return false;
             }
 
             max_splits_ = num_splits;
-            workspace_size_ = static_cast<size_t>(batch_size) * n_heads * num_splits * head_dim * sizeof(float);
-            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Allocated workspace: " << workspace_size_ << " bytes");
+            workspace_size_ = required_partial_output + required_partial_meta + required_partial_meta;
+            LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Using managed attention workspace: "
+                      << workspace_size_ << " bytes");
+            return true;
         }
 
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
-            {
-                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
-                partial_output_buf_ = nullptr;
-                partial_m_buf_ = nullptr;
-                partial_l_buf_ = nullptr;
-                workspace_size_ = 0;
-                max_splits_ = 0;
-            }
+            partial_output_buf_ = nullptr;
+            partial_m_buf_ = nullptr;
+            partial_l_buf_ = nullptr;
+            workspace_size_ = 0;
+            max_splits_ = 0;
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute(
@@ -456,8 +497,8 @@ namespace llaminar2
                 return false;
             }
 
-            // Always set the active device — required for workspace allocation (cudaMalloc)
-            // and cudaFuncSetAttribute calls which operate on the current device, not the stream's device.
+            // Always set the active device — required for workspace binding checks and
+            // cudaFuncSetAttribute calls which operate on the current device, not the stream's device.
             // In multi-GPU TP mode, the thread-local device may be wrong.
             if (cudaFlashAttn_setDevice(device_idx) != 0)
             {
@@ -473,11 +514,9 @@ namespace llaminar2
                 // Flash Decoding for single-token decode
                 int num_splits = computeNumSplitsForDevice(kv_len, n_heads, device_idx);
 
-                allocateWorkspace(n_heads, head_dim, num_splits);
-
-                if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                if (!allocateWorkspace(n_heads, head_dim, num_splits))
                 {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace allocation failed");
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace binding failed");
                     return false;
                 }
 
@@ -485,7 +524,7 @@ namespace llaminar2
                                                                                             << " num_splits=" << num_splits);
 
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                     result = cudaFlashAttn_decode_fp32(
                         Q, K, V, output,
                         static_cast<float *>(partial_output_buf_),
@@ -506,7 +545,7 @@ namespace llaminar2
                           << "batch=" << batch_size << " seq_len=" << seq_len << " kv_len=" << kv_len);
 
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_PREFILL, stream_);
                     result = cudaFlashAttn_prefill_fa2(
                         Q, K, V, output,
                         batch_size, seq_len, kv_len,
@@ -578,47 +617,104 @@ namespace llaminar2
             const float *V_ptr = static_cast<const float *>(V->gpu_data_ptr());
             float *output_ptr = static_cast<float *>(output->gpu_data_ptr());
 
-            // === EARLY device_params setup ===
-            // Wire device_params for graph-capture replay: H2D memcpy from pinned host
-            // memory is captured as a graph node. On replay, the memcpy re-reads
-            // the updated pinned values (kv_len, position_offset, mask_stride).
-            //
-            // IMPORTANT: This MUST be done BEFORE KV conversion so that the dynamic
-            // conversion kernels (used during graph capture) can read the current
-            // kv_len from device_params. Without this ordering, the captured graph
-            // would freeze the conversion element count, causing stale data on replay.
+            const bool row_local_decode_params_ready =
+                dynamic_attn_device_valid_ &&
+                dynamic_attn_query_rows_ == seq_len &&
+                dynamic_attn_param_rows_ >= seq_len;
+            const bool use_small_fp16kv_decode =
+                K->native_type() == TensorType::FP16 &&
+                V->native_type() == TensorType::FP16 &&
+                batch_size == 1 &&
+                causal &&
+                seq_len > 1 &&
+                seq_len <= MAX_SMALL_DECODE_ROWS &&
+                kv_len > seq_len &&
+                row_local_decode_params_ready;
+            const int expected_query_rows =
+                use_small_fp16kv_decode ? seq_len : 1;
+
+            // Wire device_params for graph-capture replay. Compatibility
+            // launches still use a tiny pre-capture H2D upload, while the
+            // resident MTP path can mark this buffer as device-derived after
+            // recording a count-to-params kernel inside the graph body.
             const attention::AttentionDeviceParams *d_attn_params = nullptr;
             if (stream_ && workspace_)
             {
-                // Lazy-allocate pinned host buffer
-                if (!h_attn_params_)
+                const int dynamic_position_offset =
+                    (causal && kv_len > seq_len) ? (kv_len - seq_len) : 0;
+
+                cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+                const cudaError_t cap_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(stream_), &cap_status);
+                if (cap_err != cudaSuccess)
                 {
-                    cudaError_t err = cudaMallocHost(reinterpret_cast<void **>(&h_attn_params_),
-                                                     sizeof(attention::AttentionDeviceParams));
-                    if (err != cudaSuccess)
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] cudaStreamIsCapturing failed before attention-param use: "
+                              << cudaGetErrorString(cap_err));
+                    return false;
+                }
+
+                if (dynamic_attn_device_derived_)
+                {
+                    if (!dynamic_attn_device_valid_ ||
+                        dynamic_attn_param_rows_ < expected_query_rows ||
+                        dynamic_attn_query_rows_ != expected_query_rows)
                     {
                         LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] "
-                                  "cudaMallocHost failed for h_attn_params_: "
-                                  << cudaGetErrorString(err));
-                        h_attn_params_ = nullptr;
+                                  "Device-derived attention params were not ready"
+                                  << " rows=" << expected_query_rows
+                                  << " prepared_rows=" << dynamic_attn_query_rows_
+                                  << " param_rows=" << dynamic_attn_param_rows_
+                                  << " device_valid=" << dynamic_attn_device_valid_);
+                        return false;
                     }
                 }
-                if (h_attn_params_)
+                else if (cap_status == cudaStreamCaptureStatusActive)
                 {
-                    h_attn_params_->kv_len = kv_len;
-                    h_attn_params_->position_offset = 0;
-                    h_attn_params_->mask_stride = kv_len;
-
-                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
-                    if (d_buf)
+                    if (!dynamic_attn_host_valid_ ||
+                        !dynamic_attn_device_valid_ ||
+                        dynamic_attn_param_rows_ < expected_query_rows ||
+                        dynamic_attn_query_rows_ != expected_query_rows)
                     {
-                        cudaMemcpyAsync(d_buf, h_attn_params_,
-                                        sizeof(attention::AttentionDeviceParams),
-                                        cudaMemcpyHostToDevice,
-                                        static_cast<cudaStream_t>(stream_));
-                        d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] "
+                                  "Attention device params were not ready before CUDA graph capture"
+                                  << " captured_body(kv_len=" << kv_len
+                                  << ", pos=" << dynamic_position_offset
+                                  << ", rows=" << expected_query_rows << ")"
+                                  << " prepared(kv_len=" << dynamic_attn_kv_len_
+                                  << ", pos=" << dynamic_attn_position_offset_
+                                  << ", rows=" << dynamic_attn_query_rows_
+                                  << ", param_rows=" << dynamic_attn_param_rows_
+                                  << ") host_valid=" << dynamic_attn_host_valid_
+                                  << " device_valid=" << dynamic_attn_device_valid_
+                                  << " workspace=" << (workspace_ != nullptr)
+                                  << " stream=" << stream_);
+                        return false;
                     }
                 }
+                else
+                {
+                    setDynamicAttnParams(kv_len, dynamic_position_offset, expected_query_rows);
+                    if (!dynamicAttnParamsReady(kv_len, dynamic_position_offset, expected_query_rows))
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Attention device params were not ready on the explicit stream");
+                        return false;
+                    }
+                }
+
+                if (!dynamic_attn_device_valid_)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Attention device params were not ready on the explicit stream");
+                    return false;
+                }
+
+                void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                if (!d_buf)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor] Missing workspace buffer "
+                              << AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                    return false;
+                }
+                d_attn_params = static_cast<const attention::AttentionDeviceParams *>(d_buf);
             }
 
             // === Mixed-precision KV handling (FP16→direct or Q8_1→fused/FP32) ===
@@ -795,17 +891,15 @@ namespace llaminar2
                     // DECODE: Flash Decoding with FP16 KV — no conversion needed
                     int num_splits = computeNumSplitsForDevice(kv_len, n_heads, dev);
 
-                    allocateWorkspace(n_heads, head_dim, num_splits);
-
-                    if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                    if (!allocateWorkspace(n_heads, head_dim, num_splits))
                     {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace allocation failed for FP16KV decode");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace binding failed for FP16KV decode");
                         return false;
                     }
 
                     int result;
                     {
-                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                        CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                         result = cudaFlashAttn_decode_fp16kv(
                             Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
                             static_cast<float *>(partial_output_buf_),
@@ -824,38 +918,84 @@ namespace llaminar2
                     return true;
                 }
 
-                // PREFILL: FA2 with FP16 KV
-
-                // Check for cuBLAS attention override (env: LLAMINAR_CUBLAS_ATTN=1)
-                static const int use_cublas_attn = []()
+                if (use_small_fp16kv_decode)
                 {
-                    const char *env = std::getenv("LLAMINAR_CUBLAS_ATTN");
-                    return (env && atoi(env) == 1) ? 1 : 0;
-                }();
-
-                if (use_cublas_attn && n_heads % n_kv_heads == 0)
-                {
-                    int result;
+                    LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode path"
+                              << " rows=" << seq_len
+                              << " kv_len=" << kv_len
+                              << " n_heads=" << n_heads
+                              << " n_kv_heads=" << n_kv_heads
+                              << " head_dim=" << head_dim
+                              << " device_params=" << (d_attn_params != nullptr));
+                    if (!stream_)
                     {
-                        CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
-                        result = cudaFlashAttn_prefill_cublas_fp16kv(
-                            Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
-                            batch_size, seq_len, kv_len,
-                            n_heads, n_kv_heads, head_dim,
-                            causal, 0, // position_offset
-                            stream_, dev);
-                    }
-                    if (result != 0)
-                    {
-                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] cuBLAS attention failed");
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode requires an explicit non-null CUDA stream");
                         return false;
+                    }
+
+                    if (!workspace_)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode requires a bound workspace");
+                        return false;
+                    }
+
+                    float *O_partial = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_OUTPUT));
+                    float *m_partial = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_M));
+                    float *l_partial = static_cast<float *>(workspace_->getBuffer(AttentionWorkspaceBuffers::PARTIAL_L));
+
+                    if (!O_partial || !m_partial || !l_partial)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace buffers missing for small-M FP16KV decode");
+                        return false;
+                    }
+
+                    const size_t row_stride =
+                        static_cast<size_t>(n_heads) * static_cast<size_t>(head_dim);
+                    for (int row = 0; row < seq_len; ++row)
+                    {
+                        const int row_kv_len = std::max(1, kv_len - (seq_len - 1 - row));
+                        const int num_splits = computeNumSplitsForDevice(row_kv_len, n_heads, dev);
+                        const attention::AttentionDeviceParams *row_params =
+                            d_attn_params ? (d_attn_params + row) : nullptr;
+
+                        int result;
+                        {
+                            CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
+                            result = cudaFlashAttn_decode_fp16kv(
+                                Q_ptr + static_cast<size_t>(row) * row_stride,
+                                K_fp16_ptr, V_fp16_ptr,
+                                output_ptr + static_cast<size_t>(row) * row_stride,
+                                O_partial, m_partial, l_partial,
+                                1, row_kv_len,
+                                n_heads, n_kv_heads, head_dim,
+                                num_splits, row_params, stream_, dev,
+                                head_start, gqa_n_rep);
+                        }
+                        if (result != 0)
+                        {
+                            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Small-M FP16KV decode failed"
+                                      << " row=" << row
+                                      << " row_kv_len=" << row_kv_len
+                                      << " num_splits=" << num_splits);
+                            return false;
+                        }
                     }
                     return true;
                 }
 
+                // PREFILL: FA2 with FP16 KV
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] FA2 FP16KV prefill path"
+                          << " seq_len=" << seq_len
+                          << " kv_len=" << kv_len
+                          << " n_heads=" << n_heads
+                          << " n_kv_heads=" << n_kv_heads
+                          << " head_dim=" << head_dim
+                          << " causal=" << causal
+                          << " device_params=" << (d_attn_params != nullptr));
+
                 int result;
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_PREFILL);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_PREFILL, stream_);
                     result = cudaFlashAttn_prefill_fa2_fp16kv(
                         Q_ptr, K_fp16_ptr, V_fp16_ptr, output_ptr,
                         batch_size, seq_len, kv_len,
@@ -885,17 +1025,15 @@ namespace llaminar2
                 // seq_len == 1 is guaranteed by the flag setup above
                 int num_splits = computeNumSplitsForDevice(kv_len, n_heads, dev);
 
-                allocateWorkspace(n_heads, head_dim, num_splits);
-
-                if (!partial_output_buf_ || !partial_m_buf_ || !partial_l_buf_)
+                if (!allocateWorkspace(n_heads, head_dim, num_splits))
                 {
-                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace allocation failed for Q8_1 fused decode");
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Workspace binding failed for Q8_1 fused decode");
                     return false;
                 }
 
                 int result;
                 {
-                    CUDA_KERNEL_PROFILE_SCOPE(CUDAKernelType::FLASH_ATTN_DECODE);
+                    CUDA_KERNEL_PROFILE_SCOPE_STREAM(CUDAKernelType::FLASH_ATTN_DECODE, stream_);
                     result = cudaFlashAttn_decode_q8_1(
                         Q_ptr, K_q8_ptr, V_q8_ptr, output_ptr,
                         static_cast<float *>(partial_output_buf_),
@@ -937,6 +1075,91 @@ namespace llaminar2
             }
         }
 
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::compute_verifier_rows_decode_equivalent(
+            const ITensor *Q,
+            const ITensor *K,
+            const ITensor *V,
+            ITensor *output,
+            int verifier_rows,
+            int kv_len,
+            int n_heads,
+            int n_kv_heads,
+            int head_dim,
+            bool causal,
+            int window_size,
+            const IMPIContext *mpi_ctx,
+            int device_idx,
+            int head_start,
+            int gqa_n_rep)
+        {
+            if (!Q || !K || !V || !output)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Null tensor");
+                return false;
+            }
+            if (verifier_rows < 2 || verifier_rows > MAX_SMALL_DECODE_ROWS ||
+                kv_len <= verifier_rows || !causal)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] Invalid verifier span"
+                          << " rows=" << verifier_rows
+                          << " kv_len=" << kv_len
+                          << " causal=" << causal);
+                return false;
+            }
+            if (!stream_ || !workspace_)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "requires explicit CUDA stream and bound workspace");
+                return false;
+            }
+            if (Q->native_type() != TensorType::FP32 || output->native_type() != TensorType::FP32)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "requires FP32 Q/output, got Q=" << Q->dtype_name()
+                                                           << " O=" << output->dtype_name());
+                return false;
+            }
+            if (K->native_type() != TensorType::FP16 || V->native_type() != TensorType::FP16)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "currently proven only for FP16 KV, got K=" << K->dtype_name()
+                                                                      << " V=" << V->dtype_name());
+                return false;
+            }
+
+            /*
+             * The M-row verifier path decides whether small-M decode is legal
+             * before compute_tensor() can lazily upload params, so prepare the
+             * row-local param block at this named contract boundary.
+             */
+            const int position_offset = kv_len - verifier_rows;
+            if (!dynamic_attn_device_derived_ &&
+                !prepareDynamicAttnParams(kv_len, position_offset, verifier_rows, stream_))
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_verifier_rows_decode_equivalent] "
+                          "failed preparing dynamic params");
+                return false;
+            }
+
+            return compute_tensor(Q, K, V, output,
+                                  /*batch_size=*/1,
+                                  verifier_rows,
+                                  kv_len,
+                                  n_heads,
+                                  n_kv_heads,
+                                  head_dim,
+                                  causal,
+                                  window_size,
+                                  nullptr,
+                                  nullptr,
+                                  mpi_ctx,
+                                  device_idx,
+                                  head_start,
+                                  n_heads,
+                                  n_kv_heads,
+                                  gqa_n_rep);
+        }
+
         // =====================================================================
         // FP32 IWorkspaceConsumer Interface Implementation
         // =====================================================================
@@ -975,7 +1198,8 @@ namespace llaminar2
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_M, partial_m_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::PARTIAL_L, partial_l_bytes, 256, true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::DEVICE_PARAMS,
-                                    sizeof(attention::AttentionDeviceParams),
+                                    sizeof(attention::AttentionDeviceParams) *
+                                        static_cast<size_t>(MAX_SMALL_DECODE_ROWS),
                                     256,
                                     true});
             reqs.buffers.push_back({AttentionWorkspaceBuffers::K_TMP_FP32, kv_convert_bytes, 256, true});
@@ -996,14 +1220,15 @@ namespace llaminar2
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::bindWorkspace(
             DeviceWorkspaceManager *workspace)
         {
+            freeWorkspace();
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Bound workspace manager, entering managed mode");
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Bound workspace manager");
             }
             else
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Unbound workspace, returning to legacy mode");
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP32>] Unbound workspace manager");
             }
         }
 
@@ -1017,38 +1242,261 @@ namespace llaminar2
             return workspace_;
         }
 
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::ensureHostAttnParamsCapacity(
+            int capacity)
+        {
+            capacity = std::max(1, capacity);
+            if (capacity > static_cast<int>(h_attn_params_.size()))
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Requested "
+                          << capacity << " attention param row(s), but fixed staging only holds "
+                          << h_attn_params_.size());
+                return false;
+            }
+
+            // The staging array is a member, so capacity validation is capture-safe.
+            h_attn_params_capacity_ = static_cast<int>(h_attn_params_.size());
+            return true;
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::uploadDynamicAttnParams(
+            void *stream)
+        {
+            if (!dynamic_attn_host_valid_)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Cannot upload attention params before host values are prepared");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            if (!stream)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Cannot upload attention params on a null/default CUDA stream");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            if (!workspace_)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Cannot upload attention params without a bound workspace");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+            const cudaError_t cap_err =
+                cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &cap_status);
+            if (cap_err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] cudaStreamIsCapturing failed before attention-param upload: "
+                          << cudaGetErrorString(cap_err));
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            if (cap_status == cudaStreamCaptureStatusActive)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Refusing to record attention-param H2D inside CUDA graph capture");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            if (!d_buf)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Missing workspace buffer "
+                          << AttentionWorkspaceBuffers::DEVICE_PARAMS
+                          << " for attention params");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            const cudaError_t copy_err =
+                cudaMemcpyAsync(d_buf,
+                                h_attn_params_.data(),
+                                sizeof(attention::AttentionDeviceParams) *
+                                    static_cast<size_t>(dynamic_attn_param_rows_),
+                                cudaMemcpyHostToDevice,
+                                static_cast<cudaStream_t>(stream));
+            if (copy_err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] cudaMemcpyAsync failed for attention params: "
+                          << cudaGetErrorString(copy_err));
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+
+            dynamic_attn_device_valid_ = true;
+            return true;
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::dynamicAttnParamsReady(
+            int kv_len, int position_offset, int query_rows) const
+        {
+            const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
+            const int param_rows = sanitized_query_rows;
+            return dynamic_attn_host_valid_ &&
+                   dynamic_attn_device_valid_ &&
+                   dynamic_attn_kv_len_ == kv_len &&
+                   dynamic_attn_position_offset_ == position_offset &&
+                   dynamic_attn_query_rows_ == sanitized_query_rows &&
+                   dynamic_attn_param_rows_ == param_rows;
+        }
+
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
             int kv_len, int position_offset)
         {
-            // Lazy-allocate pinned host buffer if not yet created.
-            if (!h_attn_params_)
-            {
-                cudaError_t err = cudaMallocHost(reinterpret_cast<void **>(&h_attn_params_),
-                                                 sizeof(attention::AttentionDeviceParams));
-                if (err != cudaSuccess)
-                    h_attn_params_ = nullptr;
-            }
-            if (h_attn_params_)
-            {
-                h_attn_params_->kv_len = kv_len;
-                h_attn_params_->position_offset = position_offset;
-                h_attn_params_->mask_stride = kv_len;
+            setDynamicAttnParams(kv_len, position_offset, 1);
+        }
 
-                // Explicit H2D copy OUTSIDE graph capture scope.
-                // Ensures device buffer has current attention params before
-                // CUDA graph replay (see RoPE setDynamicPosOffset rationale).
-                if (stream_ && workspace_)
-                {
-                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
-                    if (d_buf)
-                    {
-                        cudaMemcpyAsync(d_buf, h_attn_params_,
-                                        sizeof(attention::AttentionDeviceParams),
-                                        cudaMemcpyHostToDevice,
-                                        static_cast<cudaStream_t>(stream_));
-                    }
-                }
+        void CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::setDynamicAttnParams(
+            int kv_len, int position_offset, int query_rows)
+        {
+            const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
+            const int param_rows = sanitized_query_rows;
+            const bool same_params =
+                dynamic_attn_host_valid_ &&
+                dynamic_attn_kv_len_ == kv_len &&
+                dynamic_attn_position_offset_ == position_offset &&
+                dynamic_attn_query_rows_ == sanitized_query_rows &&
+                dynamic_attn_param_rows_ == param_rows;
+
+            if (!ensureHostAttnParamsCapacity(param_rows))
+            {
+                dynamic_attn_host_valid_ = false;
+                dynamic_attn_device_valid_ = false;
+                return;
             }
+
+            if (!same_params)
+                dynamic_attn_device_valid_ = false;
+            dynamic_attn_device_derived_ = false;
+
+            for (int row = 0; row < param_rows; ++row)
+            {
+                const int row_kv_len = std::max(1, kv_len - (param_rows - 1 - row));
+                h_attn_params_[row].kv_len = row_kv_len;
+                h_attn_params_[row].position_offset = position_offset + row;
+                h_attn_params_[row].mask_stride = kv_len;
+            }
+
+            dynamic_attn_kv_len_ = kv_len;
+            dynamic_attn_position_offset_ = position_offset;
+            dynamic_attn_query_rows_ = sanitized_query_rows;
+            dynamic_attn_param_rows_ = param_rows;
+            dynamic_attn_host_valid_ = true;
+
+            if (!stream_ || !workspace_)
+                return;
+
+            cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+            const cudaError_t cap_err =
+                cudaStreamIsCapturing(static_cast<cudaStream_t>(stream_), &cap_status);
+            if (cap_err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] cudaStreamIsCapturing failed while preparing attention params: "
+                          << cudaGetErrorString(cap_err));
+                dynamic_attn_device_valid_ = false;
+                return;
+            }
+            if (cap_status == cudaStreamCaptureStatusActive)
+            {
+                if (!dynamic_attn_device_valid_)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Attention params changed during CUDA graph capture; "
+                              "they must be uploaded before beginCapture()");
+                }
+                return;
+            }
+
+            if (!dynamic_attn_device_valid_)
+                uploadDynamicAttnParams(stream_);
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParams(
+            int kv_len, int position_offset, int query_rows, void *stream)
+        {
+            if (!stream)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] prepareDynamicAttnParams requires an explicit non-null CUDA stream");
+                dynamic_attn_device_valid_ = false;
+                return false;
+            }
+            setGPUStream(stream);
+            setDynamicAttnParams(kv_len, position_offset, query_rows);
+            const bool ready = dynamicAttnParamsReady(kv_len, position_offset, query_rows);
+            if (!ready)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Dynamic attention params not ready after prepare"
+                          << " requested(kv_len=" << kv_len
+                          << ", pos=" << position_offset
+                          << ", rows=" << sanitizeSmallDecodeQueryRows(query_rows) << ")"
+                          << " prepared(kv_len=" << dynamic_attn_kv_len_
+                          << ", pos=" << dynamic_attn_position_offset_
+                          << ", rows=" << dynamic_attn_query_rows_
+                          << ", param_rows=" << dynamic_attn_param_rows_
+                          << ") host_valid=" << dynamic_attn_host_valid_
+                          << " device_valid=" << dynamic_attn_device_valid_
+                          << " workspace=" << (workspace_ != nullptr)
+                          << " stream=" << stream_);
+                return false;
+            }
+            return true;
+        }
+
+        bool CUDAFlashAttentionKernelT<ActivationPrecision::FP32>::prepareDynamicAttnParamsFromDeviceSequenceState(
+            const int *post_append_cached_tokens_device,
+            int seq_len,
+            int query_rows,
+            void *stream)
+        {
+            const int sanitized_query_rows = sanitizeSmallDecodeQueryRows(query_rows);
+            if (!post_append_cached_tokens_device || seq_len <= 0 || !stream)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require count pointer, positive seq_len, and explicit stream");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+            if (!workspace_)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Device-derived attention params require a bound workspace");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+            if (!d_buf)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Missing workspace buffer "
+                          << AttentionWorkspaceBuffers::DEVICE_PARAMS
+                          << " for device-derived attention params");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            setGPUStream(stream);
+            const int rc = cudaFlashAttn_prepare_device_params_from_count(
+                d_buf,
+                post_append_cached_tokens_device,
+                seq_len,
+                sanitized_query_rows,
+                stream);
+            if (rc != 0)
+            {
+                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>] Failed to derive attention params from device KV count");
+                dynamic_attn_device_valid_ = false;
+                dynamic_attn_device_derived_ = false;
+                return false;
+            }
+
+            dynamic_attn_kv_len_ = 0;
+            dynamic_attn_position_offset_ = 0;
+            dynamic_attn_query_rows_ = sanitized_query_rows;
+            dynamic_attn_param_rows_ = sanitized_query_rows;
+            dynamic_attn_host_valid_ = true;
+            dynamic_attn_device_valid_ = true;
+            dynamic_attn_device_derived_ = true;
+            return true;
         }
 
         // =====================================================================
@@ -1074,7 +1522,9 @@ namespace llaminar2
             int head_start,
             int gqa_n_rep)
         {
-            const int num_splits = std::max(1, std::min(kv_count / 64, 32));
+            const int num_splits = debugEnv().gemm.deterministic
+                                       ? 1
+                                       : std::max(1, std::min(kv_count / 64, 32));
 
             // Ensure workspace is allocated
             if (workspace_)
@@ -1090,7 +1540,7 @@ namespace llaminar2
                 }
 
                 const attention::AttentionDeviceParams *d_params = nullptr;
-                if (h_attn_params_)
+                if (dynamic_attn_device_valid_)
                 {
                     void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
                     if (d_buf)
@@ -1122,33 +1572,9 @@ namespace llaminar2
                 return true;
             }
 
-            // Fallback without managed workspace
-            if (!partial_output_buf_)
-                allocateWorkspace(n_heads, head_dim, num_splits);
-
-            int result = cudaFlashAttn_decode_tqkv(
-                static_cast<const float *>(Q->gpu_data_ptr()),
-                static_cast<float *>(output->gpu_data_ptr()),
-                static_cast<float *>(partial_output_buf_),
-                static_cast<float *>(partial_m_buf_),
-                static_cast<float *>(partial_l_buf_),
-                K_cache, V_cache,
-                rotation, rotation_t,
-                batch_size, kv_count,
-                n_heads, n_kv_heads, head_dim,
-                num_splits,
-                max_seq_len, tail,
-                k_block_size, v_block_size,
-                nullptr,
-                stream_, device_idx_,
-                head_start, gqa_n_rep);
-
-            if (result != 0)
-            {
-                LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor_tq_decode] Fused TQ kernel failed (no workspace)");
-                return false;
-            }
-            return true;
+            LOG_ERROR("[CUDAFlashAttentionKernelT<FP32>::compute_tensor_tq_decode] "
+                      "Fused TQ decode requires bound graph workspace");
+            return false;
         }
 
         // =====================================================================
@@ -1198,11 +1624,6 @@ namespace llaminar2
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::~CUDAFlashAttentionKernelT()
         {
             freeWorkspace();
-            if (h_attn_params_)
-            {
-                cudaFreeHost(h_attn_params_);
-                h_attn_params_ = nullptr;
-            }
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::CUDAFlashAttentionKernelT(
@@ -1215,7 +1636,8 @@ namespace llaminar2
               max_splits_(other.max_splits_),
               workspace_(other.workspace_),
               device_ctx_(other.device_ctx_),
-              h_attn_params_(other.h_attn_params_)
+              h_attn_params_(other.h_attn_params_),
+              dynamic_attn_device_valid_(other.dynamic_attn_device_valid_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -1223,7 +1645,7 @@ namespace llaminar2
             other.partial_l_buf_ = nullptr;
             other.workspace_ = nullptr;
             other.device_ctx_ = nullptr;
-            other.h_attn_params_ = nullptr;
+            other.dynamic_attn_device_valid_ = false;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::FP16> &
@@ -1233,11 +1655,6 @@ namespace llaminar2
             if (this != &other)
             {
                 freeWorkspace();
-                if (h_attn_params_)
-                {
-                    cudaFreeHost(h_attn_params_);
-                    h_attn_params_ = nullptr;
-                }
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
@@ -1248,13 +1665,14 @@ namespace llaminar2
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
                 h_attn_params_ = other.h_attn_params_;
+                dynamic_attn_device_valid_ = other.dynamic_attn_device_valid_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
                 other.partial_m_buf_ = nullptr;
                 other.partial_l_buf_ = nullptr;
                 other.workspace_ = nullptr;
                 other.device_ctx_ = nullptr;
-                other.h_attn_params_ = nullptr;
+                other.dynamic_attn_device_valid_ = false;
             }
             return *this;
         }
@@ -1270,13 +1688,11 @@ namespace llaminar2
 
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
-            {
-                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
-                partial_output_buf_ = nullptr;
-                partial_m_buf_ = nullptr;
-                partial_l_buf_ = nullptr;
-            }
+            partial_output_buf_ = nullptr;
+            partial_m_buf_ = nullptr;
+            partial_l_buf_ = nullptr;
+            workspace_size_ = 0;
+            max_splits_ = 0;
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::compute(
@@ -1295,6 +1711,9 @@ namespace llaminar2
             // For now, use FP32 path
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute(Q, K, V, output, seq_len, n_heads, n_kv_heads, head_dim,
                                        causal, window_size, workspace_scores, workspace_buffer,
                                        workspace_context, workspace_mask, use_bf16, mpi_ctx, device_idx);
@@ -1314,6 +1733,9 @@ namespace llaminar2
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute_batch(Q, K, V, output, batch_size, seq_len, n_heads, n_kv_heads, head_dim,
                                              causal, window_size, workspace_scores, workspace_buffer,
                                              workspace_context, workspace_mask, use_bf16, mpi_ctx, device_idx);
@@ -1326,6 +1748,9 @@ namespace llaminar2
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute_decode(Q, K, V, output, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                                               causal, position_offset);
         }
@@ -1385,6 +1810,9 @@ namespace llaminar2
             // FP16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<FP16>] FP16 compute_tensor not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
@@ -1406,14 +1834,15 @@ namespace llaminar2
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::bindWorkspace(
             DeviceWorkspaceManager *workspace)
         {
+            freeWorkspace();
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Bound workspace manager, entering managed mode");
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Bound workspace manager");
             }
             else
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Unbound workspace, returning to legacy mode");
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<FP16>] Unbound workspace manager");
             }
         }
 
@@ -1430,29 +1859,43 @@ namespace llaminar2
         void CUDAFlashAttentionKernelT<ActivationPrecision::FP16>::setDynamicAttnParams(
             int kv_len, int position_offset)
         {
-            if (!h_attn_params_)
-            {
-                cudaError_t err = cudaMallocHost(reinterpret_cast<void **>(&h_attn_params_),
-                                                 sizeof(attention::AttentionDeviceParams));
-                if (err != cudaSuccess)
-                    h_attn_params_ = nullptr;
-            }
-            if (h_attn_params_)
-            {
-                h_attn_params_->kv_len = kv_len;
-                h_attn_params_->position_offset = position_offset;
-                h_attn_params_->mask_stride = kv_len;
+            h_attn_params_.kv_len = kv_len;
+            h_attn_params_.position_offset = position_offset;
+            h_attn_params_.mask_stride = kv_len;
+            dynamic_attn_device_valid_ = false;
 
-                if (stream_ && workspace_)
+            if (stream_ && workspace_)
+            {
+                cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+                const cudaError_t cap_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(stream_), &cap_status);
+                if (cap_err != cudaSuccess)
                 {
-                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
-                    if (d_buf)
-                    {
-                        cudaMemcpyAsync(d_buf, h_attn_params_,
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP16>] cudaStreamIsCapturing failed before attention-param upload: "
+                              << cudaGetErrorString(cap_err));
+                    return;
+                }
+                if (cap_status == cudaStreamCaptureStatusActive)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<FP16>] Refusing to record attention-param H2D inside CUDA graph capture");
+                    return;
+                }
+
+                void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                if (d_buf)
+                {
+                    const cudaError_t copy_err =
+                        cudaMemcpyAsync(d_buf, &h_attn_params_,
                                         sizeof(attention::AttentionDeviceParams),
                                         cudaMemcpyHostToDevice,
                                         static_cast<cudaStream_t>(stream_));
+                    if (copy_err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<FP16>] cudaMemcpyAsync failed for attention params: "
+                                  << cudaGetErrorString(copy_err));
+                        return;
                     }
+                    dynamic_attn_device_valid_ = true;
                 }
             }
         }
@@ -1504,11 +1947,6 @@ namespace llaminar2
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::~CUDAFlashAttentionKernelT()
         {
             freeWorkspace();
-            if (h_attn_params_)
-            {
-                cudaFreeHost(h_attn_params_);
-                h_attn_params_ = nullptr;
-            }
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::CUDAFlashAttentionKernelT(
@@ -1521,7 +1959,8 @@ namespace llaminar2
               max_splits_(other.max_splits_),
               workspace_(other.workspace_),
               device_ctx_(other.device_ctx_),
-              h_attn_params_(other.h_attn_params_)
+              h_attn_params_(other.h_attn_params_),
+              dynamic_attn_device_valid_(other.dynamic_attn_device_valid_)
         {
             other.stream_ = nullptr;
             other.partial_output_buf_ = nullptr;
@@ -1529,7 +1968,7 @@ namespace llaminar2
             other.partial_l_buf_ = nullptr;
             other.workspace_ = nullptr;
             other.device_ctx_ = nullptr;
-            other.h_attn_params_ = nullptr;
+            other.dynamic_attn_device_valid_ = false;
         }
 
         CUDAFlashAttentionKernelT<ActivationPrecision::BF16> &
@@ -1539,11 +1978,6 @@ namespace llaminar2
             if (this != &other)
             {
                 freeWorkspace();
-                if (h_attn_params_)
-                {
-                    cudaFreeHost(h_attn_params_);
-                    h_attn_params_ = nullptr;
-                }
                 device_idx_ = other.device_idx_;
                 stream_ = other.stream_;
                 partial_output_buf_ = other.partial_output_buf_;
@@ -1554,13 +1988,14 @@ namespace llaminar2
                 workspace_ = other.workspace_;
                 device_ctx_ = other.device_ctx_;
                 h_attn_params_ = other.h_attn_params_;
+                dynamic_attn_device_valid_ = other.dynamic_attn_device_valid_;
                 other.stream_ = nullptr;
                 other.partial_output_buf_ = nullptr;
                 other.partial_m_buf_ = nullptr;
                 other.partial_l_buf_ = nullptr;
                 other.workspace_ = nullptr;
                 other.device_ctx_ = nullptr;
-                other.h_attn_params_ = nullptr;
+                other.dynamic_attn_device_valid_ = false;
             }
             return *this;
         }
@@ -1576,13 +2011,11 @@ namespace llaminar2
 
         void CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::freeWorkspace()
         {
-            if (partial_output_buf_ || partial_m_buf_ || partial_l_buf_)
-            {
-                cudaFlashAttn_freeWorkspace(partial_output_buf_, partial_m_buf_, partial_l_buf_);
-                partial_output_buf_ = nullptr;
-                partial_m_buf_ = nullptr;
-                partial_l_buf_ = nullptr;
-            }
+            partial_output_buf_ = nullptr;
+            partial_m_buf_ = nullptr;
+            partial_l_buf_ = nullptr;
+            workspace_size_ = 0;
+            max_splits_ = 0;
         }
 
         bool CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::compute(
@@ -1599,6 +2032,9 @@ namespace llaminar2
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute(Q, K, V, output, seq_len, n_heads, n_kv_heads, head_dim,
                                        causal, window_size, workspace_scores, workspace_buffer,
                                        workspace_context, workspace_mask, use_bf16, mpi_ctx, device_idx);
@@ -1618,6 +2054,9 @@ namespace llaminar2
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute_batch(Q, K, V, output, batch_size, seq_len, n_heads, n_kv_heads, head_dim,
                                              causal, window_size, workspace_scores, workspace_buffer,
                                              workspace_context, workspace_mask, use_bf16, mpi_ctx, device_idx);
@@ -1630,6 +2069,9 @@ namespace llaminar2
         {
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute_decode(Q, K, V, output, seq_len, kv_len, n_heads, n_kv_heads, head_dim,
                                               causal, position_offset);
         }
@@ -1689,6 +2131,9 @@ namespace llaminar2
             // BF16 compute_tensor: delegate to FP32 for now
             LOG_WARN("[CUDAFlashAttentionKernelT<BF16>] BF16 compute_tensor not yet implemented, using FP32");
             CUDAFlashAttentionKernelT<ActivationPrecision::FP32> fp32_kernel(device_idx_);
+            fp32_kernel.setGPUStream(stream_);
+            fp32_kernel.bindWorkspace(workspace_);
+            fp32_kernel.setDeviceContext(device_ctx_);
             return fp32_kernel.compute_tensor(Q, K, V, output, batch_size, seq_len, kv_len,
                                               n_heads, n_kv_heads, head_dim, causal, window_size,
                                               workspace_scores, workspace_mask, mpi_ctx, device_idx,
@@ -1710,14 +2155,15 @@ namespace llaminar2
         void CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::bindWorkspace(
             DeviceWorkspaceManager *workspace)
         {
+            freeWorkspace();
             workspace_ = workspace;
             if (workspace)
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Bound workspace manager, entering managed mode");
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Bound workspace manager");
             }
             else
             {
-                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Unbound workspace, returning to legacy mode");
+                LOG_DEBUG("[CUDAFlashAttentionKernelT<BF16>] Unbound workspace manager");
             }
         }
 
@@ -1734,29 +2180,43 @@ namespace llaminar2
         void CUDAFlashAttentionKernelT<ActivationPrecision::BF16>::setDynamicAttnParams(
             int kv_len, int position_offset)
         {
-            if (!h_attn_params_)
-            {
-                cudaError_t err = cudaMallocHost(reinterpret_cast<void **>(&h_attn_params_),
-                                                 sizeof(attention::AttentionDeviceParams));
-                if (err != cudaSuccess)
-                    h_attn_params_ = nullptr;
-            }
-            if (h_attn_params_)
-            {
-                h_attn_params_->kv_len = kv_len;
-                h_attn_params_->position_offset = position_offset;
-                h_attn_params_->mask_stride = kv_len;
+            h_attn_params_.kv_len = kv_len;
+            h_attn_params_.position_offset = position_offset;
+            h_attn_params_.mask_stride = kv_len;
+            dynamic_attn_device_valid_ = false;
 
-                if (stream_ && workspace_)
+            if (stream_ && workspace_)
+            {
+                cudaStreamCaptureStatus cap_status = cudaStreamCaptureStatusNone;
+                const cudaError_t cap_err =
+                    cudaStreamIsCapturing(static_cast<cudaStream_t>(stream_), &cap_status);
+                if (cap_err != cudaSuccess)
                 {
-                    void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
-                    if (d_buf)
-                    {
-                        cudaMemcpyAsync(d_buf, h_attn_params_,
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<BF16>] cudaStreamIsCapturing failed before attention-param upload: "
+                              << cudaGetErrorString(cap_err));
+                    return;
+                }
+                if (cap_status == cudaStreamCaptureStatusActive)
+                {
+                    LOG_ERROR("[CUDAFlashAttentionKernelT<BF16>] Refusing to record attention-param H2D inside CUDA graph capture");
+                    return;
+                }
+
+                void *d_buf = workspace_->getBuffer(AttentionWorkspaceBuffers::DEVICE_PARAMS);
+                if (d_buf)
+                {
+                    const cudaError_t copy_err =
+                        cudaMemcpyAsync(d_buf, &h_attn_params_,
                                         sizeof(attention::AttentionDeviceParams),
                                         cudaMemcpyHostToDevice,
                                         static_cast<cudaStream_t>(stream_));
+                    if (copy_err != cudaSuccess)
+                    {
+                        LOG_ERROR("[CUDAFlashAttentionKernelT<BF16>] cudaMemcpyAsync failed for attention params: "
+                                  << cudaGetErrorString(copy_err));
+                        return;
                     }
+                    dynamic_attn_device_valid_ = true;
                 }
             }
         }

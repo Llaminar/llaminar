@@ -1,25 +1,29 @@
 /**
  * @file Test__PreparedEmbeddingWeightsLifecycle.cpp
- * @brief Unit tests for PreparedEmbeddingWeights registry lifecycle
+ * @brief Unit tests for model-owned PreparedEmbeddingWeights lifecycle
  *
  * Tests verify:
- * 1. Registry starts empty and can be cleared
- * 2. FP32 tensors skip preparation (no IINT8Unpackable)
- * 3. Q8_0 tensors get proper EmbedQ8 repack + handle metadata
- * 4. Cache hits return same handle pointer
- * 5. Different devices get separate entries
+ * 1. PreparedWeightStore owns embedding handles and can release them
+ * 2. FP32 tensors are rejected for packed embedding preparation
+ * 3. Q8_0 and Q4_0 tensors get proper EmbedQ8 repack + handle metadata
+ * 4. Prepared refs and tensor lookups resolve existing handles without creating entries
+ * 5. Different bindings get separate embedding entries
  * 6. Null tensor input throws
- * 7. Lookup-only (getPreparedEmbeddingWeights) does not create entries
- * 8. Move semantics are safe (no double-free)
- * 9. Multiple quantized formats (Q4_0, Q8_0) all work
+ * 7. Move semantics are safe (no double-free)
  */
 
 #include <gtest/gtest.h>
+
+#include <cstdlib>
+#include <string>
+#include <utility>
+
+#include "backends/BackendManager.h"
+#include "backends/ComputeBackend.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/PreparedEmbeddingWeights.h"
+#include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
-#include "backends/ComputeBackend.h"
-#include "backends/BackendManager.h"
 #include "../../utils/TestTensorFactory.h"
 
 using namespace llaminar::v2::kernels;
@@ -39,7 +43,6 @@ protected:
         if (dm.devices().empty())
             dm.initialize(-1);
 
-        // Ensure CPU backend is available for host-side allocations
         if (!getCPUBackend())
             initCPUBackend(0);
 
@@ -51,46 +54,81 @@ protected:
         KernelFactory::clearCache();
     }
 
-    // Small embedding dimensions for fast tests
+    WeightBinding makeEmbeddingBinding(uint64_t binding_id, TensorBase *tensor,
+                                       DeviceId device = DeviceId::cpu(),
+                                       const std::string &name = "token_embd.weight") const
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity.model_id = kModelId;
+        binding.identity.logical_id = binding_id;
+        binding.identity.instance_id = binding_id;
+        binding.identity.canonical_name = name;
+        binding.identity.role = WeightRole::Embedding;
+        binding.identity.derivation = WeightDerivationKind::Source;
+        binding.residency.home_device = device;
+        binding.residency.resident_device = device;
+        binding.tensor = tensor;
+        return binding;
+    }
+
+    PreparedWeightRef prepareEmbedding(PreparedWeightStore &store, uint64_t binding_id,
+                                       TensorBase *tensor, size_t vocab_offset = 0,
+                                       size_t total_vocab = 0) const
+    {
+        auto binding = makeEmbeddingBinding(binding_id, tensor);
+        return store.prepareEmbedding(binding, kDModelInt, vocab_offset, total_vocab);
+    }
+
+    static constexpr ModelContextId kModelId{77};
     static constexpr size_t kVocabSize = 128;
     static constexpr size_t kDModel = 64;
     static constexpr int kDModelInt = 64;
 };
 
 // ============================================================================
-// Registry State Tests
+// Store State Tests
 // ============================================================================
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, RegistryStartsEmpty)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, StoreStartsWithoutEmbeddingEntries)
 {
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0u);
+    PreparedWeightStore store(kModelId);
+    PreparedWeightRef missing{kModelId, 1, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
+
+    EXPECT_EQ(store.embeddingHandle(missing), nullptr);
+    EXPECT_FALSE(store.preparedRefForBinding(missing.binding_id, missing.device).has_value());
 }
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, ClearAllCachesReleasesEntries)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, ClearReleasesEmbeddingEntries)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
-    ASSERT_NE(handle, nullptr);
-    EXPECT_GT(KernelFactory::preparedEmbeddingRegistrySize(), 0u);
+    auto ref = prepareEmbedding(store, 1, tensor.get());
 
-    KernelFactory::clearCache();
+    ASSERT_TRUE(store.contains(ref));
+    ASSERT_NE(store.embeddingHandle(ref), nullptr);
 
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0u);
-    EXPECT_EQ(KernelFactory::getPreparedEmbeddingWeights(tensor.get(), DeviceId::cpu()), nullptr);
+    store.clear();
+
+    EXPECT_FALSE(store.contains(ref));
+    EXPECT_EQ(store.embeddingHandle(ref), nullptr);
 }
 
 // ============================================================================
-// FP32 Skip Tests
+// FP32 Rejection Tests
 // ============================================================================
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FP32TensorSkipsPreparation)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FP32TensorRejectsPackedPreparation)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createFP32Random({kVocabSize, kDModel});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
-    EXPECT_EQ(handle, nullptr);
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0u);
+    auto binding = makeEmbeddingBinding(1, tensor.get());
+
+    EXPECT_THROW(
+        store.prepareEmbedding(binding, kDModelInt),
+        std::runtime_error);
+    PreparedWeightRef rejected{kModelId, binding.binding_id, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
+    EXPECT_EQ(store.embeddingHandle(rejected), nullptr);
 }
 
 // ============================================================================
@@ -99,11 +137,13 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, FP32TensorSkipsPreparation)
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q8_0TensorGetsPreparation)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
+    auto ref = prepareEmbedding(store, 1, tensor.get());
+    auto *handle = store.embeddingHandle(ref);
 
     ASSERT_NE(handle, nullptr);
+    EXPECT_TRUE(store.contains(ref));
     EXPECT_EQ(handle->tensor, tensor.get());
     EXPECT_EQ(handle->device_id, DeviceId::cpu());
     ASSERT_NE(handle->weights, nullptr);
@@ -112,16 +152,17 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q8_0TensorGetsPreparation)
     EXPECT_EQ(handle->weights->vocab_size, kVocabSize);
     EXPECT_EQ(handle->weights->d_model, kDModelInt);
     EXPECT_GT(handle->weights->blocks_per_row, 0u);
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 1u);
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q4_0TensorGetsPreparation)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ4_0Random({kVocabSize, kDModel});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
+    auto ref = prepareEmbedding(store, 1, tensor.get());
+    auto *handle = store.embeddingHandle(ref);
 
     ASSERT_NE(handle, nullptr);
+    ASSERT_NE(handle->weights, nullptr);
     EXPECT_NE(handle->weights->device_data, nullptr);
     EXPECT_EQ(handle->weights->vocab_size, kVocabSize);
     EXPECT_EQ(handle->weights->d_model, kDModelInt);
@@ -129,93 +170,85 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, Q4_0TensorGetsPreparation)
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, HandleMetadataCorrect)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
-    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
+    auto ref = prepareEmbedding(store, 1, tensor.get());
+    auto *handle = store.embeddingHandle(ref);
 
     ASSERT_NE(handle, nullptr);
+    ASSERT_NE(handle->weights, nullptr);
 
-    // blocks_per_row should be ceil(kDModel / 32) for Q8_0 → EmbedQ8
     const size_t expected_blocks_per_row = (kDModel + 31) / 32;
     EXPECT_EQ(handle->weights->blocks_per_row, expected_blocks_per_row);
 
-    // byte_size should be vocab_size * blocks_per_row * sizeof(EmbedQ8Block)
-    // EmbedQ8Block = uint16_t(d) + uint16_t(m) + int8_t[32] = 36 bytes
     const size_t expected_byte_size = kVocabSize * expected_blocks_per_row * 36;
     EXPECT_EQ(handle->weights->byte_size, expected_byte_size);
 }
 
 // ============================================================================
-// Cache Hit Tests
+// Lookup Tests
 // ============================================================================
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, CacheHitReturnsSameHandle)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, RefLookupReturnsSameHandle)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    auto ref = prepareEmbedding(store, 1, tensor.get());
 
-    auto *handle1 = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
-    auto *handle2 = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
+    auto *handle1 = store.embeddingHandle(ref);
+    auto *handle2 = store.embeddingHandle(ref);
 
     ASSERT_NE(handle1, nullptr);
     EXPECT_EQ(handle1, handle2);
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 1u);
 }
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, DifferentTensorsGetSeparateEntries)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, DifferentBindingsGetSeparateEntries)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor_a = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel}, 42);
     auto tensor_b = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel}, 99);
 
-    auto *handle_a = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor_a.get(), kDModelInt, DeviceId::cpu());
-    auto *handle_b = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor_b.get(), kDModelInt, DeviceId::cpu());
+    auto ref_a = prepareEmbedding(store, 1, tensor_a.get());
+    auto ref_b = prepareEmbedding(store, 2, tensor_b.get());
+    auto *handle_a = store.embeddingHandle(ref_a);
+    auto *handle_b = store.embeddingHandle(ref_b);
 
     ASSERT_NE(handle_a, nullptr);
     ASSERT_NE(handle_b, nullptr);
     EXPECT_NE(handle_a, handle_b);
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 2u);
+    EXPECT_NE(ref_a.binding_id, ref_b.binding_id);
 }
-
-// ============================================================================
-// Lookup-Only Tests
-// ============================================================================
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupOnlyDoesNotCreate)
 {
-    auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    PreparedWeightStore store(kModelId);
+    PreparedWeightRef missing{kModelId, 1, PreparedWeightKind::PreparedEmbedding, DeviceId::cpu()};
 
-    auto *result = KernelFactory::getPreparedEmbeddingWeights(
-        tensor.get(), DeviceId::cpu());
-    EXPECT_EQ(result, nullptr);
-    EXPECT_EQ(KernelFactory::preparedEmbeddingRegistrySize(), 0u);
+    EXPECT_EQ(store.embeddingHandle(missing), nullptr);
+    EXPECT_FALSE(store.preparedRefForBinding(missing.binding_id, missing.device).has_value());
 }
 
-TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupFindsCreatedEntry)
+TEST_F(Test__PreparedEmbeddingWeightsLifecycle, BindingLookupFindsCreatedEntry)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    auto ref = prepareEmbedding(store, 1, tensor.get());
 
-    KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
-
-    auto *found = KernelFactory::getPreparedEmbeddingWeights(
-        tensor.get(), DeviceId::cpu());
-    ASSERT_NE(found, nullptr);
-    EXPECT_EQ(found->tensor, tensor.get());
+    auto found_ref = store.preparedRefForBinding(ref.binding_id, DeviceId::cpu());
+    ASSERT_TRUE(found_ref.has_value());
+    EXPECT_EQ(found_ref->binding_id, ref.binding_id);
+    EXPECT_EQ(store.embeddingHandle(*found_ref), store.embeddingHandle(ref));
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupMissesWrongDevice)
 {
+    PreparedWeightStore store(kModelId);
     auto tensor = TestTensorFactory::createQ8_0Random({kVocabSize, kDModel});
+    auto ref = prepareEmbedding(store, 1, tensor.get());
 
-    KernelFactory::getOrCreatePreparedEmbeddingWeights(
-        tensor.get(), kDModelInt, DeviceId::cpu());
-
-    auto *found = KernelFactory::getPreparedEmbeddingWeights(
-        tensor.get(), DeviceId(DeviceType::CPU, 1));
-    EXPECT_EQ(found, nullptr);
+    auto wrong_device = ref;
+    wrong_device.device = DeviceId(DeviceType::CPU, 1);
+    EXPECT_EQ(store.embeddingHandle(wrong_device), nullptr);
 }
 
 // ============================================================================
@@ -224,9 +257,11 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, LookupMissesWrongDevice)
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NullTensorThrows)
 {
+    PreparedWeightStore store(kModelId);
+    auto binding = makeEmbeddingBinding(1, nullptr);
+
     EXPECT_THROW(
-        KernelFactory::getOrCreatePreparedEmbeddingWeights(
-            nullptr, kDModelInt, DeviceId::cpu()),
+        store.prepareEmbedding(binding, kDModelInt),
         std::runtime_error);
 }
 
@@ -237,7 +272,6 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, NullTensorThrows)
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveConstructorTransfersOwnership)
 {
     PreparedEmbeddingWeights src;
-    // Simulate an allocation using CPU backend (malloc)
     src.device_data = malloc(256);
     src.byte_size = 256;
     src.blocks_per_row = 2;
@@ -255,11 +289,8 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveConstructorTransfersOwnershi
     EXPECT_EQ(dst.vocab_size, 4u);
     EXPECT_EQ(dst.d_model, 32);
 
-    // Source must be nullified
     EXPECT_EQ(src.device_data, nullptr);
     EXPECT_EQ(src.byte_size, 0u);
-
-    // dst destructor will call backend->free() which is free() for CPU
 }
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveAssignmentTransfersOwnership)
@@ -282,7 +313,6 @@ TEST_F(Test__PreparedEmbeddingWeightsLifecycle, MoveAssignmentTransfersOwnership
 
 TEST_F(Test__PreparedEmbeddingWeightsLifecycle, DestructorSafeOnNullData)
 {
-    // Should not crash — device_data is nullptr by default
     {
         PreparedEmbeddingWeights w;
     }

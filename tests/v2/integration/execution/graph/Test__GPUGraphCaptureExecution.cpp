@@ -44,15 +44,36 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 
 // ===========================================================================
-// Skip macros (same pattern as unit/backends/Test__GPUGraphCapture.cpp)
+// Skip macros for the backend linked into this binary
 // ===========================================================================
 
-#define SKIP_IF_NO_GPU()                                            \
-    if (!GPUDeviceContextPool::instance().hasNvidiaSupport() &&     \
-        !GPUDeviceContextPool::instance().hasAMDSupport())          \
-    {                                                               \
-        GTEST_SKIP() << "No GPU available (neither CUDA nor ROCm)"; \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#define ENSURE_LINKED_GPU_BACKEND() ensureNvidiaFactoryRegistered()
+#define HAS_LINKED_GPU_SUPPORT() GPUDeviceContextPool::instance().hasNvidiaSupport()
+#define LINKED_GPU_CONTEXT() GPUDeviceContextPool::instance().getNvidiaContext(0)
+#define LINKED_GPU_DEVICE_ID() DeviceId::cuda(0)
+#define LINKED_GPU_SKIP_MESSAGE "CUDA not available"
+#elif defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#define ENSURE_LINKED_GPU_BACKEND() ensureAMDFactoryRegistered()
+#define HAS_LINKED_GPU_SUPPORT() GPUDeviceContextPool::instance().hasAMDSupport()
+#define LINKED_GPU_CONTEXT() GPUDeviceContextPool::instance().getAMDContext(0)
+#define LINKED_GPU_DEVICE_ID() DeviceId::rocm(0)
+#define LINKED_GPU_SKIP_MESSAGE "ROCm not available"
+#else
+#define ENSURE_LINKED_GPU_BACKEND() ((void)0)
+#define HAS_LINKED_GPU_SUPPORT() false
+#define LINKED_GPU_CONTEXT() GPUDeviceContextPool::instance().getContext("", 0)
+#define LINKED_GPU_DEVICE_ID() DeviceId::cpu()
+#define LINKED_GPU_SKIP_MESSAGE "No GPU backend linked in this test binary"
+#endif
+
+#define SKIP_IF_NO_GPU()                                      \
+    do                                                        \
+    {                                                         \
+        ENSURE_LINKED_GPU_BACKEND();                          \
+        if (!HAS_LINKED_GPU_SUPPORT())                        \
+            GTEST_SKIP() << LINKED_GPU_SKIP_MESSAGE;          \
+    } while (false)
 
 // ===========================================================================
 // Test Fixture
@@ -71,17 +92,11 @@ protected:
 
     void SetUp() override
     {
-        auto &pool = GPUDeviceContextPool::instance();
-
-        if (pool.hasAMDSupport())
+        ENSURE_LINKED_GPU_BACKEND();
+        if (HAS_LINKED_GPU_SUPPORT())
         {
-            gpu_ctx_ = &pool.getAMDContext(0);
-            device_ctx_ = IDeviceContext::create(DeviceId::rocm(0), 1);
-        }
-        else if (pool.hasNvidiaSupport())
-        {
-            gpu_ctx_ = &pool.getNvidiaContext(0);
-            device_ctx_ = IDeviceContext::create(DeviceId::cuda(0), 1);
+            gpu_ctx_ = &LINKED_GPU_CONTEXT();
+            device_ctx_ = IDeviceContext::create(LINKED_GPU_DEVICE_ID(), 1);
         }
 
         if (gpu_ctx_)

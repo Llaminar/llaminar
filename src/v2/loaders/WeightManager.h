@@ -19,9 +19,14 @@
 
 #pragma once
 
+#include "ExpertGemmRegistry.h"
 #include "IModelLoader.h"
+#include "WeightLifecycleTrace.h"
+#include "WeightMetadataRegistry.h"
+#include "WeightPlan.h"
 #include "WeightPlacementMap.h"
 #include "WeightManagerConfig.h"
+#include "../execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "../backends/DeviceId.h"
 #include "../config/TensorParallelConfig.h"
 #include "../execution/local_execution/graph/GraphSchema.h"
@@ -38,9 +43,15 @@
 
 namespace llaminar2
 {
+    class ExpertWeightPayloadProvider;
 
     // WeightDistributionStrategy and ShardingMode are now in WeightTypes.h
     // (included transitively via WeightManagerConfig.h → WeightTypes.h)
+
+    class PreparedWeightStore;
+    class MoEExpertOverlayRuntimePlan;
+    struct MoEExpertOverlayExecutionPlan;
+    class WeightLoadProgress;
 
     /**
      * @brief Weight manager with distribution strategy and caching
@@ -127,6 +138,33 @@ namespace llaminar2
         bool prepareWeightsForDevice(DeviceId device) override;
 
         /**
+         * @brief Prepare weights for a device using graph-frozen bindings.
+         *
+         * This is the preferred graph-build path: prepared GEMM handles are
+         * registered under the exact WeightBinding ids that graph stages will
+         * reference, including PP/TP slices and tied aliases. Set
+         * include_expert_jobs=false when an explicit expert-cache preparation
+         * pass has already populated ExpertGemmRegistry for this device.
+         */
+        bool prepareWeightsForDevice(
+            const FrozenModelWeightSet &frozen_weights,
+            DeviceId device,
+            bool include_expert_jobs = true);
+
+        /// Prepare routed experts assigned to overlay tiers. Accelerator tiers use
+        /// the GPU load pipeline; CPU fallback tiers are eagerly packed into CPU
+        /// expert GEMM engines and inserted into ExpertGemmRegistry.
+        bool prepareMoEExpertOverlayWeights(
+            const MoEExpertOverlayRuntimePlan &runtime_plan,
+            const FrozenModelWeightSet *frozen_weights = nullptr,
+            const MoEExpertOverlayExecutionPlan *execution_plan = nullptr);
+
+        const MoEExpertOverlayPreparationDiagnostics &moeExpertOverlayPreparationDiagnostics() const
+        {
+            return moe_overlay_preparation_diagnostics_;
+        }
+
+        /**
          * @brief Prepare weights for a single device, filtered to a layer range
          *
          * Same as prepareWeightsForDevice(device) but only processes weights
@@ -201,6 +239,24 @@ namespace llaminar2
             std::function<bool(const std::string &)> layer_filter = nullptr) override;
 
         /**
+         * @brief Pack GEMM weights via GPU pipeline (LoadOrchestrator)
+         *
+         * Primary GPU weight loading path: single VRAM allocation, pipelined
+         * H2D transfers, and GPU-side VNNI repack kernels. Used unconditionally
+         * for all GPU devices. CPU devices use packGemmWeights() instead.
+         *
+         * @param target_device Target GPU device (ROCm or CUDA)
+         * @param layer_filter Optional filter for specific layers
+         * @return true if all GEMM weights were loaded successfully
+         */
+        bool packGemmWeightsViaPipeline(
+            DeviceId target_device,
+            std::function<bool(const std::string &)> layer_filter = nullptr,
+            const FrozenModelWeightSet *frozen_weights = nullptr,
+            bool include_expert_jobs = true,
+            const MoEExpertOverlayPreparationPlan *overlay_preparation_plan = nullptr);
+
+        /**
          * @brief Upload all non-GEMM weights to GPU
          *
          * Non-GEMM weights (norms, embeddings, biases) don't need GEMM packing
@@ -232,7 +288,26 @@ namespace llaminar2
          */
         size_t releaseHostResidentWeightData() override;
 
-        size_t getPreparedEmbeddingCount() const override;
+        /**
+         * @brief Release cached MoE expert parent tensors after eager expert packing.
+         *
+         * CPU MoE execution uses PreparedWeightStore-owned VNNI engines after graph
+         * materialization. Dynamic transfer serializes those packed engines, so the
+         * raw 3D *_exps.weight cache entries must not remain as a fallback source.
+         *
+         * @return Bytes of raw expert tensor data released
+         */
+        size_t releaseMoEExpertHostWeightData();
+
+        /**
+         * @brief Advise the OS to reclaim mmap physical pages.
+         *
+         * Delegates to the loader's adviseMmapDontneed(). Safe to call
+         * after all GEMM engines have packed their weight data.
+         *
+         * @return Total bytes advised
+         */
+        size_t adviseMmapDontneed() override;
 
         /**
          * @brief Get statistics about preloaded weights
@@ -252,6 +327,14 @@ namespace llaminar2
         size_t cacheSize() const;
 
         /**
+         * @brief Log live host tensor bytes held by WeightManager caches.
+         *
+         * This is diagnostic accounting only. Borrowed views are counted as
+         * objects but not as owned bytes.
+         */
+        void logHostMemorySummary(const char *context) const;
+
+        /**
          * @brief Clear weight cache (frees memory)
          */
         void clearCache();
@@ -266,6 +349,8 @@ namespace llaminar2
          */
         void configure(const WeightManagerConfig &config) override
         {
+            std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
+
             // Sharding config
             if (config.hasShardingConfig())
             {
@@ -331,6 +416,7 @@ namespace llaminar2
          */
         void setWeightShardingConfig(const WeightShardingConfig &config)
         {
+            std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
             sharding_config_ = config;
             has_sharding_config_ = true;
             sharding_mode_cache_.clear(); // Invalidate cache
@@ -379,6 +465,60 @@ namespace llaminar2
             weight_preprocessor_ = std::move(preprocessor);
         }
 
+        WeightMetadataRegistry *weightMetadataRegistry() const { return weight_metadata_.get(); }
+
+        /**
+         * @brief Set the expert weight payload provider.
+         *
+         * Used by MoE stages to track which experts have been prepared/transferred.
+         * After Phase 9 final, the provider is informational only — host release
+         * no longer depends on per-expert preparation state because all experts
+         * are prepared upfront at graph-build time.
+         *
+         * @param provider Model-context owned payload provider (may be nullptr)
+         */
+        void setExpertPayloadProvider(ExpertWeightPayloadProvider *provider)
+        {
+            expert_payload_provider_ = provider;
+        }
+
+        /**
+         * @brief Check if raw host data is still required for a tensor.
+         *
+         * Uses WeightMetadataRegistry host policy to determine whether the tensor's
+         * raw host data should be retained. Only RequiredForCPUExecution policy
+         * causes retention. All other policies (including expert weights) allow
+         * release after device preparation completes.
+         *
+         * @param tensor The tensor to check
+         * @param key The cache key (canonical name) of the tensor
+         * @return true if raw host data must be retained
+         */
+        bool hostDataRequired(const TensorBase *tensor, const std::string &key) const;
+
+        FrozenModelWeightSet materialize(const WeightPlan &plan);
+
+        /**
+         * @brief Iterate over all cached weights (source cache).
+         *
+         * Calls the visitor for each (name, tensor) pair in the primary weight cache.
+         * Thread-safe: acquires cache_mutex_ during iteration.
+         *
+         * @param visitor Callback receiving (canonical_name, raw_tensor_ptr)
+         */
+        void forEachWeight(std::function<void(const std::string &, TensorBase *)> visitor) const;
+
+        /**
+         * @brief Iterate ALL prepared tensors (cache_ + per_device_cache_)
+         *
+         * For PreparedWeightStore population in TP mode: iterates both the primary
+         * cache and per-device cache (which holds TP-sliced tensors). This ensures
+         * the store knows about every tensor pointer that stages will receive.
+         *
+         * @param visitor Callback receiving (canonical_name, raw_tensor_ptr)
+         */
+        void forEachPreparedWeight(std::function<void(const std::string &, TensorBase *)> visitor) const;
+
         /**
          * @brief Set layer range for LAYER_PARTITIONED strategy
          *
@@ -403,9 +543,9 @@ namespace llaminar2
             has_embedding_ = has_embedding;
             has_lm_head_ = has_lm_head;
             has_layer_range_ = true;
-            LOG_INFO("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
-                                                                 << "), embedding=" << (has_embedding ? "yes" : "no")
-                                                                 << ", lm_head=" << (has_lm_head ? "yes" : "no"));
+            LOG_DEBUG("[WeightManager] Layer range set: layers [" << first_layer << ", " << last_layer
+                                                                  << "), embedding=" << (has_embedding ? "yes" : "no")
+                                                                  << ", lm_head=" << (has_lm_head ? "yes" : "no"));
         }
 
         /**
@@ -606,12 +746,90 @@ namespace llaminar2
          * where in_local = in_dim * fraction, starting from in_dim - in_local.
          *
          * @param full_tensor Full weight tensor
-         * @param fraction Fraction of columns to extract (from tail)
          * @return Sliced tensor containing tail columns
          */
         static std::shared_ptr<TensorBase> sliceTailColumns(
             const std::shared_ptr<TensorBase> &full_tensor,
             float fraction);
+
+        // =========================================================================
+        // Progress Tracking
+        // =========================================================================
+
+        /// Set a shared progress tracker for weight loading visualization.
+        /// Must be set before calling prepareWeightsForDevice().
+        void setWeightLoadProgress(std::shared_ptr<WeightLoadProgress> progress)
+        {
+            weight_load_progress_ = std::move(progress);
+        }
+
+        /// Get the current progress tracker (may be null).
+        std::shared_ptr<WeightLoadProgress> weightLoadProgress() const
+        {
+            return weight_load_progress_;
+        }
+
+        // =========================================================================
+        // Phase 9: Weight Lifecycle Gates
+        // =========================================================================
+
+        /**
+         * @brief Get the current lifecycle gates (read-only)
+         */
+        const WeightLifecycleGates &lifecycleGates() const { return lifecycle_gates_; }
+
+        /// Access the expert GEMM registry (populated by GPU pipeline, queried by graph builders)
+        ExpertGemmRegistry &expertGemmRegistry() { return expert_gemm_registry_; }
+        const ExpertGemmRegistry &expertGemmRegistry() const { return expert_gemm_registry_; }
+
+        std::shared_ptr<PreparedWeightStore> preparedWeightStore();
+        std::shared_ptr<PreparedWeightStore> preparedWeightStoreIfInitialized() const;
+        void setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store);
+
+        /**
+         * @brief Get the current lifecycle state (derived from gates)
+         */
+        WeightLifecycleState lifecycleState() const { return lifecycle_gates_.currentState(); }
+
+        /**
+         * @brief Mark source materialization complete
+         *
+         * Call after all source tensors and derived tensors (slices, clones,
+         * TP shards, expert views) are loaded and created. After this gate,
+         * no new tensors will be created from the model file.
+         */
+        void markMaterializationComplete()
+        {
+            lifecycle_gates_.materialization_complete = true;
+            LOG_DEBUG("[WeightManager] Lifecycle gate: materialization_complete");
+        }
+
+        /**
+         * @brief Mark device preparation complete
+         *
+         * Call after all GEMM weights are packed, all embeddings are prepared,
+         * and all GPU uploads are done. After this gate, no new prepared handles
+         * will be created for model weights.
+         */
+        void markDevicePreparationComplete()
+        {
+            lifecycle_gates_.device_preparation_complete = true;
+            LOG_DEBUG("[WeightManager] Lifecycle gate: device_preparation_complete");
+        }
+
+        /**
+         * @brief Mark graph materialization complete
+         *
+         * Call after all compute graphs have resolved their weight bindings.
+         * After this gate, graph replay will not attempt to resolve new weights.
+         */
+        void markGraphMaterializationComplete() override
+        {
+            lifecycle_gates_.graph_materialization_complete = true;
+            lifecycle_gates_.host_release_allowed = lifecycle_gates_.canReleaseHostData();
+            LOG_DEBUG("[WeightManager] Lifecycle gate: graph_materialization_complete"
+                      << " (host_release_allowed=" << lifecycle_gates_.host_release_allowed << ")");
+        }
 
     private:
         /**
@@ -681,6 +899,26 @@ namespace llaminar2
         // Decode weight shard cache (separate from prefill cache)
         std::unordered_map<std::string, std::shared_ptr<TensorBase>> decode_cache_; ///< Decode shard cache
 
+        std::shared_ptr<WeightMetadataRegistry> weight_metadata_;
+        ExpertWeightPayloadProvider *expert_payload_provider_ = nullptr; ///< Optional, model-context owned
+
+        void registerSourceMetadata(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor,
+            DeviceId device);
+        void registerDerivedMetadata(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &tensor,
+            WeightDerivationKind derivation,
+            WeightSliceSpec slice,
+            DeviceId device);
+        void registerCloneMetadata(
+            const std::string &name,
+            const std::shared_ptr<TensorBase> &source,
+            const std::shared_ptr<TensorBase> &clone,
+            DeviceId device);
+        WeightSliceSpec fullSliceSpec(const TensorBase &tensor) const;
+
         // =========================================================================
         // Layer range for Pipeline Parallelism (LAYER_PARTITIONED strategy)
         // =========================================================================
@@ -723,11 +961,16 @@ namespace llaminar2
          */
         bool prepareWeightsForDeviceImpl(
             DeviceId device,
-            std::function<bool(const std::string &)> layer_filter);
+            std::function<bool(const std::string &)> layer_filter,
+            const FrozenModelWeightSet *frozen_weights = nullptr,
+            bool include_expert_jobs = true);
 
         // =========================================================================
         // Per-device tensor cache for multi-device scenarios (LOCAL TP)
         // =========================================================================
+
+        /// Progress tracker for weight loading (shared across devices)
+        std::shared_ptr<WeightLoadProgress> weight_load_progress_;
 
         /// Key: "device_type:ordinal:weight_name" e.g. "cuda:0:token_embd.weight"
         /// Value: Device-specific tensor clone, uploaded to that device
@@ -975,9 +1218,21 @@ namespace llaminar2
         // Preload statistics (folded from WeightPreloader)
         // =========================================================================
         size_t num_cpu_packed_ = 0;
+
         size_t num_gpu_packed_ = 0;
 
     private:
+        // =========================================================================
+        // Phase 9: Lifecycle gates (model-level state machine)
+        // =========================================================================
+
+        WeightLifecycleGates lifecycle_gates_;
+
+        ExpertGemmRegistry expert_gemm_registry_;
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
+        MoEExpertOverlayPreparationDiagnostics moe_overlay_preparation_diagnostics_;
+        uint64_t next_pipeline_prepared_binding_id_ = (1ULL << 48);
+
         // =========================================================================
         // Phase 2: Per-weight/device readiness tickets and TP-safe reclaim eligibility
         // =========================================================================
@@ -991,7 +1246,6 @@ namespace llaminar2
             READY,
             FAILED
         };
-
         struct WeightPrepTicket
         {
             WeightPrepState state = WeightPrepState::UNKNOWN;

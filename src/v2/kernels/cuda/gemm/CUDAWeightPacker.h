@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -114,6 +115,79 @@ namespace llaminar2
         CUDAPackedWeightFamily classifyCUDAPackedWeightFamily(TensorType type);
         const char *cudaPackedWeightFamilyName(CUDAPackedWeightFamily family);
         bool packWeightsToCUDA(const TensorBase *tensor, CUDAPackedWeights &out);
+
+        /**
+         * @brief Batch-packed MoE expert weights for CUDA (single GPU allocation for all experts).
+         *
+         * Instead of packing 256 experts into 256 separate CUDAPackedWeights (each with its
+         * own host allocation + H2D upload), this packs all experts into one contiguous slab
+         * per array and uploads once. Per-expert GEMM kernels reference offset device pointers
+         * into the shared allocation.
+         *
+         * This reduces:
+         * - Host allocations: 256 → 1 per weight per layer
+         * - H2D uploads: 256 → 1 per weight per layer
+         * - KernelFactory cache entries: 256 → 0 (bypasses KernelFactory)
+         */
+        struct MoEBatchPackedWeightsCUDA
+        {
+            // Host buffers: all experts concatenated.
+            // Expert e's data starts at offset e * <per_expert_size>.
+            std::vector<uint8_t> all_vnni;
+            std::vector<uint16_t> all_scales;
+            std::vector<uint16_t> all_mins;   // Empty if symmetric format
+            std::vector<uint32_t> all_emins;  // Empty if no emins
+
+            int num_experts = 0;
+            int rows_per_expert = 0;  // N per expert
+            int K = 0;
+            int blocks_per_row = 0;
+            uint8_t codebook_id = 0;
+
+            // Per-expert sizes for offset calculation
+            size_t vnni_bytes_per_expert = 0;
+            size_t scales_per_expert = 0;   // element count
+            size_t mins_per_expert = 0;     // element count (0 if symmetric)
+            size_t emins_per_expert = 0;    // element count (0 if no emins)
+
+            // Device upload (one big allocation per array)
+            struct DeviceUpload
+            {
+                uint8_t *d_vnni = nullptr;
+                uint16_t *d_scales = nullptr;
+                uint16_t *d_mins = nullptr;
+                uint32_t *d_emins = nullptr;
+            };
+
+            std::mutex upload_mutex;
+            std::unordered_map<int, DeviceUpload> device_uploads;
+
+            MoEBatchPackedWeightsCUDA() = default;
+            MoEBatchPackedWeightsCUDA(const MoEBatchPackedWeightsCUDA &) = delete;
+            MoEBatchPackedWeightsCUDA &operator=(const MoEBatchPackedWeightsCUDA &) = delete;
+            ~MoEBatchPackedWeightsCUDA();
+
+            /// Upload all experts to a CUDA device (one allocation per array).
+            bool uploadToDevice(int cuda_device_id);
+
+            /// Get per-expert device pointers (offset into shared allocation).
+            DeviceUpload getExpertDevicePointers(int cuda_device_id, int expert_id) const;
+
+            /// Free host buffers after upload to reclaim memory.
+            void freeHostBuffers();
+        };
+
+        /**
+         * @brief Pack all MoE experts from 2D expert views into a single batch.
+         *
+         * @param expert_views  Per-expert 2D tensor views (from extractExpertViews)
+         * @param num_experts   Number of experts
+         * @param rows_per_expert  Rows (N) per expert
+         * @return Shared pointer to batch-packed weights, or nullptr on failure.
+         */
+        std::shared_ptr<MoEBatchPackedWeightsCUDA> packMoEExpertsCUDA(
+            const std::vector<std::shared_ptr<TensorBase>> &expert_views,
+            int num_experts, int rows_per_expert);
 
     } // namespace cuda
 } // namespace llaminar2

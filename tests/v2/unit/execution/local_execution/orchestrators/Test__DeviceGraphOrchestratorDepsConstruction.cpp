@@ -6,7 +6,7 @@
  * DGO-Qwen2 decoupling (Phase 5). Verifies:
  * - Required fields validation (model_ctx, graph_builder)
  * - Optional field wiring (topology, collective_ctx, pp_stage_config, etc.)
- * - Polymorphic IGraphBuilder usage (MockGraphBuilder, not Qwen2Graph)
+ * - Polymorphic IGraphBuilder usage (MockGraphBuilder, not QwenStandardGraph)
  * - PP stage config validation during construction
  * - Field accessibility after construction
  *
@@ -15,7 +15,11 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdlib>
+#include <initializer_list>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
@@ -24,9 +28,60 @@
 #include "config/PipelineConfig.h"
 #include "config/TensorParallelConfig.h"
 #include "backends/DeviceId.h"
+#include "utils/DebugEnv.h"
 #include "../../../../mocks/MockModelContext.h"
+#include "../../../../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
+
+namespace
+{
+    class ScopedEnvVars
+    {
+    public:
+        explicit ScopedEnvVars(std::initializer_list<std::pair<const char *, const char *>> values)
+        {
+            for (const auto &[name, value] : values)
+            {
+                Entry entry;
+                entry.name = name;
+                if (const char *old_value = std::getenv(name))
+                {
+                    entry.had_value = true;
+                    entry.old_value = old_value;
+                }
+                entries_.push_back(entry);
+                ::setenv(name, value, 1);
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnvVars()
+        {
+            for (const auto &entry : entries_)
+            {
+                if (entry.had_value)
+                    ::setenv(entry.name.c_str(), entry.old_value.c_str(), 1);
+                else
+                    ::unsetenv(entry.name.c_str());
+            }
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnvVars(const ScopedEnvVars &) = delete;
+        ScopedEnvVars &operator=(const ScopedEnvVars &) = delete;
+
+    private:
+        struct Entry
+        {
+            std::string name;
+            bool had_value = false;
+            std::string old_value;
+        };
+
+        std::vector<Entry> entries_;
+    };
+} // namespace
 
 // =============================================================================
 // Test Fixture
@@ -46,7 +101,7 @@ protected:
         DeviceManager::instance().initialize(-1);
 
         // Use MockGraphBuilder — verifies DGO works with IGraphBuilder interface,
-        // not just Qwen2Graph.
+        // not just QwenStandardGraph.
         mock_builder_ = std::make_shared<MockGraphBuilder>();
         mock_builder_->setNumLayers(24);
         mock_builder_->setHiddenDim(896);
@@ -139,6 +194,29 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, MockGraphBuilder_ConfigAcc
     EXPECT_EQ(cfg.d_model, 896);
     EXPECT_EQ(cfg.n_heads, 14);
     EXPECT_EQ(cfg.head_dim, 64);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DoesNotGraphCaptureCollectivesByDefault)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", "0"},
+    });
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx,
+        0);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_FALSE(policy.collectives_graph_capturable);
+    EXPECT_FALSE(policy.allow_segmented_capture);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ExecutorAccessible)
@@ -460,13 +538,13 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, InitializeGraphCache_WithM
     EXPECT_EQ(stats.attention_cache_misses, 0u);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ClearCache_WithMockBuilder)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, InvalidateExecutionCaches_WithMockBuilder)
 {
     auto deps = minimalDeps();
     DeviceGraphOrchestrator dgo(std::move(deps));
 
     dgo.initializeGraphCache(24);
-    dgo.clearCache();
+    dgo.invalidateExecutionCaches();
 
     auto stats = dgo.getCacheStats();
     EXPECT_EQ(stats.attention_cache_hits, 0u);

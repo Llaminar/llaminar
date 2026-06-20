@@ -42,7 +42,6 @@
 #include "execution/compute_stages/stages/AllGatherStage.h"
 #include "execution/compute_stages/stages/AllGatherVStage.h"
 #include "execution/compute_stages/stages/AllreduceStage.h"
-#include "execution/compute_stages/stages/LocalTPAllreduceStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
 #include "tensors/Tensors.h"
 #include "backends/DeviceId.h"
@@ -206,16 +205,6 @@ TEST_F(Test__StreamCoherence, AllreduceStage_CoherencePolicy_IsNone)
     params.mpi_ctx = mpi_ctx_.get();
 
     AllreduceStage stage(params);
-    EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
-}
-
-TEST_F(Test__StreamCoherence, LocalTPAllreduceStage_CoherencePolicy_IsNone)
-{
-    // LocalTPAllreduceStage handles its own multi-device synchronization
-    // so it correctly returns NONE
-    LocalTPAllreduceStage::Params params;
-
-    LocalTPAllreduceStage stage(params);
     EXPECT_EQ(stage.coherencePolicy(), CoherencePolicy::NONE);
 }
 

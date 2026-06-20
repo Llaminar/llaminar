@@ -17,10 +17,17 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <numeric>
+#include <optional>
 #include <random>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "execution/compute_stages/stages/GDNProjectionStage.h"
@@ -28,11 +35,30 @@
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/IComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "execution/local_execution/device/WorkspaceDescriptor.h"
+#include "execution/mtp/MTPSpecStatePublisher.h"
 #include "execution/cache/HybridCacheManager.h"
+#include "backends/BackendManager.h"
 #include "kernels/cpu/gdn/CPUShortConvolution.h"
 #include "kernels/cpu/gdn/CPUGatedDeltaNet.h"
+#include "../../mocks/MockComputeStage.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/ROCmWeightPacker.h"
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
+#include "kernels/rocm/gdn/ROCmShortConvolution.h"
+#include <hip/hip_runtime.h>
+#endif
+#if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
+#include "kernels/cuda/gdn/CUDAGatedDeltaNet.h"
+#include <cuda_runtime.h>
+#endif
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
+#include "utils/DebugEnv.h"
+#include "../../utils/TestTensorFactory.h"
+#include "../../utils/PreparedWeightTestHarness.h"
 
 using namespace llaminar2;
 using ::testing::_;
@@ -43,6 +69,12 @@ namespace
     std::unique_ptr<IDeviceContext> makeCPUContext()
     {
         return std::make_unique<CPUDeviceContext>(DeviceId::cpu(), 1);
+    }
+
+    void ensureCPUBackendForWorkspace()
+    {
+        if (!hasCPUBackend())
+            initCPUBackend(-1);
     }
 
     // Helper: create FP32 tensor with given data
@@ -102,7 +134,500 @@ namespace
     CPUShortConvolution g_cpu_conv;
     CPUGatedDeltaNet g_cpu_gdn;
 
+    struct GDNReferenceResult
+    {
+        std::vector<float> output;
+        std::vector<float> state;
+    };
+
+    bool computeCPUSequentialGDNReference(
+        const FP32Tensor &Q,
+        const FP32Tensor &K,
+        const FP32Tensor &V,
+        const FP32Tensor &alpha,
+        const FP32Tensor &beta,
+        const FP32Tensor &A_log,
+        const FP32Tensor &dt_bias,
+        int seq_len,
+        int n_heads,
+        int d_k,
+        int d_v,
+        bool use_qk_l2norm,
+        GDNReferenceResult &result)
+    {
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        result.output.assign(static_cast<size_t>(seq_len) * static_cast<size_t>(v_stride), 0.0f);
+        result.state.assign(static_cast<size_t>(n_heads) * static_cast<size_t>(d_k) * static_cast<size_t>(d_v), 0.0f);
+
+        for (int t = 0; t < seq_len; ++t)
+        {
+            if (!g_cpu_gdn.recurrent_step(
+                    Q.data() + static_cast<size_t>(t) * static_cast<size_t>(qk_stride),
+                    K.data() + static_cast<size_t>(t) * static_cast<size_t>(qk_stride),
+                    V.data() + static_cast<size_t>(t) * static_cast<size_t>(v_stride),
+                    alpha.data() + static_cast<size_t>(t) * static_cast<size_t>(n_heads),
+                    beta.data() + static_cast<size_t>(t) * static_cast<size_t>(n_heads),
+                    A_log.data(),
+                    dt_bias.data(),
+                    result.output.data() + static_cast<size_t>(t) * static_cast<size_t>(v_stride),
+                    result.state.data(),
+                    n_heads,
+                    d_k,
+                    d_v,
+                    use_qk_l2norm))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void expectVectorsNear(
+        const std::vector<float> &actual,
+        const std::vector<float> &expected,
+        const std::string &label,
+        float max_abs_threshold,
+        double rel_l2_threshold)
+    {
+        ASSERT_EQ(actual.size(), expected.size()) << label << " vector size mismatch";
+
+        float max_abs_diff = 0.0f;
+        size_t max_abs_index = 0;
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            const float diff = std::abs(actual[i] - expected[i]);
+            if (diff > max_abs_diff)
+            {
+                max_abs_diff = diff;
+                max_abs_index = i;
+            }
+            sum_sq_diff += static_cast<double>(diff) * diff;
+            sum_sq_ref += static_cast<double>(expected[i]) * expected[i];
+        }
+
+        const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+        EXPECT_LT(max_abs_diff, max_abs_threshold)
+            << label << " max_abs mismatch at index " << max_abs_index
+            << " actual=" << actual[max_abs_index]
+            << " expected=" << expected[max_abs_index]
+            << " rel_l2=" << rel_l2;
+        EXPECT_LT(rel_l2, rel_l2_threshold)
+            << label << " relative L2 mismatch"
+            << " max_abs=" << max_abs_diff
+            << " max_abs_index=" << max_abs_index;
+    }
+
+    class ScopedEnvVar
+    {
+    public:
+        explicit ScopedEnvVar(const char *name)
+            : name_(name)
+        {
+            const char *value = std::getenv(name_);
+            if (value)
+            {
+                had_value_ = true;
+                old_value_ = value;
+            }
+            unsetenv(name_);
+        }
+
+        ~ScopedEnvVar()
+        {
+            if (had_value_)
+                setenv(name_, old_value_.c_str(), 1);
+            else
+                unsetenv(name_);
+            mutableDebugEnv().rocm.reload();
+        }
+
+        void set(const char *value)
+        {
+            setenv(name_, value, 1);
+            mutableDebugEnv().rocm.reload();
+        }
+
+        void clear()
+        {
+            unsetenv(name_);
+            mutableDebugEnv().rocm.reload();
+        }
+
+    private:
+        const char *name_;
+        bool had_value_ = false;
+        std::string old_value_;
+    };
+
+#ifdef HAVE_ROCM
+    struct GDNProjectionCodebookSpec
+    {
+        std::string name;
+        float min_cosine;
+        std::function<std::unique_ptr<TensorBase>(size_t rows, size_t cols)> create;
+    };
+
+    static const std::vector<GDNProjectionCodebookSpec> ALL_GDN_PROJECTION_CODEBOOKS = {
+        {"Q4_0", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ4_0Random({rows, cols}); }},
+        {"Q8_0", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ8_0Random({rows, cols}); }},
+        {"IQ4_NL", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ4_NLRandom({rows, cols}); }},
+        {"Q4_1", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ4_1Random({rows, cols}); }},
+        {"Q5_0", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ5_0Random({rows, cols}); }},
+        {"Q5_1", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ5_1Random({rows, cols}); }},
+        {"IQ4_XS", 0.985f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ4_XSRandom({rows, cols}); }},
+        {"Q4_K", 0.985f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ4_KRandom({rows, cols}); }},
+        {"Q5_K", 0.985f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ5_KRandom({rows, cols}); }},
+        {"Q6_K", 0.990f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ6_KRandom({rows, cols}); }},
+        {"Q3_K", 0.980f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ3_KRandom({rows, cols}); }},
+        {"Q2_K", 0.970f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createQ2_KRandom({rows, cols}); }},
+        {"IQ3_S", 0.975f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ3_SRandom({rows, cols}); }},
+        {"IQ3_XXS", 0.970f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ3_XXSRandom({rows, cols}); }},
+        {"IQ2_S", 0.960f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ2_SRandom({rows, cols}); }},
+        {"IQ2_XS", 0.960f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ2_XSRandom({rows, cols}); }},
+        {"IQ2_XXS", 0.950f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ2_XXSRandom({rows, cols}); }},
+        {"IQ1_S", 0.930f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ1_SRandom({rows, cols}); }},
+        {"IQ1_M", 0.930f, [](size_t rows, size_t cols)
+         { return test::TestTensorFactory::createIQ1_MRandom({rows, cols}); }},
+    };
+
+    float vectorCosine(const std::vector<float> &actual, const std::vector<float> &expected)
+    {
+        double dot = 0.0;
+        double actual_norm = 0.0;
+        double expected_norm = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            dot += static_cast<double>(actual[i]) * expected[i];
+            actual_norm += static_cast<double>(actual[i]) * actual[i];
+            expected_norm += static_cast<double>(expected[i]) * expected[i];
+        }
+        if (actual_norm == 0.0 || expected_norm == 0.0)
+            return 0.0f;
+        return static_cast<float>(dot / (std::sqrt(actual_norm) * std::sqrt(expected_norm)));
+    }
+
+    float vectorRelativeL2(const std::vector<float> &actual, const std::vector<float> &expected)
+    {
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (size_t i = 0; i < actual.size(); ++i)
+        {
+            const double diff = static_cast<double>(actual[i]) - expected[i];
+            sum_sq_diff += diff * diff;
+            sum_sq_ref += static_cast<double>(expected[i]) * expected[i];
+        }
+        return static_cast<float>(std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30)));
+    }
+
+    float vectorMaxAbsDiff(const std::vector<float> &actual, const std::vector<float> &expected)
+    {
+        float max_abs = 0.0f;
+        for (size_t i = 0; i < actual.size(); ++i)
+            max_abs = std::max(max_abs, std::abs(actual[i] - expected[i]));
+        return max_abs;
+    }
+
+    float vectorMaxAbsValue(const std::vector<float> &values)
+    {
+        float max_abs = 0.0f;
+        for (float value : values)
+            max_abs = std::max(max_abs, std::abs(value));
+        return max_abs;
+    }
+
+    void appendCpuGDNProjectionReference(
+        const float *input,
+        const std::vector<float> &weights,
+        int rows,
+        int cols,
+        std::vector<float> &out)
+    {
+        for (int row = 0; row < rows; ++row)
+        {
+            double acc = 0.0;
+            for (int col = 0; col < cols; ++col)
+                acc += static_cast<double>(input[col]) * weights[static_cast<size_t>(row) * cols + col];
+            out.push_back(static_cast<float>(acc));
+        }
+    }
+
+    void appendTensorData(FP32Tensor *tensor, int count, std::vector<float> &out)
+    {
+        const float *data = tensor->data();
+        out.insert(out.end(), data, data + count);
+    }
+
+    struct GDNProjectionBundle
+    {
+        std::unique_ptr<TensorBase> weights;
+        std::vector<float> weights_fp32;
+        rocm::ROCmPackedWeights packed;
+        std::unique_ptr<rocm::ROCmQuantisedGemmKernel> kernel;
+    };
+#endif
+
+    class RecordingWorkspaceGemm final : public ITensorGemm, public IWorkspaceConsumer
+    {
+    public:
+        explicit RecordingWorkspaceGemm(std::string name)
+            : name_(std::move(name))
+        {
+        }
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(
+            const TensorBase *,
+            TensorBase *,
+            int,
+            int,
+            int,
+            bool,
+            float,
+            float,
+            const TensorBase *,
+            const IMPIContext *,
+            int,
+            DeviceWorkspaceManager *,
+            int) override
+        {
+            return false;
+        }
+
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override
+        {
+            observed_m.push_back(m);
+            observed_n.push_back(n);
+            observed_k.push_back(k);
+
+            WorkspaceRequirements reqs;
+            reqs.buffers.push_back({
+                name_ + "_n" + std::to_string(n),
+                static_cast<size_t>(std::max(1, n)),
+                1,
+                true});
+            return reqs;
+        }
+
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override { workspace_ = workspace; }
+        bool hasWorkspace() const override { return workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return workspace_; }
+
+        mutable std::vector<int> observed_m;
+        mutable std::vector<int> observed_n;
+        mutable std::vector<int> observed_k;
+
+    private:
+        std::string name_;
+        DeviceWorkspaceManager *workspace_ = nullptr;
+    };
+
 } // namespace
+
+TEST(GDNROCmConfig, ConcurrentDecodeFlagDefaultsOnAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
+
+    flag.clear();
+    EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
+}
+
+TEST(GDNROCmConfig, SharedExpertGroupedDecodeFlagDefaultsOffAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_SHARED_EXPERT_GROUPED_DECODE");
+
+    flag.clear();
+    EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.shared_expert_grouped_decode);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
+}
+
+TEST(Test__GDNKernels, ShortConv_WorkspaceRequirementUsesActiveSeqLen)
+{
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 1;
+    p.channels = 8192;
+
+    ShortConv1dStage stage(p);
+    const auto reqs = stage.getWorkspaceRequirements(/*m=*/1536);
+
+    const auto *scratch = reqs.find(ShortConv1dStage::WS_INPLACE_PREFILL_SCRATCH);
+    ASSERT_NE(scratch, nullptr);
+    EXPECT_EQ(scratch->size_bytes,
+              static_cast<size_t>(1536) * static_cast<size_t>(8192) * sizeof(float));
+    EXPECT_TRUE(scratch->required);
+
+    const WorkspaceDescriptor *effective_len = nullptr;
+    for (const auto &buffer : reqs.buffers)
+    {
+        if (buffer.name.find(ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR) != std::string::npos)
+        {
+            effective_len = &buffer;
+            break;
+        }
+    }
+    ASSERT_NE(effective_len, nullptr);
+    EXPECT_GE(effective_len->size_bytes, sizeof(int));
+    EXPECT_TRUE(effective_len->required);
+}
+
+TEST(Test__GDNKernels, Recurrence_WorkspaceRequirementSharesMergedQKVScratch)
+{
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 1;
+    p.n_heads = 32;
+    p.n_k_heads = 4;
+    p.d_k = 128;
+    p.d_v = 128;
+    p.global_v_head_offset = 8;
+
+    GDNRecurrenceStage stage(p);
+    const auto reqs = stage.getWorkspaceRequirements(/*m=*/1536);
+
+    const auto *scratch = reqs.find(GDNRecurrenceStage::WS_DEINTERLEAVE_SCRATCH);
+    ASSERT_NE(scratch, nullptr);
+    const size_t row_floats = static_cast<size_t>(32) * static_cast<size_t>((2 * 128) + 128);
+    EXPECT_EQ(scratch->size_bytes,
+              static_cast<size_t>(1536) * row_floats * sizeof(float));
+    EXPECT_TRUE(scratch->required);
+}
+
+TEST(Test__GDNKernels, ShortConv_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
+{
+    auto countPrefixed = [](const WorkspaceRequirements &reqs, const std::string &prefix)
+    {
+        int count = 0;
+        for (const auto &buffer : reqs.buffers)
+        {
+            if (buffer.name.rfind(prefix, 0) == 0)
+                ++count;
+        }
+        return count;
+    };
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 2;
+    p.channels = 128;
+    p.kernel_size = 4;
+    p.layer_idx = 17;
+    p.verifier_state_capture_rows = 1;
+
+    ShortConv1dStage first(p);
+    ShortConv1dStage rebuilt(p);
+
+    WorkspaceRequirements merged;
+    merged.merge(first.getWorkspaceRequirements(/*m=*/2));
+    merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
+
+    EXPECT_NE(merged.find("gdn_shortconv_effective_seq_len_scalar_layer17"), nullptr);
+    EXPECT_NE(merged.find("gdn_shortconv_speculative_state_slots_layer17"), nullptr);
+    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
+    EXPECT_EQ(countPrefixed(merged, ShortConv1dStage::WS_SPECULATIVE_STATE_SLOTS), 1);
+}
+
+TEST(Test__GDNKernels, Recurrence_WorkspaceNamesUseStableLayerIdAcrossRebuilds)
+{
+    auto countPrefixed = [](const WorkspaceRequirements &reqs, const std::string &prefix)
+    {
+        int count = 0;
+        for (const auto &buffer : reqs.buffers)
+        {
+            if (buffer.name.rfind(prefix, 0) == 0)
+                ++count;
+        }
+        return count;
+    };
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = 2;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 8;
+    p.d_v = 8;
+    p.layer_idx = 17;
+    p.verifier_state_capture_rows = 1;
+
+    GDNRecurrenceStage first(p);
+    GDNRecurrenceStage rebuilt(p);
+
+    WorkspaceRequirements merged;
+    merged.merge(first.getWorkspaceRequirements(/*m=*/2));
+    merged.merge(rebuilt.getWorkspaceRequirements(/*m=*/2));
+
+    EXPECT_NE(merged.find("gdn_effective_seq_len_scalar_layer17"), nullptr);
+    EXPECT_NE(merged.find("gdn_speculative_state_slots_layer17"), nullptr);
+    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_EFFECTIVE_SEQ_LEN_SCALAR), 1);
+    EXPECT_EQ(countPrefixed(merged, GDNRecurrenceStage::WS_SPECULATIVE_STATE_SLOTS), 1);
+}
+
+TEST(Test__GDNKernels, Projection_WorkspaceRequirementsUsePerProjectionN)
+{
+    RecordingWorkspaceGemm qkv("qkv");
+    RecordingWorkspaceGemm z("z");
+    RecordingWorkspaceGemm alpha("alpha");
+    RecordingWorkspaceGemm beta("beta");
+
+    GDNProjectionStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.m = 4;
+    p.k = 128;
+    p.n_qkv = 96;
+    p.n_z = 64;
+    p.n_a = 8;
+    p.n_b = 12;
+    p.gemm_qkv = &qkv;
+    p.gemm_z = &z;
+    p.gemm_a = &alpha;
+    p.gemm_b = &beta;
+
+    GDNProjectionStage stage(p);
+    const auto reqs = stage.getWorkspaceRequirements(/*m=*/4, /*n=*/999, /*k=*/128);
+    (void)reqs;
+
+    ASSERT_EQ(qkv.observed_n, std::vector<int>({96}));
+    ASSERT_EQ(z.observed_n, std::vector<int>({64}));
+    ASSERT_EQ(alpha.observed_n, std::vector<int>({8}));
+    ASSERT_EQ(beta.observed_n, std::vector<int>({12}));
+
+    EXPECT_EQ(qkv.observed_m, std::vector<int>({4}));
+    EXPECT_EQ(z.observed_k, std::vector<int>({128}));
+}
 
 // ============================================================================
 // Mock Kernels for verifying stage delegation
@@ -139,6 +664,1279 @@ public:
                  int n_heads, int d_k, int d_v,
                  bool use_qk_l2norm),
                 (override));
+
+    MOCK_METHOD(bool, deinterleave_qkv_device,
+                (const float *d_merged_qkv,
+                 float *&d_q, float *&d_k, float *&d_v,
+                 int seq_len, int n_k_heads, int n_v_heads,
+                 int head_dim_k, int head_dim_v, int global_v_head_offset),
+                (override));
+};
+
+class RecordingShortConvolution final : public ITensorShortConvolution
+{
+public:
+    float *capture_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x1234));
+    int capture_rows = 7;
+    int capture_state_size = 9;
+    int capture_bind_calls = 0;
+    float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x2345));
+    int speculative_state_size = 10;
+    int speculative_bind_calls = 0;
+    int restore_row_calls = 0;
+    int restore_device_index_calls = 0;
+    float *restore_capture_workspace = nullptr;
+    int restore_capture_rows = 0;
+    int restore_capture_state_size = 0;
+    float *restore_dst_state = nullptr;
+    int restore_row = -1;
+    const int *restore_device_index = nullptr;
+    void *restore_stream = nullptr;
+
+    void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
+    {
+        ++capture_bind_calls;
+        capture_workspace = workspace;
+        capture_rows = rows;
+        capture_state_size = state_size;
+    }
+
+    void bindSpeculativeStateWorkspace(float *workspace, int state_size) override
+    {
+        ++speculative_bind_calls;
+        speculative_workspace = workspace;
+        speculative_state_size = state_size;
+    }
+
+    bool forward(
+        const float *, const float *, const float *,
+        float *, float *,
+        int, int, int,
+        bool) override
+    {
+        return true;
+    }
+
+    bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
+    {
+        ++restore_row_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_row = row;
+        restore_stream = stream;
+        return capture_workspace != nullptr && dst_state != nullptr;
+    }
+
+    bool restoreVerifierStateCaptureRowFromDeviceIndex(
+        float *dst_state,
+        const int *device_row_index,
+        void *stream) override
+    {
+        ++restore_device_index_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_device_index = device_row_index;
+        restore_stream = stream;
+        return capture_workspace != nullptr &&
+               device_row_index != nullptr && stream != nullptr;
+    }
+};
+
+class RecordingGatedDeltaNet final : public ITensorGatedDeltaNet
+{
+public:
+    float *capture_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x5678));
+    int capture_rows = 11;
+    int capture_state_size = 13;
+    int capture_bind_calls = 0;
+    float *speculative_workspace = reinterpret_cast<float *>(static_cast<std::uintptr_t>(0x6789));
+    int speculative_state_size = 14;
+    int speculative_bind_calls = 0;
+    int restore_row_calls = 0;
+    int restore_device_index_calls = 0;
+    float *restore_capture_workspace = nullptr;
+    int restore_capture_rows = 0;
+    int restore_capture_state_size = 0;
+    float *restore_dst_state = nullptr;
+    int restore_row = -1;
+    const int *restore_device_index = nullptr;
+    void *restore_stream = nullptr;
+
+    void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override
+    {
+        ++capture_bind_calls;
+        capture_workspace = workspace;
+        capture_rows = rows;
+        capture_state_size = state_size;
+    }
+
+    void bindSpeculativeStateWorkspace(float *workspace, int state_size) override
+    {
+        ++speculative_bind_calls;
+        speculative_workspace = workspace;
+        speculative_state_size = state_size;
+    }
+
+    bool chunk_forward(
+        const float *, const float *, const float *,
+        const float *, const float *,
+        const float *, const float *,
+        float *, float *,
+        int, int, int, int,
+        int, bool) override
+    {
+        return true;
+    }
+
+    bool recurrent_step(
+        const float *, const float *, const float *,
+        const float *, const float *,
+        const float *, const float *,
+        float *, float *,
+        int, int, int,
+        bool) override
+    {
+        return true;
+    }
+
+    bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override
+    {
+        ++restore_row_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_row = row;
+        restore_stream = stream;
+        return capture_workspace != nullptr && dst_state != nullptr;
+    }
+
+    bool restoreVerifierStateCaptureRowFromDeviceIndex(
+        float *dst_state,
+        const int *device_row_index,
+        void *stream) override
+    {
+        ++restore_device_index_calls;
+        restore_capture_workspace = capture_workspace;
+        restore_capture_rows = capture_rows;
+        restore_capture_state_size = capture_state_size;
+        restore_dst_state = dst_state;
+        restore_device_index = device_row_index;
+        restore_stream = stream;
+        return capture_workspace != nullptr &&
+               device_row_index != nullptr && stream != nullptr;
+    }
+};
+
+TEST(Test__GDNKernels, NonVerifierShortConvStageClearsStaleSpeculativeStateBinding)
+{
+    RecordingShortConvolution kernel;
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 1;
+    p.channels = 16;
+    p.kernel_size = 4;
+    p.verifier_state_capture_rows = 0;
+    p.kernel = &kernel;
+
+    ShortConv1dStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 48);
+}
+
+TEST(Test__GDNKernels, NonVerifierRecurrenceStageClearsStaleSpeculativeStateBinding)
+{
+    RecordingGatedDeltaNet kernel;
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 1;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 4;
+    p.d_v = 4;
+    p.verifier_state_capture_rows = 0;
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 32);
+}
+
+TEST(Test__GDNKernels, CPUShortConvVerifierStageOwnsHostCaptureSlotsWhenWorkspaceUnbound)
+{
+    RecordingShortConvolution kernel;
+    std::vector<float> conv_state(48, 0.0f);
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.channels = 16;
+    p.kernel_size = 4;
+    p.verifier_state_capture_rows = 2;
+    p.conv_state = conv_state.data();
+    p.kernel = &kernel;
+
+    ShortConv1dStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    ASSERT_NE(kernel.capture_workspace, nullptr);
+    EXPECT_NE(kernel.capture_workspace, conv_state.data());
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 48);
+    EXPECT_TRUE(stage.hasVerifierStateCapture());
+}
+
+TEST(Test__GDNKernels, CPURecurrenceVerifierStageOwnsHostCaptureSlotsWhenWorkspaceUnbound)
+{
+    RecordingGatedDeltaNet kernel;
+    std::vector<float> recurrence_state(32, 0.0f);
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 4;
+    p.d_v = 4;
+    p.verifier_state_capture_rows = 2;
+    p.recurrence_state = recurrence_state.data();
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    stage.bindWorkspace(nullptr);
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    ASSERT_NE(kernel.capture_workspace, nullptr);
+    EXPECT_NE(kernel.capture_workspace, recurrence_state.data());
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 32);
+    EXPECT_TRUE(stage.hasVerifierStateCapture());
+}
+
+TEST(Test__GDNKernels, ShortConvStageResetClearsStaleSpeculativeStateBinding)
+{
+    RecordingShortConvolution kernel;
+
+    ShortConv1dStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.channels = 16;
+    p.kernel_size = 4;
+    p.verifier_state_capture_rows = 2;
+    p.kernel = &kernel;
+
+    ShortConv1dStage stage(p);
+    stage.resetSessionState();
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 48);
+}
+
+TEST(Test__GDNKernels, RecurrenceStageResetClearsStaleSpeculativeStateBinding)
+{
+    RecordingGatedDeltaNet kernel;
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::cpu();
+    p.seq_len = 2;
+    p.n_heads = 2;
+    p.n_k_heads = 2;
+    p.d_k = 4;
+    p.d_v = 4;
+    p.verifier_state_capture_rows = 2;
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    stage.resetSessionState();
+
+    EXPECT_EQ(kernel.capture_bind_calls, 1);
+    EXPECT_EQ(kernel.capture_workspace, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 0);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_EQ(kernel.speculative_bind_calls, 1);
+    EXPECT_EQ(kernel.speculative_workspace, nullptr);
+    EXPECT_EQ(kernel.speculative_state_size, 32);
+}
+
+TEST(Test__GDNKernels, ShortConvGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingShortConvolution kernel;
+
+    ShortConv1dStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.channels = 16;
+    verifier_p.kernel_size = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.kernel = &kernel;
+
+    ShortConv1dStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+    EXPECT_TRUE(verifier_stage.needsOnGraphReplayed());
+
+    ShortConv1dStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    ShortConv1dStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+    ASSERT_EQ(kernel.capture_rows, 0);
+
+    verifier_stage.onGraphReplayed();
+    EXPECT_EQ(kernel.capture_workspace, verifier_capture)
+        << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 48);
+}
+
+TEST(Test__GDNKernels, ShortConvPublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingShortConvolution kernel;
+    std::vector<float> conv_state(48, 0.0f);
+
+    ShortConv1dStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.channels = 16;
+    verifier_p.kernel_size = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.conv_state = conv_state.data();
+    verifier_p.kernel = &kernel;
+
+    ShortConv1dStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    for (int i = 0; i < 96; ++i)
+        verifier_capture[i] = 1000.0f + static_cast<float>(i);
+
+    ShortConv1dStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    ShortConv1dStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
+    EXPECT_EQ(kernel.restore_row_calls, 0)
+        << "CPU publication must not route through a shared kernel binding";
+    for (int i = 0; i < 48; ++i)
+    {
+        EXPECT_EQ(conv_state[static_cast<size_t>(i)],
+                  verifier_capture[48 + i]);
+    }
+
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    int device_row_index = 1;
+    void *fake_stream = &device_row_index;
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRowFromDeviceIndex(
+        &device_row_index,
+        fake_stream));
+    EXPECT_EQ(kernel.restore_device_index_calls, 1);
+    EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
+        << "Device-indexed publication must also rebind the verifier workspace";
+    EXPECT_EQ(kernel.restore_capture_rows, 2);
+    EXPECT_EQ(kernel.restore_capture_state_size, 48);
+    EXPECT_EQ(kernel.restore_dst_state, nullptr)
+        << "Device-indexed publication restores backend-owned live state only; "
+           "host mirror refresh must stay out of the hot path.";
+    EXPECT_EQ(kernel.restore_device_index, &device_row_index);
+    EXPECT_EQ(kernel.restore_stream, fake_stream);
+}
+
+TEST(Test__GDNKernels, RecurrenceGraphReplayRebindsVerifierWorkspaceAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.n_heads = 2;
+    verifier_p.n_k_heads = 2;
+    verifier_p.d_k = 4;
+    verifier_p.d_v = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.kernel = &kernel;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+    EXPECT_TRUE(verifier_stage.needsOnGraphReplayed());
+
+    GDNRecurrenceStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+    ASSERT_EQ(kernel.capture_rows, 0);
+
+    verifier_stage.onGraphReplayed();
+    EXPECT_EQ(kernel.capture_workspace, verifier_capture)
+        << "Verifier graph replay must restore the shared kernel capture binding before MTP publication";
+    EXPECT_EQ(kernel.capture_rows, 2);
+    EXPECT_EQ(kernel.capture_state_size, 32);
+}
+
+TEST(Test__GDNKernels, RecurrencePublicationRestoreUsesStageOwnedCPUCaptureAfterSharedKernelClear)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet kernel;
+    std::vector<float> recurrence_state(32, 0.0f);
+
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.seq_len = 2;
+    verifier_p.n_heads = 2;
+    verifier_p.n_k_heads = 2;
+    verifier_p.d_k = 4;
+    verifier_p.d_v = 4;
+    verifier_p.verifier_state_capture_rows = 2;
+    verifier_p.recurrence_state = recurrence_state.data();
+    verifier_p.kernel = &kernel;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    WorkspaceRequirements reqs = verifier_stage.getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(reqs.has_required_buffers());
+    DeviceWorkspaceManager workspace(
+        DeviceId::cpu(),
+        reqs.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace.allocate(reqs));
+
+    verifier_stage.bindWorkspace(&workspace);
+    float *verifier_capture = kernel.capture_workspace;
+    ASSERT_NE(verifier_capture, nullptr);
+    for (int i = 0; i < 64; ++i)
+        verifier_capture[i] = 2000.0f + static_cast<float>(i);
+
+    GDNRecurrenceStage::Params normal_p = verifier_p;
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
+    EXPECT_EQ(kernel.restore_row_calls, 0)
+        << "CPU publication must not route through a shared kernel binding";
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_EQ(recurrence_state[static_cast<size_t>(i)],
+                  verifier_capture[32 + i]);
+    }
+
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(kernel.capture_workspace, nullptr);
+
+    int device_row_index = 1;
+    void *fake_stream = &device_row_index;
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRowFromDeviceIndex(
+        &device_row_index,
+        fake_stream));
+    EXPECT_EQ(kernel.restore_device_index_calls, 1);
+    EXPECT_EQ(kernel.restore_capture_workspace, verifier_capture)
+        << "Device-indexed publication must also rebind the verifier workspace";
+    EXPECT_EQ(kernel.restore_capture_rows, 2);
+    EXPECT_EQ(kernel.restore_capture_state_size, 32);
+    EXPECT_EQ(kernel.restore_dst_state, nullptr)
+        << "Device-indexed publication restores backend-owned live state only; "
+           "host mirror refresh must stay out of the hot path.";
+    EXPECT_EQ(kernel.restore_device_index, &device_row_index);
+    EXPECT_EQ(kernel.restore_stream, fake_stream);
+}
+
+TEST(Test__GDNKernels, RecurrenceCPUPublicationRestoresParallelStagesFromTheirOwnCaptureSlots)
+{
+    ensureCPUBackendForWorkspace();
+    RecordingGatedDeltaNet shared_kernel;
+
+    std::vector<float> state0(32, 0.0f);
+    std::vector<float> state1(32, 0.0f);
+
+    auto make_stage =
+        [&](int layer, std::vector<float> &state)
+    {
+        GDNRecurrenceStage::Params p;
+        p.device_id = DeviceId::cpu();
+        p.seq_len = 2;
+        p.n_heads = 2;
+        p.n_k_heads = 2;
+        p.d_k = 4;
+        p.d_v = 4;
+        p.layer_idx = layer;
+        p.verifier_state_capture_rows = 2;
+        p.recurrence_state = state.data();
+        p.kernel = &shared_kernel;
+        return std::make_unique<GDNRecurrenceStage>(p);
+    };
+
+    auto stage0 = make_stage(0, state0);
+    auto stage1 = make_stage(1, state1);
+
+    WorkspaceRequirements req0 = stage0->getWorkspaceRequirements(/*m=*/2);
+    WorkspaceRequirements req1 = stage1->getWorkspaceRequirements(/*m=*/2);
+    ASSERT_TRUE(req0.has_required_buffers());
+    ASSERT_TRUE(req1.has_required_buffers());
+    DeviceWorkspaceManager workspace0(
+        DeviceId::cpu(),
+        req0.total_bytes_with_alignment() + 1024);
+    DeviceWorkspaceManager workspace1(
+        DeviceId::cpu(),
+        req1.total_bytes_with_alignment() + 1024);
+    ASSERT_TRUE(workspace0.allocate(req0));
+    ASSERT_TRUE(workspace1.allocate(req1));
+
+    stage0->bindWorkspace(&workspace0);
+    float *capture0 = shared_kernel.capture_workspace;
+    ASSERT_NE(capture0, nullptr);
+    for (int i = 0; i < 64; ++i)
+        capture0[i] = 3000.0f + static_cast<float>(i);
+
+    stage1->bindWorkspace(&workspace1);
+    float *capture1 = shared_kernel.capture_workspace;
+    ASSERT_NE(capture1, nullptr);
+    ASSERT_NE(capture0, capture1);
+    for (int i = 0; i < 64; ++i)
+        capture1[i] = 4000.0f + static_cast<float>(i);
+
+    /*
+     * A normal decode graph can clear the shared kernel binding before the
+     * publication pass.  Publication must still use each stage's own capture
+     * slot rather than racing through that shared mutable binding.
+     */
+    GDNRecurrenceStage::Params normal_p = stage0->getParams();
+    normal_p.verifier_state_capture_rows = 0;
+    GDNRecurrenceStage normal_stage(normal_p);
+    normal_stage.bindWorkspace(nullptr);
+    ASSERT_EQ(shared_kernel.capture_workspace, nullptr);
+
+    MTPSpecStepPlan plan;
+    plan.draft_count = 2;
+    plan.target_rows = 3;
+    plan.accepted_count = 2;
+
+    std::vector<IComputeStage *> stages = {stage0.get(), stage1.get()};
+    MTPSpecStatePublicationResult result =
+        publishAcceptedMTPSpecStateFromVerifierRow(
+            plan,
+            /*verifier_restore_row=*/1,
+            stages,
+            DeviceId::cpu(),
+            /*stream=*/nullptr,
+            /*require_captured_stage=*/true);
+    ASSERT_TRUE(result.ok) << result.error;
+    EXPECT_EQ(result.restored_stage_count, 2);
+    EXPECT_EQ(shared_kernel.restore_row_calls, 0)
+        << "Parallel CPU publication must not use the shared kernel restore path";
+
+    for (int i = 0; i < 32; ++i)
+    {
+        EXPECT_EQ(state0[static_cast<size_t>(i)], capture0[32 + i]);
+        EXPECT_EQ(state1[static_cast<size_t>(i)], capture1[32 + i]);
+    }
+}
+
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentSteps)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 2;
+    static constexpr int d_k = 4;
+    static constexpr int d_v = 3;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+
+    CPUGatedDeltaNet verifier_kernel;
+    CPUGatedDeltaNet serial_kernel;
+    std::vector<float> q(static_cast<size_t>(seq_len) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(seq_len) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+    std::vector<float> verifier_state = initial_state;
+    std::vector<float> serial_state = initial_state;
+    std::vector<float> verifier_output(static_cast<size_t>(seq_len) * v_stride, 0.0f);
+    std::vector<float> serial_output(verifier_output.size(), 0.0f);
+    std::vector<float> capture(static_cast<size_t>(seq_len) * state_floats, 0.0f);
+    std::vector<float> work(state_floats, 0.0f);
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.01f * static_cast<float>((i % 17) - 8);
+        k[i] = 0.02f * static_cast<float>((i % 13) - 6);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.015f * static_cast<float>((i % 11) - 5);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.25f + 0.03f * static_cast<float>(i);
+        beta[i] = 0.15f - 0.02f * static_cast<float>(i);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.5f - 0.1f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.05f * static_cast<float>(h + 1);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.001f * static_cast<float>((i % 19) - 9);
+    verifier_state = initial_state;
+    serial_state = initial_state;
+
+    verifier_kernel.bindVerifierStateCaptureWorkspace(
+        capture.data(),
+        seq_len,
+        state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        q.data(),
+        k.data(),
+        v.data(),
+        alpha.data(),
+        beta.data(),
+        a_log.data(),
+        dt_bias.data(),
+        verifier_output.data(),
+        verifier_state.data(),
+        seq_len,
+        n_heads,
+        d_k,
+        d_v,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true));
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        ASSERT_TRUE(serial_kernel.recurrent_step(
+            q.data() + static_cast<size_t>(t) * qk_stride,
+            k.data() + static_cast<size_t>(t) * qk_stride,
+            v.data() + static_cast<size_t>(t) * v_stride,
+            alpha.data() + static_cast<size_t>(t) * n_heads,
+            beta.data() + static_cast<size_t>(t) * n_heads,
+            a_log.data(),
+            dt_bias.data(),
+            serial_output.data() + static_cast<size_t>(t) * v_stride,
+            serial_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+
+        for (int i = 0; i < state_floats; ++i)
+        {
+            EXPECT_NEAR(
+                capture[static_cast<size_t>(t) * state_floats + i],
+                serial_state[static_cast<size_t>(i)],
+                1e-7f)
+                << "row=" << t << " state_idx=" << i;
+        }
+    }
+
+    for (size_t i = 0; i < serial_output.size(); ++i)
+    {
+        EXPECT_NEAR(verifier_output[i], serial_output[i], 1e-7f)
+            << "output_idx=" << i;
+    }
+    EXPECT_EQ(verifier_state, initial_state)
+        << "Verifier capture must not mutate the live state buffer";
+}
+
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSize)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 32;
+    static constexpr int d_k = 128;
+    static constexpr int d_v = 128;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+
+    CPUGatedDeltaNet verifier_kernel;
+    CPUGatedDeltaNet serial_kernel;
+    std::vector<float> q(static_cast<size_t>(seq_len) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(seq_len) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+    std::vector<float> verifier_state;
+    std::vector<float> serial_state;
+    std::vector<float> verifier_output(static_cast<size_t>(seq_len) * v_stride, 0.0f);
+    std::vector<float> serial_output(verifier_output.size(), 0.0f);
+    std::vector<float> capture(static_cast<size_t>(seq_len) * state_floats, 0.0f);
+    std::vector<float> work(state_floats, 0.0f);
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.002f * static_cast<float>((i % 29) - 14);
+        k[i] = 0.0015f * static_cast<float>((i % 31) - 15);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.001f * static_cast<float>((i % 23) - 11);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.2f + 0.004f * static_cast<float>(i % 37);
+        beta[i] = 0.1f - 0.003f * static_cast<float>(i % 41);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.35f - 0.002f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.01f * static_cast<float>((h % 7) - 3);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.0001f * static_cast<float>((i % 43) - 21);
+    verifier_state = initial_state;
+    serial_state = initial_state;
+
+    verifier_kernel.bindVerifierStateCaptureWorkspace(
+        capture.data(),
+        seq_len,
+        state_floats);
+    verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+    ASSERT_TRUE(verifier_kernel.chunk_forward(
+        q.data(),
+        k.data(),
+        v.data(),
+        alpha.data(),
+        beta.data(),
+        a_log.data(),
+        dt_bias.data(),
+        verifier_output.data(),
+        verifier_state.data(),
+        seq_len,
+        n_heads,
+        d_k,
+        d_v,
+        /*chunk_size=*/64,
+        /*use_qk_l2norm=*/true));
+
+    for (int t = 0; t < seq_len; ++t)
+    {
+        ASSERT_TRUE(serial_kernel.recurrent_step(
+            q.data() + static_cast<size_t>(t) * qk_stride,
+            k.data() + static_cast<size_t>(t) * qk_stride,
+            v.data() + static_cast<size_t>(t) * v_stride,
+            alpha.data() + static_cast<size_t>(t) * n_heads,
+            beta.data() + static_cast<size_t>(t) * n_heads,
+            a_log.data(),
+            dt_bias.data(),
+            serial_output.data() + static_cast<size_t>(t) * v_stride,
+            serial_state.data(),
+            n_heads,
+            d_k,
+            d_v,
+            /*use_qk_l2norm=*/true));
+
+        double max_state_diff = 0.0;
+        for (int i = 0; i < state_floats; ++i)
+        {
+            max_state_diff = std::max(
+                max_state_diff,
+                static_cast<double>(std::abs(
+                    capture[static_cast<size_t>(t) * state_floats + i] -
+                    serial_state[static_cast<size_t>(i)])));
+        }
+        EXPECT_LE(max_state_diff, 1e-7)
+            << "row=" << t;
+    }
+
+    double max_output_diff = 0.0;
+    for (size_t i = 0; i < serial_output.size(); ++i)
+    {
+        max_output_diff = std::max(
+            max_output_diff,
+            static_cast<double>(std::abs(verifier_output[i] - serial_output[i])));
+    }
+    EXPECT_LE(max_output_diff, 1e-7);
+    EXPECT_EQ(verifier_state, initial_state)
+        << "Verifier capture must not mutate the live state buffer";
+}
+
+TEST(Test__GDNKernels, CPUGatedDeltaNetVerifierRowsMatchSerialRecurrentStepsAtQwenSizeM2ToM4)
+{
+    static constexpr int max_rows = 4;
+    static constexpr int n_heads = 32;
+    static constexpr int d_k = 128;
+    static constexpr int d_v = 128;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int qk_stride = n_heads * d_k;
+    static constexpr int v_stride = n_heads * d_v;
+
+    /*
+     * The verifier can run M=2,3,4 rows.  The grouped CPU kernel may parallelize
+     * across heads, but for each head it must advance the recurrent state in the
+     * same order as serial decode and publish each post-row snapshot exactly.
+     */
+    std::vector<float> q(static_cast<size_t>(max_rows) * qk_stride);
+    std::vector<float> k(q.size());
+    std::vector<float> v(static_cast<size_t>(max_rows) * v_stride);
+    std::vector<float> alpha(static_cast<size_t>(max_rows) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(max_rows) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+
+    for (size_t i = 0; i < q.size(); ++i)
+    {
+        q[i] = 0.002f * static_cast<float>((i % 29) - 14);
+        k[i] = 0.0015f * static_cast<float>((i % 31) - 15);
+    }
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.001f * static_cast<float>((i % 23) - 11);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.2f + 0.004f * static_cast<float>(i % 37);
+        beta[i] = 0.1f - 0.003f * static_cast<float>(i % 41);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.35f - 0.002f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.01f * static_cast<float>((h % 7) - 3);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.0001f * static_cast<float>((i % 43) - 21);
+
+    for (int rows = 2; rows <= max_rows; ++rows)
+    {
+        CPUGatedDeltaNet verifier_kernel;
+        CPUGatedDeltaNet serial_kernel;
+        std::vector<float> verifier_state = initial_state;
+        std::vector<float> serial_state = initial_state;
+        std::vector<float> verifier_output(static_cast<size_t>(rows) * v_stride, 0.0f);
+        std::vector<float> serial_output(verifier_output.size(), 0.0f);
+        std::vector<float> capture(static_cast<size_t>(rows) * state_floats, 0.0f);
+        std::vector<float> work(state_floats, 0.0f);
+
+        verifier_kernel.bindVerifierStateCaptureWorkspace(
+            capture.data(),
+            rows,
+            state_floats);
+        verifier_kernel.bindSpeculativeStateWorkspace(work.data(), state_floats);
+        ASSERT_TRUE(verifier_kernel.chunk_forward(
+            q.data(),
+            k.data(),
+            v.data(),
+            alpha.data(),
+            beta.data(),
+            a_log.data(),
+            dt_bias.data(),
+            verifier_output.data(),
+            verifier_state.data(),
+            rows,
+            n_heads,
+            d_k,
+            d_v,
+            /*chunk_size=*/64,
+            /*use_qk_l2norm=*/true))
+            << "rows=" << rows;
+
+        for (int t = 0; t < rows; ++t)
+        {
+            ASSERT_TRUE(serial_kernel.recurrent_step(
+                q.data() + static_cast<size_t>(t) * qk_stride,
+                k.data() + static_cast<size_t>(t) * qk_stride,
+                v.data() + static_cast<size_t>(t) * v_stride,
+                alpha.data() + static_cast<size_t>(t) * n_heads,
+                beta.data() + static_cast<size_t>(t) * n_heads,
+                a_log.data(),
+                dt_bias.data(),
+                serial_output.data() + static_cast<size_t>(t) * v_stride,
+                serial_state.data(),
+                n_heads,
+                d_k,
+                d_v,
+                /*use_qk_l2norm=*/true))
+                << "rows=" << rows << " row=" << t;
+
+            double max_state_diff = 0.0;
+            for (int i = 0; i < state_floats; ++i)
+            {
+                max_state_diff = std::max(
+                    max_state_diff,
+                    static_cast<double>(std::abs(
+                        capture[static_cast<size_t>(t) * state_floats + i] -
+                        serial_state[static_cast<size_t>(i)])));
+            }
+            EXPECT_LE(max_state_diff, 1e-7)
+                << "rows=" << rows << " row=" << t;
+        }
+
+        double max_output_diff = 0.0;
+        for (size_t i = 0; i < serial_output.size(); ++i)
+        {
+            max_output_diff = std::max(
+                max_output_diff,
+                static_cast<double>(std::abs(verifier_output[i] - serial_output[i])));
+        }
+        EXPECT_LE(max_output_diff, 1e-7) << "rows=" << rows;
+        EXPECT_EQ(verifier_state, initial_state)
+            << "Verifier capture must not mutate the live state buffer, rows=" << rows;
+    }
+}
+
+TEST(Test__GDNKernels, CPURecurrenceStageMergedQKVVerifierCaptureMatchesSerialDecode)
+{
+    static constexpr int seq_len = 2;
+    static constexpr int n_k_heads = 2;
+    static constexpr int n_heads = 4;
+    static constexpr int d_k = 8;
+    static constexpr int d_v = 8;
+    static constexpr int q_src_dim = n_k_heads * d_k;
+    static constexpr int k_src_dim = n_k_heads * d_k;
+    static constexpr int v_dim = n_heads * d_v;
+    static constexpr int qkv_stride = q_src_dim + k_src_dim + v_dim;
+    static constexpr int state_floats = n_heads * d_k * d_v;
+    static constexpr int output_stride = n_heads * d_v;
+
+    /*
+     * Qwen GDN graph stages pass Q, K, and V as the same merged QKV tensor.
+     * The verifier path runs a two-row chunk and restores a captured row,
+     * while true decode runs the same stage one row at a time.  This test keeps
+     * n_k_heads != n_heads so the CPU deinterleave path exercises modular
+     * Q/K tiling instead of the simple zero-copy identity case.
+     */
+    std::vector<float> merged(static_cast<size_t>(seq_len) * qkv_stride);
+    std::vector<float> alpha(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> beta(static_cast<size_t>(seq_len) * n_heads);
+    std::vector<float> a_log(n_heads);
+    std::vector<float> dt_bias(n_heads);
+    std::vector<float> initial_state(state_floats);
+
+    for (size_t i = 0; i < merged.size(); ++i)
+        merged[i] = 0.004f * static_cast<float>((i % 37) - 18);
+    for (size_t i = 0; i < alpha.size(); ++i)
+    {
+        alpha[i] = -0.18f + 0.011f * static_cast<float>(i % 19);
+        beta[i] = 0.09f - 0.007f * static_cast<float>(i % 23);
+    }
+    for (int h = 0; h < n_heads; ++h)
+    {
+        a_log[static_cast<size_t>(h)] = -0.45f - 0.015f * static_cast<float>(h);
+        dt_bias[static_cast<size_t>(h)] = 0.025f * static_cast<float>((h % 5) - 2);
+    }
+    for (int i = 0; i < state_floats; ++i)
+        initial_state[static_cast<size_t>(i)] =
+            0.0003f * static_cast<float>((i % 31) - 15);
+
+    auto merged_all = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(qkv_stride)},
+        merged.data());
+    auto alpha_all = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)},
+        alpha.data());
+    auto beta_all = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)},
+        beta.data());
+    auto a_log_t = makeFP32({static_cast<size_t>(n_heads)}, a_log.data());
+    auto dt_bias_t = makeFP32({static_cast<size_t>(n_heads)}, dt_bias.data());
+    auto verifier_output = makeFP32(
+        {static_cast<size_t>(seq_len), static_cast<size_t>(output_stride)});
+
+    std::vector<float> verifier_state = initial_state;
+    auto ctx = makeCPUContext();
+
+    CPUGatedDeltaNet verifier_kernel;
+    GDNRecurrenceStage::Params verifier_p;
+    verifier_p.device_id = DeviceId::cpu();
+    verifier_p.kernel = &verifier_kernel;
+    verifier_p.Q = merged_all.get();
+    verifier_p.K = merged_all.get();
+    verifier_p.V = merged_all.get();
+    verifier_p.alpha = alpha_all.get();
+    verifier_p.beta = beta_all.get();
+    verifier_p.A_log = a_log_t.get();
+    verifier_p.dt_bias = dt_bias_t.get();
+    verifier_p.output = verifier_output.get();
+    verifier_p.recurrence_state = verifier_state.data();
+    verifier_p.seq_len = seq_len;
+    verifier_p.n_heads = n_heads;
+    verifier_p.n_k_heads = n_k_heads;
+    verifier_p.d_k = d_k;
+    verifier_p.d_v = d_v;
+    verifier_p.use_qk_l2norm = true;
+    verifier_p.verifier_state_capture_rows = seq_len;
+    verifier_p.speculative_state_slot_rows = seq_len;
+
+    GDNRecurrenceStage verifier_stage(verifier_p);
+    ASSERT_TRUE(verifier_stage.execute(ctx.get()));
+    EXPECT_EQ(verifier_state, initial_state)
+        << "Verifier chunk capture must not mutate live recurrence state";
+    ASSERT_TRUE(verifier_stage.restoreVerifierStateCaptureRow(1, nullptr));
+
+    std::vector<float> serial_state = initial_state;
+    std::vector<float> serial_output(static_cast<size_t>(seq_len) * output_stride);
+    CPUGatedDeltaNet serial_kernel;
+    for (int row = 0; row < seq_len; ++row)
+    {
+        auto merged_row = makeFP32(
+            {1, static_cast<size_t>(qkv_stride)},
+            merged.data() + static_cast<size_t>(row) * qkv_stride);
+        auto alpha_row = makeFP32(
+            {1, static_cast<size_t>(n_heads)},
+            alpha.data() + static_cast<size_t>(row) * n_heads);
+        auto beta_row = makeFP32(
+            {1, static_cast<size_t>(n_heads)},
+            beta.data() + static_cast<size_t>(row) * n_heads);
+        auto output_row = makeFP32({1, static_cast<size_t>(output_stride)});
+
+        GDNRecurrenceStage::Params serial_p = verifier_p;
+        serial_p.kernel = &serial_kernel;
+        serial_p.Q = merged_row.get();
+        serial_p.K = merged_row.get();
+        serial_p.V = merged_row.get();
+        serial_p.alpha = alpha_row.get();
+        serial_p.beta = beta_row.get();
+        serial_p.output = output_row.get();
+        serial_p.recurrence_state = serial_state.data();
+        serial_p.seq_len = 1;
+        serial_p.verifier_state_capture_rows = 0;
+        serial_p.speculative_state_slot_rows = 0;
+
+        GDNRecurrenceStage serial_stage(serial_p);
+        ASSERT_TRUE(serial_stage.execute(ctx.get())) << "row=" << row;
+        std::copy_n(output_row->data(),
+                    output_stride,
+                    serial_output.data() + static_cast<size_t>(row) * output_stride);
+    }
+
+    double max_state_diff = 0.0;
+    for (int i = 0; i < state_floats; ++i)
+    {
+        max_state_diff = std::max(
+            max_state_diff,
+            static_cast<double>(std::abs(
+                verifier_state[static_cast<size_t>(i)] -
+                serial_state[static_cast<size_t>(i)])));
+    }
+    EXPECT_LE(max_state_diff, 1e-7)
+        << "Restored verifier capture row must equal serial row-1 state";
+
+    const float *verifier_out = verifier_output->data();
+    double max_output_diff = 0.0;
+    for (size_t i = 0; i < serial_output.size(); ++i)
+    {
+        max_output_diff = std::max(
+            max_output_diff,
+            static_cast<double>(std::abs(verifier_out[i] - serial_output[i])));
+    }
+    EXPECT_LE(max_output_diff, 1e-7)
+        << "Two-row verifier outputs must match serial decode-stage outputs";
+}
+
+TEST(Test__GDNKernels, Recurrence_GPUDeinterleaveRequiresBoundWorkspaceBeforeKernelDispatch)
+{
+#ifdef HAVE_ROCM
+    static constexpr int seq_len = 2;
+    static constexpr int n_heads = 4;
+    static constexpr int n_k_heads = 2;
+    static constexpr int d_k = 8;
+    static constexpr int d_v = 8;
+
+    const int qkv_cols = n_k_heads * d_k * 2 + n_heads * d_v;
+    FP32Tensor merged_qkv({seq_len, qkv_cols}, DeviceId::rocm(0));
+    FP32Tensor alpha({seq_len, n_heads}, DeviceId::rocm(0));
+    FP32Tensor beta({seq_len, n_heads}, DeviceId::rocm(0));
+    FP32Tensor a_log({1, n_heads}, DeviceId::rocm(0));
+    FP32Tensor dt_bias({1, n_heads}, DeviceId::rocm(0));
+    FP32Tensor output({seq_len, n_heads * d_v}, DeviceId::rocm(0));
+    std::vector<float> recurrence_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+
+    MockGatedDeltaNet kernel;
+    EXPECT_CALL(kernel, deinterleave_qkv_device(_, _, _, _, _, _, _, _, _, _)).Times(0);
+    EXPECT_CALL(kernel, chunk_forward(_, _, _, _, _, _, _, _, _, _, _, _, _, _, _)).Times(0);
+
+    GDNRecurrenceStage::Params p;
+    p.device_id = DeviceId::rocm(0);
+    p.seq_len = seq_len;
+    p.n_heads = n_heads;
+    p.n_k_heads = n_k_heads;
+    p.d_k = d_k;
+    p.d_v = d_v;
+    p.global_v_head_offset = 1;
+    p.Q = &merged_qkv;
+    p.K = &merged_qkv;
+    p.V = &merged_qkv;
+    p.alpha = &alpha;
+    p.beta = &beta;
+    p.A_log = &a_log;
+    p.dt_bias = &dt_bias;
+    p.output = &output;
+    p.recurrence_state = recurrence_state.data();
+    p.kernel = &kernel;
+
+    GDNRecurrenceStage stage(p);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    EXPECT_FALSE(stage.execute(&ctx))
+        << "Graph-stage GPU deinterleave must require the declared workspace buffer "
+           "instead of falling through to backend-owned scratch allocation";
+#else
+    GTEST_SKIP() << "ROCm backend not compiled";
+#endif
+}
+
+template <int Tag>
+class CountingProjectionGemm : public ITensorGemm
+{
+public:
+    explicit CountingProjectionGemm(float fill_value,
+                                    bool supports_fused = false,
+                                    bool fused_success = false,
+                                    std::optional<uint8_t> native_codebook = std::nullopt)
+        : fill_value_(fill_value),
+          supports_fused_(supports_fused),
+          fused_success_(fused_success),
+          native_codebook_(native_codebook)
+    {
+    }
+
+    bool supports_device(int) const override { return true; }
+    bool supports_fused_projection() const override { return supports_fused_; }
+    bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+    {
+        out = {};
+        if (!native_codebook_.has_value())
+            return false;
+
+        out.payload = reinterpret_cast<const uint8_t *>(this);
+        out.scales = this;
+        out.n = 1;
+        out.k = 32;
+        out.blocks_per_row = 1;
+        out.codebook_id = native_codebook_.value();
+        return out.valid();
+    }
+
+    bool multiply_tensor(
+        const TensorBase *,
+        TensorBase *C,
+        int m,
+        int n,
+        int k,
+        bool,
+        float,
+        float,
+        const TensorBase *,
+        const IMPIContext *,
+        int,
+        DeviceWorkspaceManager *,
+        int) override
+    {
+        (void)k;
+        ++multiply_calls;
+        auto *output = dynamic_cast<FP32Tensor *>(C);
+        if (!output)
+            return false;
+        float *values = output->mutable_data();
+        for (int i = 0; i < m * n; ++i)
+            values[i] = fill_value_;
+        return true;
+    }
+
+    bool multiply_fused_tensor(
+        const TensorBase *,
+        const std::vector<TensorProjectionDesc> &projections,
+        int m,
+        int,
+        const IMPIContext * = nullptr,
+        DeviceWorkspaceManager * = nullptr) override
+    {
+        ++fused_calls;
+        fused_projection_count += static_cast<int>(projections.size());
+        if (!fused_success_)
+            return false;
+
+        for (const auto &projection : projections)
+        {
+            auto *typed_kernel = dynamic_cast<CountingProjectionGemm<Tag> *>(projection.kernel);
+            auto *output = dynamic_cast<FP32Tensor *>(projection.output);
+            if (!typed_kernel || !output)
+                return false;
+
+            float *values = output->mutable_data();
+            for (int i = 0; i < m * projection.n; ++i)
+                values[i] = typed_kernel->fill_value_;
+        }
+        return true;
+    }
+
+    int multiply_calls = 0;
+    int fused_calls = 0;
+    int fused_projection_count = 0;
+
+private:
+    float fill_value_;
+    bool supports_fused_ = false;
+    bool fused_success_ = false;
+    std::optional<uint8_t> native_codebook_;
 };
 
 // ============================================================================
@@ -223,6 +2021,329 @@ TEST(Test__GDNKernels, Projection_BufferContract)
     auto contract = stage.bufferContract();
     // Should have at least the configured IDs
     SUCCEED(); // Contract creation doesn't crash
+}
+
+TEST(Test__GDNKernels, Projection_MixedKernelTypesUsePerProjectionFallback)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    CountingProjectionGemm<0> qkv_gemm(1.0f);
+    CountingProjectionGemm<0> z_gemm(2.0f);
+    CountingProjectionGemm<1> a_gemm(3.0f);
+    CountingProjectionGemm<1> b_gemm(4.0f);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    EXPECT_TRUE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 0);
+    EXPECT_EQ(z_gemm.fused_calls, 0);
+    EXPECT_EQ(a_gemm.fused_calls, 0);
+    EXPECT_EQ(b_gemm.fused_calls, 0);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 1);
+    EXPECT_EQ(z_gemm.multiply_calls, 1);
+    EXPECT_EQ(a_gemm.multiply_calls, 1);
+    EXPECT_EQ(b_gemm.multiply_calls, 1);
+
+    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
+    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
+TEST(Test__GDNKernels, Projection_MixedKernelTypesFuseSupportedSubgroups)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    CountingProjectionGemm<0> qkv_gemm(1.0f, true, true);
+    CountingProjectionGemm<0> z_gemm(2.0f, true, true);
+    CountingProjectionGemm<1> a_gemm(3.0f);
+    CountingProjectionGemm<1> b_gemm(4.0f);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    EXPECT_TRUE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 1);
+    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
+    EXPECT_EQ(z_gemm.fused_calls, 0);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 1);
+    EXPECT_EQ(b_gemm.multiply_calls, 1);
+
+    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
+    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
+TEST(Test__GDNKernels, Projection_SplitsNativeVNNIGroupsByCodebook)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    CountingProjectionGemm<0> qkv_gemm(1.0f, true, true, 5);
+    CountingProjectionGemm<0> z_gemm(2.0f, true, true, 7);
+    CountingProjectionGemm<0> a_gemm(3.0f, true, true, 5);
+    CountingProjectionGemm<0> b_gemm(4.0f, true, true, 7);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    EXPECT_TRUE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 1);
+    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
+    EXPECT_EQ(z_gemm.fused_calls, 1);
+    EXPECT_EQ(z_gemm.fused_projection_count, 2);
+    EXPECT_EQ(a_gemm.fused_calls, 0);
+    EXPECT_EQ(b_gemm.fused_calls, 0);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 0);
+    EXPECT_EQ(b_gemm.multiply_calls, 0);
+
+    EXPECT_FLOAT_EQ(out_qkv->data()[0], 1.0f);
+    EXPECT_FLOAT_EQ(out_z->data()[0], 2.0f);
+    EXPECT_FLOAT_EQ(out_a->data()[0], 3.0f);
+    EXPECT_FLOAT_EQ(out_b->data()[0], 4.0f);
+}
+
+TEST(Test__GDNKernels, Projection_FusedSubgroupFailureHardFails)
+{
+    auto ctx = makeCPUContext();
+
+    auto input = makeFP32Seq({2, 3});
+    auto w_qkv = makeFP32({3, 4});
+    auto out_qkv = makeFP32({2, 4});
+    auto w_z = makeFP32({3, 2});
+    auto out_z = makeFP32({2, 2});
+    auto w_a = makeFP32({3, 1});
+    auto out_a = makeFP32({2, 1});
+    auto w_b = makeFP32({3, 1});
+    auto out_b = makeFP32({2, 1});
+
+    CountingProjectionGemm<0> qkv_gemm(1.0f, true, false);
+    CountingProjectionGemm<0> z_gemm(2.0f, true, false);
+    CountingProjectionGemm<1> a_gemm(3.0f);
+    CountingProjectionGemm<1> b_gemm(4.0f);
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = 2;
+    p.k = 3;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = 4;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = 2;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = 1;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = 1;
+    p.gemm_qkv = &qkv_gemm;
+    p.gemm_z = &z_gemm;
+    p.gemm_a = &a_gemm;
+    p.gemm_b = &b_gemm;
+
+    GDNProjectionStage stage(p);
+    EXPECT_FALSE(stage.execute(ctx.get()));
+
+    EXPECT_EQ(qkv_gemm.fused_calls, 1);
+    EXPECT_EQ(qkv_gemm.fused_projection_count, 2);
+    EXPECT_EQ(qkv_gemm.multiply_calls, 0);
+    EXPECT_EQ(z_gemm.multiply_calls, 0);
+    EXPECT_EQ(a_gemm.multiply_calls, 0);
+    EXPECT_EQ(b_gemm.multiply_calls, 0);
+}
+
+TEST(Test__GDNKernels, Projection_Qwen36NodeLocalTPPrefillShapeResolvesPreparedMixedFallback)
+{
+    auto ctx = makeCPUContext();
+
+    const int M = 9;
+    const int K = 5120;
+    const int N_QKV = 7168;
+    const int N_Z = 3072;
+    const int N_ALPHA = 24;
+    const int N_BETA = 24;
+
+    auto input = test::TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 42);
+    auto w_qkv = test::TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)});
+    auto w_z = test::TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)});
+    auto w_a = test::TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)}, -0.1f, 0.1f, 43);
+    auto w_b = test::TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)}, -0.1f, 0.1f, 44);
+
+    auto out_qkv = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto out_z = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    auto out_a = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_ALPHA)});
+    auto out_b = test::TestTensorFactory::createFP32Zeros(
+        {static_cast<size_t>(M), static_cast<size_t>(N_BETA)});
+
+    constexpr ModelContextId model_id{3600};
+    PreparedWeightStore store(model_id);
+    auto qkv_binding = test::makePreparedWeightTestBinding(
+        w_qkv.get(), DeviceId::cpu(), "blk.0.gdn_qkv_proj.weight", model_id);
+    auto z_binding = test::makePreparedWeightTestBinding(
+        w_z.get(), DeviceId::cpu(), "blk.0.gdn_z_proj.weight", model_id);
+    auto a_binding = test::makePreparedWeightTestBinding(
+        w_a.get(), DeviceId::cpu(), "blk.0.gdn_alpha_proj.weight", model_id);
+    auto b_binding = test::makePreparedWeightTestBinding(
+        w_b.get(), DeviceId::cpu(), "blk.0.gdn_beta_proj.weight", model_id);
+
+    auto qkv_ref = store.prepareGemm(qkv_binding);
+    auto z_ref = store.prepareGemm(z_binding);
+    auto a_ref = store.prepareGemm(a_binding);
+    auto b_ref = store.prepareGemm(b_binding);
+    ASSERT_NE(store.gemmKernel(qkv_ref), nullptr);
+    ASSERT_NE(store.gemmKernel(z_ref), nullptr);
+    ASSERT_NE(store.gemmKernel(a_ref), nullptr);
+    ASSERT_NE(store.gemmKernel(b_ref), nullptr);
+
+    w_qkv->release_raw_data();
+    w_z->release_raw_data();
+
+    GDNProjectionStage::Params p;
+    p.input = input.get();
+    p.m = M;
+    p.k = K;
+    p.w_qkv = w_qkv.get();
+    p.output_qkv = out_qkv.get();
+    p.n_qkv = N_QKV;
+    p.w_z = w_z.get();
+    p.output_z = out_z.get();
+    p.n_z = N_Z;
+    p.w_a = w_a.get();
+    p.output_a = out_a.get();
+    p.n_a = N_ALPHA;
+    p.w_b = w_b.get();
+    p.output_b = out_b.get();
+    p.n_b = N_BETA;
+    p.prepared_ref_qkv = qkv_ref;
+    p.prepared_ref_z = z_ref;
+    p.prepared_ref_a = a_ref;
+    p.prepared_ref_b = b_ref;
+    p.prepared_store = &store;
+
+    GDNProjectionStage stage(p);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+
+    auto assertFiniteNonzero = [](const TensorBase *tensor, int rows, int cols, const char *name)
+    {
+        const float *data = tensor->data();
+        bool any_nonzero = false;
+        for (size_t i = 0; i < static_cast<size_t>(rows) * cols; ++i)
+        {
+            ASSERT_TRUE(std::isfinite(data[i])) << name << " non-finite at " << i;
+            any_nonzero = any_nonzero || data[i] != 0.0f;
+        }
+        EXPECT_TRUE(any_nonzero) << name << " is all zero";
+    };
+
+    assertFiniteNonzero(out_qkv.get(), M, N_QKV, "qkv");
+    assertFiniteNonzero(out_z.get(), M, N_Z, "z");
+    assertFiniteNonzero(out_a.get(), M, N_ALPHA, "alpha");
+    assertFiniteNonzero(out_b.get(), M, N_BETA, "beta");
 }
 
 // ============================================================================
@@ -865,6 +2986,1470 @@ TEST(Test__GDNKernels, Recurrence_Prefill_MatchesSequentialDecode)
             << "State mismatch at index " << i;
     }
 }
+
+TEST(Test__GDNKernels, Recurrence_ChunkForwardFromNonZeroStateMatchesSequentialDecode)
+{
+    const int n_heads = 2;
+    const int d_k = 4;
+    const int d_v = 4;
+    const int prompt_len = 5;
+    const int suffix_len = 2;
+    const int total_len = prompt_len + suffix_len;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.3f, 110);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.3f, 210);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)}, 0.0f, 0.3f, 310);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.5f, 410);
+    auto beta_raw = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.5f, 510);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, 1.0f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.5f);
+
+    auto prompt_output = makeFP32({static_cast<size_t>(prompt_len), static_cast<size_t>(v_stride)});
+    auto suffix_output = makeFP32({static_cast<size_t>(suffix_len), static_cast<size_t>(v_stride)});
+    std::vector<float> chunk_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+
+    ASSERT_TRUE(g_cpu_gdn.chunk_forward(
+        Q->data(), K->data(), V->data(),
+        alpha->data(), beta_raw->data(),
+        A_log->data(), dt_bias->data(),
+        prompt_output->mutable_data(), chunk_state.data(),
+        prompt_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/false));
+
+    ASSERT_TRUE(g_cpu_gdn.chunk_forward(
+        Q->data() + static_cast<size_t>(prompt_len) * qk_stride,
+        K->data() + static_cast<size_t>(prompt_len) * qk_stride,
+        V->data() + static_cast<size_t>(prompt_len) * v_stride,
+        alpha->data() + static_cast<size_t>(prompt_len) * n_heads,
+        beta_raw->data() + static_cast<size_t>(prompt_len) * n_heads,
+        A_log->data(), dt_bias->data(),
+        suffix_output->mutable_data(), chunk_state.data(),
+        suffix_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/false));
+
+    auto ref_output = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+    std::vector<float> ref_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    for (int t = 0; t < total_len; ++t)
+    {
+        ASSERT_TRUE(g_cpu_gdn.recurrent_step(
+            Q->data() + static_cast<size_t>(t) * qk_stride,
+            K->data() + static_cast<size_t>(t) * qk_stride,
+            V->data() + static_cast<size_t>(t) * v_stride,
+            alpha->data() + static_cast<size_t>(t) * n_heads,
+            beta_raw->data() + static_cast<size_t>(t) * n_heads,
+            A_log->data(), dt_bias->data(),
+            ref_output->mutable_data() + static_cast<size_t>(t) * v_stride,
+            ref_state.data(),
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/false));
+    }
+
+    const float *suffix = suffix_output->data();
+    const float *ref = ref_output->data() + static_cast<size_t>(prompt_len) * v_stride;
+    for (int i = 0; i < suffix_len * v_stride; ++i)
+    {
+        EXPECT_NEAR(suffix[i], ref[i], 1e-4f)
+            << "suffix output mismatch at index " << i;
+    }
+    for (size_t i = 0; i < ref_state.size(); ++i)
+    {
+        EXPECT_NEAR(chunk_state[i], ref_state[i], 1e-4f)
+            << "state mismatch at index " << i;
+    }
+}
+
+TEST(Test__GDNKernels, ShortConv_PaddedPrefillStateMatchesUnpaddedDecode)
+{
+    const int real_len = 5;
+    const int bucket_len = 8;
+    const int channels = 3;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+
+    std::vector<float> bucket_input(static_cast<size_t>(bucket_len * channels));
+    for (int t = 0; t < bucket_len; ++t)
+    {
+        for (int c = 0; c < channels; ++c)
+        {
+            bucket_input[static_cast<size_t>(t * channels + c)] =
+                t < real_len ? 0.1f * static_cast<float>(1 + t * channels + c)
+                             : 100.0f + static_cast<float>(t * channels + c);
+        }
+    }
+    std::vector<float> real_input(bucket_input.begin(), bucket_input.begin() + real_len * channels);
+    std::vector<float> decode_input = {0.33f, -0.21f, 0.17f};
+    std::vector<float> weight(static_cast<size_t>(channels * kernel_size));
+    std::vector<float> bias(static_cast<size_t>(channels));
+    for (int i = 0; i < channels * kernel_size; ++i)
+        weight[static_cast<size_t>(i)] = 0.05f * static_cast<float>((i % 5) + 1);
+    for (int c = 0; c < channels; ++c)
+        bias[static_cast<size_t>(c)] = -0.02f * static_cast<float>(c + 1);
+
+    auto padded_in = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(channels)}, bucket_input.data());
+    auto padded_out = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(channels)});
+    auto real_in = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(channels)}, real_input.data());
+    auto real_out = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(channels)});
+    auto decode_in = makeFP32({1, static_cast<size_t>(channels)}, decode_input.data());
+    auto padded_decode_out = makeFP32({1, static_cast<size_t>(channels)});
+    auto ref_decode_out = makeFP32({1, static_cast<size_t>(channels)});
+    auto weight_t = makeFP32({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, weight.data());
+    auto bias_t = makeFP32({static_cast<size_t>(channels)}, bias.data());
+    std::vector<float> padded_state(static_cast<size_t>(channels * state_len), 0.0f);
+    std::vector<float> ref_state(static_cast<size_t>(channels * state_len), 0.0f);
+    auto ctx = makeCPUContext();
+
+    ShortConv1dStage::Params padded_params;
+    padded_params.device_id = DeviceId::cpu();
+    padded_params.input = padded_in.get();
+    padded_params.output = padded_out.get();
+    padded_params.weight = weight_t.get();
+    padded_params.bias = bias_t.get();
+    padded_params.conv_state = padded_state.data();
+    padded_params.seq_len = bucket_len;
+    padded_params.channels = channels;
+    padded_params.kernel_size = kernel_size;
+    padded_params.kernel = &g_cpu_conv;
+    ShortConv1dStage padded_stage(padded_params);
+    IComputeStage::PrefillReplayParams replay;
+    replay.real_seq_len = real_len;
+    replay.bucket_seq_len = bucket_len;
+    padded_stage.updatePrefillReplayParams(replay);
+    ASSERT_TRUE(padded_stage.execute(ctx.get()));
+
+    ShortConv1dStage::Params ref_params = padded_params;
+    ref_params.input = real_in.get();
+    ref_params.output = real_out.get();
+    ref_params.conv_state = ref_state.data();
+    ref_params.seq_len = real_len;
+    ShortConv1dStage ref_stage(ref_params);
+    ASSERT_TRUE(ref_stage.execute(ctx.get()));
+
+    ShortConv1dStage::Params padded_decode = padded_params;
+    padded_decode.input = decode_in.get();
+    padded_decode.output = padded_decode_out.get();
+    padded_decode.seq_len = 1;
+    ShortConv1dStage padded_decode_stage(padded_decode);
+    ASSERT_TRUE(padded_decode_stage.execute(ctx.get()));
+
+    ShortConv1dStage::Params ref_decode = ref_params;
+    ref_decode.input = decode_in.get();
+    ref_decode.output = ref_decode_out.get();
+    ref_decode.seq_len = 1;
+    ShortConv1dStage ref_decode_stage(ref_decode);
+    ASSERT_TRUE(ref_decode_stage.execute(ctx.get()));
+
+    const float *padded_decode_data = padded_decode_out->data();
+    const float *ref_decode_data = ref_decode_out->data();
+    for (int c = 0; c < channels; ++c)
+    {
+        EXPECT_NEAR(padded_decode_data[c], ref_decode_data[c], 1e-6f)
+            << "decode output mismatch at channel " << c;
+    }
+    for (size_t i = 0; i < ref_state.size(); ++i)
+    {
+        EXPECT_NEAR(padded_state[i], ref_state[i], 1e-6f)
+            << "conv state mismatch at index " << i;
+    }
+
+    const float *padded_prefill = padded_out->data();
+    for (int i = real_len * channels; i < bucket_len * channels; ++i)
+        EXPECT_EQ(padded_prefill[i], 0.0f) << "padded output row must be inert";
+}
+
+TEST(Test__GDNKernels, ShortConv_ChunkForwardFromNonZeroStateMatchesSequentialDecode)
+{
+    const int channels = 19;
+    const int kernel_size = 4;
+    const int state_len = kernel_size - 1;
+    const int prompt_len = 5;
+    const int suffix_len = 2;
+    const int next_len = 1;
+    const int total_len = prompt_len + suffix_len + next_len;
+
+    auto input = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(channels)}, 0.0f, 0.2f, 1401);
+    auto weight = makeFP32Random({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, 0.0f, 0.06f, 1402);
+    auto bias = makeFP32Random({static_cast<size_t>(channels)}, 0.0f, 0.02f, 1403);
+    auto prompt_out = makeFP32({static_cast<size_t>(prompt_len), static_cast<size_t>(channels)});
+    auto suffix_out = makeFP32({static_cast<size_t>(suffix_len), static_cast<size_t>(channels)});
+    auto next_out = makeFP32({static_cast<size_t>(next_len), static_cast<size_t>(channels)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(channels)});
+    std::vector<float> chunk_state(static_cast<size_t>(channels * state_len), 0.0f);
+    std::vector<float> ref_state(static_cast<size_t>(channels * state_len), 0.0f);
+
+    ASSERT_TRUE(g_cpu_conv.forward(
+        input->data(), weight->data(), bias->data(),
+        prompt_out->mutable_data(), chunk_state.data(),
+        prompt_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(g_cpu_conv.forward(
+        input->data() + static_cast<size_t>(prompt_len) * channels,
+        weight->data(), bias->data(),
+        suffix_out->mutable_data(), chunk_state.data(),
+        suffix_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    const int next_row = prompt_len + suffix_len;
+    ASSERT_TRUE(g_cpu_conv.forward(
+        input->data() + static_cast<size_t>(next_row) * channels,
+        weight->data(), bias->data(),
+        next_out->mutable_data(), chunk_state.data(),
+        next_len, channels, kernel_size,
+        /*apply_silu=*/true));
+
+    for (int t = 0; t < total_len; ++t)
+    {
+        ASSERT_TRUE(g_cpu_conv.forward(
+            input->data() + static_cast<size_t>(t) * channels,
+            weight->data(), bias->data(),
+            ref_out->mutable_data() + static_cast<size_t>(t) * channels,
+            ref_state.data(),
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+
+    const float *suffix = suffix_out->data();
+    const float *next = next_out->data();
+    const float *ref = ref_out->data();
+    for (int i = 0; i < suffix_len * channels; ++i)
+    {
+        EXPECT_NEAR(suffix[i], ref[static_cast<size_t>(prompt_len) * channels + i], 1e-6f)
+            << "suffix output mismatch at index " << i;
+    }
+    for (int c = 0; c < channels; ++c)
+    {
+        EXPECT_NEAR(next[c], ref[static_cast<size_t>(next_row) * channels + c], 1e-6f)
+            << "next output mismatch at channel " << c;
+    }
+    for (size_t i = 0; i < ref_state.size(); ++i)
+    {
+        EXPECT_NEAR(chunk_state[i], ref_state[i], 1e-6f)
+            << "conv state mismatch at index " << i;
+    }
+}
+
+TEST(Test__GDNKernels, Recurrence_PaddedPrefillStateMatchesUnpaddedDecode)
+{
+    const int real_len = 5;
+    const int bucket_len = 8;
+    const int n_heads = 2;
+    const int d_k = 4;
+    const int d_v = 3;
+    const int qk_dim = n_heads * d_k;
+    const int v_dim = n_heads * d_v;
+
+    auto fill_sequence = [](std::vector<float> &values, float scale, int real_len, int row_width)
+    {
+        for (int row = 0; row < static_cast<int>(values.size()) / row_width; ++row)
+        {
+            for (int col = 0; col < row_width; ++col)
+            {
+                values[static_cast<size_t>(row * row_width + col)] =
+                    row < real_len ? scale * static_cast<float>((row + 1) * (col + 2))
+                                   : 50.0f + scale * static_cast<float>(row * row_width + col);
+            }
+        }
+    };
+
+    std::vector<float> Q_bucket(static_cast<size_t>(bucket_len * qk_dim));
+    std::vector<float> K_bucket(static_cast<size_t>(bucket_len * qk_dim));
+    std::vector<float> V_bucket(static_cast<size_t>(bucket_len * v_dim));
+    std::vector<float> alpha_bucket(static_cast<size_t>(bucket_len * n_heads));
+    std::vector<float> beta_bucket(static_cast<size_t>(bucket_len * n_heads));
+    fill_sequence(Q_bucket, 0.011f, real_len, qk_dim);
+    fill_sequence(K_bucket, -0.009f, real_len, qk_dim);
+    fill_sequence(V_bucket, 0.013f, real_len, v_dim);
+    fill_sequence(alpha_bucket, 0.017f, real_len, n_heads);
+    fill_sequence(beta_bucket, -0.015f, real_len, n_heads);
+
+    std::vector<float> Q_real(Q_bucket.begin(), Q_bucket.begin() + real_len * qk_dim);
+    std::vector<float> K_real(K_bucket.begin(), K_bucket.begin() + real_len * qk_dim);
+    std::vector<float> V_real(V_bucket.begin(), V_bucket.begin() + real_len * v_dim);
+    std::vector<float> alpha_real(alpha_bucket.begin(), alpha_bucket.begin() + real_len * n_heads);
+    std::vector<float> beta_real(beta_bucket.begin(), beta_bucket.begin() + real_len * n_heads);
+    std::vector<float> Q_decode(qk_dim), K_decode(qk_dim), V_decode(v_dim), alpha_decode(n_heads), beta_decode(n_heads);
+    for (int i = 0; i < qk_dim; ++i)
+    {
+        Q_decode[static_cast<size_t>(i)] = 0.02f * static_cast<float>(i + 1);
+        K_decode[static_cast<size_t>(i)] = -0.018f * static_cast<float>(i + 2);
+    }
+    for (int i = 0; i < v_dim; ++i)
+        V_decode[static_cast<size_t>(i)] = 0.014f * static_cast<float>(i + 3);
+    for (int h = 0; h < n_heads; ++h)
+    {
+        alpha_decode[static_cast<size_t>(h)] = 0.07f * static_cast<float>(h + 1);
+        beta_decode[static_cast<size_t>(h)] = -0.04f * static_cast<float>(h + 1);
+    }
+
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto padded_q = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(qk_dim)}, Q_bucket.data());
+    auto padded_k = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(qk_dim)}, K_bucket.data());
+    auto padded_v = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(v_dim)}, V_bucket.data());
+    auto padded_alpha = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(n_heads)}, alpha_bucket.data());
+    auto padded_beta = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(n_heads)}, beta_bucket.data());
+    auto padded_out = makeFP32({static_cast<size_t>(bucket_len), static_cast<size_t>(v_dim)});
+    auto real_q = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(qk_dim)}, Q_real.data());
+    auto real_k = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(qk_dim)}, K_real.data());
+    auto real_v = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(v_dim)}, V_real.data());
+    auto real_alpha = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(n_heads)}, alpha_real.data());
+    auto real_beta = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(n_heads)}, beta_real.data());
+    auto real_out = makeFP32({static_cast<size_t>(real_len), static_cast<size_t>(v_dim)});
+    auto decode_q = makeFP32({1, static_cast<size_t>(qk_dim)}, Q_decode.data());
+    auto decode_k = makeFP32({1, static_cast<size_t>(qk_dim)}, K_decode.data());
+    auto decode_v = makeFP32({1, static_cast<size_t>(v_dim)}, V_decode.data());
+    auto decode_alpha = makeFP32({1, static_cast<size_t>(n_heads)}, alpha_decode.data());
+    auto decode_beta = makeFP32({1, static_cast<size_t>(n_heads)}, beta_decode.data());
+    auto padded_decode_out = makeFP32({1, static_cast<size_t>(v_dim)});
+    auto ref_decode_out = makeFP32({1, static_cast<size_t>(v_dim)});
+    std::vector<float> padded_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    std::vector<float> ref_state(static_cast<size_t>(n_heads * d_k * d_v), 0.0f);
+    auto ctx = makeCPUContext();
+
+    GDNRecurrenceStage::Params padded_params;
+    padded_params.device_id = DeviceId::cpu();
+    padded_params.Q = padded_q.get();
+    padded_params.K = padded_k.get();
+    padded_params.V = padded_v.get();
+    padded_params.alpha = padded_alpha.get();
+    padded_params.beta = padded_beta.get();
+    padded_params.A_log = A_log.get();
+    padded_params.dt_bias = dt_bias.get();
+    padded_params.output = padded_out.get();
+    padded_params.recurrence_state = padded_state.data();
+    padded_params.seq_len = bucket_len;
+    padded_params.n_heads = n_heads;
+    padded_params.d_k = d_k;
+    padded_params.d_v = d_v;
+    padded_params.chunk_size = 64;
+    padded_params.kernel = &g_cpu_gdn;
+    GDNRecurrenceStage padded_stage(padded_params);
+    IComputeStage::PrefillReplayParams replay;
+    replay.real_seq_len = real_len;
+    replay.bucket_seq_len = bucket_len;
+    padded_stage.updatePrefillReplayParams(replay);
+    ASSERT_TRUE(padded_stage.execute(ctx.get()));
+
+    GDNRecurrenceStage::Params ref_params = padded_params;
+    ref_params.Q = real_q.get();
+    ref_params.K = real_k.get();
+    ref_params.V = real_v.get();
+    ref_params.alpha = real_alpha.get();
+    ref_params.beta = real_beta.get();
+    ref_params.output = real_out.get();
+    ref_params.recurrence_state = ref_state.data();
+    ref_params.seq_len = real_len;
+    GDNRecurrenceStage ref_stage(ref_params);
+    ASSERT_TRUE(ref_stage.execute(ctx.get()));
+
+    GDNRecurrenceStage::Params padded_decode = padded_params;
+    padded_decode.Q = decode_q.get();
+    padded_decode.K = decode_k.get();
+    padded_decode.V = decode_v.get();
+    padded_decode.alpha = decode_alpha.get();
+    padded_decode.beta = decode_beta.get();
+    padded_decode.output = padded_decode_out.get();
+    padded_decode.seq_len = 1;
+    GDNRecurrenceStage padded_decode_stage(padded_decode);
+    ASSERT_TRUE(padded_decode_stage.execute(ctx.get()));
+
+    GDNRecurrenceStage::Params ref_decode = padded_decode;
+    ref_decode.output = ref_decode_out.get();
+    ref_decode.recurrence_state = ref_state.data();
+    GDNRecurrenceStage ref_decode_stage(ref_decode);
+    ASSERT_TRUE(ref_decode_stage.execute(ctx.get()));
+
+    const float *padded_decode_data = padded_decode_out->data();
+    const float *ref_decode_data = ref_decode_out->data();
+    for (int i = 0; i < v_dim; ++i)
+    {
+        EXPECT_NEAR(padded_decode_data[i], ref_decode_data[i], 1e-5f)
+            << "decode output mismatch at column " << i;
+    }
+    for (size_t i = 0; i < ref_state.size(); ++i)
+    {
+        EXPECT_NEAR(padded_state[i], ref_state[i], 1e-5f)
+            << "recurrence state mismatch at index " << i;
+    }
+
+    const float *padded_prefill = padded_out->data();
+    for (int i = real_len * v_dim; i < bucket_len * v_dim; ++i)
+        EXPECT_EQ(padded_prefill[i], 0.0f) << "padded recurrence output row must be inert";
+}
+
+#ifdef HAVE_ROCM
+TEST(Test__GDNKernels, ROCmMergedQKVDeinterleaveUsesModularQKTiling)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    struct StreamGuard
+    {
+        hipStream_t stream = nullptr;
+        ~StreamGuard()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+    } stream_guard{stream};
+
+    constexpr int seq_len = 1;
+    constexpr int n_k_heads = 2;
+    constexpr int n_v_heads = 6;
+    constexpr int d_k = 2;
+    constexpr int d_v = 2;
+    constexpr int q_src_dim = n_k_heads * d_k;
+    constexpr int k_src_dim = n_k_heads * d_k;
+    constexpr int v_dim = n_v_heads * d_v;
+    constexpr int qkv_cols = q_src_dim + k_src_dim + v_dim;
+    constexpr int q_dst_dim = n_v_heads * d_k;
+    constexpr int k_dst_dim = n_v_heads * d_k;
+    constexpr int scratch_elems = q_dst_dim + k_dst_dim + v_dim;
+
+    std::vector<float> merged_host(static_cast<size_t>(qkv_cols), 0.0f);
+    // Q heads: [10, 11], [20, 21]
+    merged_host[0] = 10.0f;
+    merged_host[1] = 11.0f;
+    merged_host[2] = 20.0f;
+    merged_host[3] = 21.0f;
+    // K heads: [30, 31], [40, 41]
+    merged_host[4] = 30.0f;
+    merged_host[5] = 31.0f;
+    merged_host[6] = 40.0f;
+    merged_host[7] = 41.0f;
+    for (int i = 0; i < v_dim; ++i)
+        merged_host[static_cast<size_t>(q_src_dim + k_src_dim + i)] = 100.0f + static_cast<float>(i);
+
+    auto merged = makeFP32({seq_len, qkv_cols}, merged_host.data());
+    auto scratch = makeFP32({static_cast<size_t>(scratch_elems)});
+    ASSERT_TRUE(merged->ensureOnDevice(device, stream));
+    ASSERT_TRUE(scratch->allocateOnDevice(device, stream));
+
+    auto *d_merged = static_cast<const float *>(merged->gpu_data_ptr());
+    auto *d_scratch = static_cast<float *>(scratch->gpu_data_ptr());
+    ASSERT_NE(d_merged, nullptr);
+    ASSERT_NE(d_scratch, nullptr);
+
+    ROCmGatedDeltaNet kernel(0);
+    kernel.setGPUStream(stream);
+    kernel.bindDeinterleaveWorkspace(d_scratch, scratch_elems);
+
+    float *d_q = nullptr;
+    float *d_k_out = nullptr;
+    float *d_v_out = nullptr;
+    ASSERT_TRUE(kernel.deinterleave_qkv_device(
+        d_merged, d_q, d_k_out, d_v_out,
+        seq_len, n_k_heads, n_v_heads, d_k, d_v,
+        /*global_v_head_offset=*/0));
+    ASSERT_EQ(d_q, d_scratch);
+    ASSERT_EQ(d_k_out, d_scratch + q_dst_dim);
+    ASSERT_EQ(d_v_out, d_scratch + q_dst_dim + k_dst_dim);
+
+    scratch->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(scratch->ensureOnHost(stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const std::vector<float> expected_q = {
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+        10.0f, 11.0f,
+        20.0f, 21.0f,
+    };
+    const std::vector<float> expected_k = {
+        30.0f, 31.0f,
+        40.0f, 41.0f,
+        30.0f, 31.0f,
+        40.0f, 41.0f,
+        30.0f, 31.0f,
+        40.0f, 41.0f,
+    };
+
+    const float *data = scratch->data();
+    for (size_t i = 0; i < expected_q.size(); ++i)
+        EXPECT_FLOAT_EQ(data[i], expected_q[i]) << "Q modular tiling mismatch at " << i;
+    for (size_t i = 0; i < expected_k.size(); ++i)
+        EXPECT_FLOAT_EQ(data[static_cast<size_t>(q_dst_dim) + i], expected_k[i])
+            << "K modular tiling mismatch at " << i;
+    for (int i = 0; i < v_dim; ++i)
+        EXPECT_FLOAT_EQ(data[static_cast<size_t>(q_dst_dim + k_dst_dim + i)],
+                        100.0f + static_cast<float>(i))
+            << "V straight-copy mismatch at " << i;
+}
+
+TEST(Test__GDNKernels, ROCmSequentialDecodeMatchesCPUReferenceQwen36Shape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    struct StreamGuard
+    {
+        hipStream_t stream = nullptr;
+        ~StreamGuard()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+    } stream_guard{stream};
+
+    const int seq_len = 4;
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t state_elems = static_cast<size_t>(n_heads) * d_k * d_v;
+
+    auto Q = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 1901);
+    auto K = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 1902);
+    auto V = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(v_stride)}, 0.0f, 0.08f, 1903);
+    auto alpha = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)}, -0.2f, 0.25f, 1904);
+    auto beta = makeFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(n_heads)}, 0.0f, 0.25f, 1905);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto output = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(v_stride)});
+
+    GDNReferenceResult reference;
+    ASSERT_TRUE(computeCPUSequentialGDNReference(
+        *Q, *K, *V, *alpha, *beta, *A_log, *dt_bias,
+        seq_len, n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true,
+        reference));
+
+    ASSERT_TRUE(Q->ensureOnDevice(device, stream));
+    ASSERT_TRUE(K->ensureOnDevice(device, stream));
+    ASSERT_TRUE(V->ensureOnDevice(device, stream));
+    ASSERT_TRUE(alpha->ensureOnDevice(device, stream));
+    ASSERT_TRUE(beta->ensureOnDevice(device, stream));
+    ASSERT_TRUE(A_log->ensureOnDevice(device, stream));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device, stream));
+    ASSERT_TRUE(output->allocateOnDevice(device, stream));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_output = static_cast<float *>(output->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_output, nullptr);
+
+    ROCmGatedDeltaNet kernel(0);
+    kernel.setGPUStream(stream);
+    for (int t = 0; t < seq_len; ++t)
+    {
+        ASSERT_TRUE(kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_output + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(output->ensureOnHost(stream));
+    std::vector<float> device_state(state_elems, 0.0f);
+    ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const float *out_data = output->data();
+    std::vector<float> device_output(out_data, out_data + static_cast<size_t>(seq_len) * v_stride);
+    expectVectorsNear(device_output, reference.output, "ROCm GDN sequential output", 5e-4f, 5e-4);
+    expectVectorsNear(device_state, reference.state, "ROCm GDN sequential state", 5e-4f, 5e-4);
+}
+
+TEST(Test__GDNKernels, ROCmPrefillThenDecodeMatchesCPUReferenceQwen36DenseShape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+    struct StreamGuard
+    {
+        hipStream_t stream = nullptr;
+        ~StreamGuard()
+        {
+            if (stream)
+                (void)hipStreamDestroy(stream);
+        }
+    } stream_guard{stream};
+
+    const int prefill_len = 9;
+    const int decode_len = 3;
+    const int total_len = prefill_len + decode_len;
+    const int n_heads = 48;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t output_elems =
+        static_cast<size_t>(total_len) * static_cast<size_t>(v_stride);
+    const size_t state_elems = static_cast<size_t>(n_heads) * d_k * d_v;
+
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 2901);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.08f, 2902);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)}, 0.0f, 0.08f, 2903);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.2f, 0.25f, 2904);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.25f, 2905);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto output = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+
+    GDNReferenceResult reference;
+    ASSERT_TRUE(computeCPUSequentialGDNReference(
+        *Q, *K, *V, *alpha, *beta, *A_log, *dt_bias,
+        total_len, n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true,
+        reference));
+
+    ASSERT_TRUE(Q->ensureOnDevice(device, stream));
+    ASSERT_TRUE(K->ensureOnDevice(device, stream));
+    ASSERT_TRUE(V->ensureOnDevice(device, stream));
+    ASSERT_TRUE(alpha->ensureOnDevice(device, stream));
+    ASSERT_TRUE(beta->ensureOnDevice(device, stream));
+    ASSERT_TRUE(A_log->ensureOnDevice(device, stream));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device, stream));
+    ASSERT_TRUE(output->allocateOnDevice(device, stream));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_output = static_cast<float *>(output->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_output, nullptr);
+
+    ROCmGatedDeltaNet kernel(0);
+    kernel.setGPUStream(stream);
+    ASSERT_TRUE(kernel.chunk_forward(
+        d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+        d_output, nullptr,
+        prefill_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    for (int t = prefill_len; t < total_len; ++t)
+    {
+        ASSERT_TRUE(kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_output + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(output->ensureOnHost(stream));
+    std::vector<float> device_state(state_elems, 0.0f);
+    ASSERT_TRUE(kernel.exportState(device_state.data(), nullptr, stream));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    const float *out_data = output->data();
+    std::vector<float> device_output(out_data, out_data + output_elems);
+    expectVectorsNear(device_output, reference.output, "ROCm GDN prefill+decode output Qwen3.6 dense shape", 7e-4f, 7e-4);
+    expectVectorsNear(device_state, reference.state, "ROCm GDN prefill+decode state Qwen3.6 dense shape", 7e-4f, 7e-4);
+}
+
+TEST(Test__GDNKernels, ROCmPrefillMatchesSequentialDecodeQwen35Shape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int prefill_len = 37;
+    const int total_len = prefill_len + 1;
+    const size_t qk_elems = static_cast<size_t>(total_len) * n_heads * d_k;
+    const size_t v_elems = static_cast<size_t>(total_len) * n_heads * d_v;
+    const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
+    const size_t output_elems = static_cast<size_t>(total_len) * n_heads * d_v;
+
+    // Use production head dimensions with deterministic small-magnitude inputs
+    // so the ROCm prefill recurrence can be compared against decode exactly.
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_k)}, 0.0f, 0.03f, 1101);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_k)}, 0.0f, 0.03f, 1102);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_v)}, 0.0f, 0.03f, 1103);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.15f, 0.2f, 1104);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.2f, 1105);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto prefill_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_v)});
+    auto decode_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(n_heads * d_v)});
+
+    ASSERT_EQ(Q->numel(), qk_elems);
+    ASSERT_EQ(K->numel(), qk_elems);
+    ASSERT_EQ(V->numel(), v_elems);
+    ASSERT_EQ(alpha->numel(), gate_elems);
+    ASSERT_EQ(beta->numel(), gate_elems);
+    ASSERT_EQ(prefill_out->numel(), output_elems);
+    ASSERT_EQ(decode_out->numel(), output_elems);
+
+    // Directly exercise the ROCm kernel implementation, bypassing stage
+    // orchestration so this test only covers recurrence state compatibility.
+    ASSERT_TRUE(Q->ensureOnDevice(device));
+    ASSERT_TRUE(K->ensureOnDevice(device));
+    ASSERT_TRUE(V->ensureOnDevice(device));
+    ASSERT_TRUE(alpha->ensureOnDevice(device));
+    ASSERT_TRUE(beta->ensureOnDevice(device));
+    ASSERT_TRUE(A_log->ensureOnDevice(device));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device));
+    ASSERT_TRUE(prefill_out->allocateOnDevice(device));
+    ASSERT_TRUE(decode_out->allocateOnDevice(device));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_prefill = static_cast<float *>(prefill_out->gpu_data_ptr());
+    auto *d_decode = static_cast<float *>(decode_out->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_prefill, nullptr);
+    ASSERT_NE(d_decode, nullptr);
+
+    // Path 1: prefill the prompt history, then decode one more token using the
+    // same ROCm kernel instance. This locks down the hidden GPU recurrence
+    // state that production decode consumes after prefill.
+    ROCmGatedDeltaNet prefill_kernel(0);
+    ASSERT_TRUE(prefill_kernel.chunk_forward(
+        d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+        d_prefill, nullptr, prefill_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    ASSERT_TRUE(prefill_kernel.recurrent_step(
+        d_Q + static_cast<size_t>(prefill_len) * qk_stride,
+        d_K + static_cast<size_t>(prefill_len) * qk_stride,
+        d_V + static_cast<size_t>(prefill_len) * v_stride,
+        d_alpha + static_cast<size_t>(prefill_len) * n_heads,
+        d_beta + static_cast<size_t>(prefill_len) * n_heads,
+        d_A_log,
+        d_dt_bias,
+        d_prefill + static_cast<size_t>(prefill_len) * v_stride,
+        nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+
+    // Path 2: independent decode kernel receives every token one at a time.
+    // Its outputs should match both the prefill history and the first decode
+    // token if prefill state writeback has the same semantics as recurrent_step().
+    ROCmGatedDeltaNet decode_kernel(0);
+    for (int t = 0; t < total_len; ++t)
+    {
+        ASSERT_TRUE(decode_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_decode + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    prefill_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    decode_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(prefill_out->ensureOnHost());
+    ASSERT_TRUE(decode_out->ensureOnHost());
+
+    // Compare both an absolute bound and a relative norm so a localized state
+    // mismatch and a broad scale drift both fail loudly.
+    const float *prefill = prefill_out->data();
+    const float *decode = decode_out->data();
+    float max_abs_diff = 0.0f;
+    double sum_sq_diff = 0.0;
+    double sum_sq_ref = 0.0;
+    for (size_t i = 0; i < output_elems; ++i)
+    {
+        const float diff = std::abs(prefill[i] - decode[i]);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        sum_sq_diff += static_cast<double>(diff) * diff;
+        sum_sq_ref += static_cast<double>(decode[i]) * decode[i];
+    }
+
+    const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+    EXPECT_LT(max_abs_diff, 2e-4f) << "ROCm GDN prefill must match recurrent decode at Qwen35 shape";
+    EXPECT_LT(rel_l2, 1e-4) << "ROCm GDN prefill must produce decode-compatible recurrent state";
+}
+
+TEST(Test__GDNKernels, ROCmChunkForwardFromNonZeroStateMatchesSequentialDecodeQwen35Shape)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int prompt_len = 11;
+    const int suffix_len = 2;
+    const int next_len = 1;
+    const int total_len = prompt_len + suffix_len + next_len;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t qk_elems = static_cast<size_t>(total_len) * qk_stride;
+    const size_t v_elems = static_cast<size_t>(total_len) * v_stride;
+    const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
+
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.03f, 1301);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.03f, 1302);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)}, 0.0f, 0.03f, 1303);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.15f, 0.2f, 1304);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.2f, 1305);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto prompt_out = makeFP32({static_cast<size_t>(prompt_len), static_cast<size_t>(v_stride)});
+    auto suffix_out = makeFP32({static_cast<size_t>(suffix_len), static_cast<size_t>(v_stride)});
+    auto next_out = makeFP32({static_cast<size_t>(next_len), static_cast<size_t>(v_stride)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+
+    ASSERT_EQ(Q->numel(), qk_elems);
+    ASSERT_EQ(K->numel(), qk_elems);
+    ASSERT_EQ(V->numel(), v_elems);
+    ASSERT_EQ(alpha->numel(), gate_elems);
+    ASSERT_EQ(beta->numel(), gate_elems);
+
+    ASSERT_TRUE(Q->ensureOnDevice(device));
+    ASSERT_TRUE(K->ensureOnDevice(device));
+    ASSERT_TRUE(V->ensureOnDevice(device));
+    ASSERT_TRUE(alpha->ensureOnDevice(device));
+    ASSERT_TRUE(beta->ensureOnDevice(device));
+    ASSERT_TRUE(A_log->ensureOnDevice(device));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device));
+    ASSERT_TRUE(prompt_out->allocateOnDevice(device));
+    ASSERT_TRUE(suffix_out->allocateOnDevice(device));
+    ASSERT_TRUE(next_out->allocateOnDevice(device));
+    ASSERT_TRUE(ref_out->allocateOnDevice(device));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_prompt = static_cast<float *>(prompt_out->gpu_data_ptr());
+    auto *d_suffix = static_cast<float *>(suffix_out->gpu_data_ptr());
+    auto *d_next = static_cast<float *>(next_out->gpu_data_ptr());
+    auto *d_ref = static_cast<float *>(ref_out->gpu_data_ptr());
+
+    ASSERT_NE(d_Q, nullptr);
+    ASSERT_NE(d_K, nullptr);
+    ASSERT_NE(d_V, nullptr);
+    ASSERT_NE(d_alpha, nullptr);
+    ASSERT_NE(d_beta, nullptr);
+    ASSERT_NE(d_A_log, nullptr);
+    ASSERT_NE(d_dt_bias, nullptr);
+    ASSERT_NE(d_prompt, nullptr);
+    ASSERT_NE(d_suffix, nullptr);
+    ASSERT_NE(d_next, nullptr);
+    ASSERT_NE(d_ref, nullptr);
+
+    ROCmGatedDeltaNet chunk_kernel(0);
+    ASSERT_TRUE(chunk_kernel.chunk_forward(
+        d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+        d_prompt, nullptr, prompt_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    ASSERT_TRUE(chunk_kernel.chunk_forward(
+        d_Q + static_cast<size_t>(prompt_len) * qk_stride,
+        d_K + static_cast<size_t>(prompt_len) * qk_stride,
+        d_V + static_cast<size_t>(prompt_len) * v_stride,
+        d_alpha + static_cast<size_t>(prompt_len) * n_heads,
+        d_beta + static_cast<size_t>(prompt_len) * n_heads,
+        d_A_log, d_dt_bias,
+        d_suffix, nullptr, suffix_len, n_heads, d_k, d_v,
+        /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+    const int next_row = prompt_len + suffix_len;
+    ASSERT_TRUE(chunk_kernel.recurrent_step(
+        d_Q + static_cast<size_t>(next_row) * qk_stride,
+        d_K + static_cast<size_t>(next_row) * qk_stride,
+        d_V + static_cast<size_t>(next_row) * v_stride,
+        d_alpha + static_cast<size_t>(next_row) * n_heads,
+        d_beta + static_cast<size_t>(next_row) * n_heads,
+        d_A_log, d_dt_bias,
+        d_next, nullptr,
+        n_heads, d_k, d_v,
+        /*use_qk_l2norm=*/true));
+
+    ROCmGatedDeltaNet ref_kernel(0);
+    for (int t = 0; t < total_len; ++t)
+    {
+        ASSERT_TRUE(ref_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(t) * qk_stride,
+            d_K + static_cast<size_t>(t) * qk_stride,
+            d_V + static_cast<size_t>(t) * v_stride,
+            d_alpha + static_cast<size_t>(t) * n_heads,
+            d_beta + static_cast<size_t>(t) * n_heads,
+            d_A_log, d_dt_bias,
+            d_ref + static_cast<size_t>(t) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+    }
+
+    suffix_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    next_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(suffix_out->ensureOnHost());
+    ASSERT_TRUE(next_out->ensureOnHost());
+    ASSERT_TRUE(ref_out->ensureOnHost());
+
+    const float *suffix = suffix_out->data();
+    const float *next = next_out->data();
+    const float *ref = ref_out->data();
+
+    float max_abs_diff = 0.0f;
+    double sum_sq_diff = 0.0;
+    double sum_sq_ref = 0.0;
+    for (int i = 0; i < suffix_len * v_stride; ++i)
+    {
+        const float expected = ref[static_cast<size_t>(prompt_len) * v_stride + i];
+        const float diff = std::abs(suffix[i] - expected);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        sum_sq_diff += static_cast<double>(diff) * diff;
+        sum_sq_ref += static_cast<double>(expected) * expected;
+    }
+    for (int i = 0; i < v_stride; ++i)
+    {
+        const float expected = ref[static_cast<size_t>(next_row) * v_stride + i];
+        const float diff = std::abs(next[i] - expected);
+        max_abs_diff = std::max(max_abs_diff, diff);
+        sum_sq_diff += static_cast<double>(diff) * diff;
+        sum_sq_ref += static_cast<double>(expected) * expected;
+    }
+
+    const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+    EXPECT_LT(max_abs_diff, 2e-4f) << "ROCm GDN suffix chunk from nonzero state must match sequential decode";
+    EXPECT_LT(rel_l2, 1e-4) << "ROCm GDN suffix chunk from nonzero state must preserve decode-compatible state";
+}
+
+TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossReplayLengths)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int n_heads = 16;
+    const int d_k = 128;
+    const int d_v = 128;
+    const int bucket_len = 41;
+    const int decode_row = bucket_len;
+    const int total_len = bucket_len + 1;
+    const int qk_stride = n_heads * d_k;
+    const int v_stride = n_heads * d_v;
+    const size_t qk_elems = static_cast<size_t>(total_len) * qk_stride;
+    const size_t v_elems = static_cast<size_t>(total_len) * v_stride;
+    const size_t gate_elems = static_cast<size_t>(total_len) * n_heads;
+    const size_t output_elems = static_cast<size_t>(total_len) * v_stride;
+
+    auto Q = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.025f, 2101);
+    auto K = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(qk_stride)}, 0.0f, 0.025f, 2102);
+    auto V = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)}, 0.0f, 0.025f, 2103);
+    auto alpha = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, -0.1f, 0.15f, 2104);
+    auto beta = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(n_heads)}, 0.0f, 0.15f, 2105);
+    auto A_log = makeFP32Const({static_cast<size_t>(n_heads)}, -0.5f);
+    auto dt_bias = makeFP32Const({static_cast<size_t>(n_heads)}, 0.1f);
+    auto padded_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(v_stride)});
+
+    ASSERT_EQ(Q->numel(), qk_elems);
+    ASSERT_EQ(K->numel(), qk_elems);
+    ASSERT_EQ(V->numel(), v_elems);
+    ASSERT_EQ(alpha->numel(), gate_elems);
+    ASSERT_EQ(beta->numel(), gate_elems);
+    ASSERT_EQ(padded_out->numel(), output_elems);
+    ASSERT_EQ(ref_out->numel(), output_elems);
+
+    ASSERT_TRUE(Q->ensureOnDevice(device));
+    ASSERT_TRUE(K->ensureOnDevice(device));
+    ASSERT_TRUE(V->ensureOnDevice(device));
+    ASSERT_TRUE(alpha->ensureOnDevice(device));
+    ASSERT_TRUE(beta->ensureOnDevice(device));
+    ASSERT_TRUE(A_log->ensureOnDevice(device));
+    ASSERT_TRUE(dt_bias->ensureOnDevice(device));
+    ASSERT_TRUE(padded_out->allocateOnDevice(device));
+    ASSERT_TRUE(ref_out->allocateOnDevice(device));
+
+    auto *d_Q = static_cast<const float *>(Q->gpu_data_ptr());
+    auto *d_K = static_cast<const float *>(K->gpu_data_ptr());
+    auto *d_V = static_cast<const float *>(V->gpu_data_ptr());
+    auto *d_alpha = static_cast<const float *>(alpha->gpu_data_ptr());
+    auto *d_beta = static_cast<const float *>(beta->gpu_data_ptr());
+    auto *d_A_log = static_cast<const float *>(A_log->gpu_data_ptr());
+    auto *d_dt_bias = static_cast<const float *>(dt_bias->gpu_data_ptr());
+    auto *d_padded = static_cast<float *>(padded_out->gpu_data_ptr());
+    auto *d_ref = static_cast<float *>(ref_out->gpu_data_ptr());
+
+    int *d_effective_len = nullptr;
+    ASSERT_EQ(hipMalloc(&d_effective_len, sizeof(int)), hipSuccess);
+
+    for (int real_len : {37, 31})
+    {
+        ASSERT_EQ(hipMemcpy(d_effective_len, &real_len, sizeof(int), hipMemcpyHostToDevice), hipSuccess);
+
+        ROCmGatedDeltaNet padded_kernel(0);
+        ASSERT_TRUE(padded_kernel.chunkForwardWithEffectiveSeqLen(
+            d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+            d_padded, nullptr, bucket_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true,
+            d_effective_len));
+        ASSERT_TRUE(padded_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(decode_row) * qk_stride,
+            d_K + static_cast<size_t>(decode_row) * qk_stride,
+            d_V + static_cast<size_t>(decode_row) * v_stride,
+            d_alpha + static_cast<size_t>(decode_row) * n_heads,
+            d_beta + static_cast<size_t>(decode_row) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_padded + static_cast<size_t>(decode_row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+
+        ROCmGatedDeltaNet ref_kernel(0);
+        ASSERT_TRUE(ref_kernel.chunk_forward(
+            d_Q, d_K, d_V, d_alpha, d_beta, d_A_log, d_dt_bias,
+            d_ref, nullptr, real_len, n_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/true));
+        ASSERT_TRUE(ref_kernel.recurrent_step(
+            d_Q + static_cast<size_t>(decode_row) * qk_stride,
+            d_K + static_cast<size_t>(decode_row) * qk_stride,
+            d_V + static_cast<size_t>(decode_row) * v_stride,
+            d_alpha + static_cast<size_t>(decode_row) * n_heads,
+            d_beta + static_cast<size_t>(decode_row) * n_heads,
+            d_A_log,
+            d_dt_bias,
+            d_ref + static_cast<size_t>(decode_row) * v_stride,
+            nullptr,
+            n_heads, d_k, d_v,
+            /*use_qk_l2norm=*/true));
+
+        padded_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ASSERT_TRUE(padded_out->ensureOnHost());
+        ASSERT_TRUE(ref_out->ensureOnHost());
+
+        const float *padded = padded_out->data() + static_cast<size_t>(decode_row) * v_stride;
+        const float *ref = ref_out->data() + static_cast<size_t>(decode_row) * v_stride;
+        float max_abs_diff = 0.0f;
+        double sum_sq_diff = 0.0;
+        double sum_sq_ref = 0.0;
+        for (int i = 0; i < v_stride; ++i)
+        {
+            const float diff = std::abs(padded[i] - ref[i]);
+            max_abs_diff = std::max(max_abs_diff, diff);
+            sum_sq_diff += static_cast<double>(diff) * diff;
+            sum_sq_ref += static_cast<double>(ref[i]) * ref[i];
+        }
+        const double rel_l2 = std::sqrt(sum_sq_diff / std::max(sum_sq_ref, 1e-30));
+        EXPECT_LT(max_abs_diff, 2e-4f) << "real_len=" << real_len;
+        EXPECT_LT(rel_l2, 1e-4) << "real_len=" << real_len;
+    }
+
+    hipFree(d_effective_len);
+}
+
+TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAcrossReplayLengths)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int channels = 32;
+    const int kernel_size = 4;
+    const int bucket_len = 17;
+    const int decode_row = bucket_len;
+    const int total_len = bucket_len + 1;
+    auto input = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(channels)}, 0.0f, 0.04f, 2201);
+    auto weight = makeFP32Random({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, 0.0f, 0.03f, 2202);
+    auto bias = makeFP32Random({static_cast<size_t>(channels)}, 0.0f, 0.01f, 2203);
+    auto padded_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(channels)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(channels)});
+
+    ASSERT_TRUE(input->ensureOnDevice(device));
+    ASSERT_TRUE(weight->ensureOnDevice(device));
+    ASSERT_TRUE(bias->ensureOnDevice(device));
+    ASSERT_TRUE(padded_out->allocateOnDevice(device));
+    ASSERT_TRUE(ref_out->allocateOnDevice(device));
+
+    auto *d_input = static_cast<const float *>(input->gpu_data_ptr());
+    auto *d_weight = static_cast<const float *>(weight->gpu_data_ptr());
+    auto *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+    auto *d_padded = static_cast<float *>(padded_out->gpu_data_ptr());
+    auto *d_ref = static_cast<float *>(ref_out->gpu_data_ptr());
+
+    int *d_effective_len = nullptr;
+    ASSERT_EQ(hipMalloc(&d_effective_len, sizeof(int)), hipSuccess);
+
+    for (int real_len : {13, 9})
+    {
+        ASSERT_EQ(hipMemcpy(d_effective_len, &real_len, sizeof(int), hipMemcpyHostToDevice), hipSuccess);
+
+        ROCmShortConvolution padded_kernel(0);
+        ASSERT_TRUE(padded_kernel.forwardWithEffectiveSeqLen(
+            d_input, d_weight, d_bias,
+            d_padded, nullptr,
+            bucket_len, channels, kernel_size,
+            d_effective_len,
+            /*apply_silu=*/true));
+        ASSERT_TRUE(padded_kernel.forward(
+            d_input + static_cast<size_t>(decode_row) * channels,
+            d_weight,
+            d_bias,
+            d_padded + static_cast<size_t>(decode_row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+
+        ROCmShortConvolution ref_kernel(0);
+        ASSERT_TRUE(ref_kernel.forward(
+            d_input, d_weight, d_bias,
+            d_ref, nullptr,
+            real_len, channels, kernel_size,
+            /*apply_silu=*/true));
+        ASSERT_TRUE(ref_kernel.forward(
+            d_input + static_cast<size_t>(decode_row) * channels,
+            d_weight,
+            d_bias,
+            d_ref + static_cast<size_t>(decode_row) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+
+        padded_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        ASSERT_TRUE(padded_out->ensureOnHost());
+        ASSERT_TRUE(ref_out->ensureOnHost());
+
+        const float *padded = padded_out->data() + static_cast<size_t>(decode_row) * channels;
+        const float *ref = ref_out->data() + static_cast<size_t>(decode_row) * channels;
+        for (int channel = 0; channel < channels; ++channel)
+        {
+            EXPECT_NEAR(padded[channel], ref[channel], 1e-5f)
+                << "real_len=" << real_len << " channel=" << channel;
+        }
+    }
+
+    hipFree(d_effective_len);
+}
+
+TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentialDecode)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    const int channels = 64;
+    const int kernel_size = 4;
+    const int prompt_len = 11;
+    const int suffix_len = 2;
+    const int next_len = 1;
+    const int total_len = prompt_len + suffix_len + next_len;
+
+    auto input = makeFP32Random({static_cast<size_t>(total_len), static_cast<size_t>(channels)}, 0.0f, 0.08f, 2401);
+    auto weight = makeFP32Random({static_cast<size_t>(channels), static_cast<size_t>(kernel_size)}, 0.0f, 0.05f, 2402);
+    auto bias = makeFP32Random({static_cast<size_t>(channels)}, 0.0f, 0.01f, 2403);
+    auto prompt_out = makeFP32({static_cast<size_t>(prompt_len), static_cast<size_t>(channels)});
+    auto suffix_out = makeFP32({static_cast<size_t>(suffix_len), static_cast<size_t>(channels)});
+    auto next_out = makeFP32({static_cast<size_t>(next_len), static_cast<size_t>(channels)});
+    auto ref_out = makeFP32({static_cast<size_t>(total_len), static_cast<size_t>(channels)});
+
+    ASSERT_TRUE(input->ensureOnDevice(device));
+    ASSERT_TRUE(weight->ensureOnDevice(device));
+    ASSERT_TRUE(bias->ensureOnDevice(device));
+    ASSERT_TRUE(prompt_out->allocateOnDevice(device));
+    ASSERT_TRUE(suffix_out->allocateOnDevice(device));
+    ASSERT_TRUE(next_out->allocateOnDevice(device));
+    ASSERT_TRUE(ref_out->allocateOnDevice(device));
+
+    auto *d_input = static_cast<const float *>(input->gpu_data_ptr());
+    auto *d_weight = static_cast<const float *>(weight->gpu_data_ptr());
+    auto *d_bias = static_cast<const float *>(bias->gpu_data_ptr());
+    auto *d_prompt = static_cast<float *>(prompt_out->gpu_data_ptr());
+    auto *d_suffix = static_cast<float *>(suffix_out->gpu_data_ptr());
+    auto *d_next = static_cast<float *>(next_out->gpu_data_ptr());
+    auto *d_ref = static_cast<float *>(ref_out->gpu_data_ptr());
+    ASSERT_NE(d_input, nullptr);
+    ASSERT_NE(d_weight, nullptr);
+    ASSERT_NE(d_bias, nullptr);
+    ASSERT_NE(d_prompt, nullptr);
+    ASSERT_NE(d_suffix, nullptr);
+    ASSERT_NE(d_next, nullptr);
+    ASSERT_NE(d_ref, nullptr);
+
+    ROCmShortConvolution chunk_kernel(0);
+    ASSERT_TRUE(chunk_kernel.forward(
+        d_input, d_weight, d_bias,
+        d_prompt, nullptr,
+        prompt_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    ASSERT_TRUE(chunk_kernel.forward(
+        d_input + static_cast<size_t>(prompt_len) * channels,
+        d_weight, d_bias,
+        d_suffix, nullptr,
+        suffix_len, channels, kernel_size,
+        /*apply_silu=*/true));
+    const int next_row = prompt_len + suffix_len;
+    ASSERT_TRUE(chunk_kernel.forward(
+        d_input + static_cast<size_t>(next_row) * channels,
+        d_weight, d_bias,
+        d_next, nullptr,
+        next_len, channels, kernel_size,
+        /*apply_silu=*/true));
+
+    ROCmShortConvolution ref_kernel(0);
+    for (int t = 0; t < total_len; ++t)
+    {
+        ASSERT_TRUE(ref_kernel.forward(
+            d_input + static_cast<size_t>(t) * channels,
+            d_weight, d_bias,
+            d_ref + static_cast<size_t>(t) * channels,
+            nullptr,
+            1, channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+
+    suffix_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    next_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ref_out->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    ASSERT_TRUE(suffix_out->ensureOnHost());
+    ASSERT_TRUE(next_out->ensureOnHost());
+    ASSERT_TRUE(ref_out->ensureOnHost());
+
+    const float *suffix = suffix_out->data();
+    const float *next = next_out->data();
+    const float *ref = ref_out->data();
+    for (int i = 0; i < suffix_len * channels; ++i)
+    {
+        EXPECT_NEAR(suffix[i], ref[static_cast<size_t>(prompt_len) * channels + i], 1e-5f)
+            << "suffix output mismatch at index " << i;
+    }
+    for (int c = 0; c < channels; ++c)
+    {
+        EXPECT_NEAR(next[c], ref[static_cast<size_t>(next_row) * channels + c], 1e-5f)
+            << "next output mismatch at channel " << c;
+    }
+}
+
+TEST(Test__GDNKernels, ROCmProjectionDecodeAllNativeCodebooksMatchesReference)
+{
+    int device_count = 0;
+    ASSERT_EQ(hipGetDeviceCount(&device_count), hipSuccess);
+    if (device_count <= 0)
+        GTEST_SKIP() << "No ROCm device available";
+
+    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+
+    ScopedEnvVar concurrent_decode("LLAMINAR_ROCM_CONCURRENT_DECODE");
+    ScopedEnvVar gdn_concurrent_decode("LLAMINAR_ROCM_GDN_CONCURRENT_DECODE");
+    ScopedEnvVar forced_kb("LLAMINAR_ROCM_NVNNI_GEMV_KB");
+    concurrent_decode.set("0");
+    gdn_concurrent_decode.set("0");
+    forced_kb.set("8");
+
+    const int M = 1;
+    const int K = 256;
+    const int n_heads = 16;
+    const int d_k = 32;
+    const int d_v = 32;
+    const int n_qkv = 2 * n_heads * d_k + n_heads * d_v;
+    const int n_z = n_heads * d_v;
+    const int n_a = n_heads;
+    const int n_b = n_heads;
+    const std::array<int, 4> projection_sizes = {n_qkv, n_z, n_a, n_b};
+
+    for (const auto &fmt : ALL_GDN_PROJECTION_CODEBOOKS)
+    {
+        std::array<std::unique_ptr<GDNProjectionBundle>, 4> bundles;
+        WorkspaceRequirements combined_requirements;
+
+        for (size_t projection = 0; projection < bundles.size(); ++projection)
+        {
+            auto bundle = std::make_unique<GDNProjectionBundle>();
+            const int rows = projection_sizes[projection];
+            bundle->weights = fmt.create(static_cast<size_t>(rows), static_cast<size_t>(K));
+            ASSERT_NE(bundle->weights, nullptr)
+                << fmt.name << ": failed to create projection " << projection << " weights";
+
+            bundle->weights_fp32.resize(static_cast<size_t>(rows) * K);
+            bundle->weights->to_fp32(bundle->weights_fp32.data());
+
+            ASSERT_TRUE(rocm::packNativeVNNI(bundle->weights.get(), bundle->packed))
+                << fmt.name << ": native-VNNI pack failed for projection " << projection;
+            ASSERT_FALSE(bundle->packed.native_vnni_payload.empty())
+                << fmt.name << ": native-VNNI payload missing for projection " << projection;
+
+            bundle->kernel = std::make_unique<rocm::ROCmQuantisedGemmKernel>(&bundle->packed, 0);
+            combined_requirements.merge(bundle->kernel->getWorkspaceRequirements(M, rows, K));
+            bundles[projection] = std::move(bundle);
+        }
+
+        DeviceWorkspaceManager workspace(device, 128 * 1024 * 1024);
+        ASSERT_TRUE(workspace.allocate(combined_requirements))
+            << fmt.name << ": failed to allocate GDN projection workspace";
+        for (auto &bundle : bundles)
+            bundle->kernel->bindWorkspace(&workspace);
+
+        auto input = test::TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -0.75f, 0.75f, 2601);
+        auto out_qkv = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_qkv)});
+        auto out_z = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_z)});
+        auto out_a = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_a)});
+        auto out_b = test::TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(n_b)});
+
+        ASSERT_TRUE(input->ensureOnDevice(device));
+        ASSERT_TRUE(out_qkv->allocateOnDevice(device));
+        ASSERT_TRUE(out_z->allocateOnDevice(device));
+        ASSERT_TRUE(out_a->allocateOnDevice(device));
+        ASSERT_TRUE(out_b->allocateOnDevice(device));
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {bundles[0]->kernel.get(), out_qkv.get(), n_qkv, nullptr, "qkv"},
+            {bundles[1]->kernel.get(), out_z.get(), n_z, nullptr, "z"},
+            {bundles[2]->kernel.get(), out_a.get(), n_a, nullptr, "alpha"},
+            {bundles[3]->kernel.get(), out_b.get(), n_b, nullptr, "beta"},
+        };
+
+        ASSERT_TRUE(bundles[0]->kernel->multiply_fused_tensor(
+            input.get(), projections, M, K, nullptr, &workspace))
+            << fmt.name << ": fused GDN projection failed";
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        out_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        out_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        out_a->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+        out_b->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+
+        const float *input_host = input->data();
+        std::vector<float> expected;
+        expected.reserve(static_cast<size_t>(n_qkv + n_z + n_a + n_b));
+        for (size_t projection = 0; projection < bundles.size(); ++projection)
+        {
+            appendCpuGDNProjectionReference(
+                input_host,
+                bundles[projection]->weights_fp32,
+                projection_sizes[projection],
+                K,
+                expected);
+        }
+
+        std::vector<float> actual;
+        actual.reserve(expected.size());
+        appendTensorData(out_qkv.get(), n_qkv, actual);
+        appendTensorData(out_z.get(), n_z, actual);
+        appendTensorData(out_a.get(), n_a, actual);
+        appendTensorData(out_b.get(), n_b, actual);
+
+        ASSERT_EQ(actual.size(), expected.size());
+        const float cosine = vectorCosine(actual, expected);
+        const float rel_l2 = vectorRelativeL2(actual, expected);
+        const float max_abs = vectorMaxAbsDiff(actual, expected);
+        const float max_ref_abs = vectorMaxAbsValue(expected);
+        const float max_abs_ratio = max_abs / std::max(max_ref_abs, 1e-6f);
+
+        LOG_INFO("[GDNProjectionNativeVNNI] " << fmt.name
+                                              << " cosine=" << cosine
+                                              << " rel_l2=" << rel_l2
+                                              << " max_abs=" << max_abs
+                                              << " max_abs_ratio=" << max_abs_ratio);
+
+        EXPECT_GT(cosine, fmt.min_cosine)
+            << fmt.name << ": GDN fused projection accuracy below threshold";
+        EXPECT_LT(rel_l2, 0.05f)
+            << fmt.name << ": GDN fused projection relative error too large";
+        EXPECT_LT(max_abs_ratio, 0.02f)
+            << fmt.name << ": GDN fused projection localized error too large";
+
+        for (auto &bundle : bundles)
+            bundle->kernel->unbindWorkspace();
+    }
+}
+#endif
 
 TEST(Test__GDNKernels, Recurrence_L2Norm)
 {

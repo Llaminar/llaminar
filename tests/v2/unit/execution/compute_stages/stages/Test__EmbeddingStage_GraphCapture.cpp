@@ -14,7 +14,9 @@
 
 #include "backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
+#include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
+#include "../../../../utils/TestTensorFactory.h"
 
 namespace llaminar2
 {
@@ -131,6 +133,48 @@ namespace llaminar2
 
             EXPECT_GT(cosineSimilarity(expected_second, second_run, static_cast<size_t>(d_model_)), 0.999999);
             EXPECT_GT(maxAbsDiff(first_run.data(), second_run, static_cast<size_t>(d_model_)), 1e-5);
+        }
+
+        TEST_F(Test__EmbeddingStage_GraphCapture, QuantizedGpuEmbeddingRequiresPreparedStoreRef)
+        {
+            auto embed_table = test::TestTensorFactory::createQ8_0Random({64, static_cast<size_t>(d_model_)});
+            auto output = std::make_unique<FP32Tensor>(std::vector<size_t>{1, static_cast<size_t>(d_model_)});
+            std::vector<int> token_ids = {7};
+
+            EmbeddingStage::Params params;
+            params.embed_table = embed_table.get();
+            params.token_ids = token_ids.data();
+            params.output = output.get();
+            params.num_tokens = 1;
+            params.d_model = d_model_;
+            params.vocab_size = 64;
+            params.device_id = DeviceId::cuda(0);
+
+            EmbeddingStage missing(params);
+            std::string error;
+            EXPECT_FALSE(missing.validatePreparedWeights(&error));
+            EXPECT_NE(error.find("PreparedWeightStore"), std::string::npos);
+
+            PreparedWeightStore store(ModelContextId{99});
+            WeightBinding binding;
+            binding.binding_id = 21;
+            binding.identity = makeSourceWeightIdentity("token_embd.weight", ModelContextId{99}, 21);
+            binding.identity.role = WeightRole::Embedding;
+            binding.residency.home_device = DeviceId::cuda(0);
+            binding.residency.resident_device = DeviceId::cuda(0);
+            binding.tensor = embed_table.get();
+            binding.immutable = true;
+
+            PreparedEmbeddingHandle handle;
+            handle.tensor = embed_table.get();
+            handle.device_id = DeviceId::cuda(0);
+
+            params.prepared_ref = store.registerPreparedEmbeddingFromPipeline(
+                binding, DeviceId::cuda(0), &handle);
+            params.prepared_store = &store;
+
+            EmbeddingStage prepared(params);
+            EXPECT_TRUE(prepared.validatePreparedWeights(&error));
         }
     }
 }

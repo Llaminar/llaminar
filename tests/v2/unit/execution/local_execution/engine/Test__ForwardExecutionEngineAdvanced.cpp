@@ -16,6 +16,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <cstring>
 #include <vector>
 #include <string>
@@ -54,6 +55,8 @@ namespace
         int build_calls = 0;
         int get_context_calls = 0;
         int ensure_workspace_calls = 0;
+        int last_workspace_seq_len = -1;
+        uint64_t workspace_generation = 0;
         int sync_logits_calls = 0;
         int logits_tensor_calls = 0;
         int build_decode_policy_calls = 0;
@@ -62,6 +65,8 @@ namespace
 
         // ----- Configurable Behavior -----
         bool build_should_fail = false;
+        bool all_position_logits = false;
+        int all_position_logit_rows = 0;
         int graph_node_count = 3; // Stages in built graph (0 = empty)
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
@@ -92,8 +97,8 @@ namespace
                 auto stage = std::make_unique<llaminar2::testing::MockComputeStage>(
                     ComputeStageType::GEMM,
                     "stage_" + std::to_string(i),
-                    DeviceId::cpu());
-                graph.addNode("node_" + std::to_string(i), std::move(stage), DeviceId::cpu());
+                    input.device);
+                graph.addNode("node_" + std::to_string(i), std::move(stage), input.device);
             }
 
             return GraphBuildResult(std::move(graph), output);
@@ -116,11 +121,18 @@ namespace
             return result;
         }
 
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override
+        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &, int workspace_seq_len) override
         {
             ensure_workspace_calls++;
+            last_workspace_seq_len = workspace_seq_len;
             call_sequence.push_back("ensureWorkspace");
             return true;
+        }
+
+        uint64_t workspaceGeneration(DeviceId device) const override
+        {
+            (void)device;
+            return workspace_generation;
         }
 
         void syncLogitsAtBoundary(IDeviceContext *ctx) override
@@ -154,6 +166,16 @@ namespace
             return mock_pp_copy;
         }
 
+        bool computeAllPositionLogitsEnabled() const override
+        {
+            return all_position_logits;
+        }
+
+        int allPositionLogitRows() const override
+        {
+            return all_position_logit_rows;
+        }
+
     private:
         IDeviceContext *ctx_;
     };
@@ -167,18 +189,21 @@ namespace
         std::vector<int> positions;
         ForwardInput input;
 
-        TestInput(int seq_len, int batch_size = 1, DeviceId device = DeviceId::cpu())
+        TestInput(int seq_len,
+                  int batch_size = 1,
+                  DeviceId device = DeviceId::cpu(),
+                  int position_offset = 0)
             : tokens(seq_len * batch_size, 42), positions(seq_len * batch_size)
         {
             for (int i = 0; i < seq_len * batch_size; ++i)
-                positions[i] = i % seq_len;
+                positions[i] = position_offset + (i % seq_len);
 
             input.seq_len = seq_len;
             input.batch_size = batch_size;
             input.device = device;
             input.token_ids = tokens.data();
             input.position_ids = positions.data();
-            input.position_offset = 0;
+            input.position_offset = position_offset;
         }
     };
 
@@ -265,6 +290,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, CacheMiss_WorkspaceEnsured)
     engine.execute(ti.input, output, host);
 
     EXPECT_GE(host.ensure_workspace_calls, 1);
+    EXPECT_EQ(host.last_workspace_seq_len, 1);
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, CacheMiss_SyncLogitsCalled)
@@ -336,21 +362,247 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillThenDecode_TwoSeparateBuilds
 TEST_F(Test__ForwardExecutionEngineAdvanced, SameDecodeShape_CacheHitOnSecondCall)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
-    TrackingHost host(&mock_ctx_);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
     host.graph_node_count = 3;
 
     // First decode: cache miss → build
-    TestInput decode1(1);
+    TestInput decode1(1, 1, DeviceId::cuda(0));
     ForwardOutput output{};
     engine.execute(decode1.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
     EXPECT_FALSE(engine.cacheEmpty());
 
     // Second decode (same shape): should be cache hit → no build
-    TestInput decode2(1);
+    TestInput decode2(1, 1, DeviceId::cuda(0));
     engine.execute(decode2.input, output, host);
     // On cache HIT, buildForwardGraph is NOT called
     EXPECT_EQ(host.build_calls, 1) << "Second decode with same shape should hit cache";
+    EXPECT_EQ(host.ensure_workspace_calls, 2)
+        << "Cache hits must rebind workspace in case another cached bucket replaced it";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, ShortContinuationDecodeShapeCachesForMTPVerifier)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
+    host.graph_node_count = 3;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(2, 1, DeviceId::cuda(0), /*position_offset=*/128);
+    engine.execute(verifier1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+    EXPECT_FALSE(engine.cacheEmpty());
+
+    TestInput verifier2(2, 1, DeviceId::cuda(0), /*position_offset=*/130);
+    engine.execute(verifier2.input, output, host);
+    EXPECT_EQ(host.build_calls, 1)
+        << "Two-token verifier continuations should reuse the decode graph cache";
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "Fixed two-token verifier continuations should be eligible for decode graph capture";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, FourTokenAllPositionVerifierUsesDecodeCache)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(4, 1, DeviceId::cuda(0), /*position_offset=*/128);
+    engine.execute(verifier1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput verifier2(4, 1, DeviceId::cuda(0), /*position_offset=*/132);
+    engine.execute(verifier2.input, output, host);
+    EXPECT_EQ(host.build_calls, 1)
+        << "M=4 all-position verifier continuations should reuse the decode graph cache";
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "M=4 verifier continuations should be eligible for decode graph capture";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, AllPositionVerifierExposesLastExecutedGraphView)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(4, 1, DeviceId::cpu(), /*position_offset=*/128);
+    ASSERT_TRUE(engine.execute(verifier1.input, output, host));
+
+    auto first_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(first_view.has_value());
+    ASSERT_TRUE(*first_view);
+    EXPECT_EQ(first_view->graph->size(), 3u);
+    EXPECT_FALSE(first_view->cache_hit);
+    EXPECT_TRUE(first_view->is_decode);
+    EXPECT_TRUE(first_view->all_position_logits);
+    EXPECT_EQ(first_view->signature.seq_len, 4);
+    EXPECT_EQ(first_view->device, DeviceId::cpu());
+
+    TestInput verifier2(4, 1, DeviceId::cpu(), /*position_offset=*/132);
+    ASSERT_TRUE(engine.execute(verifier2.input, output, host));
+
+    auto second_view = engine.lastExecutedForwardGraph();
+    ASSERT_TRUE(second_view.has_value());
+    ASSERT_TRUE(*second_view);
+    EXPECT_TRUE(second_view->cache_hit);
+    EXPECT_TRUE(second_view->is_decode);
+    EXPECT_TRUE(second_view->all_position_logits);
+    EXPECT_EQ(second_view->signature.seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, FailedForwardClearsLastExecutedGraphView)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier(4, 1, DeviceId::cpu(), /*position_offset=*/128);
+    ASSERT_TRUE(engine.execute(verifier.input, output, host));
+    ASSERT_TRUE(engine.lastExecutedForwardGraph().has_value());
+
+    host.build_should_fail = true;
+    TestInput failing_prefill(8, 1, DeviceId::cpu(), /*position_offset=*/0);
+    EXPECT_FALSE(engine.execute(failing_prefill.input, output, host));
+    EXPECT_FALSE(engine.lastExecutedForwardGraph().has_value());
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, ThreeTokenAllPositionVerifierUsesDecodeCache)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    TrackingHost host(&gpu_ctx);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    TestInput verifier1(3, 1, DeviceId::cuda(0), /*position_offset=*/128);
+    engine.execute(verifier1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput verifier2(3, 1, DeviceId::cuda(0), /*position_offset=*/131);
+    engine.execute(verifier2.input, output, host);
+    EXPECT_EQ(host.build_calls, 1)
+        << "M=3 all-position verifier continuations should reuse the decode graph cache";
+    EXPECT_GT(host.build_decode_policy_calls, 0)
+        << "M=3 verifier continuations should be eligible for decode graph capture";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, TwoTokenPromptWithoutHistoryDoesNotUseDecodeCache)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+
+    ForwardOutput output{};
+
+    TestInput prompt1(2);
+    engine.execute(prompt1.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput prompt2(2);
+    engine.execute(prompt2.input, output, host);
+    EXPECT_EQ(host.build_calls, 2)
+        << "A two-token prompt at position zero is prefill, not verifier decode";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, AllPositionVerifierLogitsUseSeparateDecodeCacheKey)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+
+    ForwardOutput output{};
+
+    TestInput terminal_only(2, 1, DeviceId::cpu(), /*position_offset=*/128);
+    host.all_position_logits = false;
+    engine.execute(terminal_only.input, output, host);
+    EXPECT_EQ(host.build_calls, 1);
+
+    TestInput all_positions1(2, 1, DeviceId::cpu(), /*position_offset=*/130);
+    host.all_position_logits = true;
+    engine.execute(all_positions1.input, output, host);
+    EXPECT_EQ(host.build_calls, 2)
+        << "Verifier all-position logits need a graph with a different LM-head contract";
+
+    TestInput all_positions2(2, 1, DeviceId::cpu(), /*position_offset=*/132);
+    engine.execute(all_positions2.input, output, host);
+    EXPECT_EQ(host.build_calls, 2)
+        << "The all-position verifier graph should then hit its own cache entry";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, RowIndexedVerifierRowCountUsesSeparateDecodeCacheKey)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+    host.all_position_logits = true;
+
+    ForwardOutput output{};
+
+    // A row-indexed verifier graph has the same input sequence shape as the
+    // full verifier, but the LM-head input/output rows are compacted to the
+    // active MTP depth. Cache keys must include that row count so a depth-2
+    // graph can never be replayed for a depth-3 verifier.
+    host.all_position_logit_rows = 2;
+    TestInput depth2_a(3, 1, DeviceId::cpu(), /*position_offset=*/128);
+    ASSERT_TRUE(engine.execute(depth2_a.input, output, host));
+    EXPECT_EQ(host.build_calls, 1);
+
+    host.all_position_logit_rows = 3;
+    TestInput depth3(3, 1, DeviceId::cpu(), /*position_offset=*/131);
+    ASSERT_TRUE(engine.execute(depth3.input, output, host));
+    EXPECT_EQ(host.build_calls, 2)
+        << "Changing compact verifier row count must build a separate graph";
+
+    host.all_position_logit_rows = 2;
+    TestInput depth2_b(3, 1, DeviceId::cpu(), /*position_offset=*/134);
+    ASSERT_TRUE(engine.execute(depth2_b.input, output, host));
+    EXPECT_EQ(host.build_calls, 2)
+        << "Returning to the depth-2 row-indexed shape should hit its cache entry";
+}
+
+TEST_F(Test__ForwardExecutionEngineAdvanced, ResetSessionReplayState_PreservesCachedGraphAndResetsStages)
+{
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    TrackingHost host(&mock_ctx_);
+    host.graph_node_count = 3;
+
+    TestInput decode1(1);
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(decode1.input, output, host));
+    ASSERT_EQ(host.build_calls, 1);
+    ASSERT_FALSE(engine.cacheEmpty());
+
+    engine.resetSessionReplayState();
+
+    int reset_count = 0;
+    engine.forEachCachedStage(ComputeStageType::GEMM, [&](IComputeStage *stage)
+                              {
+        auto *mock_stage = dynamic_cast<llaminar2::testing::MockComputeStage *>(stage);
+        ASSERT_NE(mock_stage, nullptr);
+        reset_count += mock_stage->resetSessionStateCount(); });
+    EXPECT_EQ(reset_count, 3)
+        << "Request reset must clear cached stage state without dropping the graph";
+    EXPECT_FALSE(engine.cacheEmpty());
+
+    TestInput decode2(1);
+    ASSERT_TRUE(engine.execute(decode2.input, output, host));
+    EXPECT_EQ(host.build_calls, 1)
+        << "The next same-shape decode should reuse the cached graph after reset";
 }
 
 TEST_F(Test__ForwardExecutionEngineAdvanced, CachingDisabled_AlwaysBuilds)
@@ -530,7 +782,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, InvalidateAll_ForcesRebuild)
     EXPECT_EQ(host.build_calls, 2) << "invalidateAll should force rebuild";
 }
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, ClearCache_ForcesRebuild)
+TEST_F(Test__ForwardExecutionEngineAdvanced, DiscardAllCachedGraphs_ForcesRebuild)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -542,7 +794,7 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ClearCache_ForcesRebuild)
     engine.execute(t1.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
 
-    engine.clearCache();
+    engine.discardAllCachedGraphs();
     EXPECT_TRUE(engine.cacheEmpty());
 
     TestInput t2(1);
@@ -551,10 +803,10 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, ClearCache_ForcesRebuild)
 }
 
 // =========================================================================
-// Multiple Seq Lengths Have Separate Cache Entries
+// Prefill is not cached; decode is cached
 // =========================================================================
 
-TEST_F(Test__ForwardExecutionEngineAdvanced, DifferentSeqLens_SeparateCacheEntries)
+TEST_F(Test__ForwardExecutionEngineAdvanced, PrefillRebuilds_DecodeCaches)
 {
     auto engine = makeEngine(/*cache_enabled=*/true);
     TrackingHost host(&mock_ctx_);
@@ -567,20 +819,22 @@ TEST_F(Test__ForwardExecutionEngineAdvanced, DifferentSeqLens_SeparateCacheEntri
     engine.execute(prefill.input, output, host);
     EXPECT_EQ(host.build_calls, 1);
 
+    // Same prefill shape should rebuild. Caching prefill graphs retains large
+    // per-prompt activation state and causes server memory growth across
+    // different chat requests.
+    TestInput prefill2(100);
+    engine.execute(prefill2.input, output, host);
+    EXPECT_EQ(host.build_calls, 2) << "Prefill graphs should not be cached";
+
     // Decode with 1 token
     TestInput decode(1);
     engine.execute(decode.input, output, host);
-    EXPECT_EQ(host.build_calls, 2);
-
-    // Prefill again with 100 tokens — should hit cache
-    TestInput prefill2(100);
-    engine.execute(prefill2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Same prefill shape should hit cache";
+    EXPECT_EQ(host.build_calls, 3);
 
     // Decode again — should hit cache
     TestInput decode2(1);
     engine.execute(decode2.input, output, host);
-    EXPECT_EQ(host.build_calls, 2) << "Same decode shape should hit cache";
+    EXPECT_EQ(host.build_calls, 3) << "Same decode shape should hit cache";
 }
 
 // =========================================================================

@@ -135,6 +135,33 @@ TEST(Test__ConfigValidator, DefaultConfig_NoErrors)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
+TEST(Test__ConfigValidator, MoE_DefaultExpertParallel_NoErrors)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.moe_expert_mode = MoEExpertMode::ExpertParallel;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
+TEST(Test__ConfigValidator, MoE_ReplicatedExperts_NoErrors)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.moe_expert_mode = MoEExpertMode::Replicated;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
+TEST(Test__ConfigValidator, MoE_TensorParallelExperts_NotImplemented)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.moe_expert_mode = MoEExpertMode::TensorParallel;
+
+    EXPECT_TRUE(ruleFiresFor(v, "moe-tensor-parallel-experts-not-implemented", cfg));
+}
+
 TEST(Test__ConfigValidator, StandardValidator_HasRules)
 {
     auto v = ConfigValidator::createStandard();
@@ -288,6 +315,36 @@ TEST(Test__ConfigValidator, MutualExclusion_Device_SimpleTP)
     cfg.tp_degree = 2;
 
     EXPECT_TRUE(ruleFiresFor(v, "device-simple-tp-conflict", cfg));
+}
+
+TEST(Test__ConfigValidator, NodeLocalTPAutoPickWithoutDeviceIsValid)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.tp_degree = 2;
+    cfg.tp_scope = TPScope::NODE_LOCAL;
+    cfg.pp_degree = 1;
+    cfg.default_backend = CollectiveBackendType::MPI;
+
+    EXPECT_TRUE(noErrors(v, cfg));
+}
+
+TEST(Test__ConfigValidator, NodeLocalTPWithExplicitCPUDeviceMapIsValid)
+{
+    auto v = ConfigValidator::createStandard();
+    auto cfg = makeClean();
+    cfg.device_mode = DeviceAssignmentMode::EXPLICIT;
+    cfg.device_map = {
+        {0, GlobalDeviceAddress::cpu(0)},
+        {1, GlobalDeviceAddress::cpu(1)},
+    };
+    cfg.device_map_numa_explicit = {{0, true}, {1, true}};
+    cfg.tp_degree = 2;
+    cfg.tp_scope = TPScope::NODE_LOCAL;
+    cfg.pp_degree = 1;
+    cfg.default_backend = CollectiveBackendType::MPI;
+
+    EXPECT_TRUE(noErrors(v, cfg));
 }
 
 TEST(Test__ConfigValidator, MutualExclusion_Device_DeviceMap)
@@ -643,4 +700,51 @@ TEST(Test__ConfigValidator, Integration_OrchestrationConfig_Validate_StillChecks
         }
     }
     EXPECT_TRUE(found_tp) << "Existing TP degree validation should still fire";
+}
+
+TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleDevice)
+{
+    OrchestrationConfig cfg;
+    cfg.device_for_this_rank = GlobalDeviceAddress::cuda(0);
+    cfg.moe_expert_parallel_plan = std::make_shared<MoEExpertParallelPlan>();
+    cfg.moe_expert_parallel_plan->enabled = true;
+    cfg.moe_expert_parallel_plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+    cfg.moe_expert_parallel_plan->continuation_domain = "cuda_fast";
+    cfg.moe_expert_parallel_plan->shared_expert_domain = "cuda_fast";
+    cfg.moe_expert_parallel_plan->domains = {
+        ExpertComputeDomain{
+            .name = "cuda_fast",
+            .kind = ExpertDomainKind::SingleDevice,
+            .backend = CollectiveBackendType::AUTO,
+            .participants = {GlobalDeviceAddress::cuda(0)},
+            .owner_rank = 0,
+            .compute_kind = ExpertDomainComputeKind::ReplicatedExperts,
+        },
+        ExpertComputeDomain{
+            .name = "cpu_cold",
+            .kind = ExpertDomainKind::NodeLocalTP,
+            .backend = CollectiveBackendType::UPI,
+            .participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
+            .world_ranks = {0, 1},
+            .compute_kind = ExpertDomainComputeKind::TensorParallelExperts,
+        },
+    };
+    cfg.moe_expert_parallel_plan->routed_tiers = {
+        ExpertRoutedTier{.name = "fast", .domain = "cuda_fast", .priority = 0},
+        ExpertRoutedTier{.name = "cold", .domain = "cpu_cold", .priority = 1, .fallback = true},
+    };
+
+    const auto errors = cfg.validate();
+
+    bool found_overlay_conflict = false;
+    for (const auto &error : errors)
+    {
+        if (error.find("Conflicting options: --device/-d cuda:0 and --moe-expert-overlay-continuation cuda_fast") != std::string::npos)
+        {
+            found_overlay_conflict = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found_overlay_conflict) << "Expected exact overlay root placement conflict; first error: "
+                                        << (errors.empty() ? "<none>" : errors.front());
 }

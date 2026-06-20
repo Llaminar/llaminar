@@ -113,6 +113,49 @@ __global__ void applyScaling_full_kernel(
     }
 }
 
+__global__ void applyFp32Epilogue_kernel(
+    float* __restrict__ d_output,
+    const float* __restrict__ d_bias,
+    int M, int N,
+    float alpha)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    const int col = idx % N;
+    float result = alpha * d_output[idx];
+    if (d_bias != nullptr)
+    {
+        result += d_bias[col];
+    }
+    d_output[idx] = result;
+}
+
+__global__ void applyFp32CombineEpilogue_kernel(
+    const float* d_computed,
+    float* d_output,
+    const float* d_existing,
+    const float* __restrict__ d_bias,
+    int M, int N,
+    float alpha, float beta)
+{
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = M * N;
+    if (idx >= total) return;
+
+    const int col = idx % N;
+    float result = alpha * d_computed[idx];
+    if (beta != 0.0f && d_existing != nullptr)
+    {
+        result += beta * d_existing[idx];
+    }
+    if (d_bias != nullptr)
+    {
+        result += d_bias[col];
+    }
+    d_output[idx] = result;
+}
 // ============================================================================
 // Vectorized Scaling Kernel with 1D Flat Grid (M > 1 fast path)
 // ============================================================================
@@ -382,8 +425,13 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
     {
         local_max = fmaxf(local_max, __shfl_down(local_max, offset));
     }
-    // Broadcast max from sub-group lane 0 to all 32 threads
-    local_max = __shfl(local_max, sub_group * QUANT_BLOCK);
+    // Broadcast from the lane-0 thread inside this 32-thread logical block.
+    // HIP shuffles address lanes within the current wavefront, not within the
+    // full 256-thread workgroup. BLOCKS_PER_WG=8 spans four wave64 wavefronts,
+    // so groups 2..7 must wrap their source lane back to 0 or 32 in their own
+    // wave. Using the block-global source lane corrupts scales for later groups.
+    const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
+    local_max = __shfl(local_max, source_lane_in_wave);
 
     float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
     float inv_scale = 1.0f / scale;
@@ -400,6 +448,80 @@ void quantizeActivationsQ8_blockwise_v2_kernel(
         int q = static_cast<int>(rintf(val * inv_scale));
         q = max(-127, min(127, q));
         dst[sub_tid] = static_cast<int8_t>(q);
+    }
+}
+
+template <int BLOCKS_PER_WG = 8>
+__global__ __launch_bounds__(256, 4)
+void quantizeActivationsQ8_blockwise_v2_with_sums_kernel(
+    const float *__restrict__ d_A_fp32,
+    int8_t *__restrict__ d_A_int8,
+    float *__restrict__ d_scales,
+    int32_t *__restrict__ d_sums,
+    int M, int K, int blocks_per_row, int total_blocks)
+{
+    constexpr int QUANT_BLOCK = 32;
+    const int tid = threadIdx.x;
+    const int sub_group = tid / QUANT_BLOCK;
+    const int sub_tid = tid & (QUANT_BLOCK - 1);
+
+    const int global_block = blockIdx.x * BLOCKS_PER_WG + sub_group;
+    if (global_block >= total_blocks)
+        return;
+
+    const int row = global_block / blocks_per_row;
+    const int block_idx = global_block % blocks_per_row;
+    if (row >= M)
+        return;
+
+    const int k_start = block_idx * QUANT_BLOCK;
+    const int k_end = min(k_start + QUANT_BLOCK, K);
+    const int block_len = k_end - k_start;
+
+    const float *src = d_A_fp32 + static_cast<size_t>(row) * K + k_start;
+    int8_t *dst = d_A_int8 + static_cast<size_t>(row) * K + k_start;
+
+    float val = 0.0f;
+    float local_max = 0.0f;
+    if (sub_tid < block_len)
+    {
+        val = src[sub_tid];
+        local_max = fabsf(val);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+    // See quantizeActivationsQ8_blockwise_v2_kernel: source lanes are
+    // wave-local, while sub_group is workgroup-local.
+    const int source_lane_in_wave = (sub_group & 1) * QUANT_BLOCK;
+    local_max = __shfl(local_max, source_lane_in_wave);
+
+    float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    float inv_scale = 1.0f / scale;
+
+    int q = 0;
+    if (sub_tid < block_len)
+    {
+        q = static_cast<int>(rintf(val * inv_scale));
+        q = max(-127, min(127, q));
+        dst[sub_tid] = static_cast<int8_t>(q);
+    }
+
+    int q_sum = q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        q_sum += __shfl_down(q_sum, offset);
+    }
+
+    if (sub_tid == 0)
+    {
+        const size_t out_idx = static_cast<size_t>(row) * blocks_per_row + block_idx;
+        d_scales[out_idx] = scale;
+        d_sums[out_idx] = q_sum;
     }
 }
 
@@ -568,6 +690,84 @@ void quantizeActivationsQ8_blockwise_v4_kernel(
     {
         int q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
         dst[tid] = static_cast<int8_t>(q);
+    }
+}
+
+/**
+ * Variant V4 with activation sums.
+ *
+ * This is the decode-equivalent grouped-verifier quantizer.  Serial ROCm
+ * decode (`M=1`) uses `quantizeActivationsQ8_blockwise_v4_kernel`, then the
+ * native-VNNI GEMV recomputes the activation sum from the quantized int8
+ * block when an asymmetric codebook needs it.  Grouped verifier rows need the
+ * same sum, but precomputing it is cheaper than recomputing it for every
+ * projection.  Keeping the max/scale/rounding sequence byte-for-byte aligned
+ * with V4 prevents tiny activation-scale differences from growing through the
+ * recurrent verifier graph.
+ */
+__global__ __launch_bounds__(32, 8)
+void quantizeActivationsQ8_blockwise_v4_with_sums_kernel(
+    const float *__restrict__ d_A_fp32,
+    int8_t *__restrict__ d_A_int8,
+    float *__restrict__ d_scales,
+    int32_t *__restrict__ d_sums,
+    int M, int K, int blocks_per_row)
+{
+    constexpr int QUANT_BLOCK = 32;
+    const int global_block = blockIdx.x;
+    const int row = global_block / blocks_per_row;
+    const int block_idx = global_block % blocks_per_row;
+
+    if (row >= M)
+        return;
+
+    const int tid = threadIdx.x;
+    const int k_start = block_idx * QUANT_BLOCK;
+    const int k_end = min(k_start + QUANT_BLOCK, K);
+    const int block_len = k_end - k_start;
+
+    const float *src = d_A_fp32 + static_cast<size_t>(row) * K + k_start;
+    int8_t *dst = d_A_int8 + static_cast<size_t>(row) * K + k_start;
+
+    float val = 0.0f;
+    float local_max = 0.0f;
+    if (tid < block_len)
+    {
+        val = src[tid];
+        local_max = fabsf(val);
+    }
+
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+    }
+    local_max = __shfl(local_max, 0);
+
+    const float scale = (local_max > 0.0f) ? (local_max / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+
+    int q = 0;
+    if (tid < block_len)
+    {
+        q = max(-127, min(127, static_cast<int>(rintf(val * inv_scale))));
+        dst[tid] = static_cast<int8_t>(q);
+    }
+
+    int q_sum = q;
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+    {
+        q_sum += __shfl_down(q_sum, offset);
+    }
+
+    if (tid == 0)
+    {
+        const size_t out_idx =
+            static_cast<size_t>(row) * static_cast<size_t>(blocks_per_row) +
+            static_cast<size_t>(block_idx);
+        d_scales[out_idx] = scale;
+        d_sums[out_idx] = q_sum;
     }
 }
 
@@ -1120,6 +1320,56 @@ extern "C"
         return true;
     }
 
+    bool rocmQuantGemm_quantizeActivationsBlockwiseWithSums(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_blockwise,
+        int32_t *d_sums_blockwise,
+        int M, int K,
+        int rocm_device_id, void *stream,
+        int block_size)
+    {
+        if (!d_sums_blockwise)
+        {
+            return rocmQuantGemm_quantizeActivationsBlockwise(
+                d_A_fp32, d_A_int8, d_scales_blockwise,
+                M, K, rocm_device_id, stream, block_size);
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (M <= 0 || K <= 0)
+            return true;
+
+        if (block_size != 32)
+        {
+            fprintf(stderr,
+                    "[rocmQuantGemm_quantizeActivationsBlockwiseWithSums] block_size=%d is unsupported; expected 32 (M=%d K=%d)\n",
+                    block_size, M, K);
+            return false;
+        }
+
+        constexpr int QUANT_BLOCK = 32;
+        const int blocks_per_row = (K + QUANT_BLOCK - 1) / QUANT_BLOCK;
+        const int total_blocks = M * blocks_per_row;
+        hipLaunchKernelGGL(
+            quantizeActivationsQ8_blockwise_v4_with_sums_kernel,
+            dim3(total_blocks, 1, 1), dim3(32, 1, 1), 0, static_cast<hipStream_t>(stream),
+            d_A_fp32, d_A_int8, d_scales_blockwise, d_sums_blockwise,
+            M, K, blocks_per_row);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_quantizeActivationsBlockwiseWithSums] Kernel launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+
+        return true;
+    }
+
     // =========================================================================
     // MEMORY MANAGEMENT UTILITIES
     // =========================================================================
@@ -1441,6 +1691,94 @@ extern "C"
         return true;
     }
 
+    bool rocmQuantGemm_applyFp32Epilogue(
+        float *d_output,
+        const float *d_bias,
+        int M, int N,
+        float alpha,
+        int rocm_device_id, void* stream)
+    {
+        if (!d_output)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32Epilogue] Null output pointer\n");
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (alpha == 1.0f && d_bias == nullptr)
+            return true;
+
+        const int block_size = 256;
+        const int total = M * N;
+        const int grid_size = (total + block_size - 1) / block_size;
+        hipLaunchKernelGGL(
+            applyFp32Epilogue_kernel,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+            d_output, d_bias, M, N, alpha);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32Epilogue] Kernel launch failed: %s (M=%d, N=%d)\n",
+                    hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool rocmQuantGemm_applyFp32CombineEpilogue(
+        const float *d_computed,
+        float *d_output,
+        const float *d_existing,
+        const float *d_bias,
+        int M, int N,
+        float alpha, float beta,
+        int rocm_device_id, void *stream)
+    {
+        if (!d_computed || !d_output)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] Null pointer: d_computed=%p d_output=%p\n",
+                    (const void *)d_computed, (void *)d_output);
+            return false;
+        }
+
+        if (beta != 0.0f && d_existing == nullptr)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] d_existing required when beta != 0 (M=%d N=%d)\n",
+                    M, N);
+            return false;
+        }
+
+        if (!rocmQuantGemm_setDevice(rocm_device_id))
+            return false;
+
+        if (d_computed == d_output && beta == 0.0f)
+        {
+            return rocmQuantGemm_applyFp32Epilogue(
+                d_output, d_bias, M, N, alpha, rocm_device_id, stream);
+        }
+
+        const int block_size = 256;
+        const int total = M * N;
+        const int grid_size = (total + block_size - 1) / block_size;
+        hipLaunchKernelGGL(
+            applyFp32CombineEpilogue_kernel,
+            dim3(grid_size), dim3(block_size), 0, static_cast<hipStream_t>(stream),
+            d_computed, d_output, d_existing, d_bias, M, N, alpha, beta);
+
+        hipError_t err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmQuantGemm_applyFp32CombineEpilogue] Kernel launch failed: %s (M=%d, N=%d)\n",
+                    hipGetErrorString(err), M, N);
+            return false;
+        }
+
+        return true;
+    }
     // =========================================================================
     // WEIGHT-ONLY SCALING EPILOGUE (for blockwise activation-scaled GEMM)
     // =========================================================================

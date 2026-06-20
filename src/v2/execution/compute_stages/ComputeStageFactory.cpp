@@ -8,17 +8,24 @@
 #include "stages/AllGatherVStage.h"
 #include "stages/AllreduceStage.h"
 #include "stages/AttentionComputeStage.h"
-#include "stages/AttentionWithKVCacheStage.h"
 #include "stages/FusedGateUpGEMMStage.h"
 #include "stages/FusedQKVGEMMStage.h"
 #include "stages/GEMMStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
+#include "stages/HiddenStateRowSelectStage.h"
+#include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
-#include "stages/MoEStages.h"
+#include "stages/MoEExpertDispatchStage.h"
+#include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoELocalExpertStage.h"
+#include "stages/MoESparseDispatchStage.h"
+#include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
-#include "stages/RMSNormStage.h"\n #include "stages/QKNormStage.h"
+#include "stages/RMSNormStage.h"
+#include "stages/QKNormStage.h"
 #include "stages/RoPEStage.h"
 #include "stages/SendActivationsStage.h"
 #include "stages/GDNProjectionStage.h"
@@ -89,25 +96,70 @@ namespace llaminar2
         return std::make_unique<FusedResidualNormStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERouter(
-        const MoERouterStage::Params &params)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createFusedAddAllreduce(
+        const FusedAddAllreduceStage::Params &params)
     {
-        // Unified: MoERouterStage will use KernelFactory at execute-time
-        return std::make_unique<MoERouterStage>(params);
+        return std::make_unique<FusedAddAllreduceStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpert(
-        const MoEExpertStage::Params &params)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertCompute(
+        const MoEExpertComputeStage::Params &params)
     {
-        // Unified: MoEExpertStage will use KernelFactory at execute-time
-        return std::make_unique<MoEExpertStage>(params);
+        return std::make_unique<MoEExpertComputeStage>(params);
     }
 
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoECombine(
-        const MoECombineStage::Params &params)
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEFFN(
+        const MoEExpertComputeStage::Params &params)
     {
-        // Unified: MoECombineStage will use KernelFactory at execute-time
-        return std::make_unique<MoECombineStage>(params);
+        return std::make_unique<MoEExpertComputeStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoERouting(
+        const MoERoutingStage::Params &params)
+    {
+        return std::make_unique<MoERoutingStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertDispatch(
+        const MoEExpertDispatchStage::Params &params)
+    {
+        return std::make_unique<MoEExpertDispatchStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEExpertParallelReduce(
+        const MoEExpertParallelReduceStage::Params &params)
+    {
+        return std::make_unique<MoEExpertParallelReduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoESparseDispatch(
+        const MoESparseDispatchStage::Params &params)
+    {
+        return std::make_unique<MoESparseDispatchStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoELocalExpert(
+        const MoELocalExpertStage::Params &params)
+    {
+        return std::make_unique<MoELocalExpertStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoESparseReturnReduce(
+        const MoESparseReturnReduceStage::Params &params)
+    {
+        return std::make_unique<MoESparseReturnReduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(
+        const SharedExpertFFNStage::Params &params)
+    {
+        return std::make_unique<SharedExpertFFNStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertGate(
+        const SharedExpertGateStage::Params &params)
+    {
+        return std::make_unique<SharedExpertGateStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAllreduce(
@@ -143,13 +195,6 @@ namespace llaminar2
     {
         // ReceiveActivations is backend-agnostic (uses MPI point-to-point)
         return std::make_unique<ReceiveActivationsStage>(params);
-    }
-
-    std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionWithKVCache(
-        const AttentionWithKVCacheStage::Params &params)
-    {
-        // Unified: AttentionWithKVCacheStage uses KernelFactory at execute-time
-        return std::make_unique<AttentionWithKVCacheStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createKVCacheAppend(
@@ -213,6 +258,12 @@ namespace llaminar2
         return std::make_unique<QGateSplitStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMTPConcat(
+        const MTPConcatStage::Params &params)
+    {
+        return std::make_unique<MTPConcatStage>(params);
+    }
+
     // =============================================================================
     // Model-Level Stage Factories
     // =============================================================================
@@ -221,6 +272,18 @@ namespace llaminar2
         const EmbeddingStage::Params &params)
     {
         return std::make_unique<EmbeddingStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createHiddenStateRowSelect(
+        const HiddenStateRowSelectStage::Params &params)
+    {
+        return std::make_unique<HiddenStateRowSelectStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createHiddenStateRowsSelect(
+        const HiddenStateRowsSelectStage::Params &params)
+    {
+        return std::make_unique<HiddenStateRowsSelectStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createLMHead(

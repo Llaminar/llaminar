@@ -201,49 +201,61 @@ namespace llaminar2
 
     Q8_1Tensor::~Q8_1Tensor()
     {
-        // Destructor
+        // Pre-destroy heap vectors to avoid glibc free(): invalid pointer crash
+        // during implicit member destruction of large 3D MoE expert weight tensors.
+        // See Q4_KTensor teardown investigation for details.
+        { std::vector<uint8_t>().swap(raw_data_); }
+        { std::vector<size_t>().swap(shape_); }
     }
 
     std::shared_ptr<TensorBase> Q8_1Tensor::create_view(
         const std::vector<size_t> &new_shape,
         size_t offset)
     {
-        // Validate 2D shape
+        // Validate: view must be 2D
         if (new_shape.size() != 2)
         {
-            LOG_ERROR("[Q8_1Tensor::create_view] ERROR: View must be 2D (got "
-                      << new_shape.size() << "D)");
-            return nullptr;
+            throw std::invalid_argument("Q8_1Tensor::create_view: only 2D views supported");
         }
 
-        // Validate K dimension matches (row-slice only)
-        if (new_shape[1] != shape_[1])
+        // Compute effective 2D layout (supports both 2D and 3D parents).
+        // GGUF 3D: shape=[ne0, ne1, ne2] where ne0=cols (fastest), ne2=outermost.
+        // Flattened to 2D [ne1*ne2, ne0] = [total_rows, K].
+        size_t K, total_rows;
+        if (shape_.size() == 2)
         {
-            LOG_ERROR("[Q8_1Tensor::create_view] ERROR: View must preserve K dimension\n"
-                      << "  Parent K: " << shape_[1] << ", View K: " << new_shape[1]);
-            return nullptr;
+            K = shape_[1];
+            total_rows = shape_[0];
+        }
+        else if (shape_.size() == 3)
+        {
+            // GGUF 3D: shape = [ne[0], ne[1], ne[2]], ne[0] is fastest-varying (cols/K)
+            K = shape_[0];
+            total_rows = shape_[1] * shape_[2];
+        }
+        else
+        {
+            throw std::invalid_argument("Q8_1Tensor::create_view: parent must be 2D or 3D");
         }
 
-        size_t K = shape_[1];
+        // Validation: K dimension must match
+        if (new_shape[1] != K)
+        {
+            throw std::invalid_argument("Q8_1Tensor::create_view: K dimension must match parent");
+        }
 
-        // Validate offset is row-aligned
+        // Validation: offset must be row-aligned
         if (offset % K != 0)
         {
-            LOG_ERROR("[Q8_1Tensor::create_view] ERROR: Offset must be row-aligned (multiple of K="
-                      << K << ")\n"
-                      << "  Got offset: " << offset);
-            return nullptr;
+            throw std::invalid_argument("Q8_1Tensor::create_view: offset must be row-aligned");
         }
 
-        // Validate bounds
+        // Validation: bounds check
         size_t start_row = offset / K;
         size_t view_rows = new_shape[0];
-        if (start_row + view_rows > shape_[0])
+        if (start_row + view_rows > total_rows)
         {
-            LOG_ERROR("[Q8_1Tensor::create_view] ERROR: View exceeds parent bounds\n"
-                      << "  Parent rows: " << shape_[0] << ", Start row: " << start_row
-                      << ", View rows: " << view_rows);
-            return nullptr;
+            throw std::out_of_range("Q8_1Tensor::create_view: view exceeds parent bounds");
         }
 
         // Calculate byte offset
@@ -252,29 +264,21 @@ namespace llaminar2
         size_t byte_offset = block_offset * sizeof(Q8_1Block);
 
         // Determine root parent
-        std::shared_ptr<TensorBase> root_parent;
         const uint8_t *root_data_ptr;
         size_t root_byte_offset;
+        std::shared_ptr<TensorBase> root_parent;
 
         if (is_view_)
         {
-            root_parent = parent_;
             root_data_ptr = raw_data_ptr_;
             root_byte_offset = view_byte_offset_ + byte_offset;
+            root_parent = parent_;
         }
         else
         {
-            try
-            {
-                root_parent = shared_from_this();
-            }
-            catch (const std::bad_weak_ptr &e)
-            {
-                LOG_ERROR("[Q8_1Tensor::create_view] ERROR: shared_from_this() failed");
-                return nullptr;
-            }
             root_data_ptr = raw_data_.data();
             root_byte_offset = byte_offset;
+            root_parent = std::static_pointer_cast<TensorBase>(shared_from_this());
         }
 
         return std::shared_ptr<Q8_1Tensor>(new Q8_1Tensor(

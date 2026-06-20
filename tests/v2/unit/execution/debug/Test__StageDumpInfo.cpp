@@ -13,7 +13,6 @@
  * - ResidualAddStage
  * - AllreduceStage
  * - AllGatherStage
- * - MoERouterStage, MoEExpertStage, MoECombineStage
  * - KVCacheAppendStage, KVCacheGatherStage
  * - AttentionComputeStage
  * - EmbeddingStage
@@ -397,132 +396,6 @@ TEST_F(StageDumpInfoTest, AllGatherStage_GetDumpInfo)
 }
 
 // =============================================================================
-// MoERouterStage Tests
-// =============================================================================
-
-TEST_F(StageDumpInfoTest, MoERouterStage_GetDumpInfo)
-{
-    int seq_len = 16;
-    int d_model = 256;
-    int num_experts = 8;
-
-    auto hidden = TestTensorFactory::createFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-    auto gate_weights = TestTensorFactory::createFP32Random({static_cast<size_t>(d_model), static_cast<size_t>(num_experts)});
-    auto router_logits = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(num_experts)});
-
-    MoERouterStage::Params params;
-    params.hidden = hidden.get();
-    params.gate_weights = gate_weights.get();
-    params.router_logits = router_logits.get();
-    params.seq_len = seq_len;
-    params.d_model = d_model;
-    params.num_experts = num_experts;
-
-    MoERouterStage stage(params);
-    StageDumpInfo info = stage.getDumpInfo();
-
-    // Check scalars
-    EXPECT_TRUE(hasScalar(info, "seq_len"));
-    EXPECT_TRUE(hasScalar(info, "d_model"));
-    EXPECT_TRUE(hasScalar(info, "num_experts"));
-
-    // Check inputs/outputs
-    EXPECT_TRUE(hasInput(info, "hidden"));
-    EXPECT_TRUE(hasWeight(info, "gate_weights"));
-    EXPECT_TRUE(hasOutput(info, "router_logits"));
-}
-
-// =============================================================================
-// MoEExpertStage Tests
-// =============================================================================
-
-TEST_F(StageDumpInfoTest, MoEExpertStage_GetDumpInfo)
-{
-    int d_model = 256;
-    int intermediate_dim = 512;
-    int num_tokens = 8;
-    int expert_id = 3;
-
-    auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(num_tokens), static_cast<size_t>(d_model)});
-    auto output = TestTensorFactory::createFP32({static_cast<size_t>(num_tokens), static_cast<size_t>(d_model)});
-    auto gate_w = TestTensorFactory::createFP32Random({static_cast<size_t>(d_model), static_cast<size_t>(intermediate_dim)});
-    auto up_w = TestTensorFactory::createFP32Random({static_cast<size_t>(d_model), static_cast<size_t>(intermediate_dim)});
-    auto down_w = TestTensorFactory::createFP32Random({static_cast<size_t>(intermediate_dim), static_cast<size_t>(d_model)});
-
-    MoEExpertStage::Params params;
-    params.expert_id = expert_id;
-    params.input = input.get();
-    params.output = output.get();
-    params.gate_w = gate_w.get();
-    params.up_w = up_w.get();
-    params.down_w = down_w.get();
-    params.d_model = d_model;
-    params.intermediate_dim = intermediate_dim;
-
-    MoEExpertStage stage(params);
-    StageDumpInfo info = stage.getDumpInfo();
-
-    // Check scalars
-    EXPECT_TRUE(hasScalar(info, "expert_id"));
-    EXPECT_TRUE(hasScalar(info, "d_model"));
-    EXPECT_TRUE(hasScalar(info, "intermediate_dim"));
-    EXPECT_EQ(getScalarInt(info, "expert_id"), expert_id);
-
-    // Check inputs/weights/outputs
-    EXPECT_TRUE(hasInput(info, "input"));
-    EXPECT_TRUE(hasWeight(info, "gate_w"));
-    EXPECT_TRUE(hasWeight(info, "up_w"));
-    EXPECT_TRUE(hasWeight(info, "down_w"));
-    EXPECT_TRUE(hasOutput(info, "output"));
-}
-
-// =============================================================================
-// MoECombineStage Tests
-// =============================================================================
-
-TEST_F(StageDumpInfoTest, MoECombineStage_GetDumpInfo)
-{
-    int seq_len = 16;
-    int d_model = 256;
-    int top_k = 2;
-
-    auto output = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-
-    // Create some expert outputs
-    std::vector<std::unique_ptr<FP32Tensor>> expert_outputs_storage;
-    std::vector<const ITensor *> expert_outputs;
-    for (int i = 0; i < top_k; ++i)
-    {
-        auto expert_out = TestTensorFactory::createFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
-        expert_outputs.push_back(expert_out.get());
-        expert_outputs_storage.push_back(std::move(expert_out));
-    }
-
-    MoECombineStage::Params params;
-    params.expert_outputs = &expert_outputs;
-    params.output = output.get();
-    params.seq_len = seq_len;
-    params.d_model = d_model;
-    params.top_k = top_k;
-
-    MoECombineStage stage(params);
-    StageDumpInfo info = stage.getDumpInfo();
-
-    // Check scalars
-    EXPECT_TRUE(hasScalar(info, "seq_len"));
-    EXPECT_TRUE(hasScalar(info, "d_model"));
-    EXPECT_TRUE(hasScalar(info, "top_k"));
-    EXPECT_EQ(getScalarInt(info, "top_k"), top_k);
-
-    // Check outputs
-    EXPECT_TRUE(hasOutput(info, "output"));
-
-    // Check expert inputs (named expert_output_0, expert_output_1, etc.)
-    EXPECT_TRUE(hasInput(info, "expert_output_0"));
-    EXPECT_TRUE(hasInput(info, "expert_output_1"));
-}
-
-// =============================================================================
 // KVCacheAppendStage Tests
 // =============================================================================
 
@@ -779,6 +652,44 @@ TEST_F(StageDumpInfoTest, LMHeadStage_GetDumpInfo)
 
     // Check outputs
     EXPECT_TRUE(hasOutput(info, "logits"));
+}
+
+TEST_F(StageDumpInfoTest, LMHeadStage_ComputeAllPositionsDumpInfoUsesFullRows)
+{
+    int seq_len = 4;
+    int d_model = 32;
+    int vocab_size = 128;
+
+    auto hidden_states = TestTensorFactory::createFP32Random({static_cast<size_t>(seq_len), static_cast<size_t>(d_model)});
+    auto lm_head_weight = TestTensorFactory::createFP32Random({static_cast<size_t>(vocab_size), static_cast<size_t>(d_model)});
+    auto logits = TestTensorFactory::createFP32({static_cast<size_t>(seq_len), static_cast<size_t>(vocab_size)});
+
+    LMHeadStage::Params params;
+    params.hidden_states = hidden_states.get();
+    params.lm_head_weight = lm_head_weight.get();
+    params.logits = logits.get();
+    params.seq_len = seq_len;
+    params.d_model = d_model;
+    params.vocab_size = vocab_size;
+    params.compute_all_positions = true;
+
+    LMHeadStage stage(params);
+    StageDumpInfo info = stage.getDumpInfo();
+
+    const StageDumpInfo::OutputBuffer *logits_output = nullptr;
+    for (const auto &output : info.outputs)
+    {
+        if (std::string(output.name) == "logits")
+        {
+            logits_output = &output;
+            break;
+        }
+    }
+
+    ASSERT_NE(logits_output, nullptr);
+    EXPECT_EQ(logits_output->rows, static_cast<size_t>(seq_len));
+    EXPECT_EQ(logits_output->cols, static_cast<size_t>(vocab_size));
+    EXPECT_TRUE(hasScalar(info, "compute_all_positions"));
 }
 
 // =============================================================================

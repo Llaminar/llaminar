@@ -163,7 +163,7 @@ namespace llaminar2
 
             auto end = std::chrono::high_resolution_clock::now();
             auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-            LOG_INFO("[ModelWeightRotation] Tagged all weights for "
+            LOG_DEBUG("[ModelWeightRotation] Tagged all weights for "
                      << n_layers << " layers in " << ms << " ms");
         }
 

@@ -74,8 +74,8 @@ namespace llaminar2
             if (device_count > 0)
             {
                 pool.registerAMDFactory(createAMDContext, device_count);
-                LOG_INFO("[AMDContextFactory] Registered ROCm factory with "
-                         << device_count << " devices");
+                LOG_DEBUG("[AMDContextFactory] Registered ROCm factory with "
+                          << device_count << " devices");
             }
             else
             {

@@ -28,6 +28,9 @@ namespace llaminar2
 
         // Core inference
         bool forward(const int *tokens, int seq_len) override;
+        bool supportsPrefillBatchForBenchmark(int request_batch) const override;
+        bool prefillBatchForBenchmark(
+            const std::vector<std::vector<int>> &token_batches) override;
         const float *logits() const override;
         int vocab_size() const override;
         void clear_cache() override;
@@ -42,11 +45,19 @@ namespace llaminar2
         // GPU-side sampling
         int sampleGreedyOnDevice() override;
         int sampleOnDevice(const SamplingParams &params) override;
+        bool supportsDecodeStep() const override;
+        bool supportsDecodeStepBatchForBenchmark(int request_batch) const override;
+        void setDecodeSamplingParams(const SamplingParams &params) override;
+        void setDecodeStepTokenBudget(int max_tokens) override;
+        DecodeStepOutput decodeStepForBenchmark() override;
+        DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch) override;
+        bool maybeApplyDecodeBoundaryMaintenance() override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;
         void setAccumulatePrefill(bool accumulate) override;
         void flushStageTimeline() override;
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
 
     private:
         IOrchestrationRunner *orch_runner_;

@@ -19,6 +19,11 @@
  *   - LocalPP_RCCL_2xROCm_4B:        2x AMD GPU via RCCL (skipped: no GPU kernels)
  *   - LocalPP_HOST_CUDA_ROCm_4B:     Heterogeneous CUDA+ROCm (skipped: no GPU kernels)
  *
+ * Configurations (Qwen3.5-27B Q4_K_M — dense 64-layer hybrid GDN+FA):
+ *   - LocalPP_NCCL_2xCUDA_27B:       2x NVIDIA GPU via NCCL
+ *   - LocalPP_RCCL_2xROCm_27B:       2x AMD GPU via RCCL
+ *   - LocalPP_HETEROGENEOUS_CUDA_ROCm_27B: Heterogeneous CUDA+ROCm via HOST
+ *
  * @author David Sanftenberg
  * @date 2026
  */
@@ -52,6 +57,17 @@ static const auto kQwen35_4B_PP_Thresholds = BackendThresholds{
     .early_layers_count = 6,
     .min_early_layers_passed = 4,
     .kl_threshold = 0.05f, // Observed max: 0.014 (HETERO), was 0.20 = 14x over-relaxed
+};
+
+// Q4_K_M quantization diverges more than Q8_0 due to lower precision; 64 layers
+// accumulate more drift so thresholds are relaxed relative to 4B/0.8B configs.
+// Empirical results: min cosine ~0.9996, KL ~0.0001 across CUDA/ROCm/heterogeneous.
+static const auto kQwen35_27B_PP_Thresholds = BackendThresholds{
+    .cosine_threshold = 0.998f,        // Observed: 0.9996+ across all configs
+    .decode_cosine_threshold = 0.996f, // Observed: 0.9996+ in decode steps
+    .early_layers_count = 8,
+    .min_early_layers_passed = 7,
+    .kl_threshold = 0.01f, // Observed: 0.0001-0.0002
 };
 
 static const std::vector<TestConfig> kLocalPPConfigs = {
@@ -144,6 +160,42 @@ static const std::vector<TestConfig> kLocalPPConfigs = {
         .thresholds = kQwen35_4B_PP_Thresholds,
         .model_path = "models/Qwen3.5-4B-Q8_0.gguf",
         .snapshot_dir = "pytorch_qwen35_4b_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    // =========================================================================
+    // Qwen3.5-27B (Q4_K_M) — dense 64-layer hybrid GDN+FA, pipeline split 0-31 / 32-63
+    // Critical for validating large-model PP correctness with Q4 quantization
+    // on production GPU configurations (CUDA and ROCm).
+    // =========================================================================
+    {
+        .name = "LocalPP_NCCL_2xCUDA_27B",
+        .devices = {ParityDeviceType::CUDA, ParityDeviceType::CUDA},
+        .parallelism = Parallelism::LocalPP,
+        .thresholds = kQwen35_27B_PP_Thresholds,
+        .model_path = "models/Qwen3.5-27B-Q4_K_M.gguf",
+        .snapshot_dir = "pytorch_qwen35_27b_q4km_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "LocalPP_RCCL_2xROCm_27B",
+        .devices = {ParityDeviceType::ROCm, ParityDeviceType::ROCm},
+        .parallelism = Parallelism::LocalPP,
+        .thresholds = kQwen35_27B_PP_Thresholds,
+        .model_path = "models/Qwen3.5-27B-Q4_K_M.gguf",
+        .snapshot_dir = "pytorch_qwen35_27b_q4km_snapshots",
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+    },
+    {
+        .name = "LocalPP_HETEROGENEOUS_CUDA_ROCm_27B",
+        .devices = {ParityDeviceType::CUDA, ParityDeviceType::ROCm},
+        .parallelism = Parallelism::LocalPP,
+        .thresholds = kQwen35_27B_PP_Thresholds,
+        .model_path = "models/Qwen3.5-27B-Q4_K_M.gguf",
+        .snapshot_dir = "pytorch_qwen35_27b_q4km_snapshots",
+        .pp_weights = {0.31f, 0.69f}, // CUDA gets ~20 layers, ROCm gets ~44 (CUDA has less VRAM)
         .activation_precision = ActivationPrecision::FP32,
         .kv_cache_precision = KVCachePrecision::FP16,
     },

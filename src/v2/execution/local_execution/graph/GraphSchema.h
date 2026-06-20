@@ -26,6 +26,7 @@
 #include "../../../backends/DeviceId.h"
 #include "../../StageShardingMode.h"
 #include "../../../utils/Sampler.h"
+#include "../../../utils/ToolCallTypes.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -78,9 +79,12 @@ namespace llaminar2
         Allreduce,
         Allgather,
 
-        // MoE (future)
-        MoERouter,
-        MoEFFN,
+        // MoE
+        MoERouter,       ///< Router: hidden × gate → softmax top-k
+        MoEFFN,          ///< Full MoE FFN: route + expert SwiGLU + combine
+        MoECombine,      ///< Weighted combination of expert outputs
+        MoESharedExpert, ///< Always-active shared expert SwiGLU FFN
+        MoESharedGate,   ///< Sigmoid gating on shared expert output
 
         // Quantization
         Quantize,
@@ -349,10 +353,11 @@ namespace llaminar2
      */
     enum class WeightShardingMode
     {
-        Replicate,      ///< Full copy on each rank (norms, biases, embeddings)
-        ColumnParallel, ///< Split output dimension (rows of weight) - QKV, Gate/Up, LM head
-        RowParallel,    ///< Split output dimension + allreduce - Wo projection
-        InputParallel   ///< Split input dimension (columns of weight) + allreduce - Down proj
+        Replicate,       ///< Full copy on each rank (norms, biases, embeddings)
+        ColumnParallel,  ///< Split output dimension (rows of weight) - QKV, Gate/Up, LM head
+        RowParallel,     ///< Split output dimension + allreduce - Wo projection
+        InputParallel,   ///< Split input dimension (columns of weight) + allreduce - Down proj
+        ExpertParallel   ///< Split expert dimension of 3D MoE tensors across ranks
     };
 
     /**
@@ -513,8 +518,9 @@ namespace llaminar2
          */
         bool isNonGemmWeight(const std::string &name) const
         {
-            // Norms are 1D
-            if (name.find("_norm.weight") != std::string::npos)
+            // Norms are 1D.  Some sidecar layouts use compact names such as
+            // hnorm/enorm instead of *_norm; they still contain norm.weight.
+            if (name.find("norm.weight") != std::string::npos)
                 return true;
             // Biases are 1D
             if (name.find(".bias") != std::string::npos)
@@ -527,6 +533,12 @@ namespace llaminar2
                 return true;
             // SSM/GDN per-head scalar parameters (e.g. ssm_a, ssm_dt) without .weight suffix
             if (name.find(".ssm_a") != std::string::npos && name.find(".weight") == std::string::npos)
+                return true;
+            // MoE 3D expert weight tensors (gate_exps, up_exps, down_exps)
+            if (name.find("_exps.weight") != std::string::npos)
+                return true;
+            // MoE router gate and shared expert sigmoid gate
+            if (name.find("ffn_gate_inp") != std::string::npos)
                 return true;
             return false;
         }
@@ -647,6 +659,12 @@ namespace llaminar2
         /// errors compound through subsequent layers. Layers beyond this count
         /// use tp_allreduce_default_precision.
         int tp_allreduce_fp32_layer_count = 0;
+
+        /// Layer indices that are ALWAYS forced to FP32 allreduce regardless
+        /// of their position relative to fp32_layer_count. Used for hybrid
+        /// architectures (e.g., Qwen3.5) where full-attention layers are more
+        /// sensitive to allreduce precision loss than GDN layers.
+        std::vector<int> tp_allreduce_fp32_forced_layers;
     };
 
     // =========================================================================
@@ -783,6 +801,40 @@ namespace llaminar2
         virtual SamplingParams getRecommendedSamplingParams() const
         {
             return SamplingParams{}; // Standard defaults
+        }
+
+        /**
+         * @brief Get the stop-thinking prompt for thinking budget enforcement
+         *
+         * When the thinking token budget is exhausted, this string is tokenized
+         * and injected token-by-token into the generation stream to gracefully
+         * force the model out of thinking mode.
+         *
+         * Default: empty string (no stop-thinking support).
+         * Override in model-specific factories for models that support thinking.
+         *
+         * @return Stop-thinking prompt string, or empty if not supported
+         */
+        virtual std::string getStopThinkingPrompt() const
+        {
+            return "";
+        }
+
+        /**
+         * @brief Get the tool call output format for this model architecture
+         *
+         * Returns the format the model uses to emit tool calls in its raw text
+         * output. Used by ChatCompletionHandler to parse structured tool_calls
+         * from model output.
+         *
+         * Default: HERMES_2_PRO (covers Qwen 2.5, Qwen 3, Hermes, most models).
+         * Override in model-specific factories to use a different format.
+         *
+         * @return ToolCallFormat enum value
+         */
+        virtual ToolCallFormat getToolCallFormat() const
+        {
+            return ToolCallFormat::HERMES_2_PRO;
         }
     };
 

@@ -342,7 +342,7 @@ namespace llaminar2
             /**
              * @brief Construct kernel for quantized weight tensor (legacy lazy conversion)
              *
-             * Deprecated: use KernelFactory::getOrCreatePreparedGemmWeights() +
+             * Deprecated: use PreparedWeightStore or KernelFactory::prepareGemmHandleLocal() +
              * KernelFactory::getOrCreateGemmEngine(), or explicitly pre-pack via
              * ROCmPackedWeights and use the packed constructor below.
              *
@@ -351,7 +351,7 @@ namespace llaminar2
              *
              * @throws std::runtime_error if weight not quantized or not on GPU
              */
-            [[deprecated("Use KernelFactory::getOrCreatePreparedGemmWeights() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
+            [[deprecated("Use PreparedWeightStore or prepareGemmHandleLocal() + getOrCreateGemmEngine(), or pre-pack via ROCmPackedWeights.")]]
             ROCmQuantisedGemmKernel(const TensorBase *weights, int rocm_device_id);
 
             /**
@@ -367,6 +367,31 @@ namespace llaminar2
              */
             ROCmQuantisedGemmKernel(ROCmPackedWeights *packed, int rocm_device_id);
 
+            /**
+             * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
+             *
+             * Used for MoE expert weights that are batch-packed and uploaded as a single
+             * contiguous allocation. The kernel references device pointers at calculated
+             * offsets into the shared allocation.
+             *
+             * @param N Output features (rows per expert)
+             * @param K Input features (columns)
+             * @param rocm_device_id ROCm device ID
+             * @param d_native_vnni Device pointer to native-VNNI payload for this expert
+             * @param d_native_scales Device pointer to FP16 scales (void* for __half*)
+             * @param d_native_mins Device pointer to FP16 mins (nullptr if symmetric)
+             * @param d_native_emins Device pointer to extended mins (nullptr if not needed)
+             * @param codebook_id NativeVNNI codebook identifier
+             * @param blocks_per_row Number of 32-element blocks per row (K/32)
+             * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             */
+            ROCmQuantisedGemmKernel(
+                int N, int K, int rocm_device_id,
+                uint8_t *d_native_vnni, void *d_native_scales,
+                void *d_native_mins, void *d_native_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+
             ~ROCmQuantisedGemmKernel() override;
 
             // Non-copyable
@@ -380,6 +405,8 @@ namespace llaminar2
             // =========================================================================
             // ITensorGemm interface - Primary entry points
             // =========================================================================
+
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
 
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
@@ -454,6 +481,15 @@ namespace llaminar2
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
 
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool supports_fused_projection() const override { return true; }
+
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
              *
@@ -488,9 +524,18 @@ namespace llaminar2
             bool multiply_tensor_with_fused_swiglu(
                 const TensorBase *gate,
                 const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate,
+                const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,
-                float alpha = 1.0f, float beta = 0.0f) override;
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
             // =========================================================================
             // ITensorKernel interface
@@ -586,7 +631,8 @@ namespace llaminar2
             int rocm_device_id() const { return rocm_device_id_; }
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
-            bool weights_converted() const { return weights_converted_; }
+            bool weights_converted() const override;
+            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
@@ -602,14 +648,13 @@ namespace llaminar2
              *
              * This enum is intentionally small and explicit so logs, counters, and
              * future telemetry can categorize prefill routing decisions in a stable
-             * way. We keep `CK_FALLBACK` as an explicit value because fallback is a
-             * first-class execution mode, not an error condition.
+             * way. `UNSUPPORTED` indicates no viable prefill kernel path is available.
              */
             enum class PrefillDispatchPath
             {
                 NATIVE_VNNI,      ///< Native-VNNI path (lossless ≤6-bit decode, FP16 scales)
                 INT8_VNNI_NATIVE, ///< INT8-VNNI path (requantized 8-bit weights)
-                CK_FALLBACK       ///< CK ComposableKernel (debug override only)
+                UNSUPPORTED       ///< No viable prefill path (dimensions/weights unsupported)
             };
 
             // =========================================================================
@@ -621,8 +666,8 @@ namespace llaminar2
              *
              * The selection policy is deliberately conservative:
              * - Decode (`m == 1`) never calls this helper.
-             * - Unsupported metadata/shape immediately maps to `CK_FALLBACK`.
-             * - Feature flag disablement also maps to `CK_FALLBACK`.
+             * - Unsupported metadata/shape maps to `UNSUPPORTED`.
+             * - Missing VNNI weights also maps to `UNSUPPORTED`.
              *
              * @param m Number of rows in activation matrix.
              * @param n Number of output features.
@@ -731,8 +776,9 @@ namespace llaminar2
             // Member data
             // =========================================================================
 
-            const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
-            ROCmPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
+            const TensorBase *weights_ = nullptr;  // Original weight tensor (null if using packed_)
+            ROCmPackedWeights *packed_ = nullptr;  // Pre-packed weights (owned by tensor cache)
+            std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
             int rocm_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
@@ -749,16 +795,24 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
-            // Workspace buffer names for TEMP_C_FP32 / TEMP_A_FP32 are SHARED
-            // across all ROCm GEMM kernel instances (matching CUDA).  The workspace
-            // merger takes the max size, so all kernels share one allocation.
-            //
-            // Concurrent execution paths (FusedQKV prefill/decode) use the
-            // ConcurrentPrefillPool's own per-stream scratch and scatter_partial
-            // buffers — NOT these workspace buffers.  The workspace TEMP buffers
-            // are only used in serial paths (standalone multiply_tensor, sequential
-            // fallback in multiply_fused_tensor, fused SwiGLU decode), so a single
-            // shared allocation is safe.
+            // Historical per-kernel slice id. Scratch buffers are now declared
+            // under stable names so graph rebuilds do not force workspace
+            // reallocations solely because new kernel instances were created.
+            uint32_t slice_id_ = 0;
+
+            std::string scatterPartialBufferName() const
+            {
+                return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL;
+            }
+
+            std::string scatterPartialBatchedBufferName() const
+            {
+                return GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED;
+            }
+
+            // TEMP_C_FP32 / TEMP_A_FP32 remain shared across ROCm GEMM kernels.
+            // Concurrent execution paths use their own pool scratch, while serial
+            // paths do not overlap the temp buffers.
 
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;

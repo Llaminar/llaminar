@@ -8,6 +8,7 @@
 #include "utils/ROCmKernelProfiler.h"
 #include "utils/DebugEnv.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../common/EmbedQ8Repack.h"
 #include "../../common/PreparedEmbeddingWeights.h"
 #include "../../KernelFactory.h"
@@ -138,6 +139,9 @@ namespace llaminar2
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        device_token_ids_active_ = false;
+        device_token_ids_ = nullptr;
+        device_token_count_ = 0;
 
         if (!token_ids || num_tokens <= 0)
         {
@@ -216,10 +220,30 @@ namespace llaminar2
         preload_stream_ = getStream();
     }
 
+    void ROCmEmbeddingKernelT::setDynamicDeviceTokenIds(
+        const void *token_ids_device,
+        int num_tokens)
+    {
+        dynamic_params_active_ = false;
+        dynamic_token_count_ = 0;
+        preload_stream_ = nullptr;
+        device_token_ids_ = static_cast<const int *>(token_ids_device);
+        device_token_count_ = num_tokens;
+        device_token_ids_active_ = token_ids_device && num_tokens > 0;
+    }
+
     void ROCmEmbeddingKernelT::resetDynamicState()
     {
         dynamic_params_active_ = false;
         dynamic_token_count_ = 0;
+        device_token_ids_active_ = false;
+        device_token_ids_ = nullptr;
+        device_token_count_ = 0;
+        preload_stream_ = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(stream_mutex_);
+            stream_by_device_.clear();
+        }
         // h_token_ids_ buffer is preserved — it's reusable for the next session
     }
 
@@ -295,19 +319,20 @@ namespace llaminar2
                 int value = token_ids[i];
                 min_id = std::min(min_id, value);
                 max_id = std::max(max_id, value);
-                if ((value < 0 || value >= vocab_size) && first_invalid_pos < 0)
+                const bool has_upper_bound = vocab_size > 0;
+                if ((value < 0 || (has_upper_bound && value >= vocab_size)) && first_invalid_pos < 0)
                 {
                     first_invalid_pos = i;
                     first_invalid_id = value;
                 }
             }
 
-            LOG_INFO("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
-                                                                            << " vocab_size=" << vocab_size
-                                                                            << " min_id=" << min_id
-                                                                            << " max_id=" << max_id
-                                                                            << " first_id=" << token_ids[0]
-                                                                            << " last_id=" << token_ids[num_tokens - 1]);
+            LOG_DEBUG("[ROCmEmbeddingKernelT] Host token stats: num_tokens=" << num_tokens
+                                                                             << " vocab_size=" << (vocab_size > 0 ? std::to_string(vocab_size) : std::string("unchecked"))
+                                                                             << " min_id=" << min_id
+                                                                             << " max_id=" << max_id
+                                                                             << " first_id=" << token_ids[0]
+                                                                             << " last_id=" << token_ids[num_tokens - 1]);
 
             if (first_invalid_pos >= 0)
             {
@@ -340,7 +365,12 @@ namespace llaminar2
             return false;
         }
 
-        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model, INT_MAX, 0, static_cast<hipStream_t>(getStream()));
+        const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                          ? local_vocab_size_
+                                          : INT_MAX;
+        const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
+        hipError_t err = hipOps_embedding_fp32(embed_data, token_ids, output, num_tokens, d_model,
+                                               launch_vocab_size, launch_vocab_offset, static_cast<hipStream_t>(getStream()));
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -514,17 +544,30 @@ namespace llaminar2
             return false;
         }
 
-        int *d_token_ids = static_cast<int *>(workspace->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
-        if (!d_token_ids)
+        int *workspace_token_ids = static_cast<int *>(workspace->getBuffer(EmbeddingWorkspaceBuffers::TOKEN_IDS));
+        if (!workspace_token_ids)
         {
             LOG_ERROR("[ROCmEmbeddingKernelT] Workspace buffer '" << EmbeddingWorkspaceBuffers::TOKEN_IDS << "' not found");
             return false;
         }
 
         const DeviceId workspace_device = workspace->device();
+        const bool use_device_token_ids =
+            device_token_ids_active_ &&
+            device_token_count_ == num_tokens &&
+            device_token_ids_ != nullptr;
+        int *d_token_ids = use_device_token_ids
+                               ? const_cast<int *>(device_token_ids_)
+                               : workspace_token_ids;
 
         const bool validate_gpu_ptrs = debugEnv().validation.validate_gpu_ptrs;
-        if (validate_gpu_ptrs && !validateTokenIdsHost(token_ids, num_tokens, static_cast<int>(embed_table->rows()), /*fail_on_invalid=*/true))
+        const int host_token_vocab_bound =
+            allow_out_of_range_token_ids_
+                ? 0
+                : static_cast<int>(embed_table->rows());
+        if (!use_device_token_ids &&
+            validate_gpu_ptrs &&
+            !validateTokenIdsHost(token_ids, num_tokens, host_token_vocab_bound, /*fail_on_invalid=*/true))
         {
             return false;
         }
@@ -548,12 +591,29 @@ namespace llaminar2
         // Also verify stream match: setDynamicTokenIds() may have run on a
         // different stream than the current gpu_stream_ if the graph capture
         // controller reassigned stage streams after updateDynamicParams().
-        const bool token_ids_preloaded = dynamic_params_active_ && dynamic_token_count_ == num_tokens && preload_stream_ == getStream() && h_token_ids_ && std::memcmp(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
-        if (!token_ids_preloaded)
+        const bool token_ids_preloaded =
+            dynamic_params_active_ &&
+            dynamic_token_count_ == num_tokens &&
+            preload_stream_ == getStream() &&
+            token_ids &&
+            h_token_ids_ &&
+            std::memcmp(h_token_ids_, token_ids, static_cast<size_t>(num_tokens) * sizeof(int)) == 0;
+        if (!use_device_token_ids && !token_ids_preloaded)
         {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT::apply_tensor] token_ids not preloaded during graph capture — "
+                          "updateDynamicParams must be called before capture/replay");
+                return false;
+            }
             dynamic_params_active_ = false;
             dynamic_token_count_ = 0;
-            err = hipMemcpyAsync(d_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
+            if (!token_ids)
+            {
+                LOG_ERROR("[ROCmEmbeddingKernelT] Host token IDs are null and no device token source is active");
+                return false;
+            }
+            err = hipMemcpyAsync(workspace_token_ids, token_ids, token_bytes, hipMemcpyHostToDevice, stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] Failed to copy token_ids to GPU: " << hipGetErrorString(err));
@@ -576,9 +636,11 @@ namespace llaminar2
             return false;
         }
 
+        const bool capture_active = isGraphCaptureActive();
         const bool sync_embedding_stage =
             debugEnv().validation.sync_each_stage ||
             debugEnv().validation.sync_after_embedding_stage;
+        const bool allow_sync_embedding_stage = sync_embedding_stage && !capture_active;
 
         // =====================================================================
         // Step 3: Route by embedding table format
@@ -596,8 +658,12 @@ namespace llaminar2
             }
             LOG_DEBUG("[ROCmEmbeddingKernelT] FP32 fast path: d_embed=" << static_cast<void *>(d_embed)
                                                                         << " num_tokens=" << num_tokens << " d_model=" << d_model);
+            const int launch_vocab_size = explicit_vocab_range_ && local_vocab_size_ > 0
+                                              ? local_vocab_size_
+                                              : static_cast<int>(embed_fp32->rows());
+            const int launch_vocab_offset = explicit_vocab_range_ ? vocab_offset_ : 0;
             err = hipOps_embedding_fp32(d_embed, d_token_ids, d_output, num_tokens, d_model,
-                                        static_cast<int>(embed_fp32->rows()), 0, stream);
+                                        launch_vocab_size, launch_vocab_offset, stream);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[ROCmEmbeddingKernelT] FP32 kernel failed: " << hipGetErrorString(err));
@@ -626,10 +692,12 @@ namespace llaminar2
             constexpr unsigned char kCanaryPrePattern = 0xA5;
             constexpr unsigned char kCanaryPostPattern = 0x5A;
 
-            // --- Preferred path: use PreparedEmbeddingWeights from KernelFactory ---
+            // --- Preferred path: use model-owned PreparedWeightStore handle ---
             using namespace llaminar::v2::kernels;
             const DeviceId dev_id = DeviceId::rocm(dev);
-            const auto *prepared = KernelFactory::getPreparedEmbeddingWeights(embed_table, dev_id);
+            const PreparedEmbeddingHandle *prepared = nullptr;
+            if (prepared_embedding_handle_ && prepared_embedding_handle_->device_id == dev_id)
+                prepared = prepared_embedding_handle_;
 
             void *d_embed_q8 = nullptr;
             size_t blocks_per_row = 0;
@@ -704,19 +772,70 @@ namespace llaminar2
                         cached_embed_table_ = embed_table;
                         cached_embed_table_by_device_[dev] = embed_table;
                     }
-                    LOG_INFO("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
-                             << tensorTypeName(embed_table->native_type()) << " "
-                             << repacked.vocab_size << "x" << d_model
-                             << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                             << " (" << repacked.blocks_per_row << " blocks/row)");
+                    LOG_DEBUG("[ROCmEmbeddingKernelT] Uploaded EmbedQ8 embedding (workspace fallback): "
+                              << tensorTypeName(embed_table->native_type()) << " "
+                              << repacked.vocab_size << "x" << d_model
+                              << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                              << " (" << repacked.blocks_per_row << " blocks/row)");
                 }
                 else
                 {
                     blocks_per_row = (static_cast<size_t>(d_model) + 31) / 32;
                 }
             }
+            // Validation readbacks require D2H plus stream synchronization, both
+            // illegal inside HIP graph capture. The launch itself still consumes
+            // the device token IDs and remains graph-capturable.
+            if (use_device_token_ids &&
+                debugEnv().validation.validate_buffers &&
+                num_tokens > 0 &&
+                !capture_active)
+            {
+                std::vector<int> sampled_tokens(static_cast<size_t>(num_tokens), -1);
+                hipError_t token_copy_err = hipMemcpyAsync(
+                    sampled_tokens.data(),
+                    d_token_ids,
+                    static_cast<size_t>(num_tokens) * sizeof(int),
+                    hipMemcpyDeviceToHost,
+                    stream);
+                if (token_copy_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to read device token IDs for validation: "
+                              << hipGetErrorString(token_copy_err));
+                    return false;
+                }
+                token_copy_err = hipStreamSynchronize(stream);
+                if (token_copy_err != hipSuccess)
+                {
+                    LOG_ERROR("[ROCmEmbeddingKernelT] Failed to synchronize device token validation: "
+                              << hipGetErrorString(token_copy_err));
+                    return false;
+                }
+                const bool zero_token_rows_allowed =
+                    allow_out_of_range_token_ids_ ||
+                    (mpi_ctx && mpi_ctx->world_size() > 1);
+                for (int i = 0; i < num_tokens; ++i)
+                {
+                    const int token_id = sampled_tokens[static_cast<size_t>(i)];
+                    const bool in_local_range =
+                        token_id >= vocab_offset &&
+                        token_id < vocab_offset + local_vocab_size;
+                    if (!in_local_range && !zero_token_rows_allowed)
+                    {
+                        LOG_ERROR("[ROCmEmbeddingKernelT] Device-token embedding would zero single-device token="
+                                  << token_id << " local_vocab_size=" << local_vocab_size
+                                  << " vocab_offset=" << vocab_offset
+                                  << " num_tokens=" << num_tokens);
+                        return false;
+                    }
+                    LOG_DEBUG("[ROCmEmbeddingKernelT] Device-token embedding validation token="
+                              << token_id << " local_vocab_size=" << local_vocab_size
+                              << " vocab_offset=" << vocab_offset
+                              << " in_local_range=" << (in_local_range ? 1 : 0));
+                }
+            }
             const size_t output_bytes = static_cast<size_t>(num_tokens) * static_cast<size_t>(d_model) * sizeof(float);
-            const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0);
+            const bool use_dev0_canary = validate_gpu_ptrs && (dev == 0) && !capture_active;
             float *kernel_output = d_output;
             void *canary_base = nullptr;
 
@@ -775,7 +894,7 @@ namespace llaminar2
                                       static_cast<int>(blocks_per_row),
                                       local_vocab_size,
                                       vocab_offset,
-                                      (validate_gpu_ptrs && dev == 0) ? 1 : 0,
+                                      (validate_gpu_ptrs && dev == 0 && !capture_active) ? 1 : 0,
                                       stream);
             if (validate_gpu_ptrs)
             {
@@ -828,7 +947,7 @@ namespace llaminar2
                     return false;
                 }
                 // Synchronize to ensure canary data is available on host
-                hipStreamSynchronize(static_cast<hipStream_t>(getStream()));
+                (void)hipStreamSynchronize(static_cast<hipStream_t>(getStream()));
 
                 auto find_mismatch = [](const std::vector<unsigned char> &buf, unsigned char expected) -> size_t
                 {
@@ -865,7 +984,7 @@ namespace llaminar2
                 }
             }
 
-            if (sync_embedding_stage)
+            if (allow_sync_embedding_stage)
             {
                 hipError_t sync_err = hipStreamSynchronize(stream);
                 if (sync_err != hipSuccess)
@@ -922,7 +1041,7 @@ namespace llaminar2
         // Only needed when PreparedEmbeddingWeights are NOT available (test/fallback path).
         // When weights are prepared during loading, the prepared data lives in its own
         // GPU allocation and this workspace buffer is unused.
-        if (llaminar::v2::kernels::KernelFactory::preparedEmbeddingRegistrySize() == 0)
+        if (!prepared_embedding_handle_)
         {
             constexpr size_t DEFAULT_VOCAB_SIZE = 151936;
             size_t vocab_size = (n > 0) ? static_cast<size_t>(n) : DEFAULT_VOCAB_SIZE;
@@ -940,12 +1059,24 @@ namespace llaminar2
 
     void ROCmEmbeddingKernelT::bindWorkspace(DeviceWorkspaceManager *workspace)
     {
-        int dev_key = device_idx_;
-        if (workspace)
+        if (!workspace)
         {
-            const DeviceId ws_device = workspace->device();
-            dev_key = ws_device.toKernelDeviceIndex();
+            {
+                std::lock_guard<std::mutex> lock(workspace_mutex_);
+                workspace_ = nullptr;
+                workspace_by_device_.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lock(embed_cache_mutex_);
+                cached_embed_table_ = nullptr;
+                cached_embed_table_by_device_.clear();
+            }
+            return;
         }
+
+        int dev_key = device_idx_;
+        const DeviceId ws_device = workspace->device();
+        dev_key = ws_device.toKernelDeviceIndex();
 
         bool workspace_changed = false;
         {

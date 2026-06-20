@@ -46,6 +46,7 @@ try:
     from . import qwen
     from . import llama  # Stub implementation for demonstration
     from . import qwen35
+    from . import qwen35_moe
     
     _torch_available = True
 except ImportError as e:

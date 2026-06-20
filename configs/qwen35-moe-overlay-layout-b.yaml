@@ -1,0 +1,33 @@
+# Superseded by configs/moe_overlay/cuda_hot_rocm_warm_cpu_cold_static.yaml.
+# Kept as a graph-native compatibility alias for the original CUDA/ROCm/CPU layout.
+# benchmark: topology=cuda_hot/rocm_warm/cpu_cold
+# benchmark: model_requirement=Qwen3.5-35B-A3B MoE GGUF with 256 routed experts
+# benchmark: mpi_ranks=3
+# benchmark: policy=static-by-id whole-expert GPU tiers with one CPU fallback tier
+# benchmark: output_dir=benchmark_results/moe_overlay/<timestamp-or-git-hash>/
+# benchmark: env=LLAMINAR_PROFILING=1 LLAMINAR_MOE_EP_PROFILE_CSV=<run-dir>/moe_overlay_profile.csv
+
+benchmark:
+  output_dir_template: "benchmark_results/moe_overlay/<timestamp-or-git-hash>/"
+  model_env: "LLAMINAR_MOE_OVERLAY_MODEL"
+  required_env: "LLAMINAR_PROFILING=1"
+  profiler_csv_env: "LLAMINAR_MOE_EP_PROFILE_CSV"
+  mpi_ranks: 3
+  policy: "static-by-id whole-expert GPU tiers with CPU fallback"
+
+moe_expert_parallel:
+  enabled: true
+  execution_kind: tiered
+  continuation_domain: cuda_hot
+  base_model_domain: cuda_hot
+  shared_expert_domain: cuda_hot
+  residency:
+    mode: static-by-id
+  domains:
+    - "cuda_hot=0:cuda:0;scope=single;backend=nccl;compute=replicated_experts;owner=0"
+    - "rocm_warm=1:rocm:0;scope=local;backend=rccl;compute=replicated_experts;owner=1"
+    - "cpu_cold=2:cpu:0;scope=local;backend=host;compute=replicated_experts;owner=2"
+  routed_tiers:
+    - "hot@cuda_hot;priority=0;max-experts-per-layer=128;memory-mb=auto"
+    - "warm@rocm_warm;priority=1;max-experts-per-layer=64;memory-mb=auto"
+    - "cold@cpu_cold;priority=2;fallback=true"

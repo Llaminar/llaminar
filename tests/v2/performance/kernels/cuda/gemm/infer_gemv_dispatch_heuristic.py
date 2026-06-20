@@ -7,7 +7,7 @@ Approach: Per-codebook set-cover + decision tree.
 1. For each codebook (format), use greedy set cover to find a minimal set
    of "universal good" configs that cover all shapes within 3% of optimal.
 2. Relabel each shape with its best config from the set-cover set.
-3. Train a sklearn DecisionTreeClassifier on (log2(N), log2(K)) -> config_id.
+3. Train a sklearn DecisionTreeClassifier on (log2(M), log2(N), log2(K)) -> config_id.
 4. Export the tree as C++ if/else for the .inc file.
 
 This eliminates per-shape lookup tables while maintaining <3% BW penalty.
@@ -29,30 +29,18 @@ from pathlib import Path
 import numpy as np
 from sklearn.tree import DecisionTreeClassifier
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from native_vnni_codebooks import CODEBOOK_PAYLOAD_BYTES, CODEBOOK_TO_FORMAT, FORMAT_TO_CODEBOOK
+
 
 # --- Codebook metadata ------------------------------------------------
-FORMAT_TO_CODEBOOK = {
-    "Q4_0": 0, "IQ4_NL": 4, "Q4_1": 5, "Q5_0": 6, "Q5_1": 7,
-    "Q6_K": 8, "Q3_K": 9, "Q2_K": 10, "IQ3_S": 11, "IQ3_XXS": 12,
-    "IQ2_S": 13, "IQ2_XS": 14, "IQ2_XXS": 15, "IQ1_S": 16, "IQ1_M": 17,
-    "Q8_0": 19,
-}
-CODEBOOK_TO_FORMAT = {v: k for k, v in FORMAT_TO_CODEBOOK.items()}
-
-CODEBOOK_PAYLOAD_BYTES = {
-    0: 16, 4: 16, 5: 20, 6: 20, 7: 24, 8: 24,
-    9: 12, 10: 8, 11: 12, 12: 8, 13: 8, 14: 8,
-    15: 4, 16: 4, 17: 4,
-    19: 32,
-}
-
-FAMILY_MAP = {"kpar": "KPAR", "wide": "WIDE", "direct": "DIRECT"}
+FAMILY_MAP = {"kpar": "KPAR", "wide": "WIDE", "direct": "DIRECT", "rowpar": "ROWPAR"}
 
 
 # --- Data types -------------------------------------------------------
 @dataclass
 class FormatTreeResult:
-    fmt: str
+    label: str
     cb: int
     n_shapes: int
     n_raw_configs: int
@@ -64,7 +52,7 @@ class FormatTreeResult:
     mean_penalty_pct: float
     p95_penalty_pct: float
     max_penalty_pct: float
-    shape_labels: dict           # (N,K) -> master_config_idx
+    shape_labels: dict           # (M,N,K) -> master_config_idx
 
 
 # --- Data loading -----------------------------------------------------
@@ -75,9 +63,16 @@ def load_sweep_csv(path: Path) -> list[dict]:
             fmt = raw.get("format", "")
             if fmt not in FORMAT_TO_CODEBOOK:
                 continue
+            codebook = FORMAT_TO_CODEBOOK[fmt]
+            if raw.get("codebook", "").strip():
+                csv_codebook = int(raw["codebook"])
+                if csv_codebook != codebook:
+                    raise SystemExit(
+                        f"codebook mismatch in {path}: format {fmt} maps to {codebook}, row has {csv_codebook}")
             try:
                 rows.append({
-                    "fmt": fmt, "cb": FORMAT_TO_CODEBOOK[fmt],
+                    "fmt": fmt, "cb": codebook,
+                    "m": int(raw.get("m", "1")),
                     "n": int(raw["n"]), "k": int(raw["k"]),
                     "family": raw.get("family", "kpar"),
                     "tile_n": int(raw.get("tile_n", 128)),
@@ -99,19 +94,24 @@ def cfg_tuple(r: dict) -> tuple:
 
 
 # --- Per-format set-cover + tree training ------------------------------
-def train_format_tree(fmt: str, all_rows: list[dict],
+def train_codebook_tree(cb: int, all_rows: list[dict],
                       threshold: float = 0.03) -> FormatTreeResult:
-    """Train a decision tree for a single format using set-cover relabeling."""
+    """Train a decision tree for a single NativeVNNI codebook.
 
-    cb = FORMAT_TO_CODEBOOK[fmt]
-    fmt_all = [r for r in all_rows if r["fmt"] == fmt]
+    Format aliases such as Q4_1/Q4_K and Q5_1/Q5_K share the same packed
+    NativeVNNI codebook id, which is the production dispatch key. Train on the
+    union so alias rows cannot generate duplicate CB helper functions.
+    """
+
+    fmt_all = [r for r in all_rows if r["cb"] == cb]
     fmt_best = [r for r in fmt_all if r["is_best"]]
+    label = CODEBOOK_TO_FORMAT.get(cb, f"CB{cb}").split("/")[0]
 
-    # Oracle BW per (N,K)
+    # Oracle BW per (M,N,K)
     nk_oracle: dict[tuple, float] = {}
     nk_best_cfg: dict[tuple, tuple] = {}
     for r in fmt_best:
-        nk = (r["n"], r["k"])
+        nk = (r["m"], r["n"], r["k"])
         if nk not in nk_oracle or r["bw"] > nk_oracle[nk]:
             nk_oracle[nk] = r["bw"]
             nk_best_cfg[nk] = cfg_tuple(r)
@@ -119,10 +119,10 @@ def train_format_tree(fmt: str, all_rows: list[dict],
     shapes = sorted(nk_oracle.keys())
     n_raw = len(set(nk_best_cfg.values()))
 
-    # BW lookup: (N,K,config) -> best BW
+    # BW lookup: (M,N,K,config) -> best BW
     nk_cfg_bw: dict[tuple, float] = defaultdict(float)
     for r in fmt_all:
-        key = ((r["n"], r["k"]), cfg_tuple(r))
+        key = ((r["m"], r["n"], r["k"]), cfg_tuple(r))
         nk_cfg_bw[key] = max(nk_cfg_bw[key], r["bw"])
 
     all_cfgs = sorted(set(cfg_tuple(r) for r in fmt_all))
@@ -147,7 +147,7 @@ def train_format_tree(fmt: str, all_rows: list[dict],
         master_configs.append(best)
         remaining -= newly
 
-    # Relabel: each (N,K) -> master config with highest BW
+    # Relabel: each (M,N,K) -> master config with highest BW
     nk_to_master = {}
     for nk in shapes:
         best_idx, best_bw = 0, 0.0
@@ -159,7 +159,7 @@ def train_format_tree(fmt: str, all_rows: list[dict],
         nk_to_master[nk] = best_idx
 
     # Train tree
-    X = np.array([[math.log2(nk[0]), math.log2(nk[1])] for nk in shapes],
+    X = np.array([[math.log2(nk[0]), math.log2(nk[1]), math.log2(nk[2])] for nk in shapes],
                  dtype=np.float32)
     y = np.array([nk_to_master[nk] for nk in shapes], dtype=np.int32)
 
@@ -177,7 +177,7 @@ def train_format_tree(fmt: str, all_rows: list[dict],
             penalties.append(max(0.0, 1.0 - pred_bw / oracle_bw))
 
     return FormatTreeResult(
-        fmt=fmt, cb=cb,
+        label=label, cb=cb,
         n_shapes=len(shapes),
         n_raw_configs=n_raw,
         n_master_configs=len(master_configs),
@@ -229,8 +229,8 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
     """Generate the complete C++ .inc file with per-CB tree dispatch.
 
     Provides the exact API consumed by CUDANativeVNNIGemvTuned.cu:
-      template <uint8_t CB> classifyShapeGenerated(int N, int K) -> NativeGemvShape
-      template <uint8_t CB> selectGeneratedTuning(int N, int K) -> GeneratedDispatchTuning
+      template <uint8_t CB> classifyShapeGenerated(int M, int N, int K) -> NativeGemvShape
+      template <uint8_t CB> selectGeneratedTuning(int M, int N, int K) -> GeneratedDispatchTuning
     """
     lines = []
 
@@ -249,12 +249,12 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
     lines.append(f"// Overall: mean BW penalty {overall_mean:.2f}%, max {overall_max:.2f}%")
     lines.append(f"// Formats: {len(results)}")
     for r in results:
-        lines.append(f"//   CB={r.cb:2d} ({r.fmt:8s}): {r.n_master_configs:2d} configs, "
+        lines.append(f"//   CB={r.cb:2d} ({r.label:12s}): {r.n_master_configs:2d} configs, "
                       f"depth={r.depth:2d}, leaves={r.n_leaves:2d}, "
                       f"mean={r.mean_penalty_pct:.2f}% max={r.max_penalty_pct:.2f}%")
     lines.append("//")
     lines.append("// Dispatch is shape-agnostic: rules are based on")
-    lines.append("//   log2f(N), log2f(K)  (continuous shape features)")
+    lines.append("//   log2f(M), log2f(N), log2f(K)  (continuous shape features)")
     lines.append("// No per-model shape lookup tables.")
     lines.append("")
     lines.append("#include <cmath>  // log2f")
@@ -274,12 +274,12 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
 
     # ---- Per-CB internal helper functions ----
     for r in results:
-        lines.append(f"// --- CB={r.cb} ({r.fmt}) ---")
+        lines.append(f"// --- CB={r.cb} ({r.label}) ---")
         lines.append(f"// {r.n_master_configs} master configs, "
                       f"depth={r.depth}, leaves={r.n_leaves}, "
                       f"mean_bw_penalty={r.mean_penalty_pct:.2f}%")
         lines.append(f"inline __host__ void selectTuning_CB{r.cb}(")
-        lines.append(f"    float log2_n, float log2_k,")
+        lines.append(f"    float log2_m, float log2_n, float log2_k,")
         lines.append(f"    NativeGemvShape& out_shape, GeneratedDispatchTuning& out_tuning)")
         lines.append("{")
 
@@ -294,7 +294,7 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
                     f"out_tuning = {{ {tile_n}, {cpt}, {tw}, {mkg}, {max_kb}, {f2p} }}; "
                     f"return;")
 
-        tree_lines = _tree_to_cpp(r.tree, ["log2_n", "log2_k"],
+        tree_lines = _tree_to_cpp(r.tree, ["log2_m", "log2_n", "log2_k"],
                                   decode_config, indent=1)
         lines.extend(tree_lines)
         lines.append("}")
@@ -304,9 +304,10 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
     lines.append("// Internal: combined shape + tuning dispatch via per-CB tree")
     lines.append("template <uint8_t CB>")
     lines.append("inline __host__ void selectGeneratedDispatch_(")
-    lines.append("    int N, int K,")
+    lines.append("    int M, int N, int K,")
     lines.append("    NativeGemvShape& out_shape, GeneratedDispatchTuning& out_tuning)")
     lines.append("{")
+    lines.append("    const float log2_m = log2f(static_cast<float>(M > 0 ? M : 1));")
     lines.append("    const float log2_n = log2f(static_cast<float>(N > 0 ? N : 1));")
     lines.append("    const float log2_k = log2f(static_cast<float>(K > 0 ? K : 1));")
     lines.append("")
@@ -316,7 +317,7 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
         kw = "if constexpr" if first else "else if constexpr"
         lines.append(f"    {kw} (CB == {r.cb})")
         lines.append(f"    {{")
-        lines.append(f"        selectTuning_CB{r.cb}(log2_n, log2_k, out_shape, out_tuning);")
+        lines.append(f"        selectTuning_CB{r.cb}(log2_m, log2_n, log2_k, out_shape, out_tuning);")
         lines.append(f"    }}")
         first = False
 
@@ -329,26 +330,38 @@ def generate_cpp(results: list[FormatTreeResult], input_path: Path) -> str:
     lines.append("}")
     lines.append("")
 
-    # ---- Public API: classifyShapeGenerated<CB>(N, K) ----
+    # ---- Public API: classifyShapeGenerated<CB>(M, N, K) ----
     lines.append("// Public API consumed by dispatchCodebook<CB>()")
     lines.append("template <uint8_t CB>")
-    lines.append("inline NativeGemvShape classifyShapeGenerated(int N, int K)")
+    lines.append("inline NativeGemvShape classifyShapeGenerated(int M, int N, int K)")
     lines.append("{")
     lines.append("    NativeGemvShape shape;")
     lines.append("    GeneratedDispatchTuning tuning;")
-    lines.append("    selectGeneratedDispatch_<CB>(N, K, shape, tuning);")
+    lines.append("    selectGeneratedDispatch_<CB>(M, N, K, shape, tuning);")
     lines.append("    return shape;")
     lines.append("}")
     lines.append("")
-
-    # ---- Public API: selectGeneratedTuning<CB>(N, K) ----
     lines.append("template <uint8_t CB>")
-    lines.append("inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)")
+    lines.append("inline NativeGemvShape classifyShapeGenerated(int N, int K)")
+    lines.append("{")
+    lines.append("    return classifyShapeGenerated<CB>(1, N, K);")
+    lines.append("}")
+    lines.append("")
+
+    # ---- Public API: selectGeneratedTuning<CB>(M, N, K) ----
+    lines.append("template <uint8_t CB>")
+    lines.append("inline GeneratedDispatchTuning selectGeneratedTuning(int M, int N, int K)")
     lines.append("{")
     lines.append("    NativeGemvShape shape;")
     lines.append("    GeneratedDispatchTuning tuning;")
-    lines.append("    selectGeneratedDispatch_<CB>(N, K, shape, tuning);")
+    lines.append("    selectGeneratedDispatch_<CB>(M, N, K, shape, tuning);")
     lines.append("    return tuning;")
+    lines.append("}")
+    lines.append("")
+    lines.append("template <uint8_t CB>")
+    lines.append("inline GeneratedDispatchTuning selectGeneratedTuning(int N, int K)")
+    lines.append("{")
+    lines.append("    return selectGeneratedTuning<CB>(1, N, K);")
     lines.append("}")
     lines.append("")
 
@@ -365,13 +378,13 @@ def write_summary(path: Path, results: list[FormatTreeResult], input_path: Path)
     lines.append("=" * 72)
     lines.append("")
 
-    lines.append(f"{'Format':12s} {'CB':>3s} {'Shapes':>6s} {'Raw':>5s} "
+    lines.append(f"{'Codebook':16s} {'CB':>3s} {'Shapes':>6s} {'Raw':>5s} "
                  f"{'SC':>4s} {'Depth':>5s} {'Leaves':>6s} "
                  f"{'Mean%':>6s} {'P95%':>6s} {'Max%':>6s}")
     lines.append("-" * 72)
 
     for r in results:
-        lines.append(f"{r.fmt:12s} {r.cb:3d} {r.n_shapes:6d} {r.n_raw_configs:5d} "
+        lines.append(f"{r.label:16s} {r.cb:3d} {r.n_shapes:6d} {r.n_raw_configs:5d} "
                      f"{r.n_master_configs:4d} {r.depth:5d} {r.n_leaves:6d} "
                      f"{r.mean_penalty_pct:5.2f}% {r.p95_penalty_pct:5.2f}% "
                      f"{r.max_penalty_pct:5.2f}%")
@@ -410,14 +423,15 @@ def main():
     all_rows = load_sweep_csv(input_path)
     print(f"  Total rows: {len(all_rows)}")
 
-    formats = sorted(set(r["fmt"] for r in all_rows if r["is_best"]))
-    print(f"  Formats with best data: {len(formats)} ({', '.join(formats)})")
+    codebooks = sorted(set(r["cb"] for r in all_rows if r["is_best"]))
+    codebook_labels = [f"{cb}:{CODEBOOK_TO_FORMAT.get(cb, 'unknown')}" for cb in codebooks]
+    print(f"  Codebooks with best data: {len(codebooks)} ({', '.join(codebook_labels)})")
 
-    # Train per-format
+    # Train per-codebook
     results = []
-    for fmt in formats:
-        print(f"\n  Training {fmt} (CB={FORMAT_TO_CODEBOOK[fmt]}) ...")
-        r = train_format_tree(fmt, all_rows, threshold=args.threshold)
+    for cb in codebooks:
+        print(f"\n  Training CB={cb} ({CODEBOOK_TO_FORMAT.get(cb, 'unknown')}) ...")
+        r = train_codebook_tree(cb, all_rows, threshold=args.threshold)
         results.append(r)
         print(f"    {r.n_master_configs} master configs, "
               f"depth={r.depth}, leaves={r.n_leaves}, "

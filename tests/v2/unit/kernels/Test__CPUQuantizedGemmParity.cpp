@@ -92,10 +92,17 @@ namespace
 
     // K=512 is divisible by both 32 (per-block) and 256 (superblock).
     // N=16,32 exercise the ldc<64 overflow protection path.
-    // M=1 (GEMV), M=9 (odd GEMM, GDN bug shape), M=64 (large GEMM).
+    // M=1 (GEMV), M=2..4 (MTP verifier small-M), M=9
+    // (odd GEMM, GDN bug shape), M=64 (large GEMM).
     static const std::vector<ShapeConfig> SHAPE_TABLE = {
         {1, 512, 512, "GEMV_N512"},
         {1, 32, 512, "GEMV_N32"},
+        {2, 512, 512, "GEMM_M2_N512"},
+        {2, 32, 512, "GEMM_M2_N32"},
+        {3, 512, 512, "GEMM_M3_N512"},
+        {3, 32, 512, "GEMM_M3_N32"},
+        {4, 512, 512, "GEMM_M4_N512"},
+        {4, 32, 512, "GEMM_M4_N32"},
         {9, 512, 512, "GEMM_M9_N512"},
         {9, 32, 512, "GEMM_M9_N32"},
         {9, 16, 512, "GEMM_M9_N16"},
@@ -549,6 +556,58 @@ namespace
         }
 
         std::cout << "[" << fmt << "/patterned] " << total_checks << " checks PASSED" << std::endl;
+    }
+
+    TEST(CPUQuantizedGemmParityRegression, Q5KQwen36NodeLocalTPGDNPrefillShape)
+    {
+        const int M = 9;
+        const int N = 7168;
+        const int K = 5120;
+
+        auto weights = TestTensorFactory::createQ5_KRandom(
+            {static_cast<size_t>(N), static_cast<size_t>(K)});
+        ASSERT_NE(weights, nullptr);
+
+        auto gemm = weights->createGemm();
+        ASSERT_NE(gemm, nullptr);
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)}, -1.0f, 1.0f, 42);
+        auto output = TestTensorFactory::createFP32Zeros(
+            {static_cast<size_t>(M), static_cast<size_t>(N)});
+
+        const int saved_threads = omp_get_max_threads();
+        for (int threads : {1, std::max(1, saved_threads)})
+        {
+            SCOPED_TRACE(::testing::Message() << "threads=" << threads);
+            omp_set_num_threads(threads);
+            std::memset(output->mutable_data(), 0,
+                        static_cast<size_t>(M) * N * sizeof(float));
+
+            ASSERT_TRUE(gemm->multiply_tensor(input.get(), output.get(), M, N, K));
+
+            const float *out = output->data();
+            for (size_t i = 0; i < static_cast<size_t>(M) * N; ++i)
+            {
+                ASSERT_TRUE(std::isfinite(out[i]))
+                    << "non-finite output at flat index " << i;
+            }
+
+            for (int row = 0; row < M; ++row)
+            {
+                bool all_zero = true;
+                for (int col = 0; col < N; ++col)
+                {
+                    if (out[static_cast<size_t>(row) * N + col] != 0.0f)
+                    {
+                        all_zero = false;
+                        break;
+                    }
+                }
+                EXPECT_FALSE(all_zero) << "row " << row << " is all zero";
+            }
+        }
+        omp_set_num_threads(saved_threads);
     }
 
     // =========================================================================

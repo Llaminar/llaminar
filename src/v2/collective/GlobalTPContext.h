@@ -12,9 +12,12 @@
 #pragma once
 
 #include "IGlobalTPContext.h"
+#include "ICollectiveBackend.h"
 #include "backends/UPIBackend.h"
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
+#include <atomic>
 #include <memory>
+#include <string>
 #include <vector>
 #include <mpi.h>
 
@@ -70,7 +73,8 @@ namespace llaminar2
             int domain_id,
             int color,
             int key,
-            const std::string &hostfile_path = "");
+            const std::string &hostfile_path = "",
+            CollectiveBackendType backend_type = CollectiveBackendType::UPI);
 
         /**
          * @brief Create for testing (uses existing communicator directly)
@@ -87,7 +91,8 @@ namespace llaminar2
             MPI_Comm comm,
             int domain_id,
             std::vector<int> world_ranks,
-            std::vector<int> node_ids = {});
+            std::vector<int> node_ids = {},
+            CollectiveBackendType backend_type = CollectiveBackendType::UPI);
 
         ~GlobalTPContext() override;
 
@@ -122,6 +127,8 @@ namespace llaminar2
         bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override;
         bool broadcast(TensorBase *tensor, int source_index) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
+        void requestAbort() override;
+        bool isAbortRequested() const override { return abort_requested_.load(std::memory_order_acquire); }
 
         // =========================================================================
         // IGlobalTPContext Implementation
@@ -132,6 +139,7 @@ namespace llaminar2
         const std::vector<int> &worldRanks() const override;
         GlobalDeviceAddress localDevice() const override;
         void barrier() const override;
+        bool allgatherBytes(const void *send_data, void *recv_data, size_t byte_count) const override;
         bool send(const TensorBase *tensor, int dest_index) override;
         bool recv(TensorBase *tensor, int source_index) override;
 
@@ -184,6 +192,8 @@ namespace llaminar2
          */
         int nodeCount() const;
 
+        std::string collectiveBackendNameForDiagnostics() const;
+
     private:
         // Private constructor - use factory methods
         GlobalTPContext(
@@ -199,17 +209,18 @@ namespace llaminar2
         /// Auto-detect node IDs by gathering hostnames over domain_comm_
         void detectNodeIds();
 
-        MPI_Comm domain_comm_;                          ///< Domain-specific MPI communicator
-        int domain_id_;                                 ///< Domain identifier
-        int my_rank_in_domain_;                         ///< Our rank within domain (0 to size-1)
-        int domain_size_;                               ///< Number of participants
-        std::vector<int> world_ranks_;                  ///< World ranks of all domain members
-        std::vector<int> node_ids_;                     ///< Per-rank node ID (same ID = same physical node)
-        bool all_same_node_;                            ///< Cached: all ranks on same node?
-        int node_count_;                                ///< Cached: number of distinct nodes
-        bool owns_communicator_;                        ///< Whether we created the communicator
-        CollectiveBackendType backend_type_;            ///< Backend type for this context
-        std::unique_ptr<UPICollectiveBackend> backend_; ///< Backend for collective operations
+        MPI_Comm domain_comm_;                        ///< Domain-specific MPI communicator
+        int domain_id_;                               ///< Domain identifier
+        int my_rank_in_domain_;                       ///< Our rank within domain (0 to size-1)
+        int domain_size_;                             ///< Number of participants
+        std::vector<int> world_ranks_;                ///< World ranks of all domain members
+        std::vector<int> node_ids_;                   ///< Per-rank node ID (same ID = same physical node)
+        bool all_same_node_;                          ///< Cached: all ranks on same node?
+        int node_count_;                              ///< Cached: number of distinct nodes
+        bool owns_communicator_;                      ///< Whether we created the communicator
+        CollectiveBackendType backend_type_;          ///< Backend type for this context
+        std::unique_ptr<ICollectiveBackend> backend_; ///< Backend for collective operations (ShmemSpin or UPI)
+        std::atomic<bool> abort_requested_{false};    ///< One-sided failure/cancel flag
     };
 
 } // namespace llaminar2

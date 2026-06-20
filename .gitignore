@@ -41,6 +41,7 @@ compile_commands.json
 *.pdb
 **/gpucore*
 **/core.*
+**/vgcore*
 
 # System files
 .DS_Store
@@ -49,6 +50,10 @@ Thumbs.db
 # Logs
 *.log
 *.csv
+!tests/v2/performance/kernels/fixtures/
+!tests/v2/performance/kernels/fixtures/*.csv
+!tests/v2/performance/kernels/cuda/gemm/fixtures/
+!tests/v2/performance/kernels/cuda/gemm/fixtures/*.csv
 
 # Temporary files
 *.backup
@@ -81,6 +86,7 @@ artifacts/**/*
 /*.md
 # But always track README.md
 !/README.md
+!/AGENTS.md
 
 # Package managers
 node_modules/
@@ -111,4 +117,4 @@ src/v2/kernels/cuda/*_heuristic_*.h
 *.lock-*
 run_gemv_timing.sh
 
-models
+/models

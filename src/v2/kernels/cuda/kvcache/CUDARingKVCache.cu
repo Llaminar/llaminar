@@ -13,14 +13,18 @@
  */
 
 #include "CUDARingKVCache.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "../../../utils/Logger.h"
 #include "../../kvcache/KVCacheDeviceParams.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include "../../../tensors/BlockStructures.h"
+#include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
@@ -100,6 +104,191 @@ namespace llaminar2
 
         d_K_cache[dst_offset] = d_K_new[src_offset];
         d_V_cache[dst_offset] = d_V_new[src_offset];
+    }
+
+    /**
+     * @brief Append verifier rows from position-major or head-major source.
+     *
+     * MTP all-position verifier graphs may keep K/V grouped by KV head after
+     * RoPE (`[head][row][dim]`) even though the ring cache is position-major.
+     * This kernel performs the layout gather while writing rows at the same
+     * next-write positions as serial decode.
+     */
+    template <typename T>
+    __global__ void ring_append_verifier_rows_kernel(
+        T *__restrict__ d_K_cache,
+        T *__restrict__ d_V_cache,
+        const T *__restrict__ d_K_new,
+        const T *__restrict__ d_V_new,
+        int head,
+        int max_seq_len,
+        int kv_storage_dim,
+        int head_storage_dim,
+        int source_verifier_rows,
+        int source_start_row,
+        int rows_to_write,
+        bool k_source_head_major,
+        bool v_source_head_major)
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+        if (token_idx >= rows_to_write || elem_idx >= kv_storage_dim)
+            return;
+
+        const int source_row = source_start_row + token_idx;
+        const int dst_pos = (head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_storage_dim + elem_idx;
+
+        const int head_idx = elem_idx / head_storage_dim;
+        const int head_lane = elem_idx - head_idx * head_storage_dim;
+        const int k_src_offset = k_source_head_major
+                                     ? (head_idx * source_verifier_rows + source_row) * head_storage_dim + head_lane
+                                     : source_row * kv_storage_dim + elem_idx;
+        const int v_src_offset = v_source_head_major
+                                     ? (head_idx * source_verifier_rows + source_row) * head_storage_dim + head_lane
+                                     : source_row * kv_storage_dim + elem_idx;
+
+        d_K_cache[dst_offset] = d_K_new[k_src_offset];
+        d_V_cache[dst_offset] = d_V_new[v_src_offset];
+    }
+
+    template <typename T>
+    __global__ void ring_append_verifier_rows_dynamic_kernel(
+        T *__restrict__ d_K_cache,
+        T *__restrict__ d_V_cache,
+        const T *__restrict__ d_K_new,
+        const T *__restrict__ d_V_new,
+        const int *__restrict__ d_head,
+        int max_seq_len,
+        int kv_storage_dim,
+        int head_storage_dim,
+        int source_verifier_rows,
+        int source_start_row,
+        int rows_to_write,
+        bool k_source_head_major,
+        bool v_source_head_major)
+    {
+        const int token_idx = blockIdx.x;
+        const int elem_idx = blockIdx.y * blockDim.x + threadIdx.x;
+        if (token_idx >= rows_to_write || elem_idx >= kv_storage_dim)
+            return;
+
+        const int source_row = source_start_row + token_idx;
+        const int head = *d_head;
+        const int dst_pos = (head + token_idx) % max_seq_len;
+        const int dst_offset = dst_pos * kv_storage_dim + elem_idx;
+
+        const int head_idx = elem_idx / head_storage_dim;
+        const int head_lane = elem_idx - head_idx * head_storage_dim;
+        const int k_src_offset = k_source_head_major
+                                     ? (head_idx * source_verifier_rows + source_row) * head_storage_dim + head_lane
+                                     : source_row * kv_storage_dim + elem_idx;
+        const int v_src_offset = v_source_head_major
+                                     ? (head_idx * source_verifier_rows + source_row) * head_storage_dim + head_lane
+                                     : source_row * kv_storage_dim + elem_idx;
+
+        d_K_cache[dst_offset] = d_K_new[k_src_offset];
+        d_V_cache[dst_offset] = d_V_new[v_src_offset];
+    }
+
+    /**
+     * @brief Advance graph-captured KV sequence metadata on device.
+     *
+     * This runs after the append kernel on the same explicit stream. Keeping it
+     * separate avoids racing with append blocks that still need to read the
+     * pre-append head position.
+     */
+    __global__ void cuda_kv_sequence_state_advance_kernel(
+        int *__restrict__ d_head,
+        int *__restrict__ d_count,
+        int num_tokens,
+        int max_seq_len)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+        const int old_head = *d_head;
+        const int old_count = *d_count;
+        *d_head = (old_head + num_tokens) % max_seq_len;
+        const int next_count = old_count + num_tokens;
+        *d_count = next_count > max_seq_len ? max_seq_len : next_count;
+    }
+
+    __global__ void cuda_kv_sequence_state_advance_dynamic_kernel(
+        int *__restrict__ d_head,
+        int *__restrict__ d_count,
+        const int *__restrict__ d_append_count,
+        int captured_num_tokens,
+        int max_seq_len)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+
+        int advance_tokens = d_append_count ? *d_append_count : captured_num_tokens;
+        if (advance_tokens <= 0 || advance_tokens > captured_num_tokens)
+            advance_tokens = captured_num_tokens;
+
+        const int old_head = *d_head;
+        const int old_count = *d_count;
+        *d_head = (old_head + advance_tokens) % max_seq_len;
+        const int next_count = old_count + advance_tokens;
+        *d_count = next_count > max_seq_len ? max_seq_len : next_count;
+    }
+
+    /**
+     * @brief Publish accepted verifier-row sequence metadata on device.
+     *
+     * Each block owns one [request, layer] pair.  The verifier graph may have
+     * already advanced the live device head past rows that were later rejected,
+     * so publication must keep the current ring tail and clamp the visible
+     * window to the accepted target length.  This mirrors truncateSequence()
+     * and prevents host/device KV metadata from disagreeing after rollback.
+     */
+    __global__ void cuda_kv_sequence_state_publish_kernel(
+        int *__restrict__ d_heads,
+        int *__restrict__ d_counts,
+        const int32_t *__restrict__ target_cached_tokens,
+        const int32_t *__restrict__ accepted_state_counts,
+        const int32_t *__restrict__ publication_ok_flags,
+        int batch_size,
+        int first_seq_idx,
+        int request_count,
+        int max_seq_len)
+    {
+        const int request_idx = static_cast<int>(blockIdx.x);
+        const int layer = static_cast<int>(blockIdx.y);
+        if (threadIdx.x != 0 || request_idx >= request_count)
+            return;
+
+        if (publication_ok_flags[request_idx] == 0)
+            return;
+
+        const int seq_idx = first_seq_idx + request_idx;
+        if (seq_idx < 0 || seq_idx >= batch_size)
+            return;
+
+        const int accepted_count = accepted_state_counts[request_idx];
+        const int target_count = target_cached_tokens[request_idx];
+        if (accepted_count < 0 ||
+            target_count < 0 ||
+            target_count > max_seq_len)
+        {
+            return;
+        }
+
+        const int entry_idx = layer * batch_size + seq_idx;
+        const int old_head = d_heads[entry_idx];
+        const int old_count = d_counts[entry_idx];
+        if (old_count < 0 || old_count > max_seq_len)
+        {
+            return;
+        }
+
+        int tail = old_head - old_count;
+        tail %= max_seq_len;
+        if (tail < 0)
+            tail += max_seq_len;
+        d_heads[entry_idx] = (tail + target_count) % max_seq_len;
+        d_counts[entry_idx] = target_count;
     }
 
     /**
@@ -615,6 +804,107 @@ namespace llaminar2
             d_head, max_seq_len, kv_blocks, num_tokens);
     }
 
+    template <typename T>
+    static void cuda_ring_append_verifier_rows_typed(
+        T *d_K_cache, T *d_V_cache,
+        const T *d_K_new, const T *d_V_new,
+        int head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows, int source_start_row, int rows_to_write,
+        bool k_source_head_major, bool v_source_head_major,
+        cudaStream_t stream)
+    {
+        if (rows_to_write <= 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(rows_to_write, (kv_storage_dim + static_cast<int>(block.x) - 1) / static_cast<int>(block.x));
+        ring_append_verifier_rows_kernel<T><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            head, max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows, source_start_row, rows_to_write,
+            k_source_head_major, v_source_head_major);
+    }
+
+    template <typename T>
+    static void cuda_ring_append_verifier_rows_dynamic_typed(
+        T *d_K_cache, T *d_V_cache,
+        const T *d_K_new, const T *d_V_new,
+        const int *d_head, int max_seq_len, int kv_storage_dim, int head_storage_dim,
+        int source_verifier_rows, int source_start_row, int rows_to_write,
+        bool k_source_head_major, bool v_source_head_major,
+        cudaStream_t stream)
+    {
+        if (rows_to_write <= 0)
+            return;
+
+        dim3 block(256);
+        dim3 grid(rows_to_write, (kv_storage_dim + static_cast<int>(block.x) - 1) / static_cast<int>(block.x));
+        ring_append_verifier_rows_dynamic_kernel<T><<<grid, block, 0, stream>>>(
+            d_K_cache, d_V_cache, d_K_new, d_V_new,
+            d_head, max_seq_len, kv_storage_dim, head_storage_dim,
+            source_verifier_rows, source_start_row, rows_to_write,
+            k_source_head_major, v_source_head_major);
+    }
+
+    extern "C" void cuda_kv_sequence_state_advance(
+        int *d_head, int *d_count, int num_tokens, int max_seq_len,
+        cudaStream_t stream)
+    {
+        if (!d_head || !d_count || num_tokens <= 0 || max_seq_len <= 0)
+            return;
+        cuda_kv_sequence_state_advance_kernel<<<1, 1, 0, stream>>>(
+            d_head, d_count, num_tokens, max_seq_len);
+    }
+
+    extern "C" void cuda_kv_sequence_state_advance_dynamic(
+        int *d_head, int *d_count, const int *d_append_count,
+        int captured_num_tokens, int max_seq_len,
+        cudaStream_t stream)
+    {
+        if (!d_head || !d_count || captured_num_tokens <= 0 || max_seq_len <= 0)
+            return;
+        cuda_kv_sequence_state_advance_dynamic_kernel<<<1, 1, 0, stream>>>(
+            d_head, d_count, d_append_count, captured_num_tokens, max_seq_len);
+    }
+
+    extern "C" bool cuda_kv_sequence_state_publish(
+        int *d_heads,
+        int *d_counts,
+        const int32_t *target_cached_tokens,
+        const int32_t *accepted_state_counts,
+        const int32_t *publication_ok_flags,
+        int n_layers,
+        int batch_size,
+        int first_seq_idx,
+        int request_count,
+        int max_seq_len,
+        cudaStream_t stream)
+    {
+        if (!d_heads || !d_counts ||
+            !target_cached_tokens || !accepted_state_counts ||
+            !publication_ok_flags || !stream ||
+            n_layers <= 0 || batch_size <= 0 ||
+            first_seq_idx < 0 || request_count <= 0 ||
+            first_seq_idx + request_count > batch_size ||
+            max_seq_len <= 0)
+        {
+            return false;
+        }
+
+        cuda_kv_sequence_state_publish_kernel<<<
+            dim3(request_count, n_layers), dim3(1), 0, stream>>>(
+            d_heads,
+            d_counts,
+            target_cached_tokens,
+            accepted_state_counts,
+            publication_ok_flags,
+            batch_size,
+            first_seq_idx,
+            request_count,
+            max_seq_len);
+        return cudaGetLastError() == cudaSuccess;
+    }
+
     // =========================================================================
     // CUDARingKVCache Implementation
     // =========================================================================
@@ -631,10 +921,10 @@ namespace llaminar2
                               : (n_kv_heads * head_dim)),
           is_sharded_(false), device_ctx_(nullptr)
     {
-        LOG_INFO("[CUDARingKVCache] Creating cache: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
-                 << ", precision=" << static_cast<int>(Precision));
+        LOG_DEBUG("[CUDARingKVCache] Creating cache: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -657,9 +947,9 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -688,11 +978,11 @@ namespace llaminar2
         device_ctx_ = ctx;
         device_id_ = ctx->deviceOrdinal();
 
-        LOG_INFO("[CUDARingKVCache] Creating cache with device context: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
-                 << ", device=" << device_id_
-                 << ", precision=" << static_cast<int>(Precision));
+        LOG_DEBUG("[CUDARingKVCache] Creating cache with device context: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", kv_dim=" << kv_dim_
+                  << ", device=" << device_id_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -715,9 +1005,9 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -735,12 +1025,12 @@ namespace llaminar2
                               : (local_n_kv_heads * head_dim)),
           is_sharded_(local_n_kv_heads != n_kv_heads), device_ctx_(nullptr)
     {
-        LOG_INFO("[CUDARingKVCache] Creating sharded cache: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
-                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
-                 << ", local_kv_dim=" << kv_dim_
-                 << ", precision=" << static_cast<int>(Precision));
+        LOG_DEBUG("[CUDARingKVCache] Creating sharded cache: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                  << ", local_kv_dim=" << kv_dim_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -763,9 +1053,9 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -795,13 +1085,13 @@ namespace llaminar2
         device_ctx_ = ctx;
         device_id_ = ctx->deviceOrdinal();
 
-        LOG_INFO("[CUDARingKVCache] Creating sharded cache with device context: "
-                 << n_layers << " layers, batch=" << batch_size
-                 << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
-                 << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
-                 << ", local_kv_dim=" << kv_dim_
-                 << ", device=" << device_id_
-                 << ", precision=" << static_cast<int>(Precision));
+        LOG_DEBUG("[CUDARingKVCache] Creating sharded cache with device context: "
+                  << n_layers << " layers, batch=" << batch_size
+                  << ", max_seq=" << max_seq_len << ", total_kv_heads=" << n_kv_heads
+                  << ", local_kv_heads=" << local_n_kv_heads << ", kv_head_start=" << kv_head_start
+                  << ", local_kv_dim=" << kv_dim_
+                  << ", device=" << device_id_
+                  << ", precision=" << static_cast<int>(Precision));
 
         cudaSetDevice(device_id_);
 
@@ -824,9 +1114,9 @@ namespace llaminar2
             // Views are created lazily in get_k()/get_v()
         }
 
-        LOG_INFO("[CUDARingKVCache] Allocated "
-                 << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
-                 << " MB total (including scratch)");
+        LOG_DEBUG("[CUDARingKVCache] Allocated "
+                  << (n_layers_ * batch_size_ * 4 * max_seq_len_ * kv_dim_ * sizeof(DataT)) / (1024 * 1024)
+                  << " MB total (including scratch)");
 
         allocateDeviceParams();
     }
@@ -863,6 +1153,124 @@ namespace llaminar2
                     cudaFree(shadow.d_V);
             }
         }
+    }
+
+    template <ActivationPrecision Precision>
+    void CUDARingKVCache<Precision>::clear()
+    {
+        cudaSetDevice(device_id_);
+        cudaStream_t clear_stream = getEffectiveStream(nullptr);
+
+        // Drop conversion scratch so shorter follow-up requests cannot observe
+        // stale lanes from a previous longer append/read conversion path.
+        freeConvScratch();
+
+        // Keep dynamic-head allocations stable for graph caches, but reset both
+        // host and device values to match empty ring entries before next append.
+        const int num_entries = n_layers_ * batch_size_;
+        if (h_head_params_ && num_entries > 0)
+        {
+            std::memset(h_head_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
+        }
+        if (h_count_params_ && num_entries > 0)
+        {
+            std::memset(h_count_params_, 0, static_cast<size_t>(num_entries) * sizeof(int));
+        }
+        if (d_head_params_ && num_entries > 0)
+        {
+            cudaError_t head_err = cudaMemsetAsync(d_head_params_, 0,
+                                                   static_cast<size_t>(num_entries) * sizeof(int),
+                                                   clear_stream);
+            if (head_err != cudaSuccess)
+            {
+                LOG_WARN("[CUDARingKVCache::clear] head params memset failed: "
+                         << cudaGetErrorString(head_err));
+            }
+        }
+        if (d_count_params_ && num_entries > 0)
+        {
+            cudaError_t count_err = cudaMemsetAsync(d_count_params_, 0,
+                                                    static_cast<size_t>(num_entries) * sizeof(int),
+                                                    clear_stream);
+            if (count_err != cudaSuccess)
+            {
+                LOG_WARN("[CUDARingKVCache::clear] count params memset failed: "
+                         << cudaGetErrorString(count_err));
+            }
+        }
+
+        // RoPE-on-read shadows and tensor views are request-scoped wrappers over
+        // cache contents. Reset them so no stale view can survive a cache clear.
+        for (auto &layer_shadows : rope_shadows_)
+        {
+            for (auto &shadow : layer_shadows)
+            {
+                if (shadow.d_K)
+                {
+                    cudaFree(shadow.d_K);
+                    shadow.d_K = nullptr;
+                }
+                if (shadow.d_V)
+                {
+                    cudaFree(shadow.d_V);
+                    shadow.d_V = nullptr;
+                }
+                shadow.converted_count = 0;
+                shadow.last_head = -1;
+                shadow.rope_applied = false;
+                shadow.k_view.reset();
+                shadow.v_view.reset();
+            }
+        }
+        rope_shadows_.clear();
+        for (auto &layer_views : tensor_views_)
+        {
+            for (auto &views : layer_views)
+            {
+                views[0].reset();
+                views[1].reset();
+            }
+        }
+
+        // Scrub persistent device storage and linearization scratch. Metadata
+        // reset alone should be sufficient logically, but zeroing matches a new
+        // cache object and protects snapshot/debug read paths from stale rows.
+        const size_t buffer_size = static_cast<size_t>(max_seq_len_) *
+                                   static_cast<size_t>(kv_storage_dim_) *
+                                   sizeof(DataT);
+        for (auto &layer_entries : entries_)
+        {
+            for (auto &entry : layer_entries)
+            {
+                if (entry.d_K)
+                    cudaMemsetAsync(entry.d_K, 0, buffer_size, clear_stream);
+                if (entry.d_V)
+                    cudaMemsetAsync(entry.d_V, 0, buffer_size, clear_stream);
+                if (entry.d_K_scratch)
+                    cudaMemsetAsync(entry.d_K_scratch, 0, buffer_size, clear_stream);
+                if (entry.d_V_scratch)
+                    cudaMemsetAsync(entry.d_V_scratch, 0, buffer_size, clear_stream);
+            }
+        }
+
+        cudaError_t sync_err = cudaStreamSynchronize(clear_stream);
+        if (sync_err != cudaSuccess)
+        {
+            LOG_WARN("[CUDARingKVCache::clear] KV buffer clear sync failed: "
+                     << cudaGetErrorString(sync_err));
+        }
+
+        // Reset compressed entries directly. Calling CUDARingKVCacheBase::clear()
+        // would dispatch through virtual clear_layer(), which hybrid caches map
+        // through global model layer ids instead of compressed FA indices.
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            for (int seq = 0; seq < batch_size_; ++seq)
+            {
+                CUDARingKVCacheBase::clear_sequence(layer, seq);
+            }
+        }
+        wrap_warned_ = false;
     }
 
     template <ActivationPrecision Precision>
@@ -943,6 +1351,10 @@ namespace llaminar2
     extern "C" void cuda_ring_append_dynamic_q8_1(
         Q8_1Block *, Q8_1Block *, const Q8_1Block *, const Q8_1Block *,
         const int *, int, int, int, cudaStream_t);
+    extern "C" void cuda_kv_sequence_state_advance(
+        int *, int *, int, int, cudaStream_t);
+    extern "C" void cuda_kv_sequence_state_advance_dynamic(
+        int *, int *, const int *, int, int, cudaStream_t);
 
     template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::launch_append_kernel_dynamic(
@@ -1000,9 +1412,29 @@ namespace llaminar2
         }
 
         EntryT &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
+        cudaStream_t effective_stream = stream;
+        if (!effective_stream)
+        {
+            if (capture_active)
+            {
+                LOG_ERROR("[CUDARingKVCache::append] Explicit CUDA stream required during graph capture");
+                return false;
+            }
+            // Keep sequence-state ownership coherent on device even for legacy
+            // callers that pass nullptr. This is an explicit worker stream, not
+            // CUDA's device-default stream, so later metadata uploads are ordered
+            // with the payload append instead of silently leaving stale counters.
+            effective_stream = device_ctx_
+                                   ? static_cast<cudaStream_t>(device_ctx_->defaultStream())
+                                   : static_cast<cudaStream_t>(
+                                         GPUDeviceContextPool::instance()
+                                             .getNvidiaContext(device_id_)
+                                             .defaultStream());
+        }
 
         // Check if we would exceed capacity (ring buffer overwrites oldest)
-        if (entry.count + num_tokens > max_seq_len_)
+        if (!capture_active && entry.count + num_tokens > max_seq_len_)
         {
             // Auto-evict oldest tokens to make room
             int to_evict = entry.count + num_tokens - max_seq_len_;
@@ -1018,28 +1450,271 @@ namespace llaminar2
             LOG_DEBUG("[CUDARingKVCache::append] Auto-evicted " << to_evict << " tokens");
         }
 
-        // Use dynamic head params when available and stream is provided.
-        // This path is graph-capturable: the H2D copy and kernel launch are
-        // recorded in the graph, and on replay setDynamicHead() updates the
-        // pinned host buffer before the captured H2D re-reads it.
-        if (d_head_params_ && h_head_params_ && stream)
+        // Captured graphs read the ring head from a stable device scalar that
+        // updateDynamicParams()/setDynamicHead() uploads before capture/replay.
+        // Do not record H2D copies in the captured graph.
+        if (capture_active && d_head_params_ && h_head_params_)
         {
             int idx = layer * batch_size_ + seq_idx;
-            h_head_params_[idx] = entry.head;
-            cudaMemcpyAsync(&d_head_params_[idx], &h_head_params_[idx],
-                            sizeof(int), cudaMemcpyHostToDevice, stream);
-            launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, stream);
+            launch_append_kernel_dynamic(entry, d_k, d_v, &d_head_params_[idx], num_tokens, effective_stream);
+            if (d_count_params_)
+            {
+                cuda_kv_sequence_state_advance_dynamic(
+                    &d_head_params_[idx], &d_count_params_[idx],
+                    deviceDynamicAppendCountPtr(layer, seq_idx),
+                    num_tokens, max_seq_len_, effective_stream);
+            }
         }
         else
         {
             // Fallback: scalar head argument (non-graph path)
-            launch_append_kernel(entry, d_k, d_v, num_tokens, stream);
+            launch_append_kernel(entry, d_k, d_v, num_tokens, effective_stream);
         }
 
-        // Update ring buffer state
-        entry.head = (entry.head + num_tokens) % max_seq_len_;
-        entry.count += num_tokens;
-        entry.scratch_valid = false; // Scratch is stale after append
+        if (!capture_active)
+        {
+            // Update ring buffer state only for real execution. During graph
+            // capture, kernels are recorded but not executed until launch, and
+            // replay callbacks advance host metadata after that launch.
+            entry.head = (entry.head + num_tokens) % max_seq_len_;
+            entry.count += num_tokens;
+            entry.scratch_valid = false; // Scratch is stale after append
+            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, effective_stream))
+                return false;
+        }
+
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::appendVerifierRowsDecodeEquivalent(
+        int layer,
+        int seq_idx,
+        const ITensor *K,
+        const ITensor *V,
+        int verifier_rows,
+        void *gpu_stream)
+    {
+        if (layer < 0 || layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_ ||
+            verifier_rows < 1 || verifier_rows > 4 ||
+            !K || !V || !gpu_stream)
+        {
+            LOG_ERROR("[CUDARingKVCache] Invalid verifier append request: layer="
+                      << layer << " n_layers=" << n_layers_
+                      << " first_layer=" << first_layer_index()
+                      << " seq_idx=" << seq_idx << " batch_size=" << batch_size_
+                      << " rows=" << verifier_rows
+                      << " K=" << (K ? "set" : "null")
+                      << " V=" << (V ? "set" : "null")
+                      << " stream=" << gpu_stream);
+            return false;
+        }
+
+        const auto layout_for = [&](const ITensor *tensor,
+                                    const char *label,
+                                    bool *head_major,
+                                    int *convert_rows,
+                                    int *convert_cols) -> bool
+        {
+            if (!tensor || !head_major || !convert_rows || !convert_cols ||
+                tensor->shape().size() < 2)
+            {
+                return false;
+            }
+
+            const size_t rows = tensor->shape()[0];
+            const size_t cols = tensor->shape()[1];
+            const bool position_major =
+                rows >= static_cast<size_t>(verifier_rows) &&
+                cols == static_cast<size_t>(kv_dim_);
+            const bool verifier_head_major =
+                rows == static_cast<size_t>(local_n_kv_heads_) *
+                            static_cast<size_t>(verifier_rows) &&
+                cols == static_cast<size_t>(head_dim_);
+
+            if (!position_major && !verifier_head_major)
+            {
+                LOG_ERROR("[CUDARingKVCache] Unsupported verifier " << label
+                                                                    << " source shape ["
+                                                                    << rows << "," << cols
+                                                                    << "] rows=" << verifier_rows
+                                                                    << " local_heads="
+                                                                    << local_n_kv_heads_
+                                                                    << " head_dim=" << head_dim_
+                                                                    << " kv_dim=" << kv_dim_);
+                return false;
+            }
+
+            *head_major = verifier_head_major && !position_major;
+            *convert_rows = *head_major ? local_n_kv_heads_ * verifier_rows : verifier_rows;
+            *convert_cols = *head_major ? head_dim_ : kv_dim_;
+            return true;
+        };
+
+        bool k_head_major = false;
+        bool v_head_major = false;
+        int k_convert_rows = 0;
+        int k_convert_cols = 0;
+        int v_convert_rows = 0;
+        int v_convert_cols = 0;
+        if (!layout_for(K, "K", &k_head_major, &k_convert_rows, &k_convert_cols) ||
+            !layout_for(V, "V", &v_head_major, &v_convert_rows, &v_convert_cols))
+        {
+            return false;
+        }
+
+        const void *d_k_src = K->gpu_data_ptr();
+        const void *d_v_src = V->gpu_data_ptr();
+        if (!d_k_src || !d_v_src)
+        {
+            LOG_ERROR("[CUDARingKVCache] Verifier append requires device-resident K/V tensors");
+            return false;
+        }
+
+        cudaStream_t stream = static_cast<cudaStream_t>(gpu_stream);
+        const auto target_type = []() constexpr
+        {
+            if constexpr (Precision == ActivationPrecision::FP32)
+                return TensorType::FP32;
+            else if constexpr (Precision == ActivationPrecision::FP16)
+                return TensorType::FP16;
+            else if constexpr (Precision == ActivationPrecision::BF16)
+                return TensorType::BF16;
+            else
+                return TensorType::Q8_1;
+        }();
+
+        const DataT *typed_k = static_cast<const DataT *>(d_k_src);
+        const DataT *typed_v = static_cast<const DataT *>(d_v_src);
+        if (K->native_type() != target_type || V->native_type() != target_type)
+        {
+            if constexpr (Precision == ActivationPrecision::FP16)
+            {
+                const size_t k_bytes = static_cast<size_t>(k_convert_rows) *
+                                       static_cast<size_t>(k_convert_cols) * sizeof(uint16_t);
+                const size_t v_bytes = static_cast<size_t>(v_convert_rows) *
+                                       static_cast<size_t>(v_convert_cols) * sizeof(uint16_t);
+                if (!ensureConvScratch(std::max(k_bytes, v_bytes)))
+                    return false;
+                if (!cuda_convert_tensor_to_fp16(d_k_src, K->native_type(),
+                                                 static_cast<uint16_t *>(conv_scratch_k_),
+                                                 k_convert_rows * k_convert_cols, stream) ||
+                    !cuda_convert_tensor_to_fp16(d_v_src, V->native_type(),
+                                                 static_cast<uint16_t *>(conv_scratch_v_),
+                                                 v_convert_rows * v_convert_cols, stream))
+                {
+                    LOG_ERROR("[CUDARingKVCache] FP16 verifier append conversion failed");
+                    return false;
+                }
+                typed_k = static_cast<const DataT *>(conv_scratch_k_);
+                typed_v = static_cast<const DataT *>(conv_scratch_v_);
+            }
+            else if constexpr (Precision == ActivationPrecision::Q8_1)
+            {
+                const auto q8_bytes = [](int rows, int cols) -> size_t
+                {
+                    const int blocks = (cols + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+                    return static_cast<size_t>(rows) * static_cast<size_t>(blocks) * sizeof(Q8_1Block);
+                };
+                if (!ensureConvScratch(std::max(q8_bytes(k_convert_rows, k_convert_cols),
+                                                q8_bytes(v_convert_rows, v_convert_cols))))
+                    return false;
+                if (!cuda_convert_tensor_to_q8_1(d_k_src, K->native_type(),
+                                                 static_cast<Q8_1Block *>(conv_scratch_k_),
+                                                 k_convert_rows, k_convert_cols, stream) ||
+                    !cuda_convert_tensor_to_q8_1(d_v_src, V->native_type(),
+                                                 static_cast<Q8_1Block *>(conv_scratch_v_),
+                                                 v_convert_rows, v_convert_cols, stream))
+                {
+                    LOG_ERROR("[CUDARingKVCache] Q8_1 verifier append conversion failed");
+                    return false;
+                }
+                typed_k = static_cast<const DataT *>(conv_scratch_k_);
+                typed_v = static_cast<const DataT *>(conv_scratch_v_);
+            }
+            else
+            {
+                LOG_ERROR("[CUDARingKVCache] Verifier append conversion is unsupported for cache precision "
+                          << static_cast<int>(Precision));
+                return false;
+            }
+        }
+
+        EntryT &entry = entries_[layer][seq_idx];
+        const bool capture_active = isGraphCaptureActive();
+        int source_start = 0;
+        int rows_to_write = verifier_rows;
+        if (!capture_active && entry.count + verifier_rows > max_seq_len_)
+        {
+            const int to_evict = entry.count + verifier_rows - max_seq_len_;
+            if (to_evict > entry.count)
+            {
+                source_start = to_evict - entry.count;
+                rows_to_write = verifier_rows - source_start;
+                total_evicted_ += entry.count + source_start;
+                entry.count = 0;
+            }
+            else
+            {
+                entry.count -= to_evict;
+                total_evicted_ += to_evict;
+            }
+            if (!wrap_warned_)
+            {
+                LOG_WARN("Context window full (" << max_seq_len_
+                                                 << " tokens). Sliding window is now overwriting oldest tokens. "
+                                                 << "Use -c <size> to increase context length.");
+                wrap_warned_ = true;
+            }
+        }
+
+        const int head_storage_dim =
+            (Precision == ActivationPrecision::Q8_1)
+                ? (head_dim_ + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE
+                : head_dim_;
+
+        if (capture_active && d_head_params_ && h_head_params_)
+        {
+            const int idx = layer * batch_size_ + seq_idx;
+            cuda_ring_append_verifier_rows_dynamic_typed<DataT>(
+                entry.d_K, entry.d_V, typed_k, typed_v,
+                &d_head_params_[idx], max_seq_len_, kv_storage_dim_, head_storage_dim,
+                verifier_rows, source_start, rows_to_write,
+                k_head_major, v_head_major, stream);
+            if (d_count_params_)
+            {
+                cuda_kv_sequence_state_advance(
+                    &d_head_params_[idx], &d_count_params_[idx],
+                    rows_to_write, max_seq_len_, stream);
+            }
+        }
+        else
+        {
+            cuda_ring_append_verifier_rows_typed<DataT>(
+                entry.d_K, entry.d_V, typed_k, typed_v,
+                entry.head, max_seq_len_, kv_storage_dim_, head_storage_dim,
+                verifier_rows, source_start, rows_to_write,
+                k_head_major, v_head_major, stream);
+        }
+
+        const cudaError_t launch_err = cudaGetLastError();
+        if (launch_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCache] Verifier append kernel launch failed: "
+                      << cudaGetErrorString(launch_err));
+            return false;
+        }
+
+        if (!capture_active)
+        {
+            entry.head = (entry.head + rows_to_write) % max_seq_len_;
+            entry.count += rows_to_write;
+            entry.scratch_valid = false;
+            invalidateRoPEShadow(layer, seq_idx);
+            if (d_count_params_ && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                return false;
+        }
 
         return true;
     }
@@ -1200,6 +1875,257 @@ namespace llaminar2
     }
 
     template <ActivationPrecision Precision>
+    typename IKVCache::KVCacheLogicalBlockLayout
+    CUDARingKVCache<Precision>::logicalBlockLayout(int global_layer, int token_count) const
+    {
+        KVCacheLogicalBlockLayout layout;
+        layout.k_precision = Precision;
+        layout.v_precision = Precision;
+        layout.layout = TensorLayout::KV_POS_HEAD_DIM;
+        layout.local_kv_heads = local_n_kv_heads_;
+        layout.kv_head_start = kv_head_start_;
+        layout.head_dim = head_dim_;
+        layout.device_resident = true;
+
+        const int local_layer = remapLayerIndex(global_layer);
+        if (local_layer < 0 || local_layer >= n_layers_ || batch_size_ <= 0 || token_count <= 0)
+        {
+            return layout;
+        }
+
+        const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        layout.k_bytes = static_cast<size_t>(token_count) * row_bytes;
+        layout.v_bytes = static_cast<size_t>(token_count) * row_bytes;
+        return layout;
+    }
+
+    template <ActivationPrecision Precision>
+    typename IKVCache::KVCacheSequenceState
+    CUDARingKVCache<Precision>::sequenceState(int global_layer, int seq_idx) const
+    {
+        const int local_layer = remapLayerIndex(global_layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            seq_idx < 0 || seq_idx >= batch_size_)
+        {
+            return {};
+        }
+
+        const auto &entry = entries_[local_layer][seq_idx];
+        KVCacheSequenceState state;
+        state.cached_tokens = entry.count;
+        state.implementation_head = entry.head;
+        state.wrapped = entry.is_wrapped(max_seq_len_);
+        return state;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::exportLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
+    {
+        const int local_layer = remapLayerIndex(desc.layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0)
+        {
+            return false;
+        }
+
+        const auto &entry = entries_[local_layer][desc.seq_idx];
+        if (desc.logical_token_start > entry.count ||
+            desc.token_count > entry.count - desc.logical_token_start)
+        {
+            return false;
+        }
+        if (desc.token_count == 0)
+        {
+            return true;
+        }
+        if (!dst_k || !dst_v || !entry.d_K || !entry.d_V)
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_id_);
+        cudaStream_t stream = desc.stream ? static_cast<cudaStream_t>(desc.stream)
+                                          : getEffectiveStream(nullptr);
+        const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const int tail = entry.tail(max_seq_len_);
+        auto *out_k = static_cast<uint8_t *>(dst_k);
+        auto *out_v = static_cast<uint8_t *>(dst_v);
+
+        for (int i = 0; i < desc.token_count; ++i)
+        {
+            const int logical = desc.logical_token_start + i;
+            const int phys = (tail + logical) % max_seq_len_;
+            const size_t dst_offset = static_cast<size_t>(i) * row_bytes;
+            const size_t src_offset = static_cast<size_t>(phys) * static_cast<size_t>(kv_storage_dim_);
+
+            cudaError_t err = cudaMemcpyAsync(out_k + dst_offset,
+                                              entry.d_K + src_offset,
+                                              row_bytes,
+                                              cudaMemcpyDeviceToHost,
+                                              stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] K copy failed: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+            err = cudaMemcpyAsync(out_v + dst_offset,
+                                  entry.d_V + src_offset,
+                                  row_bytes,
+                                  cudaMemcpyDeviceToHost,
+                                  stream);
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] V copy failed: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+        }
+
+        const cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCache::exportLogicalBlock] stream sync failed: "
+                      << cudaGetErrorString(sync_err));
+            return false;
+        }
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::importLogicalBlock(
+        const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
+    {
+        const int local_layer = remapLayerIndex(desc.layer);
+        if (local_layer < 0 || local_layer >= n_layers_ ||
+            desc.seq_idx < 0 || desc.seq_idx >= batch_size_ ||
+            desc.logical_token_start < 0 || desc.token_count < 0 ||
+            desc.logical_token_start > max_seq_len_ ||
+            desc.token_count > max_seq_len_ - desc.logical_token_start)
+        {
+            return false;
+        }
+
+        auto &entry = entries_[local_layer][desc.seq_idx];
+        cudaStream_t stream = desc.stream ? static_cast<cudaStream_t>(desc.stream)
+                                          : getEffectiveStream(nullptr);
+        if (desc.token_count == 0)
+        {
+            if (desc.logical_token_start == 0)
+            {
+                entry.head = 0;
+                entry.count = 0;
+                entry.scratch_valid = false;
+                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+                    return false;
+                invalidateRoPEShadow(local_layer, desc.seq_idx);
+            }
+            return true;
+        }
+        if (!src_k || !src_v || !entry.d_K || !entry.d_V)
+        {
+            return false;
+        }
+        if (desc.logical_token_start != entry.count ||
+            entry.head != (entry.count % max_seq_len_))
+        {
+            return false;
+        }
+
+        cudaSetDevice(device_id_);
+        const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const size_t bytes = static_cast<size_t>(desc.token_count) * row_bytes;
+        const size_t dst_offset = static_cast<size_t>(desc.logical_token_start) *
+                                  static_cast<size_t>(kv_storage_dim_);
+
+        cudaError_t err = cudaMemcpyAsync(entry.d_K + dst_offset,
+                                          src_k,
+                                          bytes,
+                                          cudaMemcpyHostToDevice,
+                                          stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCache::importLogicalBlock] K copy failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        err = cudaMemcpyAsync(entry.d_V + dst_offset,
+                              src_v,
+                              bytes,
+                              cudaMemcpyHostToDevice,
+                              stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCache::importLogicalBlock] V copy failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        entry.count = desc.logical_token_start + desc.token_count;
+        entry.head = entry.count % max_seq_len_;
+        entry.scratch_valid = false;
+        if (d_count_params_ && !uploadHostDeviceParamMirror(local_layer, desc.seq_idx, stream))
+            return false;
+
+        const cudaError_t sync_err = cudaStreamSynchronize(stream);
+        if (sync_err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDARingKVCache::importLogicalBlock] stream sync failed: "
+                      << cudaGetErrorString(sync_err));
+            return false;
+        }
+
+        invalidateRoPEShadow(local_layer, desc.seq_idx);
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
+    bool CUDARingKVCache<Precision>::truncateSequence(int seq_idx, int cached_tokens, void *stream)
+    {
+        if (seq_idx < 0 || seq_idx >= batch_size_ ||
+            cached_tokens < 0 || cached_tokens > max_seq_len_)
+        {
+            return false;
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            if (cached_tokens > entries_[layer][seq_idx].count)
+            {
+                return false;
+            }
+        }
+
+        for (int layer = 0; layer < n_layers_; ++layer)
+        {
+            auto &entry = entries_[layer][seq_idx];
+            if (entry.count == cached_tokens)
+            {
+                if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                    return false;
+                continue;
+            }
+            if (cached_tokens == 0)
+            {
+                entry.head = 0;
+            }
+            else
+            {
+                const int tail = entry.tail(max_seq_len_);
+                entry.head = (tail + cached_tokens) % max_seq_len_;
+            }
+            entry.count = cached_tokens;
+            entry.scratch_valid = false;
+            if (d_count_params_ && stream && !uploadHostDeviceParamMirror(layer, seq_idx, stream))
+                return false;
+            invalidateRoPEShadow(layer, seq_idx);
+        }
+        return true;
+    }
+
+    template <ActivationPrecision Precision>
     void CUDARingKVCache<Precision>::evict_oldest(int layer, int seq_idx, int num_tokens)
     {
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
@@ -1262,17 +2188,20 @@ namespace llaminar2
         // Use provided max_kv_len or actual
         int out_max_kv_len = (max_kv_len > 0) ? max_kv_len : actual_max_kv_len;
 
-        launch_gather_kernel(entry_ptrs,
-                             static_cast<DataT *>(d_k_out),
-                             static_cast<DataT *>(d_v_out),
-                             kv_lens, out_max_kv_len,
-                             num_seqs, stream);
+        if (!launch_gather_kernel(entry_ptrs,
+                                  static_cast<DataT *>(d_k_out),
+                                  static_cast<DataT *>(d_v_out),
+                                  kv_lens, out_max_kv_len,
+                                  num_seqs, stream))
+        {
+            return -1;
+        }
 
         return actual_max_kv_len;
     }
 
     template <ActivationPrecision Precision>
-    void CUDARingKVCache<Precision>::launch_gather_kernel(
+    bool CUDARingKVCache<Precision>::launch_gather_kernel(
         const std::vector<EntryT *> &entries,
         DataT *d_k_out, DataT *d_v_out,
         int *kv_lens, int max_kv_len,
@@ -1283,36 +2212,31 @@ namespace llaminar2
         DataT **d_v_caches = nullptr;
         int *d_tails = nullptr;
         int *d_counts = nullptr;
-        bool using_workspace = false;
-
-        if (hasWorkspace())
+        if (!hasWorkspace() || !workspace_ || !workspace_->isAllocated())
         {
-            // Use pre-allocated workspace buffers (fast path)
-            d_k_caches = static_cast<DataT **>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_K_PTRS));
-            d_v_caches = static_cast<DataT **>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_V_PTRS));
-            d_tails = static_cast<int *>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_TAILS));
-            d_counts = static_cast<int *>(
-                workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_COUNTS));
-
-            if (d_k_caches && d_v_caches && d_tails && d_counts)
-            {
-                using_workspace = true;
-                LOG_TRACE("[CUDARingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
-            }
+            LOG_ERROR("[CUDARingKVCache] Workspace is required for batched gather; "
+                      << "raw cudaMalloc fallback is disabled");
+            return false;
         }
 
-        if (!using_workspace)
+        // Use pre-allocated workspace buffers. These are required so gather stays
+        // visible to the memory planner and remains graph-capture compatible.
+        d_k_caches = static_cast<DataT **>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_K_PTRS));
+        d_v_caches = static_cast<DataT **>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_V_PTRS));
+        d_tails = static_cast<int *>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_TAILS));
+        d_counts = static_cast<int *>(
+            workspace_->getBuffer(KVCacheWorkspaceBuffers::BATCH_COUNTS));
+
+        if (!d_k_caches || !d_v_caches || !d_tails || !d_counts)
         {
-            // Fallback to per-call allocation (backward compatibility)
-            LOG_TRACE("[CUDARingKVCache] Fallback to per-call allocation for gather, num_seqs=" << num_seqs);
-            cudaMalloc(&d_k_caches, num_seqs * sizeof(DataT *));
-            cudaMalloc(&d_v_caches, num_seqs * sizeof(DataT *));
-            cudaMalloc(&d_tails, num_seqs * sizeof(int));
-            cudaMalloc(&d_counts, num_seqs * sizeof(int));
+            LOG_ERROR("[CUDARingKVCache] Missing required workspace buffers for batched gather");
+            return false;
         }
+
+        LOG_TRACE("[CUDARingKVCache] Using workspace buffers for gather, num_seqs=" << num_seqs);
 
         // Prepare host arrays
         std::vector<DataT *> h_k_caches(num_seqs);
@@ -1347,15 +2271,7 @@ namespace llaminar2
             d_k_caches, d_v_caches,
             d_tails, d_counts,
             num_seqs, max_kv_len, max_seq_len_, kv_storage_dim_);
-
-        // Free temporary device arrays only if we allocated them
-        if (!using_workspace)
-        {
-            cudaFreeAsync(d_k_caches, stream);
-            cudaFreeAsync(d_v_caches, stream);
-            cudaFreeAsync(d_tails, stream);
-            cudaFreeAsync(d_counts, stream);
-        }
+        return cudaGetLastError() == cudaSuccess;
     }
 
     // =========================================================================
@@ -1366,48 +2282,70 @@ namespace llaminar2
     WorkspaceRequirements CUDARingKVCache<Precision>::getWorkspaceRequirements(
         int m, int n, int k) const
     {
-        // m = batch size (number of sequences in gather operation)
-        // n, k unused for KV cache
-        // Default to batch_size_ if m is 0
-        (void)n;
+        // New callers pass m=max graph tokens and n=batch size so conversion
+        // scratch can follow bucket/chunk size. Legacy one-arg callers used
+        // m=batch size; keep that behavior and size scratch to max_seq_len_.
         (void)k;
 
-        const int actual_batch_size = (m > 0) ? m : batch_size_;
+        const bool has_token_hint = n > 0;
+        const int actual_batch_size = has_token_hint ? n : ((m > 0) ? m : batch_size_);
+        const int scratch_tokens = has_token_hint ? m : max_seq_len_;
+        const int bounded_batch_size = std::max(1, actual_batch_size);
+        const int bounded_scratch_tokens = std::max(1, scratch_tokens);
+        const size_t fp32_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(float);
+        const size_t fp16_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_dim_) * sizeof(uint16_t);
+        const size_t native_scratch_bytes =
+            static_cast<size_t>(bounded_scratch_tokens) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
+        const size_t conversion_scratch_bytes =
+            std::max(fp32_scratch_bytes, std::max(fp16_scratch_bytes, native_scratch_bytes));
 
         WorkspaceRequirements reqs;
 
         // Buffer for K cache pointers: DataT* per sequence
         reqs.buffers.push_back({
             KVCacheWorkspaceBuffers::BATCH_K_PTRS,
-            static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
-            256,  // Alignment
-            false // Not required - fallback to per-call allocation
+            static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
+            256, // Alignment
+            true // Required: no raw cudaMalloc fallback in gather
         });
 
         // Buffer for V cache pointers: DataT* per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_V_PTRS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(DataT *),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(DataT *),
                                 256,
-                                false});
+                                true});
 
         // Buffer for tail indices: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_TAILS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
                                 256,
-                                false});
+                                true});
 
         // Buffer for count values: int per sequence
         reqs.buffers.push_back({KVCacheWorkspaceBuffers::BATCH_COUNTS,
-                                static_cast<size_t>(actual_batch_size) * sizeof(int),
+                                static_cast<size_t>(bounded_batch_size) * sizeof(int),
                                 256,
-                                false});
+                                true});
+
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_K,
+                                conversion_scratch_bytes,
+                                256,
+                                true});
+        reqs.buffers.push_back({KVCacheWorkspaceBuffers::CONV_SCRATCH_V,
+                                conversion_scratch_bytes,
+                                256,
+                                true});
 
         LOG_DEBUG("[CUDARingKVCache] Workspace requirements: batch_size="
-                  << actual_batch_size
-                  << " BATCH_K_PTRS=" << actual_batch_size * sizeof(DataT *)
-                  << " BATCH_V_PTRS=" << actual_batch_size * sizeof(DataT *)
-                  << " BATCH_TAILS=" << actual_batch_size * sizeof(int)
-                  << " BATCH_COUNTS=" << actual_batch_size * sizeof(int));
+                  << bounded_batch_size
+                  << " scratch_tokens=" << bounded_scratch_tokens
+                  << " BATCH_K_PTRS=" << bounded_batch_size * sizeof(DataT *)
+                  << " BATCH_V_PTRS=" << bounded_batch_size * sizeof(DataT *)
+                  << " BATCH_TAILS=" << bounded_batch_size * sizeof(int)
+                  << " BATCH_COUNTS=" << bounded_batch_size * sizeof(int)
+                  << " CONV_SCRATCH(each)=" << conversion_scratch_bytes);
 
         return reqs;
     }

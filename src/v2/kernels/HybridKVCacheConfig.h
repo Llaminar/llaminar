@@ -105,8 +105,12 @@ namespace llaminar2
     struct HybridKVCacheConfig
     {
         /// Per-layer type: "full_attention" or "gdn"
-        /// Size must equal total n_layers.
+        /// Size must equal total n_layers for single-device caches, or the
+        /// local stage layer count for PP stage-local caches.
         std::vector<std::string> layer_types;
+
+        /// Global index of layer_types[0]. Non-zero for PP stage-local caches.
+        int first_layer_index = 0;
 
         // GDN state sizing (from GGUF ssm.* metadata)
         int gdn_conv_kernel_size = 0; ///< Short conv kernel width (e.g. 4)

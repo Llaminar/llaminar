@@ -19,6 +19,7 @@
 #include "../../utils/MPIStrategy.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../execution/config/RuntimeConfig.h"
+#include "../../loaders/PreparedWeightStore.h"
 #include "../../collective/ILocalTPContext.h"
 #include "../../collective/ITPContext.h"
 #include "../../collective/ILocalPPContext.h"
@@ -27,8 +28,12 @@
 #include "../../execution/compute_stages/stages/TPAllreduceStage.h"
 #include "../../execution/compute_stages/stages/LocalPPTransferStage.h"
 #include "../../execution/compute_stages/stages/FusedResidualNormStage.h"
+#include "../../execution/compute_stages/stages/QKNormStage.h"
+#include "../../execution/mtp/MTPSpecDecodeMetadata.h"
+#include "../../kernels/IHybridKVCache.h"
 #include "../../config/PipelineConfig.h"
 #include "../../memory/BufferId.h" // Phase 2: contract BufferIds
+#include <algorithm>
 #include <chrono>
 #include <chrono>
 #include <cstring>
@@ -36,6 +41,193 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        int embeddingVocabOffsetForDevice(const GraphConfig &config, DeviceId device)
+        {
+            if (!config.tp_config)
+                return 0;
+
+            // NodeLocalTP uses one MPI rank per CPU socket, but DeviceId::cpu()
+            // is a singleton.  Matching by device would always find rank 0's
+            // assignment, so prefer the current rank's assignment when it owns
+            // the requested device.
+            if (const auto *assignment = config.getAssignment())
+            {
+                if (assignment->device == device)
+                    return assignment->vocab_start;
+            }
+
+            for (const auto &assignment : config.tp_config->assignments())
+            {
+                if (assignment.device == device)
+                    return assignment.vocab_start;
+            }
+            return 0;
+        }
+
+        BufferId logitsBufferId(bool column_parallel, bool all_positions)
+        {
+            if (all_positions)
+            {
+                return column_parallel ? BufferId::ALL_POSITION_LOGITS_LOCAL
+                                       : BufferId::ALL_POSITION_LOGITS;
+            }
+            return column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        }
+
+        BufferId gatheredLogitsBufferId(bool all_positions)
+        {
+            return all_positions ? BufferId::ALL_POSITION_LOGITS : BufferId::LOGITS;
+        }
+
+        /**
+         * @brief Resolve the layer id passed to a KV-cache stage.
+         *
+         * Plain PP-local ring caches are sized only for the current stage, so
+         * they still need compact local ids. Hybrid caches own the FA/GDN layer
+         * map internally and need the absolute model layer id; otherwise a
+         * second PP-stage offset subtraction can alias different FA layers onto
+         * the same compressed cache slot.
+         *
+         * MTP sidecar caches opt into already-local ids with
+         * layer_idx_is_cache_local and intentionally bypass both mappings.
+         */
+        int kvCacheLayerForGraphStage(const IKVCache *kv_cache,
+                                      int layer_idx,
+                                      int pp_layer_offset,
+                                      bool layer_idx_is_cache_local)
+        {
+            if (layer_idx_is_cache_local)
+            {
+                return layer_idx;
+            }
+            if (dynamic_cast<const IHybridKVCache *>(kv_cache))
+            {
+                return layer_idx;
+            }
+            return layer_idx - pp_layer_offset;
+        }
+
+        /**
+         * @brief Describes the LM-head input shape and buffer contract.
+         *
+         * Normal decode/prefill passes the whole normalized activation tensor to
+         * LMHeadStage and lets that stage read only the final row. Full
+         * all-position verification projects every normalized row. The vLLM-style
+         * compact verifier path is the middle ground: row-select first packs the
+         * verifier rows into LM_HEAD_INPUT_ROWS, then LMHeadStage projects every
+         * row of that compact scratch tensor.
+         */
+        struct LMHeadInputLayout
+        {
+            int seq_len = 1;
+            BufferId input_buffer_id = BufferId::NORMALIZED;
+            bool compute_all_positions = false;
+            bool use_prefill_replay_row_offset = true;
+        };
+
+        /**
+         * @brief Resolve LMHeadStage shape/contract fields from the selected input tensor.
+         *
+         * Keeping this logic in one helper prevents the single-device, PP, and
+         * schema-built graph paths from drifting as we add verifier modes.
+         */
+        LMHeadInputLayout describeLMHeadInputLayout(
+            const GraphConfig &config,
+            const ActivationBuffers &buffers,
+            TensorBase *lm_head_input,
+            int total_tokens)
+        {
+            const TensorBase *normalized = buffers.normalized;
+            const TensorBase *compact_rows = buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+            const bool input_is_normalized = lm_head_input == normalized;
+            const bool input_is_compact_rows =
+                config.compute_all_position_logits &&
+                config.compute_row_indexed_logits &&
+                lm_head_input == compact_rows;
+
+            LMHeadInputLayout layout;
+            if (input_is_compact_rows)
+            {
+                layout.seq_len = config.row_indexed_logits_row_count;
+                layout.input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+                layout.compute_all_positions = true;
+                // Compact rows already start at row 0, so replay row offsets
+                // would be wrong and are intentionally disabled here.
+                layout.use_prefill_replay_row_offset = false;
+                return layout;
+            }
+
+            if (input_is_normalized)
+            {
+                layout.seq_len = total_tokens;
+                layout.input_buffer_id = BufferId::NORMALIZED;
+                layout.compute_all_positions = config.compute_all_position_logits;
+                layout.use_prefill_replay_row_offset = true;
+                return layout;
+            }
+
+            layout.seq_len = 1;
+            layout.input_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
+            layout.compute_all_positions = false;
+            layout.use_prefill_replay_row_offset = false;
+            return layout;
+        }
+
+        /**
+         * @brief Resolve and validate compact verifier source rows.
+         *
+         * The request-batched MTP verifier publishes a logical row plan that
+         * may skip over non-target rows in a flattened verifier sequence. Older
+         * single-request paths did not need to publish a plan because compact
+         * rows were always the leading rows. Keeping that default here lets
+         * existing tests and exact-shape graphs continue to behave the same,
+         * while non-empty plans fail loudly if they do not match the graph
+         * shape or the verifier activation tensor.
+         */
+        std::vector<int> resolveRowIndexedLogitRows(
+            const GraphConfig &config,
+            int row_count,
+            int total_tokens,
+            const char *context)
+        {
+            std::vector<int> selected_rows;
+            if (config.row_indexed_logits_selected_rows.empty())
+            {
+                selected_rows.reserve(static_cast<size_t>(row_count));
+                for (int row = 0; row < row_count; ++row)
+                    selected_rows.push_back(row);
+            }
+            else
+            {
+                selected_rows = config.row_indexed_logits_selected_rows;
+                if (static_cast<int>(selected_rows.size()) != row_count)
+                {
+                    LOG_ERROR("[QwenGraphBase] " << context
+                                                 << " row plan length "
+                                                 << selected_rows.size()
+                                                 << " does not match row_count="
+                                                 << row_count);
+                    throw std::runtime_error("row-indexed all-position logits row plan length mismatch");
+                }
+            }
+
+            for (int row : selected_rows)
+            {
+                if (row < 0 || row >= total_tokens)
+                {
+                    LOG_ERROR("[QwenGraphBase] " << context
+                                                 << " row plan selected row "
+                                                 << row
+                                                 << " outside verifier token range 0.."
+                                                 << (total_tokens - 1));
+                    throw std::runtime_error("row-indexed all-position logits row plan out of range");
+                }
+            }
+            return selected_rows;
+        }
+    }
 
     // Import graph_utils for cleaner code
     using namespace graph_utils;
@@ -80,6 +272,134 @@ namespace llaminar2
                                                                         << " default_device=" << config_.default_device.to_string());
 
         LOG_DEBUG("[QwenGraphBase] Initialized (layer-only)");
+    }
+
+    void QwenGraphBase::setModelContext(std::shared_ptr<IModelContext> model_ctx)
+    {
+        model_ctx_ = std::dynamic_pointer_cast<ModelContext>(std::move(model_ctx));
+        if (!model_ctx_)
+        {
+            LOG_DEBUG("[QwenGraphBase] setModelContext ignored non-ModelContext instance");
+        }
+    }
+
+    bool QwenGraphBase::hasLayerWeightSource() const
+    {
+        return weight_bindings_.get_layer_weights != nullptr || weights_.get_layer_weights != nullptr;
+    }
+
+    LayerWeightBindings QwenGraphBase::layerWeightBindingsForGraph(int layer_idx) const
+    {
+        if (weight_bindings_.get_layer_weights)
+            return weight_bindings_.get_layer_weights(layer_idx);
+        return {};
+    }
+
+    LayerWeights QwenGraphBase::layerWeightsForGraph(int layer_idx) const
+    {
+        if (weight_bindings_.get_layer_weights)
+            return toLegacyLayerWeights(weight_bindings_.get_layer_weights(layer_idx));
+        if (weights_.get_layer_weights)
+            return weights_.get_layer_weights(layer_idx);
+        return {};
+    }
+
+    TensorBase *QwenGraphBase::modelEmbeddingTable() const
+    {
+        TensorBase *bound = legacyTensor(weight_bindings_.embedding_table);
+        return bound ? bound : weights_.embedding_table;
+    }
+
+    TensorBase *QwenGraphBase::modelFinalNorm() const
+    {
+        TensorBase *bound = legacyTensor(weight_bindings_.final_norm);
+        return bound ? bound : weights_.final_norm;
+    }
+
+    TensorBase *QwenGraphBase::modelLMHead() const
+    {
+        TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
+        return bound ? bound : weights_.lm_head;
+    }
+
+    const WeightBinding *QwenGraphBase::modelEmbeddingBinding() const
+    {
+        return weight_bindings_.embedding_table;
+    }
+
+    const WeightBinding *QwenGraphBase::modelFinalNormBinding() const
+    {
+        return weight_bindings_.final_norm;
+    }
+
+    const WeightBinding *QwenGraphBase::modelLMHeadBinding() const
+    {
+        return weight_bindings_.lm_head;
+    }
+
+    std::optional<PreparedWeightRef> QwenGraphBase::preparedRefForGraphWeight(
+        const WeightBinding *binding,
+        DeviceId device) const
+    {
+        // Model GEMM stages must be wired from store-owned frozen WeightBinding
+        // ids.  A binding may still carry an old PreparedWeightRef from an
+        // earlier loader/materialization pass, but graph stages resolve refs
+        // through PreparedWeightStore at execution time. Returning a ref that
+        // the store cannot resolve creates a graph that validates cleanly at
+        // construction and then fails on the first replay. Treat the store as
+        // the sole source of truth for graph-executable prepared weights.
+        if (binding && prepared_weight_store_)
+        {
+            auto ref = prepared_weight_store_->preparedRefForBinding(binding->binding_id, device);
+            if (ref.has_value())
+                return ref;
+        }
+        return std::nullopt;
+    }
+
+    bool QwenGraphBase::hasActiveExpertMask(const std::vector<bool> &expert_mask) const
+    {
+        return std::any_of(expert_mask.begin(), expert_mask.end(), [](bool active)
+                           { return active; });
+    }
+
+    std::string QwenGraphBase::describeMissingExpertGemmEngine(
+        int num_experts,
+        const std::vector<bool> &expert_mask,
+        const std::vector<ITensorGemm *> &gate_gemm,
+        const std::vector<ITensorGemm *> &up_gemm,
+        const std::vector<ITensorGemm *> &down_gemm) const
+    {
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            if (!expert_mask.empty())
+            {
+                if (expert >= static_cast<int>(expert_mask.size()))
+                    return "expert=" + std::to_string(expert) + " role=mask";
+                if (!expert_mask[expert])
+                    continue;
+            }
+
+            if (expert >= static_cast<int>(gate_gemm.size()) || gate_gemm[expert] == nullptr)
+                return "expert=" + std::to_string(expert) + " role=gate";
+            if (expert >= static_cast<int>(up_gemm.size()) || up_gemm[expert] == nullptr)
+                return "expert=" + std::to_string(expert) + " role=up";
+            if (expert >= static_cast<int>(down_gemm.size()) || down_gemm[expert] == nullptr)
+                return "expert=" + std::to_string(expert) + " role=down";
+        }
+
+        return "unknown missing expert engine";
+    }
+
+    void QwenGraphBase::failMissingGpuExpertGemmEngines(
+        DeviceId device,
+        int layer_idx,
+        const std::string &reason) const
+    {
+        const std::string message = "[" + architectureName() + "] Missing GPU expert GEMM engines for layer " +
+                                    std::to_string(layer_idx) + " on " + device.to_string() + ": " + reason;
+        LOG_ERROR(message);
+        throw std::runtime_error(message);
     }
 
     // =============================================================================
@@ -129,6 +449,10 @@ namespace llaminar2
 
         // Ensure current_hidden alias in layer_buffers (expected by some stages)
         lb.current_hidden = buffers_.current_hidden;
+        if (auto *scratch_row = toBase(arena_->getTensor(BufferId::LM_HEAD_INPUT_ROW)))
+            lb.extensions[BufferId::LM_HEAD_INPUT_ROW] = scratch_row;
+        if (auto *scratch_rows = toBase(arena_->getTensor(BufferId::LM_HEAD_INPUT_ROWS)))
+            lb.extensions[BufferId::LM_HEAD_INPUT_ROWS] = scratch_rows;
 
         LOG_DEBUG("[QwenGraphBase] Arena bound: "
                   << "residual=" << lb.residual
@@ -141,6 +465,111 @@ namespace llaminar2
     const ModelBuffers &QwenGraphBase::buffers() const
     {
         return buffers_;
+    }
+
+    TensorBase *QwenGraphBase::maybeAddLMHeadRowSelect(
+        ComputeGraph &graph,
+        const std::string &dependency_node,
+        TensorBase *final_norm_output,
+        int total_tokens,
+        int real_seq_len,
+        int bucket_seq_len,
+        DeviceId device,
+        std::string &dependency_out,
+        BufferId input_buffer_id) const
+    {
+        dependency_out = dependency_node;
+
+        if (config_.compute_all_position_logits)
+        {
+            if (!config_.compute_row_indexed_logits)
+                return final_norm_output;
+
+            const int row_count = config_.row_indexed_logits_row_count;
+            TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+            if (!scratch_rows)
+            {
+                LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require lm_head_input_rows scratch buffer");
+                throw std::runtime_error("row-indexed all-position logits scratch buffer missing");
+            }
+            const int scratch_row_capacity =
+                scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
+            if (row_count <= 0 ||
+                row_count > total_tokens ||
+                row_count > scratch_row_capacity)
+            {
+                LOG_ERROR("[QwenGraphBase] Row-indexed all-position logits require "
+                          << "1..min(scratch_rows,total_tokens) rows, got "
+                          << row_count << " for total_tokens=" << total_tokens
+                          << " scratch_rows=" << scratch_row_capacity);
+                throw std::runtime_error("invalid row-indexed all-position logits row count");
+            }
+
+            std::vector<int> selected_rows = resolveRowIndexedLogitRows(
+                config_,
+                row_count,
+                total_tokens,
+                "LM-head row-select");
+
+            HiddenStateRowsSelectStage::Params row_params;
+            row_params.input = final_norm_output;
+            row_params.output = scratch_rows;
+            row_params.seq_len = total_tokens;
+            row_params.d_model = config_.d_model;
+            row_params.selected_row_count = row_count;
+            row_params.selected_row_indices = std::move(selected_rows);
+            row_params.device_id = device;
+            row_params.input_buffer_id = input_buffer_id;
+            row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+            if (device.is_gpu())
+            {
+                row_params.workspace_buffer_name =
+                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                row_params.declare_selected_rows_workspace = false;
+                row_params.upload_selected_rows_to_workspace = false;
+            }
+
+            graph.addNode("lm_head_rows_select",
+                          ComputeStageFactory::createHiddenStateRowsSelect(row_params),
+                          device);
+            graph.addDependency("lm_head_rows_select", dependency_node);
+            dependency_out = "lm_head_rows_select";
+            return scratch_rows;
+        }
+
+        // Only bucketed prefill needs a dynamic row-select. Normal exact-shape
+        // prefill and decode preserve the existing LMHeadStage offset behavior.
+        const bool bucketed_prefill = bucket_seq_len > 0 && bucket_seq_len == total_tokens && total_tokens > 1;
+        if (!bucketed_prefill)
+            return final_norm_output;
+
+        TensorBase *scratch_row = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROW);
+        if (!scratch_row)
+        {
+            LOG_ERROR("[QwenGraphBase] Bucketed prefill LM head requires lm_head_input_row scratch buffer");
+            throw std::runtime_error("Bucketed prefill LM head row-select scratch buffer missing");
+        }
+
+        // Initial execution uses the real count available at graph build. Later
+        // cache hits call updatePrefillReplayParams() on the stage, which mutates
+        // the captured pinned scalar before graph replay.
+        const int initial_real_seq_len = real_seq_len > 0 ? real_seq_len : total_tokens;
+        HiddenStateRowSelectStage::Params row_params;
+        row_params.input = final_norm_output;
+        row_params.output = scratch_row;
+        row_params.seq_len = total_tokens;
+        row_params.d_model = config_.d_model;
+        row_params.selected_row_idx = initial_real_seq_len - 1;
+        row_params.device_id = device;
+        row_params.input_buffer_id = input_buffer_id;
+        row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROW;
+
+        graph.addNode("lm_head_row_select",
+                      ComputeStageFactory::createHiddenStateRowSelect(row_params),
+                      device);
+        graph.addDependency("lm_head_row_select", dependency_node);
+        dependency_out = "lm_head_row_select";
+        return scratch_row;
     }
 
     // =============================================================================
@@ -172,12 +601,18 @@ namespace llaminar2
         // Adapt generic ForwardInput to ForwardInput
         ForwardInput qwen_input;
         qwen_input.token_ids = input.token_ids;
+        qwen_input.token_ids_device = input.token_ids_device;
         qwen_input.position_ids = input.position_ids;
+        qwen_input.position_ids_device = input.position_ids_device;
         qwen_input.batch_size = input.batch_size;
         qwen_input.seq_len = input.seq_len;
+        qwen_input.real_seq_len = input.real_seq_len;
+        qwen_input.bucket_seq_len = input.bucket_seq_len;
+        qwen_input.token_offset = input.token_offset;
         qwen_input.position_offset = input.position_offset;
         qwen_input.device = input.device;
         qwen_input.kv_cache = input.kv_cache;
+        qwen_input.sequence_lengths = input.sequence_lengths;
 
         // Adapt generic ForwardOutput to ForwardOutput
         ForwardOutput qwen_output;
@@ -205,19 +640,19 @@ namespace llaminar2
         }
 
         // Get layer weights
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase::buildLayerGraph] Layer weight accessor not set");
             return ComputeGraph{};
         }
 
-        LayerWeights layer_weights = weights_.get_layer_weights(ctx.layer_idx);
+        LayerWeights layer_weights = layerWeightsForGraph(ctx.layer_idx);
 
         // Build attention graph
         ComputeGraph attn_graph = buildAttentionGraph(
             layer_weights, buffers_.layer_buffers, ctx.layer_idx, ctx.seq_len,
             ctx.batch_size, ctx.kv_cache, ctx.position_ids, ctx.device,
-            ctx.sequence_lengths);
+            ctx.sequence_lengths, ctx.position_ids_device);
 
         // Build FFN graph
         ComputeGraph ffn_graph = buildFFNGraph(
@@ -243,16 +678,16 @@ namespace llaminar2
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
 
-        if (!weights_.embedding_table || !weights_.final_norm || !weights_.lm_head)
+        if (!modelEmbeddingTable() || !modelFinalNorm() || !modelLMHead())
         {
             LOG_ERROR("[QwenGraphBase] Weights not set! Call setWeights() first.");
-            throw std::runtime_error("Qwen2Graph weights not initialized");
+            throw std::runtime_error("QwenStandardGraph weights not initialized");
         }
 
         if (!buffers_.current_hidden || !buffers_.logits)
         {
             LOG_ERROR("[QwenGraphBase] Buffers not set! Call setBuffers() first.");
-            throw std::runtime_error("Qwen2Graph buffers not initialized");
+            throw std::runtime_error("QwenStandardGraph buffers not initialized");
         }
 
         DeviceId device = config_.default_device;
@@ -270,15 +705,20 @@ namespace llaminar2
                                        : buffers_.current_hidden;
 
         EmbeddingStage::Params embed_params;
-        embed_params.embed_table = weights_.embedding_table;
+        embed_params.embed_table = modelEmbeddingTable();
         embed_params.token_ids = input.token_ids;
+        embed_params.token_ids_device = input.token_ids_device;
         embed_params.output = embed_output;
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
+        embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
         embed_params.mpi_ctx = mpi_ctx_.get();
+        embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
+        embed_params.prepared_store = prepared_weight_store_;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(embed_params),
@@ -291,8 +731,8 @@ namespace llaminar2
         // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
         // AllReduce(sum) combines the partial results.
         const bool embedding_is_sharded =
-            weights_.embedding_table &&
-            static_cast<int>(weights_.embedding_table->rows()) < config_.vocab_size;
+            modelEmbeddingTable() &&
+            static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
         if (embedding_is_sharded && needsTPAllreduce())
         {
             size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
@@ -326,24 +766,24 @@ namespace llaminar2
         }
 
         // Check if we have layer weight accessor
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set!");
-            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+            throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
         }
 
         // Build complete graphs for each layer
         for (int layer = 0; layer < config_.n_layers; ++layer)
         {
             // Get layer weights
-            LayerWeights layer_weights = weights_.get_layer_weights(layer);
+            LayerWeights layer_weights = layerWeightsForGraph(layer);
 
             // Build attention graph for this layer
             // Pass sequence_lengths for proper batch-aware attention masking
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths);
+                input.sequence_lengths, input.position_ids_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -382,10 +822,25 @@ namespace llaminar2
         TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                            ? buffers_.layer_buffers.residual
                                            : buffers_.current_hidden;
+        const BufferId final_norm_input_id =
+            (final_norm_input == buffers_.layer_buffers.residual)
+                ? BufferId::RESIDUAL
+                : BufferId::HIDDEN_STATE;
 
         addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                            prev_node, total_tokens, device);
+                            prev_node, total_tokens, device, final_norm_input_id);
         prev_node = "final_norm";
+
+        std::string lm_head_dependency = prev_node;
+        TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
+            graph,
+            prev_node,
+            buffers_.layer_buffers.normalized,
+            total_tokens,
+            input.real_seq_len,
+            input.bucket_seq_len,
+            device,
+            lm_head_dependency);
 
         // -------------------------------------------------------------------------
         // Stage 4: LM Head (with optional Column-Parallel + AllGather)
@@ -404,23 +859,34 @@ namespace llaminar2
         LOG_DEBUG("[QwenGraphBase] LM head in buildFullForwardGraph: use_column_parallel="
                   << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
+        const LMHeadInputLayout lm_layout =
+            describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+
         LMHeadStage::Params lm_params;
-        // Feed LM head from the final RMSNorm output (FP32).
-        lm_params.hidden_states = buffers_.layer_buffers.normalized;
-        lm_params.lm_head_weight = weights_.lm_head;
+        // Feed LM head from final RMSNorm, bucket one-row scratch, or compact
+        // verifier rows. The layout helper keeps the row count and BufferId
+        // contract synchronized.
+        lm_params.hidden_states = lm_head_input;
+        lm_params.lm_head_weight = modelLMHead();
+        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
-        lm_params.seq_len = total_tokens;
+        lm_params.seq_len = lm_layout.seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr; // Qwen2 has no LM head bias
         lm_params.device_id = config_.default_device;
-        lm_params.input_buffer_id = BufferId::NORMALIZED;
-        lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+        lm_params.prepared_store = prepared_weight_store_;
+        lm_params.input_buffer_id = lm_layout.input_buffer_id;
+        lm_params.output_buffer_id = logitsBufferId(
+            use_column_parallel,
+            lm_layout.compute_all_positions);
+        lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+        lm_params.compute_all_positions = lm_layout.compute_all_positions;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
                       device);
-        graph.addDependency("lm_head", prev_node);
+        graph.addDependency("lm_head", lm_head_dependency);
         prev_node = "lm_head";
 
         // Phase 5: AllGather stage for column-parallel LM head
@@ -433,14 +899,15 @@ namespace llaminar2
             allgather_params.local_input = buffers_.logits_local;
             allgather_params.full_output = buffers_.logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
-            // LM head always computes only the last token's logits (lm_m=1),
-            // so the AllGather always transfers 1 row regardless of total_tokens
-            allgather_params.actual_seq_len = 1;
+            allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             // Multi-domain TP typically doesn't route LM head to a specific domain
             allgather_params.domain = nullptr;
-            allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-            allgather_params.output_buffer_id = BufferId::LOGITS;
+            allgather_params.input_buffer_id = logitsBufferId(
+                /*column_parallel=*/true,
+                lm_layout.compute_all_positions);
+            allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                lm_layout.compute_all_positions);
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -486,32 +953,32 @@ namespace llaminar2
         }
 
         // Validate required weights based on configuration
-        if (has_embedding && !weights_.embedding_table)
+        if (has_embedding && !modelEmbeddingTable())
         {
             LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
-            throw std::runtime_error("Qwen2Graph embedding weights not initialized");
+            throw std::runtime_error("QwenStandardGraph embedding weights not initialized");
         }
-        if (has_lm_head && (!weights_.final_norm || !weights_.lm_head))
+        if (has_lm_head && (!modelFinalNorm() || !modelLMHead()))
         {
             LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
-            throw std::runtime_error("Qwen2Graph LM head weights not initialized");
+            throw std::runtime_error("QwenStandardGraph LM head weights not initialized");
         }
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set");
-            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+            throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
         }
 
         // Validate buffers
         if (has_embedding && !buffers_.current_hidden && !buffers_.layer_buffers.residual)
         {
             LOG_ERROR("[QwenGraphBase] Hidden buffer required for embedding output");
-            throw std::runtime_error("Qwen2Graph hidden buffer not initialized");
+            throw std::runtime_error("QwenStandardGraph hidden buffer not initialized");
         }
         if (has_lm_head && !buffers_.logits)
         {
             LOG_ERROR("[QwenGraphBase] Logits buffer required for LM head output");
-            throw std::runtime_error("Qwen2Graph logits buffer not initialized");
+            throw std::runtime_error("QwenStandardGraph logits buffer not initialized");
         }
 
         DeviceId device = config_.default_device;
@@ -532,15 +999,20 @@ namespace llaminar2
                                            : buffers_.current_hidden;
 
             EmbeddingStage::Params embed_params;
-            embed_params.embed_table = weights_.embedding_table;
+            embed_params.embed_table = modelEmbeddingTable();
             embed_params.token_ids = input.token_ids;
+            embed_params.token_ids_device = input.token_ids_device;
             embed_params.output = embed_output;
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
+            embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+            embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
             embed_params.mpi_ctx = mpi_ctx_.get();
+            embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
+            embed_params.prepared_store = prepared_weight_store_;
 
             graph.addNode("embedding",
                           ComputeStageFactory::createEmbedding(embed_params),
@@ -552,8 +1024,8 @@ namespace llaminar2
             // vocab_size/tp_degree rows. Tokens outside the local range produce zeros.
             // AllReduce(sum) combines the partial results.
             const bool embedding_is_sharded =
-                weights_.embedding_table &&
-                static_cast<int>(weights_.embedding_table->rows()) < config_.vocab_size;
+                modelEmbeddingTable() &&
+                static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
             if (embedding_is_sharded && needsTPAllreduce())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
@@ -656,13 +1128,13 @@ namespace llaminar2
         for (int layer = first_layer; layer < last_layer; ++layer)
         {
             // Get layer weights
-            LayerWeights layer_weights = weights_.get_layer_weights(layer);
+            LayerWeights layer_weights = layerWeightsForGraph(layer);
 
             // Build attention graph for this layer
             ComputeGraph attn_graph = buildAttentionGraph(
                 layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                 input.batch_size, input.kv_cache, position_ids, device,
-                input.sequence_lengths);
+                input.sequence_lengths, input.position_ids_device);
 
             // Get the terminal node of attention sub-graph
             std::string attn_last = attn_graph.terminalNode();
@@ -711,10 +1183,25 @@ namespace llaminar2
             TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                ? buffers_.layer_buffers.residual
                                                : buffers_.current_hidden;
+            const BufferId final_norm_input_id =
+                (final_norm_input == buffers_.layer_buffers.residual)
+                    ? BufferId::RESIDUAL
+                    : BufferId::HIDDEN_STATE;
 
             addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                prev_node, total_tokens, device);
+                                prev_node, total_tokens, device, final_norm_input_id);
             prev_node = "final_norm";
+
+            std::string lm_head_dependency = prev_node;
+            TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
+                graph,
+                prev_node,
+                buffers_.layer_buffers.normalized,
+                total_tokens,
+                input.real_seq_len,
+                input.bucket_seq_len,
+                device,
+                lm_head_dependency);
 
             // LM Head (with optional Column-Parallel + AllGather)
             bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
@@ -725,22 +1212,31 @@ namespace llaminar2
             LOG_DEBUG("[QwenGraphBase] LM head in buildPartialForwardGraph: use_column_parallel="
                       << use_column_parallel << " lm_head_vocab_size=" << lm_head_vocab_size);
 
+            const LMHeadInputLayout lm_layout =
+                describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+
             LMHeadStage::Params lm_params;
-            lm_params.hidden_states = buffers_.layer_buffers.normalized;
-            lm_params.lm_head_weight = weights_.lm_head;
+            lm_params.hidden_states = lm_head_input;
+            lm_params.lm_head_weight = modelLMHead();
+            lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
             lm_params.logits = lm_head_output;
-            lm_params.seq_len = total_tokens;
+            lm_params.seq_len = lm_layout.seq_len;
             lm_params.d_model = config_.d_model;
             lm_params.vocab_size = lm_head_vocab_size;
             lm_params.bias_tensor = nullptr;
             lm_params.device_id = config_.default_device;
-            lm_params.input_buffer_id = BufferId::NORMALIZED;
-            lm_params.output_buffer_id = use_column_parallel ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
+            lm_params.prepared_store = prepared_weight_store_;
+            lm_params.input_buffer_id = lm_layout.input_buffer_id;
+            lm_params.output_buffer_id = logitsBufferId(
+                use_column_parallel,
+                lm_layout.compute_all_positions);
+            lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+            lm_params.compute_all_positions = lm_layout.compute_all_positions;
 
             graph.addNode("lm_head",
                           ComputeStageFactory::createLMHead(lm_params),
                           device);
-            graph.addDependency("lm_head", prev_node);
+            graph.addDependency("lm_head", lm_head_dependency);
             prev_node = "lm_head";
 
             // AllGather stage for column-parallel LM head
@@ -753,11 +1249,13 @@ namespace llaminar2
                 allgather_params.local_input = buffers_.logits_local;
                 allgather_params.full_output = buffers_.logits;
                 allgather_params.mpi_ctx = mpi_ctx_.get();
-                // LM head always computes only the last token's logits (lm_m=1)
-                allgather_params.actual_seq_len = 1;
+                allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
                 allgather_params.domain = nullptr;
-                allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-                allgather_params.output_buffer_id = BufferId::LOGITS;
+                allgather_params.input_buffer_id = logitsBufferId(
+                    /*column_parallel=*/true,
+                    lm_layout.compute_all_positions);
+                allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                    lm_layout.compute_all_positions);
 
                 graph.addNode("lm_head_allgather",
                               ComputeStageFactory::createAllGather(allgather_params),
@@ -814,10 +1312,10 @@ namespace llaminar2
                   << ", seq_len=" << input.seq_len);
 
         // Validate weights
-        if (!weights_.get_layer_weights)
+        if (!hasLayerWeightSource())
         {
             LOG_ERROR("[QwenGraphBase] Layer weight accessor not set");
-            throw std::runtime_error("Qwen2Graph layer weight accessor not initialized");
+            throw std::runtime_error("QwenStandardGraph layer weight accessor not initialized");
         }
 
         // =====================================================================
@@ -862,7 +1360,7 @@ namespace llaminar2
 
             // Get device and TP context for this stage
             DeviceId stage_device = domain->primaryDevice();
-            ILocalTPContext *stage_tp_ctx = nullptr;
+            ITPContext *stage_tp_ctx = nullptr;
             auto tp_it = config_.domain_tp_contexts.find(pp_stage.domain_name);
             if (tp_it != config_.domain_tp_contexts.end())
             {
@@ -878,7 +1376,7 @@ namespace llaminar2
             // -----------------------------------------------------------------
             if (pp_stage.has_embedding)
             {
-                if (!weights_.embedding_table)
+                if (!modelEmbeddingTable())
                 {
                     LOG_ERROR("[QwenGraphBase] Embedding weights required but not set");
                     throw std::runtime_error("Embedding weights not initialized for unified PP graph");
@@ -892,14 +1390,19 @@ namespace llaminar2
                                                : buffers_.current_hidden;
 
                 EmbeddingStage::Params embed_params;
-                embed_params.embed_table = weights_.embedding_table;
+                embed_params.embed_table = modelEmbeddingTable();
                 embed_params.token_ids = input.token_ids;
+                embed_params.token_ids_device = input.token_ids_device;
                 embed_params.output = embed_output;
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
+                embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, stage_device);
+                embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
+                embed_params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), stage_device);
+                embed_params.prepared_store = prepared_weight_store_;
 
                 graph.addNode("embedding",
                               ComputeStageFactory::createEmbedding(embed_params),
@@ -918,7 +1421,7 @@ namespace llaminar2
                 GraphConfig &cfg;
                 DeviceId original_device;
                 ITPContext *original_tp_ctx;
-                ConfigGuard(GraphConfig &c, DeviceId dev, ILocalTPContext *tp)
+                ConfigGuard(GraphConfig &c, DeviceId dev, ITPContext *tp)
                     : cfg(c), original_device(c.default_device), original_tp_ctx(c.tp_ctx)
                 {
                     cfg.default_device = dev;
@@ -935,7 +1438,7 @@ namespace llaminar2
             for (int layer = pp_stage.first_layer; layer < pp_stage.last_layer; ++layer)
             {
                 // Get layer weights
-                LayerWeights layer_weights = weights_.get_layer_weights(layer);
+                LayerWeights layer_weights = layerWeightsForGraph(layer);
 
                 // Get KV cache for this stage's device (PP-aware)
                 IKVCache *layer_kv_cache = input.getKVCacheForDevice(stage_device);
@@ -944,7 +1447,7 @@ namespace llaminar2
                 ComputeGraph attn_graph = buildAttentionGraph(
                     layer_weights, buffers_.layer_buffers, layer, input.seq_len,
                     input.batch_size, layer_kv_cache, position_ids, stage_device,
-                    input.sequence_lengths);
+                    input.sequence_lengths, input.position_ids_device);
 
                 // Get the terminal node of attention sub-graph
                 std::string attn_last = attn_graph.terminalNode();
@@ -1038,7 +1541,7 @@ namespace llaminar2
             // -----------------------------------------------------------------
             if (pp_stage.has_lm_head)
             {
-                if (!weights_.final_norm || !weights_.lm_head)
+                if (!modelFinalNorm() || !modelLMHead())
                 {
                     LOG_ERROR("[QwenGraphBase] LM head weights required but not set");
                     throw std::runtime_error("LM head weights not initialized for unified PP graph");
@@ -1048,10 +1551,25 @@ namespace llaminar2
                 TensorBase *final_norm_input = (config_.isHybridQ16() && buffers_.layer_buffers.residual)
                                                    ? buffers_.layer_buffers.residual
                                                    : buffers_.current_hidden;
+                const BufferId final_norm_input_id =
+                    (final_norm_input == buffers_.layer_buffers.residual)
+                        ? BufferId::RESIDUAL
+                        : BufferId::HIDDEN_STATE;
 
                 addFinalNormToGraph(graph, final_norm_input, buffers_.layer_buffers.normalized,
-                                    prev_node, total_tokens, stage_device);
+                                    prev_node, total_tokens, stage_device, final_norm_input_id);
                 prev_node = "final_norm";
+
+                std::string lm_head_dependency = prev_node;
+                TensorBase *lm_head_input = maybeAddLMHeadRowSelect(
+                    graph,
+                    prev_node,
+                    buffers_.layer_buffers.normalized,
+                    total_tokens,
+                    input.real_seq_len,
+                    input.bucket_seq_len,
+                    stage_device,
+                    lm_head_dependency);
 
                 // LM Head
                 bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
@@ -1061,20 +1579,31 @@ namespace llaminar2
                 LOG_DEBUG("[QwenGraphBase] LM head in unified PP: use_column_parallel="
                           << use_column_parallel << " vocab_size=" << lm_head_vocab_size);
 
+                const LMHeadInputLayout lm_layout =
+                    describeLMHeadInputLayout(config_, buffers_.layer_buffers, lm_head_input, total_tokens);
+
                 LMHeadStage::Params lm_params;
-                lm_params.hidden_states = buffers_.layer_buffers.normalized;
-                lm_params.lm_head_weight = weights_.lm_head;
+                lm_params.hidden_states = lm_head_input;
+                lm_params.lm_head_weight = modelLMHead();
+                lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), stage_device);
                 lm_params.logits = lm_head_output;
-                lm_params.seq_len = total_tokens;
+                lm_params.seq_len = lm_layout.seq_len;
                 lm_params.d_model = config_.d_model;
                 lm_params.vocab_size = lm_head_vocab_size;
                 lm_params.bias_tensor = nullptr;
                 lm_params.device_id = stage_device;
+                lm_params.prepared_store = prepared_weight_store_;
+                lm_params.input_buffer_id = lm_layout.input_buffer_id;
+                lm_params.output_buffer_id = logitsBufferId(
+                    use_column_parallel,
+                    lm_layout.compute_all_positions);
+                lm_params.use_prefill_replay_row_offset = lm_layout.use_prefill_replay_row_offset;
+                lm_params.compute_all_positions = lm_layout.compute_all_positions;
 
                 graph.addNode("lm_head",
                               ComputeStageFactory::createLMHead(lm_params),
                               stage_device);
-                graph.addDependency("lm_head", prev_node);
+                graph.addDependency("lm_head", lm_head_dependency);
                 prev_node = "lm_head";
 
                 // AllGather stage for column-parallel LM head
@@ -1087,11 +1616,13 @@ namespace llaminar2
                     allgather_params.local_input = buffers_.logits_local;
                     allgather_params.full_output = buffers_.logits;
                     allgather_params.mpi_ctx = mpi_ctx_.get();
-                    // LM head always computes only the last token's logits (lm_m=1)
-                    allgather_params.actual_seq_len = 1;
+                    allgather_params.actual_seq_len = lm_layout.compute_all_positions ? lm_layout.seq_len : 1;
                     allgather_params.domain = nullptr;
-                    allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-                    allgather_params.output_buffer_id = BufferId::LOGITS;
+                    allgather_params.input_buffer_id = logitsBufferId(
+                        /*column_parallel=*/true,
+                        lm_layout.compute_all_positions);
+                    allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                        lm_layout.compute_all_positions);
 
                     graph.addNode("lm_head_allgather",
                                   ComputeStageFactory::createAllGather(allgather_params),
@@ -1185,13 +1716,18 @@ namespace llaminar2
         ComputeGraph graph;
 
         EmbeddingStage::Params params;
-        params.embed_table = weights_.embedding_table;
+        params.embed_table = modelEmbeddingTable();
         params.token_ids = input.token_ids;
+        params.token_ids_device = input.token_ids_device;
         params.output = output_hidden;
         params.num_tokens = input.batch_size * input.seq_len;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
+        params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         params.device_id = config_.default_device;
+        params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
+        params.prepared_store = prepared_weight_store_;
 
         graph.addNode("embedding",
                       ComputeStageFactory::createEmbedding(params),
@@ -1204,8 +1740,10 @@ namespace llaminar2
         TensorBase *input_hidden,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device)
     {
+        (void)position_ids_device;
         LOG_DEBUG("[QwenGraphBase] Building transformer layers graph: "
                   << config_.n_layers << " layers");
 
@@ -1236,8 +1774,10 @@ namespace llaminar2
         TensorBase *input_hidden,
         IKVCache *kv_cache,
         const int *position_ids,
+        const void *position_ids_device,
         DeviceId device)
     {
+        (void)position_ids_device;
         LOG_DEBUG("[QwenGraphBase] Building layer " << layer_idx << " graph");
 
         ComputeGraph graph;
@@ -1263,7 +1803,7 @@ namespace llaminar2
         RMSNormStage::Params norm_params;
         norm_params.input = hidden_states;
         norm_params.output = hidden_states; // In-place norm
-        norm_params.gamma = weights_.final_norm;
+        norm_params.gamma = modelFinalNorm();
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = total_tokens;
         norm_params.device_id = device;
@@ -1291,21 +1831,111 @@ namespace llaminar2
                                                                   << " lm_head_vocab_size=" << lm_head_vocab_size
                                                                   << " lm_head_output=" << lm_head_output);
 
+        TensorBase *lm_head_input = hidden_states;
+        std::string lm_head_dependency = "final_norm";
+        int lm_head_seq_len = total_tokens;
+        BufferId lm_head_input_buffer_id = BufferId::HIDDEN_STATE;
+        bool lm_head_compute_all_positions = config_.compute_all_position_logits;
+        bool lm_head_use_prefill_row_offset = true;
+
+        if (config_.compute_all_position_logits && config_.compute_row_indexed_logits)
+        {
+            const int row_count = config_.row_indexed_logits_row_count;
+            TensorBase *scratch_rows = buffers_.layer_buffers.get(BufferId::LM_HEAD_INPUT_ROWS);
+            if (!scratch_rows)
+            {
+                LOG_ERROR("[QwenGraphBase] Standalone row-indexed verifier requires lm_head_input_rows scratch buffer");
+                throw std::runtime_error("standalone row-indexed verifier scratch buffer missing");
+            }
+            const int scratch_row_capacity =
+                scratch_rows ? static_cast<int>(scratch_rows->rows()) : 0;
+            if (row_count <= 0 ||
+                row_count > total_tokens ||
+                row_count > scratch_row_capacity)
+            {
+                LOG_ERROR("[QwenGraphBase] Standalone LM-head graph row-indexed verifier requires "
+                          << "1..min(scratch_rows,total_tokens) rows, got "
+                          << row_count << " for total_tokens=" << total_tokens
+                          << " scratch_rows=" << scratch_row_capacity);
+                throw std::runtime_error("invalid standalone row-indexed all-position logits row count");
+            }
+
+            std::vector<int> selected_rows = resolveRowIndexedLogitRows(
+                config_,
+                row_count,
+                total_tokens,
+                "standalone LM-head row-select");
+
+            HiddenStateRowsSelectStage::Params row_params;
+            row_params.input = hidden_states;
+            row_params.output = scratch_rows;
+            row_params.seq_len = total_tokens;
+            row_params.d_model = config_.d_model;
+            row_params.selected_row_count = row_count;
+            row_params.selected_row_indices = std::move(selected_rows);
+            row_params.device_id = device;
+            row_params.input_buffer_id = BufferId::HIDDEN_STATE;
+            row_params.output_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+            if (device.is_gpu())
+            {
+                row_params.workspace_buffer_name =
+                    MTPSpecDecodeWorkspaceBuffers::VERIFIER_LOGIT_ROWS;
+                row_params.declare_selected_rows_workspace = false;
+                row_params.upload_selected_rows_to_workspace = false;
+            }
+
+            graph.addNode("lm_head_rows_select",
+                          ComputeStageFactory::createHiddenStateRowsSelect(row_params),
+                          device);
+            graph.addDependency("lm_head_rows_select", lm_head_dependency);
+
+            // Compact verifier rows are a new dense matrix. The LM head should
+            // project every compact row starting at row zero.
+            lm_head_input = scratch_rows;
+            lm_head_dependency = "lm_head_rows_select";
+            lm_head_seq_len = row_count;
+            lm_head_input_buffer_id = BufferId::LM_HEAD_INPUT_ROWS;
+            lm_head_compute_all_positions = true;
+            lm_head_use_prefill_row_offset = false;
+        }
+
         // LM Head projection
         LMHeadStage::Params lm_params;
-        lm_params.hidden_states = hidden_states;
-        lm_params.lm_head_weight = weights_.lm_head;
+        lm_params.hidden_states = lm_head_input;
+        lm_params.lm_head_weight = modelLMHead();
+        lm_params.prepared_ref = preparedRefForGraphWeight(modelLMHeadBinding(), device);
         lm_params.logits = lm_head_output;
-        lm_params.seq_len = total_tokens;
+        lm_params.seq_len = lm_head_seq_len;
         lm_params.d_model = config_.d_model;
         lm_params.vocab_size = lm_head_vocab_size;
         lm_params.bias_tensor = nullptr;
         lm_params.device_id = device;
+        lm_params.prepared_store = prepared_weight_store_;
+        lm_params.input_buffer_id = lm_head_input_buffer_id;
+        lm_params.output_buffer_id = logitsBufferId(
+            use_column_parallel,
+            lm_head_compute_all_positions);
+        lm_params.compute_all_positions = lm_head_compute_all_positions;
+        lm_params.use_prefill_replay_row_offset = lm_head_use_prefill_row_offset;
+        /*
+         * Phase 9.8 promotes compact verifier LM-head rows to the same small-M
+         * quantized GEMV/GEMM dispatch used by the rest of the grouped verifier
+         * path.  The previous GPU-only M=1 row loop was numerically safe, but it
+         * made M=2 verifier replay slower than serial decode.  Strict
+         * DenseVerifierRows and Qwen3.6 parity gates now own equivalence.
+         */
+        lm_params.force_decode_equivalent_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            lm_head_compute_all_positions &&
+            lm_head_seq_len > 1 &&
+            lm_head_seq_len <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
 
         graph.addNode("lm_head",
                       ComputeStageFactory::createLMHead(lm_params),
                       device);
-        graph.addDependency("lm_head", "final_norm");
+        graph.addDependency("lm_head", lm_head_dependency);
 
         // =================================================================
         // AllGather stage for column-parallel LM head
@@ -1319,12 +1949,14 @@ namespace llaminar2
             allgather_params.local_input = logits_local;
             allgather_params.full_output = output_logits;
             allgather_params.mpi_ctx = mpi_ctx_.get();
-            // LM head always computes only the last token's logits (lm_m=1)
-            allgather_params.actual_seq_len = 1;
+            allgather_params.actual_seq_len = lm_head_compute_all_positions ? lm_head_seq_len : 1;
             // LM head is not layer-specific; use nullptr for domain (legacy MPI path)
             allgather_params.domain = nullptr;
-            allgather_params.input_buffer_id = BufferId::LOGITS_LOCAL;
-            allgather_params.output_buffer_id = BufferId::LOGITS;
+            allgather_params.input_buffer_id = logitsBufferId(
+                /*column_parallel=*/true,
+                lm_head_compute_all_positions);
+            allgather_params.output_buffer_id = gatheredLogitsBufferId(
+                lm_head_compute_all_positions);
 
             graph.addNode("lm_head_allgather",
                           ComputeStageFactory::createAllGather(allgather_params),
@@ -1336,7 +1968,7 @@ namespace llaminar2
     }
 
     // =============================================================================
-    // buildAttentionGraph is pure virtual - implemented by Qwen2Graph, Qwen35Graph
+    // buildAttentionGraph is pure virtual - implemented by QwenStandardGraph, Qwen35Graph
     // =============================================================================
 
     ComputeGraph QwenGraphBase::buildFFNGraph(
@@ -1353,6 +1985,19 @@ namespace llaminar2
 
         // Compute total tokens for GEMM m parameter
         int total_tokens = batch_size * seq_len;
+        const bool force_decode_equivalent_ffn_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            total_tokens <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
+        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        const WeightBinding *gate_proj_binding =
+            layer.gate_proj_binding ? layer.gate_proj_binding : layer_bindings.gate_proj;
+        const WeightBinding *up_proj_binding =
+            layer.up_proj_binding ? layer.up_proj_binding : layer_bindings.up_proj;
+        const WeightBinding *down_proj_binding =
+            layer.down_proj_binding ? layer.down_proj_binding : layer_bindings.down_proj;
 
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
         // Combines the attention output residual add with FFN normalization.
@@ -1367,9 +2012,9 @@ namespace llaminar2
             fused_params.eps = config_.rms_norm_eps;
             fused_params.seq_len = total_tokens;
             fused_params.hidden_dim = config_.d_model;
-            fused_params.input_buffer_id = BufferId::ATTN_PROJ;
-            fused_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            fused_params.norm_output_buffer_id = BufferId::NORMALIZED;
+            fused_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            fused_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            fused_params.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
 
             graph.addNode(prefix + "ffn_norm",
                           ComputeStageFactory::createFusedResidualNorm(fused_params),
@@ -1392,16 +2037,21 @@ namespace llaminar2
             gate_up_params.m = total_tokens; // Use total_tokens = batch_size * seq_len
             gate_up_params.k = k;
             gate_up_params.w_gate = layer.gate_proj;
+            gate_up_params.prepared_ref_gate = preparedRefForGraphWeight(gate_proj_binding, device);
             gate_up_params.output_gate = buffers.gate;
             gate_up_params.n_gate = gate_n;
             gate_up_params.w_up = layer.up_proj;
+            gate_up_params.prepared_ref_up = preparedRefForGraphWeight(up_proj_binding, device);
             gate_up_params.output_up = buffers.up;
             gate_up_params.n_up = up_n;
             gate_up_params.mpi_ctx = mpi_ctx_.get();
             gate_up_params.device_id = device;
-            gate_up_params.input_buffer_id = BufferId::NORMALIZED;
-            gate_up_params.output_gate_buffer_id = BufferId::GATE_PROJ;
-            gate_up_params.output_up_buffer_id = BufferId::UP_PROJ;
+            gate_up_params.prepared_store = prepared_weight_store_;
+            gate_up_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            gate_up_params.output_gate_buffer_id = buffers.idFor(BufferId::GATE_PROJ);
+            gate_up_params.output_up_buffer_id = buffers.idFor(BufferId::UP_PROJ);
+            gate_up_params.force_decode_equivalent_verifier_prefill =
+                force_decode_equivalent_ffn_verifier_prefill;
 
             graph.addNode(prefix + "gate_up_proj",
                           ComputeStageFactory::createFusedGateUpGEMM(gate_up_params),
@@ -1435,8 +2085,13 @@ namespace llaminar2
                 .beta = 0.0f,
                 .transpose_B = false,
                 .gemm_context = GemmContext::FFN,
-                .a_buffer_id = BufferId::UP_PROJ,
-                .c_buffer_id = BufferId::ATTN_PROJ};
+                .a_buffer_id = buffers.idFor(BufferId::UP_PROJ),
+                .gate_buffer_id = buffers.idFor(BufferId::GATE_PROJ),
+                .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
+                .force_decode_equivalent_verifier_prefill =
+                    force_decode_equivalent_ffn_verifier_prefill,
+                .prepared_ref = preparedRefForGraphWeight(down_proj_binding, device),
+                .prepared_store = prepared_weight_store_};
 
             // SwiGLU fusion: pass gate buffer to GEMM for fused silu(gate)*up + GEMM
             if (swiglu_fusion)
@@ -1469,7 +2124,7 @@ namespace llaminar2
                 std::string stage_name = prefix + "down_allreduce";
                 auto allreduce_stage = createTPAllreduceStage(
                     buffers.attn_proj, allreduce_count, device, layer_idx, /*is_attention=*/false, stage_name,
-                    BufferId::ATTN_PROJ);
+                    buffers.idFor(BufferId::ATTN_PROJ));
 
                 if (allreduce_stage)
                 {
@@ -1492,9 +2147,9 @@ namespace llaminar2
             res_params.residual = buffers.current_hidden;
             res_params.output = buffers.current_hidden;
             res_params.num_elements = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
-            res_params.input_buffer_id = BufferId::ATTN_PROJ;
-            res_params.residual_buffer_id = BufferId::HIDDEN_STATE;
-            res_params.output_buffer_id = BufferId::HIDDEN_STATE; // In-place with residual
+            res_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            res_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            res_params.output_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE); // In-place with residual
 
             graph.addNode(prefix + "ffn_residual",
                           ComputeStageFactory::createResidualAdd(res_params),
@@ -1540,7 +2195,7 @@ namespace llaminar2
         return pos_ids;
     }
 
-    // getSchema() is pure virtual - implemented by Qwen2Graph, Qwen35Graph
+    // getSchema() is pure virtual - implemented by QwenStandardGraph, Qwen35Graph
 
     TensorContext QwenGraphBase::buildTensorContext() const
     {
@@ -1560,17 +2215,20 @@ namespace llaminar2
         tensors.buffers["logits_local"] = buffers_.logits_local;
 
         // Model-level weights
-        tensors.model_weights["embedding_table"] = weights_.embedding_table;
-        tensors.model_weights["final_norm"] = weights_.final_norm;
-        tensors.model_weights["lm_head"] = weights_.lm_head;
+        tensors.model_weights["embedding_table"] = modelEmbeddingTable();
+        tensors.model_weights["final_norm"] = modelFinalNorm();
+        tensors.model_weights["lm_head"] = modelLMHead();
+        tensors.model_weight_bindings["embedding_table"] = modelEmbeddingBinding();
+        tensors.model_weight_bindings["final_norm"] = modelFinalNormBinding();
+        tensors.model_weight_bindings["lm_head"] = modelLMHeadBinding();
 
         // Layer weight accessor
         tensors.get_layer_weight = [this](int layer_idx, const std::string &name) -> TensorBase *
         {
-            if (!weights_.get_layer_weights)
+            if (!hasLayerWeightSource())
                 return nullptr;
 
-            LayerWeights layer = weights_.get_layer_weights(layer_idx);
+            LayerWeights layer = layerWeightsForGraph(layer_idx);
 
             if (name == "wq")
                 return layer.wq;
@@ -1588,6 +2246,28 @@ namespace llaminar2
                 return layer.k_bias;
             if (name == "v_bias")
                 return layer.v_bias;
+            if (name == "q_norm")
+                return layer.q_norm;
+            if (name == "k_norm")
+                return layer.k_norm;
+            if (name == "attn_qkv")
+                return layer.attn_qkv;
+            if (name == "attn_gate")
+                return layer.attn_gate;
+            if (name == "ssm_alpha")
+                return layer.ssm_alpha;
+            if (name == "ssm_beta")
+                return layer.ssm_beta;
+            if (name == "ssm_conv1d")
+                return layer.ssm_conv1d;
+            if (name == "ssm_dt_bias")
+                return layer.ssm_dt_bias;
+            if (name == "ssm_a")
+                return layer.ssm_a;
+            if (name == "ssm_norm")
+                return layer.ssm_norm;
+            if (name == "ssm_out")
+                return layer.ssm_out;
             if (name == "gate_proj")
                 return layer.gate_proj;
             if (name == "up_proj")
@@ -1596,8 +2276,92 @@ namespace llaminar2
                 return layer.down_proj;
             if (name == "ffn_norm")
                 return layer.ffn_norm;
+            if (name == "moe_gate")
+                return layer.moe_gate;
+            if (name == "moe_gate_exps")
+                return layer.moe_gate_exps;
+            if (name == "moe_up_exps")
+                return layer.moe_up_exps;
+            if (name == "moe_down_exps")
+                return layer.moe_down_exps;
+            if (name == "shared_expert_gate")
+                return layer.shared_expert_gate;
+            if (name == "shared_expert_up")
+                return layer.shared_expert_up;
+            if (name == "shared_expert_down")
+                return layer.shared_expert_down;
+            if (name == "shared_expert_gate_inp")
+                return layer.shared_expert_gate_inp;
 
             LOG_WARN("[TensorContext] Unknown layer weight: " << name);
+            return nullptr;
+        };
+        tensors.get_layer_weight_binding = [this](int layer_idx, const std::string &name) -> const WeightBinding *
+        {
+            LayerWeightBindings layer = layerWeightBindingsForGraph(layer_idx);
+
+            if (name == "wq")
+                return layer.wq;
+            if (name == "wk")
+                return layer.wk;
+            if (name == "wv")
+                return layer.wv;
+            if (name == "wo")
+                return layer.wo;
+            if (name == "attn_norm")
+                return layer.attn_norm;
+            if (name == "q_bias")
+                return layer.q_bias;
+            if (name == "k_bias")
+                return layer.k_bias;
+            if (name == "v_bias")
+                return layer.v_bias;
+            if (name == "q_norm")
+                return layer.q_norm;
+            if (name == "k_norm")
+                return layer.k_norm;
+            if (name == "attn_qkv")
+                return layer.attn_qkv;
+            if (name == "attn_gate")
+                return layer.attn_gate;
+            if (name == "ssm_alpha")
+                return layer.ssm_alpha;
+            if (name == "ssm_beta")
+                return layer.ssm_beta;
+            if (name == "ssm_conv1d")
+                return layer.ssm_conv1d;
+            if (name == "ssm_dt_bias")
+                return layer.ssm_dt_bias;
+            if (name == "ssm_a")
+                return layer.ssm_a;
+            if (name == "ssm_norm")
+                return layer.ssm_norm;
+            if (name == "ssm_out")
+                return layer.ssm_out;
+            if (name == "gate_proj")
+                return layer.gate_proj;
+            if (name == "up_proj")
+                return layer.up_proj;
+            if (name == "down_proj")
+                return layer.down_proj;
+            if (name == "ffn_norm")
+                return layer.ffn_norm;
+            if (name == "moe_gate")
+                return layer.moe_gate;
+            if (name == "moe_gate_exps")
+                return layer.moe_gate_exps;
+            if (name == "moe_up_exps")
+                return layer.moe_up_exps;
+            if (name == "moe_down_exps")
+                return layer.moe_down_exps;
+            if (name == "shared_expert_gate")
+                return layer.shared_expert_gate;
+            if (name == "shared_expert_up")
+                return layer.shared_expert_up;
+            if (name == "shared_expert_down")
+                return layer.shared_expert_down;
+            if (name == "shared_expert_gate_inp")
+                return layer.shared_expert_gate_inp;
             return nullptr;
         };
 
@@ -1667,6 +2431,9 @@ namespace llaminar2
         if (config.local_vocab <= 0)
             config.local_vocab = config_.vocab_size;
 
+        config.custom_formulas["mtp_target_query_rows"] =
+            static_cast<size_t>(resolveMTPMaxTargetQueryRows(config_.mtp));
+
         LOG_DEBUG("[QwenGraphBase::getResolverConfig] Created config: "
                   << "seq_len=" << config.seq_len << ", "
                   << "local_n_heads=" << config.local_n_heads << " (n_heads=" << config.n_heads << "), "
@@ -1683,16 +2450,24 @@ namespace llaminar2
         TensorBase *normalized_out,
         const std::string &prev_node,
         int n_tokens,
-        DeviceId device)
+        DeviceId device,
+        BufferId input_buffer_id)
     {
         RMSNormStage::Params norm_params;
         norm_params.input = hidden;
         norm_params.output = normalized_out;
-        norm_params.gamma = weights_.final_norm;
+        norm_params.gamma = modelFinalNorm();
         norm_params.eps = config_.rms_norm_eps;
         norm_params.seq_len = n_tokens;
         norm_params.device_id = device;
-        norm_params.input_buffer_id = BufferId::HIDDEN_STATE;
+        /*
+         * The buffer contract must describe the arena slot that backs the
+         * tensor pointer above. Hybrid Qwen3.6 routes its live residual stream
+         * through RESIDUAL for final norm; advertising HIDDEN_STATE here lets
+         * the executor cohere the wrong buffer and can leave GPU final-norm
+         * inputs stale after decode/prefix state handoff.
+         */
+        norm_params.input_buffer_id = input_buffer_id;
         norm_params.output_buffer_id = BufferId::NORMALIZED;
 
         graph.addNode("final_norm",
@@ -1787,6 +2562,455 @@ namespace llaminar2
         // No TP active - should not reach here (caller should check needsTPAllreduce())
         LOG_WARN("[QwenGraphBase] createTPAllreduceStage called but no TP active");
         return nullptr;
+    }
+
+    // =========================================================================
+    // Shared Attention Building Blocks
+    // =========================================================================
+
+    std::pair<int, int> QwenGraphBase::resolveLocalHeadCounts() const
+    {
+        int local_n_heads = config_.qkv_column_parallel
+                                ? config_.local_n_heads
+                                : config_.n_heads;
+        int local_n_kv_heads = config_.qkv_column_parallel
+                                   ? config_.local_n_kv_heads
+                                   : config_.n_kv_heads;
+        if (local_n_heads <= 0)
+            local_n_heads = config_.n_heads;
+        if (local_n_kv_heads <= 0)
+            local_n_kv_heads = config_.n_kv_heads;
+        return {local_n_heads, local_n_kv_heads};
+    }
+
+    std::string QwenGraphBase::addPreAttentionNorm(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        TensorBase *norm_gamma,
+        int total_tokens,
+        int layer_idx,
+        DeviceId device,
+        bool check_hybrid_q16)
+    {
+        const std::string node_name = prefix + "attn_norm";
+        const bool use_fused = (!check_hybrid_q16 || !config_.isHybridQ16()) &&
+                               layer_idx > config_.pp_layer_offset;
+
+        if (use_fused)
+        {
+            FusedResidualNormStage::Params fused_params;
+            fused_params.device_id = device;
+            fused_params.input = buffers.attn_proj;
+            fused_params.residual = buffers.current_hidden;
+            fused_params.gamma = norm_gamma;
+            fused_params.norm_output = buffers.normalized;
+            fused_params.eps = config_.rms_norm_eps;
+            fused_params.seq_len = total_tokens;
+            fused_params.hidden_dim = config_.d_model;
+            fused_params.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            fused_params.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            fused_params.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+
+            graph.addNode(node_name,
+                          ComputeStageFactory::createFusedResidualNorm(fused_params),
+                          device);
+        }
+        else
+        {
+            RMSNormStage::Params norm_params;
+            norm_params.input = buffers.current_hidden;
+            norm_params.output = buffers.normalized;
+            norm_params.gamma = norm_gamma;
+            norm_params.eps = config_.rms_norm_eps;
+            norm_params.seq_len = total_tokens;
+            norm_params.device_id = device;
+            norm_params.input_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            norm_params.output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+
+            graph.addNode(node_name,
+                          ComputeStageFactory::createRMSNorm(norm_params),
+                          device);
+        }
+
+        return node_name;
+    }
+
+    bool QwenGraphBase::addQKNorms(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        const LayerWeights &layer,
+        int local_n_heads,
+        int local_n_kv_heads,
+        int total_tokens,
+        DeviceId device,
+        const std::string &q_dependency,
+        const std::string &k_dependency)
+    {
+        if (!layer.q_norm || !layer.k_norm)
+            return false;
+
+        LOG_DEBUG("[QwenGraphBase] Layer using QK norm");
+
+        graph.addNode(prefix + "q_norm",
+                      ComputeStageFactory::createQKNorm({
+                          .device_id = device,
+                          .input = buffers.Q,
+                          .output = buffers.Q,
+                          .gamma = layer.q_norm,
+                          .n_heads = local_n_heads,
+                          .head_dim = config_.head_dim,
+                          .eps = config_.rms_norm_eps,
+                          .seq_len = total_tokens,
+                          .input_buffer_id = buffers.idFor(BufferId::Q_PROJ),
+                          .output_buffer_id = buffers.idFor(BufferId::Q_PROJ),
+                      }),
+                      device);
+        graph.addDependency(prefix + "q_norm", q_dependency);
+
+        graph.addNode(prefix + "k_norm",
+                      ComputeStageFactory::createQKNorm({
+                          .device_id = device,
+                          .input = buffers.K,
+                          .output = buffers.K,
+                          .gamma = layer.k_norm,
+                          .n_heads = local_n_kv_heads,
+                          .head_dim = config_.head_dim,
+                          .eps = config_.rms_norm_eps,
+                          .seq_len = total_tokens,
+                          .input_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                          .output_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                      }),
+                      device);
+        graph.addDependency(prefix + "k_norm", k_dependency);
+
+        return true;
+    }
+
+    std::string QwenGraphBase::addRoPE(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        int local_n_heads,
+        int local_n_kv_heads,
+        int total_tokens,
+        const int *position_ids,
+        const void *position_ids_device,
+        DeviceId device)
+    {
+        const std::string node_name = prefix + "rope";
+        int pos_offset = position_ids ? position_ids[0] : 0;
+        const bool force_decode_equivalent_rope_verifier_prefill =
+            device.is_cpu() &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled &&
+            total_tokens > 1 &&
+            total_tokens <= 4;
+
+        graph.addNode(node_name,
+                      ComputeStageFactory::createRoPE({
+                          .device_id = device,
+                          .Q = buffers.Q,
+                          .K = buffers.K,
+                          .n_heads = local_n_heads,
+                          .n_kv_heads = local_n_kv_heads,
+                          .head_dim = config_.head_dim,
+                          .pos_offset = pos_offset,
+                          .theta_base = config_.rope_theta,
+                          .seq_len = total_tokens,
+                          .partial_rotary_factor = config_.partial_rotary_factor,
+                          .position_ids = position_ids,
+                          .position_ids_device = position_ids_device,
+                          .skip_k = config_.rope_on_read,
+                          .force_decode_equivalent_verifier_prefill =
+                              force_decode_equivalent_rope_verifier_prefill,
+                          .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
+                          .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                      }),
+                      device);
+
+        return node_name;
+    }
+
+    std::string QwenGraphBase::addKVCacheAppend(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        int batch_size,
+        IKVCache *kv_cache,
+        DeviceId device,
+        const std::string &rope_dependency,
+        bool layer_idx_is_cache_local)
+    {
+        int total_tokens = batch_size * seq_len;
+        const int kv_stage_layer = kvCacheLayerForGraphStage(
+            kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
+
+        if (kv_cache)
+        {
+            graph.addNode(prefix + "kv_append",
+                          ComputeStageFactory::createKVCacheAppend({
+                              .device_id = device,
+                              .K = buffers.K,
+                              .V = buffers.V,
+                              .kv_cache = kv_cache,
+                              .layer_idx = kv_stage_layer,
+                              .seq_idx = 0,
+                              .num_tokens = total_tokens,
+                              .batch_size = batch_size,
+                              .seq_len = seq_len,
+                              .kv_cache_scale_k = config_.kv_cache_scale_k,
+                              .kv_cache_scale_v = config_.kv_cache_scale_v,
+                              .head_dim = config_.head_dim,
+                              .turboquant_ctx = config_.turboquant_ctx,
+                              .kv_rotation = config_.kv_rotation,
+                              .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                              .v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                          }),
+                          device);
+
+            // In rope-on-read mode the RoPE stage skips K mutation, but it still
+            // carries the Q/K norm dependencies. Appending directly after QKV GEMM
+            // can cache pre-normalized K on Qwen3.5 FA layers.
+            graph.addDependency(prefix + "kv_append", rope_dependency);
+            return prefix + "kv_append";
+        }
+
+        return rope_dependency;
+    }
+
+    std::string QwenGraphBase::addKVCacheAndAttention(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        int layer_idx,
+        int seq_len,
+        int batch_size,
+        int local_n_heads,
+        int local_n_kv_heads,
+        IKVCache *kv_cache,
+        const int *position_ids,
+        const void *position_ids_device,
+        DeviceId device,
+        bool has_qkv_proj,
+        const std::string &rope_dependency,
+        bool layer_idx_is_cache_local)
+    {
+        (void)position_ids_device;
+        int total_tokens = batch_size * seq_len;
+        const int kv_stage_layer = kvCacheLayerForGraphStage(
+            kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
+
+        const std::string kv_append_dependency =
+            addKVCacheAppend(
+                graph,
+                prefix,
+                buffers,
+                layer_idx,
+                seq_len,
+                batch_size,
+                kv_cache,
+                device,
+                rope_dependency,
+                layer_idx_is_cache_local);
+
+        // --- Determine K/V source for attention ---
+        ITensor *K_for_attn = buffers.K;
+        ITensor *V_for_attn = buffers.V;
+        int kv_len = total_tokens;
+        bool use_gather_stage = false;
+
+        if (kv_cache)
+        {
+            int cached_tokens = kv_cache->get_cached_tokens(kv_stage_layer, 0);
+            if (cached_tokens > 0 && batch_size == 1)
+            {
+                K_for_attn = kv_cache->get_k(kv_stage_layer, 0);
+                V_for_attn = kv_cache->get_v(kv_stage_layer, 0);
+                kv_len = cached_tokens;
+                LOG_TRACE("[QwenGraphBase] Layer " << layer_idx << " using cached K/V (decode mode)");
+            }
+            else if (cached_tokens > 0 && batch_size > 1)
+            {
+                if (buffers.gathered_K && buffers.gathered_V)
+                {
+                    use_gather_stage = true;
+                    K_for_attn = buffers.gathered_K;
+                    V_for_attn = buffers.gathered_V;
+                    kv_len = cached_tokens;
+                    LOG_TRACE("[QwenGraphBase] Layer " << layer_idx << " using gathered K/V (batched decode)");
+                }
+                else
+                {
+                    LOG_WARN("[QwenGraphBase] Layer " << layer_idx
+                                                      << " batched decode but no gather buffers");
+                }
+            }
+        }
+
+        // --- KV Cache Gather (batched decode) ---
+        if (use_gather_stage)
+        {
+            graph.addNode(prefix + "kv_gather",
+                          ComputeStageFactory::createKVCacheGather({
+                              .kv_cache = kv_cache,
+                              .layer_idx = kv_stage_layer,
+                              .batch_size = batch_size,
+                              .out_K = buffers.gathered_K,
+                              .out_V = buffers.gathered_V,
+                          }),
+                          device);
+            graph.addDependency(prefix + "kv_gather", prefix + "kv_append");
+        }
+
+        // --- Attention Compute ---
+        {
+            AttentionMode mode = detect_attention_mode(batch_size, seq_len, kv_len);
+            LOG_TRACE("[QwenGraphBase] Layer " << layer_idx
+                                               << " attention mode: " << attention_mode_name(mode)
+                                               << " (batch=" << batch_size << ", seq=" << seq_len << ", kv=" << kv_len << ")");
+
+            AttentionComputeStage::Params attn_params;
+            attn_params.device_id = device;
+            attn_params.Q = buffers.Q;
+            attn_params.K = K_for_attn;
+            attn_params.V = V_for_attn;
+            attn_params.output = buffers.attn_output;
+            attn_params.batch_size = batch_size;
+            attn_params.seq_len = seq_len;
+            attn_params.kv_len = kv_len;
+            attn_params.n_heads = local_n_heads;
+            attn_params.n_kv_heads = local_n_kv_heads;
+            attn_params.head_dim = config_.head_dim;
+            attn_params.head_start = config_.head_start;
+            // GQA rep: only when KV heads are replicated (not column-parallel)
+            if (local_n_kv_heads == config_.n_kv_heads && config_.n_kv_heads > 0 && local_n_heads != config_.n_heads)
+                attn_params.gqa_n_rep = config_.n_heads / config_.n_kv_heads;
+            attn_params.causal = true;
+            attn_params.window_size = -1;
+            attn_params.attention_mode = mode;
+            attn_params.auto_detect_mode = true;
+            attn_params.workspace_scores = buffers.workspace_scores;
+            attn_params.workspace_context = buffers.workspace_context;
+            attn_params.workspace_mask = buffers.workspace_mask;
+            attn_params.kv_cache = kv_cache;
+            attn_params.layer_idx = kv_stage_layer;
+            attn_params.read_kv_from_cache = device.is_gpu() &&
+                                             (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
+                                             (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
+                                                            kv_cache->precision() != ActivationPrecision::TQ4));
+            attn_params.position_offset = position_ids ? position_ids[0] : 0;
+            attn_params.mpi_ctx = mpi_ctx_.get();
+            attn_params.q_buffer_id = buffers.idFor(BufferId::Q_PROJ);
+            attn_params.output_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT);
+            // NOTE: workspace_scores/workspace_context are no longer registered in
+            // the arena (CPUFlashAttentionKernelT doesn't use them — O(S²) dead
+            // buffers removed). Don't set buffer_ids for the contract.
+            attn_params.turboquant_ctx = config_.turboquant_ctx;
+            attn_params.kv_rotation = config_.kv_rotation;
+
+            if (config_.rope_on_read)
+            {
+                attn_params.apply_rope_to_k = true;
+                attn_params.rope_theta = config_.rope_theta;
+                attn_params.partial_rotary_factor = config_.partial_rotary_factor;
+            }
+
+            graph.addNode(prefix + "attention",
+                          ComputeStageFactory::createAttentionCompute(attn_params),
+                          device);
+
+            if (use_gather_stage)
+                graph.addDependency(prefix + "attention", prefix + "kv_gather");
+            else if (kv_cache)
+                graph.addDependency(prefix + "attention", kv_append_dependency);
+            else
+                graph.addDependency(prefix + "attention", rope_dependency);
+        }
+
+        return prefix + "attention";
+    }
+
+    std::string QwenGraphBase::addWoProjectionAndAllreduce(
+        ComputeGraph &graph,
+        const std::string &prefix,
+        ActivationBuffers &buffers,
+        TensorBase *wo_weight,
+        const WeightBinding *wo_binding,
+        int total_tokens,
+        int layer_idx,
+        DeviceId device,
+        const std::string &dependency,
+        const std::string &wo_node_suffix,
+        const std::string &allreduce_node_suffix)
+    {
+        if (!wo_weight)
+            return dependency;
+
+        int wo_n = static_cast<int>(wo_weight->shape()[0]);
+        int wo_k = static_cast<int>(wo_weight->shape()[1]);
+        /*
+         * Grouped verifier rows are promoted through the attention output
+         * projection as a normal small-M GEMM.  The serial M=1 verifier loop is
+         * kept available inside GEMMStage for explicit diagnostics, but the
+         * production graph relies on the Phase 9.8 dense verifier proof
+         * (cosine/relative-L2/KL/sample equality for M=2..4) instead of paying a
+         * row-copy loop in every attention block.
+         */
+        const bool force_decode_equivalent_wo_verifier_prefill =
+            (device.is_cpu() || device.is_cuda() || device.is_rocm()) &&
+            total_tokens > 1 &&
+            total_tokens <= 4 &&
+            config_.compute_all_position_logits &&
+            config_.mtp.enabled;
+
+        std::string wo_node = prefix + wo_node_suffix;
+        graph.addNode(wo_node,
+                      ComputeStageFactory::createGEMM({
+                          .device_id = device,
+                          .A = buffers.attn_output,
+                          .B = wo_weight,
+                          .C = buffers.attn_proj,
+                          .m = total_tokens,
+                          .n = wo_n,
+                          .k = wo_k,
+                          .alpha = 1.0f,
+                          .beta = 0.0f,
+                          .transpose_B = false,
+                          .gemm_context = GemmContext::ATTN,
+                          .a_buffer_id = buffers.idFor(BufferId::ATTN_OUTPUT),
+                          .c_buffer_id = buffers.idFor(BufferId::ATTN_PROJ),
+                          .force_decode_equivalent_verifier_prefill = force_decode_equivalent_wo_verifier_prefill,
+                          .prepared_ref = preparedRefForGraphWeight(wo_binding, device),
+                          .prepared_store = prepared_weight_store_,
+                      }),
+                      device);
+        graph.addDependency(wo_node, dependency);
+
+        std::string terminal = wo_node;
+
+        // TP allreduce if row-parallel sharded
+        if (isRowParallelSharded(wo_weight) && needsTPAllreduce())
+        {
+            size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+            std::string ar_node = prefix + allreduce_node_suffix;
+
+            auto allreduce_stage = createTPAllreduceStage(
+                buffers.attn_proj, allreduce_count, device, layer_idx,
+                /*is_attention=*/true, ar_node, buffers.idFor(BufferId::ATTN_PROJ));
+
+            if (allreduce_stage)
+            {
+                graph.addNode(ar_node, std::move(allreduce_stage), device);
+                graph.addDependency(ar_node, wo_node);
+                terminal = ar_node;
+            }
+        }
+
+        return terminal;
     }
 
 } // namespace llaminar2

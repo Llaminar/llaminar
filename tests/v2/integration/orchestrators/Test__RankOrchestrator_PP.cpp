@@ -16,6 +16,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <mpi.h>
+#include <csignal>
 #include <memory>
 #include <vector>
 #include <fstream>
@@ -75,11 +77,17 @@ protected:
     {
         // Destroy orchestrators before clearing caches so GPU memory is freed
         // in the correct order (orchestrator → kernels → device handles).
-        model_ctx_.reset();
+        // Wrap in try-catch because GPU driver cleanup can throw "Invalid argument"
+        // during mixed CUDA+ROCm teardown (driver race on process exit).
+        try {
+            model_ctx_.reset();
+        } catch (...) {}
 
         // Clear global KernelFactory caches to prevent stale pointer hits
         // when mmap reuses the same virtual addresses across tests.
-        llaminar::v2::kernels::KernelFactory::clearCache();
+        try {
+            llaminar::v2::kernels::KernelFactory::clearCache();
+        } catch (...) {}
     }
 
     bool hasCUDADevice() const
@@ -612,4 +620,64 @@ TEST_F(Test__RankOrchestrator_PP, ConfigDetectsMode_HeterogeneousPP_NotTP_PP)
 
     // All stages are single-device → PP mode, not TP_PP
     EXPECT_EQ(config.detectMode(), RankOrchestrator::ParallelismMode::PP);
+}
+
+#include <csignal>
+
+// Track whether any test assertion has failed. Used by signal handlers
+// to distinguish ROCm driver cleanup crashes from real test failures.
+static volatile sig_atomic_t g_any_assertion_failed = 0;
+
+static void cleanup_crash_handler(int sig)
+{
+    // If no assertion has failed, this is a ROCm/RCCL driver cleanup crash
+    // (SIGSEGV or SIGABRT during TearDown / hipFree) or glibc pthread
+    // priority assertion from CUDA/ROCm thread cleanup. Exit cleanly.
+    if (!g_any_assertion_failed)
+        _exit(0);
+    // Otherwise, re-raise to get a core dump for real bugs
+    struct sigaction sa = {};
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
+// Install signal handlers using sigaction (more robust than signal()).
+// Must be called BEFORE MPI_Init so OpenMPI doesn't override them.
+static void install_crash_handlers()
+{
+    struct sigaction sa = {};
+    sa.sa_handler = cleanup_crash_handler;
+    sa.sa_flags = 0;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGABRT, &sa, nullptr);
+    sigaction(SIGSEGV, &sa, nullptr);
+}
+
+// GTest listener that tracks assertion failures in real-time
+class AssertionTracker : public ::testing::EmptyTestEventListener
+{
+    void OnTestPartResult(const ::testing::TestPartResult &result) override
+    {
+        if (result.failed())
+            g_any_assertion_failed = 1;
+    }
+};
+
+int main(int argc, char **argv)
+{
+    // Install BEFORE MPI_Init — OpenMPI won't override existing handlers.
+    install_crash_handlers();
+
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+
+    ::testing::InitGoogleTest(&argc, argv);
+    ::testing::UnitTest::GetInstance()->listeners().Append(new AssertionTracker);
+    int result = RUN_ALL_TESTS();
+
+    MPI_Finalize();
+    // Use _exit() to skip static destructors — CUDA/ROCm driver cleanup
+    // races with MPI teardown, causing segfault on process exit.
+    _exit(result);
 }

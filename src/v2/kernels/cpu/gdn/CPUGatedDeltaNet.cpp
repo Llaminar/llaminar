@@ -127,6 +127,52 @@ static inline __m256 avx2_fast_sigmoid(__m256 vx)
 
 namespace llaminar2
 {
+    void CPUGatedDeltaNet::bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size)
+    {
+        verifier_state_capture_ = workspace;
+        verifier_state_capture_rows_ = rows;
+        verifier_state_capture_size_ = state_size;
+    }
+
+    void CPUGatedDeltaNet::bindSpeculativeStateWorkspace(float *workspace, int state_size)
+    {
+        speculative_state_work_ = workspace;
+        speculative_state_work_size_ = state_size;
+    }
+
+    bool CPUGatedDeltaNet::restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream)
+    {
+        if (row < 0 || row >= verifier_state_capture_rows_)
+            return false;
+        return restoreStateFromSnapshot(
+            dst_state,
+            verifier_state_capture_,
+            row,
+            verifier_state_capture_size_,
+            verifier_state_capture_size_,
+            stream);
+    }
+
+    float *CPUGatedDeltaNet::prepareSpeculativeState(float *live_state, int state_floats)
+    {
+        if (!live_state || state_floats <= 0)
+            return nullptr;
+
+        float *work = nullptr;
+        if (speculative_state_work_ && speculative_state_work_size_ >= state_floats)
+        {
+            work = speculative_state_work_;
+        }
+        else
+        {
+            owned_speculative_state_work_.resize(static_cast<size_t>(state_floats));
+            work = owned_speculative_state_work_.data();
+            speculative_state_work_size_ = std::max(speculative_state_work_size_, state_floats);
+        }
+
+        std::memcpy(work, live_state, static_cast<size_t>(state_floats) * sizeof(float));
+        return work;
+    }
 
     // =========================================================================
     // Scratch buffer management (grow-only, eliminates per-call allocations)
@@ -766,6 +812,20 @@ namespace llaminar2
         int n_heads, int d_k, int d_v,
         bool use_qk_l2norm)
     {
+        const int state_floats = n_heads * d_k * d_v;
+        const bool verifier_capture_active =
+            verifier_state_capture_ &&
+            verifier_state_capture_rows_ > 0 &&
+            verifier_state_capture_size_ >= state_floats &&
+            state_floats > 0;
+        float *state_for_compute = state;
+        if (verifier_capture_active)
+        {
+            state_for_compute = prepareSpeculativeState(state, state_floats);
+            if (!state_for_compute)
+                return false;
+        }
+
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
         constexpr float l2_eps = 1e-6f;
 
@@ -800,7 +860,7 @@ namespace llaminar2
                 const float beta_h = 1.0f / (1.0f + std::exp(-beta_raw[h]));
 
                 // ── Core recurrence ──
-                float *S = state + static_cast<size_t>(h) * d_k * d_v;
+                float *S = state_for_compute + static_cast<size_t>(h) * d_k * d_v;
                 const float *q_h = q_local;
                 const float *k_h = k_local;
                 const float *v_h = v + h * d_v;
@@ -810,6 +870,13 @@ namespace llaminar2
             }
         };
         OMP_WORKSHARE_REGION(do_work);
+
+        if (verifier_capture_active)
+        {
+            std::memcpy(verifier_state_capture_,
+                        state_for_compute,
+                        static_cast<size_t>(state_floats) * sizeof(float));
+        }
 
         return true;
     }
@@ -854,8 +921,259 @@ namespace llaminar2
         const float *A_log, const float *dt_bias,
         float *output, float *state,
         int seq_len, int n_heads, int d_k, int d_v,
-        int /*chunk_size*/, bool use_qk_l2norm)
+        int chunk_size, bool use_qk_l2norm)
     {
+        const int state_floats = n_heads * d_k * d_v;
+        float *state_snapshots = nullptr;
+        int snapshot_stride_floats = 0;
+        int max_snapshot_rows = 0;
+        if (verifier_state_capture_ &&
+            verifier_state_capture_rows_ > 0 &&
+            verifier_state_capture_size_ >= state_floats)
+        {
+            state_snapshots = verifier_state_capture_;
+            snapshot_stride_floats = verifier_state_capture_size_;
+            max_snapshot_rows = verifier_state_capture_rows_;
+            state = prepareSpeculativeState(state, state_floats);
+            if (!state)
+                return false;
+        }
+        if (state_snapshots && seq_len > 1 && seq_len <= 4)
+        {
+            return chunkForwardVerifierDecodeEquivalent(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+        }
+        return chunkForwardImpl(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
+            state_snapshots,
+            snapshot_stride_floats,
+            max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardWithStateSnapshots(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        int chunk_size, bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        if (state_snapshots && seq_len > 1 && seq_len <= 4)
+        {
+            return chunkForwardVerifierDecodeEquivalent(
+                Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+                seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+                state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+        }
+        return chunkForwardImpl(
+            Q, K, V, alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, chunk_size, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::restoreStateFromSnapshot(
+        float *state, const float *state_snapshots,
+        int snapshot_row, int snapshot_stride_floats,
+        int state_floats, void *stream)
+    {
+        (void)stream;
+        if (!state || !state_snapshots || snapshot_row < 0 ||
+            snapshot_stride_floats < state_floats || state_floats < 0)
+            return false;
+
+        std::memcpy(state,
+                    state_snapshots + static_cast<size_t>(snapshot_row) * snapshot_stride_floats,
+                    static_cast<size_t>(state_floats) * sizeof(float));
+        return true;
+    }
+
+    template <typename RowAccessor>
+    bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalentRows(
+        RowAccessor &&row_accessor,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        const int state_floats = n_heads * d_k * d_v;
+        if (!alpha || !beta_raw || !A_log || !dt_bias ||
+            !output || !state || !state_snapshots ||
+            seq_len <= 0 || n_heads <= 0 || d_k <= 0 || d_v <= 0 ||
+            snapshot_stride_floats < state_floats || max_snapshot_rows <= 0)
+        {
+            return false;
+        }
+
+        const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
+        constexpr float l2_eps = 1e-6f;
+        const int v_stride = n_heads * d_v;
+
+        /**
+         * The verifier rows must be decode-equivalent, but they must not be a
+         * hidden sequence of full one-token decode launches.  GDN's recurrence
+         * dependency is per head, so the grouped verifier kernel owns a head's
+         * state for all rows, advances that head in serial decode order, and
+         * publishes the head slice of every post-row snapshot.  This preserves
+         * the exact recurrent_step() operation order for each head while using
+         * one OpenMP worksharing region for the whole M=2..4 verifier chunk.
+         */
+        auto grouped_decode_equivalent = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int h = 0; h < n_heads; ++h)
+            {
+                alignas(64) float q_local[512];
+                alignas(64) float k_local[512];
+
+                const size_t head_state_floats = static_cast<size_t>(d_k) * d_v;
+                float *S = state + static_cast<size_t>(h) * head_state_floats;
+
+                for (int t = 0; t < seq_len; ++t)
+                {
+                    const float *q_t = nullptr;
+                    const float *k_t = nullptr;
+                    const float *v_t = nullptr;
+                    row_accessor(t, h, q_t, k_t, v_t);
+                    const float *alpha_t = alpha + static_cast<size_t>(t) * n_heads;
+                    const float *beta_t = beta_raw + static_cast<size_t>(t) * n_heads;
+                    float *output_t = output + static_cast<size_t>(t) * v_stride + h * d_v;
+
+                    if (use_qk_l2norm)
+                    {
+                        gdn_preprocess_qk_l2norm(q_t, k_t, q_local, k_local, d_k, scale_val, l2_eps);
+                    }
+                    else
+                    {
+                        gdn_preprocess_qk_scale(q_t, k_t, q_local, k_local, d_k, scale_val);
+                    }
+
+                    const float x = alpha_t[h] + dt_bias[h];
+                    const float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+                    const float decay = std::exp(A_log[h] * sp);
+                    const float beta_h = 1.0f / (1.0f + std::exp(-beta_t[h]));
+
+                    gdn_delta_recurrence(S, q_local, k_local, v_t, output_t, decay, beta_h, d_k, d_v);
+
+                    if (t < max_snapshot_rows)
+                    {
+                        float *snapshot_head =
+                            state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                            static_cast<size_t>(h) * head_state_floats;
+                        std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(grouped_decode_equivalent);
+
+        return true;
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardVerifierDecodeEquivalent(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        if (!Q || !K || !V)
+            return false;
+
+        const int qk_stride = n_heads * d_k;
+        const int v_stride = n_heads * d_v;
+        auto contiguous_rows =
+            [=](int t, int h, const float *&q_t, const float *&k_t, const float *&v_t)
+        {
+            q_t = Q + static_cast<size_t>(t) * qk_stride + h * d_k;
+            k_t = K + static_cast<size_t>(t) * qk_stride + h * d_k;
+            v_t = V + static_cast<size_t>(t) * v_stride + h * d_v;
+        };
+
+        return chunkForwardVerifierDecodeEquivalentRows(
+            contiguous_rows,
+            alpha, beta_raw, A_log, dt_bias, output, state,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardMergedQKVWithStateSnapshots(
+        const float *merged_qkv, int qkv_stride,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+        int global_v_head_offset, int chunk_size, bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        (void)chunk_size;
+        if (!merged_qkv || seq_len <= 0 || n_k_heads <= 0 ||
+            n_heads <= 0 || d_k <= 0 || d_v <= 0)
+        {
+            return false;
+        }
+
+        const int q_src_dim = n_k_heads * d_k;
+        const int k_src_dim = n_k_heads * d_k;
+        const int v_dim = n_heads * d_v;
+        const int state_floats = n_heads * d_k * d_v;
+        if (qkv_stride < q_src_dim + k_src_dim + v_dim)
+            return false;
+
+        float *state_for_compute = prepareSpeculativeState(state, state_floats);
+        if (!state_for_compute)
+            return false;
+
+        auto merged_rows =
+            [=](int t, int h, const float *&q_t, const float *&k_t, const float *&v_t)
+        {
+            int qk_head = (h + global_v_head_offset) % n_k_heads;
+            if (qk_head < 0)
+                qk_head += n_k_heads;
+
+            const float *row =
+                merged_qkv + static_cast<size_t>(t) * qkv_stride;
+            q_t = row + static_cast<size_t>(qk_head) * d_k;
+            k_t = row + q_src_dim + static_cast<size_t>(qk_head) * d_k;
+            v_t = row + q_src_dim + k_src_dim + static_cast<size_t>(h) * d_v;
+        };
+
+        return chunkForwardVerifierDecodeEquivalentRows(
+            merged_rows,
+            alpha, beta_raw, A_log, dt_bias, output, state_for_compute,
+            seq_len, n_heads, d_k, d_v, use_qk_l2norm,
+            state_snapshots, snapshot_stride_floats, max_snapshot_rows);
+    }
+
+    bool CPUGatedDeltaNet::chunkForwardImpl(
+        const float *Q, const float *K, const float *V,
+        const float *alpha, const float *beta_raw,
+        const float *A_log, const float *dt_bias,
+        float *output, float *state,
+        int seq_len, int n_heads, int d_k, int d_v,
+        int /*chunk_size*/, bool use_qk_l2norm,
+        float *state_snapshots, int snapshot_stride_floats,
+        int max_snapshot_rows)
+    {
+        const int state_floats = n_heads * d_k * d_v;
+        const bool capture_state_snapshots = state_snapshots != nullptr;
+        if (capture_state_snapshots &&
+            (snapshot_stride_floats < state_floats || max_snapshot_rows <= 0))
+        {
+            return false;
+        }
+
         ensureScratch(seq_len, n_heads, d_k, d_v);
 
         const float scale_val = 1.0f / std::sqrt(static_cast<float>(d_k));
@@ -930,7 +1248,8 @@ namespace llaminar2
 #pragma omp for schedule(static)
             for (int h = 0; h < n_heads; ++h)
             {
-                float *S = state + static_cast<size_t>(h) * d_k * d_v;
+                const size_t head_state_floats = static_cast<size_t>(d_k) * d_v;
+                float *S = state + static_cast<size_t>(h) * head_state_floats;
 
 #if defined(__AVX512F__)
                 if (d_v == 128)
@@ -1072,6 +1391,14 @@ namespace llaminar2
                         _mm512_storeu_ps(o_t + 96, o6);
                         _mm512_storeu_ps(o_t + 112, o7);
 
+                        if (capture_state_snapshots && t < max_snapshot_rows)
+                        {
+                            float *snapshot_head =
+                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                                static_cast<size_t>(h) * head_state_floats;
+                            std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
+                        }
+
                     } // timesteps
                 }
                 else
@@ -1151,6 +1478,13 @@ namespace llaminar2
                             }
                         }
 #endif
+                        if (capture_state_snapshots && t < max_snapshot_rows)
+                        {
+                            float *snapshot_head =
+                                state_snapshots + static_cast<size_t>(t) * snapshot_stride_floats +
+                                static_cast<size_t>(h) * head_state_floats;
+                            std::memcpy(snapshot_head, S, head_state_floats * sizeof(float));
+                        }
                     } // timesteps
                 }
             } // heads

@@ -165,7 +165,7 @@ namespace llaminar2
             }
 
             instance.initialized_ = true;
-            LOG_INFO("[AsyncStageDumper] Initialized with " << num_threads << " I/O threads");
+            LOG_DEBUG("[AsyncStageDumper] Initialized with " << num_threads << " I/O threads");
         }
 
         /**
@@ -179,7 +179,7 @@ namespace llaminar2
             if (!instance.initialized_)
                 return;
 
-            LOG_INFO("[AsyncStageDumper] Shutting down, "
+            LOG_DEBUG("[AsyncStageDumper] Shutting down, "
                      << instance.queue_.pendingCount() << " tasks pending...");
 
             instance.queue_.shutdown();
@@ -193,7 +193,7 @@ namespace llaminar2
             instance.workers_.clear();
             instance.initialized_ = false;
 
-            LOG_INFO("[AsyncStageDumper] Shutdown complete. Total writes: "
+            LOG_DEBUG("[AsyncStageDumper] Shutdown complete. Total writes: "
                      << instance.total_writes_.load()
                      << ", bytes: " << instance.total_bytes_.load());
         }
@@ -273,12 +273,19 @@ namespace llaminar2
             const StageDumpInfo &dump_info)
         {
             const auto &cfg = debugEnv().stage_dump;
+            if (!cfg.dump_inputs && !cfg.dump_weights)
+                return;
+
+            StageDumper::writeWeightMetadata(ctx, dump_info);
+            StageDumper::writeScalars(ctx, dump_info);
+
             if (!cfg.dump_inputs)
                 return;
 
             for (const auto &input : dump_info.inputs)
             {
-                if (!input.data)
+                const void *input_data = StageDumper::hostDataForDump(input);
+                if (!input_data)
                     continue;
 
                 std::string name = input.name;
@@ -308,7 +315,7 @@ namespace llaminar2
                     meta.byte_size = byte_size;
                 }
 
-                enqueue(path, input.data, byte_size, meta,
+                enqueue(path, input_data, byte_size, meta,
                         ctx.dump_dir + "/inputs/" + name + "_meta.txt");
             }
         }
@@ -324,9 +331,12 @@ namespace llaminar2
             if (!cfg.dump_outputs)
                 return;
 
+            dump_info.ensureOutputsOnHost();
+
             for (const auto &output : dump_info.outputs)
             {
-                if (!output.data)
+                const void *output_data = StageDumper::hostDataForDump(output);
+                if (!output_data)
                     continue;
 
                 std::string name = output.name;
@@ -356,9 +366,11 @@ namespace llaminar2
                     meta.byte_size = byte_size;
                 }
 
-                enqueue(path, output.data, byte_size, meta,
+                enqueue(path, output_data, byte_size, meta,
                         ctx.dump_dir + "/outputs/" + name + "_meta.txt");
             }
+
+            StageDumper::writeScalars(ctx, dump_info);
         }
 
         /**

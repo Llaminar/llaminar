@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         grep \
         sed \
         sudo \
+        tini \
         wget \
     && rm -rf /var/lib/apt/lists/*
 
@@ -38,6 +39,7 @@ RUN MODE=build /tmp/install-scripts/install-system-deps.sh
 # graphics libs for GPU debug, linux-tools for `perf`.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bc \
+        ripgrep \
         bsdmainutils \
         htop \
         libcurl4-openssl-dev \
@@ -99,17 +101,19 @@ RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/nul
 RUN rm -rf /tmp/install-scripts
 
 # --- Dev user --------------------------------------------------------------
-RUN groupadd -f render && \
+RUN if id -u ubuntu >/dev/null 2>&1; then userdel -r ubuntu 2>/dev/null || userdel ubuntu; fi && \
+    if getent group ubuntu >/dev/null 2>&1; then groupdel ubuntu; fi && \
+    groupadd -f render && \
     groupadd -f video && \
     useradd -m -s /bin/bash vscode && \
     usermod -aG sudo vscode && \
     usermod -aG render,video vscode && \
     echo "vscode ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
 
-RUN mkdir -p /workspace && chown vscode:vscode /workspace
+RUN mkdir -p /workspaces/llaminar && chown -R vscode:vscode /workspaces
 
 USER vscode
-WORKDIR /workspace
+WORKDIR /workspaces/llaminar
 
 # MPI, CUDA, ROCm env for vscode shells.
 ENV OMPI_ALLOW_RUN_AS_ROOT=1 \
@@ -131,4 +135,5 @@ RUN echo 'alias ll="ls -la"' >> ~/.bashrc && \
     echo 'alias uvx="uv run --with"' >> ~/.bashrc
 
 EXPOSE 8080 3000 5000
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
 CMD ["sleep", "infinity"]

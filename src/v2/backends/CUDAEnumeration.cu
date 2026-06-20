@@ -8,6 +8,7 @@
  */
 
 #include <cuda_runtime.h>
+#include <cuda.h> // For cuDevicePrimaryCtxRelease, cuDevicePrimaryCtxGetState
 #include <cublas_v2.h>
 #include <vector>
 #include <string>
@@ -34,12 +35,28 @@ namespace llaminar2
                 return devices;
             }
 
-            LOG_INFO("[CUDA] Found " << device_count << " CUDA device(s)");
+            LOG_DEBUG("[CUDA] Found " << device_count << " CUDA device(s)");
 
             // Save current device to restore after enumeration
             // (enumeration changes current device via cudaSetDevice for memory queries)
             int original_device = 0;
             cudaGetDevice(&original_device);
+
+            // Track which devices already had an active primary context before
+            // we touch them.  We will release contexts we created so that
+            // enumeration-only processes don't keep ~256 MiB per GPU alive.
+            std::vector<bool> had_context(device_count, false);
+            for (int i = 0; i < device_count; ++i)
+            {
+                unsigned int flags = 0;
+                int active = 0;
+                CUdevice cu_dev;
+                if (cuDeviceGet(&cu_dev, i) == CUDA_SUCCESS &&
+                    cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) == CUDA_SUCCESS)
+                {
+                    had_context[i] = (active != 0);
+                }
+            }
 
             for (int i = 0; i < device_count; ++i)
             {
@@ -73,9 +90,9 @@ namespace llaminar2
                 dev.supports_bf16 = (prop.major >= 8); // Ampere (SM 8.0+)
                 dev.supports_int8 = (prop.major >= 6); // DP4A on Pascal+
 
-                LOG_INFO("[CUDA] Device " << i << ": " << dev.name
-                                          << " (SM " << prop.major << "." << prop.minor
-                                          << ", " << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
+                LOG_DEBUG("[CUDA] Device " << i << ": " << dev.name
+                                           << " (SM " << prop.major << "." << prop.minor
+                                           << ", " << (dev.total_memory_bytes / (1024 * 1024 * 1024)) << " GB)");
 
                 // Read PCIe link information from sysfs
                 dev.pcie = pcie_enumeration::read_pcie_link_info(
@@ -86,6 +103,25 @@ namespace llaminar2
 
             // Restore original device context to avoid disrupting caller's CUDA state
             cudaSetDevice(original_device);
+
+            // Release primary contexts that we created during enumeration.
+            // cudaSetDevice() implicitly retains the primary context; if we
+            // don't release it, each enumerated device keeps ~256 MiB of GPU
+            // memory allocated even when the process never uses that GPU.
+            // This is safe: cuDevicePrimaryCtxRelease only decrements the
+            // refcount.  If another part of the process already held the
+            // context, it stays alive.
+            for (int i = 0; i < device_count; ++i)
+            {
+                if (!had_context[i])
+                {
+                    CUdevice cu_dev;
+                    if (cuDeviceGet(&cu_dev, i) == CUDA_SUCCESS)
+                    {
+                        cuDevicePrimaryCtxRelease(cu_dev);
+                    }
+                }
+            }
 
             return devices;
         }

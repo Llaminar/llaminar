@@ -86,6 +86,25 @@ namespace
         HipBuffer &operator=(const HipBuffer &) = delete;
     };
 
+    // RAII wrapper for the explicit stream required by ITensor KV appends.
+    struct ScopedHipStream
+    {
+        hipStream_t stream = nullptr;
+
+        ScopedHipStream()
+        {
+            EXPECT_EQ(hipStreamCreate(&stream), hipSuccess);
+        }
+
+        ~ScopedHipStream()
+        {
+            if (stream)
+                hipStreamDestroy(stream);
+        }
+
+        void *opaque() const { return static_cast<void *>(stream); }
+    };
+
 } // namespace
 
 // =============================================================================
@@ -153,7 +172,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, GetKV_EmptyCache_ReturnsZeroLen)
 
     const void *d_k, *d_v;
     int kv_len = -1;
-    bool ok = cache->get_kv_for_attention(0, 0, &d_k, &d_v, &kv_len);
+    bool ok = cache->get_kv_for_attention(0, 0, &d_k, &d_v, &kv_len, 0);
     EXPECT_TRUE(ok);
     EXPECT_EQ(kv_len, 0);
 }
@@ -175,13 +194,13 @@ TEST(Test__ROCmRingKVCache_Comprehensive, SingleToken_AppendAndRetrieve)
     auto h_V = generateRandomFP32(kv_dim, 43);
     HipBuffer d_K(h_K), d_V(h_V);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K.ptr, d_V.ptr, 1));
+    ASSERT_TRUE(cache->append(0, 0, d_K.ptr, d_V.ptr, 1, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 1);
     EXPECT_FALSE(cache->is_wrapped(0, 0));
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 1);
 
     std::vector<float> h_K_out(kv_dim), h_V_out(kv_dim);
@@ -209,7 +228,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_Zero_NoOp)
     auto h_V = generateRandomFP32(10 * kv_dim);
     HipBuffer d_K(h_K), d_V(h_V);
 
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 10);
+    cache->append(0, 0, d_K.ptr, d_V.ptr, 10, 0);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
 
     cache->evict_oldest(0, 0, 0);
@@ -229,7 +248,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_ClampedToSize)
     auto h_V = generateRandomFP32(5 * kv_dim);
     HipBuffer d_K(h_K), d_V(h_V);
 
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 5);
+    cache->append(0, 0, d_K.ptr, d_V.ptr, 5, 0);
     cache->evict_oldest(0, 0, 100); // Evict more than available
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
@@ -248,7 +267,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_TotalCounterTracksAcrossOperatio
     auto h_V = generateRandomFP32(20 * kv_dim);
     HipBuffer d_K(h_K), d_V(h_V);
 
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 20);
+    cache->append(0, 0, d_K.ptr, d_V.ptr, 20, 0);
     EXPECT_EQ(cache->get_total_evicted(), 0);
 
     cache->evict_oldest(0, 0, 5);
@@ -275,7 +294,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
     auto h_K1 = generateRandomFP32(10 * kv_dim, 100);
     auto h_V1 = generateRandomFP32(10 * kv_dim, 200);
     HipBuffer d_K1(h_K1), d_V1(h_V1);
-    cache->append(0, 0, d_K1.ptr, d_V1.ptr, 10);
+    cache->append(0, 0, d_K1.ptr, d_V1.ptr, 10, 0);
 
     // Evict 5
     cache->evict_oldest(0, 0, 5);
@@ -285,14 +304,14 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Evict_ThenAppend_DataCorrect)
     auto h_K2 = generateRandomFP32(3 * kv_dim, 300);
     auto h_V2 = generateRandomFP32(3 * kv_dim, 400);
     HipBuffer d_K2(h_K2), d_V2(h_V2);
-    cache->append(0, 0, d_K2.ptr, d_V2.ptr, 3);
+    cache->append(0, 0, d_K2.ptr, d_V2.ptr, 3, 0);
 
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 8);
 
     // Retrieve and verify
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, 8);
 
     std::vector<float> h_K_out(8 * kv_dim);
@@ -341,7 +360,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiSeq_ClearOne_OtherUnaffected)
     // Fill all layers and sequences
     for (int layer = 0; layer < n_layers; ++layer)
         for (int seq = 0; seq < batch_size; ++seq)
-            cache->append(layer, seq, d_K.ptr, d_V.ptr, 10);
+            cache->append(layer, seq, d_K.ptr, d_V.ptr, 10, 0);
 
     // Clear sequence 1 in layer 0
     cache->clear_sequence(0, 1);
@@ -375,13 +394,13 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiSeq_IndependentWrapping)
     auto h_K0 = generateRandomFP32(5 * kv_dim, 100);
     auto h_V0 = generateRandomFP32(5 * kv_dim, 200);
     HipBuffer d_K0(h_K0), d_V0(h_V0);
-    cache->append(0, 0, d_K0.ptr, d_V0.ptr, 5);
+    cache->append(0, 0, d_K0.ptr, d_V0.ptr, 5, 0);
 
     // Seq 1: fill 10 tokens (wraps)
     auto h_K1 = generateRandomFP32(10 * kv_dim, 300);
     auto h_V1 = generateRandomFP32(10 * kv_dim, 400);
     HipBuffer d_K1(h_K1), d_V1(h_V1);
-    cache->append(0, 1, d_K1.ptr, d_V1.ptr, 10);
+    cache->append(0, 1, d_K1.ptr, d_V1.ptr, 10, 0);
 
     // Seq 0: not wrapped, seq 1: wrapped
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
@@ -393,7 +412,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiSeq_IndependentWrapping)
     // Verify seq 0 data integrity
     const void *d_k_out, *d_v_out;
     int len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_k_out, &d_v_out, &len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_k_out, &d_v_out, &len, 0));
     EXPECT_EQ(len, 5);
 
     std::vector<float> k_out(5 * kv_dim);
@@ -426,7 +445,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiWrap_StressTest)
         hipMemcpy(d_K.ptr, h_K.data(), 4 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
         hipMemcpy(d_V.ptr, h_V.data(), 4 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
-        cache->append(0, 0, d_K.ptr, d_V.ptr, 4);
+        cache->append(0, 0, d_K.ptr, d_V.ptr, 4, 0);
 
         if (batch == 9)
             last_batch_K = h_K;
@@ -437,7 +456,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiWrap_StressTest)
     // Verify the most recent 4 tokens (from last batch) are present
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, max_seq);
 
     std::vector<float> h_K_out(max_seq * kv_dim);
@@ -493,7 +512,13 @@ TEST(Test__ROCmRingKVCache_Comprehensive, IKVCache_PolymorphismCompliance)
     k_tensor->ensureOnDevice(rocm_dev);
     v_tensor->ensureOnDevice(rocm_dev);
 
-    ASSERT_TRUE(cache->append(0, 0, k_tensor.get(), v_tensor.get(), 5));
+    // The generic ITensor append path must fail closed unless a caller supplies
+    // the execution stream used by the graph/stage path.
+    EXPECT_FALSE(cache->append(0, 0, k_tensor.get(), v_tensor.get(), 5));
+
+    ScopedHipStream stream;
+    ASSERT_TRUE(cache->appendWithStream(0, 0, k_tensor.get(), v_tensor.get(), 5, stream.opaque()));
+    ASSERT_EQ(hipStreamSynchronize(stream.stream), hipSuccess);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 5);
 
     // Clear via IKVCache
@@ -522,16 +547,16 @@ TEST(Test__ROCmRingKVCache_Comprehensive, MultiLayer_IndependentWrapping)
     auto h_K0 = generateRandomFP32(5 * kv_dim, 100);
     hipMemcpy(d_K.ptr, h_K0.data(), 5 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V.ptr, h_K0.data(), 5 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    cache->append(0, 0, d_K.ptr, d_V.ptr, 5);
+    cache->append(0, 0, d_K.ptr, d_V.ptr, 5, 0);
 
     // Layer 1: 10 tokens (wraps once)
     auto h_K1 = generateRandomFP32(10 * kv_dim, 200);
     hipMemcpy(d_K.ptr, h_K1.data(), 8 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V.ptr, h_K1.data(), 8 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    cache->append(1, 0, d_K.ptr, d_V.ptr, 8);
+    cache->append(1, 0, d_K.ptr, d_V.ptr, 8, 0);
     hipMemcpy(d_K.ptr, h_K1.data() + 8 * kv_dim, 2 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
     hipMemcpy(d_V.ptr, h_K1.data() + 8 * kv_dim, 2 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    cache->append(1, 0, d_K.ptr, d_V.ptr, 2);
+    cache->append(1, 0, d_K.ptr, d_V.ptr, 2, 0);
 
     // Layer 2: empty
 
@@ -561,21 +586,21 @@ TEST(Test__ROCmRingKVCache_Comprehensive, LinearizationCounter_TracksWraps)
     // Fill partially (not wrapped)
     auto h_data = generateRandomFP32((max_seq - 1) * kv_dim);
     HipBuffer d_K(h_data), d_V(h_data);
-    cache->append(0, 0, d_K.ptr, d_V.ptr, max_seq - 1);
+    cache->append(0, 0, d_K.ptr, d_V.ptr, max_seq - 1, 0);
     EXPECT_FALSE(cache->is_wrapped(0, 0));
 
     const void *dk, *dv;
     int len;
-    cache->get_kv_for_attention(0, 0, &dk, &dv, &len);
+    cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
     int count_after_first = cache->get_linearization_count();
 
     // Add 2 more tokens to force wrap
     auto h_extra = generateRandomFP32(2 * kv_dim, 999);
     HipBuffer d_extra(h_extra);
-    cache->append(0, 0, d_extra.ptr, d_extra.ptr, 2);
+    cache->append(0, 0, d_extra.ptr, d_extra.ptr, 2, 0);
     EXPECT_TRUE(cache->is_wrapped(0, 0));
 
-    cache->get_kv_for_attention(0, 0, &dk, &dv, &len);
+    cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0);
     EXPECT_GT(cache->get_linearization_count(), count_after_first)
         << "Linearization counter should increase after wrapped get_kv";
 
@@ -601,7 +626,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     auto h_V = generateRandomFP32(max_seq * kv_dim, 43);
     HipBuffer d_K(h_K), d_V(h_V);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K.ptr, d_V.ptr, max_seq));
+    ASSERT_TRUE(cache->append(0, 0, d_K.ptr, d_V.ptr, max_seq, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq);
     // Note: filling to exact capacity wraps the head pointer to position 0,
     // so is_wrapped() returns true. This is by design in the ring buffer.
@@ -610,7 +635,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, Append_ExactCapacity_WrapsHeadPointer)
     // Retrieve and verify data integrity despite head-pointer wrap
     const void *dk, *dv;
     int len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &dk, &dv, &len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &dk, &dv, &len, 0));
     EXPECT_EQ(len, max_seq);
 
     std::vector<float> out(max_seq * kv_dim);
@@ -636,7 +661,7 @@ TEST(Test__ROCmRingKVCache_Comprehensive, EvictOldestLayer_AllSequences)
     HipBuffer d_K(h_data), d_V(h_data);
 
     for (int seq = 0; seq < batch_size; ++seq)
-        cache->append(0, seq, d_K.ptr, d_V.ptr, 10);
+        cache->append(0, seq, d_K.ptr, d_V.ptr, 10, 0);
 
     cache->evict_oldest_layer(0, 4);
 
@@ -670,9 +695,12 @@ TEST(Test__ROCmRingKVCache_Comprehensive, FP16_BasicAppendRetrieve)
         uint16_t sign = (bits >> 16) & 0x8000;
         int32_t exp = ((bits >> 23) & 0xFF) - 127 + 15;
         uint16_t frac = (bits >> 13) & 0x03FF;
-        if (exp <= 0) h_K_fp16[i] = sign;
-        else if (exp >= 31) h_K_fp16[i] = sign | 0x7C00;
-        else h_K_fp16[i] = sign | (static_cast<uint16_t>(exp) << 10) | frac;
+        if (exp <= 0)
+            h_K_fp16[i] = sign;
+        else if (exp >= 31)
+            h_K_fp16[i] = sign | 0x7C00;
+        else
+            h_K_fp16[i] = sign | (static_cast<uint16_t>(exp) << 10) | frac;
     }
 
     uint16_t *d_K, *d_V;
@@ -681,12 +709,12 @@ TEST(Test__ROCmRingKVCache_Comprehensive, FP16_BasicAppendRetrieve)
     hipMemcpy(d_K, h_K_fp16.data(), num_tokens * kv_dim * sizeof(uint16_t), hipMemcpyHostToDevice);
     hipMemcpy(d_V, h_K_fp16.data(), num_tokens * kv_dim * sizeof(uint16_t), hipMemcpyHostToDevice);
 
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     std::vector<uint16_t> h_K_out(num_tokens * kv_dim);

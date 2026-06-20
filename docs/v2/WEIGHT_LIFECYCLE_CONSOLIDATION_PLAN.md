@@ -319,13 +319,13 @@ GGUF File
   │                              └─ Stored in per_device_cache_["rocm:0:name"]
   │                                 (Heap-allocated, is_view()=false)
   │
-  ├─[packGemmWeights]────→ For each GEMM weight in cache_:
-  │                         │
-  │                         ├─ KernelFactory::getOrCreatePreparedGemmWeights()
-  │                         │   └─ Allocates GPU buffer, copies quantized blocks
-  │                         ├─ KernelFactory::getOrCreateGemmEngine()
-  │                         │   └─ Creates kernel with packed GPU data
-  │                         └─ Optionally release_raw_data() on source tensor
+   ├─[prepare model GEMM]─→ For each GEMM weight binding:
+   │                         │
+   │                         ├─ PreparedWeightStore::prepareGemm()/registerPreparedGemmFromPipeline()
+   │                         │   └─ Owns or borrows explicit prepared handles
+   │                         ├─ PreparedWeightStore::gemmKernel(ref)
+   │                         │   └─ Resolves the executable kernel by PreparedWeightRef
+   │                         └─ Optionally release_raw_data() after graph/materialization gates
   │
   ├─[uploadNonGemmWeights]→ For each non-GEMM weight (norms, embeddings):
   │                         │

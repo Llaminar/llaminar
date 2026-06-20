@@ -20,6 +20,7 @@
 #include <numeric>
 
 #include "kernels/KernelFactory.h"
+#include "loaders/PreparedWeightStore.h"
 #include "utils/MPITopology.h"
 #include "utils/MPIContext.h"
 #include "tensors/Tensors.h"
@@ -30,14 +31,47 @@ using namespace llaminar::v2::kernels;
 
 namespace
 {
+    WeightBinding makeTestBinding(TensorBase *tensor, const std::string &canonical_name)
+    {
+        static uint64_t next_binding_id = 1;
+        WeightBinding binding;
+        binding.binding_id = next_binding_id++;
+        binding.identity = makeSourceWeightIdentity(canonical_name, ModelContextId{77}, binding.binding_id);
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        binding.tensor = tensor;
+        binding.immutable = true;
+        return binding;
+    }
+
+    struct PreparedSliceFixture
+    {
+        std::unique_ptr<PreparedWeightStore> store;
+        PreparedWeightRef ref;
+    };
+
+    PreparedSliceFixture makePreparedSliceFixture(TensorBase *tensor, const std::string &canonical_name)
+    {
+        PreparedSliceFixture fixture;
+        fixture.store = std::make_unique<PreparedWeightStore>(ModelContextId{77});
+        auto binding = makeTestBinding(tensor, canonical_name);
+        fixture.ref = fixture.store->registerPreparedForTest(
+            binding,
+            PreparedWeightKind::CpuPackedGemm,
+            DeviceId::cpu());
+        return fixture;
+    }
+
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id = DeviceId::cpu())
     {
-        auto *prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        static std::vector<std::shared_ptr<KernelFactory::PreparedGemmHandle>> handles;
+        auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, device_id);
         if (!prepared)
         {
             return nullptr;
         }
-        return KernelFactory::getOrCreateGemmEngine(prepared);
+        handles.push_back(std::move(prepared));
+        return KernelFactory::getOrCreateGemmEngine(handles.back().get());
     }
 }
 
@@ -173,9 +207,10 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, RowParallelGEMM_SlicesMatchFullOutput)
     // Create local output buffer
     auto local_output = createFP32(M, local_n);
 
-    // Get sliced kernel for this rank's portion
-    auto *sliced_kernel = KernelFactory::getOrCreateGemmSliced(
-        weights.get(), my_range.start, my_range.end);
+    // Get sliced kernel for this rank's portion through the prepared store.
+    auto prepared_slice = makePreparedSliceFixture(weights.get(), "blk.0.ffn_down.weight");
+    auto *sliced_kernel = prepared_slice.store->slicedGemmKernel(
+        prepared_slice.ref, my_range.start, my_range.end);
     ASSERT_NE(sliced_kernel, nullptr) << "Failed to create sliced kernel";
 
     // Execute local GEMM
@@ -252,8 +287,9 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, RowParallelGEMM_AllRanksGetSameGathered
     size_t local_n = my_range.size();
 
     auto local_output = createFP32(M, local_n);
-    auto *sliced_kernel = KernelFactory::getOrCreateGemmSliced(
-        weights.get(), my_range.start, my_range.end);
+    auto prepared_slice = makePreparedSliceFixture(weights.get(), "blk.0.ffn_down.weight");
+    auto *sliced_kernel = prepared_slice.store->slicedGemmKernel(
+        prepared_slice.ref, my_range.start, my_range.end);
     ASSERT_NE(sliced_kernel, nullptr);
 
     sliced_kernel->multiply_tensor(input.get(), local_output.get(),
@@ -388,9 +424,10 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, SlicedKernelCachingIsRankLocal)
 
     WorkRange my_range = topology_->get_row_range(N);
 
-    // Get sliced kernel twice
-    auto *k1 = KernelFactory::getOrCreateGemmSliced(weights.get(), my_range.start, my_range.end);
-    auto *k2 = KernelFactory::getOrCreateGemmSliced(weights.get(), my_range.start, my_range.end);
+    // Get sliced kernel twice through the same prepared store.
+    auto prepared_slice = makePreparedSliceFixture(weights.get(), "blk.0.ffn_down.weight");
+    auto *k1 = prepared_slice.store->slicedGemmKernel(prepared_slice.ref, my_range.start, my_range.end);
+    auto *k2 = prepared_slice.store->slicedGemmKernel(prepared_slice.ref, my_range.start, my_range.end);
 
     EXPECT_EQ(k1, k2) << "Same slice should return same cached kernel";
 
@@ -428,8 +465,9 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, WorkRangesMatchSlicedKernelDimensions)
 
     WorkRange my_range = topology_->get_row_range(N);
 
-    auto *kernel = KernelFactory::getOrCreateGemmSliced(
-        weights.get(), my_range.start, my_range.end);
+    auto prepared_slice = makePreparedSliceFixture(weights.get(), "blk.0.ffn_down.weight");
+    auto *kernel = prepared_slice.store->slicedGemmKernel(
+        prepared_slice.ref, my_range.start, my_range.end);
     ASSERT_NE(kernel, nullptr);
 
     // Kernel's N dimension should match slice size
@@ -456,8 +494,9 @@ TEST_F(Test__SlicedGEMM_MPI_Integration, LargeMatrixRowParallel)
 
     auto local_output = createFP32(M, local_n);
 
-    auto *sliced_kernel = KernelFactory::getOrCreateGemmSliced(
-        weights.get(), my_range.start, my_range.end);
+    auto prepared_slice = makePreparedSliceFixture(weights.get(), "blk.0.ffn_down.weight");
+    auto *sliced_kernel = prepared_slice.store->slicedGemmKernel(
+        prepared_slice.ref, my_range.start, my_range.end);
     ASSERT_NE(sliced_kernel, nullptr);
 
     bool success = sliced_kernel->multiply_tensor(

@@ -830,10 +830,20 @@ namespace llaminar2
 
     std::vector<int> BPETokenizer::encodeChat(
         const std::vector<ChatMessage> &messages,
-        bool add_generation_prompt) const
+        bool add_generation_prompt,
+        const std::string &tools_json) const
+    {
+        return encodeChat(messages, add_generation_prompt, tools_json, true);
+    }
+
+    std::vector<int> BPETokenizer::encodeChat(
+        const std::vector<ChatMessage> &messages,
+        bool add_generation_prompt,
+        const std::string &tools_json,
+        bool enable_thinking) const
     {
         // Apply template to get formatted text
-        std::string formatted = applyTemplate(messages, add_generation_prompt);
+        std::string formatted = applyTemplate(messages, add_generation_prompt, tools_json, enable_thinking);
 
         // Encode the formatted text
         // Note: We don't add BOS here because the template typically handles it
@@ -842,7 +852,17 @@ namespace llaminar2
 
     std::string BPETokenizer::applyTemplate(
         const std::vector<ChatMessage> &messages,
-        bool add_generation_prompt) const
+        bool add_generation_prompt,
+        const std::string &tools_json) const
+    {
+        return applyTemplate(messages, add_generation_prompt, tools_json, true);
+    }
+
+    std::string BPETokenizer::applyTemplate(
+        const std::vector<ChatMessage> &messages,
+        bool add_generation_prompt,
+        const std::string &tools_json,
+        bool enable_thinking) const
     {
         if (!chat_template_)
         {
@@ -860,7 +880,7 @@ namespace llaminar2
             return result;
         }
 
-        return chat_template_->apply(messages, add_generation_prompt);
+        return chat_template_->apply(messages, add_generation_prompt, enable_thinking, tools_json);
     }
 
     // ============================================================================

@@ -355,13 +355,13 @@ TEST_F(Test__CUDARingKVCache_Sharding, ShardedCache_AppendAndRetrieve)
     cudaMemcpy(d_V, h_V.data(), num_tokens * local_kv_dim * sizeof(float), cudaMemcpyHostToDevice);
 
     // Append to cache (layer 0)
-    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens));
+    ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
     // Retrieve K/V
     const void *d_K_out, *d_V_out;
     int kv_len;
-    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len));
+    ASSERT_TRUE(cache->get_kv_for_attention(0, 0, &d_K_out, &d_V_out, &kv_len, 0));
     EXPECT_EQ(kv_len, num_tokens);
 
     // Copy back and verify

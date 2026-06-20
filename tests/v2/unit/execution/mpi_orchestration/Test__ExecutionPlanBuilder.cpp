@@ -18,6 +18,8 @@
 #include <gtest/gtest.h>
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
+#include "execution/global_pp/GlobalPPRankPlanBuilder.h"
+#include "execution/global_pp/GlobalPPTopology.h"
 
 using namespace llaminar2;
 
@@ -41,7 +43,7 @@ public:
         rank_inv.rank = rank;
         rank_inv.hostname = hostname;
         rank_inv.node_id = rank; // Simple: one rank per node
-        rank_inv.local_rank = 0;
+        rank_inv.local_rank = rank;
         rank_inv.numa_nodes = 2;
 
         for (const auto &[type, ordinal] : gpus)
@@ -218,6 +220,72 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_GlobalTP_TwoRanks)
         EXPECT_EQ(plan.last_layer, model.n_layers - 1);
         EXPECT_TRUE(plan.usesGlobalTP());
         EXPECT_EQ(plan.global_tp_rank_in_domain, r % 2);
+
+        auto errors = plan.validate();
+        EXPECT_TRUE(errors.empty()) << "Rank " << r << " errors: " << (errors.empty() ? "" : errors[0]);
+    }
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_TwoRanksUsesCrossRankDomain)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {})
+                       .addRank(1, "localhost", 1, {})
+                       .build();
+
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::NODE_LOCAL;
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 2);
+    for (int r = 0; r < 2; ++r)
+    {
+        const auto &plan = plans[r];
+        EXPECT_TRUE(plan.usesGlobalTP());
+        EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
+        EXPECT_EQ(plan.global_tp_domain_size, 2);
+        EXPECT_EQ(plan.global_tp_rank_in_domain, r);
+        EXPECT_EQ(plan.weight_shard.total_shards, 2);
+        EXPECT_EQ(plan.weight_shard.shard_index, r);
+
+        auto errors = plan.validate();
+        EXPECT_TRUE(errors.empty()) << "Rank " << r << " errors: " << (errors.empty() ? "" : errors[0]);
+    }
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NodeLocalTP_ExplicitCPUDeviceMapKeepsRanksOnCPU)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}})
+                       .addRank(1, "localhost", 1, {{DeviceType::ROCm, 0}})
+                       .build();
+
+    config.device_mode = DeviceAssignmentMode::EXPLICIT;
+    config.device_map = {
+        {0, GlobalDeviceAddress::cpu(0)},
+        {1, GlobalDeviceAddress::cpu(1)},
+    };
+    config.device_map_numa_explicit = {{0, true}, {1, true}};
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::NODE_LOCAL;
+    config.default_backend = CollectiveBackendType::MPI;
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 2);
+    for (int r = 0; r < 2; ++r)
+    {
+        const auto &plan = plans[r];
+        EXPECT_TRUE(plan.usesGlobalTP());
+        EXPECT_EQ(plan.tp_scope, TPScope::NODE_LOCAL);
+        EXPECT_TRUE(plan.primary_device.isCPU());
+        EXPECT_EQ(plan.primary_device.numa_node, r);
+        EXPECT_TRUE(plan.primary_device_numa_explicit);
+        EXPECT_TRUE(plan.local_tp_devices.empty());
+        EXPECT_EQ(plan.global_tp_domain_size, 2);
+        EXPECT_EQ(plan.weight_shard.total_shards, 2);
+        EXPECT_EQ(plan.weight_shard.shard_index, r);
 
         auto errors = plan.validate();
         EXPECT_TRUE(errors.empty()) << "Rank " << r << " errors: " << (errors.empty() ? "" : errors[0]);
@@ -873,6 +941,48 @@ TEST_F(Test__ExecutionPlanBuilder, ValidateConfig_PPDegreeExceedsRanks)
     EXPECT_FALSE(errors.empty());
 }
 
+TEST_F(Test__ExecutionPlanBuilder, ValidateConfig_NamedDomainLocalPPAllowsMoreStagesThanRanks)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    DomainDefinition stage0_domain;
+    stage0_domain.name = "rocm0";
+    stage0_domain.devices = {GlobalDeviceAddress::rocm(0, 0)};
+
+    DomainDefinition stage1_domain;
+    stage1_domain.name = "rocm1";
+    stage1_domain.devices = {GlobalDeviceAddress::rocm(1, 0)};
+
+    PPStageDefinition stage0;
+    stage0.stage_id = 0;
+    stage0.domain_name = "rocm0";
+    stage0.first_layer = 0;
+    stage0.last_layer = 13;
+
+    PPStageDefinition stage1;
+    stage1.stage_id = 1;
+    stage1.domain_name = "rocm1";
+    stage1.first_layer = 14;
+    stage1.last_layer = 27;
+
+    config.pp_degree = 2;
+    config.pp_split = PPSplitMode::MANUAL;
+    config.domain_definitions = {stage0_domain, stage1_domain};
+    config.pp_stage_definitions = {stage0, stage1};
+
+    auto errors = builder->validateConfig(config, model, cluster);
+    EXPECT_TRUE(errors.empty()) << "Unexpected validation error: "
+                                << (errors.empty() ? "" : errors.front());
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+    ASSERT_EQ(plans.size(), 1);
+    EXPECT_TRUE(plans[0].usesLocalPP());
+    EXPECT_EQ(plans[0].local_pp_devices.size(), 2);
+}
+
 TEST_F(Test__ExecutionPlanBuilder, ValidateConfig_PPDegreeExceedsLayers)
 {
     auto cluster = ClusterInventoryBuilder()
@@ -1061,6 +1171,26 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_WithMultipleGPUs_NoTPConfig_Selects
     EXPECT_EQ(plan.primary_device.device_ordinal, 0);
 }
 
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_NamedDomainMissingDeviceThrows)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0,
+                                {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .build();
+
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "rocm_hot=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+    config.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;owner=0"));
+
+    EXPECT_THROW(
+        (void)builder->buildAllPlans(config, model, cluster),
+        std::invalid_argument)
+        << "Explicit domains must fail at planning time when a participant "
+           "is absent from the cluster inventory; otherwise execution can "
+           "build null collective participants and crash later.";
+}
+
 TEST_F(Test__ExecutionPlanBuilder, BuildPlan_EmptyInventory_FallsBackToCPU)
 {
     // When ClusterInventory has no GPUs, CPU must be selected
@@ -1118,4 +1248,175 @@ TEST_F(Test__ExecutionPlanBuilder, ClusterInventory_TotalGPUs_MatchesAddedDevice
         total_gpus += static_cast<int>(rank.gpus.size());
     }
     EXPECT_EQ(total_gpus, 3);
+}
+
+// =============================================================================
+// Phase 5: buildGlobalPPTopology tests
+// =============================================================================
+
+/**
+ * @brief Build a LocalTP-then-NodeLocalTP topology:
+ *        Stage 0: "rocm_domain" — two ROCm GPUs on rank 0 (scope=local)
+ *        Stage 1: "cpu_domain"  — one CPU per rank on ranks 0+1 (scope=node_local)
+ *        n_layers = 28
+ */
+TEST_F(Test__ExecutionPlanBuilder, BuildGlobalPPTopology_LocalThenNodeLocal)
+{
+    OrchestrationConfig cfg;
+
+    // Domain 0: two ROCm GPUs on rank 0 (local)
+    cfg.domain_definitions.push_back(DomainDefinition::parse(
+        "rocm_domain=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0"));
+
+    // Domain 1: one CPU per rank, two ranks (node_local)
+    cfg.domain_definitions.push_back(DomainDefinition::parse(
+        "cpu_domain=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1"));
+
+    cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("0=rocm_domain:0-13"));
+    cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("1=cpu_domain:14-27"));
+
+    ModelConfig mc;
+    mc.n_layers = 28;
+
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "host0", 0, {{DeviceType::ROCm, 0}, {DeviceType::ROCm, 1}})
+                       .addRank(1, "host1", 0, {})
+                       .build();
+
+    ExecutionPlanBuilder concrete_builder;
+    auto topo = concrete_builder.buildGlobalPPTopology(cfg, mc, cluster);
+
+    ASSERT_EQ(topo.stages.size(), 2u);
+
+    // Stage 0 should be local (owning rank 0, LOCAL_TP since 2 devices)
+    const auto &stage0 = topo.stages[0];
+    EXPECT_EQ(stage0.stage_id, 0);
+    EXPECT_FALSE(stage0.is_global_tp);
+    EXPECT_EQ(stage0.owning_rank, 0);
+    EXPECT_EQ(stage0.inner_mode, InnerParallelism::LOCAL_TP);
+    EXPECT_EQ(stage0.backend, CollectiveBackendType::RCCL);
+    EXPECT_TRUE(stage0.has_embedding);
+
+    // Stage 1 should be global TP with ranks 0 and 1
+    const auto &stage1 = topo.stages[1];
+    EXPECT_EQ(stage1.stage_id, 1);
+    EXPECT_TRUE(stage1.is_global_tp);
+    ASSERT_EQ(stage1.participating_ranks.size(), 2u);
+    EXPECT_EQ(stage1.participating_ranks[0], 0);
+    EXPECT_EQ(stage1.participating_ranks[1], 1);
+    EXPECT_EQ(stage1.backend, CollectiveBackendType::UPI);
+    ASSERT_EQ(stage1.per_rank_devices.size(), 2u);
+    EXPECT_EQ(stage1.per_rank_devices[0].numa_node, 0);
+    EXPECT_EQ(stage1.per_rank_devices[1].numa_node, 1);
+    EXPECT_TRUE(stage1.has_lm_head);
+
+    auto rank0_plan = GlobalPPRankPlanBuilder::build(topo, 0);
+    ASSERT_EQ(rank0_plan.steps.size(), 4u);
+    ASSERT_EQ(rank0_plan.steps[0].type, GlobalPPRankPlan::Step::Type::EXECUTE_STAGE);
+    EXPECT_EQ(rank0_plan.steps[0].stage_action.stage_id, 0);
+    EXPECT_EQ(rank0_plan.steps[0].stage_action.backend, CollectiveBackendType::RCCL);
+    ASSERT_EQ(rank0_plan.steps[1].type, GlobalPPRankPlan::Step::Type::TRANSFER);
+    EXPECT_EQ(rank0_plan.steps[1].transfer_action.direction, RankTransferAction::Direction::LOCAL_HANDOFF);
+    ASSERT_EQ(rank0_plan.steps[2].type, GlobalPPRankPlan::Step::Type::TRANSFER);
+    EXPECT_EQ(rank0_plan.steps[2].transfer_action.direction, RankTransferAction::Direction::SEND);
+    EXPECT_EQ(rank0_plan.steps[2].transfer_action.peer_rank, 1);
+    ASSERT_EQ(rank0_plan.steps[3].type, GlobalPPRankPlan::Step::Type::EXECUTE_STAGE);
+    EXPECT_EQ(rank0_plan.steps[3].stage_action.stage_id, 1);
+    EXPECT_EQ(rank0_plan.steps[3].stage_action.backend, CollectiveBackendType::UPI);
+    EXPECT_EQ(rank0_plan.steps[3].stage_action.device.numa_node, 0);
+
+    auto rank1_plan = GlobalPPRankPlanBuilder::build(topo, 1);
+    ASSERT_EQ(rank1_plan.steps.size(), 2u);
+    ASSERT_EQ(rank1_plan.steps[0].type, GlobalPPRankPlan::Step::Type::TRANSFER);
+    EXPECT_EQ(rank1_plan.steps[0].transfer_action.direction, RankTransferAction::Direction::RECV);
+    EXPECT_EQ(rank1_plan.steps[0].transfer_action.peer_rank, 0);
+    ASSERT_EQ(rank1_plan.steps[1].type, GlobalPPRankPlan::Step::Type::EXECUTE_STAGE);
+    EXPECT_EQ(rank1_plan.steps[1].stage_action.stage_id, 1);
+    EXPECT_EQ(rank1_plan.steps[1].stage_action.backend, CollectiveBackendType::UPI);
+    EXPECT_EQ(rank1_plan.steps[1].stage_action.device.numa_node, 1);
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildGlobalPPTopology_SingleStage_FallbackToLocal)
+{
+    // Single stage, AUTO scope, single-rank resolved → should be local
+    OrchestrationConfig cfg;
+    cfg.domain_definitions.push_back(DomainDefinition::parse("gpu=0:cuda:0"));
+    cfg.pp_stage_definitions.push_back(PPStageDefinition::parse("0=gpu:0-11"));
+
+    ModelConfig mc;
+    mc.n_layers = 12;
+
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}})
+                       .build();
+
+    ExecutionPlanBuilder concrete_builder;
+    auto topo = concrete_builder.buildGlobalPPTopology(cfg, mc, cluster);
+
+    ASSERT_EQ(topo.stages.size(), 1u);
+    EXPECT_FALSE(topo.stages[0].is_global_tp);
+    EXPECT_EQ(topo.stages[0].owning_rank, 0);
+    EXPECT_TRUE(topo.stages[0].has_embedding);
+    EXPECT_TRUE(topo.stages[0].has_lm_head);
+}
+
+TEST_F(Test__ExecutionPlanBuilder, BuildGlobalPPTopology_EmptyPPStages_ReturnsSingleFallback)
+{
+    // No pp_stage_definitions → should return a single-stage fallback
+    OrchestrationConfig cfg;
+
+    ModelConfig mc;
+    mc.n_layers = 24;
+
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {})
+                       .build();
+
+    ExecutionPlanBuilder concrete_builder;
+    auto topo = concrete_builder.buildGlobalPPTopology(cfg, mc, cluster);
+
+    // Should return a degenerate single-stage topology
+    ASSERT_EQ(topo.stages.size(), 1u);
+    EXPECT_EQ(topo.stages[0].first_layer, 0);
+    EXPECT_EQ(topo.stages[0].last_layer, mc.n_layers - 1);
+}
+
+// =============================================================================
+// Phase 5: renderMultiDomainTopologyInfo test
+// =============================================================================
+
+TEST(Test__RenderTopologyInfo, ContainsDomainNamesAndRankCounts)
+{
+    // Build a minimal 2-stage topology with known stages
+    GlobalPPStageSpec s0;
+    s0.stage_id = 0;
+    s0.domain_name = "rocm_domain";
+    s0.first_layer = 0;
+    s0.last_layer = 13;
+    s0.has_embedding = true;
+    s0.is_global_tp = false;
+    s0.owning_rank = 0;
+    s0.inner_mode = InnerParallelism::LOCAL_TP;
+
+    GlobalPPStageSpec s1;
+    s1.stage_id = 1;
+    s1.domain_name = "cpu_domain";
+    s1.first_layer = 14;
+    s1.last_layer = 27;
+    s1.has_lm_head = true;
+    s1.is_global_tp = true;
+    s1.participating_ranks = {0, 1};
+    s1.per_rank_device = GlobalDeviceAddress::cpu();
+
+    std::vector<GlobalPPStageSpec> specs = {std::move(s0), std::move(s1)};
+    auto topo = GlobalPPTopology::build(std::move(specs), 28, 2);
+
+    std::string info = renderMultiDomainTopologyInfo(topo, 2);
+
+    // Must mention both domain names
+    EXPECT_NE(info.find("rocm_domain"), std::string::npos);
+    EXPECT_NE(info.find("cpu_domain"), std::string::npos);
+    // Must mention per-rank counts
+    EXPECT_NE(info.find("rank 0"), std::string::npos);
+    EXPECT_NE(info.find("rank 1"), std::string::npos);
 }

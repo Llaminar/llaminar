@@ -68,6 +68,13 @@ namespace llaminar2
             return params;
         }
 
+        std::string getStopThinkingPrompt() const override
+        {
+            // From Qwen3.5 paper (arxiv 2505.09388) — official stop-thinking prompt
+            return "Considering the limited time by the user, I have to give the "
+                   "solution based on the thinking directly now.\n</think>\n\n";
+        }
+
         WeightShardingConfig getWeightShardingConfig() const override
         {
             WeightShardingConfig config;
@@ -101,11 +108,11 @@ namespace llaminar2
                 // GDN fused QKV and gate are column-parallel (split output dim)
                 {"attn_qkv.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::FusedQKVHeads,
                  "GDN fused QKV projection - 3 sub-blocks [Q|K|V] each split by heads"},
-                {"attn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::Heads,
-                 "GDN output gate Z - split output dim"},
+                {"attn_gate.weight", WeightShardingMode::ColumnParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN output gate Z - split output dim by GDN value heads"},
                 // SSM output projection is row-parallel (split input dim)
-                {"ssm_out.weight", WeightShardingMode::InputParallel, WeightDimensionType::Heads,
-                 "GDN output projection - split input dim, allreduce after"},
+                {"ssm_out.weight", WeightShardingMode::InputParallel, WeightDimensionType::ProportionalHeads,
+                 "GDN output projection - split input dim by GDN value heads, allreduce after"},
                 // SSM alpha/beta: column-parallel to match local head count in recurrence.
                 // Uses ProportionalHeads because output dim is n_v_heads (time_step_rank),
                 // which may differ from n_heads (e.g. 4B: n_v_heads=32 vs n_heads=36).
@@ -317,6 +324,30 @@ namespace llaminar2
                 {"workspace_scores", {"batch_size * local_n_heads * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 10, "Attention scores"},
                 {"workspace_context", {"batch_size * local_n_heads * seq_len", "head_dim"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention context"},
                 {"workspace_mask", {"batch_size * seq_len", "seq_len"}, "fp32", BufferSemantic::Scratch, "attn_workspace", 5, "Attention mask"},
+                {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
+                {"lm_head_input_rows", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
+
+                // MTP verifier sidecar buffers are declared as graph scratch with
+                // capacity for Phase 13.5 small-M verifier rows (M <= 4). Stages
+                // still execute their actual runtime m, so this is capacity, not
+                // a request to process four rows every time.
+                {"mtp_embedding", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP draft-token embedding"},
+                {"mtp_norm_hidden", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized terminal hidden"},
+                {"mtp_norm_embedding", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP normalized draft embedding"},
+                {"mtp_concat", {"4", "d_model * 2"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP concat of normalized embedding and hidden"},
+                {"mtp_projected", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP projected hidden"},
+                {"mtp_hidden", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP final hidden"},
+                {"mtp_q_raw", {"4", "fa_q_full_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA Q GEMM output"},
+                {"mtp_q_gate", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FA sigmoid gate"},
+                {"mtp_q", {"4", "local_qkv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP query projection"},
+                {"mtp_k", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP key projection"},
+                {"mtp_v", {"4", "local_kv_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP value projection"},
+                {"mtp_attn_output", {"4", "attn_output_dim"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention/GDN output"},
+                {"mtp_attn_proj", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP attention projection"},
+                {"mtp_gate", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN gate projection"},
+                {"mtp_up", {"4", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN up projection"},
+                {"mtp_ffn_output", {"4", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP FFN output"},
+                {"mtp_logits", {"4", "local_vocab"}, "fp32", BufferSemantic::Scratch, "", 0, "MTP logits shard"},
             };
 
             schema.model_buffers = {

@@ -151,6 +151,7 @@ namespace llaminar2
          * - quant_a: INT8 quantized activations [m × k]
          * - scales_a: FP32 per-row scales [m] (row-wise mode)
          * - scales_a_blockwise: FP32 per-block scales [m × ceil(k/32)] (blockwise mode)
+         * - sums_a_blockwise: INT32 per-block activation sums [m × ceil(k/32)] (min-correction mode)
          * - acc_int32: INT32 accumulator [m × n]
          *
          * @param m Maximum sequence length
@@ -169,6 +170,8 @@ namespace llaminar2
             const int blocks_per_row = (k + 31) / 32;
             req.buffers.push_back({"gemm_scales_a_blockwise",
                                    static_cast<size_t>(m) * blocks_per_row * sizeof(float), 256, true});
+            req.buffers.push_back({"gemm_sums_a_blockwise",
+                                   static_cast<size_t>(m) * blocks_per_row * sizeof(int32_t), 256, true});
             req.buffers.push_back({"gemm_acc_int32",
                                    static_cast<size_t>(m) * n * sizeof(int32_t), 256, true});
             return req;

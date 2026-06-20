@@ -21,6 +21,22 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        bool fp32BufferIsAllZero(const float *data, size_t numel)
+        {
+            if (!data || numel == 0)
+                return false;
+
+            for (size_t i = 0; i < numel; ++i)
+            {
+                if (data[i] != 0.0f)
+                    return false;
+            }
+
+            return true;
+        }
+    } // namespace
 
     void verifyStageEntry(const ComputeNode &node, int layer_idx)
     {
@@ -229,6 +245,7 @@ namespace llaminar2
         // GPU→host sync, because we only call this in Debug/Integration builds anyway.
         // The StageDumpInfo provides tensor pointers that we can use for GPU validation.
         auto dump_info = node.stage->getDumpInfo();
+        const bool zero_output_allowed = node.stage->allowsZeroOutput();
 
         bool all_valid = true;
 
@@ -277,11 +294,11 @@ namespace llaminar2
                                 TensorValidationResult result;
                                 if (validator->getResult(result))
                                 {
-                                    if (result.appears_zero && numel > 10)
+                                    if (result.appears_zero && numel > 10 && !zero_output_allowed)
                                     {
                                         LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
                                                                            << "' appears to be all zeros (GPU validation)");
-                                        if (validation.fail_on_zero && !node.stage->allowsZeroOutput())
+                                        if (validation.fail_on_zero)
                                         {
                                             LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
                                             all_valid = false;
@@ -350,11 +367,14 @@ namespace llaminar2
                 }
 
                 if (appears_zero)
+                    appears_zero = fp32BufferIsAllZero(fp32_data, numel);
+
+                if (appears_zero && !zero_output_allowed)
                 {
                     LOG_WARN("[StageVerifier] Stage '" << node.name << "' output '" << output.name
                                                        << "' appears to be all zeros (likely uninitialized)");
 
-                    if (validation.fail_on_zero && !node.stage->allowsZeroOutput())
+                    if (validation.fail_on_zero)
                     {
                         LOG_ERROR("[StageVerifier] Buffer validation failed: zero tensor detected");
                         all_valid = false;

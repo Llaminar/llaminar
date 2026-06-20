@@ -8,7 +8,7 @@
  *
  * This stage is analogous to:
  * - SendActivationsStage/ReceiveActivationsStage for MPI PP (cross-node)
- * - LocalTPAllreduceStage for LOCAL TP (intra-node collective)
+ * - TPAllreduceStage for TP (intra-node collective)
  *
  * Design rationale:
  * - Explicit compute stage provides graph visibility (vs. direct LocalPPContext calls)

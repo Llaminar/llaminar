@@ -112,7 +112,8 @@ TEST_F(Test__TPAllreduceStage_MPI, GetTPContextReturnsGlobalContext)
 
     EXPECT_EQ(stage->getTPContext(), tp_ctx.get());
     EXPECT_EQ(stage->getTPContext()->degree(), 1);
-    EXPECT_TRUE(stage->getTPContext()->isGlobal());
+    // GlobalTPContext on same node returns NODE_LOCAL scope, not GLOBAL
+    EXPECT_FALSE(stage->getTPContext()->isLocal());
 }
 
 /**
@@ -130,7 +131,8 @@ TEST_F(Test__TPAllreduceStage_MPI, WorksWithGlobalTPContextViaInterface)
 
     auto stage = std::make_unique<TPAllreduceStage>(params);
 
-    EXPECT_TRUE(stage->getTPContext()->isGlobal());
+    // GlobalTPContext on same node returns NODE_LOCAL scope, not GLOBAL
+    EXPECT_FALSE(stage->getTPContext()->isLocal());
     // UPI backend is the default for GlobalTPContext
     EXPECT_EQ(stage->getTPContext()->backend(), CollectiveBackendType::UPI);
     
@@ -286,20 +288,21 @@ TEST_F(Test__TPAllreduceStage_MPI, DumpInfoIncludesScalarsGlobalTP)
 
     auto dump_info = stage->buildDumpInfoImpl();
 
-    // Should have tp_degree, backend, and is_global scalars
+    // Should have tp_degree, backend, and tp_scope scalars
     EXPECT_GE(dump_info.scalars.size(), 3);
     
-    // Find is_global scalar and verify it's 1 (true)
-    bool found_is_global = false;
+    // Find tp_scope scalar and verify it's NODE_LOCAL (not LOCAL)
+    bool found_tp_scope = false;
     for (const auto& scalar : dump_info.scalars)
     {
-        if (scalar.name == std::string_view("is_global"))
+        if (scalar.name == std::string_view("tp_scope"))
         {
-            found_is_global = true;
-            EXPECT_EQ(static_cast<int>(scalar.value), 1);
+            found_tp_scope = true;
+            // On same node: NODE_LOCAL; across nodes: GLOBAL
+            EXPECT_NE(static_cast<int>(scalar.value), static_cast<int>(TPScope::LOCAL));
         }
     }
-    EXPECT_TRUE(found_is_global);
+    EXPECT_TRUE(found_tp_scope);
 }
 
 // =============================================================================
@@ -322,13 +325,14 @@ TEST_F(Test__TPAllreduceStage_MPI, SetParamsCanSwitchContextType)
 
     auto stage = std::make_unique<TPAllreduceStage>(params);
 
-    EXPECT_FALSE(stage->getTPContext()->isGlobal());
+    EXPECT_TRUE(stage->getTPContext()->isLocal());
 
     // Switch to GLOBAL context
     params.tp_ctx = global_ctx.get();
     stage->setParams(params);
 
-    EXPECT_TRUE(stage->getTPContext()->isGlobal());
+    // GlobalTPContext on same node returns NODE_LOCAL, not LOCAL
+    EXPECT_FALSE(stage->getTPContext()->isLocal());
 }
 
 // Note: main() is provided by integration/mpi_gtest_main.cpp

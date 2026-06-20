@@ -131,6 +131,29 @@ namespace llaminar2
         return true;
     }
 
+    bool BufferArena::bindExternalBuffer(BufferId id, ITensor *tensor)
+    {
+        auto idx = static_cast<size_t>(id);
+        if (idx >= kBufferCount || !tensor)
+            return false;
+
+        auto &b = buffers_[idx];
+        if (b.owned_tensor || (b.registered && !b.external_tensor))
+        {
+            LOG_WARN("BufferArena: cannot bind external tensor over arena-owned buffer "
+                     << bufferIdName(id));
+            return false;
+        }
+
+        b.registered = true;
+        b.external_tensor = tensor;
+        b.rows = tensor->rows();
+        b.cols = tensor->cols();
+        b.dtype = nullptr;
+        b.coherence = {};
+        return true;
+    }
+
     void BufferArena::registerAlias(BufferId a, BufferId b)
     {
         auto idx_a = static_cast<size_t>(a);
@@ -186,6 +209,10 @@ namespace llaminar2
             return "current_hidden";
         case BufferId::LOGITS:
             return "logits";
+        case BufferId::ALL_POSITION_LOGITS:
+            return "all_position_logits";
+        case BufferId::ALL_POSITION_LOGITS_LOCAL:
+            return "all_position_logits_local";
         default:
             return nullptr;
         }
@@ -216,6 +243,10 @@ namespace llaminar2
             return BufferId::ATTN_CONTEXT_WORKSPACE;
         if (name == "workspace_mask")
             return BufferId::GEMM_WORKSPACE; // reuse for mask
+        if (name == "lm_head_input_row")
+            return BufferId::LM_HEAD_INPUT_ROW;
+        if (name == "lm_head_input_rows")
+            return BufferId::LM_HEAD_INPUT_ROWS;
         if (name == "gate")
             return BufferId::GATE_PROJ;
         if (name == "up")
@@ -228,6 +259,10 @@ namespace llaminar2
             return BufferId::K_ROPE;
         if (name == "V_dequant")
             return BufferId::V_DEQUANT;
+        if (name == "all_position_logits")
+            return BufferId::ALL_POSITION_LOGITS;
+        if (name == "all_position_logits_local")
+            return BufferId::ALL_POSITION_LOGITS_LOCAL;
 
         // GDN (Gated Delta Network) buffers
         if (name == "gdn_qkv")
@@ -252,6 +287,62 @@ namespace llaminar2
             return BufferId::LOGITS;
         if (name == "logits_local")
             return BufferId::LOGITS_LOCAL;
+
+        // Prefix cache staging buffers
+        if (name == "prefix_k_staging")
+            return BufferId::PREFIX_K_STAGING;
+        if (name == "prefix_v_staging")
+            return BufferId::PREFIX_V_STAGING;
+        if (name == "prefix_hybrid_state_staging")
+            return BufferId::PREFIX_HYBRID_STATE_STAGING;
+        if (name == "prefix_mtp_k_staging")
+            return BufferId::PREFIX_MTP_K_STAGING;
+        if (name == "prefix_mtp_v_staging")
+            return BufferId::PREFIX_MTP_V_STAGING;
+        if (name == "prefix_terminal_hidden")
+            return BufferId::PREFIX_TERMINAL_HIDDEN;
+        if (name == "prefix_terminal_logits")
+            return BufferId::PREFIX_TERMINAL_LOGITS;
+
+        // MTP sidecar graph buffers
+        if (name == "mtp_embedding")
+            return BufferId::MTP_EMBEDDING;
+        if (name == "mtp_norm_hidden")
+            return BufferId::MTP_NORM_HIDDEN;
+        if (name == "mtp_norm_embedding")
+            return BufferId::MTP_NORM_EMBEDDING;
+        if (name == "mtp_concat")
+            return BufferId::MTP_CONCAT;
+        if (name == "mtp_projected")
+            return BufferId::MTP_PROJECTED;
+        if (name == "mtp_hidden")
+            return BufferId::MTP_HIDDEN;
+        if (name == "mtp_q")
+            return BufferId::MTP_Q_PROJ;
+        if (name == "mtp_k")
+            return BufferId::MTP_K_PROJ;
+        if (name == "mtp_v")
+            return BufferId::MTP_V_PROJ;
+        if (name == "mtp_q_raw")
+            return BufferId::MTP_FA_Q_RAW;
+        if (name == "mtp_q_gate")
+            return BufferId::MTP_FA_GATE;
+        if (name == "mtp_q_rope")
+            return BufferId::MTP_Q_ROPE;
+        if (name == "mtp_k_rope")
+            return BufferId::MTP_K_ROPE;
+        if (name == "mtp_attn_output")
+            return BufferId::MTP_ATTN_OUTPUT;
+        if (name == "mtp_attn_proj")
+            return BufferId::MTP_ATTN_PROJ;
+        if (name == "mtp_gate")
+            return BufferId::MTP_GATE_PROJ;
+        if (name == "mtp_up")
+            return BufferId::MTP_UP_PROJ;
+        if (name == "mtp_ffn_output")
+            return BufferId::MTP_FFN_OUTPUT;
+        if (name == "mtp_logits")
+            return BufferId::MTP_LOGITS;
 
         return BufferId::_COUNT; // sentinel: no mapping
     }
@@ -384,7 +475,7 @@ namespace llaminar2
 
         allocated_ = true;
 
-        LOG_DEBUG("[BufferArena] Allocated " << stats_.total_buffers << " buffers, "
+        LOG_TRACE("[BufferArena] Allocated " << stats_.total_buffers << " buffers, "
                                              << (stats_.total_bytes / 1024.0 / 1024.0) << " MB total");
         return true;
     }
@@ -456,7 +547,7 @@ namespace llaminar2
                     << "\n";
         }
 
-        LOG_INFO("[BufferArena] " << summary.str());
+        LOG_TRACE("[BufferArena] " << summary.str());
     }
 
     // =========================================================================

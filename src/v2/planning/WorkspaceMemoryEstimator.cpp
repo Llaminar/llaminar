@@ -23,6 +23,7 @@ size_t WorkspaceMemoryEstimator::estimate(
     {
         return 0;
     }
+    (void)d_ff;
 
     size_t B = static_cast<size_t>(batch_size);
     size_t S = static_cast<size_t>(max_seq_len);
@@ -41,11 +42,10 @@ size_t WorkspaceMemoryEstimator::estimate(
     // Padded N buffer: 8 × vocab × 4 bytes
     size_t padded_n = 8 * V * FP32;
 
-    // Embed table temp: vocab × d_model × 4 bytes
-    size_t embed_temp = V * D * FP32;
-
-    // Sum with 10% safety margin
-    size_t raw = lm_head_workspace + gemm_overhead + padded_n + embed_temp;
+    // Embedding table staging is fallback-only workspace declared by the
+    // embedding consumer when prepared embedding weights are unavailable.
+    // Production prepared-weight runs must not reserve vocab × d_model here.
+    size_t raw = lm_head_workspace + gemm_overhead + padded_n;
     size_t with_margin = static_cast<size_t>(static_cast<double>(raw) * 1.1);
 
     // Floor: 768 MB (matches WorkspaceAllocator)

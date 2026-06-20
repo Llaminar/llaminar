@@ -1,0 +1,945 @@
+/**
+ * @file MoELocalExpertStage.cpp
+ * @brief Implementation of participant-local graph-native sparse MoE expert compute stage.
+ */
+
+#include "MoELocalExpertStage.h"
+
+#include "MoEExpertComputeStage.h"
+#include "../../../execution/moe/MoEExpertOverlayProfiler.h"
+#include "../../../execution/moe/MoEWorkspaceRequirements.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../loaders/PreparedWeightStore.h"
+#include "../../../tensors/Tensors.h"
+#include "../../../utils/Logger.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <set>
+#include <sstream>
+#include <utility>
+
+namespace llaminar2
+{
+    namespace
+    {
+        bool validateDeviceContext(IDeviceContext *ctx, DeviceId device, const char *stage_name)
+        {
+            if (!ctx)
+            {
+                LOG_ERROR("[" << stage_name << "] Null device context");
+                return false;
+            }
+            (void)device;
+            // Host-staged graph-native MoE stages can be scheduled inside a GPU graph
+            // executor while executing participant-local CPU work. GPU local expert
+            // stages must still run on the matching GPU executor; executing ROCm:1
+            // kernels from a ROCm:0 context can corrupt device memory before the
+            // stage reports an ordinary failure.
+            if (device.is_gpu())
+            {
+                const DeviceId ctx_device = ctx->deviceId();
+                if (!ctx_device.is_gpu() || ctx_device != device)
+                {
+                    LOG_ERROR("[" << stage_name << "] GPU local expert stage device "
+                                  << device.to_string()
+                                  << " does not match execution context "
+                                  << ctx_device.to_string());
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool validateSparseRows(const MoEOverlaySparseRows &rows, int top_k, int d_model)
+        {
+            if (rows.d_model != d_model || rows.top_k != top_k)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Sparse row dimension mismatch: rows d_model="
+                          << rows.d_model << " top_k=" << rows.top_k << ", stage d_model="
+                          << d_model << " top_k=" << top_k);
+                return false;
+            }
+            if (!rows.row_ids_host || !rows.entry_offsets_host || !rows.expert_ids_host ||
+                !rows.route_weights_host || !rows.hidden_rows_fp32)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Sparse input rows missing host buffers");
+                return false;
+            }
+            if (rows.live_row_count > rows.row_capacity || rows.live_entry_count > rows.entry_capacity)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Sparse live counts exceed capacity");
+                return false;
+            }
+            return true;
+        }
+
+        /// True when prepared_gate_gemm (size == num_experts) or slab refs + store are set.
+        bool hasPreparedExpertState(const MoELocalExpertStage::Params &p)
+        {
+            const auto expected = static_cast<size_t>(std::max(p.num_experts, 0));
+            if (expected > 0 &&
+                p.prepared_gate_gemm.size() == expected &&
+                p.prepared_up_gemm.size() == expected &&
+                p.prepared_down_gemm.size() == expected)
+                return true;
+            if (p.prepared_store && p.gate_slab_ref.has_value() &&
+                p.up_slab_ref.has_value() && p.down_slab_ref.has_value())
+                return true;
+            return false;
+        }
+    } // namespace
+
+    MoELocalExpertStage::MoELocalExpertStage(Params params)
+        : IComputeStage(params.device_id), params_(std::move(params))
+    {
+        if (!params_.input_rows && params_.input_rows_lifetime)
+            params_.input_rows = params_.input_rows_lifetime.get();
+        if (!params_.output_rows && params_.output_rows_lifetime)
+            params_.output_rows = params_.output_rows_lifetime.get();
+        if (params_.moe_runtime_table && params_.layer_idx >= 0)
+            (void)refreshRuntimePlacement();
+    }
+
+    bool MoELocalExpertStage::refreshRuntimePlacement()
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0)
+            return false;
+        moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+        moe_runtime_table_initialized_ = runtimeTableHasActiveOverlayBank() || initializeMoERuntimePlacementBank();
+        return moe_runtime_table_initialized_;
+    }
+
+    bool MoELocalExpertStage::initializeMoERuntimePlacementBank()
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
+            return false;
+
+        try
+        {
+            if (runtimeTableHasActiveOverlayBank())
+                return true;
+
+            const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+            if (state.active_epoch != 0)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Invalid active MoE runtime placement bank for layer "
+                          << params_.layer_idx << "; refusing to overwrite non-zero epoch "
+                          << state.active_epoch);
+                return false;
+            }
+
+            if (!params_.expert_mask.empty() &&
+                params_.expert_mask.size() != static_cast<size_t>(params_.num_experts))
+            {
+                LOG_ERROR("[MoELocalExpertStage] Cannot initialize MoE runtime placement bank: expert_mask size "
+                          << params_.expert_mask.size() << " != num_experts " << params_.num_experts);
+                return false;
+            }
+
+            const bool has_prepared_vectors =
+                params_.prepared_gate_gemm.size() == static_cast<size_t>(params_.num_experts) &&
+                params_.prepared_up_gemm.size() == static_cast<size_t>(params_.num_experts) &&
+                params_.prepared_down_gemm.size() == static_cast<size_t>(params_.num_experts);
+
+            MoEPlacementUpdate update;
+            update.epoch = 1;
+            update.expert_count = static_cast<uint32_t>(params_.num_experts);
+            update.experts.resize(static_cast<size_t>(params_.num_experts));
+            update.local_compute_mask.assign(static_cast<size_t>(params_.num_experts), 0u);
+            update.replica_role.assign(static_cast<size_t>(params_.num_experts),
+                                       static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+
+            const uint32_t local_flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                          DeviceMoEExpertFlags::Resident |
+                                                          DeviceMoEExpertFlags::PreferredOwner |
+                                                          DeviceMoEExpertFlags::LocalCompute);
+
+            for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+            {
+                const bool local = params_.expert_mask.empty() ||
+                                   params_.expert_mask[static_cast<size_t>(expert_id)];
+                if (!local)
+                    continue;
+
+                if (!has_prepared_vectors ||
+                    !params_.prepared_gate_gemm[static_cast<size_t>(expert_id)] ||
+                    !params_.prepared_up_gemm[static_cast<size_t>(expert_id)] ||
+                    !params_.prepared_down_gemm[static_cast<size_t>(expert_id)])
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Cannot initialize MoE runtime placement bank for layer "
+                              << params_.layer_idx << " expert " << expert_id
+                              << ": prepared gate/up/down GEMM engines are required for local experts");
+                    return false;
+                }
+
+                DeviceMoEExpertDescriptor desc;
+                if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.gate) ||
+                    !params_.prepared_up_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.up) ||
+                    !params_.prepared_down_gemm[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.down))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Cannot initialize MoE runtime placement bank for layer "
+                              << params_.layer_idx << " expert " << expert_id
+                              << ": prepared GEMM engines did not export native-VNNI descriptors");
+                    return false;
+                }
+
+                desc.logical_expert_id = expert_id;
+                desc.owner_participant = params_.runtime_participant_index;
+                desc.local_slot = expert_id;
+                desc.flags = local_flags;
+                update.experts[static_cast<size_t>(expert_id)] = desc;
+                update.local_compute_mask[static_cast<size_t>(expert_id)] = 1u;
+                update.replica_role[static_cast<size_t>(expert_id)] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+            }
+
+            params_.moe_runtime_table->prepareInactiveBank(params_.layer_idx, update);
+            params_.moe_runtime_table->flipActiveBank(params_.layer_idx, update.epoch, nullptr);
+            moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
+            return runtimeTableHasActiveOverlayBank();
+        }
+        catch (const std::exception &ex)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Failed to initialize MoE runtime placement bank for layer "
+                      << params_.layer_idx << ": " << ex.what());
+            return false;
+        }
+    }
+
+    bool MoELocalExpertStage::runtimeTableHasActiveOverlayBank() const
+    {
+        if (!params_.moe_runtime_table || params_.layer_idx < 0 || params_.num_experts <= 0)
+            return false;
+
+        const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        if (state.active_bank > 1 ||
+            state.active_epoch == 0 ||
+            state.expert_count != static_cast<uint32_t>(params_.num_experts) ||
+            state.top_k != static_cast<uint32_t>(params_.top_k))
+        {
+            return false;
+        }
+
+        const auto &bank = state.banks[state.active_bank];
+        if (bank.epoch != state.active_epoch ||
+            bank.expert_count != static_cast<uint32_t>(params_.num_experts))
+        {
+            return false;
+        }
+
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            const auto mask = bank.local_compute_mask[static_cast<size_t>(expert_id)];
+            if (mask > 1u)
+                return false;
+            if (mask != 0u &&
+                !params_.expert_mask.empty() &&
+                params_.expert_mask.size() == static_cast<size_t>(params_.num_experts) &&
+                !params_.expert_mask[static_cast<size_t>(expert_id)])
+            {
+                return false;
+            }
+            if (mask == 0u)
+                continue;
+
+            const auto &expert = bank.experts[static_cast<size_t>(expert_id)];
+            if (expert.logical_expert_id != expert_id ||
+                expert.local_slot < 0 ||
+                !expert.gate.valid() ||
+                !expert.up.valid() ||
+                !expert.down.valid() ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Valid) ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Resident) ||
+                !hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::LocalCompute))
+            {
+                return false;
+            }
+        }
+
+        return moe_runtime_layer_ != nullptr;
+    }
+
+    bool MoELocalExpertStage::runtimeLocalComputeEnabled(int expert_id) const
+    {
+        if (!params_.moe_runtime_table || expert_id < 0 || expert_id >= params_.num_experts)
+            return false;
+        const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+        if (state.active_bank > 1 || state.active_epoch == 0)
+            return false;
+        const auto &bank = state.banks[state.active_bank];
+        return bank.local_compute_mask[static_cast<size_t>(expert_id)] != 0u;
+    }
+
+    bool MoELocalExpertStage::staticExpertMaskDisablesAllExperts() const
+    {
+        return !params_.expert_mask.empty() &&
+               params_.expert_mask.size() == static_cast<size_t>(params_.num_experts) &&
+               std::none_of(params_.expert_mask.begin(), params_.expert_mask.end(),
+                            [](bool enabled)
+                            { return enabled; });
+    }
+
+    bool MoELocalExpertStage::hasRuntimeLocalWorkForInput(const MoEOverlaySparseRows &input) const
+    {
+        for (size_t entry = 0; entry < input.live_entry_count; ++entry)
+        {
+            const int expert_id = input.expert_ids_host[entry];
+            if (expert_id < 0 || expert_id >= params_.num_experts)
+                return true;
+            if (runtimeLocalComputeEnabled(expert_id))
+                return true;
+        }
+        return false;
+    }
+
+    bool MoELocalExpertStage::isExpertActiveForValidation(int expert_id) const
+    {
+        if (params_.moe_runtime_table && moe_runtime_table_initialized_)
+            return runtimeLocalComputeEnabled(expert_id);
+        return params_.expert_mask.empty() ||
+               (static_cast<size_t>(expert_id) < params_.expert_mask.size() &&
+                params_.expert_mask[static_cast<size_t>(expert_id)]);
+    }
+
+    bool MoELocalExpertStage::ensureCompactCapacity(size_t rows, int routing_top_k) const
+    {
+        if (routing_top_k <= 0)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Invalid compact routing top_k=" << routing_top_k);
+            return false;
+        }
+        const size_t capacity = std::max<size_t>(rows, 1u);
+        if (compact_capacity_ >= capacity && compact_routing_top_k_ == routing_top_k)
+            return true;
+
+        compact_hidden_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.d_model)});
+        compact_routing_indices_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(routing_top_k)});
+        compact_routing_weights_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(routing_top_k)});
+        compact_output_ = std::make_shared<FP32Tensor>(std::vector<size_t>{capacity, static_cast<size_t>(params_.d_model)});
+        compact_capacity_ = capacity;
+        compact_routing_top_k_ = routing_top_k;
+        return true;
+    }
+
+    bool MoELocalExpertStage::execute(IDeviceContext *ctx)
+    {
+        if (!validateDeviceContext(ctx, params_.device_id, "MoELocalExpertStage"))
+            return false;
+        if (!params_.input_rows || !params_.output_rows)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Missing input or output row view");
+            return false;
+        }
+        if (params_.num_experts <= 0 || params_.top_k <= 0 || params_.d_model <= 0 || params_.expert_intermediate <= 0)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Invalid dimensions num_experts=" << params_.num_experts
+                                                                              << " top_k=" << params_.top_k
+                                                                              << " d_model=" << params_.d_model
+                                                                              << " intermediate=" << params_.expert_intermediate);
+            return false;
+        }
+
+        if (!params_.expert_mask.empty() && params_.expert_mask.size() != static_cast<size_t>(params_.num_experts))
+        {
+            LOG_ERROR("[MoELocalExpertStage] expert_mask size " << params_.expert_mask.size()
+                                                                << " != num_experts " << params_.num_experts);
+            return false;
+        }
+        const auto &input = *params_.input_rows;
+        auto &output = *params_.output_rows;
+        if (!validateSparseRows(input, params_.top_k, params_.d_model))
+            return false;
+        if (output.d_model != params_.d_model || !output.row_ids_host || !output.output_rows_fp32 ||
+            output.row_capacity < input.live_row_count)
+        {
+            LOG_ERROR("[MoELocalExpertStage] Return row view cannot hold local expert output");
+            return false;
+        }
+
+        output.key = input.key;
+        output.source_participant = input.target_participant;
+        output.target_participant = input.source_participant;
+        output.live_row_count = 0;
+
+        if (params_.moe_runtime_table)
+        {
+            if (!moe_runtime_table_initialized_ || !runtimeTableHasActiveOverlayBank())
+            {
+                LOG_ERROR("[MoELocalExpertStage] Invalid or uninitialized MoE runtime placement table for layer "
+                          << params_.layer_idx << " on " << params_.device_id.to_string());
+                return false;
+            }
+        }
+
+        if (input.live_row_count == 0)
+            return true;
+
+        if (params_.moe_runtime_table && !hasRuntimeLocalWorkForInput(input))
+            return true;
+
+        if (!params_.moe_runtime_table && staticExpertMaskDisablesAllExperts())
+            return true;
+
+        const bool has_prepared = hasPreparedExpertState(params_);
+        if (!has_prepared && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
+        {
+            LOG_ERROR("[MoELocalExpertStage] Missing expert weight tensors and no prepared expert state");
+            return false;
+        }
+        std::string prepared_error;
+        if (!validatePreparedWeights(&prepared_error))
+        {
+            LOG_ERROR("[MoELocalExpertStage] Prepared weight validation failed: " << prepared_error);
+            return false;
+        }
+
+        struct ActiveRoute
+        {
+            size_t input_row = 0;
+            int expert_id = -1;
+            float weight = 0.0f;
+        };
+
+        std::vector<ActiveRoute> active_routes;
+        active_routes.reserve(input.live_entry_count);
+        std::vector<int> row_output_slot(input.live_row_count, -1);
+        std::vector<bool> validated_input_rows(input.live_row_count, false);
+        std::vector<size_t> output_input_rows;
+        output_input_rows.reserve(input.live_row_count);
+
+        for (size_t row = 0; row < input.live_row_count; ++row)
+        {
+            const int row_id = input.row_ids_host[row];
+            if (row_id < 0)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Negative sparse row id " << row_id
+                                                                           << " at compact row " << row);
+                return false;
+            }
+
+            const int32_t entry_begin = input.entry_offsets_host[row];
+            const int32_t entry_end = input.entry_offsets_host[row + 1u];
+            if (entry_begin < 0 || entry_end < entry_begin ||
+                entry_end > static_cast<int32_t>(input.live_entry_count) ||
+                entry_end - entry_begin > params_.top_k)
+            {
+                LOG_ERROR("[MoELocalExpertStage] Invalid entry offsets for compact row " << row);
+                return false;
+            }
+
+            for (int32_t entry = entry_begin; entry < entry_end; ++entry)
+            {
+                const int expert_id = input.expert_ids_host[entry];
+                const float weight = input.route_weights_host[entry];
+                if (expert_id < 0 || expert_id >= params_.num_experts)
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Expert id " << expert_id
+                                                                 << " outside num_experts=" << params_.num_experts);
+                    return false;
+                }
+                if (!std::isfinite(weight))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Non-finite route weight for expert "
+                              << expert_id << " at compact row " << row);
+                    return false;
+                }
+                if (weight == 0.0f || !isExpertActiveForValidation(expert_id))
+                    continue;
+
+                if (!validated_input_rows[row])
+                {
+                    const float *hidden_row =
+                        input.hidden_rows_fp32 + row * static_cast<size_t>(params_.d_model);
+                    for (int col = 0; col < params_.d_model; ++col)
+                    {
+                        if (!std::isfinite(hidden_row[col]))
+                        {
+                            LOG_ERROR("[MoELocalExpertStage] Non-finite sparse hidden value for layer "
+                                      << params_.layer_idx
+                                      << " participant=" << params_.runtime_participant_index
+                                      << " compact_row=" << row
+                                      << " row_id=" << row_id
+                                      << " col=" << col);
+                            return false;
+                        }
+                    }
+                    validated_input_rows[row] = true;
+                }
+
+                if (row_output_slot[row] < 0)
+                {
+                    row_output_slot[row] = static_cast<int>(output_input_rows.size());
+                    output_input_rows.push_back(row);
+                }
+                active_routes.push_back(ActiveRoute{row, expert_id, weight});
+            }
+        }
+
+        if (active_routes.empty())
+            return true;
+
+        constexpr int kCompactTopK = 1;
+        if (!ensureCompactCapacity(active_routes.size(), kCompactTopK))
+            return false;
+
+        float *hidden = compact_hidden_->mutable_data();
+        float *routing_indices = compact_routing_indices_->mutable_data();
+        float *routing_weights = compact_routing_weights_->mutable_data();
+        float *compact_output = compact_output_->mutable_data();
+        std::fill_n(routing_indices, active_routes.size() * static_cast<size_t>(kCompactTopK), -1.0f);
+        std::fill_n(routing_weights, active_routes.size() * static_cast<size_t>(kCompactTopK), 0.0f);
+        std::fill_n(compact_output, active_routes.size() * static_cast<size_t>(params_.d_model), 0.0f);
+
+        for (size_t compact_row = 0; compact_row < active_routes.size(); ++compact_row)
+        {
+            const auto &route = active_routes[compact_row];
+
+            std::memcpy(hidden + compact_row * static_cast<size_t>(params_.d_model),
+                        input.hidden_rows_fp32 + route.input_row * static_cast<size_t>(params_.d_model),
+                        static_cast<size_t>(params_.d_model) * sizeof(float));
+            routing_indices[compact_row] = static_cast<float>(route.expert_id);
+            routing_weights[compact_row] = route.weight;
+        }
+
+        MoEExpertComputeStage::Params compute_params;
+        compute_params.device_id = params_.device_id;
+        compute_params.input = compact_hidden_.get();
+        compute_params.seq_len = static_cast<int>(active_routes.size());
+        compute_params.d_model = params_.d_model;
+        compute_params.num_experts = params_.num_experts;
+        compute_params.top_k = kCompactTopK;
+        compute_params.gate_exps = params_.gate_exps;
+        compute_params.up_exps = params_.up_exps;
+        compute_params.down_exps = params_.down_exps;
+        compute_params.expert_intermediate = params_.expert_intermediate;
+        compute_params.layer_idx = params_.layer_idx;
+        compute_params.expert_mask = params_.expert_mask;
+        compute_params.routing_indices = compact_routing_indices_.get();
+        compute_params.routing_weights = compact_routing_weights_.get();
+        compute_params.output = compact_output_.get();
+        compute_params.output_registered_in_arena = false;
+        // Propagate prepared expert state so execute() uses them directly.
+        compute_params.prepared_gate_gemm = params_.prepared_gate_gemm;
+        compute_params.prepared_up_gemm = params_.prepared_up_gemm;
+        compute_params.prepared_down_gemm = params_.prepared_down_gemm;
+        compute_params.prepared_store = params_.prepared_store;
+        compute_params.expert_registry = params_.expert_registry;
+        compute_params.moe_runtime_table = params_.moe_runtime_table;
+        compute_params.gate_slab_ref = params_.gate_slab_ref;
+        compute_params.up_slab_ref = params_.up_slab_ref;
+        compute_params.down_slab_ref = params_.down_slab_ref;
+
+        if (!has_prepared)
+        {
+            // Legacy / test fallback: extract expert views and prepare engines inline.
+            if (!MoEExpertComputeStage::extractExpertViews(compute_params) ||
+                !MoEExpertComputeStage::prepareExpertGemmEngines(compute_params))
+            {
+                LOG_ERROR("[MoELocalExpertStage] Failed to prepare compact expert compute stage");
+                return false;
+            }
+        }
+
+        // For GPU participants: upload compact input tensors to device before expert
+        // kernel dispatch.  After execute(), reading compact_output_->data() triggers
+        // an implicit D2H sync via the coherence state machine.
+        const bool is_gpu = params_.device_id.is_gpu();
+        if (is_gpu)
+        {
+            if (!compact_hidden_->ensureOnDevice(params_.device_id) ||
+                !compact_routing_indices_->ensureOnDevice(params_.device_id) ||
+                !compact_routing_weights_->ensureOnDevice(params_.device_id) ||
+                !compact_output_->ensureOnDevice(params_.device_id))
+            {
+                LOG_ERROR("[MoELocalExpertStage] GPU coherence upload failed for compact tensors");
+                return false;
+            }
+        }
+
+        MoEExpertComputeStage compute_stage(std::move(compute_params));
+        compute_stage.setGPUStream(gpuStream());
+        if (bound_workspace_)
+            compute_stage.bindWorkspace(bound_workspace_);
+        else if (is_gpu)
+        {
+            LOG_ERROR("[MoELocalExpertStage] GPU local expert compute requires a bound workspace");
+            return false;
+        }
+        if (has_prepared)
+        {
+            // Signal to MoEExpertComputeStage that raw weight pointers may be null —
+            // prepared engines are used instead.
+            compute_stage.releaseRawExpertWeights();
+        }
+
+        std::chrono::steady_clock::time_point t_compute_start;
+        if (MoEExpertOverlayProfiler::isEnabled())
+            t_compute_start = std::chrono::steady_clock::now();
+
+        if (!compute_stage.execute(ctx))
+            return false;
+
+        if (MoEExpertOverlayProfiler::isEnabled())
+        {
+            const double compute_ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t_compute_start)
+                                          .count();
+            std::set<int> unique_set;
+            for (size_t e = 0; e < input.live_entry_count; ++e)
+                unique_set.insert(input.expert_ids_host[e]);
+            MoEExpertOverlayProfiler::recordGraphNativeLocalExpert(
+                params_.layer_idx,
+                input.key.tier_idx,
+                params_.device_id.to_string(),
+                params_.device_id.is_cpu(),
+                input.live_row_count,
+                input.live_row_count, // output rows == input rows for local expert
+                std::vector<int>(unique_set.begin(), unique_set.end()),
+                compute_ms);
+        }
+
+        const float *compact_result = compact_output_->data();
+        for (size_t compact_row = 0; compact_row < active_routes.size(); ++compact_row)
+        {
+            const auto &route = active_routes[compact_row];
+            const float *src = compact_result + compact_row * static_cast<size_t>(params_.d_model);
+            for (int col = 0; col < params_.d_model; ++col)
+            {
+                if (!std::isfinite(src[col]))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Non-finite local expert output for layer "
+                              << params_.layer_idx
+                              << " participant=" << params_.runtime_participant_index
+                              << " expert=" << route.expert_id
+                              << " compact_row=" << compact_row
+                              << " input_row=" << route.input_row
+                              << " row_id=" << input.row_ids_host[route.input_row]
+                              << " col=" << col);
+                    return false;
+                }
+            }
+        }
+
+        for (size_t output_row = 0; output_row < output_input_rows.size(); ++output_row)
+        {
+            const size_t input_row = output_input_rows[output_row];
+            output.row_ids_host[output_row] = input.row_ids_host[input_row];
+            std::fill_n(output.output_rows_fp32 + output_row * static_cast<size_t>(params_.d_model),
+                        static_cast<size_t>(params_.d_model), 0.0f);
+        }
+
+        for (size_t compact_row = 0; compact_row < active_routes.size(); ++compact_row)
+        {
+            const auto &route = active_routes[compact_row];
+            const int output_slot = row_output_slot[route.input_row];
+            if (output_slot < 0 || static_cast<size_t>(output_slot) >= output_input_rows.size())
+            {
+                LOG_ERROR("[MoELocalExpertStage] Internal active-route aggregation slot mismatch");
+                return false;
+            }
+            const float *src = compact_result + compact_row * static_cast<size_t>(params_.d_model);
+            float *dst = output.output_rows_fp32 + static_cast<size_t>(output_slot) * static_cast<size_t>(params_.d_model);
+            for (int col = 0; col < params_.d_model; ++col)
+                dst[col] += src[col];
+        }
+        for (size_t output_row = 0; output_row < output_input_rows.size(); ++output_row)
+        {
+            const float *row = output.output_rows_fp32 + output_row * static_cast<size_t>(params_.d_model);
+            for (int col = 0; col < params_.d_model; ++col)
+            {
+                if (!std::isfinite(row[col]))
+                {
+                    LOG_ERROR("[MoELocalExpertStage] Non-finite aggregated local expert output for layer "
+                              << params_.layer_idx
+                              << " participant=" << params_.runtime_participant_index
+                              << " output_row=" << output_row
+                              << " row_id=" << output.row_ids_host[output_row]
+                              << " col=" << col);
+                    return false;
+                }
+            }
+        }
+        output.live_row_count = output_input_rows.size();
+        return true;
+    }
+
+    bool MoELocalExpertStage::validatePreparedWeights(std::string *error) const
+    {
+        if (error)
+            error->clear();
+
+        const bool has_prepared_vectors =
+            !params_.prepared_gate_gemm.empty() &&
+            params_.prepared_gate_gemm.size() == static_cast<size_t>(params_.num_experts);
+        const bool has_slab_refs = params_.prepared_store &&
+                                   params_.gate_slab_ref.has_value() &&
+                                   params_.up_slab_ref.has_value() &&
+                                   params_.down_slab_ref.has_value();
+
+        if (!has_prepared_vectors && !has_slab_refs)
+        {
+            // No prepared state — stage will use inline view extraction (legacy path).
+            // This is only valid when raw tensors are present.
+            if (params_.gate_exps && params_.up_exps && params_.down_exps)
+                return true;
+            if (error)
+                *error = "[MoELocalExpertStage] No prepared expert state and no raw expert tensors";
+            return false;
+        }
+
+        if (has_prepared_vectors)
+        {
+            // Verify every active expert has a non-null engine.
+            const auto &gate_v = params_.prepared_gate_gemm;
+            const auto &up_v = params_.prepared_up_gemm;
+            const auto &down_v = params_.prepared_down_gemm;
+
+            if (up_v.size() != gate_v.size() || down_v.size() != gate_v.size())
+            {
+                if (error)
+                    *error = "[MoELocalExpertStage] Prepared engine vector size mismatch";
+                return false;
+            }
+
+            for (int expert = 0; expert < params_.num_experts; ++expert)
+            {
+                const bool active = isExpertActiveForValidation(expert);
+                if (!active)
+                    continue;
+                const bool ok = gate_v[expert] && up_v[expert] && down_v[expert];
+                if (!ok)
+                {
+                    if (error)
+                    {
+                        std::ostringstream oss;
+                        oss << "[MoELocalExpertStage] Layer " << params_.layer_idx
+                            << " expert " << expert << " is active but prepared engine is null"
+                            << " (gate=" << (bool)gate_v[expert]
+                            << " up=" << (bool)up_v[expert]
+                            << " down=" << (bool)down_v[expert] << ")";
+                        *error = oss.str();
+                    }
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // Slab-ref path: verify store contains every active expert in each slab.
+        if (!has_slab_refs)
+        {
+            if (error)
+                *error = "[MoELocalExpertStage] validatePreparedWeights reached slab path without all slab refs — internal logic error";
+            return false;
+        }
+
+        auto validate_slab = [&](const char *name, const ExpertSlabRef &ref)
+        {
+            const auto availability = params_.prepared_store->expertAvailabilityMask(ref);
+            if (availability.empty())
+            {
+                if (error)
+                    *error = std::string("[MoELocalExpertStage] PreparedWeightStore missing expert slab for ") + name;
+                return false;
+            }
+            if (availability.size() != static_cast<size_t>(params_.num_experts))
+            {
+                if (error)
+                {
+                    std::ostringstream oss;
+                    oss << "[MoELocalExpertStage] PreparedWeightStore slab size mismatch for " << name
+                        << ": got " << availability.size()
+                        << ", expected " << params_.num_experts;
+                    *error = oss.str();
+                }
+                return false;
+            }
+
+            for (int expert = 0; expert < params_.num_experts; ++expert)
+            {
+                const bool active = isExpertActiveForValidation(expert);
+                if (!active)
+                    continue;
+                if (!availability[static_cast<size_t>(expert)])
+                {
+                    if (error)
+                    {
+                        std::ostringstream oss;
+                        oss << "[MoELocalExpertStage] Layer " << params_.layer_idx
+                            << " expert " << expert << " is active but missing in PreparedWeightStore slab "
+                            << name;
+                        *error = oss.str();
+                    }
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        if (!validate_slab("gate", *params_.gate_slab_ref) ||
+            !validate_slab("up", *params_.up_slab_ref) ||
+            !validate_slab("down", *params_.down_slab_ref))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    size_t MoELocalExpertStage::estimatedFlops() const
+    {
+        const size_t rows = params_.input_rows ? params_.input_rows->live_row_count : 0;
+        return rows * static_cast<size_t>(params_.top_k) *
+               static_cast<size_t>(6) * static_cast<size_t>(params_.d_model) *
+               static_cast<size_t>(params_.expert_intermediate);
+    }
+
+    bool MoELocalExpertStage::supportsBackend(ComputeBackendType backend) const
+    {
+        return backend == ComputeBackendType::CPU ||
+               backend == ComputeBackendType::GPU_CUDA ||
+               backend == ComputeBackendType::GPU_ROCM;
+    }
+
+    StageBufferRequirements MoELocalExpertStage::getBufferRequirements() const
+    {
+        StageBufferRequirements reqs;
+        if (params_.gate_exps)
+            reqs.addWeight("gate_exps", params_.gate_exps->shape(), toBufferTensorType(params_.gate_exps->native_type()));
+        if (params_.up_exps)
+            reqs.addWeight("up_exps", params_.up_exps->shape(), toBufferTensorType(params_.up_exps->native_type()));
+        if (params_.down_exps)
+            reqs.addWeight("down_exps", params_.down_exps->shape(), toBufferTensorType(params_.down_exps->native_type()));
+        return reqs;
+    }
+
+    StageDumpInfo MoELocalExpertStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        if (params_.gate_exps)
+            info.addWeight("gate_exps", params_.gate_exps);
+        if (params_.up_exps)
+            info.addWeight("up_exps", params_.up_exps);
+        if (params_.down_exps)
+            info.addWeight("down_exps", params_.down_exps);
+        info.addScalarInt("num_experts", params_.num_experts);
+        info.addScalarInt("top_k", params_.top_k);
+        info.addScalarInt("d_model", params_.d_model);
+        info.addScalarInt("expert_intermediate", params_.expert_intermediate);
+        info.addScalarInt("layer_idx", params_.layer_idx);
+        info.addScalarInt("live_rows", params_.input_rows ? static_cast<int>(params_.input_rows->live_row_count) : 0);
+        return info;
+    }
+
+    WorkspaceRequirements MoELocalExpertStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        const int compact_rows_from_sparse_payload =
+            params_.input_rows
+                ? static_cast<int>(std::max<size_t>(params_.input_rows->entry_capacity, 1u))
+                : 0;
+        const int compact_rows_from_graph_hint =
+            std::max(1, m) * std::max(1, params_.top_k);
+        const int max_compact_rows =
+            std::max(compact_rows_from_sparse_payload, compact_rows_from_graph_hint);
+
+        WorkspaceRequirements reqs;
+        if (params_.device_id.is_cuda())
+        {
+            reqs.merge(MoEWorkspaceBuffers::expertExecution(
+                max_compact_rows,
+                params_.d_model,
+                params_.expert_intermediate,
+                params_.num_experts,
+                /*top_k=*/1));
+        }
+        else if (params_.device_id.is_rocm())
+        {
+            reqs.merge(MoEWorkspaceBuffers::rocmMoE(
+                max_compact_rows,
+                params_.d_model,
+                params_.expert_intermediate,
+                params_.num_experts,
+                /*top_k=*/1));
+        }
+
+        /**
+         * The local expert stage compacts sparse routes into one row per active
+         * route before delegating to MoEExpertComputeStage.  The nested stage is
+         * constructed at execute() time, so the graph allocator cannot discover
+         * its GEMM scratch unless we advertise it here with the projected shapes.
+         */
+        auto mergeGemmRequirements = [&](const std::vector<ITensorGemm *> &engines,
+                                         int out_features,
+                                         int in_features)
+        {
+            for (auto *gemm : engines)
+            {
+                if (!gemm)
+                    continue;
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer)
+                    reqs.merge(consumer->getWorkspaceRequirements(
+                        max_compact_rows,
+                        out_features,
+                        in_features));
+            }
+        };
+
+        mergeGemmRequirements(params_.prepared_gate_gemm,
+                              params_.expert_intermediate,
+                              params_.d_model);
+        mergeGemmRequirements(params_.prepared_up_gemm,
+                              params_.expert_intermediate,
+                              params_.d_model);
+        mergeGemmRequirements(params_.prepared_down_gemm,
+                              params_.d_model,
+                              params_.expert_intermediate);
+
+        (void)n;
+        (void)k;
+        return reqs;
+    }
+
+    void MoELocalExpertStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        auto bindAll = [workspace](const std::vector<ITensorGemm *> &engines)
+        {
+            for (auto *gemm : engines)
+            {
+                if (!gemm)
+                    continue;
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer)
+                    consumer->bindWorkspace(workspace);
+            }
+        };
+
+        bindAll(params_.prepared_gate_gemm);
+        bindAll(params_.prepared_up_gemm);
+        bindAll(params_.prepared_down_gemm);
+        bound_workspace_ = workspace;
+    }
+
+    void MoELocalExpertStage::unbindWorkspace()
+    {
+        auto unbindAll = [](const std::vector<ITensorGemm *> &engines)
+        {
+            for (auto *gemm : engines)
+            {
+                if (!gemm)
+                    continue;
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer)
+                    consumer->unbindWorkspace();
+            }
+        };
+
+        unbindAll(params_.prepared_gate_gemm);
+        unbindAll(params_.prepared_up_gemm);
+        unbindAll(params_.prepared_down_gemm);
+        bound_workspace_ = nullptr;
+    }
+
+} // namespace llaminar2

@@ -659,7 +659,7 @@ namespace llaminar2
         friend MemoryDescriptor makeMemoryDescriptor(const TensorBase *); // Allow descriptor factory
 
     public:
-        virtual ~TensorBase(); // Implemented in TensorBase.cpp - clears KernelFactory cache
+        virtual ~TensorBase(); // Implemented in TensorBase.cpp
 
         // Non-copyable: tensors contain mutexes and cached kernels
         // Use copyFrom() method to copy data between tensors
@@ -673,15 +673,18 @@ namespace llaminar2
         // Generic cache for CPU kernel state (e.g. packed VNNI weights)
         mutable std::any cache_;
 
-        // Generic cache for CUDA kernel state (e.g. packed INT8 weights)
-        // Separate from cache_ to allow both CPU and CUDA paths to coexist
-        mutable std::any cuda_cache_;
+        // Runtime hint: set when this tensor's device representation is managed
+        // by the prepared weight pipeline (PreparedWeightStore).
+        // Used by StageCoherence, TransferEngine, DeviceGraphExecutor, and
+        // WeightManager to skip raw uploads and determine host-release safety.
+        //
+        // Phase 8: This flag is a cheap O(1) alternative to mutex-guarded
+        // registry lookups on every stage boundary. It has NO lifecycle
+        // implications — TensorBase destructor does NOT use it.
+        // Cleanup is the exclusive responsibility of PreparedWeightStore.
+        mutable bool has_prepared_device_state_ = false;
 
-        // Generic cache for ROCm kernel state (e.g. packed INT8 weights for CK)
-        // Separate from cache_ and cuda_cache_ to allow CPU, CUDA, and ROCm paths to coexist
-        mutable std::any rocm_cache_;
-
-        // Synchronizes cache_ / cuda_cache_ / rocm_cache_ initialization and reset
+        // Synchronizes cache_ initialization and reset
         mutable std::mutex packed_cache_mutex_;
 
         // Shape and type - each concrete tensor class has its own shape_ member
@@ -946,6 +949,29 @@ namespace llaminar2
         virtual void invalidateGpuData();
 
         /**
+         * @brief Mark host storage as containing the newest tensor contents.
+         *
+         * Use this after callers write host memory directly through
+         * raw_mutable_data() or an external receive path. Unlike mutable_data(),
+         * this does not try to download the previous device contents first.
+         */
+        void mark_host_dirty() override
+        {
+            std::lock_guard<std::mutex> lock(coherence_mutex_);
+            if (is_mapped_)
+            {
+                setCoherenceState_(TensorCoherenceState::MAPPED);
+                mapped_needs_sync_ = false;
+            }
+            else
+            {
+                setCoherenceState_(gpu_data_ptr_ ? TensorCoherenceState::HOST_AUTHORITATIVE
+                                                 : TensorCoherenceState::HOST_ONLY);
+            }
+            authoritative_device_.reset();
+        }
+
+        /**
          * @brief Ensure tensor data is available on host (CPU)
          *
          * Performs lazy download: if data is already on host and valid, returns immediately.
@@ -1056,7 +1082,7 @@ namespace llaminar2
          *   Any → MAPPED           (shared memory, always in sync)
          */
         void transitionTo(TensorCoherenceState new_state,
-                          std::optional<DeviceId> authoritative_dev = std::nullopt)
+                          std::optional<DeviceId> authoritative_dev = std::nullopt) override
         {
             std::lock_guard<std::mutex> lock(coherence_mutex_);
             setCoherenceState_(new_state);
@@ -1090,20 +1116,16 @@ namespace llaminar2
                                    void *stream = nullptr);
 
         /**
-         * @brief Check if tensor has cached device data via internal packing mechanisms
+         * @brief Check if this tensor's GEMM weights are managed by the GPU pipeline
          *
-         * CUDA/ROCm GEMM kernels often convert quantized weights to a different
-         * representation (e.g., Q8_0 -> INT8 + per-column scales) and upload that
-         * instead of the raw tensor data. This method checks if such cached data exists.
+         * When true, the tensor's GEMM representation lives in pooled VRAM owned
+         * by the prepared weight pipeline (PreparedWeightStore).
+         * The raw host data may already be released.  Callers should skip
+         * ensureOnDevice() for such tensors — the kernel has its own device copy.
          *
-         * Use this to skip redundant ensureOnDevice() calls for weight tensors
-         * that use internal packing - they don't need raw tensor uploads.
-         *
-         * @param device_type Device type to check (CUDA or ROCm)
-         * @return true if tensor has cached device data uploaded for the given device type
-         * @note Implementation checks cuda_cache_/rocm_cache_ for uploaded packed weights
+         * @return true if this tensor has prepared device state
          */
-        virtual bool hasCachedDeviceData(DeviceType device_type) const;
+        bool hasPreparedDeviceState() const { return has_prepared_device_state_; }
 
         /**
          * @brief Check if tensor uses zero-copy mapped memory
@@ -1283,6 +1305,20 @@ namespace llaminar2
         virtual bool is_raw_data_released() const { return false; }
 
         /**
+         * @brief Check if the tensor's data resides in an mmap'd region.
+         *
+         * Returns true only when raw_data() points into a memory-mapped file
+         * (GGUF mmap). Use this instead of is_view() when deciding whether it
+         * is safe to call madvise(MADV_DONTNEED) — calling MADV_DONTNEED on
+         * heap-allocated data zeroes the pages and corrupts the heap.
+         *
+         * TensorSlice delegates to its inner tensor; heap-owning tensors
+         * created by loadTensorRowSlice() return false even though
+         * TensorSlice::is_view() returns true.
+         */
+        virtual bool is_mmap_data() const { return false; }
+
+        /**
          * @brief Release ALL host-side weight data for GPU-offloaded tensors
          *
          * After weights have been uploaded to GPU, this frees:
@@ -1300,6 +1336,20 @@ namespace llaminar2
         {
             unpinHostMemory(); // Must unpin BEFORE freeing — CUDA/HIP tracks pinned regions
             release_raw_data();
+        }
+
+        /**
+         * @brief Drop CUDA/HIP host registration before mmap pages are advised away.
+         *
+         * mmap-backed weights can be uploaded through TransferEngine, which may
+         * pin their host pages for DMA. MADV_DONTNEED on still-registered pages
+         * can leave the GPU runtime with stale host mappings, so mmap reclaim
+         * must unregister first even when the tensor's raw host data is retained.
+         */
+        virtual void releaseMmapHostRegistration()
+        {
+            if (is_mmap_data())
+                unpinHostMemory();
         }
 
         // ===== Generic Type Conversion API =====
@@ -3099,6 +3149,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -3350,6 +3401,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -4601,6 +4653,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -4821,6 +4874,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5039,6 +5093,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5248,6 +5303,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5453,6 +5509,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5621,6 +5678,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5803,6 +5861,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -5962,6 +6021,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6130,6 +6190,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6302,6 +6363,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6503,6 +6565,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6702,6 +6765,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -6889,6 +6953,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7076,6 +7141,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7267,6 +7333,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7454,6 +7521,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7645,6 +7713,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {
@@ -7832,6 +7901,7 @@ namespace llaminar2
             }
         }
         bool is_raw_data_released() const override { return raw_data_released_; }
+        bool is_mmap_data() const override { return mmap_owner_ != nullptr; }
 
         void release_host_weight_data() override
         {

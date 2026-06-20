@@ -27,29 +27,41 @@
 #include "tensors/TensorKernels.h" // For TensorProjectionDesc
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/gemm/CUDAWeightPacker.h"
+#include "kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "kernels/cuda/gemm/CUDADeviceWorkspace.h"
 #include "backends/ComputeBackend.h"
 #include "execution/local_execution/device/DeviceContext.h"
+#include "execution/compute_stages/ComputeStageUtils.h"
 #include "execution/local_execution/coherence/GpuCoherence.h"        // For gpu_output(), with_gpu_coherence()
 #include "execution/local_execution/device/DeviceWorkspaceManager.h" // For workspace binding
+#include "execution/compute_stages/stages/GDNProjectionStage.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
+#include "utils/PerfStatsCollector.h"
+#include "utils/DebugEnv.h"
 #include "utils/MPIContext.h"
 #include "../../../utils/TestModelHelper.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
-#include <cuda_runtime.h> // For cudaMalloc, cudaMemcpy, etc.
+#include <cuda_runtime.h>
 #endif
 
 // Now include test utils
 #include "../../../utils/CUDATestUtils.h"
 #include "../../../utils/TestTensorFactory.h"
+#include "../../../utils/GpuPreparedGemmHarness.h"
 
 #include <vector>
+#include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <functional>
 #include <random>
 #include <numeric>
 #include <filesystem>
+#include <limits>
 
 using namespace llaminar2;
 using namespace llaminar2::test::cuda;
@@ -61,17 +73,238 @@ using KernelDeviceType = llaminar::v2::kernels::DeviceType;
 // Alias for TensorProjectionDesc
 using TensorProjectionDesc = llaminar2::ITensorGemm::TensorProjectionDesc;
 
+#ifdef HAVE_CUDA
+extern "C"
+{
+    void cudaNativeVNNIPrefill_setStreamKMode(int mode);
+    int cudaNativeVNNIPrefill_getStreamKMode();
+    void cudaNativeVNNIPrefill_setBK256Mode(int mode);
+    int cudaNativeVNNIPrefill_getBK256Mode();
+    void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
+    bool cudaNativeVNNIPrefill_getDeterministicMode();
+    void cudaNativeVNNIPrefill_setForceTile(int tile_id, int split_k);
+    void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
+    void cudaNativeVNNIPrefill_getLastLaunchSelection(
+        int *tile_id,
+        int *split_k,
+        int *used_bk256,
+        int *used_streamk);
+    bool cudaNativeVNNIInitIQGridTables_tuned();
+    bool cudaQuantGemm_quantizeActivationsBlockwise(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A,
+        int M, int K,
+        int cuda_device_id,
+        void *stream);
+    bool cudaNativeVNNIGemvTuned_fp32(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        uint8_t codebook_id,
+        int cuda_device_id,
+        void *stream,
+        CUDAGemvContext *gemv_ctx,
+        CUDARowMajorWeights **rm_slot);
+    bool cudaNativeVNNIGemvTuned_small_m_fp32(
+        const int8_t *d_A_int8,
+        const uint8_t *d_payload,
+        const uint16_t *d_scales,
+        const uint16_t *d_mins,
+        const uint32_t *d_emins,
+        float *d_C_fp32,
+        const float *d_scales_A_block,
+        int M,
+        int N, int K,
+        float alpha, float beta,
+        const float *d_C_existing,
+        const float *d_bias,
+        uint8_t codebook_id,
+        int cuda_device_id,
+        void *stream,
+        CUDAGemvContext *gemv_ctx,
+        CUDARowMajorWeights **rm_slot);
+}
+#endif
+
 namespace
 {
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::string old_value_;
+        bool had_old_ = false;
+    };
+
+#ifdef HAVE_CUDA
+    class ScopedCudaPrefillModes
+    {
+    public:
+        ScopedCudaPrefillModes()
+            : streamk_(cudaNativeVNNIPrefill_getStreamKMode()),
+              bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+              deterministic_(cudaNativeVNNIPrefill_getDeterministicMode())
+        {
+            cudaNativeVNNIPrefill_getForceTile(&force_tile_, &force_split_k_);
+        }
+
+        ~ScopedCudaPrefillModes()
+        {
+            cudaNativeVNNIPrefill_setForceTile(force_tile_, force_split_k_);
+            cudaNativeVNNIPrefill_setStreamKMode(streamk_);
+            cudaNativeVNNIPrefill_setBK256Mode(bk256_);
+            cudaNativeVNNIPrefill_setDeterministicMode(deterministic_);
+        }
+
+        ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
+        ScopedCudaPrefillModes &operator=(const ScopedCudaPrefillModes &) = delete;
+
+    private:
+        int force_tile_ = -1;
+        int force_split_k_ = 0;
+        int streamk_ = 0;
+        int bk256_ = 0;
+        bool deterministic_ = false;
+    };
+
+    class ScopedDeterministicDebugEnv
+    {
+    public:
+        ScopedDeterministicDebugEnv()
+        {
+            const char *old = std::getenv("LLAMINAR_DETERMINISTIC");
+            if (old)
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            old_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
+            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            mutableDebugEnv().reload();
+            cudaNativeVNNIPrefill_setDeterministicMode(true);
+        }
+
+        ~ScopedDeterministicDebugEnv()
+        {
+            cudaNativeVNNIPrefill_setDeterministicMode(old_prefill_deterministic_);
+            if (had_old_)
+                setenv("LLAMINAR_DETERMINISTIC", old_value_.c_str(), 1);
+            else
+                unsetenv("LLAMINAR_DETERMINISTIC");
+            mutableDebugEnv().reload();
+        }
+
+        ScopedDeterministicDebugEnv(const ScopedDeterministicDebugEnv &) = delete;
+        ScopedDeterministicDebugEnv &operator=(const ScopedDeterministicDebugEnv &) = delete;
+
+    private:
+        std::string old_value_;
+        bool had_old_ = false;
+        bool old_prefill_deterministic_ = false;
+    };
+#endif
+
+    struct CUDASmallMFormatSpec
+    {
+        const char *name;
+        double cosine_threshold;
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create;
+    };
+
+    const std::vector<CUDASmallMFormatSpec> &cudaSmallMNativeFormats()
+    {
+        static const std::vector<CUDASmallMFormatSpec> formats = {
+            {"Q4_0", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_0Random({n, k}); }},
+            {"IQ4_NL", 0.985, [](size_t n, size_t k) { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
+            {"Q4_1", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_1Random({n, k}); }},
+            {"IQ4_XS", 0.985, [](size_t n, size_t k) { return TestTensorFactory::createIQ4_XSRandom({n, k}); }},
+            {"Q5_0", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_0Random({n, k}); }},
+            {"Q5_1", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_1Random({n, k}); }},
+            {"Q4_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ4_KRandom({n, k}); }},
+            {"Q5_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ5_KRandom({n, k}); }},
+            {"Q6_K", 0.990, [](size_t n, size_t k) { return TestTensorFactory::createQ6_KRandom({n, k}); }},
+            {"Q3_K", 0.980, [](size_t n, size_t k) { return TestTensorFactory::createQ3_KRandom({n, k}); }},
+            {"Q2_K", 0.960, [](size_t n, size_t k) { return TestTensorFactory::createQ2_KRandom({n, k}); }},
+            {"IQ3_S", 0.970, [](size_t n, size_t k) { return TestTensorFactory::createIQ3_SRandom({n, k}); }},
+            {"IQ3_XXS", 0.960, [](size_t n, size_t k) { return TestTensorFactory::createIQ3_XXSRandom({n, k}); }},
+            {"IQ2_S", 0.920, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_SRandom({n, k}); }},
+            {"IQ2_XS", 0.900, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XSRandom({n, k}); }},
+            {"IQ2_XXS", 0.880, [](size_t n, size_t k) { return TestTensorFactory::createIQ2_XXSRandom({n, k}); }},
+            {"IQ1_S", 0.800, [](size_t n, size_t k) { return TestTensorFactory::createIQ1_SRandom({n, k}); }},
+            {"IQ1_M", 0.800, [](size_t n, size_t k) { return TestTensorFactory::createIQ1_MRandom({n, k}); }},
+            {"Q8_0", 0.999, [](size_t n, size_t k) { return TestTensorFactory::createQ8_0Random({n, k}); }},
+        };
+        return formats;
+    }
+
 
     ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
     {
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(tensor, device_id);
+        // GPU INT8-packed (quantized native-VNNI) weights cannot go through
+        // KernelFactory::prepareGemmHandleLocal() — that path is guarded and throws
+        // because such kernels must be built from VRAM-resident, repacked payloads
+        // owned by a WeightVRAMPool. Route those through the shared production-pipeline
+        // helper instead, and keep the returned lifetime owners alive in a static list.
+        auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+        const bool is_gpu_quantized =
+            (device_id.is_cuda() || device_id.is_rocm()) &&
+            unpackable != nullptr &&
+            const_cast<IINT8Unpackable *>(unpackable)->vnniFormatInfo() != nullptr;
+
+        if (is_gpu_quantized)
+        {
+            static std::vector<llaminar2::test::GpuPreparedGemm> gpu_prepared;
+            const uint64_t prepared_id = static_cast<uint64_t>(gpu_prepared.size());
+            gpu_prepared.push_back(
+                llaminar2::test::makeGpuPreparedGemm(
+                    const_cast<TensorBase *>(tensor),
+                    device_id,
+                    "test.gpu_prepared_gemm.weight." + std::to_string(prepared_id),
+                    ModelContextId{9900 + prepared_id}));
+            return gpu_prepared.back().kernel;
+        }
+
+        static std::vector<std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>> handles;
+        auto prepared = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(tensor, device_id);
         if (!prepared)
         {
             return nullptr;
         }
-        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+        handles.push_back(std::move(prepared));
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(handles.back().get());
     }
 
     // ============================================================================
@@ -131,6 +364,55 @@ namespace
         return max_err;
     }
 
+    /**
+     * @brief Compare two logit rows as probability distributions.
+     *
+     * Cosine and L2 catch amplitude drift, but speculative decoding is also
+     * sensitive to small probability-mass movement near the sampled frontier.
+     * This helper applies a numerically stable softmax to both rows and returns
+     * 0.5 * (KL(actual || expected) + KL(expected || actual)).
+     */
+    double symmetricKLFromLogits(const float *actual, const float *expected, size_t count)
+    {
+        if (!actual || !expected || count == 0)
+            return std::numeric_limits<double>::infinity();
+
+        double max_actual = -std::numeric_limits<double>::infinity();
+        double max_expected = -std::numeric_limits<double>::infinity();
+        for (size_t i = 0; i < count; ++i)
+        {
+            max_actual = std::max(max_actual, static_cast<double>(actual[i]));
+            max_expected = std::max(max_expected, static_cast<double>(expected[i]));
+        }
+
+        double sum_actual = 0.0;
+        double sum_expected = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            sum_actual += std::exp(static_cast<double>(actual[i]) - max_actual);
+            sum_expected += std::exp(static_cast<double>(expected[i]) - max_expected);
+        }
+
+        if (sum_actual <= 0.0 || sum_expected <= 0.0)
+            return std::numeric_limits<double>::infinity();
+
+        constexpr double kFloor = 1.0e-30;
+        double actual_to_expected = 0.0;
+        double expected_to_actual = 0.0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            const double p = std::max(
+                kFloor,
+                std::exp(static_cast<double>(actual[i]) - max_actual) / sum_actual);
+            const double q = std::max(
+                kFloor,
+                std::exp(static_cast<double>(expected[i]) - max_expected) / sum_expected);
+            actual_to_expected += p * std::log(p / q);
+            expected_to_actual += q * std::log(q / p);
+        }
+        return 0.5 * (actual_to_expected + expected_to_actual);
+    }
+
     // =========================================================================
     // Helpers: multiply via tensor interface (multiply() removed from ITensorGemm)
     // =========================================================================
@@ -169,6 +451,57 @@ namespace
         bool ok = with_gpu_coherence(gpu_device, {A_tensor.get()}, {C_tensor.get()},
                                      [&]
                                      { return kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, transpose_B, alpha, beta); });
+        if (ok)
+            std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
+        return ok;
+    }
+
+    bool cpuFusedSwiGLUDownToVector(ITensorGemm *kernel,
+                                    const float *gate_host,
+                                    const float *up_host,
+                                    float *C_host,
+                                    int M, int N, int K,
+                                    float alpha = 1.0f, float beta = 0.0f)
+    {
+        auto gate_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        auto up_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(gate_tensor->mutable_data(), gate_host, (size_t)M * K * sizeof(float));
+        std::memcpy(up_tensor->mutable_data(), up_host, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        if (beta != 0.0f)
+            std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
+
+        bool ok = kernel->multiply_tensor_with_fused_swiglu(
+            gate_tensor.get(), up_tensor.get(), C_tensor.get(),
+            M, N, K, alpha, beta);
+        if (ok)
+            std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
+        return ok;
+    }
+
+    bool cudaFusedSwiGLUDownViaTensor(ITensorGemm *kernel,
+                                      const float *gate_host,
+                                      const float *up_host,
+                                      float *C_host,
+                                      int M, int N, int K,
+                                      DeviceId gpu_device,
+                                      float alpha = 1.0f, float beta = 0.0f)
+    {
+        auto gate_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        auto up_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+        std::memcpy(gate_tensor->mutable_data(), gate_host, (size_t)M * K * sizeof(float));
+        std::memcpy(up_tensor->mutable_data(), up_host, (size_t)M * K * sizeof(float));
+        auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        if (beta != 0.0f)
+            std::memcpy(C_tensor->mutable_data(), C_host, (size_t)M * N * sizeof(float));
+
+        bool ok = with_gpu_coherence(gpu_device, {gate_tensor.get(), up_tensor.get()}, {C_tensor.get()},
+                                     [&]
+                                     {
+                                         return kernel->multiply_tensor_with_fused_swiglu(
+                                             gate_tensor.get(), up_tensor.get(), C_tensor.get(),
+                                             M, N, K, alpha, beta);
+                                     });
         if (ok)
             std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
@@ -242,6 +575,7 @@ protected:
     {
         double cosine_similarity = 0.0;
         double relative_l2_error = 0.0;
+        double symmetric_kl = 0.0;
         float max_abs_error = 0.0f;
         bool has_nan_inf = false;
         bool passed = false;
@@ -251,6 +585,7 @@ protected:
             std::cout << name << ":\n"
                       << "  Cosine similarity: " << cosine_similarity << "\n"
                       << "  Relative L2 error: " << (relative_l2_error * 100.0) << "%\n"
+                      << "  Symmetric KL:       " << symmetric_kl << "\n"
                       << "  Max abs error:     " << max_abs_error << "\n"
                       << "  Passed:            " << (passed ? "YES" : "NO") << "\n";
         }
@@ -273,6 +608,7 @@ protected:
         result.has_nan_inf = hasNaNOrInf(cuda_result, count);
         result.cosine_similarity = cosineSimilarity(cuda_result, cpu_result, count);
         result.relative_l2_error = relativeL2Error(cuda_result, cpu_result, count);
+        result.symmetric_kl = symmetricKLFromLogits(cuda_result, cpu_result, count);
         result.max_abs_error = maxAbsError(cuda_result, cpu_result, count);
 
         result.passed = !result.has_nan_inf &&
@@ -285,6 +621,13 @@ protected:
     // =========================================================================
     // Workspace Management Helpers
     // =========================================================================
+
+    static size_t workspaceBudgetFor(const WorkspaceRequirements &reqs)
+    {
+        constexpr size_t kMinBudget = 64ull * 1024ull * 1024ull;
+        constexpr size_t kPadding = 16ull * 1024ull * 1024ull;
+        return std::max(kMinBudget, reqs.total_bytes_with_alignment() + kPadding);
+    }
 
     /**
      * @brief Set up workspace for a CUDA GEMM kernel if it supports it
@@ -312,7 +655,7 @@ protected:
         }
 
         auto reqs = ws_consumer->getWorkspaceRequirements(M, N, K);
-        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024); // 64MB
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, workspaceBudgetFor(reqs));
         if (!workspace_->allocate(reqs))
         {
             LOG_ERROR("Failed to allocate workspace for CUDA GEMM kernel");
@@ -329,11 +672,20 @@ protected:
     {
         if (workspace_)
         {
+#ifdef HAVE_CUDA
+            if (gpu_device_.is_cuda())
+            {
+                ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+                ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess)
+                    << "CUDA GEMM test cleanup must wait for workspace users before freeing buffers";
+            }
+#endif
             auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
             if (ws_consumer)
             {
                 ws_consumer->unbindWorkspace();
             }
+            kernel->resetDynamicState();
             workspace_.reset();
         }
     }
@@ -389,7 +741,13 @@ protected:
             }
         }
 
-        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 64 * 1024 * 1024); // 64MB
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            shared_reqs,
+            gpu_device_,
+            M,
+            kernels.size());
+
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, workspaceBudgetFor(shared_reqs));
         if (!workspace_->allocate(shared_reqs))
         {
             LOG_ERROR("Failed to allocate shared workspace");
@@ -414,12 +772,24 @@ protected:
      */
     void cleanupSharedWorkspace(const std::vector<ITensorGemm *> &kernels)
     {
+#ifdef HAVE_CUDA
+        if (workspace_ && gpu_device_.is_cuda())
+        {
+            ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+            ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess)
+                << "CUDA GEMM shared-workspace cleanup must wait for all projection kernels before freeing buffers";
+        }
+#endif
         for (auto *kernel : kernels)
         {
             auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(kernel);
             if (ws_consumer && ws_consumer->hasWorkspace())
             {
                 ws_consumer->unbindWorkspace();
+            }
+            if (kernel)
+            {
+                kernel->resetDynamicState();
             }
         }
         workspace_.reset();
@@ -461,13 +831,13 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
     EXPECT_TRUE(weights->isOnGPU());
 
     // Create CUDA kernel via KernelFactory
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
 
     // Execute CUDA GEMM via tensor coherence
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
 
     // ===== Compare =====
     auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.9999, 0.01);
@@ -478,6 +848,8 @@ TEST_F(Test__CUDAGemmParity, FP32_SmallMatrix_128x256x512)
         << "Cosine similarity too low: " << result.cosine_similarity;
     EXPECT_LE(result.relative_l2_error, 0.01)
         << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
@@ -500,13 +872,15 @@ TEST_F(Test__CUDAGemmParity, FP32_DecodeSize_1x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
@@ -529,13 +903,15 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -572,17 +948,19 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_SmallMatrix_128x896x896)
     EXPECT_TRUE(weights->isOnGPU());
 
     // Create CUDA kernel via KernelFactory
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA IQ4_NL kernel";
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Allocate GPU memory for activations and output
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
@@ -604,16 +982,18 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_DecodeSize_1x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
@@ -635,16 +1015,18 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
 
     // CUDA
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -681,15 +1063,15 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
                                                                                                   \
         /* CUDA */                                                                                \
         ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                        \
-        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
-            weights.get(), KernelDeviceType::CUDA);                                               \
+        auto *cuda_kernel = getPreparedKernel(                                                    \
+            weights.get(), gpu_device_);                                                          \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;       \
                                                                                                   \
         /* Set up workspace for quantized kernel */                                               \
-        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                          \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));                                \
                                                                                                   \
         std::vector<float> C_cuda(M * N, 0.0f);                                                   \
-        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(),                       \
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(),                             \
                                           C_cuda.data(), M, N, K, gpu_device_));                  \
                                                                                                   \
         auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);                \
@@ -699,7 +1081,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         EXPECT_GE(result.cosine_similarity, 0.99)                                                 \
             << "Cosine similarity too low: " << result.cosine_similarity;                         \
                                                                                                   \
-        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                              \
+        cleanupWorkspaceIfNeeded(cuda_kernel);                                                    \
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());                       \
     }
 
 /**
@@ -729,14 +1112,14 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
                                                                                                   \
         /* CUDA */                                                                                \
         ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));                                        \
-        auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(                      \
-            weights.get(), KernelDeviceType::CUDA);                                               \
+        auto *cuda_kernel = getPreparedKernel(                                                    \
+            weights.get(), gpu_device_);                                                          \
         ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel for " #TensorType;       \
                                                                                                   \
-        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));                          \
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));                                \
                                                                                                   \
         std::vector<float> C_cuda(M * N, 0.0f);                                                   \
-        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(),                       \
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(),                             \
                                           C_cuda.data(), M, N, K, gpu_device_));                  \
                                                                                                   \
         auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.99, 0.15);                \
@@ -746,7 +1129,8 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
         EXPECT_GE(result.cosine_similarity, 0.99)                                                 \
             << "Cosine similarity too low: " << result.cosine_similarity;                         \
                                                                                                   \
-        cleanupWorkspaceIfNeeded(cuda_kernel.get());                                              \
+        cleanupWorkspaceIfNeeded(cuda_kernel);                                                    \
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());                       \
     }
 
 // ============================================================================
@@ -770,15 +1154,33 @@ TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
+
+    auto *ws_consumer = dynamic_cast<IWorkspaceConsumer *>(cuda_kernel);
+    ASSERT_NE(ws_consumer, nullptr);
+    const auto reqs = ws_consumer->getWorkspaceRequirements(M, N, K);
+    const auto kpar_req = std::find_if(
+        reqs.buffers.begin(),
+        reqs.buffers.end(),
+        [](const WorkspaceDescriptor &buffer)
+        {
+            return buffer.name == GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS;
+        });
+    ASSERT_NE(kpar_req, reqs.buffers.end())
+        << "CUDA decode native-VNNI KPAR route must declare its partials workspace";
+    EXPECT_TRUE(kpar_req->required);
+    EXPECT_GE(kpar_req->size_bytes,
+              static_cast<size_t>((K + 31) / 32) * static_cast<size_t>(N) * sizeof(float));
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -802,15 +1204,153 @@ TEST_F(Test__CUDAGemmParity, Q4_0_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_0_SmallPrefillM4_UsesNativeSmallMRoute)
+{
+    const int M = 4;
+    const int N = 896;
+    const int K = 896;
+
+    auto weights = TestTensorFactory::createQ4_0Random({(size_t)N, (size_t)K}, 231);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_0 small-prefill native GEMV route 4x896x896");
+    EXPECT_FALSE(result.has_nan_inf)
+        << "CUDA small-prefill M=4 route must not emit NaN/Inf";
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_0_PrefillGraphReplaySurvivesKernelDynamicReset)
+{
+    const int M = 512;
+    const int N = 896;
+    const int K = 896;
+
+    ScopedCudaPrefillModes prefill_modes;
+    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+    cudaNativeVNNIPrefill_setForceTile(1, 1); // T64x128_w2x2, single split-K.
+    cudaNativeVNNIPrefill_setStreamKMode(2);  // Force two-pass Stream-K fixup buffer path.
+
+    auto weights = TestTensorFactory::createQ4_0Random({static_cast<size_t>(N), static_cast<size_t>(K)}, 232);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    FP32Tensor A_tensor({static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_tensor.mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    FP32Tensor C_tensor({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    ASSERT_TRUE(A_tensor.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(C_tensor.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cuda_kernel->setGPUStream(stream);
+    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
+        gpu_device_.ordinal, workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    int tile_id = -1;
+    int split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id, &split_k, &used_bk256, &used_streamk);
+    ASSERT_EQ(used_bk256, 0) << "Regression must exercise BK64 Stream-K, not BK256";
+    ASSERT_EQ(used_streamk, 2) << "Regression must exercise two-pass Stream-K context scratch";
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeRelaxed), cudaSuccess);
+    ASSERT_TRUE(cuda_kernel->multiply_tensor(
+        &A_tensor, &C_tensor, M, N, K, true, 1.0f, 0.0f, nullptr, nullptr,
+        gpu_device_.ordinal, workspace_.get()));
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_NE(graph_exec, nullptr);
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cuda_kernel->resetDynamicState();
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "resetDynamicState should clear request-scoped stream binding";
+
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess)
+        << "Captured graph must survive request reset without dangling context scratch";
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_EQ(cudaMemcpyAsync(
+                  C_cuda.data(),
+                  C_tensor.gpu_data_ptr(),
+                  C_cuda.size() * sizeof(float),
+                  cudaMemcpyDeviceToHost,
+                  stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_0 prefill graph replay after CUDA GEMM dynamic reset");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low after graph replay: " << result.cosine_similarity;
+
+    if (graph_exec)
+        cudaGraphExecDestroy(graph_exec);
+    if (graph)
+        cudaGraphDestroy(graph);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
@@ -829,16 +1369,18 @@ TEST_F(Test__CUDAGemmParity, Q4_1_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A = nullptr;
     float *d_C = nullptr;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -869,16 +1411,18 @@ TEST_F(Test__CUDAGemmParity, Q5_0_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A = nullptr;
     float *d_C = nullptr;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -903,16 +1447,18 @@ TEST_F(Test__CUDAGemmParity, Q5_1_DecodeSize_1x896x896)
     ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
 
     ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights.get(), KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        weights.get(), gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A = nullptr;
     float *d_C = nullptr;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -931,12 +1477,2783 @@ DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q3_K_DecodeSize, Q3_KTensor, createQ3_KRando
 DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q4_K_DecodeSize, Q4_KTensor, createQ4_KRandom, 256, 214)
 DEFINE_QUANTIZED_DECODE_PARITY_TEST(Q5_K_DecodeSize, Q5_KTensor, createQ5_KRandom, 256, 215)
 
+TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_2x896x768)
+{
+    const int M = 2;
+    const int N = 896;
+    const int K = 768;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 224);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_K verifier-small-M 2x896x768");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+    EXPECT_LE(result.relative_l2_error, 0.15)
+        << "Relative L2 error too high: " << (result.relative_l2_error * 100.0) << "%";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "Small-M verifier GEMV test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_2x512x768)
+{
+    const int M = 2;
+    const int N = 512;
+    const int K = 768;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 227);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_K verifier-small-M 2x512x768");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+    EXPECT_LE(result.relative_l2_error, 0.15)
+        << "Relative L2 error too high: " << (result.relative_l2_error * 100.0) << "%";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "Small-M verifier GEMV test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeVNNIRoute)
+{
+    const int M = 2;
+    const int N = 896;
+    const int K = 768;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 229);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    const auto records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls",
+                                      "kernel.cuda_native_vnni_m2_calls"});
+    uint64_t specialized_records = 0;
+    uint64_t specialized_m2_records = 0;
+    for (const auto &record : records)
+    {
+        if (record.domain != "kernel" ||
+            record.kind != PerfStatRecord::Kind::Counter ||
+            record.device != "cuda:" + std::to_string(gpu_device_.ordinal) ||
+            record.tags.at("codebook") != "5" ||
+            record.tags.at("n") != std::to_string(N) ||
+            record.tags.at("k") != std::to_string(K))
+        {
+            continue;
+        }
+        if (record.name == "cuda_native_vnni_small_m_calls" &&
+            record.tags.at("m") == std::to_string(M) &&
+            record.tags.at("route") == "specialized")
+        {
+            specialized_records += record.count;
+        }
+        if (record.name == "cuda_native_vnni_m2_calls" &&
+            record.tags.at("route") == "specialized")
+        {
+            specialized_m2_records += record.count;
+        }
+    }
+
+    EXPECT_EQ(specialized_records, 1u)
+        << "Q4_K M=2 verifier GEMM must use the specialized native-VNNI small-M route";
+    EXPECT_EQ(specialized_m2_records, 1u)
+        << "M=2 verifier GEMM must also emit the M2 route counter for tuning visibility";
+
+    PerfStatsCollector::reset();
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_M2MatchesTwoSingleRowDecodeGEMVs)
+{
+    const int M = 2;
+    const int N = 896;
+    const int K = 768;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 230);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_m2(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m2.data(), M, N, K, gpu_device_))
+        << "M=2 verifier GEMM failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            A_data.data() + static_cast<size_t>(row) * K,
+            C_m1.data(),
+            1,
+            N,
+            K,
+            gpu_device_))
+            << "M=1 decode GEMV failed for row " << row;
+
+        const float *verifier_row = C_m2.data() + static_cast<size_t>(row) * N;
+        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << "M=2 verifier row " << row << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << "M=2 verifier row " << row << " diverges from single-row decode GEMV";
+        EXPECT_LE(result.relative_l2_error, 1e-5)
+            << "M=2 verifier row " << row << " relative L2 differs from single-row decode GEMV";
+    }
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "M=2 row-equivalence test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNOut_M4MatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 5120;
+    const int K = 6144;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 231);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m4.data(), M, N, K, gpu_device_))
+        << "M=4 Qwen3.6 GDN output projection GEMM failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            A_data.data() + static_cast<size_t>(row) * K,
+            C_m1.data(),
+            1,
+            N,
+            K,
+            gpu_device_))
+            << "M=1 Qwen3.6 GDN output projection GEMV failed for row " << row;
+
+        const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
+        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN output projection row " << row
+            << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN output projection row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_LE(result.relative_l2_error, 1e-5)
+            << "M=4 Qwen3.6 GDN output projection row " << row
+            << " relative L2 differs from single-row decode GEMV";
+    }
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "M=4 Qwen3.6 row-equivalence test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @brief Guard the Qwen3.6 GDN QKV verifier projection shape.
+ *
+ * The model-level grouped verifier parity test first diverged at
+ * `layer1_QKV_PROJECTION` for the Qwen3.6 dense model.  That projection is much
+ * wider than the older synthetic small-M tests, so this regression proves the
+ * exact MTP contract at the kernel boundary: a grouped M=4 verifier projection
+ * must produce the same rows as four ordinary M=1 decode GEMVs using the same
+ * CUDA tensor path.  The thresholds are intentionally strict because top-token
+ * equality can hide distribution drift that later breaks stochastic MTP.
+ */
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKV_M4MatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 10240;
+    const int K = 5120;
+
+    auto weights = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 3321);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_m4.data(), M, N, K, gpu_device_))
+        << "M=4 Qwen3.6 GDN QKV projection GEMM failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            cuda_kernel,
+            A_data.data() + static_cast<size_t>(row) * K,
+            C_m1.data(),
+            1,
+            N,
+            K,
+            gpu_device_))
+            << "M=1 Qwen3.6 GDN QKV projection GEMV failed for row " << row;
+
+        const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
+        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN QKV projection row " << row
+            << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN QKV projection row " << row
+            << " diverges from single-row decode GEMV"
+            << " rel_l2=" << result.relative_l2_error
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.relative_l2_error, 1e-5)
+            << "M=4 Qwen3.6 GDN QKV projection row " << row
+            << " relative L2 differs from single-row decode GEMV"
+            << " cosine=" << result.cosine_similarity
+            << " max_abs=" << result.max_abs_error;
+    }
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "M=4 Qwen3.6 GDN QKV row-equivalence test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/**
+ * @brief Guard the production Qwen3.6 GDN qkv+z fused verifier subgroup.
+ *
+ * `GDNProjectionStage` groups native CUDA qkv and z projections together when
+ * verifier rows use the decode-equivalent M=2..4 path.  The model-level M=4
+ * parity failure first appears at `layer1_QKV_PROJECTION`, so this test checks
+ * the grouped descriptor contract directly: one M=4 qkv+z fused verifier call
+ * must match four independent M=1 fused decode calls for both outputs.  That
+ * proves the shared-workspace/projection-descriptor path before we diagnose
+ * higher-level graph or stage ownership.
+ */
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int K = 5120;
+    const int N_QKV = 10240;
+    const int N_Z = 6144;
+
+    auto weights_qkv = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 4331);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 4332);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *cuda_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    ASSERT_NE(cuda_qkv, nullptr);
+    ASSERT_NE(cuda_z, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_qkv, cuda_z}, M, {N_QKV, N_Z}, K));
+
+    auto A_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_m4->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto qkv_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto z_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    std::vector<TensorProjectionDesc> m4_projections = {
+        {cuda_qkv, qkv_m4.get(), N_QKV, nullptr, "gdn_qkv"},
+        {cuda_z, z_m4.get(), N_Z, nullptr, "gdn_z"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m4.get()},
+        {qkv_m4.get(), z_m4.get()},
+        [&]
+        {
+            return cuda_qkv->multiply_fused_tensor(A_m4.get(), m4_projections, M, K);
+        }))
+        << "M=4 Qwen3.6 GDN qkv+z fused verifier projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto A_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+        std::memcpy(
+            A_m1->mutable_data(),
+            A_data.data() + static_cast<size_t>(row) * K,
+            static_cast<size_t>(K) * sizeof(float));
+        auto qkv_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_QKV)});
+        auto z_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_Z)});
+        std::vector<TensorProjectionDesc> m1_projections = {
+            {cuda_qkv, qkv_m1.get(), N_QKV, nullptr, "gdn_qkv"},
+            {cuda_z, z_m1.get(), N_Z, nullptr, "gdn_z"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m1.get()},
+            {qkv_m1.get(), z_m1.get()},
+            [&]
+            {
+                return cuda_qkv->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
+            }))
+            << "M=1 Qwen3.6 GDN qkv+z fused decode projection failed for row " << row;
+
+        const float *qkv_row = qkv_m4->data() + static_cast<size_t>(row) * N_QKV;
+        const float *z_row = z_m4->data() + static_cast<size_t>(row) * N_Z;
+        const auto qkv_result =
+            checkParity(qkv_row, qkv_m1->data(), static_cast<size_t>(N_QKV), 0.999999, 1.0e-5);
+        const auto z_result =
+            checkParity(z_row, z_m1->data(), static_cast<size_t>(N_Z), 0.999999, 1.0e-5);
+
+        EXPECT_FALSE(qkv_result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN qkv row " << row << " produced non-finite output";
+        EXPECT_FALSE(z_result.has_nan_inf)
+            << "M=4 Qwen3.6 GDN z row " << row << " produced non-finite output";
+        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN qkv row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << qkv_result.relative_l2_error
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_GE(z_result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 GDN z row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << z_result.relative_l2_error
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
+            << "M=4 Qwen3.6 GDN qkv row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << qkv_result.cosine_similarity
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
+            << "M=4 Qwen3.6 GDN z row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << z_result.cosine_similarity
+            << " max_abs=" << z_result.max_abs_error;
+    }
+
+    cleanupSharedWorkspace({cuda_qkv, cuda_z});
+    EXPECT_FALSE(cuda_qkv->hasDynamicStateActive())
+        << "M=4 GDN qkv fused verifier test must not leak CUDA dynamic state";
+    EXPECT_FALSE(cuda_z->hasDynamicStateActive())
+        << "M=4 GDN z fused verifier test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+}
+
+/**
+ * @brief Guard the real Qwen3.6 dense GDN mixed-codebook qkv+z subgroup.
+ *
+ * The `Qwen3.6-27B-Q4_K_S` fixture stores `blk.1.attn_qkv.weight` as Q5_K
+ * while `blk.1.attn_gate.weight` (the GDN z projection) is Q4_K.  The stage
+ * groups them because both use CUDAQuantisedGemmKernel, so this test proves
+ * that mixed native codebooks in one fused verifier subgroup remain exactly
+ * decode-equivalent for M=4.
+ */
+TEST_F(Test__CUDAGemmParity, Q5KQ4K_Qwen36GDNQKVZ_M4FusedProjectionMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int K = 5120;
+    const int N_QKV = 10240;
+    const int N_Z = 6144;
+
+    auto weights_qkv = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 4431);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 4432);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *cuda_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    ASSERT_NE(cuda_qkv, nullptr);
+    ASSERT_NE(cuda_z, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_qkv, cuda_z}, M, {N_QKV, N_Z}, K));
+
+    auto A_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_m4->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto qkv_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto z_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    std::vector<TensorProjectionDesc> m4_projections = {
+        {cuda_qkv, qkv_m4.get(), N_QKV, nullptr, "gdn_qkv_q5k"},
+        {cuda_z, z_m4.get(), N_Z, nullptr, "gdn_z_q4k"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m4.get()},
+        {qkv_m4.get(), z_m4.get()},
+        [&]
+        {
+            return cuda_qkv->multiply_fused_tensor(A_m4.get(), m4_projections, M, K);
+        }))
+        << "M=4 mixed Q5_K/Q4_K Qwen3.6 GDN qkv+z verifier projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto A_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+        std::memcpy(
+            A_m1->mutable_data(),
+            A_data.data() + static_cast<size_t>(row) * K,
+            static_cast<size_t>(K) * sizeof(float));
+        auto qkv_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_QKV)});
+        auto z_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N_Z)});
+        std::vector<TensorProjectionDesc> m1_projections = {
+            {cuda_qkv, qkv_m1.get(), N_QKV, nullptr, "gdn_qkv_q5k"},
+            {cuda_z, z_m1.get(), N_Z, nullptr, "gdn_z_q4k"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m1.get()},
+            {qkv_m1.get(), z_m1.get()},
+            [&]
+            {
+                return cuda_qkv->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
+            }))
+            << "M=1 mixed Q5_K/Q4_K Qwen3.6 GDN qkv+z decode projection failed for row " << row;
+
+        const float *qkv_row = qkv_m4->data() + static_cast<size_t>(row) * N_QKV;
+        const float *z_row = z_m4->data() + static_cast<size_t>(row) * N_Z;
+        const auto qkv_result =
+            checkParity(qkv_row, qkv_m1->data(), static_cast<size_t>(N_QKV), 0.999999, 1.0e-5);
+        const auto z_result =
+            checkParity(z_row, z_m1->data(), static_cast<size_t>(N_Z), 0.999999, 1.0e-5);
+
+        EXPECT_FALSE(qkv_result.has_nan_inf)
+            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row << " produced non-finite output";
+        EXPECT_FALSE(z_result.has_nan_inf)
+            << "M=4 mixed Q5_K/Q4_K GDN z row " << row << " produced non-finite output";
+        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
+            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << qkv_result.relative_l2_error
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_GE(z_result.cosine_similarity, 0.999999)
+            << "M=4 mixed Q5_K/Q4_K GDN z row " << row
+            << " diverges from single-row fused decode"
+            << " rel_l2=" << z_result.relative_l2_error
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
+            << "M=4 mixed Q5_K/Q4_K GDN qkv row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << qkv_result.cosine_similarity
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
+            << "M=4 mixed Q5_K/Q4_K GDN z row " << row
+            << " relative L2 differs from single-row fused decode"
+            << " cosine=" << z_result.cosine_similarity
+            << " max_abs=" << z_result.max_abs_error;
+    }
+
+    cleanupSharedWorkspace({cuda_qkv, cuda_z});
+    EXPECT_FALSE(cuda_qkv->hasDynamicStateActive())
+        << "M=4 mixed-codebook GDN qkv fused verifier test must not leak CUDA dynamic state";
+    EXPECT_FALSE(cuda_z->hasDynamicStateActive())
+        << "M=4 mixed-codebook GDN z fused verifier test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_FusedVerifierSmallM_2RowsTwoProjections)
+{
+    const int M = 2;
+    const int N0 = 896;
+    const int N1 = 512;
+    const int K = 768;
+
+    auto weights0 = TestTensorFactory::createQ4_KRandom({(size_t)N0, (size_t)K}, 225);
+    auto weights1 = TestTensorFactory::createQ4_KRandom({(size_t)N1, (size_t)K}, 226);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C0_cpu(static_cast<size_t>(M) * N0, 0.0f);
+    std::vector<float> C1_cpu(static_cast<size_t>(M) * N1, 0.0f);
+    auto cpu_kernel0 = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights0.get(), KernelDeviceType::CPU);
+    auto cpu_kernel1 = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights1.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel0, nullptr);
+    ASSERT_NE(cpu_kernel1, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel0.get(), A_data.data(), C0_cpu.data(), M, N0, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel1.get(), A_data.data(), C1_cpu.data(), M, N1, K));
+
+    auto *cuda_kernel0 = getPreparedKernel(weights0.get(), gpu_device_);
+    auto *cuda_kernel1 = getPreparedKernel(weights1.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel0, nullptr);
+    ASSERT_NE(cuda_kernel1, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_kernel0, cuda_kernel1}, M, {N0, N1}, K));
+
+    auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
+    std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto C0_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N0});
+    auto C1_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N1});
+
+    std::vector<TensorProjectionDesc> projections = {
+        {cuda_kernel0, C0_tensor.get(), N0, nullptr, "q4k_proj0"},
+        {cuda_kernel1, C1_tensor.get(), N1, nullptr, "q4k_proj1"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_tensor.get()},
+        {C0_tensor.get(), C1_tensor.get()},
+        [&]
+        {
+            return cuda_kernel0->multiply_fused_tensor(
+                A_tensor.get(), projections, M, K);
+        }));
+
+    const float *C0_cuda = C0_tensor->data();
+    const float *C1_cuda = C1_tensor->data();
+    auto result0 = checkParity(C0_cuda, C0_cpu.data(), C0_cpu.size(), 0.99, 0.15);
+    auto result1 = checkParity(C1_cuda, C1_cpu.data(), C1_cpu.size(), 0.99, 0.15);
+    result0.print("Q4_K fused verifier-small-M projection 0");
+    result1.print("Q4_K fused verifier-small-M projection 1");
+    EXPECT_FALSE(result0.has_nan_inf);
+    EXPECT_FALSE(result1.has_nan_inf);
+    EXPECT_GE(result0.cosine_similarity, 0.99);
+    EXPECT_GE(result1.cosine_similarity, 0.99);
+    EXPECT_LE(result0.relative_l2_error, 0.15);
+    EXPECT_LE(result1.relative_l2_error, 0.15);
+
+    cleanupSharedWorkspace({cuda_kernel0, cuda_kernel1});
+    EXPECT_FALSE(cuda_kernel0->hasDynamicStateActive())
+        << "Small-M fused verifier projection 0 must not leak CUDA dynamic state after workspace cleanup";
+    EXPECT_FALSE(cuda_kernel1->hasDynamicStateActive())
+        << "Small-M fused verifier projection 1 must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+}
+
+TEST_F(Test__CUDAGemmParity, GDNProjectionStageFusesCUDAQuantizedQKVAndZSmallM)
+{
+    const int M = 2;
+    const int K = 768;
+    const int N_QKV = 896;
+    const int N_Z = 512;
+    const int N_ALPHA = 16;
+    const int N_BETA = 16;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    auto input_data = randomFP32(static_cast<size_t>(M) * K);
+    std::memcpy(input->mutable_data(), input_data.data(), input_data.size() * sizeof(float));
+
+    auto weights_qkv = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 232);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 233);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)}, -0.1f, 0.1f, 234);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)}, -0.1f, 0.1f, 235);
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
+
+    std::vector<float> alpha_cpu(static_cast<size_t>(M) * N_ALPHA, 0.0f);
+    std::vector<float> beta_cpu(static_cast<size_t>(M) * N_BETA, 0.0f);
+    auto cpu_alpha = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_alpha.get(), KernelDeviceType::CPU);
+    auto cpu_beta = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights_beta.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_alpha, nullptr);
+    ASSERT_NE(cpu_beta, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_alpha.get(), input_data.data(), alpha_cpu.data(), M, N_ALPHA, K));
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_beta.get(), input_data.data(), beta_cpu.data(), M, N_BETA, K));
+
+    auto output_qkv = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_QKV)});
+    auto output_z = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_Z)});
+    auto output_alpha = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_ALPHA)});
+    auto output_beta = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_BETA)});
+
+    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
+    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    ASSERT_NE(kernel_qkv, nullptr);
+    ASSERT_NE(kernel_z, nullptr);
+    ASSERT_NE(kernel_alpha, nullptr);
+    ASSERT_NE(kernel_beta, nullptr);
+    ASSERT_TRUE(kernel_qkv->supports_fused_projection())
+        << "CUDA quantized GEMM must advertise fused projection support so GDN can batch qkv+z";
+    ASSERT_TRUE(kernel_z->supports_fused_projection())
+        << "CUDA quantized GEMM must advertise fused projection support so GDN can batch qkv+z";
+    ASSERT_TRUE(kernel_alpha->supports_fused_projection())
+        << "CUDA FP32 GEMM must advertise fused projection support so GDN can batch alpha+beta";
+    ASSERT_TRUE(kernel_beta->supports_fused_projection())
+        << "CUDA FP32 GEMM must advertise fused projection support so GDN can batch alpha+beta";
+
+    GDNProjectionStage::Params params;
+    params.device_id = gpu_device_;
+    params.input = input.get();
+    params.m = M;
+    params.k = K;
+    params.w_qkv = weights_qkv.get();
+    params.output_qkv = output_qkv.get();
+    params.n_qkv = N_QKV;
+    params.w_z = weights_z.get();
+    params.output_z = output_z.get();
+    params.n_z = N_Z;
+    params.w_a = weights_alpha.get();
+    params.output_a = output_alpha.get();
+    params.n_a = N_ALPHA;
+    params.w_b = weights_beta.get();
+    params.output_b = output_beta.get();
+    params.n_b = N_BETA;
+    params.gemm_qkv = kernel_qkv;
+    params.gemm_z = kernel_z;
+    params.gemm_a = kernel_alpha;
+    params.gemm_b = kernel_beta;
+
+    GDNProjectionStage stage(params);
+    WorkspaceRequirements reqs = stage.getWorkspaceRequirements(M, 0, K);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, workspaceBudgetFor(reqs));
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    stage.bindWorkspace(workspace_.get());
+
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+    stage.setGPUStream(static_cast<void *>(stream));
+    CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+
+    const bool ok = with_gpu_coherence(
+        gpu_device_,
+        {input.get()},
+        {output_qkv.get(), output_z.get(), output_alpha.get(), output_beta.get()},
+        [&]
+        {
+            return stage.execute(&ctx);
+        });
+    ASSERT_TRUE(ok);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    ASSERT_NE(output_qkv->gpu_data_ptr(), nullptr);
+    ASSERT_NE(output_z->gpu_data_ptr(), nullptr);
+    ASSERT_NE(output_alpha->gpu_data_ptr(), nullptr);
+    ASSERT_NE(output_beta->gpu_data_ptr(), nullptr);
+    ASSERT_EQ(cudaMemsetAsync(output_qkv->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_QKV * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(output_z->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_Z * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(output_alpha->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_ALPHA * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaMemsetAsync(output_beta->gpu_data_ptr(), 0,
+                              static_cast<size_t>(M) * N_BETA * sizeof(float), stream),
+              cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t graph_exec = nullptr;
+    ASSERT_EQ(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal), cudaSuccess);
+    ASSERT_TRUE(stage.execute(&ctx))
+        << "CUDA GDN projection stage should be graph-capturable with fused qkv+z and alpha+beta subgroups";
+    ASSERT_EQ(cudaStreamEndCapture(stream, &graph), cudaSuccess);
+    ASSERT_NE(graph, nullptr);
+    ASSERT_EQ(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), cudaSuccess);
+    ASSERT_EQ(cudaGraphLaunch(graph_exec, stream), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+    ASSERT_EQ(cudaGraphExecDestroy(graph_exec), cudaSuccess);
+    ASSERT_EQ(cudaGraphDestroy(graph), cudaSuccess);
+
+    output_qkv->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_z->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_alpha->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_beta->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+
+    stage.unbindWorkspace();
+    workspace_.reset();
+    kernel_qkv->resetDynamicState();
+    kernel_z->resetDynamicState();
+    kernel_alpha->resetDynamicState();
+    kernel_beta->resetDynamicState();
+
+    const auto route_records = PerfStatsCollector::snapshot({"kernel.gdn_projection_route"});
+    const auto qkv_z_route = std::find_if(
+        route_records.begin(),
+        route_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "gdn_projection_route" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("route") == "native_subgroup" &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("projections") == "2" &&
+                   record.tags.at("names") == "qkv+z";
+        });
+    ASSERT_NE(qkv_z_route, route_records.end())
+        << "CUDA GDN verifier projection must fuse quantized qkv+z instead of routing both as single fallbacks";
+
+    const auto alpha_beta_route = std::find_if(
+        route_records.begin(),
+        route_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "gdn_projection_route" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("route") == "same_kernel_mixed_codebook_subgroup" &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("projections") == "2" &&
+                   record.tags.at("names") == "alpha+beta";
+        });
+    ASSERT_NE(alpha_beta_route, route_records.end())
+        << "CUDA GDN verifier projection must batch FP32 alpha+beta instead of routing them as single fallbacks";
+
+    const auto fused_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+    const auto fused_kernel_record = std::find_if(
+        fused_records.begin(),
+        fused_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("projections") == "2";
+        });
+    ASSERT_NE(fused_kernel_record, fused_records.end())
+        << "CUDA qkv+z GDN subgroup should execute the graph-native small-M fused projection kernel";
+
+    const auto fp32_fused_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_fp32_batched_fused_projection_calls"});
+    const auto fp32_fused_record = std::find_if(
+        fp32_fused_records.begin(),
+        fp32_fused_records.end(),
+        [&](const PerfStatRecord &record)
+        {
+            return record.domain == "kernel" &&
+                   record.name == "cuda_fp32_batched_fused_projection_calls" &&
+                   record.kind == PerfStatRecord::Kind::Counter &&
+                   record.tags.at("m") == std::to_string(M) &&
+                   record.tags.at("k") == std::to_string(K) &&
+                   record.tags.at("n") == std::to_string(N_ALPHA) &&
+                   record.tags.at("projections") == "2" &&
+                   record.tags.at("route") == "tiny_fp32_batched_projection";
+        });
+    ASSERT_NE(fp32_fused_record, fp32_fused_records.end())
+        << "CUDA alpha+beta GDN subgroup should execute the deterministic tiny FP32 projection route";
+
+    const auto alpha_result =
+        checkParity(output_alpha->data(), alpha_cpu.data(), alpha_cpu.size(), 0.9999, 0.01);
+    const auto beta_result =
+        checkParity(output_beta->data(), beta_cpu.data(), beta_cpu.size(), 0.9999, 0.01);
+    EXPECT_FALSE(alpha_result.has_nan_inf);
+    EXPECT_FALSE(beta_result.has_nan_inf);
+    EXPECT_GE(alpha_result.cosine_similarity, 0.9999);
+    EXPECT_GE(beta_result.cosine_similarity, 0.9999);
+    EXPECT_LE(alpha_result.relative_l2_error, 0.01);
+    EXPECT_LE(beta_result.relative_l2_error, 0.01);
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @brief Prove production-width GDNProjectionStage verifier rows are decode-equivalent.
+ *
+ * The full Qwen3.6 dense grouped-verifier test compares the captured verifier
+ * graph against serial decode and first fails near `layer1_QKV_PROJECTION`.
+ * This stage-level regression keeps the real layer1 projection formats
+ * (Q5_K qkv, Q4_K z, F32 alpha/beta) and checks the exact graph stage API:
+ * one M=4 verifier-stage execution must match four ordinary M=1 stage
+ * executions row-for-row.  Passing here means remaining drift comes from
+ * surrounding graph state rather than GDNProjectionStage itself.
+ */
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MixedCodebooks_M4MatchesFourM1StageRows)
+{
+    const int M = 4;
+    const int K = 5120;
+    const int N_QKV = 10240;
+    const int N_Z = 6144;
+    const int N_ALPHA = 48;
+    const int N_BETA = 48;
+
+    auto weights_qkv = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N_QKV), static_cast<size_t>(K)}, 4531);
+    auto weights_z = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N_Z), static_cast<size_t>(K)}, 4532);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_ALPHA), static_cast<size_t>(K)}, -0.1f, 0.1f, 4533);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(N_BETA), static_cast<size_t>(K)}, -0.1f, 0.1f, 4534);
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
+
+    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
+    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    ASSERT_NE(kernel_qkv, nullptr);
+    ASSERT_NE(kernel_z, nullptr);
+    ASSERT_NE(kernel_alpha, nullptr);
+    ASSERT_NE(kernel_beta, nullptr);
+
+    struct StageOutputs
+    {
+        std::unique_ptr<FP32Tensor> qkv;
+        std::unique_ptr<FP32Tensor> z;
+        std::unique_ptr<FP32Tensor> alpha;
+        std::unique_ptr<FP32Tensor> beta;
+    };
+
+    auto make_outputs = [&](int rows) -> StageOutputs
+    {
+        return {
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_QKV)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_Z)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_ALPHA)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(N_BETA)})};
+    };
+
+    auto run_stage = [&](int rows, const float *input_data, StageOutputs *outputs)
+    {
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(K)});
+        std::memcpy(
+            input->mutable_data(),
+            input_data,
+            static_cast<size_t>(rows) * K * sizeof(float));
+
+        GDNProjectionStage::Params params;
+        params.device_id = gpu_device_;
+        params.input = input.get();
+        params.m = rows;
+        params.k = K;
+        params.w_qkv = weights_qkv.get();
+        params.output_qkv = outputs->qkv.get();
+        params.n_qkv = N_QKV;
+        params.w_z = weights_z.get();
+        params.output_z = outputs->z.get();
+        params.n_z = N_Z;
+        params.w_a = weights_alpha.get();
+        params.output_a = outputs->alpha.get();
+        params.n_a = N_ALPHA;
+        params.w_b = weights_beta.get();
+        params.output_b = outputs->beta.get();
+        params.n_b = N_BETA;
+        params.gemm_qkv = kernel_qkv;
+        params.gemm_z = kernel_z;
+        params.gemm_a = kernel_alpha;
+        params.gemm_b = kernel_beta;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        GDNProjectionStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(rows, 0, K);
+        DeviceWorkspaceManager workspace(gpu_device_, workspaceBudgetFor(reqs));
+        ASSERT_TRUE(workspace.allocate(reqs));
+        stage.bindWorkspace(&workspace);
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        stage.setGPUStream(static_cast<void *>(stream));
+        CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+        const bool ok = with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            [&]
+            {
+                return stage.execute(&ctx);
+            });
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        stage.unbindWorkspace();
+        kernel_qkv->resetDynamicState();
+        kernel_z->resetDynamicState();
+        kernel_alpha->resetDynamicState();
+        kernel_beta->resetDynamicState();
+    };
+
+    const auto input_data = randomFP32(static_cast<size_t>(M) * K);
+    StageOutputs grouped = make_outputs(M);
+    run_stage(M, input_data.data(), &grouped);
+
+    for (int row = 0; row < M; ++row)
+    {
+        StageOutputs serial = make_outputs(1);
+        run_stage(1, input_data.data() + static_cast<size_t>(row) * K, &serial);
+
+        const auto qkv_result = checkParity(
+            grouped.qkv->data() + static_cast<size_t>(row) * N_QKV,
+            serial.qkv->data(),
+            static_cast<size_t>(N_QKV),
+            0.999999,
+            1.0e-5);
+        const auto z_result = checkParity(
+            grouped.z->data() + static_cast<size_t>(row) * N_Z,
+            serial.z->data(),
+            static_cast<size_t>(N_Z),
+            0.999999,
+            1.0e-5);
+        const auto alpha_result = checkParity(
+            grouped.alpha->data() + static_cast<size_t>(row) * N_ALPHA,
+            serial.alpha->data(),
+            static_cast<size_t>(N_ALPHA),
+            0.999999,
+            1.0e-5);
+        const auto beta_result = checkParity(
+            grouped.beta->data() + static_cast<size_t>(row) * N_BETA,
+            serial.beta->data(),
+            static_cast<size_t>(N_BETA),
+            0.999999,
+            1.0e-5);
+
+        EXPECT_FALSE(qkv_result.has_nan_inf);
+        EXPECT_FALSE(z_result.has_nan_inf);
+        EXPECT_FALSE(alpha_result.has_nan_inf);
+        EXPECT_FALSE(beta_result.has_nan_inf);
+        EXPECT_GE(qkv_result.cosine_similarity, 0.999999)
+            << "stage qkv row " << row << " rel_l2=" << qkv_result.relative_l2_error
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_GE(z_result.cosine_similarity, 0.999999)
+            << "stage z row " << row << " rel_l2=" << z_result.relative_l2_error
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_GE(alpha_result.cosine_similarity, 0.999999)
+            << "stage alpha row " << row << " rel_l2=" << alpha_result.relative_l2_error
+            << " max_abs=" << alpha_result.max_abs_error;
+        EXPECT_GE(beta_result.cosine_similarity, 0.999999)
+            << "stage beta row " << row << " rel_l2=" << beta_result.relative_l2_error
+            << " max_abs=" << beta_result.max_abs_error;
+        EXPECT_LE(qkv_result.relative_l2_error, 1.0e-5)
+            << "stage qkv row " << row << " cosine=" << qkv_result.cosine_similarity
+            << " max_abs=" << qkv_result.max_abs_error;
+        EXPECT_LE(z_result.relative_l2_error, 1.0e-5)
+            << "stage z row " << row << " cosine=" << z_result.cosine_similarity
+            << " max_abs=" << z_result.max_abs_error;
+        EXPECT_LE(alpha_result.relative_l2_error, 1.0e-5)
+            << "stage alpha row " << row << " cosine=" << alpha_result.cosine_similarity
+            << " max_abs=" << alpha_result.max_abs_error;
+        EXPECT_LE(beta_result.relative_l2_error, 1.0e-5)
+            << "stage beta row " << row << " cosine=" << beta_result.cosine_similarity
+            << " max_abs=" << beta_result.max_abs_error;
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+}
+
+/**
+ * @brief Prove the real Qwen3.6 MoE GDN projection verifier rows are serial-decode equivalent.
+ *
+ * The MoE 35B fixture stores GDN qkv/z/out weights as Q6_K and uses the
+ * narrower MoE hidden width (`K=2048`, qkv=`8192`, z=`4096`, alpha/beta=`32`).
+ * Dense Qwen3.6 M=4 tests did not cover this shape or codebook, while the
+ * production continuation proof failed first around QKV/Z projection before
+ * attention and MoE routing amplified the error.  This regression checks the
+ * stage-level contract directly for every production verifier depth:
+ * grouped M=2/3/4 rows must match repeated M=1 decode-stage rows under tight
+ * cosine, relative-L2, max-absolute, and softmax symmetric-KL thresholds.
+ */
+TEST_F(Test__CUDAGemmParity, GDNProjectionStage_Qwen36MoEQ6K_M234MatchesSerialStageRows)
+{
+    constexpr int kK = 2048;
+    constexpr int kNQKV = 8192;
+    constexpr int kNZ = 4096;
+    constexpr int kNAlpha = 32;
+    constexpr int kNBeta = 32;
+    constexpr std::array<int, 3> kVerifierRows = {2, 3, 4};
+
+    auto weights_qkv = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(kNQKV), static_cast<size_t>(kK)}, 5531);
+    auto weights_z = TestTensorFactory::createQ6_KRandom(
+        {static_cast<size_t>(kNZ), static_cast<size_t>(kK)}, 5532);
+    auto weights_alpha = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNAlpha), static_cast<size_t>(kK)}, -0.1f, 0.1f, 5533);
+    auto weights_beta = TestTensorFactory::createFP32Random(
+        {static_cast<size_t>(kNBeta), static_cast<size_t>(kK)}, -0.1f, 0.1f, 5534);
+    ASSERT_TRUE(weights_alpha->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(weights_beta->ensureOnDevice(gpu_device_));
+
+    auto *kernel_qkv = getPreparedKernel(weights_qkv.get(), gpu_device_);
+    auto *kernel_z = getPreparedKernel(weights_z.get(), gpu_device_);
+    auto *kernel_alpha = getPreparedKernel(weights_alpha.get(), gpu_device_);
+    auto *kernel_beta = getPreparedKernel(weights_beta.get(), gpu_device_);
+    ASSERT_NE(kernel_qkv, nullptr);
+    ASSERT_NE(kernel_z, nullptr);
+    ASSERT_NE(kernel_alpha, nullptr);
+    ASSERT_NE(kernel_beta, nullptr);
+
+    struct StageOutputs
+    {
+        std::unique_ptr<FP32Tensor> qkv;
+        std::unique_ptr<FP32Tensor> z;
+        std::unique_ptr<FP32Tensor> alpha;
+        std::unique_ptr<FP32Tensor> beta;
+    };
+
+    auto make_outputs = [](int rows) -> StageOutputs
+    {
+        return {
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNQKV)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNZ)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNAlpha)}),
+            std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kNBeta)})};
+    };
+
+    auto run_stage = [&](int rows, const float *input_data, StageOutputs *outputs)
+    {
+        auto input = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(kK)});
+        std::memcpy(
+            input->mutable_data(),
+            input_data,
+            static_cast<size_t>(rows) * kK * sizeof(float));
+
+        GDNProjectionStage::Params params;
+        params.device_id = gpu_device_;
+        params.input = input.get();
+        params.m = rows;
+        params.k = kK;
+        params.w_qkv = weights_qkv.get();
+        params.output_qkv = outputs->qkv.get();
+        params.n_qkv = kNQKV;
+        params.w_z = weights_z.get();
+        params.output_z = outputs->z.get();
+        params.n_z = kNZ;
+        params.w_a = weights_alpha.get();
+        params.output_a = outputs->alpha.get();
+        params.n_a = kNAlpha;
+        params.w_b = weights_beta.get();
+        params.output_b = outputs->beta.get();
+        params.n_b = kNBeta;
+        params.gemm_qkv = kernel_qkv;
+        params.gemm_z = kernel_z;
+        params.gemm_a = kernel_alpha;
+        params.gemm_b = kernel_beta;
+        params.force_decode_equivalent_verifier_prefill = true;
+
+        GDNProjectionStage stage(params);
+        WorkspaceRequirements reqs = stage.getWorkspaceRequirements(rows, 0, kK);
+        DeviceWorkspaceManager workspace(gpu_device_, workspaceBudgetFor(reqs));
+        ASSERT_TRUE(workspace.allocate(reqs));
+        stage.bindWorkspace(&workspace);
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+        stage.setGPUStream(static_cast<void *>(stream));
+        CUDADeviceContext ctx(gpu_device_, gpu_device_.ordinal);
+        const bool ok = with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {outputs->qkv.get(), outputs->z.get(), outputs->alpha.get(), outputs->beta.get()},
+            [&]
+            {
+                return stage.execute(&ctx);
+            });
+        ASSERT_TRUE(ok);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        stage.unbindWorkspace();
+        kernel_qkv->resetDynamicState();
+        kernel_z->resetDynamicState();
+        kernel_alpha->resetDynamicState();
+        kernel_beta->resetDynamicState();
+    };
+
+    auto expect_strict_row = [](
+        const ParityResult &result,
+        const char *label,
+        int m,
+        int row,
+        double max_symmetric_kl = 1.0e-8)
+    {
+        EXPECT_FALSE(result.has_nan_inf)
+            << label << " M=" << m << " row=" << row << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << label << " M=" << m << " row=" << row
+            << " cosine drift rel_l2=" << result.relative_l2_error
+            << " symmetric_kl=" << result.symmetric_kl
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.relative_l2_error, 1.0e-5)
+            << label << " M=" << m << " row=" << row
+            << " relative-L2 drift cosine=" << result.cosine_similarity
+            << " symmetric_kl=" << result.symmetric_kl
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.symmetric_kl, max_symmetric_kl)
+            << label << " M=" << m << " row=" << row
+            << " softmax distribution drift cosine=" << result.cosine_similarity
+            << " rel_l2=" << result.relative_l2_error
+            << " max_abs=" << result.max_abs_error;
+        EXPECT_LE(result.max_abs_error, 3.0e-4f)
+            << label << " M=" << m << " row=" << row
+            << " max-absolute drift cosine=" << result.cosine_similarity
+            << " rel_l2=" << result.relative_l2_error
+            << " symmetric_kl=" << result.symmetric_kl;
+    };
+
+    for (int M : kVerifierRows)
+    {
+        const auto input_data = randomFP32(static_cast<size_t>(M) * kK);
+        StageOutputs grouped = make_outputs(M);
+        run_stage(M, input_data.data(), &grouped);
+
+        for (int row = 0; row < M; ++row)
+        {
+            StageOutputs serial = make_outputs(1);
+            run_stage(1, input_data.data() + static_cast<size_t>(row) * kK, &serial);
+
+            expect_strict_row(
+                checkParity(
+                    grouped.qkv->data() + static_cast<size_t>(row) * kNQKV,
+                    serial.qkv->data(),
+                    static_cast<size_t>(kNQKV),
+                    0.999999,
+                    1.0e-5),
+                "qkv",
+                M,
+                row);
+            expect_strict_row(
+                checkParity(
+                    grouped.z->data() + static_cast<size_t>(row) * kNZ,
+                    serial.z->data(),
+                    static_cast<size_t>(kNZ),
+                    0.999999,
+                    1.0e-5),
+                "z",
+                M,
+                row);
+            expect_strict_row(
+                checkParity(
+                    grouped.alpha->data() + static_cast<size_t>(row) * kNAlpha,
+                    serial.alpha->data(),
+                    static_cast<size_t>(kNAlpha),
+                    0.999999,
+                    1.0e-5),
+                "alpha",
+                M,
+                row,
+                1.0e-10);
+            expect_strict_row(
+                checkParity(
+                    grouped.beta->data() + static_cast<size_t>(row) * kNBeta,
+                    serial.beta->data(),
+                    static_cast<size_t>(kNBeta),
+                    0.999999,
+                    1.0e-5),
+                "beta",
+                M,
+                row,
+                1.0e-10);
+        }
+    }
+
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_qkv.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_z.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_alpha.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_beta.get());
+}
+
+TEST_F(Test__CUDAGemmParity, MTP_SmallM_FusedProjection_AllNativeFormats)
+{
+    const int K = 256;
+    const int N0 = 192;
+    const int N1 = 128;
+    const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    for (const auto &fmt : cudaSmallMNativeFormats())
+    {
+        auto weights0 = fmt.create(N0, K);
+        auto weights1 = fmt.create(N1, K);
+        ASSERT_NE(weights0, nullptr) << "Failed to create " << fmt.name << " first projection";
+        ASSERT_NE(weights1, nullptr) << "Failed to create " << fmt.name << " second projection";
+
+        auto cpu_kernel0 = llaminar::v2::kernels::KernelFactory::createGemm(
+            weights0.get(), KernelDeviceType::CPU);
+        auto cpu_kernel1 = llaminar::v2::kernels::KernelFactory::createGemm(
+            weights1.get(), KernelDeviceType::CPU);
+        ASSERT_NE(cpu_kernel0, nullptr) << fmt.name << " CPU projection 0 kernel";
+        ASSERT_NE(cpu_kernel1, nullptr) << fmt.name << " CPU projection 1 kernel";
+
+        auto *cuda_kernel0 = getPreparedKernel(weights0.get(), gpu_device_);
+        auto *cuda_kernel1 = getPreparedKernel(weights1.get(), gpu_device_);
+        ASSERT_NE(cuda_kernel0, nullptr) << fmt.name << " CUDA projection 0 kernel";
+        ASSERT_NE(cuda_kernel1, nullptr) << fmt.name << " CUDA projection 1 kernel";
+
+        ASSERT_TRUE(setupSharedWorkspace({cuda_kernel0, cuda_kernel1}, 4, {N0, N1}, K))
+            << fmt.name << " shared workspace";
+
+        for (int M : verifier_rows)
+        {
+            auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+            std::vector<float> C0_cpu(static_cast<size_t>(M) * N0, 0.0f);
+            std::vector<float> C1_cpu(static_cast<size_t>(M) * N1, 0.0f);
+            ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel0.get(), A_data.data(), C0_cpu.data(), M, N0, K))
+                << fmt.name << " CPU projection 0 at M=" << M;
+            ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel1.get(), A_data.data(), C1_cpu.data(), M, N1, K))
+                << fmt.name << " CPU projection 1 at M=" << M;
+
+            auto A_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+            std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+            auto C0_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N0)});
+            auto C1_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N1)});
+
+            std::vector<TensorProjectionDesc> projections = {
+                {cuda_kernel0, C0_tensor.get(), N0, nullptr, "qkv"},
+                {cuda_kernel1, C1_tensor.get(), N1, nullptr, "z"}};
+
+            ASSERT_TRUE(with_gpu_coherence(
+                gpu_device_,
+                {A_tensor.get()},
+                {C0_tensor.get(), C1_tensor.get()},
+                [&]
+                {
+                    return cuda_kernel0->multiply_fused_tensor(
+                        A_tensor.get(), projections, M, K);
+                }))
+                << fmt.name << " CUDA fused projection failed at M=" << M;
+
+            const float *C0_cuda = C0_tensor->data();
+            const float *C1_cuda = C1_tensor->data();
+            const auto result0 =
+                checkParity(C0_cuda, C0_cpu.data(), C0_cpu.size(), fmt.cosine_threshold, 0.20);
+            const auto result1 =
+                checkParity(C1_cuda, C1_cpu.data(), C1_cpu.size(), fmt.cosine_threshold, 0.20);
+            EXPECT_FALSE(result0.has_nan_inf)
+                << fmt.name << " projection 0 produced non-finite output at M=" << M;
+            EXPECT_FALSE(result1.has_nan_inf)
+                << fmt.name << " projection 1 produced non-finite output at M=" << M;
+            EXPECT_GE(result0.cosine_similarity, fmt.cosine_threshold)
+                << fmt.name << " projection 0 cosine too low at M=" << M
+                << " rel_l2=" << result0.relative_l2_error
+                << " max_abs=" << result0.max_abs_error;
+            EXPECT_GE(result1.cosine_similarity, fmt.cosine_threshold)
+                << fmt.name << " projection 1 cosine too low at M=" << M
+                << " rel_l2=" << result1.relative_l2_error
+                << " max_abs=" << result1.max_abs_error;
+            EXPECT_LE(result0.relative_l2_error, 0.20)
+                << fmt.name << " projection 0 relative L2 too high at M=" << M;
+            EXPECT_LE(result1.relative_l2_error, 0.20)
+                << fmt.name << " projection 1 relative L2 too high at M=" << M;
+        }
+
+        cleanupSharedWorkspace({cuda_kernel0, cuda_kernel1});
+        EXPECT_FALSE(cuda_kernel0->hasDynamicStateActive())
+            << fmt.name << " projection 0 leaked CUDA dynamic state";
+        EXPECT_FALSE(cuda_kernel1->hasDynamicStateActive())
+            << fmt.name << " projection 1 leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+    }
+
+    const auto records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+    uint64_t total_count = 0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter)
+        {
+            total_count += record.count;
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"), "2");
+            const std::string &m_tag = record.tags.at("m");
+            const std::string &route_tag = record.tags.at("route");
+            EXPECT_TRUE(m_tag == "2" || m_tag == "3" || m_tag == "4");
+            EXPECT_EQ(route_tag, "specialized")
+                << "CUDA verifier projections should use the specialized native-VNNI small-M route";
+        }
+    }
+    EXPECT_EQ(total_count, cudaSmallMNativeFormats().size() * verifier_rows.size())
+        << "Every CUDA native format and M=2/3/4 verifier shape should use the fused small-M route";
+
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatchSerialGEMVs)
+{
+    const int K = 512;
+    const int N = 384;
+    const std::array<int, 3> verifier_rows = {2, 3, 4};
+
+    ScopedEnv deterministic("LLAMINAR_DETERMINISTIC", "1");
+    ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
+        << "CUDA native-VNNI IQ grid tables must be initialized for direct low-level GEMV tests";
+
+    for (const auto &fmt : cudaSmallMNativeFormats())
+    {
+        auto weights = fmt.create(N, K);
+        ASSERT_NE(weights, nullptr) << "Failed to create " << fmt.name << " weights";
+
+        auto *base_kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(base_kernel, nullptr) << fmt.name << " CUDA kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(base_kernel, 4, N, K))
+            << fmt.name << " workspace";
+
+        cudaStream_t stream = nullptr;
+        ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess)
+            << fmt.name << " explicit CUDA stream";
+        base_kernel->setGPUStream(stream);
+
+        DeviceNativeVNNIMatrixDesc desc;
+        ASSERT_TRUE(base_kernel->exportNativeVNNIMatrixDesc(desc))
+            << fmt.name << " must export native-VNNI packed descriptor";
+
+        CUDAGemvContext *gemv_ctx = cudaGemvContext_create(gpu_device_.ordinal);
+        ASSERT_NE(gemv_ctx, nullptr) << fmt.name << " GEMV context";
+        auto *kpar_partials = static_cast<float *>(
+            workspace_->getBuffer(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS));
+        const size_t kpar_partials_bytes =
+            workspace_->getBufferSize(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+        cudaGemvContext_bindWorkspace(gemv_ctx, kpar_partials, kpar_partials_bytes);
+
+        CUDARowMajorWeights *rowmajor = nullptr;
+
+        for (int M : verifier_rows)
+        {
+            auto A_data = randomFP32(static_cast<size_t>(M) * K);
+            auto A_tensor = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+            std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+
+            auto C_specialized = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+            auto C_serial = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+
+            ASSERT_TRUE(with_gpu_coherence(
+                gpu_device_,
+                {A_tensor.get()},
+                {C_specialized.get(), C_serial.get()},
+                [&]
+                {
+                    const float *d_A = static_cast<const float *>(A_tensor->gpu_data_ptr());
+                    float *d_C_specialized = static_cast<float *>(C_specialized->gpu_data_ptr());
+                    float *d_C_serial = static_cast<float *>(C_serial->gpu_data_ptr());
+                    auto *d_A_int8 = static_cast<int8_t *>(
+                        workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+                    auto *d_scales_A = static_cast<float *>(
+                        workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+
+                    if (!d_A || !d_C_specialized || !d_C_serial || !d_A_int8 || !d_scales_A)
+                        return false;
+
+                    if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                            d_A,
+                            d_A_int8,
+                            d_scales_A,
+                            M,
+                            K,
+                            gpu_device_.ordinal,
+                            stream))
+                    {
+                        return false;
+                    }
+
+                    if (!cudaNativeVNNIGemvTuned_small_m_fp32(
+                            d_A_int8,
+                            static_cast<const uint8_t *>(desc.payload),
+                            static_cast<const uint16_t *>(desc.scales),
+                            static_cast<const uint16_t *>(desc.mins),
+                            static_cast<const uint32_t *>(desc.emins),
+                            d_C_specialized,
+                            d_scales_A,
+                            M,
+                            N,
+                            K,
+                            1.0f,
+                            0.0f,
+                            nullptr,
+                            nullptr,
+                            desc.codebook_id,
+                            gpu_device_.ordinal,
+                            stream,
+                            gemv_ctx,
+                            &rowmajor))
+                    {
+                        return false;
+                    }
+
+                    for (int row = 0; row < M; ++row)
+                    {
+                        const int8_t *row_A =
+                            d_A_int8 + static_cast<size_t>(row) * static_cast<size_t>(K);
+                        const float *row_scales =
+                            d_scales_A + static_cast<size_t>(row) * static_cast<size_t>(K / 32);
+                        float *row_C =
+                            d_C_serial + static_cast<size_t>(row) * static_cast<size_t>(N);
+                        if (!cudaNativeVNNIGemvTuned_fp32(
+                                row_A,
+                                static_cast<const uint8_t *>(desc.payload),
+                                static_cast<const uint16_t *>(desc.scales),
+                                static_cast<const uint16_t *>(desc.mins),
+                                static_cast<const uint32_t *>(desc.emins),
+                                row_C,
+                                row_scales,
+                                N,
+                                K,
+                                1.0f,
+                                0.0f,
+                                nullptr,
+                                nullptr,
+                                desc.codebook_id,
+                                gpu_device_.ordinal,
+                                stream,
+                                gemv_ctx,
+                                &rowmajor))
+                        {
+                            return false;
+                        }
+                    }
+
+                    return cudaStreamSynchronize(stream) == cudaSuccess;
+                }))
+                << fmt.name << " specialized-vs-serial CUDA native-VNNI GEMV failed at M=" << M;
+
+            const auto result = checkParity(
+                C_specialized->data(),
+                C_serial->data(),
+                static_cast<size_t>(M) * N,
+                0.999999,
+                1e-5);
+            EXPECT_FALSE(result.has_nan_inf)
+                << fmt.name << " M=" << M << " specialized small-M output contains non-finite values";
+            EXPECT_LE(result.relative_l2_error, 1e-5)
+                << fmt.name << " M=" << M << " relative L2 differs from serial GEMVs";
+            /**
+             * The grouped M=2..4 kernels and the serial M=1 oracle can use
+             * different generated KPAR tilings for the same codebook.  That is
+             * still decode-equivalent for the verifier contract when the full
+             * distribution metrics are tight; keep this absolute bound as a
+             * small outlier guard instead of making one reduction-order ULP
+             * spike override cosine/relative-L2.
+             */
+            EXPECT_LE(result.max_abs_error, 3e-4f)
+                << fmt.name << " M=" << M
+                << " max abs differs from serial GEMVs"
+                << " rel_l2=" << result.relative_l2_error
+                << " cosine=" << result.cosine_similarity;
+            if (result.max_abs_error > 0.0f)
+            {
+                EXPECT_GE(result.cosine_similarity, 0.999999)
+                    << fmt.name << " M=" << M
+                    << " specialized CUDA small-M GEMV diverges from serial GEMVs"
+                    << " rel_l2=" << result.relative_l2_error
+                    << " max_abs=" << result.max_abs_error;
+            }
+        }
+
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        if (rowmajor)
+            cudaRowMajorWeights_destroy(rowmajor);
+        cudaGemvContext_destroy(gemv_ctx);
+        base_kernel->setGPUStream(nullptr);
+        ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+        cleanupWorkspaceIfNeeded(base_kernel);
+        EXPECT_FALSE(base_kernel->hasDynamicStateActive())
+            << fmt.name << " specialized small-M equivalence test leaked CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+}
+
+TEST_F(Test__CUDAGemmParity, MTP_SmallM_MoEProjectionNamesUseSpecializedNativeVNNI)
+{
+    const int K = 256;
+    const int N0 = 192;
+    const int N1 = 128;
+    const std::array<int, 2> verifier_rows = {3, 4};
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights0 = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N0), static_cast<size_t>(K)}, 230);
+    auto weights1 = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N1), static_cast<size_t>(K)}, 231);
+    ASSERT_NE(weights0, nullptr);
+    ASSERT_NE(weights1, nullptr);
+
+    auto cpu_kernel0 = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights0.get(), KernelDeviceType::CPU);
+    auto cpu_kernel1 = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights1.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel0, nullptr);
+    ASSERT_NE(cpu_kernel1, nullptr);
+
+    auto *cuda_kernel0 = getPreparedKernel(weights0.get(), gpu_device_);
+    auto *cuda_kernel1 = getPreparedKernel(weights1.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel0, nullptr);
+    ASSERT_NE(cuda_kernel1, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_kernel0, cuda_kernel1}, 4, {N0, N1}, K));
+
+    for (int M : verifier_rows)
+    {
+        auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+        std::vector<float> C0_cpu(static_cast<size_t>(M) * N0, 0.0f);
+        std::vector<float> C1_cpu(static_cast<size_t>(M) * N1, 0.0f);
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel0.get(), A_data.data(), C0_cpu.data(), M, N0, K));
+        ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel1.get(), A_data.data(), C1_cpu.data(), M, N1, K));
+
+        auto A_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::memcpy(A_tensor->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+        auto C0_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N0)});
+        auto C1_tensor = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N1)});
+
+        std::vector<TensorProjectionDesc> projections = {
+            {cuda_kernel0, C0_tensor.get(), N0, nullptr, "shared_gate"},
+            {cuda_kernel1, C1_tensor.get(), N1, nullptr, "shared_up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_tensor.get()},
+            {C0_tensor.get(), C1_tensor.get()},
+            [&]
+            {
+                return cuda_kernel0->multiply_fused_tensor(
+                    A_tensor.get(), projections, M, K);
+            }))
+            << "MoE-style CUDA fused projection failed at M=" << M;
+
+        const float *C0_cuda = C0_tensor->data();
+        const float *C1_cuda = C1_tensor->data();
+        const auto result0 =
+            checkParity(C0_cuda, C0_cpu.data(), C0_cpu.size(), 0.990, 0.20);
+        const auto result1 =
+            checkParity(C1_cuda, C1_cpu.data(), C1_cpu.size(), 0.990, 0.20);
+        EXPECT_FALSE(result0.has_nan_inf);
+        EXPECT_FALSE(result1.has_nan_inf);
+        EXPECT_GE(result0.cosine_similarity, 0.990)
+            << "projection 0 cosine too low at M=" << M;
+        EXPECT_GE(result1.cosine_similarity, 0.990)
+            << "projection 1 cosine too low at M=" << M;
+        EXPECT_LE(result0.relative_l2_error, 0.20);
+        EXPECT_LE(result1.relative_l2_error, 0.20);
+    }
+
+    cleanupSharedWorkspace({cuda_kernel0, cuda_kernel1});
+    EXPECT_FALSE(cuda_kernel0->hasDynamicStateActive());
+    EXPECT_FALSE(cuda_kernel1->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights0.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights1.get());
+
+    const auto records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_fused_projection_calls"});
+    uint64_t total_count = 0;
+    for (const auto &record : records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_small_m_fused_projection_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter)
+        {
+            total_count += record.count;
+            EXPECT_EQ(record.tags.at("k"), std::to_string(K));
+            EXPECT_EQ(record.tags.at("projections"), "2");
+            EXPECT_EQ(record.tags.at("route"), "specialized")
+                << "MoE projection groups must use the same specialized small-M native-VNNI route";
+        }
+    }
+    EXPECT_EQ(total_count, verifier_rows.size());
+
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_FusedSwiGLUDownSmallM_2x896x768)
+{
+    const int M = 2;
+    const int N = 896;
+    const int K = 768;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 228);
+    auto gate_data = randomFP32(static_cast<size_t>(M) * K);
+    auto up_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuFusedSwiGLUDownToVector(
+        cpu_kernel.get(), gate_data.data(), up_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+        cuda_kernel, gate_data.data(), up_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_K fused-SwiGLU down small-M 2x896x768");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+    EXPECT_LE(result.relative_l2_error, 0.15)
+        << "Relative L2 error too high: " << (result.relative_l2_error * 100.0) << "%";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "Small-M fused-SwiGLU down test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M4FusedProjectionMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 17408;
+    const int K = 5120;
+
+    auto weights_gate = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 331);
+    auto weights_up = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 332);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_gate = getPreparedKernel(weights_gate.get(), gpu_device_);
+    auto *cuda_up = getPreparedKernel(weights_up.get(), gpu_device_);
+    ASSERT_NE(cuda_gate, nullptr);
+    ASSERT_NE(cuda_up, nullptr);
+    ASSERT_TRUE(setupSharedWorkspace({cuda_gate, cuda_up}, M, {N, N}, K));
+
+    auto A_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_m4->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto gate_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    auto up_m4 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    std::vector<TensorProjectionDesc> m4_projections = {
+        {cuda_gate, gate_m4.get(), N, nullptr, "ffn_gate"},
+        {cuda_up, up_m4.get(), N, nullptr, "ffn_up"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m4.get()},
+        {gate_m4.get(), up_m4.get()},
+        [&]
+        {
+            return cuda_gate->multiply_fused_tensor(
+                A_m4.get(), m4_projections, M, K);
+        }))
+        << "M=4 Qwen3.6 FFN gate/up fused projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto A_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+        std::memcpy(
+            A_m1->mutable_data(),
+            A_data.data() + static_cast<size_t>(row) * K,
+            static_cast<size_t>(K) * sizeof(float));
+        auto gate_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+        auto up_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+        std::vector<TensorProjectionDesc> m1_projections = {
+            {cuda_gate, gate_m1.get(), N, nullptr, "ffn_gate"},
+            {cuda_up, up_m1.get(), N, nullptr, "ffn_up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m1.get()},
+            {gate_m1.get(), up_m1.get()},
+            [&]
+            {
+                return cuda_gate->multiply_fused_tensor(
+                    A_m1.get(), m1_projections, 1, K);
+            }))
+            << "M=1 Qwen3.6 FFN gate/up projection failed for row " << row;
+
+        const float *gate_row =
+            gate_m4->data() + static_cast<size_t>(row) * N;
+        const float *up_row =
+            up_m4->data() + static_cast<size_t>(row) * N;
+        const auto gate_result =
+            checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+        const auto up_result =
+            checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+        EXPECT_FALSE(gate_result.has_nan_inf)
+            << "M=4 Qwen3.6 FFN gate row " << row
+            << " produced non-finite output";
+        EXPECT_FALSE(up_result.has_nan_inf)
+            << "M=4 Qwen3.6 FFN up row " << row
+            << " produced non-finite output";
+        EXPECT_GE(gate_result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 FFN gate row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_GE(up_result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 FFN up row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
+            << "M=4 Qwen3.6 FFN gate row " << row
+            << " relative L2 differs from single-row decode GEMV";
+        EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
+            << "M=4 Qwen3.6 FFN up row " << row
+            << " relative L2 differs from single-row decode GEMV";
+    }
+
+    cleanupSharedWorkspace({cuda_gate, cuda_up});
+    EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
+    EXPECT_FALSE(cuda_up->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_gate.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_up.get());
+}
+
+TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M4FusedProjectionMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 17408;
+    const int K = 5120;
+
+    struct FormatCase
+    {
+        const char *name;
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t, int)> create;
+    };
+
+    const std::array<FormatCase, 2> formats = {
+        FormatCase{
+            "Q5_1",
+            [](size_t n, size_t k, int seed)
+            {
+                return TestTensorFactory::createQ5_1Random({n, k}, seed);
+            }},
+        FormatCase{
+            "Q5_K",
+            [](size_t n, size_t k, int seed)
+            {
+                return TestTensorFactory::createQ5_KRandom({n, k}, seed);
+            }}};
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+
+    for (size_t fmt_index = 0; fmt_index < formats.size(); ++fmt_index)
+    {
+        const auto &fmt = formats[fmt_index];
+        PerfStatsCollector::reset();
+
+        auto weights_gate = fmt.create(static_cast<size_t>(N), static_cast<size_t>(K),
+                                       341 + static_cast<int>(fmt_index) * 10);
+        auto weights_up = fmt.create(static_cast<size_t>(N), static_cast<size_t>(K),
+                                     342 + static_cast<int>(fmt_index) * 10);
+        auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+        auto *cuda_gate = getPreparedKernel(weights_gate.get(), gpu_device_);
+        auto *cuda_up = getPreparedKernel(weights_up.get(), gpu_device_);
+        ASSERT_NE(cuda_gate, nullptr) << fmt.name << " gate kernel";
+        ASSERT_NE(cuda_up, nullptr) << fmt.name << " up kernel";
+        ASSERT_TRUE(setupSharedWorkspace({cuda_gate, cuda_up}, M, {N, N}, K))
+            << fmt.name << " shared workspace";
+
+        auto A_m4 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::memcpy(A_m4->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+        auto gate_m4 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        auto up_m4 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        std::vector<TensorProjectionDesc> m4_projections = {
+            {cuda_gate, gate_m4.get(), N, nullptr, "ffn_gate"},
+            {cuda_up, up_m4.get(), N, nullptr, "ffn_up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m4.get()},
+            {gate_m4.get(), up_m4.get()},
+            [&]
+            {
+                return cuda_gate->multiply_fused_tensor(
+                    A_m4.get(), m4_projections, M, K);
+            }))
+            << fmt.name << " M=4 Qwen3.6 FFN gate/up fused projection failed";
+
+        for (int row = 0; row < M; ++row)
+        {
+            auto A_m1 = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+            std::memcpy(
+                A_m1->mutable_data(),
+                A_data.data() + static_cast<size_t>(row) * K,
+                static_cast<size_t>(K) * sizeof(float));
+            auto gate_m1 = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+            auto up_m1 = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+            std::vector<TensorProjectionDesc> m1_projections = {
+                {cuda_gate, gate_m1.get(), N, nullptr, "ffn_gate"},
+                {cuda_up, up_m1.get(), N, nullptr, "ffn_up"}};
+
+            ASSERT_TRUE(with_gpu_coherence(
+                gpu_device_,
+                {A_m1.get()},
+                {gate_m1.get(), up_m1.get()},
+                [&]
+                {
+                    return cuda_gate->multiply_fused_tensor(
+                        A_m1.get(), m1_projections, 1, K);
+                }))
+                << fmt.name << " M=1 Qwen3.6 FFN gate/up projection failed for row " << row;
+
+            const float *gate_row =
+                gate_m4->data() + static_cast<size_t>(row) * N;
+            const float *up_row =
+                up_m4->data() + static_cast<size_t>(row) * N;
+            const auto gate_result =
+                checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+            const auto up_result =
+                checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+            EXPECT_FALSE(gate_result.has_nan_inf)
+                << fmt.name << " M=4 Qwen3.6 FFN gate row " << row
+                << " produced non-finite output";
+            EXPECT_FALSE(up_result.has_nan_inf)
+                << fmt.name << " M=4 Qwen3.6 FFN up row " << row
+                << " produced non-finite output";
+            EXPECT_GE(gate_result.cosine_similarity, 0.999999)
+                << fmt.name << " M=4 Qwen3.6 FFN gate row " << row
+                << " diverges from single-row decode GEMV";
+            EXPECT_GE(up_result.cosine_similarity, 0.999999)
+                << fmt.name << " M=4 Qwen3.6 FFN up row " << row
+                << " diverges from single-row decode GEMV";
+            EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
+                << fmt.name << " M=4 Qwen3.6 FFN gate row " << row
+                << " relative L2 differs from single-row decode GEMV";
+            EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
+                << fmt.name << " M=4 Qwen3.6 FFN up row " << row
+                << " relative L2 differs from single-row decode GEMV";
+        }
+
+        const auto route_records =
+            PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+        uint64_t codebook7_m4_specialized = 0;
+        for (const auto &record : route_records)
+        {
+            if (record.domain == "kernel" &&
+                record.name == "cuda_native_vnni_small_m_calls" &&
+                record.kind == PerfStatRecord::Kind::Counter &&
+                record.tags.at("m") == std::to_string(M) &&
+                record.tags.at("codebook") == "7" &&
+                record.tags.at("n") == std::to_string(N) &&
+                record.tags.at("k") == std::to_string(K) &&
+                record.tags.at("route") == "specialized")
+            {
+                codebook7_m4_specialized += record.count;
+            }
+        }
+        EXPECT_EQ(codebook7_m4_specialized, 2u)
+            << fmt.name << " M=4 gate/up must route through the specialized "
+            << "codebook-7 verifier path";
+
+        cleanupSharedWorkspace({cuda_gate, cuda_up});
+        EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
+        EXPECT_FALSE(cuda_up->hasDynamicStateActive());
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_gate.get());
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_up.get());
+        PerfStatsCollector::reset();
+    }
+}
+
+TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSingleRowDecodeGEMVs)
+{
+    const int M = 2;
+    const int N = 17408;
+    const int K = 5120;
+
+    struct FormatCase
+    {
+        const char *name;
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t, int)> create;
+    };
+
+    const std::array<FormatCase, 2> formats = {
+        FormatCase{
+            "Q5_1",
+            [](size_t n, size_t k, int seed)
+            {
+                return TestTensorFactory::createQ5_1Random({n, k}, seed);
+            }},
+        FormatCase{
+            "Q5_K",
+            [](size_t n, size_t k, int seed)
+            {
+                return TestTensorFactory::createQ5_KRandom({n, k}, seed);
+            }}};
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+
+    for (size_t fmt_index = 0; fmt_index < formats.size(); ++fmt_index)
+    {
+        const auto &fmt = formats[fmt_index];
+        PerfStatsCollector::reset();
+
+        auto weights_gate = fmt.create(static_cast<size_t>(N), static_cast<size_t>(K),
+                                       361 + static_cast<int>(fmt_index) * 10);
+        auto weights_up = fmt.create(static_cast<size_t>(N), static_cast<size_t>(K),
+                                     362 + static_cast<int>(fmt_index) * 10);
+        auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+        auto *cuda_gate = getPreparedKernel(weights_gate.get(), gpu_device_);
+        auto *cuda_up = getPreparedKernel(weights_up.get(), gpu_device_);
+        ASSERT_NE(cuda_gate, nullptr) << fmt.name << " gate kernel";
+        ASSERT_NE(cuda_up, nullptr) << fmt.name << " up kernel";
+        ASSERT_TRUE(setupSharedWorkspace({cuda_gate, cuda_up}, M, {N, N}, K))
+            << fmt.name << " shared workspace";
+
+        auto A_m2 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+        std::memcpy(A_m2->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+        auto gate_m2 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        auto up_m2 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+        std::vector<TensorProjectionDesc> m2_projections = {
+            {cuda_gate, gate_m2.get(), N, nullptr, "ffn_gate"},
+            {cuda_up, up_m2.get(), N, nullptr, "ffn_up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m2.get()},
+            {gate_m2.get(), up_m2.get()},
+            [&]
+            {
+                return cuda_gate->multiply_fused_tensor(
+                    A_m2.get(), m2_projections, M, K);
+            }))
+            << fmt.name << " M=2 Qwen3.6 FFN gate/up fused projection failed";
+
+        for (int row = 0; row < M; ++row)
+        {
+            auto A_m1 = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+            std::memcpy(
+                A_m1->mutable_data(),
+                A_data.data() + static_cast<size_t>(row) * K,
+                static_cast<size_t>(K) * sizeof(float));
+            auto gate_m1 = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+            auto up_m1 = std::make_unique<FP32Tensor>(
+                std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+            std::vector<TensorProjectionDesc> m1_projections = {
+                {cuda_gate, gate_m1.get(), N, nullptr, "ffn_gate"},
+                {cuda_up, up_m1.get(), N, nullptr, "ffn_up"}};
+
+            ASSERT_TRUE(with_gpu_coherence(
+                gpu_device_,
+                {A_m1.get()},
+                {gate_m1.get(), up_m1.get()},
+                [&]
+                {
+                    return cuda_gate->multiply_fused_tensor(
+                        A_m1.get(), m1_projections, 1, K);
+                }))
+                << fmt.name << " M=1 Qwen3.6 FFN gate/up projection failed for row " << row;
+
+            const float *gate_row =
+                gate_m2->data() + static_cast<size_t>(row) * N;
+            const float *up_row =
+                up_m2->data() + static_cast<size_t>(row) * N;
+            const auto gate_result =
+                checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+            const auto up_result =
+                checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+            EXPECT_FALSE(gate_result.has_nan_inf)
+                << fmt.name << " M=2 Qwen3.6 FFN gate row " << row
+                << " produced non-finite output";
+            EXPECT_FALSE(up_result.has_nan_inf)
+                << fmt.name << " M=2 Qwen3.6 FFN up row " << row
+                << " produced non-finite output";
+            EXPECT_GE(gate_result.cosine_similarity, 0.999999)
+                << fmt.name << " M=2 Qwen3.6 FFN gate row " << row
+                << " diverges from single-row decode GEMV";
+            EXPECT_GE(up_result.cosine_similarity, 0.999999)
+                << fmt.name << " M=2 Qwen3.6 FFN up row " << row
+                << " diverges from single-row decode GEMV";
+            EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
+                << fmt.name << " M=2 Qwen3.6 FFN gate row " << row
+                << " relative L2 differs from single-row decode GEMV";
+            EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
+                << fmt.name << " M=2 Qwen3.6 FFN up row " << row
+                << " relative L2 differs from single-row decode GEMV";
+        }
+
+        const auto route_records =
+            PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+        uint64_t specialized = 0;
+        for (const auto &record : route_records)
+        {
+            if (record.domain == "kernel" &&
+                record.name == "cuda_native_vnni_small_m_calls" &&
+                record.kind == PerfStatRecord::Kind::Counter &&
+                record.tags.at("m") == std::to_string(M) &&
+                record.tags.at("n") == std::to_string(N) &&
+                record.tags.at("k") == std::to_string(K) &&
+                record.tags.at("route") == "specialized")
+            {
+                specialized += record.count;
+            }
+        }
+        EXPECT_EQ(specialized, 2u)
+            << fmt.name << " M=2 gate/up must route through specialized "
+            << "small-M native-VNNI projections";
+
+        cleanupSharedWorkspace({cuda_gate, cuda_up});
+        EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
+        EXPECT_FALSE(cuda_up->hasDynamicStateActive());
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_gate.get());
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_up.get());
+        PerfStatsCollector::reset();
+    }
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_M2FusedProjectionMatchesTwoSingleRowDecodeGEMVs)
+{
+    const int M = 2;
+    const int N = 17408;
+    const int K = 5120;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights_gate = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 381);
+    auto weights_up = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 382);
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_gate = getPreparedKernel(weights_gate.get(), gpu_device_);
+    auto *cuda_up = getPreparedKernel(weights_up.get(), gpu_device_);
+    ASSERT_NE(cuda_gate, nullptr) << "Q4_K gate kernel";
+    ASSERT_NE(cuda_up, nullptr) << "Q4_K up kernel";
+    ASSERT_TRUE(setupSharedWorkspace({cuda_gate, cuda_up}, M, {N, N}, K))
+        << "Q4_K shared workspace";
+
+    auto A_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    std::memcpy(A_m2->mutable_data(), A_data.data(), A_data.size() * sizeof(float));
+    auto gate_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    auto up_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    std::vector<TensorProjectionDesc> m2_projections = {
+        {cuda_gate, gate_m2.get(), N, nullptr, "ffn_gate"},
+        {cuda_up, up_m2.get(), N, nullptr, "ffn_up"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m2.get()},
+        {gate_m2.get(), up_m2.get()},
+        [&]
+        {
+            return cuda_gate->multiply_fused_tensor(
+                A_m2.get(), m2_projections, M, K);
+        }))
+        << "Q4_K M=2 Qwen3.6 FFN gate/up fused projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        auto A_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+        std::memcpy(
+            A_m1->mutable_data(),
+            A_data.data() + static_cast<size_t>(row) * K,
+            static_cast<size_t>(K) * sizeof(float));
+        auto gate_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+        auto up_m1 = std::make_unique<FP32Tensor>(
+            std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+        std::vector<TensorProjectionDesc> m1_projections = {
+            {cuda_gate, gate_m1.get(), N, nullptr, "ffn_gate"},
+            {cuda_up, up_m1.get(), N, nullptr, "ffn_up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {A_m1.get()},
+            {gate_m1.get(), up_m1.get()},
+            [&]
+            {
+                return cuda_gate->multiply_fused_tensor(
+                    A_m1.get(), m1_projections, 1, K);
+            }))
+            << "Q4_K M=1 Qwen3.6 FFN gate/up projection failed for row " << row;
+
+        const float *gate_row =
+            gate_m2->data() + static_cast<size_t>(row) * N;
+        const float *up_row =
+            up_m2->data() + static_cast<size_t>(row) * N;
+        const auto gate_result =
+            checkParity(gate_row, gate_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+        const auto up_result =
+            checkParity(up_row, up_m1->data(), static_cast<size_t>(N), 0.999999, 1.0e-5);
+        EXPECT_FALSE(gate_result.has_nan_inf)
+            << "Q4_K M=2 Qwen3.6 FFN gate row " << row
+            << " produced non-finite output";
+        EXPECT_FALSE(up_result.has_nan_inf)
+            << "Q4_K M=2 Qwen3.6 FFN up row " << row
+            << " produced non-finite output";
+        EXPECT_GE(gate_result.cosine_similarity, 0.999999)
+            << "Q4_K M=2 Qwen3.6 FFN gate row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_GE(up_result.cosine_similarity, 0.999999)
+            << "Q4_K M=2 Qwen3.6 FFN up row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_LE(gate_result.relative_l2_error, 1.0e-5)
+            << "Q4_K M=2 Qwen3.6 FFN gate row " << row
+            << " relative L2 differs from single-row decode GEMV";
+        EXPECT_LE(up_result.relative_l2_error, 1.0e-5)
+            << "Q4_K M=2 Qwen3.6 FFN up row " << row
+            << " relative L2 differs from single-row decode GEMV";
+    }
+
+    const auto route_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+    uint64_t q4k_specialized = 0;
+    for (const auto &record : route_records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_small_m_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.at("m") == std::to_string(M) &&
+            record.tags.at("codebook") == "5" &&
+            record.tags.at("n") == std::to_string(N) &&
+            record.tags.at("k") == std::to_string(K) &&
+            record.tags.at("route") == "specialized")
+        {
+            q4k_specialized += record.count;
+        }
+    }
+    EXPECT_EQ(q4k_specialized, 2u)
+        << "Q4_K M=2 gate/up must route through specialized small-M native-VNNI projections";
+
+    cleanupSharedWorkspace({cuda_gate, cuda_up});
+    EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
+    EXPECT_FALSE(cuda_up->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_gate.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_up.get());
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalSmallMRoute)
+{
+    const int N = 17408;
+    const int K = 5120;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedDeterministicDebugEnv deterministic;
+    PerfStatsCollector::reset();
+
+    auto weights_gate = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 383);
+    auto weights_up = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 384);
+    auto A_data = randomFP32(static_cast<size_t>(2) * K);
+
+    auto *cuda_gate = getPreparedKernel(weights_gate.get(), gpu_device_);
+    auto *cuda_up = getPreparedKernel(weights_up.get(), gpu_device_);
+    ASSERT_NE(cuda_gate, nullptr) << "Q4_K gate kernel";
+    ASSERT_NE(cuda_up, nullptr) << "Q4_K up kernel";
+    ASSERT_TRUE(setupSharedWorkspace({cuda_gate, cuda_up}, 2, {N, N}, K))
+        << "Q4_K shared workspace";
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess)
+        << "explicit CUDA stream";
+    cuda_gate->setGPUStream(stream);
+    cuda_up->setGPUStream(stream);
+
+    auto A_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{2}, static_cast<size_t>(K)});
+    std::memcpy(A_m2->mutable_data(), A_data.data(), static_cast<size_t>(2) * K * sizeof(float));
+    auto gate_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{2}, static_cast<size_t>(N)});
+    auto up_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{2}, static_cast<size_t>(N)});
+    std::vector<TensorProjectionDesc> m2_projections = {
+        {cuda_gate, gate_m2.get(), N, nullptr, "ffn_gate"},
+        {cuda_up, up_m2.get(), N, nullptr, "ffn_up"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m2.get()},
+        {gate_m2.get(), up_m2.get()},
+        [&]
+        {
+            return cuda_gate->multiply_fused_tensor(A_m2.get(), m2_projections, 2, K);
+        }))
+        << "Q4_K M=2 canonical gate/up projection failed";
+
+    auto A_m1 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+    std::memcpy(A_m1->mutable_data(), A_data.data(), static_cast<size_t>(K) * sizeof(float));
+    auto gate_m1 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+    auto up_m1 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+    std::vector<TensorProjectionDesc> m1_projections = {
+        {cuda_gate, gate_m1.get(), N, nullptr, "ffn_gate"},
+        {cuda_up, up_m1.get(), N, nullptr, "ffn_up"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m1.get()},
+        {gate_m1.get(), up_m1.get()},
+        [&]
+        {
+            return cuda_gate->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
+        }))
+        << "Q4_K deterministic M=1 canonical gate/up projection failed";
+
+    const auto gate_result =
+        checkParity(gate_m2->data(), gate_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
+    const auto up_result =
+        checkParity(up_m2->data(), up_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
+    EXPECT_FALSE(gate_result.has_nan_inf);
+    EXPECT_FALSE(up_result.has_nan_inf);
+    EXPECT_LE(gate_result.max_abs_error, 1.0e-6f)
+        << "Deterministic M=1 Q4_K gate path must match canonical M=2 row 0";
+    EXPECT_LE(up_result.max_abs_error, 1.0e-6f)
+        << "Deterministic M=1 Q4_K up path must match canonical M=2 row 0";
+    EXPECT_LE(gate_result.relative_l2_error, 1.0e-7);
+    EXPECT_LE(up_result.relative_l2_error, 1.0e-7);
+
+    const auto route_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_small_m_calls"});
+    uint64_t canonical_m1 = 0;
+    for (const auto &record : route_records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_m1_canonical_small_m_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.at("codebook") == "5" &&
+            record.tags.at("n") == std::to_string(N) &&
+            record.tags.at("k") == std::to_string(K))
+        {
+            canonical_m1 += record.count;
+        }
+    }
+    EXPECT_EQ(canonical_m1, 2u)
+        << "Deterministic M=1 gate/up must route through canonical small-M GEMV";
+
+    cleanupSharedWorkspace({cuda_gate, cuda_up});
+    cuda_gate->setGPUStream(nullptr);
+    cuda_up->setGPUStream(nullptr);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
+    EXPECT_FALSE(cuda_up->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_gate.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_up.get());
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, Q5_K_Qwen36FFNGateUp_DeterministicM1UsesCanonicalSmallMRoute)
+{
+    const int N = 17408;
+    const int K = 5120;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedDeterministicDebugEnv deterministic;
+    PerfStatsCollector::reset();
+
+    auto weights_gate = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 385);
+    auto weights_up = TestTensorFactory::createQ5_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 386);
+    auto A_data = randomFP32(static_cast<size_t>(2) * K);
+
+    auto *cuda_gate = getPreparedKernel(weights_gate.get(), gpu_device_);
+    auto *cuda_up = getPreparedKernel(weights_up.get(), gpu_device_);
+    ASSERT_NE(cuda_gate, nullptr) << "Q5_K gate kernel";
+    ASSERT_NE(cuda_up, nullptr) << "Q5_K up kernel";
+    ASSERT_TRUE(setupSharedWorkspace({cuda_gate, cuda_up}, 2, {N, N}, K))
+        << "Q5_K shared workspace";
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess)
+        << "explicit CUDA stream";
+    cuda_gate->setGPUStream(stream);
+    cuda_up->setGPUStream(stream);
+
+    auto A_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{2}, static_cast<size_t>(K)});
+    std::memcpy(A_m2->mutable_data(), A_data.data(), static_cast<size_t>(2) * K * sizeof(float));
+    auto gate_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{2}, static_cast<size_t>(N)});
+    auto up_m2 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{2}, static_cast<size_t>(N)});
+    std::vector<TensorProjectionDesc> m2_projections = {
+        {cuda_gate, gate_m2.get(), N, nullptr, "ffn_gate"},
+        {cuda_up, up_m2.get(), N, nullptr, "ffn_up"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m2.get()},
+        {gate_m2.get(), up_m2.get()},
+        [&]
+        {
+            return cuda_gate->multiply_fused_tensor(A_m2.get(), m2_projections, 2, K);
+        }))
+        << "Q5_K M=2 canonical gate/up projection failed";
+
+    auto A_m1 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{1}, static_cast<size_t>(K)});
+    std::memcpy(A_m1->mutable_data(), A_data.data(), static_cast<size_t>(K) * sizeof(float));
+    auto gate_m1 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+    auto up_m1 = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{size_t{1}, static_cast<size_t>(N)});
+    std::vector<TensorProjectionDesc> m1_projections = {
+        {cuda_gate, gate_m1.get(), N, nullptr, "ffn_gate"},
+        {cuda_up, up_m1.get(), N, nullptr, "ffn_up"}};
+
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {A_m1.get()},
+        {gate_m1.get(), up_m1.get()},
+        [&]
+        {
+            return cuda_gate->multiply_fused_tensor(A_m1.get(), m1_projections, 1, K);
+        }))
+        << "Q5_K deterministic M=1 canonical gate/up projection failed";
+
+    const auto gate_result =
+        checkParity(gate_m2->data(), gate_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
+    const auto up_result =
+        checkParity(up_m2->data(), up_m1->data(), static_cast<size_t>(N), 0.99999999, 1.0e-7);
+    EXPECT_FALSE(gate_result.has_nan_inf);
+    EXPECT_FALSE(up_result.has_nan_inf);
+    EXPECT_LE(gate_result.max_abs_error, 1.0e-6f)
+        << "Deterministic M=1 Q5_K gate path must match canonical M=2 row 0";
+    EXPECT_LE(up_result.max_abs_error, 1.0e-6f)
+        << "Deterministic M=1 Q5_K up path must match canonical M=2 row 0";
+    EXPECT_LE(gate_result.relative_l2_error, 1.0e-7);
+    EXPECT_LE(up_result.relative_l2_error, 1.0e-7);
+
+    const auto route_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_m1_canonical_small_m_calls"});
+    uint64_t canonical_m1 = 0;
+    for (const auto &record : route_records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_m1_canonical_small_m_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.at("codebook") == "7" &&
+            record.tags.at("n") == std::to_string(N) &&
+            record.tags.at("k") == std::to_string(K))
+        {
+            canonical_m1 += record.count;
+        }
+    }
+    EXPECT_EQ(canonical_m1, 2u)
+        << "Deterministic M=1 Q5_K gate/up must route through canonical small-M GEMV";
+
+    cleanupSharedWorkspace({cuda_gate, cuda_up});
+    cuda_gate->setGPUStream(nullptr);
+    cuda_up->setGPUStream(nullptr);
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    EXPECT_FALSE(cuda_gate->hasDynamicStateActive());
+    EXPECT_FALSE(cuda_up->hasDynamicStateActive());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_gate.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_up.get());
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 5120;
+    const int K = 17408;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 233);
+    auto gate_data = randomFP32(static_cast<size_t>(M) * K);
+    auto up_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+        cuda_kernel,
+        gate_data.data(),
+        up_data.data(),
+        C_m4.data(),
+        M,
+        N,
+        K,
+        gpu_device_))
+        << "M=4 Qwen3.6 fused-SwiGLU down projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+            cuda_kernel,
+            gate_data.data() + static_cast<size_t>(row) * K,
+            up_data.data() + static_cast<size_t>(row) * K,
+            C_m1.data(),
+            1,
+            N,
+            K,
+            gpu_device_))
+            << "M=1 Qwen3.6 fused-SwiGLU down projection failed for row " << row;
+
+        const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
+        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
+        EXPECT_FALSE(result.has_nan_inf)
+            << "M=4 Qwen3.6 fused-SwiGLU down row " << row
+            << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.999999)
+            << "M=4 Qwen3.6 fused-SwiGLU down row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_LE(result.relative_l2_error, 1e-5)
+            << "M=4 Qwen3.6 fused-SwiGLU down row " << row
+            << " relative L2 differs from single-row decode GEMV";
+    }
+
+    const auto route_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls"});
+    uint64_t q4k_m4_specialized = 0;
+    for (const auto &record : route_records)
+    {
+        if (record.domain == "kernel" &&
+            record.name == "cuda_native_vnni_small_m_calls" &&
+            record.kind == PerfStatRecord::Kind::Counter &&
+            record.tags.at("m") == std::to_string(M) &&
+            record.tags.at("codebook") == "5" &&
+            record.tags.at("n") == std::to_string(N) &&
+            record.tags.at("k") == std::to_string(K) &&
+            record.tags.at("route") == "specialized")
+        {
+            q4k_m4_specialized += record.count;
+        }
+    }
+    EXPECT_EQ(q4k_m4_specialized, 1u)
+        << "Qwen3.6 verifier-sized fused-SwiGLU down must use the "
+        << "decode-equivalent small-M GEMV route, not generic NativeVNNI prefill";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "M=4 Qwen3.6 fused-SwiGLU row-equivalence test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_Qwen36FFNDown_M2FusedSwiGLUUsesSpecializedNativeVNNI)
+{
+    const int M = 2;
+    const int N = 5120;
+    const int K = 17408;
+
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto weights = TestTensorFactory::createQ4_KRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 234);
+    auto gate_data = randomFP32(static_cast<size_t>(M) * K);
+    auto up_data = randomFP32(static_cast<size_t>(M) * K);
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_m2(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+        cuda_kernel,
+        gate_data.data(),
+        up_data.data(),
+        C_m2.data(),
+        M,
+        N,
+        K,
+        gpu_device_))
+        << "M=2 Qwen3.6 fused-SwiGLU down projection failed";
+
+    for (int row = 0; row < M; ++row)
+    {
+        std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+        ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+            cuda_kernel,
+            gate_data.data() + static_cast<size_t>(row) * K,
+            up_data.data() + static_cast<size_t>(row) * K,
+            C_m1.data(),
+            1,
+            N,
+            K,
+            gpu_device_))
+            << "M=1 Qwen3.6 fused-SwiGLU down projection failed for row " << row;
+
+        const float *verifier_row = C_m2.data() + static_cast<size_t>(row) * N;
+        const auto result = checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.9999995, 1e-6);
+        EXPECT_FALSE(result.has_nan_inf)
+            << "M=2 Qwen3.6 fused-SwiGLU down row " << row
+            << " produced non-finite output";
+        EXPECT_GE(result.cosine_similarity, 0.9999995)
+            << "M=2 Qwen3.6 fused-SwiGLU down row " << row
+            << " diverges from single-row decode GEMV";
+        EXPECT_LE(result.relative_l2_error, 1e-6)
+            << "M=2 Qwen3.6 fused-SwiGLU down row " << row
+            << " relative L2 differs from single-row decode GEMV";
+    }
+
+    const auto route_records =
+        PerfStatsCollector::snapshot({"kernel.cuda_native_vnni_small_m_calls",
+                                      "kernel.cuda_native_vnni_m2_calls"});
+    uint64_t specialized_records = 0;
+    uint64_t m2_kernel_records = 0;
+    for (const auto &record : route_records)
+    {
+        if (record.domain != "kernel" ||
+            record.kind != PerfStatRecord::Kind::Counter)
+        {
+            continue;
+        }
+
+        const bool shape_match =
+            record.tags.at("n") == std::to_string(N) &&
+            record.tags.at("k") == std::to_string(K);
+        if (!shape_match)
+        {
+            continue;
+        }
+
+        if (record.name == "cuda_native_vnni_small_m_calls" &&
+            record.tags.at("m") == std::to_string(M) &&
+            record.tags.at("codebook") == "5" &&
+            record.tags.at("route") == "specialized")
+        {
+            specialized_records += record.count;
+        }
+        if (record.name == "cuda_native_vnni_m2_calls" &&
+            record.tags.at("codebook") == "5" &&
+            record.tags.at("route") == "specialized")
+        {
+            m2_kernel_records += record.count;
+        }
+    }
+    EXPECT_EQ(specialized_records, 1u)
+        << "Qwen3.6 fused-SwiGLU down M=2 must use specialized native-VNNI small-M GEMV";
+    EXPECT_EQ(m2_kernel_records, 1u)
+        << "Qwen3.6 fused-SwiGLU down M=2 must emit the M2 tuning counter";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "M=2 Qwen3.6 fused-SwiGLU row-equivalence test must not leak CUDA dynamic state";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    PerfStatsCollector::reset();
+}
+
+TEST_F(Test__CUDAGemmParity, Q5Native_Qwen36FFNDown_M4FusedSwiGLUMatchesFourSingleRowDecodeGEMVs)
+{
+    const int M = 4;
+    const int N = 5120;
+    const int K = 17408;
+
+    struct FormatCase
+    {
+        const char *name;
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t, int)> create;
+    };
+
+    const std::array<FormatCase, 2> formats = {
+        FormatCase{
+            "Q5_1",
+            [](size_t n, size_t k, int seed)
+            {
+                return TestTensorFactory::createQ5_1Random({n, k}, seed);
+            }},
+        FormatCase{
+            "Q5_K",
+            [](size_t n, size_t k, int seed)
+            {
+                return TestTensorFactory::createQ5_KRandom({n, k}, seed);
+            }}};
+
+    for (size_t fmt_index = 0; fmt_index < formats.size(); ++fmt_index)
+    {
+        const auto &fmt = formats[fmt_index];
+
+        auto weights = fmt.create(
+            static_cast<size_t>(N),
+            static_cast<size_t>(K),
+            243 + static_cast<int>(fmt_index) * 10);
+        auto gate_data = randomFP32(static_cast<size_t>(M) * K);
+        auto up_data = randomFP32(static_cast<size_t>(M) * K);
+
+        auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+        ASSERT_NE(cuda_kernel, nullptr) << fmt.name << " CUDA kernel";
+        ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K))
+            << fmt.name << " workspace";
+
+        std::vector<float> C_m4(static_cast<size_t>(M) * N, 0.0f);
+        ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+            cuda_kernel,
+            gate_data.data(),
+            up_data.data(),
+            C_m4.data(),
+            M,
+            N,
+            K,
+            gpu_device_))
+            << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down projection failed";
+
+        for (int row = 0; row < M; ++row)
+        {
+            std::vector<float> C_m1(static_cast<size_t>(N), 0.0f);
+            ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+                cuda_kernel,
+                gate_data.data() + static_cast<size_t>(row) * K,
+                up_data.data() + static_cast<size_t>(row) * K,
+                C_m1.data(),
+                1,
+                N,
+                K,
+                gpu_device_))
+                << fmt.name << " M=1 Qwen3.6 fused-SwiGLU down projection failed for row " << row;
+
+            const float *verifier_row = C_m4.data() + static_cast<size_t>(row) * N;
+            const auto result =
+                checkParity(verifier_row, C_m1.data(), C_m1.size(), 0.999999, 1e-5);
+            EXPECT_FALSE(result.has_nan_inf)
+                << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down row " << row
+                << " produced non-finite output";
+            EXPECT_GE(result.cosine_similarity, 0.999999)
+                << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down row " << row
+                << " diverges from single-row decode GEMV";
+            EXPECT_LE(result.relative_l2_error, 1e-5)
+                << fmt.name << " M=4 Qwen3.6 fused-SwiGLU down row " << row
+                << " relative L2 differs from single-row decode GEMV";
+        }
+
+        cleanupWorkspaceIfNeeded(cuda_kernel);
+        EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+            << fmt.name << " M=4 Qwen3.6 fused-SwiGLU row-equivalence test "
+            << "must not leak CUDA dynamic state";
+        llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+    }
+}
+
+TEST_F(Test__CUDAGemmParity, Q4_K_FusedSwiGLUDownDecodeM1_1x896x768)
+{
+    const int M = 1;
+    const int N = 896;
+    const int K = 768;
+
+    auto weights = TestTensorFactory::createQ4_KRandom({(size_t)N, (size_t)K}, 232);
+    auto gate_data = randomFP32(static_cast<size_t>(M) * K);
+    auto up_data = randomFP32(static_cast<size_t>(M) * K);
+
+    std::vector<float> C_cpu(static_cast<size_t>(M) * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuFusedSwiGLUDownToVector(
+        cpu_kernel.get(), gate_data.data(), up_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), C_cpu.size()));
+
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
+    ASSERT_TRUE(cudaFusedSwiGLUDownViaTensor(
+        cuda_kernel, gate_data.data(), up_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    auto result = checkParity(C_cuda.data(), C_cpu.data(), C_cpu.size(), 0.99, 0.15);
+    result.print("Q4_K fused-SwiGLU down decode M=1 1x896x768");
+    EXPECT_FALSE(result.has_nan_inf);
+    EXPECT_GE(result.cosine_similarity, 0.99)
+        << "Cosine similarity too low: " << result.cosine_similarity;
+    EXPECT_LE(result.relative_l2_error, 0.15)
+        << "Relative L2 error too high: " << (result.relative_l2_error * 100.0) << "%";
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    EXPECT_FALSE(cuda_kernel->hasDynamicStateActive())
+        << "Decode fused-SwiGLU down test must not leak CUDA dynamic state after workspace cleanup";
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
 // ============================================================================
 // IQ (Importance Quantization) Parity Tests
 // ============================================================================
 
 DEFINE_QUANTIZED_PARITY_TEST(IQ4_XS_SmallMatrix, IQ4_XSTensor, createIQ4_XSRandom, 256, 301)
 DEFINE_QUANTIZED_PARITY_TEST(IQ2_XXS_SmallMatrix, IQ2_XXSTensor, createIQ2_XXSRandom, 256, 302)
+
 DEFINE_QUANTIZED_PARITY_TEST(IQ2_XS_SmallMatrix, IQ2_XSTensor, createIQ2_XSRandom, 256, 303)
 DEFINE_QUANTIZED_PARITY_TEST(IQ2_S_SmallMatrix, IQ2_STensor, createIQ2_SRandom, 256, 304)
 DEFINE_QUANTIZED_PARITY_TEST(IQ3_XXS_SmallMatrix, IQ3_XXSTensor, createIQ3_XXSRandom, 256, 305)
@@ -1019,16 +4336,19 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_Layer0)
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
     EXPECT_TRUE(q4_tensor->isOnGPU());
 
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr) << "Failed to create CUDA kernel";
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1075,15 +4395,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnK_Layer0)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1130,15 +4453,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnV_Layer0)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1184,15 +4510,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_FFNGate_Layer0)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(M * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1245,15 +4574,18 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_LMHead)
 
     // CUDA
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     float *d_A, *d_C;
     std::vector<float> C_cuda(static_cast<size_t>(M) * N, 0.0f);
-    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel.get(), A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+    ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_));
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1315,12 +4647,12 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     // First ensure weights are on GPU
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
-    auto cuda_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
+    auto *cuda_kernel = getPreparedKernel(
+        q4_tensor, gpu_device_);
     ASSERT_NE(cuda_kernel, nullptr);
 
     // Set up workspace for quantized kernel
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel.get(), M, N, K));
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Use with_gpu_coherence for automatic input/output coherence management
     ASSERT_TRUE(with_gpu_coherence(
@@ -1335,7 +4667,7 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
         }));
 
     // Clean up workspace
-    cleanupWorkspaceIfNeeded(cuda_kernel.get());
+    cleanupWorkspaceIfNeeded(cuda_kernel);
 
     // ===== Compare =====
     // data() will automatically sync to host if needed
@@ -1348,6 +4680,9 @@ TEST_F(Test__CUDAGemmParity, RealModel_Q4_0_AttnQ_TensorAPI)
     EXPECT_GE(result.cosine_similarity, 0.99)
         << "multiply_tensor() API shows divergence!";
     EXPECT_FALSE(result.has_nan_inf);
+
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1409,25 +4744,23 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     std::cout << "FusedQKV test: M=" << M << " K=" << K
               << " N_q=" << N_q << " N_k=" << N_k << " N_v=" << N_v << "\n";
 
-    // Ensure all weights are on GPU
-    ASSERT_TRUE(weights_q->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(weights_k->ensureOnDevice(gpu_device_));
-    ASSERT_TRUE(weights_v->ensureOnDevice(gpu_device_));
+    // Note: ensureOnDevice is NOT needed for CUDA quantized GEMM path -
+    // prepareGpuGemmOnDemand handles the upload via WeightVRAMPool internally
 
     // Create CUDA kernels for each projection
-    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_q, KernelDeviceType::CUDA);
-    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_k, KernelDeviceType::CUDA);
-    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_v, KernelDeviceType::CUDA);
+    auto *cuda_kernel_q = getPreparedKernel(
+        weights_q, gpu_device_);
+    auto *cuda_kernel_k = getPreparedKernel(
+        weights_k, gpu_device_);
+    auto *cuda_kernel_v = getPreparedKernel(
+        weights_v, gpu_device_);
     ASSERT_NE(cuda_kernel_q, nullptr) << "Failed to create CUDA kernel for Q";
     ASSERT_NE(cuda_kernel_k, nullptr) << "Failed to create CUDA kernel for K";
     ASSERT_NE(cuda_kernel_v, nullptr) << "Failed to create CUDA kernel for V";
 
     // Set up SHARED workspace for fused QKV (all kernels share workspace)
     ASSERT_TRUE(setupSharedWorkspace(
-        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         M, {N_q, N_k, N_v}, K));
 
     // Create input tensor with random data
@@ -1479,11 +4812,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
 
     // Build projection descriptors
     std::vector<TensorProjectionDesc> projections;
-    projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
+    projections.emplace_back(cuda_kernel_q, output_q_fused.get(), N_q,
                              nullptr, "Q");
-    projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
+    projections.emplace_back(cuda_kernel_k, output_k_fused.get(), N_k,
                              nullptr, "K");
-    projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
+    projections.emplace_back(cuda_kernel_v, output_v_fused.get(), N_v,
                              nullptr, "V");
 
     // Call fused method with coherence wrapper
@@ -1547,6 +4880,7 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
 
     auto result_q_cpu = checkParity(q_fused, q_cpu.data(), M * N_q, 0.99, 0.10);
     result_q_cpu.print("Q projection (CUDA fused vs CPU)");
+
     EXPECT_GE(result_q_cpu.cosine_similarity, 0.99);
 
     auto result_k_cpu = checkParity(k_fused, k_cpu.data(), M * N_k, 0.99, 0.10);
@@ -1558,7 +4892,12 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_TensorAPI_vs_Separate)
     EXPECT_GE(result_v_cpu.cosine_similarity, 0.99);
 
     // Clean up shared workspace
-    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+    cleanupSharedWorkspace({cuda_kernel_q, cuda_kernel_k, cuda_kernel_v});
+
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v);
 }
 
 /**
@@ -1612,16 +4951,16 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     ASSERT_TRUE(weights_k->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(weights_v->ensureOnDevice(gpu_device_));
 
-    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_q, KernelDeviceType::CUDA);
-    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_k, KernelDeviceType::CUDA);
-    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
-        weights_v, KernelDeviceType::CUDA);
+    auto *cuda_kernel_q = getPreparedKernel(
+        weights_q, gpu_device_);
+    auto *cuda_kernel_k = getPreparedKernel(
+        weights_k, gpu_device_);
+    auto *cuda_kernel_v = getPreparedKernel(
+        weights_v, gpu_device_);
 
     // Set up SHARED workspace for fused QKV (all kernels share workspace)
     ASSERT_TRUE(setupSharedWorkspace(
-        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         M, {N_q, N_k, N_v}, K));
 
     auto input_tensor = std::make_unique<FP32Tensor>(
@@ -1642,11 +4981,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
 
     // Run fused with coherence wrapper
     std::vector<TensorProjectionDesc> projections;
-    projections.emplace_back(cuda_kernel_q.get(), output_q_fused.get(), N_q,
+    projections.emplace_back(cuda_kernel_q, output_q_fused.get(), N_q,
                              nullptr, "Q");
-    projections.emplace_back(cuda_kernel_k.get(), output_k_fused.get(), N_k,
+    projections.emplace_back(cuda_kernel_k, output_k_fused.get(), N_k,
                              nullptr, "K");
-    projections.emplace_back(cuda_kernel_v.get(), output_v_fused.get(), N_v,
+    projections.emplace_back(cuda_kernel_v, output_v_fused.get(), N_v,
                              nullptr, "V");
 
     ASSERT_TRUE(with_gpu_coherence(
@@ -1693,7 +5032,12 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_DecodeSize_M1)
     EXPECT_FALSE(result_v.has_nan_inf);
 
     // Clean up shared workspace
-    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+    cleanupSharedWorkspace({cuda_kernel_q, cuda_kernel_k, cuda_kernel_v});
+
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q_base.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k_base.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v_base.get());
 }
 
 // ============================================================================
@@ -1716,9 +5060,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    // Clear any existing cached kernels
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -1744,26 +5085,19 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
     // Ensure on GPU
     ASSERT_TRUE(q4_tensor->ensureOnDevice(gpu_device_));
 
-    // Create fresh kernel (not cached)
-    auto fresh_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        q4_tensor, KernelDeviceType::CUDA);
-    ASSERT_NE(fresh_kernel, nullptr);
+    // Get kernel via prepared GEMM path (legacy createGemm GPU path removed)
+    auto *cuda_kernel = getPreparedKernel(q4_tensor, gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
 
-    // Get cached kernel (this is what the pipeline uses)
-    auto *cached_kernel = getPreparedKernel(q4_tensor, gpu_device_);
-    ASSERT_NE(cached_kernel, nullptr);
-
-    // Set up SHARED workspace for both kernels
-    ASSERT_TRUE(setupSharedWorkspace(
-        {fresh_kernel.get(), cached_kernel},
-        M, {N, N}, K));
+    // Set up workspace
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
 
     // Create input and outputs
     auto input_tensor = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
-    auto output_fresh = std::make_unique<FP32Tensor>(
+    auto output_a = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
-    auto output_cached = std::make_unique<FP32Tensor>(
+    auto output_b = std::make_unique<FP32Tensor>(
         std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
 
     // Fill input
@@ -1773,100 +5107,45 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_vs_FreshKernel)
         input_data[i] = dist_(rng_);
     }
 
-    // Run fresh kernel with coherence wrapper
+    // Run kernel twice — should produce identical results
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
         {input_tensor.get()},
-        {output_fresh.get()},
+        {output_a.get()},
         [&]
         {
-            return fresh_kernel->multiply_tensor(
-                input_tensor.get(), output_fresh.get(),
+            return cuda_kernel->multiply_tensor(
+                input_tensor.get(), output_a.get(),
                 M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
-    // Run cached kernel with coherence wrapper
     ASSERT_TRUE(with_gpu_coherence(
         gpu_device_,
         {input_tensor.get()},
-        {output_cached.get()},
+        {output_b.get()},
         [&]
         {
-            return cached_kernel->multiply_tensor(
-                input_tensor.get(), output_cached.get(),
+            return cuda_kernel->multiply_tensor(
+                input_tensor.get(), output_b.get(),
                 M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
         }));
 
-    // Compare: should be EXACTLY the same (same kernel, same weights)
-    const float *fresh_data = output_fresh->data();
-    const float *cached_data = output_cached->data();
+    // Compare: should be EXACTLY the same (same kernel, same weights, same input)
+    const float *data_a = output_a->data();
+    const float *data_b = output_b->data();
 
-    auto result = checkParity(cached_data, fresh_data, M * N, 0.9999, 0.001);
-    result.print("Cached kernel vs Fresh kernel");
+    auto result = checkParity(data_b, data_a, M * N, 0.9999, 0.001);
+    result.print("Kernel run A vs run B (same prepared kernel)");
 
     EXPECT_GE(result.cosine_similarity, 0.9999)
-        << "Cached and fresh kernels should produce nearly identical results";
+        << "Same prepared kernel should produce nearly identical results";
     EXPECT_FALSE(result.has_nan_inf);
 
-    // Clean up shared workspace
-    cleanupSharedWorkspace({fresh_kernel.get(), cached_kernel});
+    // Clean up workspace
+    cleanupWorkspaceIfNeeded(cuda_kernel);
 
-    // Clear cache for next test
-    llaminar::v2::kernels::KernelFactory::clearCache();
-}
-
-TEST_F(Test__CUDAGemmParity, CachedIQ4_NLKernel_FirstExecutionPopulatesLazyCUDAUploads)
-{
-    const int M = 8;
-    const int N = 128;
-    const int K = 128;
-
-    auto weights = TestTensorFactory::createIQ4_NLRandom({static_cast<size_t>(N), static_cast<size_t>(K)}, 2026);
-    auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)}, -0.25f, 0.25f, 17);
-    auto output = TestTensorFactory::createFP32Zeros({static_cast<size_t>(M), static_cast<size_t>(N)});
-
-    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
-
-    auto *packed = llaminar::v2::kernels::KernelFactory::ensureCUDAPackedWeightsInTensorCache(weights.get());
-    ASSERT_NE(packed, nullptr);
-    EXPECT_EQ(packed->preferred_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
-    EXPECT_EQ(packed->active_family, llaminar2::cuda::CUDAPackedWeightFamily::NativeVNNI);
-    EXPECT_FALSE(packed->uploaded);
-    EXPECT_TRUE(packed->device_uploads.empty());
-    EXPECT_FALSE(packed->native_vnni.empty());
-
-    auto *cached_kernel = getPreparedKernel(weights.get(), gpu_device_);
-    ASSERT_NE(cached_kernel, nullptr);
-    ASSERT_TRUE(setupWorkspaceIfNeeded(cached_kernel, M, N, K));
-
-    ASSERT_TRUE(with_gpu_coherence(
-        gpu_device_,
-        {input.get()},
-        {output.get()},
-        [&]
-        {
-            return cached_kernel->multiply_tensor(
-                input.get(), output.get(),
-                M, N, K,
-                true, 1.0f, 0.0f,
-                nullptr, nullptr, -1);
-        }));
-
-    EXPECT_TRUE(packed->uploaded);
-    auto upload_it = packed->device_uploads.find(gpu_device_.cuda_ordinal());
-    ASSERT_NE(upload_it, packed->device_uploads.end());
-
-    const auto &upload = upload_it->second;
-    EXPECT_NE(upload.d_native_vnni, nullptr);
-    EXPECT_NE(upload.d_native_scales, nullptr);
-    EXPECT_EQ(upload.d_native_mins, nullptr);
-    EXPECT_EQ(upload.d_native_emins, nullptr);
-
-    EXPECT_TRUE(packed->native_vnni.empty()) << "Native payload host buffers should be released after first upload";
-    EXPECT_TRUE(packed->native_scales.empty()) << "Native payload host scales should be released after first upload";
-
-    cleanupWorkspaceIfNeeded(cached_kernel);
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1881,8 +5160,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -1960,7 +5237,8 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_MultipleCallsConsistent)
     // Clean up workspace
     cleanupWorkspaceIfNeeded(kernel);
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 /**
@@ -1976,8 +5254,6 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -2060,7 +5336,8 @@ TEST_F(Test__CUDAGemmParity, CachedKernel_VaryingBatchSizes)
     // Clean up workspace
     cleanupWorkspaceIfNeeded(kernel);
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entry while tensor is still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
 // ============================================================================
@@ -2079,8 +5356,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -2144,16 +5419,16 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
         ASSERT_TRUE(bias_v->ensureOnDevice(gpu_device_));
 
     // Create kernels
-    auto cuda_kernel_q = llaminar::v2::kernels::KernelFactory::createGemm(
-        wq, KernelDeviceType::CUDA);
-    auto cuda_kernel_k = llaminar::v2::kernels::KernelFactory::createGemm(
-        wk, KernelDeviceType::CUDA);
-    auto cuda_kernel_v = llaminar::v2::kernels::KernelFactory::createGemm(
-        wv, KernelDeviceType::CUDA);
+    auto *cuda_kernel_q = getPreparedKernel(
+        wq, gpu_device_);
+    auto *cuda_kernel_k = getPreparedKernel(
+        wk, gpu_device_);
+    auto *cuda_kernel_v = getPreparedKernel(
+        wv, gpu_device_);
 
     // Set up SHARED workspace for fused QKV (all kernels share workspace)
     ASSERT_TRUE(setupSharedWorkspace(
-        {cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()},
+        {cuda_kernel_q, cuda_kernel_k, cuda_kernel_v},
         M, {N_q, N_k, N_v}, K));
 
     // Create input
@@ -2179,11 +5454,11 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
 
     // Run fused GEMM with biases
     std::vector<TensorProjectionDesc> projections;
-    projections.emplace_back(cuda_kernel_q.get(), output_q.get(), N_q,
+    projections.emplace_back(cuda_kernel_q, output_q.get(), N_q,
                              bias_q.get(), "Q");
-    projections.emplace_back(cuda_kernel_k.get(), output_k.get(), N_k,
+    projections.emplace_back(cuda_kernel_k, output_k.get(), N_k,
                              bias_k.get(), "K");
-    projections.emplace_back(cuda_kernel_v.get(), output_v.get(), N_v,
+    projections.emplace_back(cuda_kernel_v, output_v.get(), N_v,
                              bias_v.get(), "V");
 
     ASSERT_TRUE(cuda_kernel_q->multiply_fused_tensor(
@@ -2264,9 +5539,12 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_WithBias)
     EXPECT_FALSE(result_v.has_nan_inf);
 
     // Clean up shared workspace
-    cleanupSharedWorkspace({cuda_kernel_q.get(), cuda_kernel_k.get(), cuda_kernel_v.get()});
+    cleanupSharedWorkspace({cuda_kernel_q, cuda_kernel_k, cuda_kernel_v});
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v.get());
 }
 
 /**
@@ -2283,8 +5561,6 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     {
         GTEST_SKIP() << "Model file not found: " << REAL_MODEL_PATH;
     }
-
-    llaminar::v2::kernels::KernelFactory::clearCache();
 
     auto mpi_ctx = std::make_shared<MPIContext>(0, 1, MPI_COMM_WORLD);
     TensorFactory factory(*mpi_ctx);
@@ -2415,7 +5691,10 @@ TEST_F(Test__CUDAGemmParity, FusedQKV_CachedKernels_MultipleIterations)
     // Clean up shared workspace
     cleanupSharedWorkspace({kernel_q, kernel_k, kernel_v});
 
-    llaminar::v2::kernels::KernelFactory::clearCache();
+    // Clean up cache entries while tensors are still alive
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_q.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_k.get());
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights_v.get());
 }
 
 #endif // HAVE_CUDA

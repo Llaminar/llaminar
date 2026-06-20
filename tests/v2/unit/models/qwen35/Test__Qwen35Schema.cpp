@@ -12,16 +12,19 @@
  * - Layer type pattern generation from full_attention_interval
  * - "qwen35" architecture registration in factories
  * - GDN attention graph construction: correct stages, wiring, interface usage
- * - FA attention graph delegation to Qwen2Graph
+ * - FA attention graph delegation to QwenStandardGraph
  */
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cstring>
 #include <string>
+#include <unordered_set>
 
 #include "models/qwen35/Qwen35Schema.h"
 #include "models/qwen35/Qwen35GraphConfigBuilder.h"
 #include "models/qwen35/Qwen35Graph.h"
+#include "execution/factory/EagerWeightValidator.h"
 #include "execution/local_execution/graph/GraphBuilderRegistry.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/local_execution/graph/GraphSchema.h"
@@ -32,11 +35,14 @@
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/AttentionOutputGateStage.h"
 #include "execution/compute_stages/stages/GEMMStage.h"
+#include "config/TensorParallelConfig.h"
 #include "kernels/IKVCache.h"
 #include "kernels/IHybridKVCache.h"
 #include "kernels/HybridKVCacheConfig.h"
+#include "loaders/WeightPlan.h"
 #include "tensors/TensorKernels.h"
 #include "memory/BufferId.h"
+#include "../../../mocks/MockModelContext.h"
 #include "../../../utils/TestTensorFactory.h"
 
 using namespace llaminar2;
@@ -173,10 +179,86 @@ namespace
                 total += s.memoryBytes();
             return total;
         }
+        HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
+        {
+            HybridPrefixStateMetadata metadata;
+            metadata.total_layers = n_layers_;
+            metadata.gdn_layers = gdnLayerCount();
+            metadata.host_bytes = gdnMemoryBytes();
+            return metadata;
+        }
+        bool exportHybridPrefixState(const HybridPrefixStateDescriptor &desc,
+                                     void *dst_host,
+                                     void *dst_device) const override
+        {
+            (void)dst_device;
+            if (desc.seq_idx < 0)
+                return false;
+            if (gdnMemoryBytes() > 0 && !dst_host)
+                return false;
+
+            auto *cursor = static_cast<char *>(dst_host);
+            for (int layer = 0; layer < n_layers_; ++layer)
+            {
+                const auto *s = getGDNState(layer);
+                if (!s)
+                    continue;
+
+                const size_t recurrence_bytes = s->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = s->conv_state.size() * sizeof(float);
+                if (recurrence_bytes > 0)
+                {
+                    std::memcpy(cursor, s->recurrence_state.data(), recurrence_bytes);
+                    cursor += recurrence_bytes;
+                }
+                if (conv_bytes > 0)
+                {
+                    std::memcpy(cursor, s->conv_state.data(), conv_bytes);
+                    cursor += conv_bytes;
+                }
+            }
+            return true;
+        }
+        bool importHybridPrefixState(const HybridPrefixStateDescriptor &desc,
+                                     const void *src_host,
+                                     const void *src_device) override
+        {
+            (void)src_device;
+            if (desc.seq_idx < 0)
+                return false;
+            if (gdnMemoryBytes() > 0 && !src_host)
+                return false;
+
+            const auto *cursor = static_cast<const char *>(src_host);
+            for (int layer = 0; layer < n_layers_; ++layer)
+            {
+                auto *s = getGDNState(layer);
+                if (!s)
+                    continue;
+
+                const size_t recurrence_bytes = s->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = s->conv_state.size() * sizeof(float);
+                if (recurrence_bytes > 0)
+                {
+                    std::memcpy(s->recurrence_state.data(), cursor, recurrence_bytes);
+                    cursor += recurrence_bytes;
+                }
+                if (conv_bytes > 0)
+                {
+                    std::memcpy(s->conv_state.data(), cursor, conv_bytes);
+                    cursor += conv_bytes;
+                }
+            }
+            return true;
+        }
 
         // --- IKVCache stubs (never called by graph builders) ---
         ActivationPrecision k_precision() const override { return ActivationPrecision::FP32; }
-        int get_cached_tokens(int, int) const override { return 0; }
+        int get_cached_tokens(int layer, int) const override
+        {
+            queried_cache_layers.push_back(layer);
+            return 0;
+        }
         int max_seq_len() const override { return 32; }
         int n_layers() const override { return n_layers_; }
         bool get_kv(int, int, ITensor **, ITensor **, int *) override { return false; }
@@ -189,6 +271,8 @@ namespace
         void clear() override {}
         void clear_sequence(int, int) override {}
         void clear_layer(int) override {}
+
+        mutable std::vector<int> queried_cache_layers;
 
     private:
         int n_layers_ = 0;
@@ -241,6 +325,71 @@ TEST(Test__Qwen35Schema, CreatesValidSchema)
     EXPECT_EQ(schema.name, "qwen35");
     EXPECT_EQ(schema.version, "1.0");
     EXPECT_FALSE(schema.required_params.empty());
+}
+
+TEST(Test__Qwen35Schema, GDNValueHeadWeightsUseProportionalHeadSharding)
+{
+    Qwen35SchemaFactory factory;
+    WeightShardingConfig sharding = factory.getWeightShardingConfig();
+
+    EXPECT_EQ(sharding.getMode("blk.0.attn_gate.weight"),
+              WeightShardingMode::ColumnParallel);
+    EXPECT_EQ(sharding.getDimensionType("blk.0.attn_gate.weight"),
+              WeightDimensionType::ProportionalHeads);
+
+    EXPECT_EQ(sharding.getMode("blk.0.ssm_out.weight"),
+              WeightShardingMode::InputParallel);
+    EXPECT_EQ(sharding.getDimensionType("blk.0.ssm_out.weight"),
+              WeightDimensionType::ProportionalHeads);
+}
+
+TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetPrefersValueProjectionSlice)
+{
+    // Qwen3.5-4B dense GDN has 36 FA/Q heads but 32 GDN V heads.
+    // TP=2 rank 1 therefore starts at Q-head 18, but V-head 16.
+    GraphConfig config;
+    config.n_heads = 36;
+    config.head_start = 18;
+    config.local_rank = 1;
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
+
+    WeightBinding value_projection_binding;
+    value_projection_binding.slice.source_rows = 4096;
+    value_projection_binding.slice.row_start = 16 * 128;
+    value_projection_binding.slice.row_count = 16 * 128;
+
+    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
+        &value_projection_binding,
+        128,
+        16,
+        32,
+        config,
+        nullptr);
+
+    EXPECT_EQ(offset, 16);
+    EXPECT_NE(offset, config.head_start);
+}
+
+TEST(Test__Qwen35Schema, GDNGlobalVHeadOffsetFallbackMapsQHeadsToVHeads)
+{
+    GraphConfig config;
+    config.n_heads = 36;
+    config.local_rank = 1;
+    config.tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(2, 36, 4, 9216, 151936));
+
+    const int offset = Qwen35Graph::resolveGDNGlobalVHeadOffset(
+        nullptr,
+        128,
+        16,
+        32,
+        config,
+        nullptr);
+
+    EXPECT_EQ(config.tp_config->forRank(1).head_start, 18);
+    EXPECT_EQ(offset, 16);
+    EXPECT_NE(offset, config.tp_config->forRank(1).head_start);
 }
 
 TEST(Test__Qwen35Schema, HasNamedTemplates)
@@ -516,6 +665,131 @@ TEST(Test__Qwen35Schema, LayerTypes_Interval4)
     EXPECT_EQ(config.layer_types[4], "gdn");
     EXPECT_EQ(config.layer_types[7], "full_attention");
     EXPECT_EQ(config.layer_types[31], "full_attention");
+}
+
+TEST(Test__Qwen35Schema, ConfigBuilder_LayerTypesPreferTensorInventory)
+{
+    auto ctx = MockModelContextBuilder()
+                   .setArchitecture("qwen35")
+                   .setBlockCount(5)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(1)
+                   .setFeedForwardLength(512)
+                   .setVocabSize(1024)
+                   .build();
+
+    auto &loader = ctx->mockLoader();
+    loader.setIntParam("qwen35.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35.ssm.state_size", 64);
+    loader.setIntParam("qwen35.ssm.inner_size", 256);
+    loader.setIntParam("qwen35.ssm.group_count", 2);
+    loader.setIntParam("qwen35.ssm.time_step_rank", 4);
+    loader.setIntParam("qwen35.full_attention_interval", 4);
+
+    // The interval fallback would mark layer 3 full-attention and layer 4 GDN.
+    // Real Qwen3.6 nextn layouts prove the tensor directory is more specific.
+    loader.addFP32ZerosTensor("blk.3.attn_qkv.weight", {512, 256});
+    loader.addFP32ZerosTensor("blk.4.attn_q.weight", {256, 256});
+
+    GraphConfig config;
+    Qwen35GraphConfigBuilder builder;
+    ASSERT_TRUE(builder.populateFromModelContext(*ctx, config));
+
+    ASSERT_EQ(config.layer_types.size(), 5u);
+    EXPECT_EQ(config.layer_types[0], "gdn");
+    EXPECT_EQ(config.layer_types[1], "gdn");
+    EXPECT_EQ(config.layer_types[2], "gdn");
+    EXPECT_EQ(config.layer_types[3], "gdn");
+    EXPECT_EQ(config.layer_types[4], "full_attention");
+}
+
+TEST(Test__Qwen35Schema, ConfigBuilder_ExcludesTrailingNextNBlocksFromMainGraph)
+{
+    auto ctx = MockModelContextBuilder()
+                   .setArchitecture("qwen35")
+                   .setBlockCount(5)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(1)
+                   .setFeedForwardLength(512)
+                   .setVocabSize(1024)
+                   .build();
+
+    auto &loader = ctx->mockLoader();
+    loader.setIntParam("qwen35.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35.ssm.state_size", 64);
+    loader.setIntParam("qwen35.ssm.inner_size", 256);
+    loader.setIntParam("qwen35.ssm.group_count", 2);
+    loader.setIntParam("qwen35.ssm.time_step_rank", 4);
+    loader.setIntParam("qwen35.full_attention_interval", 4);
+    loader.setIntParam("qwen35.nextn_predict_layers", 1);
+
+    loader.addFP32ZerosTensor("blk.4.nextn.eh_proj.weight", {256, 512});
+    loader.addFP32ZerosTensor("blk.4.attn_q.weight", {512, 256});
+    loader.addFP32ZerosTensor("blk.3.attn_qkv.weight", {512, 256});
+
+    GraphConfig config;
+    Qwen35GraphConfigBuilder builder;
+    ASSERT_TRUE(builder.populateFromModelContext(*ctx, config));
+
+    EXPECT_EQ(config.n_layers, 4);
+    EXPECT_EQ(config.total_n_layers, 4);
+    ASSERT_EQ(config.layer_types.size(), 4u);
+    EXPECT_EQ(config.layer_types[3], "gdn")
+        << "The trailing nextn block owns layer 4 tensors but must not enter the main graph";
+}
+
+TEST(Test__Qwen35Schema, ConfigBuilder_MainLayerCountDrivesEagerValidation)
+{
+    auto ctx = MockModelContextBuilder()
+                   .setArchitecture("qwen35")
+                   .setBlockCount(5)
+                   .setEmbeddingLength(256)
+                   .setHeadCount(4)
+                   .setHeadCountKV(1)
+                   .setFeedForwardLength(512)
+                   .setVocabSize(1024)
+                   .build();
+
+    auto &loader = ctx->mockLoader();
+    loader.setIntParam("qwen35.ssm.conv_kernel", 4);
+    loader.setIntParam("qwen35.ssm.state_size", 64);
+    loader.setIntParam("qwen35.ssm.inner_size", 256);
+    loader.setIntParam("qwen35.ssm.group_count", 2);
+    loader.setIntParam("qwen35.ssm.time_step_rank", 4);
+    loader.setIntParam("qwen35.full_attention_interval", 4);
+    loader.setIntParam("qwen35.nextn_predict_layers", 1);
+    loader.addFP32ZerosTensor("blk.4.nextn.eh_proj.weight", {256, 512});
+
+    GraphConfig config;
+    Qwen35GraphConfigBuilder builder;
+    ASSERT_TRUE(builder.populateFromModelContext(*ctx, config));
+    ASSERT_EQ(config.n_layers, 4);
+
+    Qwen35SchemaFactory schema;
+    std::unordered_set<std::string> tensors;
+    for (int layer = 0; layer < config.n_layers; ++layer)
+    {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        tensors.insert(prefix + "attn_norm.weight");
+        tensors.insert(prefix + "post_attention_norm.weight");
+        tensors.insert(prefix + "ffn_gate.weight");
+        tensors.insert(prefix + "ffn_up.weight");
+        tensors.insert(prefix + "ffn_down.weight");
+    }
+
+    auto has_tensor = [&tensors](const std::string &name)
+    {
+        return tensors.count(name) != 0;
+    };
+
+    auto main_validation = validateLayerWeights(schema, config.n_layers, has_tensor);
+    EXPECT_TRUE(main_validation.success) << main_validation.error_message();
+
+    auto raw_validation = validateLayerWeights(schema, ctx->blockCount(), has_tensor);
+    EXPECT_FALSE(raw_validation.success)
+        << "Raw GGUF block_count includes the trailing nextn sidecar block and must not drive main eager validation";
 }
 
 TEST(Test__Qwen35Schema, IsFullAttentionLayer_Shortcut)
@@ -898,6 +1172,108 @@ TEST_F(Qwen35GraphBuildTest, GDNProjection_AllWeightsWired)
     EXPECT_EQ(params.w_z, layer_.attn_gate);
     EXPECT_EQ(params.w_a, layer_.ssm_alpha);
     EXPECT_EQ(params.w_b, layer_.ssm_beta);
+}
+
+TEST_F(Qwen35GraphBuildTest, HybridPPFullAttentionUsesGlobalLayerIdsForCacheStages)
+{
+    /*
+     * Regression for LocalPP Qwen3.5/Qwen3.6 hybrid caches.  A PP stage such as
+     * [20, 64) owns a hybrid cache whose layer map starts at global layer 20.
+     * The graph must pass global FA layer ids (for example 43) into that cache;
+     * passing a PP-local id (23) lets the cache subtract first_layer_index again
+     * and aliases layer 43 onto layer 23's compressed KV slot.
+     */
+    GraphConfig pp_config = config_;
+    pp_config.pp_layer_offset = 20;
+    pp_config.n_layers = 44;
+    pp_config.total_n_layers = 64;
+    pp_config.layer_types.clear();
+    pp_config.layer_types.reserve(static_cast<size_t>(pp_config.n_layers));
+    for (int global_layer = pp_config.pp_layer_offset;
+         global_layer < pp_config.pp_layer_offset + pp_config.n_layers;
+         ++global_layer)
+    {
+        pp_config.layer_types.push_back((global_layer % 4 == 3) ? "full_attention" : "gdn");
+    }
+
+    Qwen35Graph graph(pp_config, nullptr);
+    StubHybridKVCache cache(pp_config);
+
+    const size_t d = static_cast<size_t>(pp_config.d_model);
+    const size_t q_dim = static_cast<size_t>(pp_config.n_heads * pp_config.head_dim);
+    const size_t kv_dim = static_cast<size_t>(pp_config.n_kv_heads * pp_config.head_dim);
+    constexpr int seq_len = 2;
+
+    auto attn_norm = TestTensorFactory::createFP32Ones({d});
+    auto wq = TestTensorFactory::createFP32Random({q_dim * 2, d});
+    auto wk = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wv = TestTensorFactory::createFP32Random({kv_dim, d});
+    auto wo = TestTensorFactory::createFP32Random({d, q_dim});
+
+    LayerWeights fa_layer;
+    fa_layer.attn_norm = attn_norm.get();
+    fa_layer.wq = wq.get();
+    fa_layer.wk = wk.get();
+    fa_layer.wv = wv.get();
+    fa_layer.wo = wo.get();
+
+    ActivationBuffers fa_buffers;
+    auto hidden = TestTensorFactory::createFP32({seq_len, d});
+    auto residual = TestTensorFactory::createFP32({seq_len, d});
+    auto normalized = TestTensorFactory::createFP32({seq_len, d});
+    auto fa_q_raw = TestTensorFactory::createFP32({seq_len, q_dim * 2});
+    auto fa_gate = TestTensorFactory::createFP32({seq_len, q_dim});
+    auto q = TestTensorFactory::createFP32({seq_len, q_dim});
+    auto k = TestTensorFactory::createFP32({seq_len, kv_dim});
+    auto v = TestTensorFactory::createFP32({seq_len, kv_dim});
+    auto attn_output = TestTensorFactory::createFP32({seq_len, q_dim});
+    auto attn_proj = TestTensorFactory::createFP32({seq_len, d});
+
+    fa_buffers.current_hidden = hidden.get();
+    fa_buffers.residual = residual.get();
+    fa_buffers.normalized = normalized.get();
+    fa_buffers.Q = q.get();
+    fa_buffers.K = k.get();
+    fa_buffers.V = v.get();
+    fa_buffers.attn_output = attn_output.get();
+    fa_buffers.attn_proj = attn_proj.get();
+    fa_buffers.extensions[BufferId::FA_Q_RAW] = fa_q_raw.get();
+    fa_buffers.extensions[BufferId::FA_GATE] = fa_gate.get();
+
+    int position_ids[seq_len] = {0, 1};
+    ComputeGraph attn_graph = graph.buildAttentionGraph(
+        fa_layer,
+        fa_buffers,
+        /*layer_idx=*/43,
+        /*seq_len=*/seq_len,
+        /*batch_size=*/1,
+        &cache,
+        position_ids,
+        DeviceId::cpu(),
+        /*sequence_lengths=*/nullptr,
+        /*position_ids_device=*/nullptr);
+
+    EXPECT_NE(std::find(cache.queried_cache_layers.begin(), cache.queried_cache_layers.end(), 43),
+              cache.queried_cache_layers.end());
+    EXPECT_EQ(std::find(cache.queried_cache_layers.begin(), cache.queried_cache_layers.end(), 23),
+              cache.queried_cache_layers.end());
+
+    auto expectStageLayer = [&](const char *node_name)
+    {
+        auto *node = attn_graph.getNode(node_name);
+        ASSERT_NE(node, nullptr) << node_name;
+        const auto &dump = node->stage->getDumpInfo();
+        auto it = std::find_if(dump.scalars.begin(), dump.scalars.end(),
+                               [](const StageDumpInfo::ScalarParam &scalar)
+                               {
+                                   return std::strcmp(scalar.name, "layer_idx") == 0;
+                               });
+        ASSERT_NE(it, dump.scalars.end()) << node_name << " did not expose layer_idx";
+        EXPECT_EQ(static_cast<int>(it->value), 43) << node_name;
+    };
+
+    expectStageLayer("layer43_kv_append");
+    expectStageLayer("layer43_attention");
 }
 
 TEST_F(Qwen35GraphBuildTest, OutputGate_NotUsedInGDNLayers)

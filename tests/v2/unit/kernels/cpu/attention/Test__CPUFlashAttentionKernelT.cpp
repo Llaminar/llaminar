@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -403,6 +404,115 @@ TEST_F(Test__CPUFlashAttentionKernelT, Decode_HeadDim128)
     runDecodeAndCompare(1, 256, 4, 2, 128, true, 255,
                         FP32_TOLERANCE, FP32_COSINE_THRESHOLD,
                         "Decode_HeadDim128");
+}
+
+TEST_F(Test__CPUFlashAttentionKernelT, GroupedVerifierRowsMatchSerialDecode_Qwen36FP32_M2ToM4)
+{
+    /*
+     * MTP verifier attention appends several speculative KV rows, but row r
+     * must be numerically equivalent to a normal one-token decode that can see
+     * only KV[0..base+r].  This regression uses Qwen3.6 dense dimensions from
+     * the real CPU parity failure so a grouped implementation cannot quietly
+     * behave like prefill over the full appended cache.
+     */
+    MPIContext mpi_ctx(0, 1, MPI_COMM_WORLD);
+    TensorFactory factory(mpi_ctx);
+    const DeviceId device_id = DeviceId::cpu();
+
+    constexpr int kHeads = 24;
+    constexpr int kKVHeads = 4;
+    constexpr int kHeadDim = 256;
+    constexpr int kMaxRows = 4;
+    constexpr int kQStride = kHeads * kHeadDim;
+    constexpr int kKVStride = kKVHeads * kHeadDim;
+    const std::array<int, 3> base_kv_lengths = {9, 37, 129};
+
+    for (const int verifier_rows : {2, 3, 4})
+    {
+        for (const int base_kv_len : base_kv_lengths)
+        {
+            const int kv_len = base_kv_len + verifier_rows;
+            const size_t q_size = static_cast<size_t>(verifier_rows) * kQStride;
+            const size_t kv_size = static_cast<size_t>(kv_len) * kKVStride;
+
+            auto Q_tensor = factory.createFP32(
+                {static_cast<size_t>(verifier_rows), static_cast<size_t>(kQStride)}, device_id);
+            auto K_tensor = factory.createFP32(
+                {static_cast<size_t>(kv_len), static_cast<size_t>(kKVStride)}, device_id);
+            auto V_tensor = factory.createFP32(
+                {static_cast<size_t>(kv_len), static_cast<size_t>(kKVStride)}, device_id);
+            auto grouped_output = factory.createFP32(
+                {static_cast<size_t>(verifier_rows), static_cast<size_t>(kQStride)}, device_id);
+
+            fill_random(Q_tensor->mutable_data(), q_size, -0.25f, 0.25f);
+            fill_random(K_tensor->mutable_data(), kv_size, -0.25f, 0.25f);
+            fill_random(V_tensor->mutable_data(), kv_size, -0.25f, 0.25f);
+            std::fill(grouped_output->mutable_data(),
+                      grouped_output->mutable_data() + q_size,
+                      0.0f);
+
+            ASSERT_TRUE(kernel_.compute_verifier_rows_decode_equivalent(
+                Q_tensor.get(),
+                K_tensor.get(),
+                V_tensor.get(),
+                grouped_output.get(),
+                verifier_rows,
+                kv_len,
+                kHeads,
+                kKVHeads,
+                kHeadDim,
+                /*causal=*/true,
+                /*window_size=*/-1,
+                &mpi_ctx,
+                /*device_idx=*/-1))
+                << "grouped verifier attention failed for M=" << verifier_rows
+                << " base_kv_len=" << base_kv_len;
+
+            std::vector<float> serial_output(q_size, 0.0f);
+            for (int row = 0; row < verifier_rows; ++row)
+            {
+                const int row_kv_len = base_kv_len + row + 1;
+                const int row_position = row_kv_len - 1;
+                ASSERT_TRUE(kernel_.compute_decode(
+                    Q_tensor->data() + static_cast<size_t>(row) * kQStride,
+                    K_tensor->data(),
+                    V_tensor->data(),
+                    serial_output.data() + static_cast<size_t>(row) * kQStride,
+                    /*seq_len=*/1,
+                    row_kv_len,
+                    kHeads,
+                    kKVHeads,
+                    kHeadDim,
+                    /*causal=*/true,
+                    row_position))
+                    << "serial decode attention failed for M=" << verifier_rows
+                    << " row=" << row
+                    << " row_kv_len=" << row_kv_len;
+            }
+
+            const float *grouped = grouped_output->data();
+            ASSERT_TRUE(is_finite(grouped, q_size))
+                << "grouped output has NaN/Inf for M=" << verifier_rows
+                << " base_kv_len=" << base_kv_len;
+            ASSERT_TRUE(is_finite(serial_output.data(), q_size))
+                << "serial output has NaN/Inf for M=" << verifier_rows
+                << " base_kv_len=" << base_kv_len;
+
+            const float mae = max_abs_error(grouped, serial_output.data(), q_size);
+            const float cos = cosine_similarity(grouped, serial_output.data(), q_size);
+            EXPECT_LE(mae, 1e-6f)
+                << "grouped verifier rows must match serial decode exactly enough"
+                << " for M=" << verifier_rows
+                << " base_kv_len=" << base_kv_len
+                << " mae=" << mae
+                << " cosine=" << cos;
+            EXPECT_GE(cos, 0.999999f)
+                << "grouped verifier cosine drift for M=" << verifier_rows
+                << " base_kv_len=" << base_kv_len
+                << " mae=" << mae
+                << " cosine=" << cos;
+        }
+    }
 }
 
 // ===========================================================================

@@ -4,7 +4,9 @@
  *
  * Extracted from DeviceGraphBufferManager to decouple workspace management
  * from buffer lifecycle management. Provides model-aware GPU/CPU workspace
- * allocation with per-device budget enforcement.
+ * allocation with per-device budget enforcement. Graph-stage workspace binding
+ * is GPU-only; CPU scratch is owned by CPU kernels or higher-level CPU memory
+ * managers rather than DeviceWorkspaceManager.
  *
  * @author David Sanftenberg
  * @date March 2026
@@ -15,6 +17,7 @@
 #include "DeviceWorkspaceManager.h"
 #include "WorkspaceDescriptor.h"
 #include "../../../backends/DeviceId.h"
+#include <cstdint>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -139,7 +142,7 @@ namespace llaminar2
         // =====================================================================
 
         /**
-         * @brief Allocate workspace for all GPU consumers in a graph
+         * @brief Allocate workspace for all CPU/GPU consumers in a graph
          *
          * Scans graph stages for IWorkspaceConsumer implementations, derives
          * per-stage dimension hints, allocates per-device workspace, and binds
@@ -183,6 +186,18 @@ namespace llaminar2
          */
         DeviceWorkspaceManager *getDeviceWorkspace(DeviceId device);
 
+        /**
+         * @brief Return the current workspace address epoch for a device.
+         *
+         * The epoch changes whenever the device workspace manager is replaced
+         * or released. Cached graphs use this to detect that captured GPU graph
+         * replay state contains stale raw workspace pointers.
+         *
+         * @param device Target device.
+         * @return Monotonic generation for the device, or 0 if it has never had workspace.
+         */
+        uint64_t deviceGeneration(DeviceId device) const;
+
         // =====================================================================
         // Metrics
         // =====================================================================
@@ -208,6 +223,17 @@ namespace llaminar2
 
         /// Per-device workspace budgets (for metrics)
         std::unordered_map<DeviceId, size_t> device_workspace_budgets_;
+
+        /// Per-device workspace address epochs for cached-graph invalidation.
+        std::unordered_map<DeviceId, uint64_t> device_workspace_generations_;
+
+        /// Monotonic source for device workspace generations.
+        uint64_t next_workspace_generation_ = 1;
+
+        /**
+         * @brief Advance the generation for a device after workspace addresses change.
+         */
+        void bumpDeviceGeneration(DeviceId device);
 
         /**
          * @brief Compute model-aware minimum budget floor

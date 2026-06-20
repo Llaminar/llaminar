@@ -50,6 +50,37 @@ namespace llaminar2
     {
     }
 
+    ITensorRoPE *RoPEStage::getOrCreateStageKernel(TensorBase *Q_base)
+    {
+        if (!Q_base)
+            return nullptr;
+
+        const int tensor_type = static_cast<int>(Q_base->native_type());
+        if (!owned_kernel_ || cached_kernel_tensor_type_ != tensor_type)
+        {
+            try
+            {
+                owned_kernel_ = llaminar::v2::kernels::KernelFactory::createRoPE(
+                    Q_base,
+                    llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id),
+                    params_.device_id.ordinal);
+                cached_kernel_ = owned_kernel_.get();
+                cached_kernel_tensor_type_ = tensor_type;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[RoPEStage] Failed to create stage-owned RoPE kernel for type "
+                          << Q_base->dtype_name() << ": " << e.what());
+                owned_kernel_.reset();
+                cached_kernel_ = nullptr;
+                cached_kernel_tensor_type_ = -1;
+                return nullptr;
+            }
+        }
+
+        return cached_kernel_;
+    }
+
     bool RoPEStage::execute(IDeviceContext *ctx)
     {
         if (!ensureContext(ctx, "RoPEStage"))
@@ -61,6 +92,12 @@ namespace llaminar2
                                                      {"Q", params_.Q},
                                                  }))
         {
+            return false;
+        }
+
+        if (params_.device_id.is_gpu() && !gpuStream())
+        {
+            LOG_ERROR("[RoPEStage] GPU RoPE requires an explicit non-null stage stream");
             return false;
         }
 
@@ -93,6 +130,18 @@ namespace llaminar2
         const bool k_is_q16_1 = (params_.K != nullptr) &&
                                 (params_.K->native_type() == TensorType::Q16_1);
 
+        if (params_.position_ids_device && !params_.device_id.is_gpu())
+        {
+            LOG_ERROR("[RoPEStage] Device-resident position IDs require a GPU stage");
+            return false;
+        }
+
+        if (params_.position_ids_device && (hybrid_mode || hybrid_q16_mode))
+        {
+            LOG_ERROR("[RoPEStage] Device-resident position IDs are currently supported only by standard tensor RoPE");
+            return false;
+        }
+
         LOG_DEBUG("[RoPEStage] Execute: seq_len=" << seq_len
                                                   << " n_heads=" << params_.n_heads
                                                   << " n_kv_heads=" << params_.n_kv_heads
@@ -105,25 +154,16 @@ namespace llaminar2
                                                   << " hybrid_q16_mode=" << (hybrid_q16_mode ? "true" : "false")
                                                   << " k_is_q16_1=" << (k_is_q16_1 ? "true" : "false"));
 
-        // Compute effective rotary dimension (partial RoPE support)
+        // Compute the rotary prefix length, but keep head_dim as the physical
+        // per-head stride when invoking kernels. Partial RoPE rotates only the
+        // first rotary_dim elements; the rest of each full-width head is passed
+        // through unchanged.
         const int rotary_dim = static_cast<int>(
             static_cast<float>(params_.head_dim) * params_.partial_rotary_factor);
-        // rotary_dim is used as effective head_dim for RoPE computation.
-        // When partial_rotary_factor < 1.0, only the first `rotary_dim` elements
-        // of each head get rotary encoding, the rest are pass-through.
-        const int effective_head_dim = (params_.partial_rotary_factor < 1.0f)
-                                           ? rotary_dim
-                                           : params_.head_dim;
 
-        // Get or create device-scoped cached kernel via KernelFactory
-        auto *kernel = getOrRefreshKernelByTensorType(
-            cached_kernel_,
-            cached_kernel_tensor_type_,
-            Q_base,
-            [&]()
-            {
-                return llaminar::v2::kernels::KernelFactory::getOrCreateRoPE(Q_base, params_.device_id);
-            });
+        // Get or create the stage-owned kernel so graph-capture metadata is
+        // scoped to this RoPE stage instead of shared across graph nodes.
+        auto *kernel = getOrCreateStageKernel(Q_base);
 
         if (!kernel)
         {
@@ -135,16 +175,21 @@ namespace llaminar2
         // Thread GPU stream for graph capture
         bindStageStream(kernel);
 
-        // Use provided position_ids if available (for batched execution with per-token positions)
-        // Otherwise, pass nullptr to the kernel to enable zero-copy contiguous path.
-        // The kernel computes positions on-the-fly on GPU: pos = pos_offset + seq_idx.
-        // This avoids a synchronous hipMemcpy that forces a full GPU pipeline drain.
+        // Use provided position_ids if available (for batched execution with per-token positions).
+        // Otherwise, pass nullptr to GPU kernels to keep the contiguous position path:
+        // positions are computed on device from pos_offset + seq_idx, and pos_offset
+        // is pre-uploaded by updateDynamicParams() before graph capture/replay.
         const int *position_ids_ptr = params_.position_ids;
+        if (params_.position_ids_device)
+        {
+            kernel->setDynamicDevicePositionIds(params_.position_ids_device, seq_len);
+            position_ids_ptr = nullptr;
+        }
 
-        // CPU paths and graph-capture paths both need an explicit position_ids
-        // buffer whenever pos_offset != 0. Otherwise kernels that treat
-        // nullptr as [0..seq_len-1] would ignore the offset.
-        if (!position_ids_ptr && seq_len > 0 && params_.pos_offset != 0)
+        // CPU paths need explicit position_ids whenever pos_offset != 0.
+        // GPU kernels have a contiguous pos_offset/device-param path, and
+        // manufacturing a host position_ids array would force an H2D upload.
+        if (!params_.device_id.is_gpu() && !position_ids_ptr && seq_len > 0 && params_.pos_offset != 0)
         {
             position_ids_cache_.resize(static_cast<size_t>(seq_len));
             for (int i = 0; i < seq_len; ++i)
@@ -154,22 +199,17 @@ namespace llaminar2
             position_ids_ptr = position_ids_cache_.data();
         }
 
-        if (gpuStream() != nullptr)
+        if (!params_.position_ids_device && gpuStream() != nullptr && position_ids_ptr != nullptr)
         {
-            // Graph-capture path: ensure a stable position_ids pointer so the
-            // kernel can copy to device and avoid scalar pos_offset args.
+            // Explicit non-contiguous/batched position ids must use a stable
+            // host pointer. Contiguous GPU positions intentionally stay null.
             if (seq_len > 0)
             {
-                position_ids_cache_.resize(static_cast<size_t>(seq_len));
-                if (position_ids_ptr)
+                if (position_ids_ptr != position_ids_cache_.data())
                 {
+                    position_ids_cache_.resize(static_cast<size_t>(seq_len));
                     std::memcpy(position_ids_cache_.data(), position_ids_ptr,
                                 static_cast<size_t>(seq_len) * sizeof(int));
-                }
-                else
-                {
-                    for (int i = 0; i < seq_len; ++i)
-                        position_ids_cache_[static_cast<size_t>(i)] = params_.pos_offset + i;
                 }
                 position_ids_ptr = position_ids_cache_.data();
             }
@@ -349,6 +389,30 @@ namespace llaminar2
         // KV cache and RoPE will be fused into the attention dequant path.
         auto *K_for_rope = (params_.skip_k) ? nullptr : K_base;
 
+        if (params_.force_decode_equivalent_verifier_prefill && seq_len > 1)
+        {
+            const bool success = kernel->apply_verifier_rows_decode_equivalent(
+                Q_base,
+                K_for_rope,
+                position_ids_ptr,
+                seq_len,
+                params_.n_heads,
+                n_kv_heads,
+                params_.head_dim,
+                params_.theta_base,
+                params_.mpi_ctx,
+                params_.device_id.toKernelDeviceIndex(),
+                params_.pos_offset,
+                rotary_dim);
+            if (!success)
+            {
+                LOG_ERROR("[RoPEStage] Backend does not support grouped decode-equivalent verifier RoPE for "
+                          << Q_base->dtype_name() << " rows=" << seq_len);
+                return false;
+            }
+            return true;
+        }
+
         return kernel->apply_tensor(
             Q_base,
             K_for_rope,
@@ -356,7 +420,7 @@ namespace llaminar2
             seq_len,
             params_.n_heads,
             n_kv_heads,
-            effective_head_dim,
+            params_.head_dim,
             params_.theta_base,
             params_.mpi_ctx,
             params_.device_id.toKernelDeviceIndex(),
@@ -406,6 +470,59 @@ namespace llaminar2
         default:
             return false;
         }
+    }
+
+    bool RoPEStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        (void)ctx;
+        if (!params_.device_id.is_gpu())
+            return true;
+        if (!stream)
+        {
+            LOG_ERROR("[RoPEStage] GPU graph launch preparation requires an explicit non-null stream");
+            return false;
+        }
+        if (!params_.Q)
+        {
+            LOG_ERROR("[RoPEStage] Cannot prepare graph launch without Q tensor");
+            return false;
+        }
+
+        auto *Q_base = requireTensorBasePtr(params_.Q, "Q");
+        if (!Q_base)
+            return false;
+
+        auto *kernel = getOrCreateStageKernel(Q_base);
+        if (!kernel)
+        {
+            LOG_ERROR("[RoPEStage] Failed to prepare RoPE kernel before graph launch");
+            return false;
+        }
+
+        /*
+         * Graph capture must record only RoPE compute kernels.  Position
+         * metadata is mutable between launches, so upload it to the
+         * workspace-owned device buffer on the exact stream the capture
+         * controller is about to use.  This hook also runs before graph replay,
+         * keeping scalar contiguous positions and explicit request-batch
+         * position rows fresh without rebuilding the graph.
+         */
+        setGPUStream(stream);
+        kernel->setGPUStream(stream);
+        if (params_.position_ids_device && params_.seq_len > 0)
+        {
+            kernel->setDynamicDevicePositionIds(params_.position_ids_device, params_.seq_len);
+        }
+        else if (params_.position_ids && params_.seq_len > 0)
+        {
+            kernel->setDynamicPositionIds(params_.position_ids, params_.seq_len);
+        }
+        else
+        {
+            kernel->setDynamicPosOffset(params_.pos_offset);
+        }
+
+        return true;
     }
 
     StageDumpInfo RoPEStage::buildDumpInfoImpl() const
@@ -599,14 +716,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto *kernel = getOrRefreshKernelByTensorType(
-            cached_kernel_,
-            cached_kernel_tensor_type_,
-            Q_base,
-            [&]()
-            {
-                return llaminar::v2::kernels::KernelFactory::getOrCreateRoPE(Q_base, params_.device_id);
-            });
+        auto *kernel = getOrCreateStageKernel(Q_base);
 
         if (!kernel)
         {

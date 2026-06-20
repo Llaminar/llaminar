@@ -149,7 +149,7 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(coordinator_pool_mutex_);
         if (!coordinator_pool_.empty())
         {
-            LOG_INFO("[RCCLBackend] Draining coordinator pool (" << coordinator_pool_.size() << " entries)");
+            LOG_DEBUG("[RCCLBackend] Draining coordinator pool (" << coordinator_pool_.size() << " entries)");
             coordinator_pool_.clear(); // shared_ptr release → RCCLCoordinator dtor → ncclCommDestroy
         }
     }
@@ -328,7 +328,7 @@ namespace llaminar2
                 return false;
             }
 
-            LOG_INFO("RCCLBackend: Initialized multi-process with " << num_ranks_
+            LOG_DEBUG("RCCLBackend: Initialized multi-process with " << num_ranks_
                                                                     << " MPI ranks, local_rank=" << local_rank_
                                                                     << ", device=" << local_device.ordinal);
         }
@@ -344,7 +344,7 @@ namespace llaminar2
                 stream_ = nullptr;
                 return false;
             }
-            LOG_INFO("RCCLBackend: Initialized single-GPU mode");
+            LOG_DEBUG("RCCLBackend: Initialized single-GPU mode");
         }
         else
         {
@@ -378,7 +378,7 @@ namespace llaminar2
                 {
                     coordinator_ = it->second;
                     coordinator_pool_.erase(it);
-                    LOG_INFO("RCCLBackend: Reused pooled RCCLCoordinator for devices [" << pool_key << "]");
+                    LOG_DEBUG("RCCLBackend: Reused pooled RCCLCoordinator for devices [" << pool_key << "]");
                 }
             }
             if (!coordinator_)
@@ -393,7 +393,7 @@ namespace llaminar2
                 }
             }
 
-            LOG_INFO("RCCLBackend: Initialized multi-GPU single-process (via RCCLCoordinator) with "
+            LOG_DEBUG("RCCLBackend: Initialized multi-GPU single-process (via RCCLCoordinator) with "
                      << num_ranks_ << " GPU(s), local_rank=" << local_rank_);
         }
 

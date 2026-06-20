@@ -28,6 +28,7 @@
 #include "tensors/Tensors.h"
 #include "utils/TestTensorFactory.h"
 #include "models/qwen/Qwen2Schema.h"
+#include "mocks/MockModelLoader.h"
 
 namespace llaminar2
 {
@@ -111,6 +112,52 @@ namespace llaminar2
                     }
                 }
             }
+        };
+
+        /**
+         * @brief Mock loader that simulates an unavailable native packed column slice
+         *
+         * Some real GGUF quantized formats can only slice columns on their packed
+         * block boundary. Returning nullptr from loadTensorColumnSlice() lets the
+         * unit test exercise WeightManager's FP32 fallback without needing a GGUF
+         * fixture on disk.
+         */
+        class FailingColumnSliceModelLoader : public MockModelLoader
+        {
+        public:
+            std::shared_ptr<TensorBase> loadTensorColumnSlice(
+                const std::string &name,
+                size_t col_start,
+                size_t col_end,
+                DeviceId device = DeviceId::cpu(),
+                WeightPrecision weight_precision = WeightPrecision::NATIVE) override
+            {
+                (void)name;
+                (void)device;
+                (void)weight_precision;
+
+                ++column_slice_attempts;
+                last_col_start = col_start;
+                last_col_end = col_end;
+                return nullptr;
+            }
+
+            std::shared_ptr<TensorBase> loadTensor(
+                const std::string &name,
+                DeviceId device = DeviceId::cpu(),
+                WeightPrecision weight_precision = WeightPrecision::NATIVE) override
+            {
+                if (weight_precision == WeightPrecision::CONVERT_TO_FP32)
+                {
+                    ++fp32_fallback_loads;
+                }
+                return MockModelLoader::loadTensor(name, device, weight_precision);
+            }
+
+            int column_slice_attempts = 0;
+            int fp32_fallback_loads = 0;
+            size_t last_col_start = 0;
+            size_t last_col_end = 0;
         };
 
         // =============================================================================
@@ -322,6 +369,56 @@ namespace llaminar2
             auto sliced = WeightManager::sliceColumnRange(tensor, 2432, 2432);
 
             verifySequentialSlice(sliced.get(), HIDDEN_DIM, 2432, D_FF, 2432);
+        }
+
+        /**
+         * @brief Regression: unaligned native INPUT_PARALLEL slices fall back to FP32
+         *
+         * Qwen3.6 shared-expert down weights can be IQ3_S with a 256-column packed
+         * block, while ROCm 4-way TP asks each rank for a 128-column logical shard.
+         * The loader correctly refuses that native packed slice, so WeightManager
+         * must materialize a full FP32 tensor and copy only the rank-local columns.
+         */
+        TEST_F(Test__WeightManagerInputParallelSlicing, LoadInputParallelWeight_FallsBackToFP32WhenNativeSliceUnavailable)
+        {
+            constexpr size_t kRows = 16;
+            constexpr size_t kColumns = 512;
+            constexpr const char *kWeightName = "blk.0.ffn_down.weight";
+
+            auto loader = std::make_shared<FailingColumnSliceModelLoader>();
+            loader->addTensor(kWeightName, createSequentialTensor(kRows, kColumns));
+
+            std::vector<DeviceId> devices = {
+                DeviceId::rocm(0),
+                DeviceId::rocm(1),
+                DeviceId::rocm(2),
+                DeviceId::rocm(3)};
+            auto tp_config = std::make_shared<TensorParallelConfig>(
+                TensorParallelConfig::equalSplit(
+                    4,
+                    4,                  // n_heads: irrelevant for FFNHidden slicing
+                    4,                  // n_kv_heads
+                    static_cast<int>(kColumns),
+                    128,                // vocab_size
+                    devices));
+
+            WeightManager wm(*loader, nullptr, nullptr,
+                             WeightDistributionStrategy::SHARDED,
+                             WeightPrecision::NATIVE);
+            Qwen2SchemaFactory schema_factory;
+            wm.setWeightShardingConfig(schema_factory.getWeightShardingConfig());
+            wm.setTensorParallelConfig(tp_config);
+
+            const auto &assignment = tp_config->forDevice(DeviceId::rocm(1));
+            auto shard = wm.getShardedWeightForAssignment(kWeightName, DeviceId::rocm(1), assignment, 0);
+
+            ASSERT_NE(shard, nullptr);
+            EXPECT_EQ(loader->column_slice_attempts, 1);
+            EXPECT_EQ(loader->fp32_fallback_loads, 1);
+            EXPECT_EQ(loader->last_col_start, 128);
+            EXPECT_EQ(loader->last_col_end, 256);
+
+            verifySequentialSlice(shard.get(), kRows, 128, kColumns, 128);
         }
 
         // =============================================================================

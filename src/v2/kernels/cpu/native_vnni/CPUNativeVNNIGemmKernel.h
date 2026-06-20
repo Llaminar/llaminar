@@ -28,11 +28,13 @@
 
 #include "CPUNativeVNNIWeightPacker.h"
 #include "CPUNativeVNNIGemv.h"
+#include "CPUPackedWeights.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/TensorClasses.h"
 #include "kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "kernels/cpu/rotation/ActivationRotation.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 
 namespace llaminar2::cpu::native_vnni
 {
@@ -69,61 +71,30 @@ namespace llaminar2::cpu::native_vnni
             }
             valid_ = true;
 
-            // Store the native block size for this format
+            // Store the native block size for this format. VNNI engines are
+            // fully eager: the packed interleaved representation stays owned
+            // by the engine and is never rebuilt from raw tensor storage.
             native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
 
-            // ---------------------------------------------------------------
-            // Store native blocks for deferred VNNI packing (all formats).
-            //
-            // This enables memory-efficient operation: instead of keeping the
-            // VNNI-interleaved data permanently (~1.1 B/elem overhead), we store
-            // only the native quantized blocks (~0.5-1.06 B/elem) and repack
-            // into a shared workspace on demand for each GEMM/GEMV call.
-            //
-            // Superblock formats (Q6_K, Q3_K, etc.) and rotation paths retain
-            // permanent interleaved data since repacking from native blocks is
-            // not supported (superblocks need full context, rotation fuses into packing).
-            // ---------------------------------------------------------------
-            const bool is_superblock = packed_.is_superblock;
-            const bool can_defer = !is_superblock && !activation_rotation_ && native_block_size_ > 0;
-
-            if (can_defer)
-            {
-                // Store native blocks from the weight tensor
-                storeNativeBlocks(weights, row_start, row_end);
-            }
-
-            // Release the permanent interleaved data if deferred packing is active.
-            // The workspace will be populated on demand before each GEMM/GEMV call.
-            if (can_defer && native_blocks_ptr_ != nullptr)
-            {
-                packed_.releaseInterleavedData();
-                deferred_packing_ = true;
-
-                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Deferred packing: "
-                          << packed_.N << "×" << packed_.K
-                          << " (codebook=" << (int)packed_.codebook_id
-                          << ", block_size=" << native_block_size_
-                          << ", owned=" << (!native_blocks_owned_.empty() ? "yes" : "mmap")
-                          << ", saved ~" << (interleavedWorkspaceSize(packed_) / (1024 * 1024)) << " MB)");
-            }
-            else
-            {
-                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
-                          << packed_.N << "×" << packed_.K
-                          << " weights (codebook=" << (int)packed_.codebook_id
-                          << ", payload=" << packed_.payload_bytes << " B/block"
-                          << ", asymmetric=" << packed_.is_asymmetric
-                          << ", rotation=" << (activation_rotation_ != nullptr)
-                          << ", permanent_interleaved=true)");
-            }
+            LOG_DEBUG("[CPUNativeVNNIGemmKernel] Packed "
+                      << packed_.N << "×" << packed_.K
+                      << " weights (codebook=" << (int)packed_.codebook_id
+                      << ", payload=" << packed_.payload_bytes << " B/block"
+                      << ", asymmetric=" << packed_.is_asymmetric
+                      << ", rotation=" << (activation_rotation_ != nullptr)
+                      << ", permanent_interleaved=true)");
         }
 
         /**
          * @brief Construct from pre-packed weights (move).
          */
         explicit CPUNativeVNNIGemmKernel(CPUNativeVNNIPackedWeights &&packed)
-            : packed_(std::move(packed)), valid_(true) {}
+            : packed_(std::move(packed)), valid_(packed_.hasInterleavedData())
+        {
+            native_block_size_ = native_block_bytes_for_codebook(packed_.codebook_id);
+            if (!valid_)
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] Pre-packed CPU_NATIVE_VNNI weights are missing eager interleaved data");
+        }
 
         ~CPUNativeVNNIGemmKernel() override = default;
 
@@ -186,7 +157,8 @@ namespace llaminar2::cpu::native_vnni
                     C_data[i] *= beta;
             }
 
-            // For deferred packing: repack native blocks into shared workspace
+            // Legacy deferred-packing guard. New CPU VNNI engines are eager and
+            // transferred blobs with native-block deferred payloads are rejected.
             if (deferred_packing_)
             {
                 if (m == 1 && packed_.codebook_id == 19)
@@ -245,6 +217,87 @@ namespace llaminar2::cpu::native_vnni
         }
 
         // -------------------------------------------------------------------
+        // Weight Lifecycle (IPackedWeights integration)
+        // -------------------------------------------------------------------
+
+        std::unique_ptr<IPackedWeights> detachWeights() override
+        {
+            if (!valid_)
+                return nullptr;
+
+            auto result = std::make_unique<CPUPackedWeights>(std::move(packed_));
+
+            // Invalidate kernel
+            packed_ = CPUNativeVNNIPackedWeights{};
+            native_blocks_owned_.clear();
+            native_blocks_ptr_ = nullptr;
+            deferred_packing_ = false;
+            valid_ = false;
+            return result;
+        }
+
+        std::unique_ptr<IPackedWeights> cloneWeights() const override
+        {
+            if (!valid_)
+                return nullptr;
+
+            return std::make_unique<CPUPackedWeights>(packed_);
+        }
+
+        bool attachWeights(std::unique_ptr<IPackedWeights> weights) override
+        {
+            if (!weights || weights->format() != PackedWeightsFormat::CPU_NATIVE_VNNI)
+                return false;
+
+            if (dynamic_cast<CPUPackedWeightsWithNativeBlocks *>(weights.get()))
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] Deferred/native-block weight attachment is disabled; expected eager interleaved CPU_NATIVE_VNNI weights");
+                return false;
+            }
+
+            auto *cpu_packed = dynamic_cast<CPUPackedWeights *>(weights.get());
+            if (!cpu_packed)
+                return false;
+
+            packed_ = cpu_packed->takePacked();
+            if (!packed_.hasInterleavedData())
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] Attached CPU_NATIVE_VNNI weights have no eager interleaved data");
+                packed_ = CPUNativeVNNIPackedWeights{};
+                return false;
+            }
+
+            native_blocks_owned_.clear();
+            native_blocks_ptr_ = nullptr;
+            deferred_packing_ = false;
+
+            valid_ = true;
+            return true;
+        }
+
+        void releaseWeights() override
+        {
+            {
+                CPUNativeVNNIPackedWeights empty;
+                packed_ = std::move(empty);
+            }
+            native_blocks_owned_.clear();
+            native_blocks_owned_.shrink_to_fit();
+            native_blocks_ptr_ = nullptr;
+            deferred_packing_ = false;
+            valid_ = false;
+        }
+
+        bool hasWeights() const override { return valid_; }
+
+        size_t packedWeightBytes() const override
+        {
+            if (!valid_)
+                return 0;
+            return packed_.native_interleaved.size() + packed_.payload.size() + packed_.int8_flat.size() + native_blocks_owned_.size();
+        }
+
+        // -------------------------------------------------------------------
         // Accessors
         // -------------------------------------------------------------------
 
@@ -274,30 +327,68 @@ namespace llaminar2::cpu::native_vnni
             const TensorBase *up,
             TensorBase *output,
             int m, int n, int k,
-            float alpha = 1.0f, float beta = 0.0f) override
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override
         {
+            (void)workspace;
             if (!valid_)
                 return false;
+            if (!gate || !up || !output)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU received null tensor");
+                return false;
+            }
+            if (m <= 0 || n <= 0 || k <= 0)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU invalid dimensions m="
+                          << m << " n=" << n << " k=" << k);
+                return false;
+            }
+            if (packed_.N != n || packed_.K != k)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU dimension mismatch: packed N="
+                          << packed_.N << " K=" << packed_.K << ", call n=" << n
+                          << " k=" << k);
+                return false;
+            }
+            const size_t input_size = static_cast<size_t>(m) * static_cast<size_t>(k);
+            const size_t output_size = static_cast<size_t>(m) * static_cast<size_t>(n);
+            if (gate->numel() < input_size || up->numel() < input_size || output->numel() < output_size)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] fused SwiGLU tensor capacity mismatch: gate="
+                          << gate->numel() << " up=" << up->numel() << " output=" << output->numel()
+                          << ", required input=" << input_size << " output=" << output_size);
+                return false;
+            }
 
             const float *gate_fp32 = gate->data();
             const float *up_fp32 = up->data();
             float *output_fp32 = output->mutable_data();
 
             // Apply SwiGLU to get the GEMM input: temp = silu(gate) * up  [m, k]
-            const size_t input_size = static_cast<size_t>(m) * k;
 
-            // Reuse cached scratch buffer to avoid allocation on every decode token
+            // Prepared CPU expert engines are shared across graph participants in
+            // LocalTP. Keep per-call scratch thread-local so concurrent users do
+            // not race on mutable engine state.
+            thread_local std::vector<float> swiglu_scratch_tls;
             const size_t needed = input_size;
-            if (swiglu_scratch_.size() < needed)
-                swiglu_scratch_.resize(needed);
+            if (swiglu_scratch_tls.size() < needed)
+                swiglu_scratch_tls.resize(needed);
 
-            primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_.data(),
-                                       static_cast<int>(input_size));
+            // M=1 decode: use serial SwiGLU to avoid OMP fork/join overhead.
+            // For MoE experts with intermediate=512, the 512-element SwiGLU
+            // takes ~0.1µs in SIMD vs ~6µs OMP barrier cost.
+            if (m == 1)
+                primitives::compute_swiglu_serial(gate_fp32, up_fp32, swiglu_scratch_tls.data(),
+                                                  static_cast<int>(input_size));
+            else
+                primitives::compute_swiglu(gate_fp32, up_fp32, swiglu_scratch_tls.data(),
+                                           static_cast<int>(input_size));
 
             // Apply activation rotation for kurtosis reduction (if configured)
-            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_.data(), m, k);
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
 
-            // Prepare workspace for deferred packing if needed
+            // Legacy deferred-packing guard; eager engines should never enter it.
             if (deferred_packing_)
             {
                 if (m == 1 && packed_.codebook_id == 19)
@@ -340,6 +431,135 @@ namespace llaminar2::cpu::native_vnni
             return true;
         }
 
+        /**
+         * @brief Grouped MTP verifier SwiGLU + down projection.
+         *
+         * This follows the same SwiGLU math as the ordinary CPU down path, but
+         * sends the resulting M=2..4 activation rows through
+         * gemm_native_vnni_preq_decode_equivalent_rows().  That helper shares
+         * Q8_1 activation quantization across rows and parallelizes the work,
+         * while each row keeps the same K-tile reduction order as M=1 decode.
+         */
+        bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+            const TensorBase *gate,
+            const TensorBase *up,
+            TensorBase *output,
+            int m, int n, int k,
+            float alpha = 1.0f, float beta = 0.0f,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            (void)workspace;
+            if (!valid_ || !gate || !up || !output || m <= 1 || m > 4 || n <= 0 || k <= 0)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU rejected: valid="
+                          << valid_ << " gate=" << (gate != nullptr)
+                          << " up=" << (up != nullptr)
+                          << " output=" << (output != nullptr)
+                          << " m=" << m << " n=" << n << " k=" << k);
+                return false;
+            }
+            if (alpha != 1.0f || beta != 0.0f)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU only supports alpha=1,beta=0; got alpha="
+                          << alpha << " beta=" << beta);
+                return false;
+            }
+            if (packed_.N != n || packed_.K != k)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU dimension mismatch: packed N="
+                          << packed_.N << " K=" << packed_.K << ", call n=" << n << " k=" << k);
+                return false;
+            }
+
+            const size_t input_size = static_cast<size_t>(m) * static_cast<size_t>(k);
+            const size_t output_size = static_cast<size_t>(m) * static_cast<size_t>(n);
+            if (gate->numel() < input_size || up->numel() < input_size || output->numel() < output_size)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU tensor capacity mismatch");
+                return false;
+            }
+
+            const float *gate_fp32 = gate->data();
+            const float *up_fp32 = up->data();
+            float *output_fp32 = output->mutable_data();
+            if (!gate_fp32 || !up_fp32 || !output_fp32)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier SwiGLU requires FP32 host tensors");
+                return false;
+            }
+
+            thread_local AlignedVector<float> swiglu_scratch_tls;
+            if (swiglu_scratch_tls.size() < input_size)
+                swiglu_scratch_tls.resize_uninitialized(input_size);
+            const bool perf_enabled = PerfStatsCollector::isEnabled();
+            auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                           : PerfStatsCollector::Clock::time_point{};
+            primitives::compute_swiglu(
+                gate_fp32,
+                up_fp32,
+                swiglu_scratch_tls.data(),
+                static_cast<int>(input_size));
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_swiglu_compute",
+                perf_start,
+                m,
+                n,
+                k,
+                1);
+
+            const float *gemm_input = maybe_rotate_activation(swiglu_scratch_tls.data(), m, k);
+            const int K_blocks = (k + 31) / 32;
+            const size_t shared_q8_blocks = static_cast<size_t>(m) * K_blocks;
+            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
+            if (shared_q8_tls.size() < shared_q8_blocks)
+                shared_q8_tls.resize_uninitialized(shared_q8_blocks);
+            perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                      : PerfStatsCollector::Clock::time_point{};
+            quantize_activations_to_q8_1(gemm_input, shared_q8_tls.data(), m, k, K_blocks);
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_activation_quantize",
+                perf_start,
+                m,
+                n,
+                k,
+                1);
+
+            if (deferred_packing_)
+                ensureWorkspace();
+            perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                      : PerfStatsCollector::Clock::time_point{};
+            gemm_native_vnni_preq_decode_equivalent_rows(
+                packed_,
+                shared_q8_tls.data(),
+                output_fp32,
+                m,
+                n);
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_swiglu_down_gemv",
+                perf_start,
+                m,
+                n,
+                k,
+                1);
+            if (deferred_packing_)
+                packed_.clearWorkspace();
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_grouped_verifier_swiglu_down_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"n", std::to_string(n)},
+                        {"k", std::to_string(k)}});
+            }
+            return true;
+        }
+
         // -------------------------------------------------------------------
         // Fused multi-projection with quantize-once + epilogues
         // -------------------------------------------------------------------
@@ -367,17 +587,135 @@ namespace llaminar2::cpu::native_vnni
             const int K_blocks = (k + 31) / 32;
 
             // -----------------------------------------------------------
-            // M==1 decode path: delegate to multiply_tensor per projection.
-            // multiply_tensor handles ensureWorkspace + gemv + clearWorkspace
-            // correctly for all weight formats and configurations.
+            // M==1 decode path: try fused single-OMP-region GEMV first.
+            // This quantizes the input to Q8_1 once and runs all projections
+            // with nowait in a single OMP parallel region, saving:
+            //   - (N-1) × Q8_1 quantization (~2μs each)
+            //   - (N-1) × OMP fork/join (~6μs each)
+            // Falls back to individual calls for non-VNNI kernels.
             // -----------------------------------------------------------
             if (m == 1)
             {
+                // Check if ALL projections are CPUNativeVNNIGemmKernel
+                bool all_vnni = true;
                 for (const auto &proj : projections)
                 {
                     if (!proj.kernel || !proj.output)
                         return false;
-                    
+                    auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                    if (!vnni || !vnni->valid_)
+                    {
+                        all_vnni = false;
+                        break;
+                    }
+                }
+
+                if (all_vnni && projections.size() >= 2)
+                {
+                    // Fused path: quantize once, single OMP region for all projections
+
+                    // Set up workspace for deferred-packing kernels.
+                    // Multiple deferred kernels need simultaneous workspace slots
+                    // since the fused GEMV reads all weights in parallel.
+                    {
+                        size_t max_interleave_ws = 0;
+                        int deferred_interleave_count = 0;
+                        for (const auto &proj : projections)
+                        {
+                            auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                            if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                            {
+                                max_interleave_ws = std::max(max_interleave_ws,
+                                                             interleavedWorkspaceSize(vnni->packed_));
+                                deferred_interleave_count++;
+                            }
+                        }
+                        if (deferred_interleave_count > 0)
+                        {
+                            auto &ws = sharedWorkspace();
+                            const size_t total = max_interleave_ws * deferred_interleave_count;
+                            if (ws.size() < total)
+                                ws.resize_uninitialized(total);
+                        }
+                        int slot_idx = 0;
+                        for (const auto &proj : projections)
+                        {
+                            auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                            if (vnni->deferred_packing_)
+                            {
+                                if (vnni->packed_.codebook_id == 19)
+                                {
+                                    vnni->ensureWorkspaceRaw();
+                                }
+                                else
+                                {
+                                    uint8_t *slot = sharedWorkspace().data() +
+                                                    static_cast<size_t>(slot_idx) * max_interleave_ws;
+                                    repackNativeBlocksToInterleaved(
+                                        vnni->native_blocks_ptr_, vnni->native_block_size_,
+                                        vnni->packed_, slot);
+                                    vnni->packed_.setWorkspace(slot);
+                                    slot_idx++;
+                                }
+                            }
+                        }
+                    }
+
+                    // Quantize activations to Q8_1 once (shared across all projections)
+                    thread_local std::vector<Q8_1Block> fused_q8_tls;
+                    if (static_cast<int>(fused_q8_tls.size()) < K_blocks)
+                        fused_q8_tls.resize(K_blocks);
+                    {
+                        int kb = 0;
+#if defined(__AVX512F__)
+                        for (; kb + 1 < K_blocks; kb += 2)
+                            simd::quantize_two_blocks_avx512(input_data + kb * 32,
+                                                             fused_q8_tls[kb], fused_q8_tls[kb + 1]);
+#endif
+                        for (; kb < K_blocks; ++kb)
+                            simd::quantize_single_block(input_data + kb * 32, fused_q8_tls[kb],
+                                                        std::min(32, k - kb * 32));
+                    }
+
+                    // Build fused GEMV descriptors
+                    FusedGemvDesc descs[16]; // Stack-allocated, max 16 projections (MoE batches 8 gate+up)
+                    int num_descs = 0;
+                    for (const auto &proj : projections)
+                    {
+                        if (num_descs >= 16)
+                            break;
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        auto &d = descs[num_descs++];
+                        d.packed = &vnni->packed_;
+                        d.output = proj.output->mutable_data();
+                        d.bias = proj.bias ? proj.bias->data() : nullptr;
+                        d.N = proj.n;
+                        d.bpr = K_blocks;
+
+                        // Check for Q8_0 raw path (deferred zero-copy)
+                        if (vnni->packed_.codebook_id == 19 && vnni->packed_.workspace_data_)
+                            d.q8_0_raw = reinterpret_cast<const Q8_0Block *>(vnni->packed_.workspace_data_);
+                        else
+                            d.q8_0_raw = nullptr;
+                    }
+
+                    // Single OMP region with nowait between projections
+                    gemv_native_vnni_fused_preq(fused_q8_tls.data(), descs, num_descs);
+
+                    // Clean up deferred workspace
+                    for (const auto &proj : projections)
+                    {
+                        auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                        if (vnni->deferred_packing_)
+                            vnni->packed_.clearWorkspace();
+                    }
+
+                    return true;
+                }
+
+                // Fallback: individual calls for non-VNNI or single projection
+                for (const auto &proj : projections)
+                {
                     bool success = proj.kernel->multiply_tensor(
                         input, proj.output, m, proj.n, k,
                         true, 1.0f, 0.0f, proj.bias, mpi_ctx, -1, workspace);
@@ -437,6 +775,365 @@ namespace llaminar2::cpu::native_vnni
                     apply_bias_epilogue(out_data, bias_data, m, proj.n, proj.n);
                 }
             }
+            if (q8_quantized && PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_small_m_fused_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"k", std::to_string(k)},
+                        {"projections", std::to_string(projections.size())}});
+            }
+            return true;
+        }
+
+        /**
+         * @brief Group MTP verifier rows while preserving M=1 decode GEMV math.
+         *
+         * This is the CPU implementation of ITensorGemm's Phase 9.8 verifier
+         * contract.  It quantizes the M verifier activation rows once, then
+         * runs every projection through gemm_native_vnni_preq_decode_equivalent_rows().
+         * That helper parallelizes across rows and N/K tasks, but each row uses
+         * the same chunk kernels and reduction order as serial decode.  The
+         * result is grouped/concurrent execution without the 2-row GEMM
+         * accumulation drift that can poison GDN/short-conv state publication.
+         */
+        bool multiply_fused_verifier_rows_decode_equivalent(
+            const TensorBase *input,
+            const std::vector<TensorProjectionDesc> &projections,
+            int m, int k,
+            const IMPIContext *mpi_ctx = nullptr,
+            DeviceWorkspaceManager *workspace = nullptr) override
+        {
+            (void)mpi_ctx;
+            (void)workspace;
+
+            if (!valid_ || !input || m <= 1 || m > 4 || k <= 0 || projections.empty())
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: valid="
+                          << valid_ << " input=" << (input != nullptr)
+                          << " m=" << m << " k=" << k
+                          << " projections=" << projections.size());
+                return false;
+            }
+
+            const float *input_data = input->data();
+            if (!input_data)
+            {
+                LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected: input has no host FP32 data");
+                return false;
+            }
+
+            std::vector<CPUNativeVNNIGemmKernel *> vnni_kernels;
+            vnni_kernels.reserve(projections.size());
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                const auto &proj = projections[i];
+                auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(proj.kernel);
+                if (!vnni || !vnni->valid_ || !proj.output || proj.n <= 0)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected at projection "
+                              << i << ": native_vnni=" << (vnni != nullptr)
+                              << " valid=" << (vnni ? vnni->valid_ : false)
+                              << " output=" << (proj.output != nullptr)
+                              << " n=" << proj.n);
+                    return false;
+                }
+
+                /*
+                 * The fused projection API shares one activation transform.
+                 * If a future model ever mixes differently rotated weights in
+                 * one fused group, that is a real contract gap and must be
+                 * handled explicitly rather than silently producing drift.
+                 */
+                if (vnni->activation_rotation_ != activation_rotation_)
+                {
+                    LOG_ERROR("[CPUNativeVNNIGemmKernel] grouped verifier projection rejected at projection "
+                              << i << ": mixed activation rotation contracts");
+                    return false;
+                }
+                vnni_kernels.push_back(vnni);
+            }
+
+            const bool perf_enabled = PerfStatsCollector::isEnabled();
+            auto perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                           : PerfStatsCollector::Clock::time_point{};
+            input_data = maybe_rotate_activation(input_data, m, k);
+
+            const int K_blocks = (k + 31) / 32;
+            const size_t shared_q8_blocks = static_cast<size_t>(m) * K_blocks;
+            thread_local AlignedVector<Q8_1Block> shared_q8_tls;
+            if (shared_q8_tls.size() < shared_q8_blocks)
+                shared_q8_tls.resize_uninitialized(shared_q8_blocks);
+            quantize_activations_to_q8_1(input_data, shared_q8_tls.data(), m, k, K_blocks);
+            recordVerifierTiming(
+                "cpu_native_vnni_verifier_projection_activation_quantize",
+                perf_start,
+                m,
+                /*n=*/0,
+                k,
+                static_cast<int>(projections.size()));
+
+            for (auto *vnni : vnni_kernels)
+            {
+                if (vnni->deferred_packing_)
+                    vnni->ensureWorkspace();
+            }
+
+            /*
+             * Multi-projection verifier path.
+             *
+             * GDN/QKV verifier graphs commonly have several projections fed by
+             * the same M=2..4 hidden-state rows.  The older implementation ran
+             * one grouped-row GEMV per projection, which was correct but paid
+             * an OpenMP team entry and scheduling cost for every projection.
+             * This fused descriptor path keeps the exact M=1 decode chunk math
+             * and schedules every projection under one OpenMP team.
+             */
+            if (projections.size() >= 2)
+            {
+                std::vector<FusedVerifierRowsDesc> fused_descs;
+                fused_descs.reserve(projections.size());
+                for (size_t i = 0; i < projections.size(); ++i)
+                {
+                    const auto &proj = projections[i];
+                    float *out_data = proj.output->mutable_data();
+                    if (!out_data)
+                        return false;
+
+                    fused_descs.push_back({
+                        &vnni_kernels[i]->packed_,
+                        out_data,
+                        proj.bias ? proj.bias->data() : nullptr,
+                        proj.n,
+                        proj.n});
+                }
+
+                perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                          : PerfStatsCollector::Clock::time_point{};
+                if (gemm_native_vnni_fused_verifier_rows_preq(
+                        shared_q8_tls.data(),
+                        fused_descs.data(),
+                        static_cast<int>(fused_descs.size()),
+                        m,
+                        K_blocks))
+                {
+                    recordVerifierTiming(
+                        "cpu_native_vnni_verifier_projection_fused_gemv",
+                        perf_start,
+                        m,
+                        /*n=*/0,
+                        k,
+                        static_cast<int>(fused_descs.size()));
+                    for (auto *vnni : vnni_kernels)
+                    {
+                        if (vnni->deferred_packing_)
+                            vnni->packed_.clearWorkspace();
+                    }
+
+                    if (PerfStatsCollector::isEnabled())
+                    {
+                        PerfStatsCollector::addCounter(
+                            "kernel",
+                            "cpu_native_vnni_fused_grouped_verifier_projection_calls",
+                            1.0,
+                            "gemm",
+                            "cpu",
+                            PerfStatsCollector::Tags{
+                                {"m", std::to_string(m)},
+                                {"k", std::to_string(k)},
+                                {"projections", std::to_string(projections.size())}});
+                    }
+                    return true;
+                }
+
+                LOG_DEBUG("[CPUNativeVNNIGemmKernel] Fused grouped verifier "
+                          "projection path unavailable; using per-projection "
+                          "grouped verifier rows");
+                recordVerifierTiming(
+                    "cpu_native_vnni_verifier_projection_fused_gemv_rejected",
+                    perf_start,
+                    m,
+                    /*n=*/0,
+                    k,
+                    static_cast<int>(fused_descs.size()));
+            }
+
+            for (size_t i = 0; i < projections.size(); ++i)
+            {
+                auto *vnni = vnni_kernels[i];
+                const auto &proj = projections[i];
+                float *out_data = proj.output->mutable_data();
+                if (!out_data)
+                    return false;
+
+                perf_start = perf_enabled ? PerfStatsCollector::Clock::now()
+                                          : PerfStatsCollector::Clock::time_point{};
+                gemm_native_vnni_preq_decode_equivalent_rows(
+                    vnni->packed_,
+                    shared_q8_tls.data(),
+                    out_data,
+                    m,
+                    proj.n);
+                recordVerifierTiming(
+                    "cpu_native_vnni_verifier_projection_per_gemv",
+                    perf_start,
+                    m,
+                    proj.n,
+                    k,
+                    1);
+
+                if (proj.bias)
+                {
+                    const float *bias_data = proj.bias->data();
+                    if (!bias_data)
+                        return false;
+                    apply_bias_epilogue(out_data, bias_data, m, proj.n, proj.n);
+                }
+            }
+
+            for (auto *vnni : vnni_kernels)
+            {
+                if (vnni->deferred_packing_)
+                    vnni->packed_.clearWorkspace();
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "kernel",
+                    "cpu_native_vnni_grouped_verifier_projection_calls",
+                    1.0,
+                    "gemm",
+                    "cpu",
+                    PerfStatsCollector::Tags{
+                        {"m", std::to_string(m)},
+                        {"k", std::to_string(k)},
+                        {"projections", std::to_string(projections.size())}});
+            }
+            return true;
+        }
+
+        // =====================================================================
+        // Fused multi-input GEMV for MoE expert down projections
+        // =====================================================================
+
+        bool multiply_fused_expert_down(
+            const FusedExpertDownDesc *descs, int num_descs,
+            int m, int k) override
+        {
+            if (m != 1 || num_descs < 1)
+                return false;
+
+            // Verify all kernels are CPUNativeVNNIGemmKernel
+            for (int i = 0; i < num_descs; ++i)
+            {
+                auto *vnni = dynamic_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                if (!vnni || !vnni->valid_)
+                    return false;
+            }
+
+            const int K_blocks = (k + 31) / 32;
+
+            // Set up deferred workspace for all kernels
+            {
+                size_t max_interleave_ws = 0;
+                int deferred_interleave_count = 0;
+                for (int i = 0; i < num_descs; ++i)
+                {
+                    auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                    if (vnni->deferred_packing_ && vnni->packed_.codebook_id != 19)
+                    {
+                        max_interleave_ws = std::max(max_interleave_ws,
+                                                     interleavedWorkspaceSize(vnni->packed_));
+                        deferred_interleave_count++;
+                    }
+                }
+                if (deferred_interleave_count > 0)
+                {
+                    auto &ws = sharedWorkspace();
+                    const size_t total = max_interleave_ws * deferred_interleave_count;
+                    if (ws.size() < total)
+                        ws.resize_uninitialized(total);
+                }
+                int slot_idx = 0;
+                for (int i = 0; i < num_descs; ++i)
+                {
+                    auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                    if (vnni->deferred_packing_)
+                    {
+                        if (vnni->packed_.codebook_id == 19)
+                        {
+                            vnni->ensureWorkspaceRaw();
+                        }
+                        else
+                        {
+                            uint8_t *slot = sharedWorkspace().data() +
+                                            static_cast<size_t>(slot_idx) * max_interleave_ws;
+                            repackNativeBlocksToInterleaved(
+                                vnni->native_blocks_ptr_, vnni->native_block_size_,
+                                vnni->packed_, slot);
+                            vnni->packed_.setWorkspace(slot);
+                            slot_idx++;
+                        }
+                    }
+                }
+            }
+
+            // Quantize each expert's FP32 input to Q8_1
+            // Use a contiguous buffer for all experts' Q8_1 blocks
+            thread_local std::vector<Q8_1Block> multi_q8_tls;
+            const size_t total_blocks = static_cast<size_t>(num_descs) * K_blocks;
+            if (multi_q8_tls.size() < total_blocks)
+                multi_q8_tls.resize(total_blocks);
+
+            for (int i = 0; i < num_descs; ++i)
+            {
+                Q8_1Block *A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
+                const float *input_data = descs[i].input;
+                int kb = 0;
+#if defined(__AVX512F__)
+                for (; kb + 1 < K_blocks; kb += 2)
+                    simd::quantize_two_blocks_avx512(input_data + kb * 32,
+                                                     A_q8[kb], A_q8[kb + 1]);
+#endif
+                for (; kb < K_blocks; ++kb)
+                    simd::quantize_single_block(input_data + kb * 32, A_q8[kb],
+                                                std::min(32, k - kb * 32));
+            }
+
+            // Build fused multi-input GEMV descriptors
+            FusedGemvMultiInputDesc mi_descs[16]; // max 16 experts
+            int num_mi = 0;
+            for (int i = 0; i < num_descs && num_mi < 16; ++i)
+            {
+                auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                auto &d = mi_descs[num_mi++];
+                d.A_q8 = multi_q8_tls.data() + static_cast<size_t>(i) * K_blocks;
+                d.packed = &vnni->packed_;
+                d.output = descs[i].output;
+                d.N = descs[i].n;
+                d.bpr = K_blocks;
+                d.q8_0_raw = (vnni->packed_.codebook_id == 19 && vnni->packed_.workspace_data_)
+                                 ? reinterpret_cast<const Q8_0Block *>(vnni->packed_.workspace_data_)
+                                 : nullptr;
+            }
+
+            // Single OMP region with nowait between expert projections
+            gemv_fused_multi_input_preq(mi_descs, num_mi);
+
+            // Clean up deferred workspace
+            for (int i = 0; i < num_descs; ++i)
+            {
+                auto *vnni = static_cast<CPUNativeVNNIGemmKernel *>(descs[i].kernel);
+                if (vnni->deferred_packing_)
+                    vnni->packed_.clearWorkspace();
+            }
+
             return true;
         }
 
@@ -450,7 +1147,8 @@ namespace llaminar2::cpu::native_vnni
 
         /// Owned copy of native quantized blocks for all weight formats.
         /// Layout: [N × blocks_per_row × block_size] contiguous bytes.
-        /// Used for deferred VNNI repacking.
+        /// Legacy deferred-packing storage. Kept only for defensive cleanup paths;
+        /// new CPU VNNI engines keep eager interleaved packed weights.
         std::vector<uint8_t> native_blocks_owned_;
 
         /// Pointer to native block data — either into native_blocks_owned_
@@ -460,11 +1158,8 @@ namespace llaminar2::cpu::native_vnni
         /// Size in bytes of a single native quantized block (34 for Q8_0, 18 for Q4_0, etc.)
         size_t native_block_size_ = 0;
 
-        /// Whether deferred packing is active (interleaved data released, repack on demand)
+        /// Legacy flag. New CPU VNNI engine construction never sets this true.
         bool deferred_packing_ = false;
-
-        // Cached scratch buffer for fused SwiGLU+GEMM (avoids malloc per decode token)
-        mutable std::vector<float> swiglu_scratch_;
 
         // Cached Q8_1 quantization buffer for fused projections (avoids malloc per decode token)
         mutable std::vector<Q8_1Block> q8_scratch_;
@@ -473,9 +1168,6 @@ namespace llaminar2::cpu::native_vnni
         // When set, activations are rotated before Q8_1 quantization for GEMM.
         // The weight must have been pre-rotated with the same rotation.
         const ActivationRotation *activation_rotation_ = nullptr;
-
-        // Cached scratch buffer for rotated activation (avoids malloc per call)
-        mutable std::vector<float> rotation_scratch_;
 
         // -------------------------------------------------------------------
         // Native block storage helper
@@ -530,6 +1222,115 @@ namespace llaminar2::cpu::native_vnni
         }
 
         // -------------------------------------------------------------------
+        // Q4_K superblock → Q4_1 elementary block synthesis
+        // -------------------------------------------------------------------
+
+        /// Synthesize Q4_1-compatible elementary blocks from Q4_K superblock data.
+        ///
+        /// Each Q4_K superblock (144 bytes, 256 elements) is decomposed into
+        /// 8 elementary blocks (20 bytes each, 32 elements). The elementary
+        /// block format matches Q4_1: [scale_fp16(2) | min_fp16(2) | payload(16)].
+        ///
+        /// The resulting blocks are stored in native_blocks_owned_ and can be
+        /// repacked by the standard repackNativeBlocksToInterleaved() function
+        /// since packed_.codebook_id == 5 (Q4_1).
+        ///
+        /// Legacy deferred-packing helper retained for experiments only; normal
+        /// CPU VNNI engine construction does not call it.
+        void synthesizeElementaryBlocksFromSuperblock(const TensorBase *weights,
+                                                      int row_start, int row_end)
+        {
+            if (row_start < 0)
+                row_start = 0;
+            if (row_end < 0)
+                row_end = weights->shape()[0];
+
+            const int N = row_end - row_start;
+            const int K = packed_.K;
+            const int bpr = packed_.blocks_per_row; // elementary blocks per row (K/32)
+            const int sbpr = K / 256;               // superblocks per row
+
+            // Elementary Q4_1 block: scale_fp16(2) + min_fp16(2) + payload(16) = 20 bytes
+            static constexpr size_t ELEM_BLOCK_SIZE = 20;
+
+            const auto *base = reinterpret_cast<const uint8_t *>(weights->raw_data());
+
+            if (!base || sbpr == 0)
+            {
+                LOG_WARN("[CPUNativeVNNIGemmKernel] Cannot synthesize elementary blocks: "
+                         << "raw_data()=" << (const void *)base
+                         << " sbpr=" << sbpr
+                         << " — keeping permanent interleaved data");
+                native_blocks_ptr_ = nullptr;
+                return;
+            }
+
+            // Q4_K superblock layout: row_stride = sbpr * sizeof(Q4_KBlock)
+            // Compute from shape instead of size_bytes() (views may report 0).
+            static constexpr size_t Q4K_BLOCK_SIZE = 144; // sizeof(Q4_KBlock)
+            const size_t sb_row_stride = static_cast<size_t>(sbpr) * Q4K_BLOCK_SIZE;
+            const uint8_t *row_base = base + static_cast<size_t>(row_start) * sb_row_stride;
+
+            // Allocate elementary blocks: N rows × bpr blocks × 20 bytes each
+            native_blocks_owned_.resize(static_cast<size_t>(N) * bpr * ELEM_BLOCK_SIZE);
+
+#pragma omp parallel for schedule(static)
+            for (int n = 0; n < N; ++n)
+            {
+                const uint8_t *row_ptr = row_base + static_cast<size_t>(n) * sb_row_stride;
+
+                for (int sb = 0; sb < sbpr; ++sb)
+                {
+                    const auto *blk = reinterpret_cast<const Q4_KBlock *>(
+                        row_ptr + static_cast<size_t>(sb) * Q4K_BLOCK_SIZE);
+
+                    const float d = fp16_to_fp32(blk->d);
+                    const float dmin = fp16_to_fp32(blk->dmin);
+
+                    for (int sub = 0; sub < 8; ++sub)
+                    {
+                        const int kb = sb * 8 + sub;
+                        uint8_t *dst = native_blocks_owned_.data() +
+                                       (static_cast<size_t>(n) * bpr + kb) * ELEM_BLOCK_SIZE;
+
+                        // Decode 6-bit packed scale and min for this sub-block
+                        uint8_t sc, m_val;
+                        simd::get_scale_min_k4(sub, blk->scales, &sc, &m_val);
+
+                        // Convert to FP16 (matches packVnniBlock() output)
+                        const uint16_t scale_fp16 = fp32_to_fp16(d * static_cast<float>(sc));
+                        const uint16_t min_fp16 = fp32_to_fp16(-dmin * static_cast<float>(m_val));
+
+                        std::memcpy(dst, &scale_fp16, 2);
+                        std::memcpy(dst + 2, &min_fp16, 2);
+
+                        // Extract nibble payload: repack from Q4_K interleaved layout
+                        // to contiguous 16 bytes (matches packVnniBlock() nibble extraction)
+                        const int group_idx = sub / 2;
+                        const int is_high = sub & 1;
+                        const uint8_t *src32 = blk->qs + group_idx * 32;
+
+                        if (is_high)
+                        {
+                            for (int i = 0; i < 16; ++i)
+                                dst[4 + i] = (src32[i] >> 4) | (src32[i + 16] & 0xF0);
+                        }
+                        else
+                        {
+                            for (int i = 0; i < 16; ++i)
+                                dst[4 + i] = (src32[i] & 0xF) | ((src32[i + 16] & 0xF) << 4);
+                        }
+                    }
+                }
+            }
+
+            native_blocks_ptr_ = native_blocks_owned_.data();
+            // Override native_block_size_ to elementary Q4_1 block size
+            // (the codebook_id-based default of 20 already matches, but be explicit)
+            native_block_size_ = ELEM_BLOCK_SIZE;
+        }
+
+        // -------------------------------------------------------------------
         // Workspace management for deferred VNNI packing
         // -------------------------------------------------------------------
 
@@ -574,12 +1375,49 @@ namespace llaminar2::cpu::native_vnni
                 return input;
 
             const size_t len = static_cast<size_t>(m) * k;
-            if (rotation_scratch_.size() < len)
-                rotation_scratch_.resize(len);
+            thread_local std::vector<float> rotation_scratch_tls;
+            if (rotation_scratch_tls.size() < len)
+                rotation_scratch_tls.resize(len);
 
-            std::memcpy(rotation_scratch_.data(), input, len * sizeof(float));
-            activation_rotation_->rotate_rows_inplace(rotation_scratch_.data(), m, k);
-            return rotation_scratch_.data();
+            std::memcpy(rotation_scratch_tls.data(), input, len * sizeof(float));
+            activation_rotation_->rotate_rows_inplace(rotation_scratch_tls.data(), m, k);
+            return rotation_scratch_tls.data();
+        }
+
+        /**
+         * @brief Record one coarse verifier-kernel timing sample.
+         *
+         * These timers intentionally sit at the projection bundle boundary, not
+         * inside the NativeVNNI block kernels.  That keeps ordinary inference
+         * cheap while still telling us whether Phase 9.8 verifier time is spent
+         * in activation preparation, grouped projection GEMV, or SwiGLU.
+         */
+        static void recordVerifierTiming(
+            const char *name,
+            PerfStatsCollector::Clock::time_point start,
+            int m,
+            int n,
+            int k,
+            int projections)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const auto end = PerfStatsCollector::Clock::now();
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+            PerfStatsCollector::Tags tags{
+                {"m", std::to_string(m)},
+                {"k", std::to_string(k)},
+                {"projections", std::to_string(projections)}};
+            if (n > 0)
+                tags.emplace("n", std::to_string(n));
+            PerfStatsCollector::recordTimingNs(
+                "kernel",
+                name ? name : "cpu_native_vnni_verifier_unknown",
+                ns > 0 ? static_cast<uint64_t>(ns) : 0,
+                "gemm",
+                "cpu",
+                std::move(tags));
         }
     };
 

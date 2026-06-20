@@ -8,6 +8,8 @@
 #include "../backends/BackendManager.h"
 #include "../planning/KVCacheMemoryEstimator.h"
 #include "cpu/native_vnni/CPUNativeVNNIGemmKernel.h"
+#include "cpu/native_vnni/CPUPackedWeights.h"
+#include "PackedWeightsSerialization.h"
 #include "cpu/gemm/FloatingPointGemmKernel.h"
 #include "../tensors/TensorSlice.h"
 #include "cpu/ops/CPURoPEKernelT.h"
@@ -19,6 +21,7 @@
 #include "cpu/attention/CPUFlashAttentionKernelT.h"
 #include "cpu/gdn/CPUShortConvolution.h"
 #include "cpu/gdn/CPUGatedDeltaNet.h"
+#include "cpu/moe/CPUMoEKernel.h"
 #include "../utils/Assertions.h"
 #include <unordered_set>
 
@@ -40,8 +43,8 @@
 #include "../interfaces/IWorkspaceConsumer.h"
 #include "../backends/ComputeBackend.h"
 #include "../utils/Logger.h"
+#include "../utils/DebugEnv.h"
 #include "common/EmbedQ8Repack.h"
-
 // CUDA kernel classes
 #ifdef HAVE_CUDA
 #include "cuda/gemm/CUDAQuantisedGemmKernel.h"        // Quantized tensors via CUTLASS INT8
@@ -54,6 +57,7 @@
 #include "cuda/attention/CUDAFlashAttentionKernelT.h" // Flash Attention
 #include "cuda/gdn/CUDAGatedDeltaNet.h"               // GDN recurrence
 #include "cuda/gdn/CUDAShortConvolution.h"            // GDN short conv1d
+#include "cuda/moe/CUDAMoEKernel.h"                   // MoE routing/gather/scatter/gate/swiglu
 
 extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #endif
@@ -73,6 +77,7 @@ extern "C" void cudaNativeVNNIGemvTuned_clearStaticState();
 #include "rocm/attention/ROCmFlashAttentionKernelT.h"  // Flash Attention
 #include "rocm/gdn/ROCmGatedDeltaNet.h"                // GDN recurrence
 #include "rocm/gdn/ROCmShortConvolution.h"             // GDN short conv1d
+#include "rocm/moe/ROCmMoEKernel.h"                    // MoE routing/gather/scatter/gate/swiglu
 #endif
 
 namespace llaminar
@@ -81,6 +86,18 @@ namespace llaminar
     {
         namespace kernels
         {
+
+            static const llaminar2::NativeVnniFormatInfo *vnniFormatInfoIfPackable(
+                const llaminar2::TensorBase *tensor)
+            {
+                const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
+                return unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            }
+
+            static bool isVnniPackableTensor(const llaminar2::TensorBase *tensor)
+            {
+                return vnniFormatInfoIfPackable(tensor) != nullptr;
+            }
 
             // ==========================================================================
             // Device Type Resolution
@@ -193,7 +210,7 @@ namespace llaminar
                     // No implicit fallback - require explicit device specification
                     LOG_ERROR("[KernelFactory] Cannot determine CUDA device for kernel creation. "
                               "Tensor is not on a CUDA device and no target device was specified. "
-                              "Use getOrCreatePreparedGemmWeights(tensor, DeviceId) and getOrCreateGemmEngine(prepared) to specify the target device explicitly.");
+                              "Use prepareGemmHandleLocal(tensor, DeviceId) and getOrCreateGemmEngine(prepared.get()) to specify the target device explicitly.");
                     throw std::runtime_error(
                         "KernelFactory: CUDA device must be specified explicitly - tensor is not on CUDA "
                         "and no target device provided via CUDAOrdinalGuard or DeviceId");
@@ -236,7 +253,7 @@ namespace llaminar
                     // No implicit fallback - require explicit device specification
                     LOG_ERROR("[KernelFactory] Cannot determine ROCm device for kernel creation. "
                               "Tensor is not on a ROCm device and no target device was specified. "
-                              "Use getOrCreatePreparedGemmWeights(tensor, DeviceId) and getOrCreateGemmEngine(prepared) to specify the target device explicitly.");
+                              "Use prepareGemmHandleLocal(tensor, DeviceId) and getOrCreateGemmEngine(prepared.get()) to specify the target device explicitly.");
                     throw std::runtime_error(
                         "KernelFactory: ROCm device must be specified explicitly - tensor is not on ROCm "
                         "and no target device provided via ROCmOrdinalGuard or DeviceId");
@@ -589,7 +606,7 @@ namespace llaminar
                 // 1. IINT8Unpackable → CPUNativeVNNIGemmKernel (quantized weights)
                 // 2. Otherwise → FloatingPointGemmKernel (FP32/FP16/BF16)
 
-                const auto *quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
+                const bool quantized = isVnniPackableTensor(tensor);
 
                 if (quantized)
                 {
@@ -622,17 +639,17 @@ namespace llaminar
 #ifdef HAVE_CUDA
                     case DeviceType::CUDA:
                     {
-                        auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                        int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                        return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                        throw std::runtime_error(
+                            "[KernelFactory] Legacy createGemm() GPU path removed. "
+                            "Use GPU pipeline (DeviceLoadPipeline/WeightVRAMPool) for CUDA weight preparation.");
                     }
 #endif
 #ifdef HAVE_ROCM
                     case DeviceType::ROCm:
                     {
-                        auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
-                        int rocm_device_id = getROCmDeviceIdForKernel(tensor);
-                        return std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                        throw std::runtime_error(
+                            "[KernelFactory] Legacy createGemm() GPU path removed. "
+                            "Use GPU pipeline (DeviceLoadPipeline/WeightVRAMPool) for ROCm weight preparation.");
                     }
 #endif
                     default:
@@ -697,11 +714,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ4_NL GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -731,10 +746,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return new llaminar2::cuda::CUDAQuantisedGemmKernel(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -760,21 +774,18 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q4_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
 #ifdef HAVE_ROCM
                 case DeviceType::ROCm:
                 {
-                    LOG_DEBUG("[KernelFactory] Q4_0 GEMM: Using ROCmQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureROCmPackedWeightsInTensorCache(tensor);
-                    int rocm_device_id = getROCmDeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(packed, rocm_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for ROCm weight preparation.");
                 }
 #endif
 
@@ -804,11 +815,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q4_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -838,11 +847,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q5_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -872,11 +879,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q5_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -906,11 +911,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q6_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -940,11 +943,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q8_0 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -974,11 +975,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q8_1 GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1008,11 +1007,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q2_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1042,11 +1039,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q3_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1076,11 +1071,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q4_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1110,11 +1103,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q5_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1144,11 +1135,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] Q8_K GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1178,11 +1167,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ1_M GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1212,11 +1199,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ1_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1246,11 +1231,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ2_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1280,11 +1263,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ2_XS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1314,11 +1295,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ2_XXS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1348,11 +1327,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ3_S GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1382,11 +1359,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ3_XXS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -1416,11 +1391,9 @@ namespace llaminar
 #ifdef HAVE_CUDA
                 case DeviceType::CUDA:
                 {
-                    LOG_DEBUG("[KernelFactory] IQ4_XS GEMM: Using CUDAQuantisedGemmKernel (pre-packed)");
-                    auto *packed = ensureCUDAPackedWeightsInTensorCache(tensor);
-                    const auto &dm = llaminar2::DeviceManager::instance();
-                    int cuda_device_id = getCUDADeviceIdForKernel(tensor);
-                    return std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(packed, cuda_device_id);
+                    throw std::runtime_error(
+                        "[KernelFactory] Legacy createGemm() GPU path removed. "
+                        "Use GPU pipeline for CUDA weight preparation.");
                 }
 #endif
 
@@ -2249,10 +2222,10 @@ namespace llaminar
                 auto *raw_ptr = kernel.get();
                 rmsnorm_cache_[key] = std::move(kernel);
                 device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
-                LOG_INFO("[KernelFactory][RMSNORM] create dev=" << static_cast<int>(target_device.type)
-                                                                << ":" << target_device.ordinal
-                                                                << " tensor_type=" << static_cast<int>(tensor->native_type())
-                                                                << " kernel=" << static_cast<const void *>(raw_ptr));
+                LOG_DEBUG("[KernelFactory][RMSNORM] create dev=" << static_cast<int>(target_device.type)
+                                                                 << ":" << target_device.ordinal
+                                                                 << " tensor_type=" << static_cast<int>(tensor->native_type())
+                                                                 << " kernel=" << static_cast<const void *>(raw_ptr));
                 LOG_DEBUG("[KernelFactory][Registry] create kind=RMSNORM dev=" << static_cast<int>(target_device.type)
                                                                                << ":" << target_device.ordinal
                                                                                << " variant=" << static_cast<int>(tensor->native_type())
@@ -2534,6 +2507,80 @@ namespace llaminar
                                                                                  << ":" << target_device.ordinal
                                                                                  << " variant=" << static_cast<int>(tensor->native_type())
                                                                                  << " ptr=" << raw_ptr);
+                return raw_ptr;
+            }
+
+            llaminar2::IMoEKernel *KernelFactory::getOrCreateMoEKernel(
+                llaminar2::DeviceId target_device)
+            {
+                const DeviceKernelKey registry_key{
+                    target_device,
+                    KernelKind::MOE,
+                    0}; // No variant (always FP32)
+
+                MoECacheKey key{target_device};
+
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+
+                auto reg_it = device_kernel_registry_.find(registry_key);
+                if (reg_it != device_kernel_registry_.end())
+                {
+                    return static_cast<llaminar2::IMoEKernel *>(reg_it->second.get());
+                }
+
+                auto it = moe_cache_.find(key);
+                if (it != moe_cache_.end())
+                {
+                    auto *raw_ptr = it->second.get();
+                    device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                    return raw_ptr;
+                }
+
+                // Create device-appropriate MoE kernel. CUDA/ROCm devices must
+                // never silently fall through to CPU: that would pull routing
+                // tensors back to host and break graph-capture assumptions.
+                std::unique_ptr<llaminar2::IMoEKernel> kernel;
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    kernel = std::make_unique<llaminar2::CUDAMoEKernel>(target_device.cuda_ordinal());
+                }
+                else
+#else
+                if (target_device.is_cuda())
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: CUDA device requested but HAVE_CUDA is OFF");
+                }
+                else
+#endif
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    kernel = std::make_unique<llaminar2::ROCmMoEKernel>(target_device.rocm_ordinal());
+                }
+                else
+#else
+                if (target_device.is_rocm())
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: ROCm device requested but HAVE_ROCM is OFF");
+                }
+                else
+#endif
+                if (target_device.is_cpu())
+                {
+                    kernel = std::make_unique<llaminar2::CPUMoEKernel>();
+                }
+                else
+                {
+                    throw std::runtime_error("KernelFactory::getOrCreateMoEKernel: invalid target device " + target_device.to_string());
+                }
+
+                auto *raw_ptr = kernel.get();
+                moe_cache_[key] = std::move(kernel);
+                device_kernel_registry_[registry_key] = std::shared_ptr<void>(raw_ptr, [](void *) {});
+                LOG_DEBUG("[KernelFactory][MOE] create dev=" << static_cast<int>(target_device.type)
+                                                             << ":" << target_device.ordinal
+                                                             << " kernel=" << static_cast<const void *>(raw_ptr));
                 return raw_ptr;
             }
 
@@ -2880,8 +2927,6 @@ namespace llaminar
             // ==========================================================================
 
             std::mutex KernelFactory::cache_mutex_;
-            std::unordered_map<KernelFactory::SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, KernelFactory::SlicedKeyHash> KernelFactory::sliced_cache_;
-            std::unordered_map<KernelFactory::FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, KernelFactory::FusedQKVKeyHash> KernelFactory::fused_qkv_cache_;
             std::unordered_map<KernelFactory::FusedGateUpCacheKey, std::unique_ptr<llaminar2::ITensorFusedGateUpGemm>, KernelFactory::FusedGateUpKeyHash> KernelFactory::fused_gate_up_cache_;
             std::unordered_map<KernelFactory::RoPECacheKey, std::unique_ptr<llaminar2::ITensorRoPE>, KernelFactory::RoPECacheKeyHash> KernelFactory::rope_cache_;
             std::unordered_map<KernelFactory::RMSNormCacheKey, std::unique_ptr<llaminar2::ITensorRMSNorm>, KernelFactory::RMSNormCacheKeyHash> KernelFactory::rmsnorm_cache_;
@@ -2890,11 +2935,9 @@ namespace llaminar
             std::unordered_map<KernelFactory::ResidualAddCacheKey, std::unique_ptr<llaminar2::ITensorResidualAdd>, KernelFactory::ResidualAddCacheKeyHash> KernelFactory::residual_add_cache_;
             std::unordered_map<KernelFactory::AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, KernelFactory::AttentionCacheKeyHash> KernelFactory::attention_cache_;
             std::unordered_map<KernelFactory::EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, KernelFactory::EmbeddingCacheKeyHash> KernelFactory::embedding_cache_;
+            std::unordered_map<KernelFactory::MoECacheKey, std::unique_ptr<llaminar2::IMoEKernel>, KernelFactory::MoECacheKeyHash> KernelFactory::moe_cache_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> KernelFactory::device_kernel_registry_;
-            std::unordered_map<KernelFactory::PreparedGemmKey, std::shared_ptr<KernelFactory::PreparedGemmHandle>, KernelFactory::PreparedGemmKeyHash> KernelFactory::prepared_gemm_registry_;
             std::unordered_map<DeviceKernelKey, std::shared_ptr<KernelFactory::IGemmEngine>, DeviceKernelKeyHash> KernelFactory::device_gemm_engine_registry_;
-            std::unordered_map<KernelFactory::PreparedEmbeddingKey, std::shared_ptr<llaminar2::PreparedEmbeddingHandle>, KernelFactory::PreparedEmbeddingKeyHash> KernelFactory::prepared_embedding_registry_;
-
             // NOTE: Device-level kernel caching (hipBLAS, cuBLAS handles, etc.)
             // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
 
@@ -2920,217 +2963,12 @@ namespace llaminar
                 return nullptr;
             }
 
-#ifdef HAVE_CUDA
-            /**
-             * @brief Cache wrapper for CUDA packed weights
-             *
-             * Stored in tensor->cuda_cache_ to manage lifetime.
-             */
-            struct TensorCUDAPackedWeightsCache
-            {
-                llaminar2::cuda::CUDAPackedWeights packed;
-            };
-
-            llaminar2::cuda::CUDAPackedWeights *
-            KernelFactory::ensureCUDAPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
-            {
-                std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
-
-                // Check if tensor already has CUDA packed weights cached
-                if (tensor->cuda_cache_.has_value())
-                {
-                    try
-                    {
-                        auto cached = std::any_cast<std::shared_ptr<TensorCUDAPackedWeightsCache>>(tensor->cuda_cache_);
-                        if (cached)
-                        {
-                            return &cached->packed;
-                        }
-                    }
-                    catch (const std::bad_any_cast &)
-                    {
-                        // cuda_cache_ contains something else - overwrite
-                    }
-                }
-
-                // Pack weights into tensor's cuda_cache_
-                auto new_cache = std::make_shared<TensorCUDAPackedWeightsCache>();
-                if (!llaminar2::cuda::packWeightsToCUDA(tensor, new_cache->packed))
-                {
-                    LOG_ERROR("[KernelFactory] Failed to pack CUDA weights for tensor type "
-                              << static_cast<int>(tensor->native_type()));
-                    throw std::runtime_error("KernelFactory: failed to pack CUDA weights");
-                }
-
-                // Store back-reference to source tensor for coherence marking
-                // const_cast is safe here because we only use it to mark device_valid_
-                // after uploading the packed weights to GPU
-                new_cache->packed.source_tensor_ = const_cast<llaminar2::TensorBase *>(tensor);
-
-                // Store as shared_ptr in tensor's cuda_cache_ (std::any properly
-                // destroys shared_ptr on overwrite/destruction, preventing leaks)
-                tensor->cuda_cache_ = new_cache;
-
-                LOG_DEBUG("[KernelFactory] Packed CUDA weights for tensor "
-                          << tensor << " type=" << llaminar2::tensorTypeName(tensor->native_type())
-                          << " dims=" << new_cache->packed.N << "x" << new_cache->packed.K
-                          << " preferred_family="
-                          << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.preferred_family)
-                          << " active_family="
-                          << llaminar2::cuda::cudaPackedWeightFamilyName(new_cache->packed.active_family));
-
-                return &new_cache->packed;
-            }
-#endif
-
-#ifdef HAVE_ROCM
-            /**
-             * @brief Cache wrapper for ROCm packed weights
-             *
-             * Stored in tensor->rocm_cache_ to manage lifetime.
-             * The ROCmPackedWeights struct contains both host (int8_data, scales)
-             * and device (d_int8_data, d_scales) pointers. Device memory is uploaded
-             * lazily on first kernel use.
-             */
-            struct TensorROCmPackedWeightsCache
-            {
-                llaminar2::rocm::ROCmPackedWeights packed;
-            };
-
-            llaminar2::rocm::ROCmPackedWeights *
-            KernelFactory::ensureROCmPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor)
-            {
-                std::lock_guard<std::mutex> tensor_lock(tensor->packed_cache_mutex_);
-
-                // Check if tensor already has ROCm packed weights cached
-                if (tensor->rocm_cache_.has_value())
-                {
-                    try
-                    {
-                        auto cached = std::any_cast<std::shared_ptr<TensorROCmPackedWeightsCache>>(tensor->rocm_cache_);
-                        if (cached)
-                        {
-                            return &cached->packed;
-                        }
-                    }
-                    catch (const std::bad_any_cast &)
-                    {
-                        // rocm_cache_ contains something else - overwrite
-                    }
-                }
-
-                // Pack weights into tensor's rocm_cache_
-                auto new_cache = std::make_shared<TensorROCmPackedWeightsCache>();
-                if (!llaminar2::rocm::packWeightsToROCm(tensor, new_cache->packed))
-                {
-                    LOG_ERROR("[KernelFactory] Failed to pack ROCm weights for tensor type "
-                              << static_cast<int>(tensor->native_type()));
-                    throw std::runtime_error("KernelFactory: failed to pack ROCm weights");
-                }
-
-                // Store as shared_ptr in tensor's rocm_cache_ (std::any properly
-                // destroys shared_ptr on overwrite/destruction, preventing leaks)
-                tensor->rocm_cache_ = new_cache;
-
-                LOG_DEBUG("[KernelFactory] Packed ROCm INT8 weights for tensor "
-                          << tensor << " (" << new_cache->packed.N << "x" << new_cache->packed.K << ")");
-
-                return &new_cache->packed;
-            }
-#endif
-
             // NOTE: Shared device kernel caching (hipBLAS, cuBLAS handles, etc.)
             // has been moved to DeviceKernelCache. See kernels/DeviceKernelCache.h
-
-            llaminar2::ITensorGemm *KernelFactory::getOrCreateGemmSliced(
-                const llaminar2::TensorBase *tensor,
-                size_t row_start,
-                size_t row_end)
-            {
-                if (!tensor)
-                {
-                    LOG_ERROR("[KernelFactory] getOrCreateGemmSliced: tensor is null");
-                    return nullptr;
-                }
-
-                // Validate row range
-                const auto &shape = tensor->shape();
-                if (shape.size() != 2)
-                {
-                    LOG_ERROR("[KernelFactory] Tensor must be 2D for GEMM, got " << shape.size() << "D");
-                    throw std::runtime_error("KernelFactory: tensor must be 2D");
-                }
-                size_t tensor_n = shape[0]; // rows = output features
-                if (row_start >= row_end || row_end > tensor_n)
-                {
-                    LOG_ERROR("[KernelFactory] Invalid row range [" << row_start << ", " << row_end
-                                                                    << ") for tensor with N=" << tensor_n);
-                    throw std::runtime_error("KernelFactory: invalid row range for sliced GEMM");
-                }
-
-                // Check sliced cache
-                SlicedCacheKey key{tensor, row_start, row_end};
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                auto it = sliced_cache_.find(key);
-                if (it != sliced_cache_.end())
-                {
-                    LOG_DEBUG("[KernelFactory] Sliced GEMM cache HIT: tensor=" << tensor
-                                                                               << " rows=[" << row_start << "," << row_end << ")");
-                    return it->second.get();
-                }
-
-                // Cache miss - create sliced kernel
-                LOG_DEBUG("[KernelFactory] Sliced GEMM cache MISS: creating kernel for tensor=" << tensor
-                                                                                                << " rows=[" << row_start << "," << row_end << ")");
-
-                // Get device type from tensor's current location
-                auto current_dev = tensor->current_device();
-                DeviceType dev_type = DeviceType::CPU;
-                if (current_dev.has_value() && current_dev->is_gpu())
-                {
-                    dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
-                }
-
-                if (dev_type != DeviceType::CPU)
-                {
-                    LOG_ERROR("[KernelFactory] Sliced GEMM currently only supported on CPU, got " << to_string(dev_type));
-                    throw std::runtime_error("KernelFactory: sliced GEMM only supported on CPU");
-                }
-
-                // Create sliced kernel using row-range constructor
-                std::unique_ptr<llaminar2::ITensorGemm> kernel;
-
-                {
-                    kernel = std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
-                        tensor, static_cast<int>(row_start), static_cast<int>(row_end));
-                }
-
-                auto *raw_ptr = kernel.get();
-                sliced_cache_[key] = std::move(kernel);
-
-                LOG_DEBUG("[KernelFactory] Created sliced GEMM kernel: N=" << (row_end - row_start)
-                                                                           << ", K=" << shape[1]);
-
-                return raw_ptr;
-            }
 
             void KernelFactory::clearCacheFor(const llaminar2::TensorBase *tensor)
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                // Also clear any sliced kernels for this tensor
-                for (auto it = sliced_cache_.begin(); it != sliced_cache_.end();)
-                {
-                    if (it->first.tensor == tensor)
-                    {
-                        it = sliced_cache_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
-                }
 
                 // Also clean up tensor's packed weights cache if present (CPU VNNI)
                 // Note: caches store std::shared_ptr<T>, so resetting the std::any
@@ -3140,43 +2978,6 @@ namespace llaminar
                     if (tensor->cache_.has_value())
                     {
                         tensor->cache_.reset();
-                    }
-
-#ifdef HAVE_CUDA
-                    // Also clean up tensor's CUDA packed weights cache if present
-                    if (tensor->cuda_cache_.has_value())
-                    {
-                        tensor->cuda_cache_.reset();
-                    }
-#endif
-
-#ifdef HAVE_ROCM
-                    // Also clean up tensor's ROCm packed weights cache if present
-                    if (tensor->rocm_cache_.has_value())
-                    {
-                        tensor->rocm_cache_.reset();
-                    }
-#endif
-                }
-
-                // Clear any fused QKV kernels that reference this tensor
-                for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
-                {
-                    const auto *wq_handle = it->first.wq_handle;
-                    const auto *wk_handle = it->first.wk_handle;
-                    const auto *wv_handle = it->first.wv_handle;
-                    const bool references_tensor =
-                        (wq_handle && wq_handle->tensor == tensor) ||
-                        (wk_handle && wk_handle->tensor == tensor) ||
-                        (wv_handle && wv_handle->tensor == tensor);
-
-                    if (references_tensor)
-                    {
-                        it = fused_qkv_cache_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
                     }
                 }
 
@@ -3198,18 +2999,6 @@ namespace llaminar
                         ++it;
                     }
                 }
-
-                for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
-                {
-                    if (it->first.tensor == tensor)
-                    {
-                        it = prepared_gemm_registry_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
-                }
             }
 
             void KernelFactory::clearCache()
@@ -3217,37 +3006,8 @@ namespace llaminar
                 std::lock_guard<std::mutex> lock(cache_mutex_);
 
                 std::unordered_set<const llaminar2::TensorBase *> tracked_tensors;
-                tracked_tensors.reserve(prepared_gemm_registry_.size() + sliced_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size());
+                tracked_tensors.reserve(fused_gate_up_cache_.size());
 
-                for (const auto &entry : prepared_gemm_registry_)
-                {
-                    if (entry.first.tensor)
-                    {
-                        tracked_tensors.insert(entry.first.tensor);
-                    }
-                }
-                for (const auto &entry : sliced_cache_)
-                {
-                    if (entry.first.tensor)
-                    {
-                        tracked_tensors.insert(entry.first.tensor);
-                    }
-                }
-                for (const auto &entry : fused_qkv_cache_)
-                {
-                    if (entry.first.wq_handle && entry.first.wq_handle->tensor)
-                    {
-                        tracked_tensors.insert(entry.first.wq_handle->tensor);
-                    }
-                    if (entry.first.wk_handle && entry.first.wk_handle->tensor)
-                    {
-                        tracked_tensors.insert(entry.first.wk_handle->tensor);
-                    }
-                    if (entry.first.wv_handle && entry.first.wv_handle->tensor)
-                    {
-                        tracked_tensors.insert(entry.first.wv_handle->tensor);
-                    }
-                }
                 for (const auto &entry : fused_gate_up_cache_)
                 {
                     if (entry.first.w_gate_handle && entry.first.w_gate_handle->tensor)
@@ -3277,26 +3037,8 @@ namespace llaminar
                     {
                         tensor->cache_.reset();
                     }
-
-#ifdef HAVE_CUDA
-                    // Clean up CUDA packed weights
-                    if (tensor->cuda_cache_.has_value())
-                    {
-                        tensor->cuda_cache_.reset();
-                    }
-#endif
-
-#ifdef HAVE_ROCM
-                    // Clean up ROCm packed weights
-                    if (tensor->rocm_cache_.has_value())
-                    {
-                        tensor->rocm_cache_.reset();
-                    }
-#endif
                 }
 
-                sliced_cache_.clear();
-                fused_qkv_cache_.clear();
                 fused_gate_up_cache_.clear();
                 rope_cache_.clear();
                 rmsnorm_cache_.clear();
@@ -3305,11 +3047,9 @@ namespace llaminar
                 residual_add_cache_.clear();
                 attention_cache_.clear();
                 embedding_cache_.clear();
+                moe_cache_.clear();
                 device_kernel_registry_.clear();
-                prepared_gemm_registry_.clear();
                 device_gemm_engine_registry_.clear();
-                prepared_embedding_registry_.clear();
-
 #ifdef HAVE_CUDA
                 // Clear CUDA GEMV static caches (row-major weight transpose, sweep
                 // state) to prevent cross-test contamination.
@@ -3331,32 +3071,26 @@ namespace llaminar
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
 
-                // Reset embedding kernels (the primary holders of dynamic state)
-                for (auto &[key, kernel] : embedding_cache_)
+                auto reset_kernel_cache = [](auto &cache)
                 {
-                    if (kernel)
+                    for (auto &[_, kernel] : cache)
                     {
+                        if (!kernel)
+                            continue;
                         kernel->resetDynamicState();
+                        kernel->setGPUStream(nullptr);
                     }
-                }
+                };
 
-                // Reset attention kernels (may cache position-dependent state)
-                for (auto &[key, kernel] : attention_cache_)
-                {
-                    if (kernel)
-                    {
-                        kernel->resetDynamicState();
-                    }
-                }
-
-                // Reset RoPE kernels (position-dependent)
-                for (auto &[key, kernel] : rope_cache_)
-                {
-                    if (kernel)
-                    {
-                        kernel->resetDynamicState();
-                    }
-                }
+                reset_kernel_cache(fused_gate_up_cache_);
+                reset_kernel_cache(rope_cache_);
+                reset_kernel_cache(rmsnorm_cache_);
+                reset_kernel_cache(swiglu_cache_);
+                reset_kernel_cache(softmax_cache_);
+                reset_kernel_cache(residual_add_cache_);
+                reset_kernel_cache(attention_cache_);
+                reset_kernel_cache(embedding_cache_);
+                reset_kernel_cache(moe_cache_);
 
 #if LLAMINAR_ASSERTIONS_ACTIVE
                 // Post-reset assertion: no kernel should retain stale dynamic state
@@ -3373,7 +3107,8 @@ namespace llaminar
                 LOG_DEBUG("[KernelFactory] Reset dynamic state on "
                           << embedding_cache_.size() << " embedding, "
                           << attention_cache_.size() << " attention, "
-                          << rope_cache_.size() << " RoPE kernels");
+                          << rope_cache_.size() << " RoPE, "
+                          << moe_cache_.size() << " MoE kernels");
             }
 
             std::pair<size_t, size_t> KernelFactory::cacheStats()
@@ -3382,7 +3117,7 @@ namespace llaminar
                 size_t total_bytes = 0;
                 // Note: packed_bytes not tracked per-kernel
                 // For now, just return count (includes all caches)
-                return {sliced_cache_.size() + fused_qkv_cache_.size() + fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + device_kernel_registry_.size() + prepared_gemm_registry_.size(), total_bytes};
+                return {fused_gate_up_cache_.size() + rope_cache_.size() + rmsnorm_cache_.size() + swiglu_cache_.size() + softmax_cache_.size() + residual_add_cache_.size() + attention_cache_.size() + embedding_cache_.size() + moe_cache_.size() + device_kernel_registry_.size(), total_bytes};
             }
 
             std::shared_ptr<void> KernelFactory::getDeviceKernelEntry(const DeviceKernelKey &key)
@@ -3542,17 +3277,115 @@ namespace llaminar
                 return kernel;
             }
 
-            const KernelFactory::PreparedGemmHandle *KernelFactory::getOrCreatePreparedGemmWeights(
+            namespace
+            {
+                KernelFactory::GemmPreparationKind resolveGemmPreparationKind(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device,
+                    KernelFactory::GemmPreparationKind prep_kind)
+                {
+                    const bool quantized = isVnniPackableTensor(tensor);
+                    if (prep_kind != KernelFactory::GemmPreparationKind::AUTO)
+                        return prep_kind;
+
+                    if (!quantized)
+                        return KernelFactory::GemmPreparationKind::FLOATING_POINT;
+
+                    switch (KernelFactory::getDeviceType(target_device))
+                    {
+                    case DeviceType::CPU:
+                        return KernelFactory::GemmPreparationKind::CPU_PACKED;
+                    case DeviceType::CUDA:
+                        return KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
+                    case DeviceType::ROCm:
+                        return KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED;
+                    default:
+                        return KernelFactory::GemmPreparationKind::FLOATING_POINT;
+                    }
+                }
+            }
+
+            std::shared_ptr<KernelFactory::PreparedGemmHandle> KernelFactory::prepareGemmHandleLocal(
                 const llaminar2::TensorBase *tensor,
                 llaminar2::DeviceId target_device,
                 GemmPreparationKind prep_kind)
             {
                 if (!tensor)
+                    throw std::runtime_error("KernelFactory::prepareGemmHandleLocal: null tensor");
+
+                const bool quantized = isVnniPackableTensor(tensor);
+                const GemmPreparationKind resolved_kind = resolveGemmPreparationKind(tensor, target_device, prep_kind);
+
+                if (!tensor->raw_data())
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreatePreparedGemmWeights: null tensor");
+                    throw std::runtime_error(
+                        "KernelFactory::prepareGemmHandleLocal: tensor host data has already been released");
                 }
 
-                const bool quantized = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor) != nullptr;
+                if (resolved_kind == GemmPreparationKind::CUDA_INT8_PACKED ||
+                    resolved_kind == GemmPreparationKind::ROCM_INT8_PACKED)
+                {
+                    throw std::runtime_error(
+                        "KernelFactory::prepareGemmHandleLocal: GPU prepared GEMM handles must be registered by the PreparedWeightStore-backed load pipeline");
+                }
+
+                if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
+                    (void)ensurePackedWeightsInTensorCache(tensor);
+
+                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device);
+                if (!bound_kernel)
+                    throw std::runtime_error("KernelFactory::prepareGemmHandleLocal: failed to bind prepared kernel");
+
+                auto handle = std::make_shared<PreparedGemmHandle>();
+                handle->tensor = tensor;
+                handle->device_id = target_device;
+                handle->kind = resolved_kind;
+                handle->variant = static_cast<int>(tensor->native_type());
+                handle->prepared_weights = std::make_shared<PreparedGemmWeights>();
+                handle->prepared_weights->kind = resolved_kind;
+                handle->prepared_weights->owned_kernel = std::shared_ptr<llaminar2::ITensorGemm>(std::move(bound_kernel));
+                handle->prepared_weights->kernel = handle->prepared_weights->owned_kernel.get();
+                return handle;
+            }
+
+            std::unique_ptr<llaminar2::ITensorGemm> KernelFactory::createGemmSlicedLocal(
+                const llaminar2::TensorBase *tensor,
+                size_t row_start,
+                size_t row_end)
+            {
+                if (!tensor)
+                {
+                    LOG_ERROR("[KernelFactory] createGemmSlicedLocal: tensor is null");
+                    return nullptr;
+                }
+
+                const auto &shape = tensor->shape();
+                if (shape.size() != 2)
+                    throw std::runtime_error("KernelFactory: tensor must be 2D");
+                const size_t tensor_n = shape[0];
+                if (row_start >= row_end || row_end > tensor_n)
+                    throw std::runtime_error("KernelFactory: invalid row range for sliced GEMM");
+
+                auto current_dev = tensor->current_device();
+                DeviceType dev_type = DeviceType::CPU;
+                if (current_dev.has_value() && current_dev->is_gpu())
+                    dev_type = current_dev->is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
+                if (dev_type != DeviceType::CPU)
+                    throw std::runtime_error("KernelFactory: sliced GEMM only supported on CPU");
+
+                return std::make_unique<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                    tensor, static_cast<int>(row_start), static_cast<int>(row_end));
+            }
+
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::prepareExpertGemmLocal(
+                const llaminar2::TensorBase *tensor,
+                llaminar2::DeviceId target_device,
+                GemmPreparationKind prep_kind)
+            {
+                if (!tensor)
+                    return nullptr;
+
+                const bool quantized = isVnniPackableTensor(tensor);
 
                 GemmPreparationKind resolved_kind = prep_kind;
                 if (resolved_kind == GemmPreparationKind::AUTO)
@@ -3581,142 +3414,87 @@ namespace llaminar
                     }
                 }
 
-                const PreparedGemmKey key{
-                    tensor,
-                    target_device,
-                    static_cast<int>(resolved_kind)};
-
+                // GPU devices should use LoadOrchestrator pipeline, not this path
+                if (resolved_kind == GemmPreparationKind::CUDA_INT8_PACKED ||
+                    resolved_kind == GemmPreparationKind::ROCM_INT8_PACKED)
                 {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto it = prepared_gemm_registry_.find(key);
-                    if (it != prepared_gemm_registry_.end())
-                    {
-                        LOG_DEBUG("[KernelFactory][PhaseC] prepared weights hit dev=" << static_cast<int>(target_device.type)
-                                                                                      << ":" << target_device.ordinal
-                                                                                      << " kind=" << static_cast<int>(resolved_kind)
-                                                                                      << " tensor=" << tensor);
-                        return it->second.get();
-                    }
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] GPU experts should use "
+                              "LoadOrchestrator pipeline, not local preparation");
+                    return nullptr;
                 }
 
-                if (quantized)
+                if (!tensor->raw_data())
                 {
-                    switch (resolved_kind)
-                    {
-                    case GemmPreparationKind::CPU_PACKED:
-                        (void)ensurePackedWeightsInTensorCache(tensor);
-                        break;
-                    case GemmPreparationKind::CUDA_INT8_PACKED:
-#ifdef HAVE_CUDA
-                        (void)ensureCUDAPackedWeightsInTensorCache(tensor);
-#endif
-                        break;
-                    case GemmPreparationKind::ROCM_INT8_PACKED:
-#ifdef HAVE_ROCM
-                        (void)ensureROCmPackedWeightsInTensorCache(tensor);
-#endif
-                        break;
-                    default:
-                        break;
-                    }
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Tensor has no raw data "
+                              "(host data already released?)");
+                    return nullptr;
                 }
 
-                auto handle = std::make_shared<PreparedGemmHandle>();
-                handle->tensor = tensor;
-                handle->device_id = target_device;
-                handle->kind = resolved_kind;
-                handle->variant = static_cast<int>(tensor->native_type());
-                handle->prepared_weights = std::make_shared<PreparedGemmWeights>();
-                handle->prepared_weights->kind = resolved_kind;
+                // Pack weights into tensor-local cache (same as global path)
+                if (quantized && resolved_kind == GemmPreparationKind::CPU_PACKED)
+                    (void)ensurePackedWeightsInTensorCache(tensor);
 
-                // Bind executable GEMM kernel via explicit-device create path.
-                // This avoids direct dependency on legacy tensor-keyed
-                // legacy GEMM cache-style behavior in the prepared path.
-                auto bound_kernel = createPreparedKernelForDevice(tensor, target_device);
-                if (!bound_kernel)
+                // Create the GEMM kernel bound to this tensor
+                auto kernel = createPreparedKernelForDevice(tensor, target_device);
+                if (!kernel)
                 {
-                    throw std::runtime_error("KernelFactory::getOrCreatePreparedGemmWeights: failed to bind prepared kernel");
+                    LOG_ERROR("[KernelFactory::prepareExpertGemmLocal] Failed to create kernel for expert view");
+                    return nullptr;
                 }
-                handle->prepared_weights->owned_kernel = std::shared_ptr<llaminar2::ITensorGemm>(std::move(bound_kernel));
-                handle->prepared_weights->kernel = handle->prepared_weights->owned_kernel.get();
 
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                auto [it, inserted] = prepared_gemm_registry_.emplace(key, std::move(handle));
-                LOG_DEBUG("[KernelFactory][PhaseC] prepared weights " << (inserted ? "create" : "race-hit")
-                                                                      << " dev=" << static_cast<int>(target_device.type)
-                                                                      << ":" << target_device.ordinal
-                                                                      << " kind=" << static_cast<int>(resolved_kind)
-                                                                      << " tensor=" << tensor);
-                return it->second.get();
+                // Return ownership to caller — NO global registry insertion,
+                // NO has_prepared_device_state_ flag set
+                return std::shared_ptr<llaminar2::ITensorGemm>(std::move(kernel));
             }
 
-            void KernelFactory::clearPreparedGemmWeightsFor(const llaminar2::TensorBase *tensor)
+            std::shared_ptr<llaminar2::ITensorGemm> KernelFactory::createExpertGemmFromTransferBlob(
+                const std::vector<uint8_t> &blob)
             {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
+                if (blob.empty())
+                    return nullptr;
 
-                // Evict fused cache entries that reference prepared handles for this tensor.
-                // This prevents stale prepared-handle keys after prepared_gemm_registry_ erase.
-                for (auto it = fused_qkv_cache_.begin(); it != fused_qkv_cache_.end();)
+                auto packed_weights = llaminar2::packed_weights_serialization::deserialize(
+                    blob.data(), blob.size());
+                if (!packed_weights)
                 {
-                    const auto *wq_handle = it->first.wq_handle;
-                    const auto *wk_handle = it->first.wk_handle;
-                    const auto *wv_handle = it->first.wv_handle;
-                    const bool references_tensor =
-                        (wq_handle && wq_handle->tensor == tensor) ||
-                        (wk_handle && wk_handle->tensor == tensor) ||
-                        (wv_handle && wv_handle->tensor == tensor);
-
-                    if (references_tensor)
-                    {
-                        it = fused_qkv_cache_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Failed to deserialize transferred blob ("
+                              << blob.size() << " bytes)");
+                    return nullptr;
                 }
 
-                for (auto it = fused_gate_up_cache_.begin(); it != fused_gate_up_cache_.end();)
+                auto *cpu_pw = dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeights *>(
+                    packed_weights.get());
+                if (!cpu_pw)
                 {
-                    const auto *gate_handle = it->first.w_gate_handle;
-                    const auto *up_handle = it->first.w_up_handle;
-                    const bool references_tensor =
-                        (gate_handle && gate_handle->tensor == tensor) ||
-                        (up_handle && up_handle->tensor == tensor);
-
-                    if (references_tensor)
-                    {
-                        it = fused_gate_up_cache_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Deserialized weights are not CPUPackedWeights");
+                    return nullptr;
                 }
 
-                for (auto it = prepared_gemm_registry_.begin(); it != prepared_gemm_registry_.end();)
+                if (dynamic_cast<llaminar2::cpu::native_vnni::CPUPackedWeightsWithNativeBlocks *>(
+                        packed_weights.get()))
                 {
-                    if (it->first.tensor == tensor)
-                    {
-                        it = prepared_gemm_registry_.erase(it);
-                    }
-                    else
-                    {
-                        ++it;
-                    }
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Deferred/native-block CPU VNNI blobs are no longer accepted; expected eager interleaved packed weights");
+                    return nullptr;
                 }
+
+                auto kernel = std::make_shared<llaminar2::cpu::native_vnni::CPUNativeVNNIGemmKernel>(
+                    cpu_pw->takePacked());
+                if (!kernel->isValid())
+                {
+                    LOG_ERROR("[KernelFactory::createExpertGemmFromTransferBlob] "
+                              "Transferred CPU VNNI blob did not contain eager interleaved weights");
+                    return nullptr;
+                }
+                return kernel;
             }
 
             size_t KernelFactory::gemmEngineRegistrySize()
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 return device_gemm_engine_registry_.size();
-            }
-
-            size_t KernelFactory::preparedGemmRegistrySize()
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                return prepared_gemm_registry_.size();
             }
 
             size_t KernelFactory::deviceScopedGemmEngineRegistrySize()
@@ -3729,7 +3507,7 @@ namespace llaminar
             // Prepared Embedding Weights
             // ==========================================================================
 
-            const llaminar2::PreparedEmbeddingHandle *KernelFactory::getOrCreatePreparedEmbeddingWeights(
+            std::shared_ptr<llaminar2::PreparedEmbeddingHandle> KernelFactory::prepareEmbeddingHandleLocal(
                 const llaminar2::TensorBase *tensor,
                 int d_model,
                 llaminar2::DeviceId target_device,
@@ -3737,33 +3515,17 @@ namespace llaminar
                 size_t total_vocab)
             {
                 if (!tensor)
-                    throw std::runtime_error("getOrCreatePreparedEmbeddingWeights: null tensor");
+                    throw std::runtime_error("prepareEmbeddingHandleLocal: null tensor");
 
-                // Only quantized tensors need EmbedQ8 repack
-                const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(tensor);
-                if (!unpackable)
-                    return nullptr; // FP32 embedding tables are used directly, no prep needed
+                if (!isVnniPackableTensor(tensor))
+                    return nullptr;
 
-                const PreparedEmbeddingKey key{tensor, target_device};
-
-                // Cache lookup
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto it = prepared_embedding_registry_.find(key);
-                    if (it != prepared_embedding_registry_.end())
-                        return it->second.get();
-                }
-
-                // Resolve vocab metadata
                 const size_t shard_rows = tensor->rows();
                 const size_t effective_total = (total_vocab > 0) ? total_vocab : shard_rows;
                 const bool is_sharded = (shard_rows < effective_total);
 
-                // CPU-side repack: Q8_0/Q4_0/etc. → EmbedQ8Block array
-                // The tensor is already sliced to the correct rows— repack all of them
                 auto repacked = llaminar2::repackEmbeddingToQ8(tensor, d_model);
 
-                // Allocate GPU memory and upload
                 auto weights = std::make_shared<llaminar2::PreparedEmbeddingWeights>();
                 weights->byte_size = repacked.byte_size;
                 weights->blocks_per_row = repacked.blocks_per_row;
@@ -3773,7 +3535,6 @@ namespace llaminar
                 weights->d_model = d_model;
                 weights->device_id = target_device;
 
-                bool upload_ok = false;
                 llaminar2::IBackend *backend = llaminar2::getBackendFor(target_device);
                 if (!backend)
                 {
@@ -3789,8 +3550,8 @@ namespace llaminar
                     return nullptr;
                 }
 
-                upload_ok = backend->hostToDevice(weights->device_data, repacked.data.data(),
-                                                  repacked.byte_size, target_device.ordinal);
+                const bool upload_ok = backend->hostToDevice(weights->device_data, repacked.data.data(),
+                                                             repacked.byte_size, target_device.ordinal);
                 if (!upload_ok)
                 {
                     LOG_ERROR("[PreparedEmbeddingWeights] H2D upload failed for " << target_device.to_string());
@@ -3799,175 +3560,21 @@ namespace llaminar
                     return nullptr;
                 }
 
-                LOG_INFO("[PreparedEmbeddingWeights] Prepared embedding for "
-                         << target_device.to_string() << ": "
-                         << llaminar2::tensorTypeName(tensor->native_type()) << " "
-                         << repacked.vocab_size << "x" << d_model
-                         << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
-                                           " of " + std::to_string(effective_total) + ")")
-                                        : "")
-                         << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
-                         << " (" << repacked.blocks_per_row << " blocks/row)");
+                LOG_DEBUG("[PreparedEmbeddingWeights] Prepared embedding for "
+                          << target_device.to_string() << ": "
+                          << llaminar2::tensorTypeName(tensor->native_type()) << " "
+                          << repacked.vocab_size << "x" << d_model
+                          << (is_sharded ? (" (vocab_offset=" + std::to_string(vocab_offset) +
+                                            " of " + std::to_string(effective_total) + ")")
+                                         : "")
+                          << " → " << (repacked.byte_size / (1024 * 1024)) << " MB"
+                          << " (" << repacked.blocks_per_row << " blocks/row)");
 
                 auto handle = std::make_shared<llaminar2::PreparedEmbeddingHandle>();
                 handle->tensor = tensor;
                 handle->device_id = target_device;
                 handle->weights = std::move(weights);
-
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                auto [it, inserted] = prepared_embedding_registry_.emplace(key, std::move(handle));
-                return it->second.get();
-            }
-
-            const llaminar2::PreparedEmbeddingHandle *KernelFactory::getPreparedEmbeddingWeights(
-                const llaminar2::TensorBase *tensor,
-                llaminar2::DeviceId target_device)
-            {
-                const PreparedEmbeddingKey key{tensor, target_device};
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                auto it = prepared_embedding_registry_.find(key);
-                if (it != prepared_embedding_registry_.end())
-                    return it->second.get();
-                return nullptr;
-            }
-
-            size_t KernelFactory::preparedEmbeddingRegistrySize()
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                return prepared_embedding_registry_.size();
-            }
-
-            // ==========================================================================
-            // Fused QKV GEMM Factory Methods (now delegates to individual ITensorGemm)
-            // ==========================================================================
-
-            /**
-             * @brief Build fused QKV adapter from already-resolved prepared handles
-             *
-             * Since Q8_1/Q16_1 activation paths have been removed, fused QKV on CPU
-             * now uses individual ITensorGemm kernels via FusedQKVGEMMStage directly.
-             * This factory method creates a trivial adapter for backward compatibility
-             * with the cache keying mechanism.
-             *
-             * Note: The actual execution now happens in FusedQKVGEMMStage using
-             * individual prepared GEMM handles, not through ITensorFusedQKVGemm.
-             */
-            static std::unique_ptr<llaminar2::ITensorFusedQKVGemm> createFusedQKVAdapterFromPrepared(
-                const KernelFactory::PreparedGemmHandle *prepared_q,
-                const KernelFactory::PreparedGemmHandle *prepared_k,
-                const KernelFactory::PreparedGemmHandle *prepared_v,
-                llaminar2::DeviceId target_device)
-            {
-                // FusedQKVGemmAdapter has been removed — the FusedQKVGEMMStage now
-                // uses individual ITensorGemm kernels directly (via getOrCreatePreparedGemmWeights
-                // + getOrCreateGemmEngine). Return nullptr to signal callers should use the
-                // individual kernel path.
-                return nullptr;
-            }
-
-            std::unique_ptr<llaminar2::ITensorFusedQKVGemm> KernelFactory::createFusedQKVGemm(
-                const llaminar2::TensorBase *wq,
-                const llaminar2::TensorBase *wk,
-                const llaminar2::TensorBase *wv,
-                DeviceType dev_type)
-            {
-                return createFusedQKVGemm(wq, wk, wv, llaminar2::DeviceId(dev_type, 0));
-            }
-
-            std::unique_ptr<llaminar2::ITensorFusedQKVGemm> KernelFactory::createFusedQKVGemm(
-                const llaminar2::TensorBase *wq,
-                const llaminar2::TensorBase *wk,
-                const llaminar2::TensorBase *wv,
-                llaminar2::DeviceId target_device)
-            {
-                if (!wq || !wk || !wv)
-                {
-                    LOG_ERROR("[KernelFactory] createFusedQKVGemm: null weight tensor(s)");
-                    throw std::runtime_error("FusedQKVGemm requires non-null weight tensors");
-                }
-
-                const auto *prepared_q = getOrCreatePreparedGemmWeights(wq, target_device);
-                const auto *prepared_k = getOrCreatePreparedGemmWeights(wk, target_device);
-                const auto *prepared_v = getOrCreatePreparedGemmWeights(wv, target_device);
-
-                // Use the same helper as cache-miss path so explicit creation and
-                // cached creation cannot diverge in validation or adapter wiring.
-                return createFusedQKVAdapterFromPrepared(prepared_q, prepared_k, prepared_v, target_device);
-            }
-
-            llaminar2::ITensorFusedQKVGemm *KernelFactory::getOrCreateFusedQKVGemm(
-                const llaminar2::TensorBase *wq,
-                const llaminar2::TensorBase *wk,
-                const llaminar2::TensorBase *wv,
-                DeviceType dev_type)
-            {
-                // Get ordinal from thread-local (for future GPU support) or default to 0 for CPU
-                int target_ordinal = 0;
-#ifdef HAVE_ROCM
-                if (dev_type == DeviceType::ROCm && tl_target_rocm_ordinal.has_value())
-                {
-                    target_ordinal = tl_target_rocm_ordinal.value();
-                }
-#endif
-#ifdef HAVE_CUDA
-                if (dev_type == DeviceType::CUDA && tl_target_cuda_ordinal.has_value())
-                {
-                    target_ordinal = tl_target_cuda_ordinal.value();
-                }
-#endif
-
-                const llaminar2::DeviceId target_device_id(dev_type, target_ordinal);
-                return getOrCreateFusedQKVGemm(wq, wk, wv, target_device_id);
-            }
-
-            llaminar2::ITensorFusedQKVGemm *KernelFactory::getOrCreateFusedQKVGemm(
-                const llaminar2::TensorBase *wq,
-                const llaminar2::TensorBase *wk,
-                const llaminar2::TensorBase *wv,
-                llaminar2::DeviceId target_device)
-            {
-                const auto *prepared_q = getOrCreatePreparedGemmWeights(wq, target_device);
-                const auto *prepared_k = getOrCreatePreparedGemmWeights(wk, target_device);
-                const auto *prepared_v = getOrCreatePreparedGemmWeights(wv, target_device);
-
-                FusedQKVCacheKey key{prepared_q, prepared_k, prepared_v, target_device};
-
-                // Fast path: check cache under lock.
-                // Cache key is prepared-handle identity + device, so hits are aligned
-                // with backend-ready weight state, not just raw tensor pointers.
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto it = fused_qkv_cache_.find(key);
-                    if (it != fused_qkv_cache_.end())
-                    {
-                        LOG_TRACE("[KernelFactory::getOrCreateFusedQKVGemm] CACHE HIT");
-                        return it->second.get();
-                    }
-                }
-
-                LOG_DEBUG("[KernelFactory::getOrCreateFusedQKVGemm] CACHE MISS - creating new kernel");
-
-                // Create kernel WITHOUT holding cache_mutex_. Use already-resolved
-                // prepared handles so cache-miss path does not repeat preparation lookup.
-                auto kernel = createFusedQKVAdapterFromPrepared(prepared_q, prepared_k, prepared_v, target_device);
-
-                // Re-acquire lock to insert into cache (double-checked locking).
-                // Another thread may have populated the same key while construction ran.
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                    // Double-check another thread didn't create it while we were unlocked
-                    auto it = fused_qkv_cache_.find(key);
-                    if (it != fused_qkv_cache_.end())
-                    {
-                        LOG_TRACE("[KernelFactory::getOrCreateFusedQKVGemm] Lost race, returning existing kernel");
-                        return it->second.get();
-                    }
-
-                    auto *raw_ptr = kernel.get();
-                    fused_qkv_cache_[key] = std::move(kernel);
-                    return raw_ptr;
-                }
+                return handle;
             }
 
             // ==========================================================================
@@ -4027,7 +3634,7 @@ namespace llaminar
                         {gemm_gate_, output_gate, n_gate, nullptr, "gate"},
                         {gemm_up_, output_up, n_up, nullptr, "up"}};
 
-                    return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
+                    return gemm_gate_->multiply_fused_tensor(input, projections, m, k, nullptr, bound_workspace_);
                 }
 
                 bool execute_with_bias(
@@ -4056,7 +3663,7 @@ namespace llaminar
                             {gemm_gate_, output_gate, n_gate, bias_gate, "gate"},
                             {gemm_up_, output_up, n_up, bias_up, "up"}};
 
-                        return gemm_gate_->multiply_fused_tensor(input, projections, m, k);
+                        return gemm_gate_->multiply_fused_tensor(input, projections, m, k, nullptr, bound_workspace_);
                     }
                 }
 
@@ -4195,84 +3802,12 @@ namespace llaminar
                 return std::make_unique<FusedGateUpGemmAdapter>(gemm_gate, gemm_up, target_device.type);
             }
 
-            std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemm(
-                const llaminar2::TensorBase *w_gate,
-                const llaminar2::TensorBase *w_up,
-                DeviceType dev_type)
-            {
-                // Delegate to DeviceId version with ordinal 0
-                return createFusedGateUpGemm(w_gate, w_up, llaminar2::DeviceId(dev_type, 0));
-            }
-
-            std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemm(
-                const llaminar2::TensorBase *w_gate,
-                const llaminar2::TensorBase *w_up,
+            std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> KernelFactory::createFusedGateUpGemmLocal(
+                const PreparedGemmHandle *prepared_gate,
+                const PreparedGemmHandle *prepared_up,
                 llaminar2::DeviceId target_device)
             {
-                if (!w_gate || !w_up)
-                {
-                    LOG_ERROR("[KernelFactory] createFusedGateUpGemm: null weight tensor(s)");
-                    throw std::runtime_error("FusedGateUpGemm requires non-null weight tensors");
-                }
-
-                const auto *prepared_gate = getOrCreatePreparedGemmWeights(w_gate, target_device);
-                const auto *prepared_up = getOrCreatePreparedGemmWeights(w_up, target_device);
                 return createFusedGateUpAdapterFromPrepared(prepared_gate, prepared_up, target_device);
-            }
-
-            llaminar2::ITensorFusedGateUpGemm *KernelFactory::getOrCreateFusedGateUpGemm(
-                const llaminar2::TensorBase *w_gate,
-                const llaminar2::TensorBase *w_up,
-                DeviceType dev_type)
-            {
-                // Delegate to DeviceId version with ordinal 0
-                return getOrCreateFusedGateUpGemm(w_gate, w_up, llaminar2::DeviceId(dev_type, 0));
-            }
-
-            llaminar2::ITensorFusedGateUpGemm *KernelFactory::getOrCreateFusedGateUpGemm(
-                const llaminar2::TensorBase *w_gate,
-                const llaminar2::TensorBase *w_up,
-                llaminar2::DeviceId target_device)
-            {
-                const auto *prepared_gate = getOrCreatePreparedGemmWeights(w_gate, target_device);
-                const auto *prepared_up = getOrCreatePreparedGemmWeights(w_up, target_device);
-                FusedGateUpCacheKey key{prepared_gate, prepared_up, target_device};
-
-                // Fast path: acquire lock and check cache.
-                // Key uses prepared-handle identity + device so it tracks per-device
-                // prepared state rather than only raw tensor addresses.
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto it = fused_gate_up_cache_.find(key);
-                    if (it != fused_gate_up_cache_.end())
-                    {
-                        LOG_TRACE("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE HIT for "
-                                  << target_device.to_string());
-                        return it->second.get();
-                    }
-                }
-
-                LOG_DEBUG("[KernelFactory::getOrCreateFusedGateUpGemm] CACHE MISS for "
-                          << target_device.to_string() << " - creating new kernel");
-
-                // Create kernel WITHOUT holding lock. Reuse already-resolved prepared handles
-                // to avoid duplicate prepared lookup on cache miss.
-                auto kernel = createFusedGateUpAdapterFromPrepared(prepared_gate, prepared_up, target_device);
-
-                // Second check: re-acquire lock and insert (double-checked locking)
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-                    auto it = fused_gate_up_cache_.find(key);
-                    if (it != fused_gate_up_cache_.end())
-                    {
-                        // Another thread inserted while we were creating - use theirs
-                        LOG_TRACE("[KernelFactory::getOrCreateFusedGateUpGemm] Race detected - using existing kernel");
-                        return it->second.get();
-                    }
-                    auto *raw_ptr = kernel.get();
-                    fused_gate_up_cache_[key] = std::move(kernel);
-                    return raw_ptr;
-                }
             }
 
             // ==========================================================================
@@ -4288,10 +3823,18 @@ namespace llaminar
                 std::string prec_str;
                 switch (precision)
                 {
-                case ::llaminar2::ActivationPrecision::FP32:   prec_str = "fp32"; break;
-                case ::llaminar2::ActivationPrecision::FP16:   prec_str = "fp16"; break;
-                case ::llaminar2::ActivationPrecision::Q8_1:   prec_str = "q8_1"; break;
-                default:                                       prec_str = "fp16"; break;
+                case ::llaminar2::ActivationPrecision::FP32:
+                    prec_str = "fp32";
+                    break;
+                case ::llaminar2::ActivationPrecision::FP16:
+                    prec_str = "fp16";
+                    break;
+                case ::llaminar2::ActivationPrecision::Q8_1:
+                    prec_str = "q8_1";
+                    break;
+                default:
+                    prec_str = "fp16";
+                    break;
                 }
 
                 return ::llaminar2::KVCacheMemoryEstimator::estimate(
@@ -4648,12 +4191,12 @@ namespace llaminar
                         throw std::runtime_error("KernelFactory::createHybridKVCache: mpi_ctx is required for CPU");
                     }
 
-                    LOG_INFO("[KernelFactory] Creating CPU Hybrid KVCache: "
-                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
-                             << ", total_layers=" << config.num_layers
-                             << ", kv_layers=" << hc.countKVLayers()
-                             << ", n_kv_heads=" << config.n_kv_heads
-                             << ", head_dim=" << config.head_dim);
+                    LOG_DEBUG("[KernelFactory] Creating CPU Hybrid KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", total_layers=" << config.num_layers
+                              << ", kv_layers=" << hc.countKVLayers()
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim);
 
                     if (config.is_sharded())
                     {
@@ -4737,13 +4280,13 @@ namespace llaminar
                 {
                     const int cuda_device = config.device.cuda_ordinal();
 
-                    LOG_INFO("[KernelFactory] Creating CUDA Hybrid KVCache: "
-                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
-                             << ", device=CUDA:" << cuda_device
-                             << ", total_layers=" << config.num_layers
-                             << ", kv_layers=" << hc.countKVLayers()
-                             << ", n_kv_heads=" << config.n_kv_heads
-                             << ", head_dim=" << config.head_dim);
+                    LOG_DEBUG("[KernelFactory] Creating CUDA Hybrid KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=CUDA:" << cuda_device
+                              << ", total_layers=" << config.num_layers
+                              << ", kv_layers=" << hc.countKVLayers()
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim);
 
                     if (config.is_sharded())
                     {
@@ -4812,13 +4355,13 @@ namespace llaminar
                 {
                     const int rocm_device = config.device.rocm_ordinal();
 
-                    LOG_INFO("[KernelFactory] Creating ROCm Hybrid KVCache: "
-                             << "precision=" << llaminar2::activationPrecisionToString(config.precision)
-                             << ", device=ROCm:" << rocm_device
-                             << ", total_layers=" << config.num_layers
-                             << ", kv_layers=" << hc.countKVLayers()
-                             << ", n_kv_heads=" << config.n_kv_heads
-                             << ", head_dim=" << config.head_dim);
+                    LOG_DEBUG("[KernelFactory] Creating ROCm Hybrid KVCache: "
+                              << "precision=" << llaminar2::activationPrecisionToString(config.precision)
+                              << ", device=ROCm:" << rocm_device
+                              << ", total_layers=" << config.num_layers
+                              << ", kv_layers=" << hc.countKVLayers()
+                              << ", n_kv_heads=" << config.n_kv_heads
+                              << ", head_dim=" << config.head_dim);
 
                     if (config.is_sharded())
                     {
@@ -4867,13 +4410,17 @@ namespace llaminar
                         // (no-op for CPU via virtual dispatch)
                         gdn_state->conv_kernel->allocateGPUState(
                             static_cast<int>(gdn_state->conv_state.size()));
+                        // In-place prefill scratch is supplied by ShortConv1dStage
+                        // through DeviceWorkspaceManager. Keeping it out of the
+                        // per-layer KV-cache state avoids one persistent
+                        // max_seq_len * qkv_dim allocation for every GDN layer.
                         gdn_state->rec_kernel->allocateGPUState(
                             static_cast<int>(gdn_state->recurrence_state.size()));
                     }
 
-                    LOG_INFO("[KernelFactory] Initialized GDN kernels for "
-                             << hybrid->gdnLayerCount() << " GDN layers on "
-                             << config.device.to_string());
+                    LOG_DEBUG("[KernelFactory] Initialized GDN kernels for "
+                              << hybrid->gdnLayerCount() << " GDN layers on "
+                              << config.device.to_string());
                 }
 
                 return cache;

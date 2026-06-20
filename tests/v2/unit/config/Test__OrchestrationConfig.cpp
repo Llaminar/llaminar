@@ -580,3 +580,75 @@ TEST(Test__OrchestrationConfig, ToString_ContainsRelevantInfo)
     EXPECT_TRUE(str.find("pp_degree: 2") != std::string::npos);
     EXPECT_TRUE(str.find("cpu_layers: 4") != std::string::npos);
 }
+
+
+// =============================================================================
+// Phase 5: DomainDefinition scope / owner / explicit_ranks tests
+// =============================================================================
+
+TEST(Test__DomainDefinition, Parse_WithScopeLocal)
+{
+    auto def = DomainDefinition::parse("rocm_socket0=0:rocm:0,0:rocm:1;scope=local;backend=rccl;owner=0");
+    EXPECT_EQ(def.name, "rocm_socket0");
+    EXPECT_EQ(def.scope, TPScope::LOCAL);
+    EXPECT_TRUE(def.owner_rank.has_value());
+    EXPECT_EQ(*def.owner_rank, 0);
+    EXPECT_EQ(def.backend, CollectiveBackendType::RCCL);
+    EXPECT_EQ(def.devices.size(), 2u);
+}
+
+TEST(Test__DomainDefinition, Parse_WithScopeNodeLocal)
+{
+    auto def = DomainDefinition::parse("cpu_sockets=0:cpu:0,1:cpu:0;scope=node_local;backend=upi;ranks=0,1");
+    EXPECT_EQ(def.name, "cpu_sockets");
+    EXPECT_EQ(def.scope, TPScope::NODE_LOCAL);
+    ASSERT_EQ(def.explicit_ranks.size(), 2u);
+    EXPECT_EQ(def.explicit_ranks[0], 0);
+    EXPECT_EQ(def.explicit_ranks[1], 1);
+    EXPECT_EQ(def.backend, CollectiveBackendType::UPI);
+}
+
+TEST(Test__DomainDefinition, Parse_WithScopeGlobal)
+{
+    auto def = DomainDefinition::parse("dist=cuda:0;scope=global;ranks=0,1,2,3");
+    EXPECT_EQ(def.scope, TPScope::GLOBAL);
+    ASSERT_EQ(def.explicit_ranks.size(), 4u);
+    EXPECT_EQ(def.explicit_ranks[3], 3);
+}
+
+TEST(Test__DomainDefinition, TryParse_ScopeHybrid_ReturnsNullopt)
+{
+    // hybrid is not valid for domain scope
+    auto result = DomainDefinition::tryParse("d=cuda:0;scope=hybrid");
+    EXPECT_FALSE(result.has_value());
+}
+
+TEST(Test__DomainDefinition, Validate_ScopeLocalWithExplicitRanks_ReturnsError)
+{
+    auto def = DomainDefinition::parse("d=cuda:0;scope=local;ranks=0,1");
+    auto errors = def.validate();
+    EXPECT_FALSE(errors.empty());
+}
+
+TEST(Test__DomainDefinition, Validate_ScopeLocalWithOwnerRank_OK)
+{
+    auto def = DomainDefinition::parse("d=cuda:0;scope=local;owner=0");
+    auto errors = def.validate();
+    EXPECT_TRUE(errors.empty());
+}
+
+TEST(Test__DomainDefinition, Validate_ScopeNodeLocalWithRanks_OK)
+{
+    auto def = DomainDefinition::parse("d=0:cpu:0,1:cpu:0;scope=node_local;ranks=0,1");
+    auto errors = def.validate();
+    EXPECT_TRUE(errors.empty());
+}
+
+TEST(Test__DomainDefinition, ToString_EmitsScope)
+{
+    auto def = DomainDefinition::parse("d=0:cpu:0;scope=global;ranks=0,1");
+    std::string s = def.toString();
+    EXPECT_NE(s.find("scope=global"), std::string::npos);
+    // toString emits ranks=[0,1]
+    EXPECT_NE(s.find("ranks=[0,1]"), std::string::npos);
+}

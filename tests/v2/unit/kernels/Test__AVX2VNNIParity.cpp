@@ -15,8 +15,10 @@
 
 #include <gtest/gtest.h>
 #include <immintrin.h>
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <vector>
 #include <cmath>
@@ -101,6 +103,79 @@ namespace avx2_parity_helpers
             << (max_idx >= 0 ? (" (avx512=" + std::to_string(a[max_idx]) +
                                 " avx2=" + std::to_string(b[max_idx]) + ")")
                              : "");
+    }
+
+    inline double relativeL2(const float *expected, const float *actual, int n)
+    {
+        double num = 0.0;
+        double den = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double e = static_cast<double>(expected[i]);
+            const double d = e - static_cast<double>(actual[i]);
+            num += d * d;
+            den += e * e;
+        }
+        return std::sqrt(num / std::max(den, 1.0e-30));
+    }
+
+    inline double cosineSimilarity(const float *a, const float *b, int n)
+    {
+        double dot = 0.0;
+        double aa = 0.0;
+        double bb = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double av = static_cast<double>(a[i]);
+            const double bv = static_cast<double>(b[i]);
+            dot += av * bv;
+            aa += av * av;
+            bb += bv * bv;
+        }
+        return dot / std::sqrt(std::max(aa * bb, 1.0e-30));
+    }
+
+    inline double symmetricKLFromLogits(const float *a, const float *b, int n)
+    {
+        auto accumulate = [n](const float *p_logits, const float *q_logits)
+        {
+            const double max_p = *std::max_element(p_logits, p_logits + n);
+            const double max_q = *std::max_element(q_logits, q_logits + n);
+            double sum_p = 0.0;
+            double sum_q = 0.0;
+            for (int i = 0; i < n; ++i)
+            {
+                sum_p += std::exp(static_cast<double>(p_logits[i]) - max_p);
+                sum_q += std::exp(static_cast<double>(q_logits[i]) - max_q);
+            }
+
+            double kl = 0.0;
+            for (int i = 0; i < n; ++i)
+            {
+                const double log_p = static_cast<double>(p_logits[i]) - max_p - std::log(sum_p);
+                const double log_q = static_cast<double>(q_logits[i]) - max_q - std::log(sum_q);
+                const double p = std::exp(log_p);
+                kl += p * (log_p - log_q);
+            }
+            return kl;
+        };
+
+        return 0.5 * (accumulate(a, b) + accumulate(b, a));
+    }
+
+    inline void assertStrictMetricClose(
+        const float *expected,
+        const float *actual,
+        int n,
+        const std::string &label)
+    {
+        const double rel_l2 = relativeL2(expected, actual, n);
+        const double cos = cosineSimilarity(expected, actual, n);
+        const double skl = symmetricKLFromLogits(expected, actual, n);
+
+        EXPECT_LE(rel_l2, 1.0e-4) << label << " relative L2";
+        EXPECT_GE(cos, 0.999999) << label << " cosine";
+        EXPECT_LE(skl, 1.0e-7) << label << " symmetric KL";
     }
 } // namespace avx2_parity_helpers
 
@@ -520,6 +595,67 @@ FULL_GEMM_PARITY_TEST(Q2_K, createQ2_KRandom, 8, 512, 512, 120)
 FULL_GEMM_PARITY_TEST(IQ1_S, createIQ1_SRandom, 8, 512, 512, 121)
 
 #undef FULL_GEMM_PARITY_TEST
+
+TEST_F(AVX2VNNIParity, RuntimeISADispatch_ScalarAVX2AVX512_VerifierRows)
+{
+    struct Case
+    {
+        std::unique_ptr<TensorBase> weights;
+        std::string name;
+    };
+
+    std::vector<Case> cases;
+    cases.push_back({TestTensorFactory::createQ4_0Random({200, 512}, 130), "Q4_0"});
+    cases.push_back({TestTensorFactory::createQ6_KRandom({200, 512}, 131), "Q6_K"});
+
+    for (const auto &test_case : cases)
+    {
+        const auto packed = packWeights(test_case.weights.get());
+        const int N = packed.N;
+        const int K_blocks = packed.blocks_per_row;
+        constexpr int M = 4;
+
+        /*
+         * Use one shared activation inventory for every ISA path.  This mirrors
+         * MTP verifier publication: rows are already quantized once, then the
+         * selected runtime ISA should only change how the packed weights are
+         * consumed.
+         */
+        std::vector<Q8_1Block> A_q8_all(static_cast<size_t>(M) * K_blocks);
+        for (int row = 0; row < M; ++row)
+        {
+            auto row_q8 = createRandomQ8_1(packed.K, 900 + row);
+            std::copy(row_q8.begin(), row_q8.end(), A_q8_all.begin() + row * K_blocks);
+        }
+
+        std::vector<float> gemv_512(N, 0.0f);
+        std::vector<float> gemv_256(N, 0.0f);
+        std::vector<float> gemv_scalar(N, 0.0f);
+        gemv_native_vnni_preq(packed, A_q8_all.data(), gemv_512.data(), ISAPath::AVX512);
+        gemv_native_vnni_preq(packed, A_q8_all.data(), gemv_256.data(), ISAPath::AVX2);
+        gemv_native_vnni_preq(packed, A_q8_all.data(), gemv_scalar.data(), ISAPath::SCALAR);
+
+        assertExactEqual(gemv_512.data(), gemv_256.data(), N,
+                         test_case.name + " M=1 AVX512 vs AVX2");
+        assertStrictMetricClose(gemv_512.data(), gemv_scalar.data(), N,
+                                test_case.name + " M=1 AVX512 vs scalar");
+
+        std::vector<float> rows_512(static_cast<size_t>(M) * N, 0.0f);
+        std::vector<float> rows_256(static_cast<size_t>(M) * N, 0.0f);
+        std::vector<float> rows_scalar(static_cast<size_t>(M) * N, 0.0f);
+        gemm_native_vnni_preq_decode_equivalent_rows(
+            packed, A_q8_all.data(), rows_512.data(), M, N, ISAPath::AVX512);
+        gemm_native_vnni_preq_decode_equivalent_rows(
+            packed, A_q8_all.data(), rows_256.data(), M, N, ISAPath::AVX2);
+        gemm_native_vnni_preq_decode_equivalent_rows(
+            packed, A_q8_all.data(), rows_scalar.data(), M, N, ISAPath::SCALAR);
+
+        assertExactEqual(rows_512.data(), rows_256.data(), M * N,
+                         test_case.name + " verifier rows AVX512 vs AVX2");
+        assertStrictMetricClose(rows_512.data(), rows_scalar.data(), M * N,
+                                test_case.name + " verifier rows AVX512 vs scalar");
+    }
+}
 
 // ============================================================================
 // Level 5: Decode LUT builder parity

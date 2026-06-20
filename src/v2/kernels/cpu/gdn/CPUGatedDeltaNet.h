@@ -26,6 +26,11 @@ namespace llaminar2
     class CPUGatedDeltaNet : public ITensorGatedDeltaNet
     {
     public:
+        bool supportsPaddedPrefillRealLength() const override { return true; }
+        void bindVerifierStateCaptureWorkspace(float *workspace, int rows, int state_size) override;
+        void bindSpeculativeStateWorkspace(float *workspace, int state_size) override;
+        bool restoreVerifierStateCaptureRow(float *dst_state, int row, void *stream) override;
+
         bool chunk_forward(
             const float *Q, const float *K, const float *V,
             const float *alpha, const float *beta_raw,
@@ -33,6 +38,31 @@ namespace llaminar2
             float *output, float *state,
             int seq_len, int n_heads, int d_k, int d_v,
             int chunk_size, bool use_qk_l2norm) override;
+
+        bool chunkForwardWithStateSnapshots(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows) override;
+
+        bool chunkForwardMergedQKVWithStateSnapshots(
+            const float *merged_qkv, int qkv_stride,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_k_heads, int n_heads, int d_k, int d_v,
+            int global_v_head_offset, int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows) override;
+
+        bool restoreStateFromSnapshot(
+            float *state, const float *state_snapshots,
+            int snapshot_row, int snapshot_stride_floats,
+            int state_floats, void *stream = nullptr) override;
 
         bool recurrent_step(
             const float *q, const float *k, const float *v,
@@ -56,11 +86,71 @@ namespace llaminar2
         /// Ensure scratch buffers are large enough, reallocating only when needed
         void ensureScratch(int seq_len, int n_heads, int d_k, int d_v);
 
+        bool chunkForwardImpl(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            int chunk_size, bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows);
+
+        /**
+         * @brief Run a tiny verifier chunk with exact decode-step semantics.
+         *
+         * MTP verifier publication restores one of the intermediate rows as
+         * live decode state. For those rows, "close enough" chunk-prefill math
+         * is not enough: a small FP-order drift can change later greedy ties.
+         * This helper intentionally mirrors recurrent_step() row by row for
+         * each head, while parallelizing across heads for the whole verifier
+         * chunk.  Keeping the row loop inside the head-owned work item avoids
+         * repeated OpenMP launches without changing the per-head recurrence
+         * order.
+         */
+        bool chunkForwardVerifierDecodeEquivalent(
+            const float *Q, const float *K, const float *V,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows);
+
+        /**
+         * @brief Shared exact M=2..4 verifier recurrence over strided rows.
+         *
+         * This is the implementation behind both contiguous Q/K/V verifier
+         * chunks and merged-QKV verifier chunks.  The row accessor supplies the
+         * Q, K, and V head slices for row t/head h, allowing the stage to avoid
+         * materializing separate Q/K/V buffers when the graph already has merged
+         * QKV rows.
+         */
+        template <typename RowAccessor>
+        bool chunkForwardVerifierDecodeEquivalentRows(
+            RowAccessor &&row_accessor,
+            const float *alpha, const float *beta_raw,
+            const float *A_log, const float *dt_bias,
+            float *output, float *state,
+            int seq_len, int n_heads, int d_k, int d_v,
+            bool use_qk_l2norm,
+            float *state_snapshots, int snapshot_stride_floats,
+            int max_snapshot_rows);
+
+        float *prepareSpeculativeState(float *live_state, int state_floats);
+
         // Reusable scratch buffers (grow-only, never shrink during lifetime)
-        std::vector<float> q_scratch_;       ///< Preprocessed Q buffer
-        std::vector<float> k_scratch_;       ///< Preprocessed K buffer
-        std::vector<float> gate_scratch_;    ///< Gate values
+        std::vector<float> q_scratch_;        ///< Preprocessed Q buffer
+        std::vector<float> k_scratch_;        ///< Preprocessed K buffer
+        std::vector<float> gate_scratch_;     ///< Gate values
         std::vector<float> beta_sig_scratch_; ///< Sigmoid of beta
+        float *verifier_state_capture_ = nullptr;
+        int verifier_state_capture_rows_ = 0;
+        int verifier_state_capture_size_ = 0;
+        float *speculative_state_work_ = nullptr;
+        int speculative_state_work_size_ = 0;
+        std::vector<float> owned_speculative_state_work_;
     };
 
 } // namespace llaminar2

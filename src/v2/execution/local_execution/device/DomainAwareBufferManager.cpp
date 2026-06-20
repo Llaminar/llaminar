@@ -248,12 +248,12 @@ namespace llaminar2
 
     void DomainAwareBufferManager::dumpBufferInventory() const
     {
-        LOG_INFO("[DomainAwareBufferManager] Buffer Inventory:");
-        LOG_INFO("  Total buffers: " << stats_.total_buffers());
-        LOG_INFO("  Total bytes: " << stats_.total_bytes());
-        LOG_INFO("  GPU buffers: " << stats_.gpu_buffer_count
+        LOG_DEBUG("[DomainAwareBufferManager] Buffer Inventory:");
+        LOG_DEBUG("  Total buffers: " << stats_.total_buffers());
+        LOG_DEBUG("  Total bytes: " << stats_.total_bytes());
+        LOG_DEBUG("  GPU buffers: " << stats_.gpu_buffer_count
                                    << " (" << stats_.gpu_bytes_allocated << " bytes)");
-        LOG_INFO("  CPU buffers: " << stats_.cpu_buffer_count
+        LOG_DEBUG("  CPU buffers: " << stats_.cpu_buffer_count
                                    << " (" << stats_.cpu_bytes_allocated << " bytes)");
 
         // Per-device breakdown
@@ -262,17 +262,17 @@ namespace llaminar2
             int count = stats_.buffers_per_device.count(device)
                             ? stats_.buffers_per_device.at(device)
                             : 0;
-            LOG_INFO("  " << device.to_string() << ": " << count
+            LOG_DEBUG("  " << device.to_string() << ": " << count
                           << " buffers (" << bytes << " bytes)");
         }
 
         // NUMA breakdown
         if (!stats_.bytes_per_numa_node.empty())
         {
-            LOG_INFO("  NUMA node breakdown:");
+            LOG_DEBUG("  NUMA node breakdown:");
             for (const auto &[node, bytes] : stats_.bytes_per_numa_node)
             {
-                LOG_INFO("    Node " << node << ": " << bytes << " bytes");
+                LOG_DEBUG("    Node " << node << ": " << bytes << " bytes");
             }
         }
 

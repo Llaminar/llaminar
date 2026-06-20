@@ -48,9 +48,11 @@
 #include <cstdint>
 #include <cassert>
 #include <memory>
+#include <optional>
 #include <string>
 #include <stdexcept>
 #include "TensorType.h"           // For TensorType enum (CUDA-safe, no SIMD)
+#include "CoherenceState.h"       // For TensorCoherenceState enum
 #include "../backends/DeviceId.h" // Type-safe device identification
 
 namespace llaminar2
@@ -304,6 +306,32 @@ namespace llaminar2
          *   - Next ensureOnDevice() will sync to device
          */
         virtual void mark_host_dirty() {}
+
+        /**
+         * @brief Transition tensor coherence to a new state
+         *
+         * Kernel implementations call this after writing to device memory
+         * to mark the tensor as DEVICE_AUTHORITATIVE, avoiding implicit
+         * D2H transfers on subsequent data() calls.
+         *
+         * @param new_state          Target coherence state
+         * @param authoritative_dev  Device that holds authoritative data
+         *                           (required for DEVICE_AUTHORITATIVE)
+         *
+         * @throws std::logic_error Always — concrete tensors must override.
+         *         A no-op default would silently swallow coherence transitions,
+         *         causing stale-data bugs that are extremely hard to diagnose.
+         */
+        virtual void transitionTo(
+            TensorCoherenceState new_state,
+            std::optional<DeviceId> authoritative_dev = std::nullopt)
+        {
+            (void)authoritative_dev;
+            throw std::logic_error(
+                "ITensor::transitionTo() called on a type that does not override it "
+                "(state=" + std::to_string(static_cast<int>(new_state)) + "). "
+                "All concrete tensor types must implement transitionTo().");
+        }
 
         /**
          * @brief Ensure tensor data is present on the specified device

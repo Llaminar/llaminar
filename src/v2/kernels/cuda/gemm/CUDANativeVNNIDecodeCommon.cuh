@@ -280,16 +280,11 @@ namespace llaminar2::cuda_native_vnni
             for (int g = 0; g < 4; ++g)
             {
                 const uint32_t raw = *reinterpret_cast<const uint32_t *>(payload + g * 4);
-                packed_groups[g] = pack_i8x4(
-                    iq4nl_lookup_reg(raw & 0x0F),
-                    iq4nl_lookup_reg((raw >> 8) & 0x0F),
-                    iq4nl_lookup_reg((raw >> 16) & 0x0F),
-                    iq4nl_lookup_reg((raw >> 24) & 0x0F));
-                packed_groups[g + 4] = pack_i8x4(
-                    iq4nl_lookup_reg((raw >> 4) & 0x0F),
-                    iq4nl_lookup_reg((raw >> 12) & 0x0F),
-                    iq4nl_lookup_reg((raw >> 20) & 0x0F),
-                    iq4nl_lookup_reg((raw >> 28) & 0x0F));
+                uint32_t lo = 0;
+                uint32_t hi = 0;
+                iq4nl_decode_word(raw, lo, hi);
+                packed_groups[g] = static_cast<int32_t>(lo);
+                packed_groups[g + 4] = static_cast<int32_t>(hi);
             }
         }
         else if constexpr (CODEBOOK_ID == 5)
@@ -481,16 +476,11 @@ namespace llaminar2::cuda_native_vnni
                 for (int g = 0; g < 4; ++g)
                 {
                     const uint32_t raw = raws[g];
-                    packed_groups[g] = pack_i8x4(
-                        iq4nl_lookup_reg(raw & 0x0F),
-                        iq4nl_lookup_reg((raw >> 8) & 0x0F),
-                        iq4nl_lookup_reg((raw >> 16) & 0x0F),
-                        iq4nl_lookup_reg((raw >> 24) & 0x0F));
-                    packed_groups[g + 4] = pack_i8x4(
-                        iq4nl_lookup_reg((raw >> 4) & 0x0F),
-                        iq4nl_lookup_reg((raw >> 12) & 0x0F),
-                        iq4nl_lookup_reg((raw >> 20) & 0x0F),
-                        iq4nl_lookup_reg((raw >> 28) & 0x0F));
+                    uint32_t lo = 0;
+                    uint32_t hi = 0;
+                    iq4nl_decode_word(raw, lo, hi);
+                    packed_groups[g] = static_cast<int32_t>(lo);
+                    packed_groups[g + 4] = static_cast<int32_t>(hi);
                 }
             }
             else if constexpr (CODEBOOK_ID == 5)

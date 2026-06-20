@@ -44,6 +44,7 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
+#include "kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc"
 
 // ============================================================================
 // Format tags — full set matching ROCmGemvKernel_native_VNNI.hip
@@ -67,6 +68,7 @@ enum NativeVNNIGemmFormat : uint8_t {
     NVNNI_GEMM_IQ2_XXS = 15,  // IQ2 grid, 8-bit index
     NVNNI_GEMM_IQ1_S   = 16,  // IQ1 grid, 11-bit index, asymmetric, embedded scales
     NVNNI_GEMM_IQ1_M   = 17,  // IQ1 grid, 11-bit index, dual-scale + embedded mins
+    NVNNI_GEMM_Q8_0    = 19,  // 8-bit symmetric, direct INT8 payload (32 bytes)
 };
 
 // ============================================================================
@@ -99,8 +101,10 @@ struct NVNNIGemmTraits {
     static constexpr bool is_6bit   = (FMT == NVNNI_GEMM_Q6_K);
     static constexpr bool is_3bit   = (FMT == NVNNI_GEMM_Q3_K);
     static constexpr bool is_2bit   = (FMT == NVNNI_GEMM_Q2_K);
+    static constexpr bool is_8bit   = (FMT == NVNNI_GEMM_Q8_0);
     static constexpr bool uses_lut  = (FMT == NVNNI_GEMM_IQ4_NL);
     static constexpr int  payload_bytes =
+        is_8bit ? 32 :                              // Q8_0: 32 raw INT8 values
         is_iq1_grid ? 6 :                          // IQ1_S/IQ1_M: qs[4]+qh[2], native size
         is_iq3_grid ? (has_qh ? 13 : 12) :
         is_iq2_grid ? (has_qh ? 9 : 8) :
@@ -227,6 +231,8 @@ __device__ __forceinline__ void load_payload(const uint8_t* __restrict__ src,
         out[0] = p.x; out[1] = p.y; out[2] = p.z; out[3] = p.w;
         if constexpr (FULL_DW >= 5) out[4] = *reinterpret_cast<const uint32_t*>(src + 16);
         if constexpr (FULL_DW >= 6) out[5] = *reinterpret_cast<const uint32_t*>(src + 20);
+        if constexpr (FULL_DW >= 7) out[6] = *reinterpret_cast<const uint32_t*>(src + 24);
+        if constexpr (FULL_DW >= 8) out[7] = *reinterpret_cast<const uint32_t*>(src + 28);
     } else if constexpr (PB >= 8) {
         uint2 p = *reinterpret_cast<const uint2*>(src);
         out[0] = p.x; out[1] = p.y;
@@ -311,6 +317,13 @@ __device__ __forceinline__ void decode_block(
             packed_groups[g]     = static_cast<int32_t>(raw[g] & 0x0F0F0F0Fu);
             packed_groups[g + 4] = static_cast<int32_t>((raw[g] >> 4) & 0x0F0F0F0Fu);
         }
+    }
+    else if constexpr (Traits::is_8bit)
+    {
+        // Q8_0: 32 raw INT8 values — direct load, no decode needed
+        #pragma unroll
+        for (int g = 0; g < 8; ++g)
+            packed_groups[g] = static_cast<int32_t>(raw[g]);
     }
     else if constexpr (Traits::is_5bit)
     {
@@ -2188,6 +2201,65 @@ static bool launch_native_vnni_gemm(
         return hipGetLastError() == hipSuccess;
     };
 
+    auto launch_config = [&](int n_tile, int m_tile_cfg, int min_blocks, int unroll) -> bool
+    {
+        if (min_blocks != 1 && min_blocks != 2)
+            return false;
+
+#define NVNNI_CONFIG_LAUNCH(NT, MT, MB, UG) \
+        { \
+            dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
+            dim3 block(BLOCK_SIZE, 1, 1); \
+            native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
+                <<<grid, block, 0, hip_stream>>>( \
+                    d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
+                    d_output, d_scales_A, M, N, K, d_scales_A_blockwise); \
+            return hipGetLastError() == hipSuccess; \
+        }
+
+#define NVNNI_CONFIG_LAUNCH_UG(NT, MT, MB) \
+        switch (unroll) { \
+            case 0:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 0) \
+            case 1:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 1) \
+            case 2:  NVNNI_CONFIG_LAUNCH(NT, MT, MB, 2) \
+            default: NVNNI_CONFIG_LAUNCH(NT, MT, MB, 4) \
+        }
+
+#define NVNNI_CONFIG_LAUNCH_MB(NT, MT) \
+        switch (min_blocks) { \
+            case 1:  NVNNI_CONFIG_LAUNCH_UG(NT, MT, 1) \
+            default: NVNNI_CONFIG_LAUNCH_UG(NT, MT, 2) \
+        }
+
+#define NVNNI_CONFIG_LAUNCH_MT(NT) \
+        switch (m_tile_cfg) { \
+            case 16: NVNNI_CONFIG_LAUNCH_MB(NT, 16) \
+            case 64: NVNNI_CONFIG_LAUNCH_MB(NT, 64) \
+            default: NVNNI_CONFIG_LAUNCH_MB(NT, 32) \
+        }
+
+        switch (n_tile)
+        {
+        case 64:
+            NVNNI_CONFIG_LAUNCH_MT(64)
+        case 128:
+            // N128/MT64 is intentionally not a supported trained mode; the
+            // generator rejects stale CSVs that claim it as a winner.
+            switch (m_tile_cfg)
+            {
+            case 16: NVNNI_CONFIG_LAUNCH_MB(128, 16)
+            default: NVNNI_CONFIG_LAUNCH_MB(128, 32)
+            }
+        default:
+            return false;
+        }
+
+#undef NVNNI_CONFIG_LAUNCH_MT
+#undef NVNNI_CONFIG_LAUNCH_MB
+#undef NVNNI_CONFIG_LAUNCH_UG
+#undef NVNNI_CONFIG_LAUNCH
+    };
+
     // M_TILE selection: minimize row waste (same as INT8 V7)
     auto select_m_tile = [](int rows) -> int {
         int best_mt = 64;
@@ -2228,62 +2300,31 @@ static bool launch_native_vnni_gemm(
     // extra template instantiations only for Pattern S formats (Q4_0, IQ4_NL)
     // to keep compile time reasonable.
     // =========================================================================
-    if constexpr (FMT == NVNNI_GEMM_Q4_0 || FMT == NVNNI_GEMM_IQ4_NL) {
-        const auto& env = llaminar2::debugEnv().rocm;
-        const bool has_overrides = (env.nvnni_mt > 0 || env.nvnni_unroll >= 0 ||
-                                    env.nvnni_min_blocks > 0 ||
-                                    env.nvnni_force_n64 || env.nvnni_force_n128);
-        if (has_overrides) {
-            const int eff_mt = (env.nvnni_mt > 0) ? env.nvnni_mt : m_tile;
-            const int eff_unroll = (env.nvnni_unroll >= 0) ? env.nvnni_unroll : 4;
-            const int eff_min_blocks = (env.nvnni_min_blocks > 0) ? env.nvnni_min_blocks : 2;
-            const bool eff_n128 = env.nvnni_force_n128 ? true :
-                                  env.nvnni_force_n64 ? false : use_n128;
+    const auto& env = llaminar2::debugEnv().rocm;
+    const bool has_overrides = (env.nvnni_mt > 0 || env.nvnni_unroll >= 0 ||
+                                env.nvnni_min_blocks > 0 ||
+                                env.nvnni_force_n64 || env.nvnni_force_n128);
+    if (has_overrides) {
+        int eff_mt = (env.nvnni_mt > 0) ? env.nvnni_mt : m_tile;
+        const int eff_unroll = (env.nvnni_unroll >= 0) ? env.nvnni_unroll : 4;
+        const int eff_min_blocks = (env.nvnni_min_blocks > 0) ? env.nvnni_min_blocks : 2;
+        const bool eff_n128 = env.nvnni_force_n128 ? true :
+                              env.nvnni_force_n64 ? false : use_n128;
+        if (eff_n128 && eff_mt > 32)
+            eff_mt = 32;
+        return launch_config(eff_n128 ? 128 : 64, eff_mt, eff_min_blocks, eff_unroll);
+    }
 
-#define NVNNI_LAUNCH(NT, MT, MB, UG) \
-            { \
-                dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
-                dim3 block(BLOCK_SIZE, 1, 1); \
-                native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
-                    <<<grid, block, 0, hip_stream>>>( \
-                        d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
-                        d_output, d_scales_A, M, N, K, d_scales_A_blockwise); \
-                return hipGetLastError() == hipSuccess; \
-            }
-
-#define NVNNI_LAUNCH_UG(NT, MT, MB) \
-            switch (eff_unroll) { \
-                case 0:  NVNNI_LAUNCH(NT, MT, MB, 0) \
-                case 1:  NVNNI_LAUNCH(NT, MT, MB, 1) \
-                case 2:  NVNNI_LAUNCH(NT, MT, MB, 2) \
-                default: NVNNI_LAUNCH(NT, MT, MB, 4) \
-            }
-
-#define NVNNI_LAUNCH_MB(NT, MT) \
-            switch (eff_min_blocks) { \
-                case 1:  NVNNI_LAUNCH_UG(NT, MT, 1) \
-                case 3:  NVNNI_LAUNCH_UG(NT, MT, 3) \
-                default: NVNNI_LAUNCH_UG(NT, MT, 2) \
-            }
-
-#define NVNNI_LAUNCH_MT(NT) \
-            switch (eff_mt) { \
-                case 16: NVNNI_LAUNCH_MB(NT, 16) \
-                case 64: NVNNI_LAUNCH_MB(NT, 64) \
-                default: NVNNI_LAUNCH_MB(NT, 32) \
-            }
-
-            if (eff_n128) {
-                NVNNI_LAUNCH_MT(128)
-            } else {
-                NVNNI_LAUNCH_MT(64)
-            }
-
-#undef NVNNI_LAUNCH_MT
-#undef NVNNI_LAUNCH_MB
-#undef NVNNI_LAUNCH_UG
-#undef NVNNI_LAUNCH
-        }
+    llaminar2::rocm::generated::ROCmNativeVNNIPrefillDispatchConfig generated_cfg{};
+    if (!env.nvnni_disable_generated &&
+        llaminar2::rocm::generated::selectROCmNativeVNNIPrefillGenerated<static_cast<uint8_t>(FMT)>(
+            M, N, K, generated_cfg))
+    {
+        return launch_config(
+            static_cast<int>(generated_cfg.n_tile),
+            static_cast<int>(generated_cfg.m_tile),
+            static_cast<int>(generated_cfg.min_blocks),
+            static_cast<int>(generated_cfg.unroll));
     }
 
     // =========================================================================
@@ -2433,6 +2474,11 @@ static bool launch_native_vnni_gemm(
 
         // Hybrid N128 dispatch: M16/3-wave for small grids, M32/2-wave for large
         //
+        // Guard with if constexpr: only dual_scale (non-asym) formats reach here
+        // at runtime (Q6_K, Q3_K, IQ2_S, IQ2_XS, IQ1_M), but without the guard
+        // the compiler still instantiates launch3 for all formats — causing
+        // occupancy failures for Q2_K (drops to 1-wave at N128/M16/3w).
+        //
         // NOTE: M_TILE > 32 is NOT viable on N128 due to A-LDS bank conflicts.
         // gfx906 has 32 LDS banks at 4-byte granularity.  With M_PER_THREAD=4,
         // each thread reads 4 consecutive int32 from banks (t_m*4)%32 through
@@ -2443,6 +2489,8 @@ static bool launch_native_vnni_gemm(
         // The A-data reuse gain from N_PER_THREAD 4→8 is completely eaten by
         // the bank conflict stalls.  Empirically: M64/N128 and M128/N64 both
         // regressed LM_Head from 0.88× to 0.30-0.37× (2.5× slower).
+        if constexpr (!NVNNIGemmTraits<FMT>::is_dual_scale_asym &&
+                      !NVNNIGemmTraits<FMT>::is_asymmetric) {
         const int n128_blocks = (N + 127) / 128;
         const int m16_blocks  = (M + 15) / 16;
         const int total_wgs_m16 = n128_blocks * m16_blocks;
@@ -2457,6 +2505,7 @@ static bool launch_native_vnni_gemm(
                 return launch3(N128{}, M16{});
             else
                 return launch(N128{}, M32{});
+        }
         }
     } else {
         // Dual-scale-asymmetric formats (Pattern DA: Q2_K only): force M16 on N64.
@@ -2572,6 +2621,7 @@ bool rocmGemm_native_vnni_fp32(
     case NVNNI_GEMM_IQ2_XXS:  LAUNCH_GEMM(NVNNI_GEMM_IQ2_XXS);
     case NVNNI_GEMM_IQ1_S:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_S);
     case NVNNI_GEMM_IQ1_M:    LAUNCH_GEMM(NVNNI_GEMM_IQ1_M);
+    case NVNNI_GEMM_Q8_0:     LAUNCH_GEMM(NVNNI_GEMM_Q8_0);
     default:
         fprintf(stderr, "[rocmGemm_native_vnni_fp32] Unsupported codebook_id=%d\n",
                 codebook_id);

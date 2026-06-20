@@ -227,7 +227,7 @@ namespace llaminar2
             int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
             if (rank == 0)
             {
-                LOG_INFO("[DeviceOrchestrator] " << message);
+                LOG_DEBUG("[DeviceOrchestrator] " << message);
             }
         }
     }

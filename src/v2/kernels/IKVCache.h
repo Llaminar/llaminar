@@ -12,6 +12,10 @@
 #include "../execution/config/RuntimeConfig.h" // ActivationPrecision
 #include "../tensors/ITensor.h"                // Lightweight interface (no MPI)
 #include "../tensors/TensorLayout.h"
+#include "../utils/Logger.h"
+#include <cstddef>
+#include <cstdint>
+#include <string>
 #include <vector>
 
 namespace llaminar2
@@ -29,6 +33,120 @@ namespace llaminar2
     {
     public:
         virtual ~IKVCache() = default;
+
+        /**
+         * @brief Descriptor for copying a logical KV block in oldest-to-newest order.
+         *
+         * The token range is logical within the sequence, not a physical ring row
+         * range. Implementations may remap global_layer through first_layer_index().
+         */
+        struct KVCacheLogicalBlockDescriptor
+        {
+            int layer = 0;
+            int seq_idx = 0;
+            int logical_token_start = 0;
+            int token_count = 0;
+            void *stream = nullptr;
+        };
+
+        /**
+         * @brief Packed byte layout for a logical KV block payload.
+         *
+         * Payloads preserve native K/V precision and KV cache layout. For
+         * KV_POS_HEAD_DIM, rows are packed by token. For KV_HEAD_POS_DIM, rows
+         * are packed by head, then logical token, then head dimension.
+         */
+        struct KVCacheLogicalBlockLayout
+        {
+            ActivationPrecision k_precision = ActivationPrecision::FP32;
+            ActivationPrecision v_precision = ActivationPrecision::FP32;
+            TensorLayout layout = TensorLayout::UNKNOWN;
+            int local_kv_heads = 0;
+            int kv_head_start = 0;
+            int head_dim = 0;
+            size_t k_bytes = 0;
+            size_t v_bytes = 0;
+            bool device_resident = false;
+        };
+
+        /**
+         * @brief Logical sequence state for cache import/export planning.
+         */
+        struct KVCacheSequenceState
+        {
+            int cached_tokens = 0;
+            int implementation_head = 0;
+            bool wrapped = false;
+        };
+
+        /**
+         * @brief Device-resident sequence-state publication request.
+         *
+         * vLLM-style MTP publication derives accepted verifier rows and target
+         * cache lengths in GPU memory.  A cache implementation may consume this
+         * request to update its device-side sequence metadata without first
+         * copying accepted counts back to the CPU.
+         *
+         * Long-context ring caches must treat @p target_cached_tokens_device as
+         * the target valid-token count.  Publication must preserve the live
+         * ring tail and move the head to `tail + target_cached_tokens`, matching
+         * truncateSequence() semantics after a verifier graph has written
+         * temporary rows.  @p accepted_state_counts_device records how many
+         * verifier rows were accepted for validation/accounting; it is not a
+         * reliable source of ring-head position because the live device head may
+         * already include rejected verifier rows.
+         *
+         * The stream is mandatory for GPU implementations.  Work enqueued by
+         * this call must be ordered after the verifier outcome producer and
+         * before any graph replay that consumes the updated KV state.
+         */
+        struct DeviceSequenceStatePublicationRequest
+        {
+            int request_count = 0;
+            int first_seq_idx = 0;
+            const int32_t *target_cached_tokens_device = nullptr;
+            const int32_t *accepted_state_counts_device = nullptr;
+            const int32_t *publication_ok_flags_device = nullptr;
+            void *stream = nullptr;
+
+            bool valid() const
+            {
+                return request_count > 0 &&
+                       first_seq_idx >= 0 &&
+                       target_cached_tokens_device != nullptr &&
+                       accepted_state_counts_device != nullptr &&
+                       publication_ok_flags_device != nullptr &&
+                       stream != nullptr;
+            }
+        };
+
+        /**
+         * @brief Host mirror update paired with device-resident publication.
+         *
+         * DeviceSequenceStatePublicationRequest updates GPU-visible KV
+         * head/count mirrors on an explicit stream.  Graph signatures and legacy
+         * diagnostics still read host cache state through get_cached_tokens() and
+         * ring_head(), so callers that later synchronize compact verifier metadata
+         * can use this host-only request to make those mirrors match the already
+         * enqueued device publication.  This method must not enqueue device work.
+         */
+        struct HostSequenceStatePublicationRequest
+        {
+            int request_count = 0;
+            int first_seq_idx = 0;
+            std::vector<int32_t> target_cached_tokens;
+            std::vector<int32_t> accepted_state_counts;
+            std::vector<int32_t> publication_ok_flags;
+
+            bool valid() const
+            {
+                return request_count > 0 &&
+                       first_seq_idx >= 0 &&
+                       static_cast<int>(target_cached_tokens.size()) == request_count &&
+                       static_cast<int>(accepted_state_counts.size()) == request_count &&
+                       static_cast<int>(publication_ok_flags.size()) == request_count;
+            }
+        };
 
         // =================================================================
         // Query Operations
@@ -118,6 +236,181 @@ namespace llaminar2
          *         Default is KV_POS_HEAD_DIM (position-major)
          */
         virtual TensorLayout kv_layout() const { return TensorLayout::KV_POS_HEAD_DIM; }
+
+        /**
+         * @brief Inspect the current physical ring head for diagnostics.
+         *
+         * For ring caches this is the physical row that represents the oldest
+         * valid token. Non-ring implementations may return 0.
+         */
+        virtual int ring_head(int layer, int seq_idx = 0) const
+        {
+            (void)layer;
+            (void)seq_idx;
+            return 0;
+        }
+
+        /**
+         * @brief Describe the byte layout for a packed logical KV block.
+         */
+        virtual KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const
+        {
+            (void)global_layer;
+            (void)token_count;
+            return {};
+        }
+
+        /**
+         * @brief Inspect logical sequence state for a global layer/sequence.
+         */
+        virtual KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const
+        {
+            (void)global_layer;
+            (void)seq_idx;
+            return {};
+        }
+
+        /**
+         * @brief Export a logical KV block into packed native-precision buffers.
+         */
+        virtual bool exportLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, void *dst_k, void *dst_v) const
+        {
+            (void)desc;
+            (void)dst_k;
+            (void)dst_v;
+            return false;
+        }
+
+        /**
+         * @brief Import a packed logical KV block into this cache.
+         */
+        virtual bool importLogicalBlock(const KVCacheLogicalBlockDescriptor &desc, const void *src_k, const void *src_v)
+        {
+            (void)desc;
+            (void)src_k;
+            (void)src_v;
+            return false;
+        }
+
+        /**
+         * @brief Truncate every layer for one sequence to cached_tokens.
+         */
+        virtual bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr)
+        {
+            (void)seq_idx;
+            (void)cached_tokens;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Device pointer to the live cached-token count mirror.
+         *
+         * GPU graph-captured stages can use this pointer once they are taught
+         * to compute dynamic attention/KV parameters on device.  The pointer is
+         * only a mirror unless supportsDeviceResidentSequenceStatePublication()
+         * also returns true; callers must not treat it as authoritative for
+         * host-visible state before that point.
+         */
+        virtual const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const
+        {
+            (void)layer;
+            (void)seq_idx;
+            return nullptr;
+        }
+
+        /**
+         * @brief Device pointer to the canonical live cached-token count for a request.
+         *
+         * Verifier publication needs the cache length before the verifier appends
+         * target rows.  GPU caches expose that value through per-layer device
+         * mirrors; hybrid models may not have attention state at model layer zero.
+         * This helper returns the first available per-layer count so callers can
+         * consume a device-owned sequence length without knowing the model's
+         * attention/GDN layout.
+         */
+        virtual const int *deviceSequenceCachedTokenCountPtr(int seq_idx = 0) const
+        {
+            const int first_layer = first_layer_index();
+            const int layer_count = n_layers();
+            for (int layer = first_layer; layer < first_layer + layer_count; ++layer)
+            {
+                if (const int *ptr = deviceCachedTokenCountPtr(layer, seq_idx))
+                    return ptr;
+            }
+            return nullptr;
+        }
+
+        /**
+         * @brief Device pointer to the live ring-head mirror.
+         *
+         * Wrapped ring-cache publication requires both the target cached-token
+         * count and the current ring head.  This accessor gives future Phase 10
+         * kernels a backend-neutral way to consume that head without reaching
+         * into CUDA/HIP cache internals.
+         */
+        virtual const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const
+        {
+            (void)layer;
+            (void)seq_idx;
+            return nullptr;
+        }
+
+        /**
+         * @brief Whether this cache can publish sequence metadata from device buffers.
+         *
+         * Returning true means the cache can consume
+         * DeviceSequenceStatePublicationRequest without a D2H sync and future
+         * graph-dynamic KV consumers will observe the published state from
+         * device-owned metadata.  Implementations must not return true if they
+         * only update an auxiliary device buffer while get_cached_tokens(),
+         * attention dynamic params, or graph signatures still depend on stale
+         * host counters.
+         */
+        virtual bool supportsDeviceResidentSequenceStatePublication() const
+        {
+            return false;
+        }
+
+        /**
+         * @brief Publish accepted verifier cache counts from device metadata.
+         *
+         * The default hard-fails so callers cannot accidentally hide the host
+         * synchronization that Phase 10 is trying to remove.  GPU backends
+         * should implement this only together with device-readable count/head
+         * metadata for subsequent attention and append stages.
+         */
+        virtual bool publishSequenceStateFromDeviceMetadata(
+            const DeviceSequenceStatePublicationRequest &request,
+            std::string *error = nullptr)
+        {
+            (void)request;
+            if (error)
+            {
+                *error =
+                    "KV cache does not support device-resident sequence-state publication";
+            }
+            return false;
+        }
+
+        /**
+         * @brief Adopt host KV head/count mirrors after direct device publication.
+         *
+         * The default hard-fails because only caches that understand their
+         * wrapped-head transition can mirror device publication safely.
+         */
+        virtual bool adoptSequenceStateFromHostMetadata(
+            const HostSequenceStatePublicationRequest &request,
+            std::string *error = nullptr)
+        {
+            (void)request;
+            if (error)
+            {
+                *error =
+                    "KV cache does not support host mirror adoption after device-resident publication";
+            }
+            return false;
+        }
 
         // =================================================================
         // ITensor Access (unified CPU/GPU interface)
@@ -231,6 +524,38 @@ namespace llaminar2
         }
 
         /**
+         * @brief Append MTP verifier rows with decode-equivalent ring semantics.
+         *
+         * The verifier path computes several future rows at once, but those rows
+         * must become KV-cache state exactly as if normal decode had appended
+         * them one token at a time.  Backends that implement this method should
+         * write all rows in one grouped/concurrent operation and update ring
+         * metadata once, preserving the same oldest-to-newest order and
+         * wraparound behavior as serial decode.
+         *
+         * Source tensors may be ordinary position-major rows
+         * `[verifier_rows][local_kv_heads * head_dim]` or head-major rows
+         * `[local_kv_heads * verifier_rows][head_dim]`.  Implementations must
+         * fail closed for unsupported layouts rather than silently falling back
+         * to stage-level row replay.
+         */
+        virtual bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                        int seq_idx,
+                                                        const ITensor *K,
+                                                        const ITensor *V,
+                                                        int verifier_rows,
+                                                        void *gpu_stream = nullptr)
+        {
+            (void)layer;
+            (void)seq_idx;
+            (void)K;
+            (void)V;
+            (void)verifier_rows;
+            (void)gpu_stream;
+            return false;
+        }
+
+        /**
          * @brief Stream-aware append for GPU graph capture compatibility
          *
          * GPU KV cache implementations override this to dispatch the append
@@ -238,7 +563,10 @@ namespace llaminar2
          * This is critical for GPU graph capture where all operations must
          * execute on the same stream.
          *
-         * CPU caches ignore the stream and forward to the regular append.
+         * Implementations that support stream-aware append must override this
+         * method. The base implementation fails so GPU callers cannot silently
+         * drop to append(), which may use the default stream or skip required
+         * format conversion.
          *
          * @param layer Layer index
          * @param seq_idx Sequence index
@@ -251,8 +579,14 @@ namespace llaminar2
         virtual bool appendWithStream(int layer, int seq_idx, const ITensor *K, const ITensor *V,
                                       int num_tokens, void *gpu_stream)
         {
+            (void)layer;
+            (void)seq_idx;
+            (void)K;
+            (void)V;
+            (void)num_tokens;
             (void)gpu_stream;
-            return append(layer, seq_idx, K, V, num_tokens);
+            LOG_ERROR("[IKVCache::appendWithStream] Stream-aware append is not implemented by this cache");
+            return false;
         }
 
         // =================================================================
@@ -270,20 +604,30 @@ namespace llaminar2
         virtual bool isGraphCaptureReady() const { return false; }
 
         /**
-         * @brief Copy current head position to device buffer for graph replay
+         * @brief Whether setDynamicAppendState() is a real backend capability.
          *
-         * Updates the pinned host buffer with the current ring buffer head
-         * position and issues an H2D copy on the given stream. This ensures
-         * the device buffer has the correct value before the graph replays
-         * the captured ring_append_kernel.
+         * Graph-captured GPU append stages need device-side metadata mailboxes
+         * for the current ring head, cached-token count, and padded-prefill
+         * real append count. CPU caches and other host-only implementations
+         * must keep the default false value so generic cached-graph plumbing
+         * does not call the GPU-only update path and report a false hard
+         * failure. Returning true is a promise that setDynamicAppendState()
+         * is implemented and should fail loudly if a required upload cannot
+         * be performed on the explicit stream.
+         */
+        virtual bool supportsDynamicAppendState() const { return false; }
+
+        /**
+         * @brief Prepare current head position in a device buffer for graph replay
          *
-         * For graph mode: the captured H2D in the graph also re-reads from
-         * the pinned host buffer, making the explicit copy here a no-op
-         * (but it's needed for stream-only mode without graph capture).
+         * Implementations upload the current ring buffer head position to a
+         * workspace-owned device buffer on the explicit graph stream. Captured
+         * append execution must record the dynamic append kernel only, never an
+         * H2D metadata copy.
          *
          * @param layer Layer index
          * @param seq_idx Sequence index
-         * @param gpu_stream GPU stream for the H2D copy
+         * @param gpu_stream Explicit GPU stream for the pre-capture upload
          */
         virtual void setDynamicHead(int layer, int seq_idx, void *gpu_stream)
         {
@@ -293,12 +637,37 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prepare device-side KV append metadata for graph replay.
+         *
+         * Padded prefill graph buckets record a fixed-size append kernel so the
+         * graph can be reused for nearby prompt lengths.  The cache metadata,
+         * however, must advance by the real prompt length rather than the bucket
+         * length.  GPU caches override this method to upload both the current
+         * ring head/count and an optional real append count to explicit-stream
+         * device scalars before graph capture/replay.
+         *
+         * @param layer Layer index
+         * @param seq_idx Sequence index
+         * @param append_tokens Real tokens appended by this replay.  A value
+         *        less than or equal to zero means "use the captured append
+         *        kernel's token count", which preserves legacy exact-shape
+         *        decode behavior.
+         * @param gpu_stream Explicit GPU stream for the pre-capture upload
+         * @return true when the backend accepted the dynamic append state
+         */
+        virtual bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream)
+        {
+            (void)append_tokens;
+            setDynamicHead(layer, seq_idx, gpu_stream);
+            return false;
+        }
+
+        /**
          * @brief Update device-side dequant params for graph-capturable read.
          *
-         * TQ caches override this to write incremental dequant parameters
-         * (ring_pos, out_offset, rope_position) to a pinned host buffer.
-         * The captured H2D memcpy in the graph re-reads from pinned host
-         * on replay, so the kernel receives updated values.
+         * TQ caches override this to upload incremental dequant parameters
+         * (ring_pos, out_offset, rope_position) to a device buffer before graph
+         * capture/replay. Captured dequant execution must record kernels only.
          *
          * Called from AttentionComputeStage::updateDynamicParams() before
          * graph replay. Not needed for non-TQ caches.
@@ -428,6 +797,14 @@ namespace llaminar2
         virtual int local_n_kv_heads() const { return 0; }
 
         /**
+         * @brief Get total number of KV heads across all ranks.
+         *
+         * Most concrete caches already expose this. The default preserves
+         * non-sharded semantics for older implementations.
+         */
+        virtual int n_kv_heads() const { return local_n_kv_heads(); }
+
+        /**
          * @brief Get local KV dimension (local_n_kv_heads * head_dim)
          * @return Local KV dimension (default: 0)
          */
@@ -463,6 +840,7 @@ namespace llaminar2
             int head_dim = 0;                                  ///< Dimension per attention head
             int rope_dim = 0;                                  ///< Number of dimensions to rotate per head (0 = full head_dim)
             const TurboQuantContext *turboquant_ctx = nullptr; ///< Required for TQ cache dequant (optional otherwise)
+            void *gpu_stream = nullptr;                        ///< Optional GPU stream for fused conversion/read kernels
         };
 
         /**
@@ -490,10 +868,18 @@ namespace llaminar2
                                       int *out_kv_len = nullptr,
                                       const KVReadParams *rope = nullptr)
         {
-            // Default: ignore target precision and RoPE, return raw cache tensors
+            // No base fallback: callers that request converted/RoPE-applied KV
+            // require an implementation that owns the necessary scratch buffers.
             (void)target;
             (void)rope;
-            return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+            if (out_k)
+                *out_k = nullptr;
+            if (out_v)
+                *out_v = nullptr;
+            if (out_kv_len)
+                *out_kv_len = 0;
+            LOG_ERROR("[IKVCache::get_kv_converted] Converted KV read is not implemented by this cache");
+            return false;
         }
 
         /**

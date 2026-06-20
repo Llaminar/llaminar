@@ -182,7 +182,7 @@ namespace llaminar2
     RCCLCoordinator::~RCCLCoordinator()
     {
         LOG_DEBUG("[RCCLCoordinator] Destroying");
-        if (initialized_.load())
+        if (initialized_.load() || running_.load() || coordinator_thread_.joinable())
         {
             shutdown();
         }
@@ -260,7 +260,7 @@ namespace llaminar2
         }
 
         initialized_.store(true);
-        LOG_INFO("[RCCLCoordinator] Initialized with " << num_devices_ << " ROCm GPU(s)");
+        LOG_DEBUG("[RCCLCoordinator] Initialized with " << num_devices_ << " ROCm GPU(s)");
         return true;
 #else
         last_error_ = "RCCL not available (HAVE_RCCL not defined)";
@@ -271,7 +271,7 @@ namespace llaminar2
 
     void RCCLCoordinator::shutdown()
     {
-        if (!initialized_.load() && !running_.load())
+        if (!initialized_.load() && !running_.load() && !coordinator_thread_.joinable())
         {
             return;
         }
@@ -292,7 +292,7 @@ namespace llaminar2
         }
 
         initialized_.store(false);
-        LOG_INFO("[RCCLCoordinator] Shutdown complete");
+        LOG_DEBUG("[RCCLCoordinator] Shutdown complete");
     }
 
     void RCCLCoordinator::abortCommunicators()
@@ -424,8 +424,20 @@ namespace llaminar2
             compute_events_[i] = static_cast<void *>(ev);
         }
 
-        LOG_INFO("[RCCLCoordinator] Compute streams registered for " << num_devices_
+        LOG_DEBUG("[RCCLCoordinator] Compute streams registered for " << num_devices_
                                                                      << " devices — using stream-level pre-sync");
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=rccl_compute_stream"
+                         << " coordinator=" << static_cast<const void *>(this)
+                         << " slot=" << i
+                         << " ordinal=" << device_ordinals_[i]
+                         << " compute_stream=" << compute_streams_[i]
+                         << " compute_event=" << compute_events_[i]);
+            }
+        }
 #else
         (void)compute_streams;
 #endif
@@ -1005,6 +1017,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         // 4. Post-sync: record completion on RCCL stream, compute stream waits
         err = hipEventRecord(completion_event, rccl_stream);
@@ -1082,6 +1095,19 @@ namespace llaminar2
         // 2. Launch allreduce directly on the caller's stream.
         //    No cross-stream event sync needed — the caller's stream provides
         //    ordering (prior compute → allreduce → subsequent compute).
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " buffer=" << buffer
+                     << " count=" << count
+                     << " dtype=" << static_cast<int>(dtype)
+                     << " op=" << static_cast<int>(op)
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
         rccl::ncclResult_t r = rccl::ncclAllReduce(
             buffer, buffer, count,
             toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
@@ -1090,6 +1116,16 @@ namespace llaminar2
         {
             last_error_ = std::string("rcclAllReduce(on-stream) failed: ") + rccl::ncclGetErrorString(r);
             return false;
+        }
+        collective_performed_.store(true);
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_onstream_enqueued"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " stream=" << stream);
         }
 
         return true;
@@ -1225,6 +1261,7 @@ namespace llaminar2
             last_error_ = std::string("rcclAllReduce failed: ") + rccl::ncclGetErrorString(r);
             return false;
         }
+        collective_performed_.store(true);
 
         // Record completion event
         err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[device_idx]), stream);

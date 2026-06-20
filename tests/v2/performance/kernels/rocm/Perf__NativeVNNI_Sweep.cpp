@@ -1,6 +1,6 @@
 /**
  * @file Perf__NativeVNNI_Sweep.cpp
- * @brief Per-shape tuning sweep for native-VNNI GEMM (Q4_0 prefill).
+ * @brief Per-shape tuning sweep for native-VNNI GEMM prefill.
  *
  * Benchmarks all combinations of:
  *   - N_TILE: 64 vs 128
@@ -9,8 +9,8 @@
  *   - UNROLL_G: {0 (no hint), 2, 4 (default)}
  *   - Auto dispatch (current heuristic baseline)
  *
- * Shapes tested: Qwen2.5-0.5B, 3B, 7B (Attention, FFN_Up, FFN_Down, LM_Head)
- * M values: 128, 256, 512 (typical prefill sizes)
+ * Shapes tested: Qwen2.5/Qwen3.6 dense and MoE-style production shapes.
+ * M values: MTP small rows plus the canonical graph-prefill bucket policy.
  *
  * Output: per-shape best variant table with correctness gate (cosine > 0.9990).
  *
@@ -19,6 +19,7 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -26,6 +27,10 @@
 #include <functional>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -34,6 +39,7 @@
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "fort.hpp"
 
@@ -112,6 +118,9 @@ namespace
     };
 
     static const std::vector<GEMMShape> GEMM_SHAPES = {
+        // Qwen3.5/Qwen3.6 MoE expert FFN shapes.
+        {"35BMoE_Expert_GateUp", "MoE", 512, 2048},
+        {"35BMoE_Expert_Down", "MoE", 2048, 512},
         // Qwen2.5-0.5B (hidden=896, intermediate=4864)
         {"0.5B_AttnQKV", "Attention", 2688, 896},
         {"0.5B_AttnOut", "Attention", 896, 896},
@@ -130,9 +139,146 @@ namespace
         {"7B_FFN_Up", "FFN_Up", 18944, 3584},
         {"7B_FFN_Dn", "FFN_Down", 3584, 18944},
         {"7B_LM_Head", "LM_Head", 151936, 3584},
+        // Qwen3.6 27B dense / hybrid GDN production shapes.
+        {"Qwen36_Attn_Q", "Attention", 5120, 5120},
+        {"Qwen36_Attn_KV", "Attention", 1024, 5120},
+        {"Qwen36_Attn_Wo", "Attention", 5120, 5120},
+        {"Qwen36_FFN_GateUp", "FFN_Up", 17408, 5120},
+        {"Qwen36_FFN_DownProjection", "FFN_Down", 5120, 17408},
+        {"Qwen36_GDN_InnerProjection", "GDN", 10240, 5120},
+        {"Qwen36_GDN_ZProjection", "GDN", 6144, 5120},
+        {"Qwen36_GDN_TimeProjection", "GDN", 1024, 5120},
+        {"Qwen36_GDN_OutputProjection", "GDN", 5120, 6144},
+        {"Qwen36_LM_Head", "LM_Head", 248320, 5120},
     };
 
-    static const std::vector<int> M_VALUES = {128, 256, 512};
+    static const std::vector<int> M_VALUES = defaultNativeVNNIDispatchTrainingRows();
+
+    struct FormatSpec
+    {
+        std::string name;
+        std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create;
+    };
+
+    static const std::vector<FormatSpec> NVNNI_FORMATS = {
+        {"Q4_0", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ4_0Random({N, K}); }},
+        {"IQ4_NL", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"Q4_1", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ4_1Random({N, K}); }},
+        {"Q4_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ4_KRandom({N, K}); }},
+        {"Q5_0", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ5_0Random({N, K}); }},
+        {"Q5_1", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ5_1Random({N, K}); }},
+        {"Q5_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ5_KRandom({N, K}); }},
+        {"Q6_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ6_KRandom({N, K}); }},
+        {"Q3_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ3_KRandom({N, K}); }},
+        {"Q2_K", [](size_t N, size_t K)
+         { return TestTensorFactory::createQ2_KRandom({N, K}); }},
+        {"IQ3_S", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ3_SRandom({N, K}); }},
+        {"IQ3_XXS", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ3_XXSRandom({N, K}); }},
+        {"IQ2_S", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ2_SRandom({N, K}); }},
+        {"IQ2_XS", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ2_XSRandom({N, K}); }},
+        {"IQ2_XXS", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ2_XXSRandom({N, K}); }},
+        {"IQ1_S", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ1_SRandom({N, K}); }},
+        {"IQ1_M", [](size_t N, size_t K)
+         { return TestTensorFactory::createIQ1_MRandom({N, K}); }},
+    };
+
+    static std::string toLower(std::string value)
+    {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        return value;
+    }
+
+    static std::string trim(std::string value)
+    {
+        const auto begin = value.find_first_not_of(" \t\n\r");
+        if (begin == std::string::npos)
+            return {};
+        const auto end = value.find_last_not_of(" \t\n\r");
+        return value.substr(begin, end - begin + 1);
+    }
+
+    static std::string getEnvString(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return {};
+        return trim(raw);
+    }
+
+    static std::optional<int> getEnvInt(const char *name)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return std::nullopt;
+        return std::atoi(raw);
+    }
+
+    static std::set<std::string> getEnvCsvSet(const char *name)
+    {
+        std::set<std::string> values;
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return values;
+
+        std::stringstream stream(raw);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = toLower(trim(token));
+            if (!token.empty())
+                values.insert(token);
+        }
+        return values;
+    }
+
+    static std::vector<int> getEnvCsvInts(const char *name, const std::vector<int> &fallback)
+    {
+        const char *raw = std::getenv(name);
+        if (!raw || *raw == '\0')
+            return fallback;
+
+        std::vector<int> values;
+        std::stringstream stream(raw);
+        std::string token;
+        while (std::getline(stream, token, ','))
+        {
+            token = trim(token);
+            if (!token.empty())
+                values.push_back(std::atoi(token.c_str()));
+        }
+        return values.empty() ? fallback : values;
+    }
+
+    static bool shouldRunName(const std::set<std::string> &filters, const std::string &name)
+    {
+        return filters.empty() || filters.count(toLower(name)) > 0;
+    }
+
+    static const NativeVnniFormatInfo &requireNativeVnniInfo(const TensorBase *weights, const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(weights);
+        const NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("ROCm NativeVNNI sweep format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
 
     // =========================================================================
     // Variant definitions
@@ -160,8 +306,6 @@ namespace
         {"N128/MT16/MB2", 128, 16, 2, -1},
         {"N128/MT32/MB1", 128, 32, 1, -1},
         {"N128/MT32/MB2", 128, 32, 2, -1},
-        {"N128/MT64/MB1", 128, 64, 1, -1},
-        {"N128/MT64/MB2", 128, 64, 2, -1},
         // UNROLL_G sweep on best known config (N64/MT64/MB1 — most likely winner)
         {"N64/MT64/MB1/U0", 64, 64, 1, 0},
         {"N64/MT64/MB1/U1", 64, 64, 1, 1},
@@ -172,9 +316,6 @@ namespace
         {"N128/MT32/MB1/U1", 128, 32, 1, 1},
         {"N128/MT32/MB1/U2", 128, 32, 1, 2},
         {"N128/MT32/MB1/U4", 128, 32, 1, 4},
-        // 3-wave variants for comparison
-        {"N64/MT16/MB3", 64, 16, 3, -1},
-        {"N128/MT16/MB3", 128, 16, 3, -1},
         // Auto dispatch (current heuristic)
         {"Auto", -1, -1, -1, -1},
     };
@@ -214,8 +355,10 @@ namespace
             {
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, 0);
-                device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
+                if (hipGetDeviceProperties(&props, 0) == hipSuccess)
+                    device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
+                else
+                    device_name_ = "rocm:0";
             }
 #else
             has_device_ = false;
@@ -543,6 +686,138 @@ namespace
                         best_name, best_us, auto_us, speedup);
             }
         }
+#endif
+    }
+
+    TEST_F(NativeVNNISweepTest, TrainerCsv_CodebookTagged)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_device_)
+            GTEST_SKIP() << "No ROCm device available";
+
+        std::set<std::string> format_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_FORMATS");
+        if (format_filters.empty())
+            format_filters.insert("q4_0");
+        const std::set<std::string> shape_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_SHAPES");
+        const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NVNNI_SWEEP_VARIANTS");
+        const std::vector<int> m_values = getEnvCsvInts(
+            "LLAMINAR_ROCM_NVNNI_SWEEP_M",
+            defaultNativeVNNIDispatchTrainingRows());
+        const int max_cases = std::max(1, getEnvInt("LLAMINAR_ROCM_NVNNI_SWEEP_MAX_CASES").value_or(1));
+        const std::string csv_path = getEnvString("LLAMINAR_ROCM_NVNNI_SWEEP_CSV");
+
+        std::FILE *csv = nullptr;
+        if (!csv_path.empty())
+        {
+            csv = std::fopen(csv_path.c_str(), "w");
+            ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeVNNI sweep CSV: " << csv_path;
+            std::fprintf(csv,
+                         "backend,phase,format,codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,is_best\n");
+        }
+
+        int executed_cases = 0;
+        int executed_rows = 0;
+
+        for (const auto &format : NVNNI_FORMATS)
+        {
+            if (!shouldRunName(format_filters, format.name))
+                continue;
+
+            for (const auto &shape : GEMM_SHAPES)
+            {
+                if (!shouldRunName(shape_filters, shape.name))
+                    continue;
+                if ((shape.K % 32) != 0)
+                    continue;
+
+                auto weights = format.create(static_cast<size_t>(shape.N), static_cast<size_t>(shape.K));
+                const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
+
+                GpuWeightsCache gpu_weights;
+                if (weights)
+                {
+                    const float *w_fp32 = weights->data();
+                    if (w_fp32)
+                        gpu_weights.upload(w_fp32, shape.N, shape.K, 0);
+                }
+
+                for (const int M : m_values)
+                {
+                    if (executed_cases >= max_cases)
+                        break;
+
+                    std::vector<BenchResult> rows;
+                    rows.reserve(NVNNI_VARIANTS.size());
+                    for (const auto &variant : NVNNI_VARIANTS)
+                    {
+                        if (!shouldRunName(variant_filters, variant.name))
+                            continue;
+                        auto r = benchmarkVariant(variant, shape, M, weights.get(), gpu_weights);
+                        rows.push_back(std::move(r));
+                    }
+                    ASSERT_FALSE(rows.empty()) << "No ROCm NativeVNNI variants selected.";
+
+                    const auto best_it = std::min_element(
+                        rows.begin(), rows.end(),
+                        [](const BenchResult &lhs, const BenchResult &rhs)
+                        {
+                            const double lhs_time = lhs.correctness_pass && lhs.min_us > 0.0 ? lhs.min_us : 1e100;
+                            const double rhs_time = rhs.correctness_pass && rhs.min_us > 0.0 ? rhs.min_us : 1e100;
+                            return lhs_time < rhs_time;
+                        });
+                    ASSERT_NE(best_it, rows.end());
+
+                    for (const auto &r : rows)
+                    {
+                        const int is_best = (&r == &(*best_it)) ? 1 : 0;
+                        if (csv)
+                        {
+                            std::fprintf(csv,
+                                         "rocm,prefill,%s,%u,%s,%s,%d,%d,%d,%s,%.3f,%.3f,%.3f,%.3f,%.6f,%d,%d\n",
+                                         format.name.c_str(),
+                                         static_cast<unsigned>(codebook_id),
+                                         shape.name.c_str(),
+                                         shape.category.c_str(),
+                                         M,
+                                         shape.N,
+                                         shape.K,
+                                         r.variant_name.c_str(),
+                                         r.min_us,
+                                         r.mean_us,
+                                         r.stddev_us,
+                                         r.gflops,
+                                         r.cosine_sim,
+                                         r.correctness_pass ? 1 : 0,
+                                         is_best);
+                            ++executed_rows;
+                        }
+                    }
+                    if (csv)
+                        std::fflush(csv);
+
+                    std::fprintf(stderr,
+                                 "[ROCmNativeVNNI][TRAINER][BEST] format=%s codebook=%u shape=%s M=%d variant=%s time_us=%.3f cosine=%.6f\n",
+                                 format.name.c_str(),
+                                 static_cast<unsigned>(codebook_id),
+                                 shape.name.c_str(),
+                                 M,
+                                 best_it->variant_name.c_str(),
+                                 best_it->min_us,
+                                 best_it->cosine_sim);
+
+                    ++executed_cases;
+                }
+            }
+        }
+
+        if (csv)
+        {
+            std::fclose(csv);
+            ASSERT_GT(executed_rows, 0) << "ROCm NativeVNNI trainer CSV had no rows.";
+        }
+        ASSERT_GT(executed_cases, 0) << "No ROCm NativeVNNI trainer cases selected.";
 #endif
     }
 

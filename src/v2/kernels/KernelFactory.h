@@ -98,7 +98,7 @@ namespace llaminar2
     class ITensorResidualAdd;
     class ITensorAttention;
     class ITensorEmbedding;
-    class ITensorFusedQKVGemm;
+    class IMoEKernel;
     class ITensorFusedGateUpGemm;
     class ITensorShortConvolution;
     class ITensorGatedDeltaNet;
@@ -175,6 +175,7 @@ namespace llaminar
                 EMBEDDING,
                 FUSED_QKV,
                 FUSED_GATE_UP,
+                MOE,
             };
 
             /**
@@ -361,8 +362,8 @@ namespace llaminar
                  * @code
                  * {
                  *     KernelFactory::CUDAOrdinalGuard guard(1); // Target CUDA device 1
-                 *     auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, DeviceId::cuda(1));
-                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared);
+                 *     auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, DeviceId::cuda(1));
+                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared.get());
                  *     // kernel will target CUDA device 1
                  * } // guard goes out of scope, thread-local cleared
                  * @endcode
@@ -390,8 +391,8 @@ namespace llaminar
                  * @code
                  * {
                  *     KernelFactory::ROCmOrdinalGuard guard(1); // Target ROCm device 1
-                 *     auto* prepared = KernelFactory::getOrCreatePreparedGemmWeights(tensor, DeviceId::rocm(1));
-                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared);
+                 *     auto prepared = KernelFactory::prepareGemmHandleLocal(tensor, DeviceId::rocm(1));
+                 *     auto* kernel = KernelFactory::getOrCreateGemmEngine(prepared.get());
                  *     // kernel will target ROCm device 1
                  * } // guard goes out of scope, thread-local cleared
                  * @endcode
@@ -633,156 +634,6 @@ namespace llaminar
                  */
                 static std::unique_ptr<llaminar2::ITensorGemm> createGemm(
                     const llaminar2::BF16Tensor *tensor, DeviceType dev_type, int device_ordinal = -1);
-
-                // ==========================================================================
-                // Fused QKV GEMM Kernel Creation
-                // ==========================================================================
-
-                /**
-                 * @brief Create fused QKV GEMM kernel
-                 *
-                 * Creates a kernel that performs three concurrent GEMM operations
-                 * for Q, K, V projections with shared activation quantization.
-                 *
-                 * @param wq Q weight tensor
-                 * @param wk K weight tensor
-                 * @param wv V weight tensor
-                 * @param dev_type Target device type
-                 * @return Kernel instance (caller owns)
-                 *
-                 * @note Compatibility overload. Prefer explicit DeviceId overload.
-                 */
-                static std::unique_ptr<llaminar2::ITensorFusedQKVGemm> createFusedQKVGemm(
-                    const llaminar2::TensorBase *wq,
-                    const llaminar2::TensorBase *wk,
-                    const llaminar2::TensorBase *wv,
-                    DeviceType dev_type = DeviceType::CPU);
-
-                /**
-                 * @brief Create fused QKV GEMM kernel with explicit DeviceId
-                 *
-                 * Preferred create path for deterministic multi-device behavior.
-                 *
-                 * Internally, this resolves prepared handles for all three projection
-                 * weights on `target_device` and constructs the fused adapter from
-                 * those prepared identities.
-                 */
-                static std::unique_ptr<llaminar2::ITensorFusedQKVGemm> createFusedQKVGemm(
-                    const llaminar2::TensorBase *wq,
-                    const llaminar2::TensorBase *wk,
-                    const llaminar2::TensorBase *wv,
-                    llaminar2::DeviceId target_device);
-
-                /**
-                 * @brief Get or create cached fused QKV GEMM kernel
-                 *
-                 * Maintains a cache of kernels keyed by prepared-handle identity
-                 * (wq, wk, wv prepared handles + device), ensuring prepared GEMM
-                 * state and fused kernel identity stay aligned.
-                 *
-                 * @param wq Q weight tensor (used as primary cache key)
-                 * @param wk K weight tensor
-                 * @param wv V weight tensor
-                 * @param dev_type Target device type
-                 * @return Kernel pointer (factory owns lifetime)
-                 *
-                 * @note Compatibility overload. For multi-GPU callers, prefer
-                 * explicit DeviceId overload to avoid implicit ordinal resolution.
-                 */
-                static llaminar2::ITensorFusedQKVGemm *getOrCreateFusedQKVGemm(
-                    const llaminar2::TensorBase *wq,
-                    const llaminar2::TensorBase *wk,
-                    const llaminar2::TensorBase *wv,
-                    DeviceType dev_type = DeviceType::CPU);
-
-                /**
-                 * @brief Get or create cached fused QKV GEMM kernel with explicit DeviceId
-                 *
-                 * Preferred API for multi-device execution because it avoids
-                 * implicit thread-local ordinal resolution.
-                 *
-                 * Cache keying is based on prepared-handle identity plus device,
-                 * so cache membership reflects actual backend-ready state instead
-                 * of only raw tensor pointers.
-                 */
-                static llaminar2::ITensorFusedQKVGemm *getOrCreateFusedQKVGemm(
-                    const llaminar2::TensorBase *wq,
-                    const llaminar2::TensorBase *wk,
-                    const llaminar2::TensorBase *wv,
-                    llaminar2::DeviceId target_device);
-
-                // ==========================================================================
-                // Fused Gate/Up GEMM Kernel Creation
-                // ==========================================================================
-
-                /**
-                 * @brief Create fused Gate/Up GEMM kernel for SwiGLU FFN
-                 *
-                 * Creates a kernel that wraps two individual GEMM kernels for
-                 * gate and up projections. The adapter manages the underlying
-                 * GEMM kernels through prepared-handle-aware engine resolution.
-                 *
-                 * @param w_gate Gate weight tensor
-                 * @param w_up Up weight tensor
-                 * @param dev_type Target device type
-                 * @return Kernel instance (caller owns)
-                 */
-                static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpGemm(
-                    const llaminar2::TensorBase *w_gate,
-                    const llaminar2::TensorBase *w_up,
-                    DeviceType dev_type = DeviceType::CPU);
-
-                /**
-                 * @brief Create fused Gate/Up GEMM kernel with explicit DeviceId
-                 *
-                 * Same as createFusedGateUpGemm but uses DeviceId to specify BOTH
-                 * the device type AND ordinal. Use for multi-GPU scenarios.
-                 *
-                 * @param w_gate Gate weight tensor
-                 * @param w_up Up weight tensor
-                 * @param target_device DeviceId specifying type and ordinal
-                 * @return Kernel instance (caller owns)
-                 */
-                static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpGemm(
-                    const llaminar2::TensorBase *w_gate,
-                    const llaminar2::TensorBase *w_up,
-                    llaminar2::DeviceId target_device);
-
-                /**
-                 * @brief Get or create cached fused Gate/Up GEMM kernel
-                 *
-                 * Compatibility overload for call sites that only provide DeviceType.
-                 * Internally delegates to the DeviceId overload.
-                 *
-                 * @param w_gate Gate weight tensor
-                 * @param w_up Up weight tensor
-                 * @param dev_type Target device type
-                 * @return Kernel pointer (factory owns lifetime)
-                 */
-                static llaminar2::ITensorFusedGateUpGemm *getOrCreateFusedGateUpGemm(
-                    const llaminar2::TensorBase *w_gate,
-                    const llaminar2::TensorBase *w_up,
-                    DeviceType dev_type = DeviceType::CPU);
-
-                /**
-                 * @brief Get or create cached fused Gate/Up GEMM kernel with explicit DeviceId
-                 *
-                 * Same as getOrCreateFusedGateUpGemm but uses DeviceId to specify BOTH
-                 * the device type AND the device ordinal (e.g., ROCm:1 vs ROCm:0).
-                 * Use this when weights are on CPU but need to run on a specific GPU.
-                 *
-                 * @param w_gate Gate weight tensor
-                 * @param w_up Up weight tensor
-                 * @param target_device DeviceId specifying type and ordinal
-                 * @return Kernel pointer (factory owns lifetime)
-                 *
-                 * @note Cache key includes prepared-handle identity and DeviceId,
-                 * so entries stay aligned with per-device prepared GEMM readiness.
-                 */
-                static llaminar2::ITensorFusedGateUpGemm *getOrCreateFusedGateUpGemm(
-                    const llaminar2::TensorBase *w_gate,
-                    const llaminar2::TensorBase *w_up,
-                    llaminar2::DeviceId target_device);
 
                 // ==========================================================================
                 // RoPE Kernel Creation - Device-aware dispatch
@@ -1102,6 +953,19 @@ namespace llaminar
                     llaminar2::DeviceId target_device);
 
                 /**
+                 * @brief Get or create a device-scoped MoE kernel
+                 *
+                 * Cache key is target_device only (MoE always operates on FP32).
+                 * Returns a device-appropriate IMoEKernel for routing, gather/scatter,
+                 * shared expert gating, and SwiGLU fallback operations.
+                 *
+                 * @param target_device Target device for execution
+                 * @return Cached or newly created IMoEKernel instance
+                 */
+                static llaminar2::IMoEKernel *getOrCreateMoEKernel(
+                    llaminar2::DeviceId target_device);
+
+                /**
                  * @brief Create RoPE kernel for any tensor type via dynamic dispatch
                  *
                  * Dispatches to the appropriate typed createRoPE overload based on
@@ -1268,36 +1132,6 @@ namespace llaminar
                 static std::unique_ptr<llaminar2::IKVCache> createROCmKVCache(const KVCacheConfig &config);
 #endif
 
-                // ==========================================================================
-                // Cached GEMM Kernel API - Pack Once, Use Many
-                // ==========================================================================
-
-                /**
-                 * @brief Get or create a cached row-sliced GEMM kernel for tensor parallelism
-                 *
-                 * Creates a kernel that only packs rows [row_start, row_end) from the weight tensor.
-                 * This is used for row-parallel tensor parallelism where each MPI rank computes
-                 * a slice of the output dimension.
-                 *
-                 * For a weight matrix [N, K]:
-                 * - Full kernel: packs all N rows, output C is [M, N]
-                 * - Sliced kernel: packs only (row_end - row_start) rows, output C is [M, row_end - row_start]
-                 *
-                 * @param tensor Weight tensor (quantized)
-                 * @param row_start First row to include (0-indexed)
-                 * @param row_end One past the last row to include
-                 * @return Cached GEMM kernel pointer (lifetime managed by cache)
-                 *
-                 * @note Cache key includes row range, so different slices get different kernels
-                 * @note Thread-safe via mutex protection
-                 * @note The resulting kernel has N = (row_end - row_start), K unchanged
-                 * @note After sliced GEMM, caller is responsible for AllReduce if needed
-                 */
-                static llaminar2::ITensorGemm *getOrCreateGemmSliced(
-                    const llaminar2::TensorBase *tensor,
-                    size_t row_start,
-                    size_t row_end);
-
                 /**
                  * @brief Ensure tensor has packed weights in its cache and return pointer
                  *
@@ -1312,48 +1146,6 @@ namespace llaminar
                  */
                 static const llaminar2::gemm::QuantisedPackedWeights *
                 ensurePackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
-
-#ifdef HAVE_CUDA
-                /**
-                 * @brief Ensure tensor has CUDA INT8 packed weights in its cache and return pointer
-                 *
-                 * Similar to ensurePackedWeightsInTensorCache but for CUDA backend.
-                 * Converts any quantized tensor to INT8 + per-column scales for CUTLASS.
-                 *
-                 * The packed weights are stored in tensor->cuda_cache_ so they outlive
-                 * any individual kernel and can be shared across multiple kernel instances.
-                 *
-                 * Thread-safe: can be called from multiple threads.
-                 *
-                 * @param tensor Quantized tensor
-                 * @return Pointer to CUDA packed weights (stored in tensor's cuda_cache_)
-                 * @throws std::runtime_error if packing fails
-                 */
-                static llaminar2::cuda::CUDAPackedWeights *
-                ensureCUDAPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
-#endif
-
-#ifdef HAVE_ROCM
-                /**
-                 * @brief Ensure ROCm INT8 packed weights are cached in tensor
-                 *
-                 * Similar to ensurePackedWeightsInTensorCache but for ROCm backend.
-                 * Converts any quantized tensor to INT8 + per-column scales for CK.
-                 *
-                 * The packed weights are stored in tensor->rocm_cache_ so they outlive
-                 * any individual kernel and can be shared across multiple kernel instances.
-                 *
-                 * Device upload happens lazily on first kernel use (ROCmPackedWeights::uploaded flag).
-                 *
-                 * Thread-safe: can be called from multiple threads.
-                 *
-                 * @param tensor Quantized tensor
-                 * @return Pointer to ROCm packed weights (stored in tensor's rocm_cache_)
-                 * @throws std::runtime_error if packing fails
-                 */
-                static llaminar2::rocm::ROCmPackedWeights *
-                ensureROCmPackedWeightsInTensorCache(const llaminar2::TensorBase *tensor);
-#endif
 
                 /**
                  * @brief Clear cached kernel for a specific tensor
@@ -1526,28 +1318,74 @@ namespace llaminar
                     const PreparedGemmHandle *prepared);
 
                 /**
-                 * @brief Get or create a prepared GEMM-weights handle
+                 * @brief Prepare GEMM weights without inserting into KernelFactory global registries.
                  *
-                 * Resolves preparation kind, ensures packed state where applicable,
-                 * and binds an executable GEMM kernel via explicit-device create path.
-                 *
-                 * Returned handles are stable identity objects for cache keying and
-                 * may be shared by multiple callers (stages, fused adapters, preloaders)
-                 * targeting the same tensor/device/preparation tuple.
+                 * The returned handle is owned by the caller. This is the model-context
+                 * path used by PreparedWeightStore; TensorBase destructors and global
+                 * KernelFactory cleanup do not participate in its lifetime.
                  */
-                static const PreparedGemmHandle *getOrCreatePreparedGemmWeights(
+                static std::shared_ptr<PreparedGemmHandle> prepareGemmHandleLocal(
                     const llaminar2::TensorBase *tensor,
                     llaminar2::DeviceId target_device,
                     GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
 
                 /**
-                 * @brief Clear prepared GEMM handle entries associated with a tensor
-                 *
-                 * Clears all prepared entries for the tensor across devices and prep kinds.
-                 * Implementation is responsible for coordinated fused-cache eviction so
-                 * no fused entry retains stale prepared-handle identity.
+                 * @brief Create a sliced CPU GEMM kernel without using the global sliced cache.
                  */
-                static void clearPreparedGemmWeightsFor(const llaminar2::TensorBase *tensor);
+                static std::unique_ptr<llaminar2::ITensorGemm> createGemmSlicedLocal(
+                    const llaminar2::TensorBase *tensor,
+                    size_t row_start,
+                    size_t row_end);
+
+                /**
+                 * @brief Create a fused Gate/Up adapter from prepared handles without global cache insertion.
+                 */
+                static std::unique_ptr<llaminar2::ITensorFusedGateUpGemm> createFusedGateUpGemmLocal(
+                    const PreparedGemmHandle *prepared_gate,
+                    const PreparedGemmHandle *prepared_up,
+                    llaminar2::DeviceId target_device);
+
+                /**
+                 * @brief Prepare embedding weights without inserting into KernelFactory global registries.
+                 */
+                static std::shared_ptr<llaminar2::PreparedEmbeddingHandle> prepareEmbeddingHandleLocal(
+                    const llaminar2::TensorBase *tensor,
+                    int d_model,
+                    llaminar2::DeviceId target_device,
+                    size_t vocab_offset = 0,
+                    size_t total_vocab = 0);
+
+                /**
+                 * @brief Prepare GEMM weights for an expert view WITHOUT global registry registration.
+                 *
+                 * Performs local VNNI repacking / kernel binding and returns a
+                 * shared_ptr that the caller owns. Lifetime is managed by the caller
+                 * (PreparedWeightStore expert slab).
+                 *
+                 * @param tensor Expert view tensor (2D slice of 3D parent)
+                 * @param target_device Target device for preparation
+                 * @param prep_kind Preparation kind (AUTO resolves to CPU_PACKED for CPU)
+                 * @return shared_ptr to ITensorGemm — caller owns lifetime. Returns nullptr on failure.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> prepareExpertGemmLocal(
+                    const llaminar2::TensorBase *tensor,
+                    llaminar2::DeviceId target_device,
+                    GemmPreparationKind prep_kind = GemmPreparationKind::AUTO);
+
+                /**
+                 * @brief Create a GEMM engine from a transferred (pre-packed) weight blob.
+                 *
+                 * Deserializes the blob and constructs a CPUNativeVNNIGemmKernel directly
+                 * from the pre-packed representation. This avoids the expensive VNNI repack
+                 * that prepareExpertGemmLocal() performs from raw tensor data.
+                 *
+                 * Caller owns the returned shared_ptr lifetime.
+                 *
+                 * @param blob Serialized packed weight blob (from ExpertWeightTransfer)
+                 * @return shared_ptr to ITensorGemm, or nullptr if deserialization fails.
+                 */
+                static std::shared_ptr<llaminar2::ITensorGemm> createExpertGemmFromTransferBlob(
+                    const std::vector<uint8_t> &blob);
 
                 /**
                  * @brief Number of active GEMM engine registry entries
@@ -1557,146 +1395,14 @@ namespace llaminar
                 static size_t gemmEngineRegistrySize();
 
                 /**
-                 * @brief Number of prepared GEMM registry entries
-                 */
-                static size_t preparedGemmRegistrySize();
-
-                /**
                  * @brief Number of device-scoped GEMM engine entries
                  */
                 static size_t deviceScopedGemmEngineRegistrySize();
 
-                // =================================================================
-                // Prepared Embedding Weights
-                // =================================================================
-
-                /**
-                 * @brief Get or create prepared embedding weights for a device
-                 *
-                 * Repacks the embedding table from its native quantized format to
-                 * EmbedQ8Block and uploads to GPU memory. Results are cached by
-                 * (tensor, device) — subsequent calls return the cached handle.
-                 *
-                 * Called during weight loading (Phase 4) alongside GEMM preparation.
-                 *
-                 * @param tensor     Source embedding tensor (must implement IINT8Unpackable)
-                 * @param d_model    Embedding dimension
-                 * @param target_device Target GPU device
-                 * @param vocab_offset Global vocab index of this shard's first row (0 = unsharded)
-                 * @param total_vocab  Total vocab size across all shards (0 = use tensor->rows())
-                 * @return Handle to prepared GPU-resident data, or nullptr on failure
-                 */
-                static const llaminar2::PreparedEmbeddingHandle *getOrCreatePreparedEmbeddingWeights(
-                    const llaminar2::TensorBase *tensor,
-                    int d_model,
-                    llaminar2::DeviceId target_device,
-                    size_t vocab_offset = 0,
-                    size_t total_vocab = 0);
-
-                /**
-                 * @brief Look up already-prepared embedding weights (no creation)
-                 *
-                 * Returns nullptr if no prepared entry exists for this tensor/device.
-                 * Used by embedding kernels during execution to find their GPU data.
-                 */
-                static const llaminar2::PreparedEmbeddingHandle *getPreparedEmbeddingWeights(
-                    const llaminar2::TensorBase *tensor,
-                    llaminar2::DeviceId target_device);
-
-                /**
-                 * @brief Number of prepared embedding registry entries
-                 */
-                static size_t preparedEmbeddingRegistrySize();
-
             private:
                 KernelFactory() = delete; // Static-only class
 
-                struct PreparedGemmKey
-                {
-                    const llaminar2::TensorBase *tensor{nullptr};
-                    llaminar2::DeviceId device_id;
-                    int prep_kind{0};
-
-                    bool operator==(const PreparedGemmKey &other) const
-                    {
-                        return tensor == other.tensor &&
-                               device_id == other.device_id &&
-                               prep_kind == other.prep_kind;
-                    }
-                };
-
-                struct PreparedGemmKeyHash
-                {
-                    size_t operator()(const PreparedGemmKey &k) const
-                    {
-                        return std::hash<const void *>()(k.tensor) ^
-                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 1) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 2) ^
-                               (std::hash<int>()(k.prep_kind) << 3);
-                    }
-                };
-
                 static std::mutex cache_mutex_;
-
-                // Sliced GEMM cache - keyed by (tensor, row_start, row_end)
-                struct SlicedCacheKey
-                {
-                    const llaminar2::TensorBase *tensor;
-                    size_t row_start;
-                    size_t row_end;
-
-                    bool operator==(const SlicedCacheKey &other) const
-                    {
-                        return tensor == other.tensor &&
-                               row_start == other.row_start &&
-                               row_end == other.row_end;
-                    }
-                };
-
-                struct SlicedKeyHash
-                {
-                    size_t operator()(const SlicedCacheKey &k) const
-                    {
-                        return std::hash<const void *>()(k.tensor) ^
-                               (std::hash<size_t>()(k.row_start) << 1) ^
-                               (std::hash<size_t>()(k.row_end) << 2);
-                    }
-                };
-
-                static std::unordered_map<SlicedCacheKey, std::unique_ptr<llaminar2::ITensorGemm>, SlicedKeyHash> sliced_cache_;
-
-                // Fused QKV GEMM cache - keyed by prepared-handle identity + device
-                // This keeps fused cache identity aligned with prepared GEMM state
-                // instead of raw tensor pointer tuples.
-                struct FusedQKVCacheKey
-                {
-                    const PreparedGemmHandle *wq_handle{nullptr};
-                    const PreparedGemmHandle *wk_handle{nullptr};
-                    const PreparedGemmHandle *wv_handle{nullptr};
-                    llaminar2::DeviceId device_id{};
-
-                    bool operator==(const FusedQKVCacheKey &other) const
-                    {
-                        return wq_handle == other.wq_handle &&
-                               wk_handle == other.wk_handle &&
-                               wv_handle == other.wv_handle &&
-                               device_id == other.device_id;
-                    }
-                };
-
-                struct FusedQKVKeyHash
-                {
-                    size_t operator()(const FusedQKVCacheKey &k) const
-                    {
-                        return std::hash<const void *>()(k.wq_handle) ^
-                               (std::hash<const void *>()(k.wk_handle) << 1) ^
-                               (std::hash<const void *>()(k.wv_handle) << 2) ^
-                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 3) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 8);
-                    }
-                };
-
-                static std::unordered_map<FusedQKVCacheKey, std::unique_ptr<llaminar2::ITensorFusedQKVGemm>, FusedQKVKeyHash> fused_qkv_cache_;
 
                 // Fused Gate/Up GEMM cache - keyed by prepared-handle identity + device
                 struct FusedGateUpCacheKey
@@ -1881,39 +1587,30 @@ namespace llaminar
                 static std::unordered_map<AttentionCacheKey, std::unique_ptr<llaminar2::ITensorAttention>, AttentionCacheKeyHash> attention_cache_;
                 static std::unordered_map<EmbeddingCacheKey, std::unique_ptr<llaminar2::ITensorEmbedding>, EmbeddingCacheKeyHash> embedding_cache_;
 
+                // MoE kernel cache — keyed by DeviceId (always FP32, no tensor type variant)
+                struct MoECacheKey
+                {
+                    llaminar2::DeviceId device_id;
+                    bool operator==(const MoECacheKey &other) const
+                    {
+                        return device_id == other.device_id;
+                    }
+                };
+                struct MoECacheKeyHash
+                {
+                    size_t operator()(const MoECacheKey &k) const
+                    {
+                        return std::hash<int>()(static_cast<int>(k.device_id.type)) ^
+                               (std::hash<int>()(k.device_id.ordinal) << 1);
+                    }
+                };
+                static std::unordered_map<MoECacheKey, std::unique_ptr<llaminar2::IMoEKernel>, MoECacheKeyHash> moe_cache_;
+
                 // Generic device-scoped non-GEMM registry
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<void>, DeviceKernelKeyHash> device_kernel_registry_;
 
-                // Prepared-weight and device-scoped GEMM engine registries
-                static std::unordered_map<PreparedGemmKey, std::shared_ptr<PreparedGemmHandle>, PreparedGemmKeyHash> prepared_gemm_registry_;
+                // Device-scoped GEMM engine registry
                 static std::unordered_map<DeviceKernelKey, std::shared_ptr<IGemmEngine>, DeviceKernelKeyHash> device_gemm_engine_registry_;
-
-                // Prepared embedding registry — keyed by (tensor pointer, device)
-                struct PreparedEmbeddingKey
-                {
-                    const llaminar2::TensorBase *tensor{nullptr};
-                    llaminar2::DeviceId device_id;
-
-                    bool operator==(const PreparedEmbeddingKey &other) const
-                    {
-                        return tensor == other.tensor && device_id == other.device_id;
-                    }
-                };
-
-                struct PreparedEmbeddingKeyHash
-                {
-                    size_t operator()(const PreparedEmbeddingKey &k) const
-                    {
-                        return std::hash<const void *>()(k.tensor) ^
-                               (std::hash<int>()(static_cast<int>(k.device_id.type)) << 1) ^
-                               (std::hash<int>()(k.device_id.ordinal) << 2);
-                    }
-                };
-
-                static std::unordered_map<PreparedEmbeddingKey,
-                                          std::shared_ptr<llaminar2::PreparedEmbeddingHandle>,
-                                          PreparedEmbeddingKeyHash>
-                    prepared_embedding_registry_;
 
                 // NOTE: Universal device kernel caching (hipBLAS, cuBLAS handles, etc.)
                 // has moved to DeviceKernelCache. See kernels/DeviceKernelCache.h

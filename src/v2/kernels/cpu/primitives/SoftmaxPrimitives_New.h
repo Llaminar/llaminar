@@ -1,5 +1,5 @@
 /**
- * @file SoftmaxPrimitives.h
+ * @file SoftmaxPrimitives_New.h
  * @brief Multi-precision Softmax primitives with separated SIMD variants
  * @author David Sanftenberg
  *

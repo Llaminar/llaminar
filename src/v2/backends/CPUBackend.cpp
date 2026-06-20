@@ -355,6 +355,11 @@ namespace llaminar2
         return reinterpret_cast<void *>(&dummy_event);
     }
 
+    void *CPUBackend::createTimingEvent(int device_id)
+    {
+        return createEvent(device_id);
+    }
+
     void CPUBackend::destroyEvent(void *event, int device_id)
     {
         // No-op for CPU - nothing to destroy
@@ -382,6 +387,22 @@ namespace llaminar2
         }
 
         // No-op for CPU - always synchronous
+        return true;
+    }
+
+    bool CPUBackend::eventElapsedTimeMs(
+        void *start_event,
+        void *stop_event,
+        int device_id,
+        float *out_ms)
+    {
+        if (!start_event || !stop_event || !out_ms ||
+            !isValidDeviceId(device_id))
+        {
+            return false;
+        }
+
+        *out_ms = 0.0f;
         return true;
     }
 

@@ -47,12 +47,16 @@ namespace llaminar2
          * @param comm MPI communicator (default: MPI_COMM_WORLD)
          */
         MPIContext(int rank, int world_size, MPI_Comm comm = MPI_COMM_WORLD)
-            : rank_(rank), world_size_(world_size), comm_(comm) {}
+            : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(rank) {}
+
+        MPIContext(int rank, int world_size, int local_rank, MPI_Comm comm)
+            : rank_(rank), world_size_(world_size), comm_(comm), local_rank_(local_rank) {}
 
         // Accessors (IMPIContext overrides)
         int rank() const override { return rank_; }
         int world_size() const override { return world_size_; }
         bool is_root() const override { return rank_ == 0; }
+        int local_rank() const override { return local_rank_; }
         MPI_Comm communicator() const override { return comm_; }
         MPI_Comm comm() const { return comm_; }
 
@@ -62,9 +66,19 @@ namespace llaminar2
          * Lazily initializes the topology on first access. The topology
          * provides device inventory and placement strategy computation.
          *
-         * @return Reference to the MPITopology instance
+         * @return Pointer to the IMPITopology instance (never null for real contexts)
          */
-        const MPITopology &topology() const;
+        const IMPITopology *topology() const override;
+
+        /**
+         * @brief Get the concrete MPITopology (non-virtual, for callers that need MPITopology-specific APIs)
+         */
+        const MPITopology &concrete_topology() const;
+
+        /**
+         * @brief Get communicator for ranks on the same physical node
+         */
+        MPI_Comm intra_node_comm() const override;
 
         /**
          * @brief All-reduce sum operation
@@ -661,6 +675,7 @@ namespace llaminar2
         int rank_;
         int world_size_;
         MPI_Comm comm_;
+        int local_rank_;
         mutable std::unique_ptr<MPITopology> topology_; ///< Lazily initialized topology
     };
 
@@ -683,7 +698,17 @@ namespace llaminar2
                 int rank, world_size;
                 MPI_Comm_rank(MPI_COMM_WORLD, &rank);
                 MPI_Comm_size(MPI_COMM_WORLD, &world_size);
-                instance = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+
+                // Compute node-local rank via shared-memory communicator
+                int local_rank = rank; // fallback for single-node
+                MPI_Comm local_comm = MPI_COMM_NULL;
+                if (MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED,
+                                        rank, MPI_INFO_NULL, &local_comm) == MPI_SUCCESS)
+                {
+                    MPI_Comm_rank(local_comm, &local_rank);
+                    MPI_Comm_free(&local_comm);
+                }
+                instance = std::make_shared<MPIContext>(rank, world_size, local_rank, MPI_COMM_WORLD);
             }
             return instance;
         }
@@ -708,12 +733,26 @@ namespace llaminar2
 
 namespace llaminar2
 {
-    inline const MPITopology &MPIContext::topology() const
+    inline const IMPITopology *MPIContext::topology() const
+    {
+        if (!topology_)
+        {
+            topology_ = std::make_unique<MPITopology>(comm_);
+        }
+        return topology_.get();
+    }
+
+    inline const MPITopology &MPIContext::concrete_topology() const
     {
         if (!topology_)
         {
             topology_ = std::make_unique<MPITopology>(comm_);
         }
         return *topology_;
+    }
+
+    inline MPI_Comm MPIContext::intra_node_comm() const
+    {
+        return concrete_topology().intra_node_comm();
     }
 } // namespace llaminar2

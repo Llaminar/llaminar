@@ -8,7 +8,6 @@
  *
  * Individual stages can also be included directly from stages/ subfolder:
  *   #include "execution/compute_stages/stages/GEMMStage.h"
- *   #include "execution/compute_stages/stages/AttentionWithKVCacheStage.h"
  */
 
 #pragma once
@@ -26,7 +25,6 @@
 #include "stages/RoPEStage.h"
 
 // Attention stages
-#include "stages/AttentionWithKVCacheStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
 #include "stages/AttentionComputeStage.h"
@@ -36,6 +34,8 @@
 
 // Model-level stages
 #include "stages/EmbeddingStage.h"
+#include "stages/HiddenStateRowSelectStage.h"
+#include "stages/HiddenStateRowsSelectStage.h"
 #include "stages/LMHeadStage.h"
 
 // MPI communication stages
@@ -43,10 +43,17 @@
 #include "stages/AllGatherStage.h"
 
 // MoE stages
-#include "stages/MoEStages.h"
+#include "stages/MoEExpertDispatchStage.h"
+#include "stages/MoEExpertParallelReduceStage.h"
+#include "stages/MoELocalExpertStage.h"
+#include "stages/MoESparseDispatchStage.h"
+#include "stages/MoESparseReturnReduceStage.h"
 
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"
+
+// MTP sidecar stages
+#include "stages/MTPConcatStage.h"
 
 // Factory
 #include "ComputeStageFactory.h"

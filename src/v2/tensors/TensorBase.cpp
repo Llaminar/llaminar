@@ -16,7 +16,6 @@
 #include "../backends/BackendManager.h"
 #include "../backends/ComputeBackend.h"
 #include "../backends/DeviceId.h"
-#include "../kernels/KernelFactory.h"
 #include "../collective/BackendRouter.h"
 #include "../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../transfer/TransferEngine.h"
@@ -174,7 +173,15 @@ namespace llaminar2
         }
         secondary_device_buffers_.clear();
 
-        // Free GPU memory if allocated (before unpinning host memory)
+        // Unpin host memory BEFORE freeing GPU memory.
+        // When a non-blocking stream was used for H2D transfer (e.g., via
+        // GPUDeviceContextPool's default stream in resolveStream()), calling
+        // cudaHostUnregister AFTER cudaFree can corrupt the CUDA driver's
+        // internal pinned-memory bookkeeping, leading to silent data corruption
+        // in subsequent GPU allocations and kernel launches.
+        unpinHostMemory();
+
+        // Free GPU memory if allocated
         if (gpu_data_ptr_ && gpu_device_.has_value())
         {
             IBackend *backend = resolveBackend(*gpu_device_);
@@ -195,11 +202,15 @@ namespace llaminar2
             applyCoherenceOp_(CoherenceOp::RELEASE_DEVICE); // GPU memory freed
         }
 
-        // Unpin host memory if pinned (after freeing GPU memory)
-        unpinHostMemory();
-
-        // Clear kernel cache
-        llaminar::v2::kernels::KernelFactory::clearCacheFor(this);
+        // Phase 10: TensorBase destructor NEVER touches global KernelFactory state.
+        // Cleanup of KernelFactory registries is the exclusive responsibility of
+        // PreparedWeightStore::releaseAllPreparedState() (called during orchestrator
+        // shutdown). Only clear local packed-weights cache here.
+        if (cache_.has_value())
+        {
+            std::lock_guard<std::mutex> lock(packed_cache_mutex_);
+            cache_.reset();
+        }
     }
 
     // ===== Zero-Copy Mapped Memory Implementation =====
@@ -959,7 +970,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TensorBase::allocateOnDevice] ZERO-COPY: Tensor is mapped, no allocation needed");
+                LOG_DEBUG("[TensorBase::allocateOnDevice] ZERO-COPY: Tensor is mapped, no allocation needed");
             }
             return true;
         }
@@ -974,7 +985,7 @@ namespace llaminar2
             // a subsequent prepareForRead sees the reset state before markWritten runs.
             if (trace)
             {
-                LOG_INFO("[TensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());
+                LOG_DEBUG("[TensorBase::allocateOnDevice] Reusing existing allocation on " << target_device.toString());
             }
             return true;
         }
@@ -1018,8 +1029,8 @@ namespace llaminar2
 
                 if (trace)
                 {
-                    LOG_INFO("[TensorBase::allocateOnDevice] Promoted secondary buffer to primary for "
-                             << target_device.toString() << " ptr=" << promoted_ptr);
+                    LOG_DEBUG("[TensorBase::allocateOnDevice] Promoted secondary buffer to primary for "
+                              << target_device.toString() << " ptr=" << promoted_ptr);
                 }
                 return true;
             }
@@ -1050,7 +1061,7 @@ namespace llaminar2
 
             if (trace)
             {
-                LOG_INFO("[TensorBase::allocateOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
+                LOG_DEBUG("[TensorBase::allocateOnDevice] backend->allocate(" << bytes << " bytes) took " << alloc_us << " us");
             }
 
             if (!gpu_data_ptr_)
@@ -1117,6 +1128,15 @@ namespace llaminar2
         }
 
         // --- GPU event recording ---
+        // During graph capture, cudaEventRecord/hipEventRecord on the captured stream
+        // creates a graph node rather than a real synchronizable event. If we recorded
+        // here, the event would be invalid for later cudaEventSynchronize calls, causing
+        // "invalid argument" errors when TransferEngine tries to sync before D2H.
+        // Skip event recording entirely during capture — graph replay already ensures
+        // execution order, and the executor syncs the stream after replay.
+        if (isGraphCaptureActive())
+            return;
+
         if (!gpu_device_.has_value())
             return;
 
@@ -1546,54 +1566,6 @@ namespace llaminar2
         }
 
         return summary;
-    }
-
-    // ========================================================================
-    // hasCachedDeviceData - Check for kernel-cached device representations
-    // ========================================================================
-
-    bool TensorBase::hasCachedDeviceData(DeviceType device_type) const
-    {
-        // Check if we have cached packed weights for the given device type
-        // These caches are populated by KernelFactory when creating GEMM kernels
-        // and contain converted/packed weight data that's already on device.
-
-        if (device_type == DeviceType::CUDA)
-        {
-#ifdef HAVE_CUDA
-            if (cuda_cache_.has_value())
-            {
-                // The cache contains TensorCUDAPackedWeightsCache* which wraps CUDAPackedWeights
-                // We can't include the header here, but we know if cuda_cache_ has a value,
-                // the packing was done. Check if uploaded by examining the value.
-                try
-                {
-                    // Use the packed weights header type to check upload status
-                    // This relies on KernelFactory storing the cache in a known format
-                    // For now, if cuda_cache_ has value, assume it's been packed
-                    // The actual upload status is tracked in CUDAPackedWeights::uploaded
-                    return true; // Cache exists = packed weights ready
-                }
-                catch (...)
-                {
-                    return false;
-                }
-            }
-#endif
-            return false;
-        }
-        else if (device_type == DeviceType::ROCm)
-        {
-#ifdef HAVE_ROCM
-            if (rocm_cache_.has_value())
-            {
-                return true; // Cache exists = packed weights ready
-            }
-#endif
-            return false;
-        }
-
-        return false; // CPU doesn't use device caching
     }
 
     // =========================================================================

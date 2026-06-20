@@ -382,7 +382,8 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLGraphPolicy_GraphsWithSegmentedCollecti
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 
 /**
- * @test AUTO backend with mixed GPU types (1 CUDA + 1 ROCm) selects HETEROGENEOUS
+ * @test AUTO backend with mixed GPU types (1 CUDA + 1 ROCm) selects HOST
+ *       (host-staged cross-vendor transfer for the 1+1 case)
  */
 TEST_F(Test__LocalTPBackendBehavior, AutoBackend_MixedGPUs_SelectsHeterogeneous)
 {
@@ -394,8 +395,8 @@ TEST_F(Test__LocalTPBackendBehavior, AutoBackend_MixedGPUs_SelectsHeterogeneous)
 
     auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::AUTO);
     ASSERT_NE(ctx, nullptr);
-    EXPECT_EQ(ctx->backend(), CollectiveBackendType::HETEROGENEOUS)
-        << "AUTO backend should select HETEROGENEOUS for 1+1 mixed GPU configuration";
+    EXPECT_EQ(ctx->backend(), CollectiveBackendType::HOST)
+        << "AUTO backend should select HOST for 1+1 mixed GPU configuration (host-staged cross-vendor)";
 }
 
 /**

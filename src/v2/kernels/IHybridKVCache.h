@@ -15,11 +15,34 @@
 
 #pragma once
 
+#include <cstddef>
+
 namespace llaminar2
 {
     class ITensorShortConvolution;
     class ITensorGatedDeltaNet;
     struct HybridGDNLayerState;
+
+    struct HybridPrefixStateMetadata
+    {
+        int total_layers = 0;
+        int gdn_layers = 0;
+        size_t host_bytes = 0;
+        size_t device_bytes = 0;
+        bool has_device_kernel_state = false;
+    };
+
+    struct HybridPrefixStateDescriptor
+    {
+        int seq_idx = 0;
+        int logical_token_count = 0;
+        void *stream = nullptr;
+        // Prefix-cache persistence needs completed payloads on return; live rollback
+        // checkpoints can use stream ordering and avoid a host-side sync.
+        bool synchronize = true;
+        bool include_host_state = true;
+        bool include_device_state = true;
+    };
 
     /**
      * @brief Extended KV cache interface with GDN state management
@@ -83,6 +106,22 @@ namespace llaminar2
 
         /// Total GDN state memory in bytes
         virtual size_t gdnMemoryBytes() const = 0;
+
+        // =====================================================================
+        // Prefix/Rollback State
+        // =====================================================================
+
+        virtual HybridPrefixStateMetadata hybridPrefixStateMetadata() const = 0;
+
+        virtual bool exportHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            void *dst_host,
+            void *dst_device) const = 0;
+
+        virtual bool importHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            const void *src_host,
+            const void *src_device) = 0;
     };
 
 } // namespace llaminar2

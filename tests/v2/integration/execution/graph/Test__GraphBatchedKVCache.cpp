@@ -20,7 +20,7 @@
 
 #include "v2/kernels/cpu/CPURingKVCache.h"
 #include "v2/tensors/Tensors.h"
-#include "v2/models/qwen/Qwen2Graph.h"
+#include "v2/models/qwen/QwenStandardGraph.h"
 #include "v2/backends/DeviceId.h"
 #include "execution/compute_stages/ComputeStages.h"
 #include "v2/loaders/ModelContext.h"

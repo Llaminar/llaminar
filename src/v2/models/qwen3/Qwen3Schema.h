@@ -57,6 +57,13 @@ namespace llaminar2
             return params;
         }
 
+        std::string getStopThinkingPrompt() const override
+        {
+            // Qwen3 uses the same thinking format as Qwen3.5
+            return "Considering the limited time by the user, I have to give the "
+                   "solution based on the thinking directly now.\n</think>\n\n";
+        }
+
         /**
          * @brief Get weight sharding configuration for Qwen3 tensor parallelism
          *
@@ -230,6 +237,8 @@ namespace llaminar2
                 {"attn_proj", {"seq_len", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Wo projection output"},
                 {"gate", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Gate projection for SwiGLU"},
                 {"up", {"seq_len", "local_d_ff"}, "fp32", BufferSemantic::Scratch, "ffn_scratch", 10, "Up projection for SwiGLU"},
+                {"lm_head_input_row", {"1", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Stable selected hidden row for bucketed prefill LM head"},
+                {"lm_head_input_rows", {"mtp_target_query_rows", "d_model"}, "fp32", BufferSemantic::Scratch, "", 0, "Compact verifier hidden rows for row-indexed LM head"},
             };
 
             schema.model_buffers = {

@@ -212,6 +212,25 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) = 0;
+
+        // =========================================================================
+        // Abort (for failure propagation)
+        // =========================================================================
+
+        /**
+         * @brief Request cancellation/abort of pending collectives.
+         *
+         * LOCAL TP implementations can abort NCCL/RCCL communicators. GLOBAL or
+         * MPI-backed contexts may terminate the MPI job to avoid rank
+         * desynchronization. The default is a no-op for single-participant or
+         * test-only contexts.
+         */
+        virtual void requestAbort() {}
+
+        /**
+         * @brief Check whether this context has been aborted/canceled.
+         */
+        virtual bool isAbortRequested() const { return false; }
     };
 
 } // namespace llaminar2

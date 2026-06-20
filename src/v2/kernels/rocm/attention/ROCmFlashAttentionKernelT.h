@@ -402,8 +402,44 @@ namespace llaminar2
                 int local_n_kv_heads = -1,
                 int gqa_n_rep = 0) override;
 
+            /**
+             * @brief Compute compact MTP verifier rows through the GPU small-M decode path.
+             *
+             * This is the graph-stage proof boundary for M=2..4 verifier rows.
+             * It prepares row-local attention parameters for the whole verifier
+             * span, then invokes one small-M attention dispatch.  ROCm currently
+             * preserves serial decode math with row-local flash-decode launches
+             * inside that dispatch; Phase 9.8 still tracks the true grouped
+             * attention kernel as the economics target.
+             */
+            bool compute_verifier_rows_decode_equivalent(
+                const ITensor *Q,
+                const ITensor *K,
+                const ITensor *V,
+                ITensor *output,
+                int verifier_rows,
+                int kv_len,
+                int n_heads,
+                int n_kv_heads,
+                int head_dim,
+                bool causal,
+                int window_size = -1,
+                const IMPIContext *mpi_ctx = nullptr,
+                int device_idx = -1,
+                int head_start = 0,
+                int gqa_n_rep = 0) override;
+
             /// Update device-side attention params for graph-capture replay
             void setDynamicAttnParams(int kv_len, int position_offset) override;
+            void setDynamicAttnParams(int kv_len, int position_offset, int query_rows) override;
+            bool prepareDynamicAttnParams(
+                int kv_len, int position_offset, int query_rows, void *stream) override;
+            bool prepareDynamicAttnParamsFromDeviceSequenceState(
+                const int *post_append_cached_tokens_device,
+                int seq_len,
+                int query_rows,
+                void *stream) override;
+            void resetDynamicState() override;
 
             // =========================================================================
             // IWorkspaceConsumer Interface
@@ -482,9 +518,22 @@ namespace llaminar2
             // Device Context (Phase 4)
             IWorkerGPUContext *device_ctx_ = nullptr;
 
-            /// Pinned host memory for graph-captured H2D copy of attention device params
+            /// Pinned host staging for pre-capture attention-param uploads
             attention::AttentionDeviceParams *h_attn_params_ = nullptr;
+            int h_attn_params_capacity_ = 0;
+            int small_decode_rows_ = 0;
+            int dynamic_attn_kv_len_ = 0;
+            int dynamic_attn_position_offset_ = 0;
+            int dynamic_attn_query_rows_ = 1;
+            int dynamic_attn_param_rows_ = 1;
+            bool dynamic_attn_host_valid_ = false;
+            bool dynamic_attn_device_valid_ = false;
+            bool dynamic_attn_device_derived_ = false;
 
+            bool ensureHostAttnParamsCapacity(int capacity);
+            bool uploadDynamicAttnParams(void *stream);
+            bool dynamicAttnParamsReady(
+                int kv_len, int position_offset, int query_rows) const;
             void allocateWorkspace(int n_heads, int head_dim, int num_splits);
             void freeWorkspace();
         };

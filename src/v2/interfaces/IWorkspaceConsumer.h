@@ -13,7 +13,8 @@
  *
  * 1. **Memory Budgeting**: Centralized allocation allows global VRAM budget control
  * 2. **Hot-Path Efficiency**: No allocations during GEMM execution
- * 3. **Backward Compatibility**: Kernels work in both legacy and managed modes
+ * 3. **Capture Safety**: Capture-sensitive kernels fail loudly when required
+ *    workspace is missing instead of allocating scratch internally
  *
  * ## Usage Pattern
  *
@@ -51,8 +52,8 @@ namespace llaminar2
      * Kernels implementing this interface:
      * 1. Declare workspace requirements via getWorkspaceRequirements()
      * 2. Receive pre-allocated buffers via bindWorkspace()
-     * 3. Use bound workspace instead of internal allocations when available
-     * 4. Fall back to legacy internal buffers when workspace not bound
+     * 3. Use bound workspace instead of internal allocations
+     * 4. Treat missing required workspace as an execution error
      *
      * (Formerly IGpuWorkspaceConsumer)
      */
@@ -93,13 +94,12 @@ namespace llaminar2
         /**
          * @brief Bind a workspace manager to this kernel
          *
-         * After binding, the kernel uses buffers from the workspace manager
-         * instead of its internal ad-hoc allocations. The workspace manager
-         * must have allocated all buffers returned by getWorkspaceRequirements()
-         * for the maximum expected dimensions.
+         * After binding, the kernel uses buffers from the workspace manager.
+         * The workspace manager must have allocated all required buffers returned
+         * by getWorkspaceRequirements() for the maximum expected dimensions.
          *
          * @param workspace Pointer to workspace manager (NOT owned, must outlive kernel)
-         *                  Pass nullptr to unbind and return to legacy mode.
+         *                  Pass nullptr to unbind during allocator rebuilds.
          *
          * @note Thread Safety: This method should only be called during setup,
          *       not during concurrent kernel execution.
@@ -109,8 +109,8 @@ namespace llaminar2
         /**
          * @brief Unbind workspace and return to legacy mode
          *
-         * Equivalent to bindWorkspace(nullptr). Kernel will use internal
-         * buffer management after this call.
+         * Equivalent to bindWorkspace(nullptr). Capture-sensitive kernels should
+         * fail execution while unbound.
          */
         virtual void unbindWorkspace()
         {
@@ -152,6 +152,7 @@ namespace llaminar2
         constexpr const char *QUANT_A = "gemm_quant_a";                       ///< [M × K] INT8 quantized activations
         constexpr const char *SCALES_A = "gemm_scales_a";                     ///< [M] FP32 per-row activation scales (row-wise mode)
         constexpr const char *SCALES_A_BLOCKWISE = "gemm_scales_a_blockwise"; ///< [M × blocks_per_row] FP32 per-block activation scales (blockwise mode)
+        constexpr const char *SUMS_A_BLOCKWISE = "gemm_sums_a_blockwise";     ///< [M × blocks_per_row] INT32 per-block activation sums
         constexpr const char *ACC_INT32 = "gemm_acc_int32";                   ///< [M × N] INT32 accumulator
 
         // FP32 temporary buffers
@@ -170,9 +171,29 @@ namespace llaminar2
 
         // ROCm scatter+reduce partial buffer for fused GEMV
         constexpr const char *ROCM_SCATTER_PARTIAL = "rocm_scatter_partial"; ///< [KB_MAX × N] FP32 scatter partials
+        constexpr const char *ROCM_SCATTER_PARTIAL_BATCHED = "rocm_scatter_partial_batched"; ///< [batch × KB_MAX × N] FP32 scatter partials
+        constexpr const char *ROCM_SELFREDUCE_COUNTERS = "rocm_selfreduce_counters"; ///< [ceil(N/128)] INT32 self-reduce counters
+
+        // ROCm FP32 hipBLAS batched pointer arrays for graph-capturable fused projections
+        constexpr const char *ROCM_FP32_BATCH_A_PTRS = "rocm_fp32_batch_a_ptrs"; ///< [batch] device pointers to A matrices
+        constexpr const char *ROCM_FP32_BATCH_B_PTRS = "rocm_fp32_batch_b_ptrs"; ///< [batch] device pointers to B matrices
+        constexpr const char *ROCM_FP32_BATCH_C_PTRS = "rocm_fp32_batch_c_ptrs"; ///< [batch] device pointers to C matrices
+        constexpr const char *CUDA_FP32_BATCH_A_PTRS = "cuda_fp32_batch_a_ptrs"; ///< [batch] device pointers to A matrices
+        constexpr const char *CUDA_FP32_BATCH_B_PTRS = "cuda_fp32_batch_b_ptrs"; ///< [batch] device pointers to B matrices
+        constexpr const char *CUDA_FP32_BATCH_C_PTRS = "cuda_fp32_batch_c_ptrs"; ///< [batch] device pointers to C matrices
+        constexpr const char *ROCM_FP32_MAPPED_REDIRECT = "rocm_fp32_mapped_redirect"; ///< [M × N] HBM redirect for mapped FP32 outputs
+        constexpr const char *CUDA_FP32_MAPPED_REDIRECT = "cuda_fp32_mapped_redirect"; ///< [batch × M × N] HBM redirect for mapped FP32 outputs
 
         // GEMV kpar partials buffer for CUDA NativeVNNI two-phase reduction
         constexpr const char *GEMV_KPAR_PARTIALS = "gemv_kpar_partials"; ///< [kpar × N] FP32 reduction partials
+        constexpr const char *CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS = "cuda_concurrent_decode_gemv_kpar_partials"; ///< per-side-stream [kpar × M × max_N] FP32 GEMV partials
+
+        // CUDA NativeVNNI prefill scratch. These buffers are intentionally
+        // workspace-owned so split-K and stream-K cannot grow hidden VRAM
+        // allocations behind graph capture / workspace planning.
+        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS = "cuda_native_vnni_prefill_splitk_partials"; ///< serial [split_k × M × N], concurrent [slot × split_k × M × max_N] FP32 partials
+        constexpr const char *CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP = "cuda_native_vnni_prefill_streamk_fixup";       ///< serial [tiles × BM × BN], concurrent [slot × tiles × BM × BN] FP32 stream-K fixup
+        constexpr const char *CUDA_CONCURRENT_PREFILL_ACC_INT32 = "cuda_concurrent_prefill_acc_int32";               ///< per-slot [M × max_N] INT32 accumulator
     }
 
     // =============================================================================

@@ -19,6 +19,7 @@
 #include "RankExecutionPlan.h"
 #include "DeviceInventory.h"
 #include "../../config/OrchestrationConfig.h"
+#include "../../execution/global_pp/GlobalPPTopology.h"
 #include <memory>
 #include <vector>
 #include <map>
@@ -97,6 +98,22 @@ namespace llaminar2
             const OrchestrationConfig &config,
             const ModelConfig &model_config,
             const ClusterInventory &cluster_inventory) override;
+
+        /**
+         * @brief Build a GlobalPPTopology from named-domain PP configuration.
+         *
+         * Converts each PPStageDefinition into a GlobalPPStageSpec, deriving
+         * local vs global scope from DomainDefinition::scope, owner_rank, and
+         * explicit_ranks.  For AUTO-scope domains, single-rank domains become
+         * local stages and multi-rank domains become global TP stages.
+         *
+         * Requires at least one PPStageDefinition in the config; returns a
+         * minimal single-stage topology otherwise.
+         */
+        GlobalPPTopology buildGlobalPPTopology(
+            const OrchestrationConfig &config,
+            const ModelConfig &model_config,
+            const ClusterInventory &cluster_inventory);
 
     private:
         // =====================================================================
@@ -197,5 +214,17 @@ namespace llaminar2
         CollectiveBackendType selectCrossRankBackend(
             const ClusterInventory &cluster_inventory);
     };
+
+    // =========================================================================
+    // Free Functions
+    // =========================================================================
+
+    /**
+     * @brief Render multi-domain topology info for --show-topology output.
+     *
+     * Returns GlobalPPTopology::toTable() followed by a per-rank stage runner
+     * count and domain name summary.
+     */
+    std::string renderMultiDomainTopologyInfo(const GlobalPPTopology &topo, int world_size);
 
 } // namespace llaminar2

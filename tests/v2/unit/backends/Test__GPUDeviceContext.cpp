@@ -22,6 +22,10 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IWorkerGPUContext.h"
 
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#include <hip/hip_runtime.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <future>
@@ -34,24 +38,37 @@ using namespace llaminar2;
 // Skip macros for hardware availability
 // ===========================================================================
 
-#define SKIP_IF_NO_CUDA()                                     \
-    if (!GPUDeviceContextPool::instance().hasNvidiaSupport()) \
-    {                                                         \
-        GTEST_SKIP() << "CUDA not available";                 \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#define SKIP_IF_NO_CUDA()                                      \
+    do                                                         \
+    {                                                          \
+        ensureNvidiaFactoryRegistered();                       \
+        if (!GPUDeviceContextPool::instance().hasNvidiaSupport()) \
+            GTEST_SKIP() << "CUDA not available";              \
+    } while (false)
+#else
+#define SKIP_IF_NO_CUDA() GTEST_SKIP() << "CUDA backend not linked in this test binary"
+#endif
 
-#define SKIP_IF_NO_ROCM()                                  \
-    if (!GPUDeviceContextPool::instance().hasAMDSupport()) \
-    {                                                      \
-        GTEST_SKIP() << "ROCm not available";              \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#define SKIP_IF_NO_ROCM()                                   \
+    do                                                      \
+    {                                                       \
+        ensureAMDFactoryRegistered();                       \
+        if (!GPUDeviceContextPool::instance().hasAMDSupport()) \
+            GTEST_SKIP() << "ROCm not available";           \
+    } while (false)
+#else
+#define SKIP_IF_NO_ROCM() GTEST_SKIP() << "ROCm backend not linked in this test binary"
+#endif
 
-#define SKIP_IF_NO_GPU()                                            \
-    if (!GPUDeviceContextPool::instance().hasNvidiaSupport() &&     \
-        !GPUDeviceContextPool::instance().hasAMDSupport())          \
-    {                                                               \
-        GTEST_SKIP() << "No GPU available (neither CUDA nor ROCm)"; \
-    }
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+#define SKIP_IF_NO_GPU() SKIP_IF_NO_ROCM()
+#elif defined(GPU_CONTEXT_TEST_BACKEND_CUDA)
+#define SKIP_IF_NO_GPU() SKIP_IF_NO_CUDA()
+#else
+#define SKIP_IF_NO_GPU() GTEST_SKIP() << "No GPU backend linked in this test binary"
+#endif
 
 // ===========================================================================
 // GPUDeviceContextPool Tests
@@ -629,6 +646,51 @@ TEST(Test__AMDDeviceContext, StreamCreationAndDestruction)
     ctx.submitAndWait([&]()
                       { ctx.destroyStream(stream); });
 }
+
+#if defined(GPU_CONTEXT_TEST_BACKEND_ROCM)
+TEST(Test__AMDDeviceContext, StreamCreationUsesContextDeviceWhenCallerDeviceDiffers)
+{
+    SKIP_IF_NO_ROCM();
+
+    auto &pool = GPUDeviceContextPool::instance();
+    if (pool.amdDeviceCount() < 2)
+    {
+        GTEST_SKIP() << "requires at least two ROCm devices";
+    }
+
+    int original_device = 0;
+    (void)hipGetDevice(&original_device);
+
+    auto &ctx = pool.getAMDContext(0);
+
+    ASSERT_EQ(hipSetDevice(1), hipSuccess);
+    void *stream = ctx.createStream();
+    ASSERT_NE(stream, nullptr) << "createStream() should return non-null";
+
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    int *device_word = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_word), sizeof(int)), hipSuccess);
+
+    hipError_t memset_err = hipMemsetAsync(
+        device_word,
+        0,
+        sizeof(int),
+        static_cast<hipStream_t>(stream));
+    EXPECT_EQ(memset_err, hipSuccess) << hipGetErrorString(memset_err);
+    if (memset_err == hipSuccess)
+    {
+        EXPECT_EQ(hipStreamSynchronize(static_cast<hipStream_t>(stream)), hipSuccess);
+    }
+
+    ASSERT_EQ(hipFree(device_word), hipSuccess);
+    ctx.destroyStream(stream);
+
+    if (original_device >= 0)
+    {
+        (void)hipSetDevice(original_device);
+    }
+}
+#endif
 
 TEST(Test__AMDDeviceContext, MultipleStreams)
 {

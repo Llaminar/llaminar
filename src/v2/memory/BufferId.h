@@ -27,6 +27,8 @@ namespace llaminar2
         HIDDEN_STATE, ///< Main hidden state [batch, d_model]
         LOGITS,       ///< Final logits [batch, vocab_size]
         LOGITS_LOCAL, ///< Column-parallel partial logits (TP)
+        ALL_POSITION_LOGITS,       ///< Verifier logits for every row [seq_len, vocab_size]
+        ALL_POSITION_LOGITS_LOCAL, ///< Column-parallel verifier logits [seq_len, local_vocab]
 
         // ── Per-layer activation buffers (recycled across layers) ───────────
         NORMALIZED,  ///< RMSNorm output
@@ -47,6 +49,8 @@ namespace llaminar2
         ATTN_SCORES_WORKSPACE,  ///< Attention score scratch
         ATTN_CONTEXT_WORKSPACE, ///< Attention context scratch
         GEMM_WORKSPACE,         ///< GEMM temporary storage
+        LM_HEAD_INPUT_ROW,      ///< Stable [1, d_model] scratch row feeding LM head in bucketed prefill
+        LM_HEAD_INPUT_ROWS,     ///< Stable [mtp_target_query_rows, d_model] compact verifier rows feeding LM head
 
         // ── Collective staging buffers ──────────────────────────────────────
         ALLREDUCE_STAGING, ///< Staging buffer for allreduce
@@ -66,6 +70,9 @@ namespace llaminar2
         MOE_EXPERT_OUTPUT,        ///< Scratch for per-expert FFN output
         MOE_COMBINED_OUTPUT,      ///< Final combined expert output
         MOE_SHARED_EXPERT_OUTPUT, ///< Shared expert FFN output
+        MOE_SHARED_GATE_OUTPUT,   ///< Shared expert after sigmoid gating
+        MOE_GATE_SCRATCH,         ///< Expert gate projection scratch [seq, intermediate]
+        MOE_UP_SCRATCH,           ///< Expert up projection scratch [seq, intermediate]
 
         // ── GDN (Gated Delta Network) buffers ───────────────────────────
         ATTN_OUTPUT_GATE,   ///< Sigmoid gate weight for attention output [batch, d_model]
@@ -78,6 +85,61 @@ namespace llaminar2
         GDN_BETA,           ///< GDN beta projection [seq_len, n_heads]
         FA_GATE,            ///< FA sigmoid gate (extracted from Q projection) [seq_len, n_heads * d_head]
         FA_Q_RAW,           ///< FA raw Q GEMM output (query+gate interleaved) [seq_len, n_heads * d_head * 2]
+
+        // ── Sampling scratch buffers ────────────────────────────────────────
+        ARGMAX_PARTIAL_VALS, ///< Per-block partial max values for two-pass GPU argmax [1, kArgmaxPartials]
+        ARGMAX_PARTIAL_IDXS, ///< Per-block partial max indices for two-pass GPU argmax [1, kArgmaxPartials]
+        STOCHASTIC_TARGET_TOKEN_IDS, ///< Compact verifier/main distribution token ids [4, 256]
+        STOCHASTIC_TARGET_PROBS,     ///< Compact verifier/main distribution probabilities [4, 256]
+        STOCHASTIC_DRAFT_TOKEN_IDS,  ///< Compact MTP draft distribution token ids [3, 256]
+        STOCHASTIC_DRAFT_PROBS,      ///< Compact MTP draft distribution probabilities [3, 256]
+        STOCHASTIC_PROCESSED_LOGITS, ///< Full-vocab processed-logit staging rows [4, vocab]
+        STOCHASTIC_INVERSE_REJECTION_SAMPLES, ///< vLLM inverse-exp samples [3, vocab]
+        STOCHASTIC_TARGET_SAMPLE_TOKENS, ///< Device-resident sampled main/verifier target tokens [1, 4]
+        STOCHASTIC_DRAFT_SAMPLE_TOKENS, ///< Device-resident sampled MTP draft tokens [1, 3]
+        STOCHASTIC_DRAFT_SAMPLE_PROBS,  ///< Device-resident sampled MTP draft probabilities [1, 3]
+        STOCHASTIC_TOPK_PARTIAL_VALS, ///< Target/verifier per-block stochastic top-k partial values [blocks, 32]
+        STOCHASTIC_TOPK_PARTIAL_IDXS, ///< Target/verifier per-block stochastic top-k partial indices [blocks, 32]
+        STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS, ///< MTP-draft per-block stochastic top-k partial values [blocks, 32]
+        STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS, ///< MTP-draft per-block stochastic top-k partial indices [blocks, 32]
+        STOCHASTIC_VERIFY_TOKENS,    ///< Scalar stochastic verifier output tokens [1, 4]
+        STOCHASTIC_VERIFY_ACCEPTED,  ///< Scalar stochastic verifier accept flags [1, 4]
+        STOCHASTIC_VERIFY_ACCEPT_PROBS, ///< Scalar stochastic verifier accept probabilities [1, 4]
+        STOCHASTIC_VERIFY_THRESHOLDS,   ///< Scalar stochastic verifier thresholds [1, 4]
+        STOCHASTIC_BATCH_OUTPUT_TOKENS, ///< Reduced stochastic verifier output tokens [request, 5]
+        STOCHASTIC_BATCH_OUTPUT_META,   ///< Reduced stochastic verifier metadata [request, 10]
+
+        // ── Prefix cache restore/harvest staging ───────────────────────────
+        PREFIX_K_STAGING,
+        PREFIX_V_STAGING,
+        PREFIX_HYBRID_STATE_STAGING,
+        PREFIX_MTP_K_STAGING,
+        PREFIX_MTP_V_STAGING,
+        PREFIX_TERMINAL_HIDDEN,
+        PREFIX_TERMINAL_LOGITS,
+
+        // ── MTP sidecar graph buffers ───────────────────────────────────────
+        MTP_EMBEDDING,
+        MTP_NORM_HIDDEN,
+        MTP_NORM_EMBEDDING,
+        MTP_CONCAT,
+        MTP_PROJECTED,
+        MTP_HIDDEN,
+        MTP_Q_PROJ,
+        MTP_K_PROJ,
+        MTP_V_PROJ,
+        MTP_FA_Q_RAW,
+        MTP_FA_GATE,
+        MTP_Q_ROPE,
+        MTP_K_ROPE,
+        MTP_ATTN_OUTPUT,
+        MTP_ATTN_PROJ,
+        MTP_GATE_PROJ,
+        MTP_UP_PROJ,
+        MTP_FFN_OUTPUT,
+        MTP_LOGITS,
+        MTP_CONDITION_TOKEN, ///< Arena-owned INT32 condition-token rows for device-resident MTP sidecar input
+        MTP_VERIFIER_INPUT_TOKENS, ///< Arena-owned INT32 verifier token row fed directly to GPU embedding
 
         _COUNT ///< Sentinel – must be last
     };
@@ -95,6 +157,10 @@ namespace llaminar2
             return "LOGITS";
         case BufferId::LOGITS_LOCAL:
             return "LOGITS_LOCAL";
+        case BufferId::ALL_POSITION_LOGITS:
+            return "ALL_POSITION_LOGITS";
+        case BufferId::ALL_POSITION_LOGITS_LOCAL:
+            return "ALL_POSITION_LOGITS_LOCAL";
         case BufferId::NORMALIZED:
             return "NORMALIZED";
         case BufferId::RESIDUAL:
@@ -127,6 +193,10 @@ namespace llaminar2
             return "ATTN_CONTEXT_WORKSPACE";
         case BufferId::GEMM_WORKSPACE:
             return "GEMM_WORKSPACE";
+        case BufferId::LM_HEAD_INPUT_ROW:
+            return "LM_HEAD_INPUT_ROW";
+        case BufferId::LM_HEAD_INPUT_ROWS:
+            return "LM_HEAD_INPUT_ROWS";
         case BufferId::ALLREDUCE_STAGING:
             return "ALLREDUCE_STAGING";
         case BufferId::ALLGATHER_STAGING:
@@ -149,6 +219,110 @@ namespace llaminar2
             return "MOE_COMBINED_OUTPUT";
         case BufferId::MOE_SHARED_EXPERT_OUTPUT:
             return "MOE_SHARED_EXPERT_OUTPUT";
+        case BufferId::MOE_SHARED_GATE_OUTPUT:
+            return "MOE_SHARED_GATE_OUTPUT";
+        case BufferId::ARGMAX_PARTIAL_VALS:
+            return "ARGMAX_PARTIAL_VALS";
+        case BufferId::ARGMAX_PARTIAL_IDXS:
+            return "ARGMAX_PARTIAL_IDXS";
+        case BufferId::STOCHASTIC_TARGET_TOKEN_IDS:
+            return "STOCHASTIC_TARGET_TOKEN_IDS";
+        case BufferId::STOCHASTIC_TARGET_PROBS:
+            return "STOCHASTIC_TARGET_PROBS";
+        case BufferId::STOCHASTIC_DRAFT_TOKEN_IDS:
+            return "STOCHASTIC_DRAFT_TOKEN_IDS";
+        case BufferId::STOCHASTIC_DRAFT_PROBS:
+            return "STOCHASTIC_DRAFT_PROBS";
+        case BufferId::STOCHASTIC_PROCESSED_LOGITS:
+            return "STOCHASTIC_PROCESSED_LOGITS";
+        case BufferId::STOCHASTIC_INVERSE_REJECTION_SAMPLES:
+            return "STOCHASTIC_INVERSE_REJECTION_SAMPLES";
+        case BufferId::STOCHASTIC_TARGET_SAMPLE_TOKENS:
+            return "STOCHASTIC_TARGET_SAMPLE_TOKENS";
+        case BufferId::STOCHASTIC_DRAFT_SAMPLE_TOKENS:
+            return "STOCHASTIC_DRAFT_SAMPLE_TOKENS";
+        case BufferId::STOCHASTIC_DRAFT_SAMPLE_PROBS:
+            return "STOCHASTIC_DRAFT_SAMPLE_PROBS";
+        case BufferId::STOCHASTIC_TOPK_PARTIAL_VALS:
+            return "STOCHASTIC_TOPK_PARTIAL_VALS";
+        case BufferId::STOCHASTIC_TOPK_PARTIAL_IDXS:
+            return "STOCHASTIC_TOPK_PARTIAL_IDXS";
+        case BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS:
+            return "STOCHASTIC_DRAFT_TOPK_PARTIAL_VALS";
+        case BufferId::STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS:
+            return "STOCHASTIC_DRAFT_TOPK_PARTIAL_IDXS";
+        case BufferId::STOCHASTIC_VERIFY_TOKENS:
+            return "STOCHASTIC_VERIFY_TOKENS";
+        case BufferId::STOCHASTIC_VERIFY_ACCEPTED:
+            return "STOCHASTIC_VERIFY_ACCEPTED";
+        case BufferId::STOCHASTIC_VERIFY_ACCEPT_PROBS:
+            return "STOCHASTIC_VERIFY_ACCEPT_PROBS";
+        case BufferId::STOCHASTIC_VERIFY_THRESHOLDS:
+            return "STOCHASTIC_VERIFY_THRESHOLDS";
+        case BufferId::STOCHASTIC_BATCH_OUTPUT_TOKENS:
+            return "STOCHASTIC_BATCH_OUTPUT_TOKENS";
+        case BufferId::STOCHASTIC_BATCH_OUTPUT_META:
+            return "STOCHASTIC_BATCH_OUTPUT_META";
+        case BufferId::PREFIX_K_STAGING:
+            return "PREFIX_K_STAGING";
+        case BufferId::PREFIX_V_STAGING:
+            return "PREFIX_V_STAGING";
+        case BufferId::PREFIX_HYBRID_STATE_STAGING:
+            return "PREFIX_HYBRID_STATE_STAGING";
+        case BufferId::PREFIX_MTP_K_STAGING:
+            return "PREFIX_MTP_K_STAGING";
+        case BufferId::PREFIX_MTP_V_STAGING:
+            return "PREFIX_MTP_V_STAGING";
+        case BufferId::PREFIX_TERMINAL_HIDDEN:
+            return "PREFIX_TERMINAL_HIDDEN";
+        case BufferId::PREFIX_TERMINAL_LOGITS:
+            return "PREFIX_TERMINAL_LOGITS";
+        case BufferId::MTP_EMBEDDING:
+            return "MTP_EMBEDDING";
+        case BufferId::MTP_NORM_HIDDEN:
+            return "MTP_NORM_HIDDEN";
+        case BufferId::MTP_NORM_EMBEDDING:
+            return "MTP_NORM_EMBEDDING";
+        case BufferId::MTP_CONCAT:
+            return "MTP_CONCAT";
+        case BufferId::MTP_PROJECTED:
+            return "MTP_PROJECTED";
+        case BufferId::MTP_HIDDEN:
+            return "MTP_HIDDEN";
+        case BufferId::MTP_Q_PROJ:
+            return "MTP_Q_PROJ";
+        case BufferId::MTP_K_PROJ:
+            return "MTP_K_PROJ";
+        case BufferId::MTP_V_PROJ:
+            return "MTP_V_PROJ";
+        case BufferId::MTP_FA_Q_RAW:
+            return "MTP_FA_Q_RAW";
+        case BufferId::MTP_FA_GATE:
+            return "MTP_FA_GATE";
+        case BufferId::MTP_Q_ROPE:
+            return "MTP_Q_ROPE";
+        case BufferId::MTP_K_ROPE:
+            return "MTP_K_ROPE";
+        case BufferId::MTP_ATTN_OUTPUT:
+            return "MTP_ATTN_OUTPUT";
+        case BufferId::MTP_ATTN_PROJ:
+            return "MTP_ATTN_PROJ";
+        case BufferId::MTP_GATE_PROJ:
+            return "MTP_GATE_PROJ";
+        case BufferId::MTP_UP_PROJ:
+            return "MTP_UP_PROJ";
+        case BufferId::MTP_FFN_OUTPUT:
+            return "MTP_FFN_OUTPUT";
+        case BufferId::MTP_LOGITS:
+            return "MTP_LOGITS";
+        case BufferId::MTP_CONDITION_TOKEN:
+            return "MTP_CONDITION_TOKEN";
+        case BufferId::MTP_VERIFIER_INPUT_TOKENS:
+            return "MTP_VERIFIER_INPUT_TOKENS";
+        case BufferId::MOE_GATE_SCRATCH:
+            return "MOE_GATE_SCRATCH";
+        case BufferId::MOE_UP_SCRATCH:
+            return "MOE_UP_SCRATCH";
         case BufferId::ATTN_OUTPUT_GATE:
             return "ATTN_OUTPUT_GATE";
         case BufferId::GDN_CONV_STATE:

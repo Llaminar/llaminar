@@ -61,6 +61,8 @@ namespace llaminar2
             size_t d2h_count = 0;                ///< Number of Device→Host transfers
             size_t h2d_bytes = 0;                ///< Total bytes transferred Host→Device
             size_t d2h_bytes = 0;                ///< Total bytes transferred Device→Host
+            size_t d2d_count = 0;                ///< Number of same-device Device→Device copies
+            size_t d2d_bytes = 0;                ///< Total bytes transferred Device→Device
             std::vector<TransferRecord> records; ///< Detailed transfer log
 
             void clear()
@@ -69,6 +71,8 @@ namespace llaminar2
                 d2h_count = 0;
                 h2d_bytes = 0;
                 d2h_bytes = 0;
+                d2d_count = 0;
+                d2d_bytes = 0;
                 records.clear();
             }
         };
@@ -153,6 +157,27 @@ namespace llaminar2
                 }
 
                 // Simulate the transfer (copy from host to our "device" memory)
+                if (bytes > 0 && dst && src)
+                {
+                    std::memcpy(dst, src, bytes);
+                }
+
+                return true;
+            }
+
+            bool deviceToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream = nullptr) override
+            {
+                (void)stream;
+                std::lock_guard<std::mutex> lock(mutex_);
+
+                // Record the same-device device-to-device copy
+                stats_.d2d_count++;
+                stats_.d2d_bytes += bytes;
+
+                LOG_DEBUG("[MockBackend] D2D transfer: " << bytes << " bytes on device "
+                                                         << device_id << " (total D2D: " << stats_.d2d_count << ")");
+
+                // Simulate the copy (mock "device" memory is host memory)
                 if (bytes > 0 && dst && src)
                 {
                     std::memcpy(dst, src, bytes);

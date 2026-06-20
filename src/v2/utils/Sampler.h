@@ -21,9 +21,30 @@
 #include <algorithm>
 #include <numeric>
 #include <unordered_map>
+#include <functional>
+#include <string>
 
 namespace llaminar2
 {
+
+    /**
+     * @brief A single logit penalty entry for GPU-side penalty application
+     *
+     * Represents an additive penalty to subtract from a token's logit.
+     * Used to upload a sparse penalty map to the GPU, avoiding a full D2H
+     * transfer of the logits tensor (~600KB) just to apply penalties.
+     */
+    struct LogitPenalty
+    {
+        int32_t token_id; ///< Token to penalize
+        float penalty;    ///< Amount to subtract from logit (positive = penalize)
+    };
+
+    struct SamplingDistributionEntry
+    {
+        int token_id = -1;
+        float probability = 0.0f;
+    };
 
     /**
      * @brief Parameters for sampling configuration
@@ -39,6 +60,16 @@ namespace llaminar2
         float presence_penalty = 0.0f;  ///< Penalize tokens that appeared at all (OpenAI-style, additive)
         float frequency_penalty = 0.0f; ///< Penalize tokens proportional to frequency (OpenAI-style, additive)
 
+        // DRY (Don't Repeat Yourself) penalty parameters
+        // Detects repeated N-gram patterns and penalizes tokens that would extend them.
+        // Algorithm: reverse Z-algorithm on token history to find suffix matches.
+        // Penalty: multiplier * base^(repeat_len - allowed_length)
+        float dry_multiplier = 0.0f;    ///< DRY penalty strength (0 = disabled)
+        float dry_base = 1.75f;         ///< Exponential base for penalty scaling
+        int dry_allowed_length = 2;     ///< Repeats up to this length are ignored
+        int dry_penalty_last_n = -1;    ///< Token window to scan (-1 = full context, 0 = disabled)
+        std::vector<std::string> dry_sequence_breakers = {"\n", ":", "\"", "*"}; ///< Reset repeat detection
+
         /**
          * @brief Check if sampling is greedy (deterministic argmax)
          */
@@ -52,7 +83,8 @@ namespace llaminar2
          */
         bool has_penalties() const
         {
-            return presence_penalty != 0.0f || frequency_penalty != 0.0f;
+            return presence_penalty != 0.0f || frequency_penalty != 0.0f ||
+                   (dry_multiplier != 0.0f && dry_penalty_last_n != 0);
         }
     };
 
@@ -174,6 +206,33 @@ namespace llaminar2
         int sample_top_p(const std::vector<float> &logits, float p, float temperature = 1.0f);
 
         /**
+         * @brief Build the normalized sampling distribution for the current history.
+         *
+         * Applies additive penalties, temperature, top-k, and top-p. When both
+         * top_k and top_p are set, top_p is applied within the top-k candidate
+         * set; this matches common chat defaults and the GPU sampler path.
+         */
+        std::vector<SamplingDistributionEntry> compute_distribution(
+            const float *logits,
+            size_t vocab_size,
+            const SamplingParams &params);
+
+        int sample_from_distribution(const std::vector<SamplingDistributionEntry> &distribution);
+        int sample_from_residual_distribution(
+            const std::vector<SamplingDistributionEntry> &target,
+            const std::vector<SamplingDistributionEntry> &draft);
+        static std::vector<SamplingDistributionEntry> residual_distribution(
+            const std::vector<SamplingDistributionEntry> &target,
+            const std::vector<SamplingDistributionEntry> &draft);
+        static float speculative_accept_probability(
+            float target_probability,
+            float draft_probability);
+        static float probability_of_token(
+            const std::vector<SamplingDistributionEntry> &distribution,
+            int token_id);
+        float random_uniform_01();
+
+        /**
          * @brief Set random seed for reproducibility
          * @param seed Random seed (0 = use random device)
          */
@@ -194,9 +253,54 @@ namespace llaminar2
          */
         void reset_history();
 
+        /**
+         * @brief Initialize DRY sequence breakers from string patterns
+         *
+         * Tokenizes each breaker string and builds a multimap from head tokens
+         * to tail token sequences. Must be called before DRY penalties are used.
+         *
+         * @param breaker_strings Strings that reset repeat detection (e.g., "\n", ":")
+         * @param tokenize Function that converts a string to token IDs
+         */
+        using TokenizeFunc = std::function<std::vector<int>(const std::string &)>;
+        void initDryBreakers(const std::vector<std::string> &breaker_strings,
+                             const TokenizeFunc &tokenize);
+
+        /**
+         * @brief Compute a sparse penalty map for GPU-side penalty application
+         *
+         * Combines presence, frequency, and DRY penalties into a single sparse
+         * map of (token_id, penalty) entries. Upload this to the GPU to apply
+         * penalties without a full D2H of the logits tensor.
+         *
+         * @param params Sampling parameters with penalty configuration
+         * @param vocab_size Vocabulary size (for bounds checking)
+         * @return Vector of LogitPenalty entries to subtract from logits
+         */
+        std::vector<LogitPenalty> compute_penalty_map(const SamplingParams &params, int vocab_size);
+
     private:
         std::mt19937 rng_; ///< Random number generator
         std::unordered_map<int, int> token_counts_; ///< Token ID → generation count
+
+        // DRY state
+        std::vector<int> dry_token_history_;  ///< Ring buffer of recent token IDs
+        size_t dry_history_capacity_ = 0;     ///< Max tokens to keep (dry_penalty_last_n)
+        std::unordered_multimap<int, std::vector<int>> dry_breakers_; ///< Head token → tail sequences
+        bool dry_breakers_initialized_ = false;
+
+        /**
+         * @brief Apply DRY penalty to a penalty map
+         *
+         * Uses the reverse Z-algorithm on token history to find repeated N-gram
+         * patterns and compute penalties for tokens that would extend them.
+         *
+         * @param penalty_map Map to merge DRY penalties into
+         * @param params Sampling parameters with DRY configuration
+         * @param vocab_size Vocabulary size (for bounds checking)
+         */
+        void compute_dry_penalties(std::unordered_map<int, float> &penalty_map,
+                                   const SamplingParams &params, int vocab_size);
 
         /**
          * @brief Apply presence and frequency penalties to logits (in-place)

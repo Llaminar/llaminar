@@ -111,6 +111,18 @@ namespace llaminar2
             static void clearSharedPrefillPools();
 
             /**
+             * @brief Release input-dependent CUDA execution contexts.
+             *
+             * Keeps packed weights resident, but drops per-session GEMV, prefill,
+             * and cuBLAS scratch/handles so a new request cannot inherit state
+             * from the previous prompt shape or capture stream.
+             */
+            void resetDynamicState() override;
+
+            /// @brief Returns true when any CUDA execution context is live.
+            bool hasDynamicStateActive() const override;
+
+            /**
              * @brief Construct kernel for quantized weight tensor (lazy conversion)
              *
              * @param weights Any quantized tensor (must be on GPU)
@@ -133,6 +145,30 @@ namespace llaminar2
              */
             CUDAQuantisedGemmKernel(CUDAPackedWeights *packed, int cuda_device_id);
 
+            /**
+             * @brief Construct kernel from pre-uploaded device pointers (MoE batch path)
+             *
+             * Used for MoE expert weights that are batch-packed and uploaded as a single
+             * contiguous allocation. The kernel references device pointers at calculated
+             * offsets into the shared allocation.
+             *
+             * @param N Output features (rows per expert)
+             * @param K Input features (columns)
+             * @param cuda_device_id CUDA device ID
+             * @param d_vnni Device pointer to NativeVNNI payload for this expert
+             * @param d_scales Device pointer to FP16 scales for this expert
+             * @param d_mins Device pointer to FP16 mins (nullptr if symmetric)
+             * @param d_emins Device pointer to extended mins (nullptr if not needed)
+             * @param codebook_id NativeVNNI codebook identifier
+             * @param blocks_per_row Number of 32-element blocks per row (K/32)
+             * @param lifetime_owner Shared pointer that keeps the GPU allocation alive
+             */
+            CUDAQuantisedGemmKernel(
+                int N, int K, int cuda_device_id,
+                uint8_t *d_vnni, uint16_t *d_scales, uint16_t *d_mins, uint32_t *d_emins,
+                uint8_t codebook_id, uint32_t blocks_per_row,
+                std::shared_ptr<void> lifetime_owner);
+
             ~CUDAQuantisedGemmKernel() override;
 
             // Non-copyable
@@ -146,6 +182,8 @@ namespace llaminar2
             // =========================================================================
             // ITensorGemm interface - Primary entry points
             // =========================================================================
+
+            std::unique_ptr<VerifierKernelModeScope> beginVerifierDecodeEquivalentScope() override;
 
             /**
              * @brief Tensor-based GEMM with type introspection (PRIMARY ENTRY POINT)
@@ -219,6 +257,15 @@ namespace llaminar2
                 int m, int k,
                 const IMPIContext *mpi_ctx = nullptr,
                 DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool supports_fused_projection() const override { return true; }
 
             /**
              * @brief Activation-activation GEMM (not supported for quantized kernel)
@@ -313,7 +360,10 @@ namespace llaminar2
 
             size_t weight_rows() const { return N_; }
             size_t weight_cols() const { return K_; }
-            bool weights_converted() const { return weights_converted_; }
+            bool weights_converted() const override;
+
+            /// @brief Export native-VNNI device pointers for grouped MoE CUDA prefill.
+            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override;
 
             /**
              * @brief Prepare weights for efficient execution (ITensorGemm interface)
@@ -371,7 +421,15 @@ namespace llaminar2
                 const TensorBase *gate, const TensorBase *up,
                 TensorBase *output,
                 int m, int n, int k,
-                float alpha = 1.0f, float beta = 0.0f);
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_tensor_with_fused_swiglu_verifier_rows_decode_equivalent(
+                const TensorBase *gate, const TensorBase *up,
+                TensorBase *output,
+                int m, int n, int k,
+                float alpha = 1.0f, float beta = 0.0f,
+                DeviceWorkspaceManager *workspace = nullptr) override;
 
         private:
             // =========================================================================
@@ -408,6 +466,43 @@ namespace llaminar2
             bool multiply_fp32_to_fp32_with_bias(
                 const float *d_A, float *d_C, const float *d_bias,
                 int m, int n, int k,
+                float alpha, float beta);
+
+            /**
+             * @brief Small-M FP32 activations -> specialized native-VNNI GEMV.
+             *
+             * Greedy MTP verifier forwards commonly use M=2..4. The generic
+             * native VNNI prefill path is tuned for larger prefill buckets and
+             * has separate dispatch regimes, so verifier rows stay on the small-M
+             * decode-class GEMV path after one shared activation quantization.
+             */
+            bool multiply_fp32_to_fp32_small_m_gemv(
+                const float *d_A, float *d_C, const float *d_bias,
+                int m, int n, int k,
+                float alpha, float beta);
+
+            /**
+             * @brief Already-quantized small-M activations -> native-VNNI GEMV.
+             *
+             * Used by fused activation paths that quantize a derived activation
+             * once, for example silu(gate)*up. Tests may pass false for
+             * use_specialized_small_m_kernel to compare against serial M=1 GEMVs.
+             */
+            bool multiply_quantized_small_m_gemv(
+                const int8_t *d_A_int8,
+                const float *d_scales_A_blockwise,
+                float *d_C,
+                const float *d_bias,
+                int m, int n, int k,
+                float alpha, float beta,
+                bool use_specialized_small_m_kernel = true);
+
+            bool multiply_quantized_m1_via_small_m_gemv(
+                const int8_t *d_A_int8,
+                const float *d_scales_A_blockwise,
+                float *d_C,
+                const float *d_bias,
+                int n, int k,
                 float alpha, float beta);
 
             /**
@@ -461,12 +556,41 @@ namespace llaminar2
              */
             void validateWorkspace() const;
 
+            /**
+             * @brief Rebind NativeVNNI prefill scratch to the per-stream slot used by concurrent fused prefill.
+             *
+             * validateWorkspace() binds the serial view of the workspace. Concurrent
+             * prefill projections need disjoint split-K/stream-K slices before their
+             * side-stream launch.
+             */
+            void bindConcurrentNativePrefillScratch(int m, int n, int k, int stream_idx) const;
+
+            /**
+             * @brief Rebind NativeVNNI GEMV partials to a concurrent fused-decode stream slot.
+             *
+             * Fused decode launches multiple M=1 projections on side streams. Some
+             * projections use the two-phase KPAR GEMV reduction, so each side stream
+             * needs a disjoint partials arena before launch.
+             *
+             * @param projection_count Number of projections launched by the fused
+             *                         stage. Slot 0 uses GEMV_KPAR_PARTIALS and the
+             *                         remaining projection_count-1 slots use
+             *                         CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS.
+             */
+            void bindConcurrentNativeDecodeScratch(
+                int m,
+                int n,
+                int k,
+                int stream_idx,
+                int projection_count) const;
+
             // =========================================================================
             // Member data
             // =========================================================================
 
-            const TensorBase *weights_ = nullptr; // Original weight tensor (null if using packed_)
-            CUDAPackedWeights *packed_ = nullptr; // Pre-packed weights (owned by tensor cache)
+            const TensorBase *weights_ = nullptr;  // Original weight tensor (null if using packed_)
+            CUDAPackedWeights *packed_ = nullptr;  // Pre-packed weights (owned by tensor cache)
+            std::shared_ptr<void> lifetime_owner_; // Keeps shared MoE batch allocation alive
             int cuda_device_id_;
             size_t N_; // Output features (weight rows)
             size_t K_; // Input features (weight cols)
@@ -482,17 +606,13 @@ namespace llaminar2
             // Kernels do not own any work buffers; all buffers come from workspace
             DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned, REQUIRED)
 
-            // Per-kernel-instance unique slice id for the TEMP_C_FP32 redirect
-            // buffer. Each cached GEMM kernel needs its OWN slice in the shared
-            // workspace; otherwise a kernel can clobber the redirect source of
-            // another kernel whose async D2D copy is still pending. Set in the
-            // constructors from a static atomic counter.
-            uint32_t slice_id_ = 0;
-
-            // Helper: unique workspace buffer name for this kernel's TEMP_C_FP32 slice.
+            // TEMP_C_FP32 is shared serial scratch, matching the ROCm GEMM
+            // workspace contract. Concurrent mapped-output routes must use a
+            // dedicated batched/pool buffer rather than multiplying this buffer
+            // by cached kernel count.
             std::string tempCFp32BufferName() const
             {
-                return std::string(GemmWorkspaceBuffers::TEMP_C_FP32) + "_" + std::to_string(slice_id_);
+                return GemmWorkspaceBuffers::TEMP_C_FP32;
             }
 
             // GPU stream for graph capture (nullptr = default stream)

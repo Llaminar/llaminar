@@ -18,6 +18,12 @@
 #include "CPURingKVCache.h"
 #include "../HybridKVCacheConfig.h"
 #include "../IHybridKVCache.h"
+#include "../../tensors/TensorKernels.h"
+#include "../../utils/OpenMPUtils.h"
+
+#include <cstdint>
+#include <cstring>
+#include <vector>
 
 namespace llaminar2
 {
@@ -94,6 +100,7 @@ namespace llaminar2
 
         int n_layers() const override { return total_layers_; }
         int num_layers() const override { return total_layers_; }
+        int first_layer_index() const override { return first_layer_index_; }
 
         // =====================================================================
         // IKVCache Overrides — Layer-Indexed Methods
@@ -101,7 +108,7 @@ namespace llaminar2
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0; // GDN layer — no KV cache tokens
             return Base::get_cached_tokens(kv_idx, seq_idx);
@@ -111,7 +118,7 @@ namespace llaminar2
                     ITensor **out_k, ITensor **out_v,
                     int *out_kv_len = nullptr) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -129,7 +136,7 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -145,7 +152,7 @@ namespace llaminar2
 
         ITensor *get_k(int layer, int seq_idx = 0) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_k(kv_idx, seq_idx);
@@ -153,7 +160,7 @@ namespace llaminar2
 
         const ITensor *get_k(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_k(kv_idx, seq_idx);
@@ -161,7 +168,7 @@ namespace llaminar2
 
         ITensor *get_v(int layer, int seq_idx = 0) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_v(kv_idx, seq_idx);
@@ -169,7 +176,7 @@ namespace llaminar2
 
         const ITensor *get_v(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_v(kv_idx, seq_idx);
@@ -177,7 +184,7 @@ namespace llaminar2
 
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return true; // GDN layer — no-op
             return Base::append_kv(kv_idx, seq_idx, new_k, new_v);
@@ -185,10 +192,33 @@ namespace llaminar2
 
         bool append_kv(int layer, int seq_idx, const TensorBase *new_k, const TensorBase *new_v, int num_tokens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return true; // GDN layer — no-op
             return Base::append_kv(kv_idx, seq_idx, new_k, new_v, num_tokens);
+        }
+
+        /**
+         * @brief Forward grouped verifier KV publication through the hybrid layer map.
+         *
+         * Hybrid Qwen layers use global layer ids in graph stages, while the
+         * base ring cache stores only full-attention layers in a compressed
+         * index space.  This override keeps the Phase 9.8 grouped verifier
+         * append contract aligned with ordinary append_kv().
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override
+        {
+            (void)gpu_stream;
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return true; // GDN layer — no KV payload to publish.
+            return Base::appendVerifierRowsDecodeEquivalent(
+                kv_idx, seq_idx, K, V, verifier_rows, nullptr);
         }
 
         void clear() override
@@ -203,7 +233,7 @@ namespace llaminar2
 
         void clear_sequence(int layer, int seq_idx) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return; // GDN — no per-sequence clear needed (state is global)
             Base::clear_sequence(kv_idx, seq_idx);
@@ -211,7 +241,7 @@ namespace llaminar2
 
         void clear_layer(int layer) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx >= 0)
             {
                 Base::clear_layer(kv_idx);
@@ -219,17 +249,65 @@ namespace llaminar2
             else
             {
                 // Reset GDN state for this layer
-                int gdn_idx = layer_map_.toGDNIndex(layer);
+                int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
+                {
                     gdn_states_[gdn_idx].reset();
+                    gdn_states_[gdn_idx].resetGPUKernelState();
+                }
             }
+        }
+
+        typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(global_layer));
+            if (kv_idx < 0)
+                return {};
+            return Base::logicalBlockLayout(baseLayerIndexForKVIndex(kv_idx), token_count);
+        }
+
+        typename IKVCache::KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(global_layer));
+            if (kv_idx < 0)
+                return {};
+            return Base::sequenceState(baseLayerIndexForKVIndex(kv_idx), seq_idx);
+        }
+
+        bool exportLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
+                                void *dst_k,
+                                void *dst_v) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(desc.layer));
+            if (kv_idx < 0)
+                return false;
+            auto remapped = desc;
+            remapped.layer = baseLayerIndexForKVIndex(kv_idx);
+            return Base::exportLogicalBlock(remapped, dst_k, dst_v);
+        }
+
+        bool importLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
+                                const void *src_k,
+                                const void *src_v) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(desc.layer));
+            if (kv_idx < 0)
+                return false;
+            auto remapped = desc;
+            remapped.layer = baseLayerIndexForKVIndex(kv_idx);
+            return Base::importLogicalBlock(remapped, src_k, src_v);
+        }
+
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override
+        {
+            return Base::truncateSequence(seq_idx, cached_tokens, stream);
         }
 
         int gather_kv_batched(int layer, int num_sequences,
                               TensorBase *out_k, TensorBase *out_v,
                               std::vector<int> &out_kv_lens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return -1; // GDN layer
             return Base::gather_kv_batched(kv_idx, num_sequences, out_k, out_v, out_kv_lens);
@@ -241,7 +319,7 @@ namespace llaminar2
                               int *out_kv_len = nullptr,
                               const typename Base::KVReadParams *rope = nullptr) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -257,7 +335,7 @@ namespace llaminar2
 
         DeviceId get_layer_device(int layer) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return DeviceId::cpu(); // GDN state is on CPU
             return Base::get_layer_device(kv_idx);
@@ -265,7 +343,7 @@ namespace llaminar2
 
         int ring_head(int layer, int seq_idx = 0) const
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0;
             return Base::ring_head(kv_idx, seq_idx);
@@ -273,7 +351,7 @@ namespace llaminar2
 
         int ring_size(int layer, int seq_idx = 0) const
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0;
             return Base::ring_size(kv_idx, seq_idx);
@@ -284,15 +362,23 @@ namespace llaminar2
         // =====================================================================
 
         /// Check if a layer is a GDN layer
-        bool isGDNLayer(int layer) const override { return !layer_map_.isFullAttention(layer); }
+        bool isGDNLayer(int layer) const override
+        {
+            const int local_layer = normalizeLayerIndex(layer);
+            return local_layer >= 0 && local_layer < total_layers_ &&
+                   !layer_map_.isFullAttention(local_layer);
+        }
 
         /// Check if a layer is a full-attention layer
-        bool isFullAttentionLayer(int layer) const override { return layer_map_.isFullAttention(layer); }
+        bool isFullAttentionLayer(int layer) const override
+        {
+            return layer_map_.isFullAttention(normalizeLayerIndex(layer));
+        }
 
         /// Get GDN state for a layer (nullptr if FA layer)
         HybridGDNLayerState *getGDNState(int layer) override
         {
-            int gdn_idx = layer_map_.toGDNIndex(layer);
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0)
                 return nullptr;
             return &gdn_states_[gdn_idx];
@@ -300,7 +386,7 @@ namespace llaminar2
 
         const HybridGDNLayerState *getGDNState(int layer) const override
         {
-            int gdn_idx = layer_map_.toGDNIndex(layer);
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0)
                 return nullptr;
             return &gdn_states_[gdn_idx];
@@ -363,16 +449,296 @@ namespace llaminar2
             return total;
         }
 
+        HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
+        {
+            return buildHybridPrefixStateMetadata();
+        }
+
+        bool exportHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            void *dst_host,
+            void *dst_device) const override
+        {
+            if (desc.seq_idx < 0)
+                return false;
+
+            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
+            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            if ((needs_host && !dst_host) ||
+                (needs_device && !dst_device))
+            {
+                return false;
+            }
+
+            auto *host_cursor = needs_host ? reinterpret_cast<uint8_t *>(dst_host) : nullptr;
+            auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
+            return exportHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                desc.stream,
+                desc.include_host_state,
+                desc.include_device_state);
+        }
+
+        bool importHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            const void *src_host,
+            const void *src_device) override
+        {
+            if (desc.seq_idx < 0)
+                return false;
+
+            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
+            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            if ((needs_host && !src_host) ||
+                (needs_device && !src_device))
+            {
+                return false;
+            }
+
+            const auto *host_cursor = needs_host ? reinterpret_cast<const uint8_t *>(src_host) : nullptr;
+            const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
+            return importHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                desc.stream,
+                desc.include_host_state,
+                desc.include_device_state);
+        }
+
         /// Access the layer map
         const HybridLayerMap &layerMap() const { return layer_map_; }
 
     private:
         int total_layers_;
+        int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
         std::vector<HybridGDNLayerState> gdn_states_;
 
+        struct HostStateCopySpan
+        {
+            uint8_t *dst = nullptr;
+            const uint8_t *src = nullptr;
+            size_t bytes = 0;
+        };
+
+        static constexpr size_t kParallelHostStateCopyThresholdBytes = 1u << 20;
+
+        static bool copyHostStateSpans(const std::vector<HostStateCopySpan> &spans)
+        {
+            size_t total_bytes = 0;
+            for (const auto &span : spans)
+            {
+                if (span.bytes == 0)
+                    continue;
+                if (!span.dst || !span.src)
+                    return false;
+                total_bytes += span.bytes;
+            }
+
+            if (total_bytes == 0)
+                return true;
+
+            const bool parallel =
+                total_bytes >= kParallelHostStateCopyThresholdBytes &&
+                spans.size() > 1;
+            auto copy_work = [&]()
+            {
+#pragma omp for schedule(static)
+                for (int i = 0; i < static_cast<int>(spans.size()); ++i)
+                {
+                    const auto &span = spans[static_cast<size_t>(i)];
+                    if (span.bytes > 0)
+                        std::memcpy(span.dst, span.src, span.bytes);
+                }
+            };
+            OMP_WORKSHARE_REGION_IF(copy_work, parallel);
+            return true;
+        }
+
+        int normalizeLayerIndex(int layer) const
+        {
+            if (layer >= first_layer_index_ &&
+                layer < first_layer_index_ + total_layers_)
+            {
+                return layer - first_layer_index_;
+            }
+            return layer;
+        }
+
+        int baseLayerIndexForKVIndex(int kv_idx) const
+        {
+            return first_layer_index_ + kv_idx;
+        }
+
+        HybridPrefixStateMetadata buildHybridPrefixStateMetadata() const
+        {
+            HybridPrefixStateMetadata metadata;
+            metadata.total_layers = total_layers_;
+            metadata.gdn_layers = layer_map_.gdnLayerCount();
+            metadata.host_bytes = gdnMemoryBytes();
+
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                const auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+                if (state->conv_kernel)
+                    metadata.device_bytes += state->conv_kernel->stateBytes();
+                if (state->rec_kernel)
+                    metadata.device_bytes += state->rec_kernel->stateBytes();
+            }
+            metadata.has_device_kernel_state = metadata.device_bytes > 0;
+            return metadata;
+        }
+
+        bool exportHybridStatePayload(
+            uint8_t *&host_cursor,
+            uint8_t *&device_cursor,
+            void *stream,
+            bool include_host_state = true,
+            bool include_device_state = true) const
+        {
+            std::vector<HostStateCopySpan> host_spans;
+            uint8_t *host_base = host_cursor;
+            size_t host_offset = 0;
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                const auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+
+                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                if (include_host_state && recurrence_bytes > 0)
+                {
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            host_base + host_offset,
+                            reinterpret_cast<const uint8_t *>(state->recurrence_state.data()),
+                            recurrence_bytes});
+                    host_offset += recurrence_bytes;
+                }
+                if (include_host_state && conv_bytes > 0)
+                {
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            host_base + host_offset,
+                            reinterpret_cast<const uint8_t *>(state->conv_state.data()),
+                            conv_bytes});
+                    host_offset += conv_bytes;
+                }
+
+                if (include_device_state && state->conv_kernel)
+                {
+                    const size_t bytes = state->conv_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+                if (include_device_state && state->rec_kernel)
+                {
+                    const size_t bytes = state->rec_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+            }
+            if (include_host_state)
+            {
+                if (!copyHostStateSpans(host_spans))
+                    return false;
+                host_cursor = host_base + host_offset;
+            }
+            return true;
+        }
+
+        bool importHybridStatePayload(
+            const uint8_t *&host_cursor,
+            const uint8_t *&device_cursor,
+            void *stream,
+            bool include_host_state = true,
+            bool include_device_state = true)
+        {
+            std::vector<HostStateCopySpan> host_spans;
+            const uint8_t *host_base = host_cursor;
+            size_t host_offset = 0;
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+
+                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                if (include_host_state && recurrence_bytes > 0)
+                {
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            reinterpret_cast<uint8_t *>(state->recurrence_state.data()),
+                            host_base + host_offset,
+                            recurrence_bytes});
+                    host_offset += recurrence_bytes;
+                }
+                if (include_host_state && conv_bytes > 0)
+                {
+                    if (!host_base)
+                        return false;
+                    host_spans.push_back(
+                        HostStateCopySpan{
+                            reinterpret_cast<uint8_t *>(state->conv_state.data()),
+                            host_base + host_offset,
+                            conv_bytes});
+                    host_offset += conv_bytes;
+                }
+
+                if (include_device_state && state->conv_kernel)
+                {
+                    const size_t bytes = state->conv_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+                if (include_device_state && state->rec_kernel)
+                {
+                    const size_t bytes = state->rec_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
+                            return false;
+                        device_cursor += bytes;
+                    }
+                }
+            }
+            if (include_host_state)
+            {
+                if (!copyHostStateSpans(host_spans))
+                    return false;
+                host_cursor = host_base + host_offset;
+            }
+            return true;
+        }
+
         void initHybrid(const HybridKVCacheConfig &config)
         {
+            first_layer_index_ = config.first_layer_index;
             layer_map_.build(config.layer_types);
 
             // Initialize GDN states
@@ -426,10 +792,10 @@ namespace llaminar2
                 state.initialize(qkv_dim);
             }
 
-            LOG_INFO("[CPUHybridRingKVCache] Created: " << total_layers_ << " total layers, "
-                                                        << layer_map_.kvLayerCount() << " KV (FA), "
-                                                        << n_gdn << " GDN. "
-                                                        << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
+            LOG_DEBUG("[CPUHybridRingKVCache] Created: " << total_layers_ << " total layers, "
+                                                         << layer_map_.kvLayerCount() << " KV (FA), "
+                                                         << n_gdn << " GDN. "
+                                                         << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
         }
     };
 

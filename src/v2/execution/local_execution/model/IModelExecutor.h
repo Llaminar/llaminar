@@ -128,12 +128,23 @@ namespace llaminar2
     {
         // Token input (one of these must be set)
         const int *token_ids = nullptr;                         ///< Token IDs [seq_len] (single sequence)
+        /**
+         * @brief Optional device-resident INT32 token IDs.
+         *
+         * This mirrors the graph-builder forward contract. Device execution can
+         * read tokens from a stable GPU buffer while `token_ids` remains a host
+         * shadow for diagnostics and request bookkeeping.
+         */
+        const void *token_ids_device = nullptr;
         const std::vector<std::vector<int>> *batches = nullptr; ///< Batched tokens
 
         // Dimensions
         int batch_size = 1;
         int seq_len = 0;            ///< Per-sequence length (single) or max length (batched)
         int *seq_lengths = nullptr; ///< Per-sequence lengths for batched (nullptr = all same)
+        int real_seq_len = 0;       ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
+        int bucket_seq_len = 0;     ///< Fixed bucket length for graph shape (0 = seq_len)
+        int token_offset = 0;       ///< Chunk offset within the original prompt
 
         // Position information (for decode mode)
         int *position_ids = nullptr; ///< Position IDs for RoPE (nullptr = auto)

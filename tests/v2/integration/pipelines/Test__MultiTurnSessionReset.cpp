@@ -3,17 +3,18 @@
  * @brief Integration test for multi-turn inference with session resets
  * @author David Sanftenberg
  *
- * Validates that clear_cache() correctly resets kernel dynamic state
- * so that a second inference request produces correct output (not garbage
- * from stale token IDs cached in embedding kernel GPU buffers).
+ * Validates that clear_cache() correctly resets request-local dynamic state so
+ * that a second inference request produces correct output (not garbage from
+ * stale token IDs cached in graph-facing GPU buffers).
  *
  * Parameterized across backends: CPU, CUDA, ROCm. Each GPU backend is
  * skipped if the corresponding hardware is not available.
  *
  * Regression coverage for:
  *   - Embedding stale dynamic_params_active_ after clearCache() (eeca83dd)
- *   - Graph cache invalidation on clear_cache() (eeca83dd)
- *   - KernelFactory::resetAllDynamicState() lifecycle (8666332f)
+ *   - Graph cache reuse after clear_cache() without stale request state
+ *   - request-boundary dynamic metadata reset without stale graph-facing state
+ *     (8666332f)
  *   - Session epoch reset (8666332f)
  *   - Stale activation buffer K/V in decode after graph cache reuse
  *     (AttentionComputeStage decode-mode KV cache override)
@@ -22,6 +23,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <mpi.h>
 #include <fstream>
 #include <cmath>
 #include <numeric>
@@ -191,8 +193,8 @@ TEST_P(Test__MultiTurnSessionReset, R2_After_ClearCache_ProducesValidOutput)
 }
 
 // Regression: same prompt after clearCache() must produce identical tokens.
-// Verifies the full reset path: KernelFactory::resetAllDynamicState() →
-// embedding kernel resetDynamicState() → memcmp guard forces H2D re-upload.
+// Verifies the full request reset path: stage/request metadata resets must
+// force fresh prompt materialization without tearing down replay-safe captures.
 TEST_P(Test__MultiTurnSessionReset, R1_Repeat_After_ClearCache_IsDeterministic)
 {
     std::vector<int32_t> prompt = {9707}; // "Hello"
@@ -286,3 +288,22 @@ INSTANTIATE_TEST_SUITE_P(
     Test__MultiTurnSessionReset,
     ::testing::Values(TestBackend::CPU, TestBackend::CUDA, TestBackend::ROCm),
     backendName);
+
+// ============================================================================
+// Custom main() — MPI must be initialized before the runner factory is called
+// ============================================================================
+
+int main(int argc, char **argv)
+{
+    int provided = 0;
+    MPI_Init_thread(&argc, &argv, MPI_THREAD_FUNNELED, &provided);
+
+    ::testing::InitGoogleTest(&argc, argv);
+    int result = RUN_ALL_TESTS();
+
+    MPI_Finalize();
+
+    // Use _exit() to skip static destructors — CUDA/ROCm driver cleanup
+    // races with MPI teardown, causing hangs or SIGABRT on process exit.
+    _exit(result);
+}

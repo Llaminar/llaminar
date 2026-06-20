@@ -13,6 +13,8 @@
 #include "HipDeviceGuard.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
+#include "../../kernels/common/SamplingMath.h"
 #include <hip/hip_runtime.h>
 #include <chrono>
 #include <stdexcept>
@@ -23,11 +25,42 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <deque>
+#include <limits>
 #include <thread>
+#include <cstdint>
 
 namespace llaminar2
 {
+
+    extern "C" bool rocmOps_vector_add_inplace_fp32(
+        float *output,
+        const float *input,
+        size_t count,
+        int device_idx,
+        void *stream);
+
+    namespace
+    {
+        constexpr std::uintptr_t kDeviceAllocationAlignment = 256;
+
+        // Immortal singletons: heap-allocated and never destroyed.
+        // Prevents static destruction order fiasco when KernelFactory's static
+        // caches (which hold GEMM kernels with shared_ptr<LoadOrchestrator>)
+        // are destroyed during __cxa_finalize AFTER these singletons.
+        std::mutex &rocmPinnedAllocationsMutex()
+        {
+            static auto *mutex = new std::mutex();
+            return *mutex;
+        }
+
+        std::unordered_map<void *, int> &rocmPinnedAllocations()
+        {
+            static auto *allocations = new std::unordered_map<void *, int>();
+            return *allocations;
+        }
+    }
 
     // Check a HIP API result and throw on failure with full diagnostic context.
     //
@@ -123,9 +156,12 @@ namespace llaminar2
             bool active = false;
         };
 
-        std::mutex g_ptr_registry_mutex;
-        std::unordered_map<void *, ROCmPointerOwnerInfo> g_active_ptrs;
-        std::deque<PointerEvent> g_ptr_events;
+        // Immortal: heap-allocated and never destroyed to avoid static
+        // destruction order issues during process exit.
+        std::mutex &g_ptr_registry_mutex = *new std::mutex();
+        std::unordered_map<void *, ROCmPointerOwnerInfo> &g_active_ptrs =
+            *new std::unordered_map<void *, ROCmPointerOwnerInfo>();
+        std::deque<PointerEvent> &g_ptr_events = *new std::deque<PointerEvent>();
         uint64_t g_ptr_sequence = 0;
         constexpr size_t kMaxPointerEvents = 512;
 
@@ -288,10 +324,17 @@ namespace llaminar2
     // Forward declaration for HIP argmax kernel (implemented in ROCmArgmaxKernels.hip)
     extern "C" bool rocmOps_argmax_f32(
         const float *data, int n, float *out_value, int *out_index,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
         int device_idx, void *stream);
+    extern "C" bool rocmOps_argmax_f32_batched_rows(
+        const float *data, int rows, int cols, int row_stride,
+        float *out_values, int *out_indices,
+        float *partial_vals, int *partial_idxs, int partial_capacity,
+        int device_idx, void *stream, int output_stride);
 
     bool ROCmBackend::argmaxF32(const void *data_device, int n, int device_id,
-                                float *out_value, int *out_index, void *stream)
+                                float *out_value, int *out_index, void *stream,
+                                void *partial_vals, void *partial_idxs, int partial_capacity)
     {
         if (device_id >= device_count_ || device_id < 0 || !data_device || n <= 0)
             return false;
@@ -316,21 +359,30 @@ namespace llaminar2
                 bufs.value_ptr = nullptr;
                 return false;
             }
+            bufs.allocated_count = 1;
         }
 
         // Launch kernel on device's managed stream
         HIP_CHECK_OR_THROW(hipSetDevice(device_id));
         hipStream_t s = resolveStream(device_id, stream);
+        // Pass the caller-supplied partial scratch through to the kernel wrapper.
+        // The scratch is mandatory (arena-owned); the wrapper fails loud if it is
+        // missing or undersized — there is no single-block fallback.
         if (!rocmOps_argmax_f32(
                 static_cast<const float *>(data_device), n,
                 static_cast<float *>(bufs.value_ptr),
                 static_cast<int *>(bufs.index_ptr),
+                static_cast<float *>(partial_vals),
+                static_cast<int *>(partial_idxs),
+                partial_capacity,
                 device_id, s))
         {
             return false;
         }
 
-        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        // The argmax kernel and the two tiny D2H copies are enqueued on the
+        // same stream. Stream ordering guarantees the copies observe the kernel
+        // results, so only the final synchronize is needed.
         HIP_CHECK_OR_THROW(hipMemcpyAsync(out_value, bufs.value_ptr, sizeof(float), hipMemcpyDeviceToHost, s));
         HIP_CHECK_OR_THROW(hipMemcpyAsync(out_index, bufs.index_ptr, sizeof(int), hipMemcpyDeviceToHost, s));
         HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
@@ -338,10 +390,445 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmBackend::argmaxF32BatchedRows(const void *data_device, int rows, int cols, int device_id,
+                                           float *out_values, int *out_indices, void *stream,
+                                           void *partial_vals, void *partial_idxs, int partial_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            rows <= 0 || cols <= 0 || !out_values || !out_indices)
+        {
+            return false;
+        }
+
+        if (!partial_vals || !partial_idxs || partial_capacity < rows)
+        {
+            LOG_ERROR("[ROCmBackend::argmaxF32BatchedRows] missing arena-owned partial scratch "
+                      << "(rows=" << rows << " capacity=" << partial_capacity << ")");
+            return false;
+        }
+
+        if (argmax_buffers_.empty())
+            argmax_buffers_.resize(device_count_);
+
+        auto &bufs = argmax_buffers_[device_id];
+        if (!bufs.value_ptr || bufs.allocated_count < rows)
+        {
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+            if (bufs.value_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.value_ptr));
+            if (bufs.index_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.index_ptr));
+            bufs.value_ptr = nullptr;
+            bufs.index_ptr = nullptr;
+            bufs.allocated_count = 0;
+
+            HIP_CHECK_OR_THROW(hipMalloc(&bufs.value_ptr, static_cast<size_t>(rows) * sizeof(float)));
+            hipError_t err = hipMalloc(&bufs.index_ptr, static_cast<size_t>(rows) * sizeof(int));
+            if (err != hipSuccess)
+            {
+                HIP_WARN_IF_FAIL(hipFree(bufs.value_ptr));
+                bufs.value_ptr = nullptr;
+                LOG_ERROR("[ROCmBackend::argmaxF32BatchedRows] hipMalloc indices failed: "
+                          << hipGetErrorString(err));
+                return false;
+            }
+            bufs.allocated_count = rows;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        hipStream_t s = resolveStream(device_id, stream);
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "backend", "rocm_argmax_f32_batched_rows_launch", "decode");
+            if (!rocmOps_argmax_f32_batched_rows(
+                    static_cast<const float *>(data_device),
+                    rows,
+                    cols,
+                    cols,
+                    static_cast<float *>(bufs.value_ptr),
+                    static_cast<int *>(bufs.index_ptr),
+                    static_cast<float *>(partial_vals),
+                    static_cast<int *>(partial_idxs),
+                    partial_capacity,
+                    device_id,
+                    s,
+                    /*output_stride=*/1))
+            {
+                return false;
+            }
+        }
+
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "backend", "rocm_argmax_f32_batched_rows_d2h_enqueue", "decode");
+            HIP_CHECK_OR_THROW(hipMemcpyAsync(out_values,
+                                              bufs.value_ptr,
+                                              static_cast<size_t>(rows) * sizeof(float),
+                                              hipMemcpyDeviceToHost,
+                                              s));
+            HIP_CHECK_OR_THROW(hipMemcpyAsync(out_indices,
+                                              bufs.index_ptr,
+                                              static_cast<size_t>(rows) * sizeof(int),
+                                              hipMemcpyDeviceToHost,
+                                              s));
+        }
+        {
+            PerfStatsCollector::ScopedTimer timer(
+                "backend", "rocm_argmax_f32_batched_rows_sync", "decode");
+            HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        }
+        return true;
+    }
+
+    bool ROCmBackend::enqueueArgmaxF32BatchedRowsDevice(
+        const void *data_device,
+        int rows,
+        int cols,
+        int device_id,
+        void *stream,
+        void *out_values_device,
+        void *out_indices_device,
+        void *partial_vals,
+        void *partial_idxs,
+        int partial_capacity,
+        int output_stride)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            rows <= 0 || cols <= 0 || !stream ||
+            !out_values_device || !out_indices_device ||
+            !partial_vals || !partial_idxs || partial_capacity < rows ||
+            output_stride <= 0)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        PerfStatsCollector::ScopedTimer timer(
+            "backend", "rocm_argmax_f32_batched_rows_device_launch", "decode");
+        return rocmOps_argmax_f32_batched_rows(
+            static_cast<const float *>(data_device),
+            rows,
+            cols,
+            cols,
+            static_cast<float *>(out_values_device),
+            static_cast<int *>(out_indices_device),
+            static_cast<float *>(partial_vals),
+            static_cast<int *>(partial_idxs),
+            partial_capacity,
+            device_id,
+            static_cast<hipStream_t>(stream),
+            output_stride);
+    }
+
     // Forward declaration for HIP top-k kernel (implemented in ROCmSamplingKernels.hip)
     extern "C" bool rocmOps_topk_f32(
         const float *data, int n, int k, float *out_values, int *out_indices,
         int device_idx, void *stream);
+    extern "C" bool rocmOps_sample_topk_topp_f32(
+        const float *data, int n, int k, float top_p, float temperature,
+        unsigned long long rng_seed, unsigned long long rng_offset,
+        int *out_token, int device_idx, void *stream);
+    extern "C" bool rocmOps_topk_topp_distribution_f32(
+        const float *data, int n, int k, float top_p, float temperature,
+        int *out_token_ids, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_topk_topp_distributions_f32(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        int *out_token_ids, int out_stride, float *out_probs,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_topk_topp_processed_logits_f32(
+        const float *data, int row_count, int n, int row_stride, int k,
+        float top_p, float temperature,
+        float *out_logits, int out_row_stride,
+        float *scratch_values, int *scratch_indices, int scratch_capacity,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_speculative_verify_distribution_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int draft_token,
+        unsigned long long accept_seed, unsigned long long accept_offset,
+        unsigned long long residual_seed, unsigned long long residual_offset,
+        int *out_token, int *out_accepted,
+        float *out_accept_probability, float *out_accept_threshold,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_sample_distribution_f32(
+        const int *token_ids, const float *probs,
+        int k, float threshold,
+        int *out_token, float *out_probability, int device_idx, void *stream);
+    extern "C" bool rocmOps_sample_processed_logits_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        int first_token,
+        const int *first_token_device,
+        int stop_token0,
+        int stop_token1,
+        int stop_token2,
+        int stop_token3,
+        int stop_token4,
+        int stop_token5,
+        int stop_token6,
+        int stop_token7,
+        int stop_token_count,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_softmax_processed_logits_f32(
+        const float *logits,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        float *out_probabilities,
+        int out_row_stride,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_softmax_sample_temperature_logits_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        float *out_probabilities,
+        int out_row_stride,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_scale_sample_temperature_logits_f32(
+        const float *logits,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        float *out_logits,
+        int out_row_stride,
+        int *out_token,
+        float *out_probability,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_speculative_verify_distribution_threshold_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int draft_token,
+        float accept_threshold, float residual_threshold,
+        int *out_token, int *out_accepted,
+        float *out_accept_probability, float *out_accept_threshold,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_fill_inverse_exponential_samples_f32(
+        float *out_samples,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        unsigned long long seed,
+        int first_logical_position,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_speculative_verify_distribution_thresholds_batch_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int distribution_stride,
+        int draft_token0, int draft_token1, int draft_token2, int draft_token3,
+        float accept_threshold0, float accept_threshold1,
+        float accept_threshold2, float accept_threshold3,
+        float residual_threshold0, float residual_threshold1,
+        float residual_threshold2, float residual_threshold3,
+        int row_count,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
+        const int *target_token_ids, const float *target_probs,
+        const int *draft_token_ids, const float *draft_probs,
+        int k, int distribution_stride,
+        const int *sampled_draft_tokens,
+        const float *sampled_draft_probabilities,
+        float accept_threshold0, float accept_threshold1,
+        float accept_threshold2, float accept_threshold3,
+        float residual_threshold0, float residual_threshold1,
+        float residual_threshold2, float residual_threshold3,
+        int row_count,
+        unsigned long long inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int inverse_sample_vocab_size,
+        unsigned long long threshold_seed,
+        int threshold_first_logical_position,
+        int thresholds_from_seed,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_f32(
+        const float *target_logits,
+        const float *draft_logits,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0, float accept_threshold1,
+        float accept_threshold2, float accept_threshold3,
+        float residual_threshold0, float residual_threshold1,
+        float residual_threshold2, float residual_threshold3,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        const float *draft_token_probabilities,
+        int device_idx, void *stream);
+    extern "C" bool rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_f32(
+        const float *target_logits,
+        const float *draft_probabilities,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        unsigned long long inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int no_draft_probabilities,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_f32(
+        const float *target_logits,
+        const float *draft_logits,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const int *sampled_draft_tokens,
+        const float *sampled_draft_probabilities,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        unsigned long long inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32(
+        const float *target_probabilities,
+        const float *draft_probabilities,
+        const float *inverse_rejection_samples,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        int inverse_sample_row_stride,
+        const int *sampled_draft_tokens,
+        float accept_threshold0,
+        float accept_threshold1,
+        float accept_threshold2,
+        float accept_threshold3,
+        int no_draft_probabilities,
+        int *out_token,
+        int *out_accepted,
+        float *out_accept_probability,
+        float *out_accept_threshold,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_summarize_speculative_verify_batch(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        int first_token,
+        int stop_token0, int stop_token1, int stop_token2, int stop_token3,
+        int stop_token4, int stop_token5, int stop_token6, int stop_token7,
+        int stop_token_count,
+        const int *bonus_token,
+        int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_summarize_speculative_verify_batch_device_first_token(
+        const int *verify_tokens,
+        const int *verify_accepted,
+        int row_count,
+        const int *first_token,
+        int stop_token0, int stop_token1, int stop_token2, int stop_token3,
+        int stop_token4, int stop_token5, int stop_token6, int stop_token7,
+        int stop_token_count,
+        const int *bonus_token,
+        int has_bonus_token,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_summarize_greedy_speculative_verify_batch(
+        const int *verify_tokens,
+        const int *draft_tokens,
+        int compare_row_count,
+        int first_token,
+        int stop_token0, int stop_token1, int stop_token2, int stop_token3,
+        int stop_token4, int stop_token5, int stop_token6, int stop_token7,
+        int stop_token_count,
+        int *out_tokens,
+        int *out_meta,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_derive_speculative_publication_metadata(
+        const int *meta,
+        int meta_stride,
+        const int *base_cached_tokens,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int *out_restore_rows,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_counts,
+        int *out_ok,
+        int *out_next_condition_tokens,
+        const int32_t *output_tokens,
+        int output_token_stride,
+        int *out_all_drafts_accepted_flags,
+        int *out_stopped_flags,
+        int device_idx,
+        void *stream);
+    extern "C" bool rocmOps_derive_shifted_speculative_publication_metadata(
+        const int *meta,
+        int meta_stride,
+        const int *base_cached_tokens,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int mtp_depth,
+        int *out_target_cached_tokens,
+        int *out_accepted_state_counts,
+        int *out_ok,
+        int device_idx,
+        void *stream);
 
     bool ROCmBackend::topKF32(const void *data_device, int n, int k, int device_id,
                               float *out_values, int *out_indices, void *stream)
@@ -404,6 +891,1341 @@ namespace llaminar2
         HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
 
         return true;
+    }
+
+    bool ROCmBackend::enqueueSampleTopKTopPF32Device(const void *data_device, int n,
+                                                     int top_k, float top_p, float temperature,
+                                                     uint64_t rng_seed, uint64_t rng_offset,
+                                                     int device_id, void *stream,
+                                                     void *out_token_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            n <= 0 || top_k <= 0 || !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_sample_topk_topp_f32(
+            static_cast<const float *>(data_device),
+            n,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<unsigned long long>(rng_seed),
+            static_cast<unsigned long long>(rng_offset),
+            static_cast<int *>(out_token_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::sampleTopKTopPF32(const void *data_device, int n,
+                                        int top_k, float top_p, float temperature,
+                                        uint64_t rng_seed, uint64_t rng_offset,
+                                        int device_id, int *out_token,
+                                        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            n <= 0 || top_k <= 0 || !out_token || !stream)
+        {
+            return false;
+        }
+
+        if (sample_token_buffers_.empty())
+            sample_token_buffers_.resize(device_count_);
+
+        auto &bufs = sample_token_buffers_[device_id];
+        if (!bufs.token_ptr)
+        {
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+            hipError_t err = hipMalloc(&bufs.token_ptr, sizeof(int));
+            if (err != hipSuccess)
+            {
+                bufs.token_ptr = nullptr;
+                return false;
+            }
+        }
+
+        if (!enqueueSampleTopKTopPF32Device(data_device,
+                                            n,
+                                            top_k,
+                                            top_p,
+                                            temperature,
+                                            rng_seed,
+                                            rng_offset,
+                                            device_id,
+                                            stream,
+                                            bufs.token_ptr))
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(out_token,
+                                          bufs.token_ptr,
+                                          sizeof(int),
+                                          hipMemcpyDeviceToHost,
+                                          static_cast<hipStream_t>(stream)));
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(static_cast<hipStream_t>(stream)));
+        return true;
+    }
+
+    bool ROCmBackend::enqueueBuildTopKTopPDistributionF32Device(
+        const void *data_device,
+        int n,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !data_device ||
+            n <= 0 || top_k <= 0 || !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_topk_topp_distribution_f32(
+            static_cast<const float *>(data_device),
+            n,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueBuildTopKTopPDistributionsF32Device(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_token_ids_device,
+        int out_stride,
+        void *out_probs_device,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || row_count <= 0 || n <= 0 || row_stride < n ||
+            top_k <= 0 || out_stride <= 0 || out_stride < top_k ||
+            !stream || !out_token_ids_device || !out_probs_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_topk_topp_distributions_f32(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<int *>(out_token_ids_device),
+            out_stride,
+            static_cast<float *>(out_probs_device),
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueBuildTopKTopPProcessedLogitsF32Device(
+        const void *data_device,
+        int row_count,
+        int n,
+        int row_stride,
+        int top_k,
+        float top_p,
+        float temperature,
+        int device_id,
+        void *stream,
+        void *out_logits_device,
+        int out_row_stride,
+        void *scratch_values_device,
+        void *scratch_indices_device,
+        int scratch_capacity)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !data_device || row_count <= 0 || n <= 0 ||
+            row_stride < n || out_row_stride < n ||
+            top_k <= 0 || !stream || !out_logits_device)
+        {
+            return false;
+        }
+
+        if (top_k > 256)
+            top_k = 256;
+        if (top_k > n)
+            top_k = n;
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_topk_topp_processed_logits_f32(
+            static_cast<const float *>(data_device),
+            row_count,
+            n,
+            row_stride,
+            top_k,
+            top_p,
+            temperature,
+            static_cast<float *>(out_logits_device),
+            out_row_stride,
+            static_cast<float *>(scratch_values_device),
+            static_cast<int *>(scratch_indices_device),
+            scratch_capacity,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyDistributionsF32Device(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int draft_token,
+        uint64_t accept_seed,
+        uint64_t accept_offset,
+        uint64_t residual_seed,
+        uint64_t residual_offset,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            !draft_token_ids_device || !draft_probs_device ||
+            top_k <= 0 || top_k > 256 || !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_distribution_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            draft_token,
+            static_cast<unsigned long long>(accept_seed),
+            static_cast<unsigned long long>(accept_offset),
+            static_cast<unsigned long long>(residual_seed),
+            static_cast<unsigned long long>(residual_offset),
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSampleDistributionF32Device(
+        const void *token_ids_device,
+        const void *probs_device,
+        int top_k,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !token_ids_device || !probs_device ||
+            top_k <= 0 || top_k > 256 || !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_sample_distribution_f32(
+            static_cast<const int *>(token_ids_device),
+            static_cast<const float *>(probs_device),
+            top_k,
+            threshold,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSampleProcessedLogitsF32Device(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_sample_processed_logits_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            threshold,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSampleProcessedLogitsF32DeviceIfSpeculativeBatchNeedsBonus(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float threshold,
+        const void *verify_tokens_device,
+        const void *verify_accepted_device,
+        int row_count,
+        int first_token,
+        const void *first_token_device,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            !verify_tokens_device || !verify_accepted_device ||
+            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            (first_token < 0 && !first_token_device) ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            !stream || !out_token_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_sample_processed_logits_if_speculative_batch_needs_bonus_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            threshold,
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            row_count,
+            first_token,
+            static_cast<const int *>(first_token_device),
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSoftmaxAndSampleTemperatureLogitsF32Device(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_probabilities_device,
+        int out_row_stride,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            out_row_stride < vocab_size || !stream ||
+            !out_probabilities_device || !out_token_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_softmax_sample_temperature_logits_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            temperature,
+            threshold,
+            static_cast<float *>(out_probabilities_device),
+            out_row_stride,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueScaleAndSampleTemperatureLogitsF32Device(
+        const void *logits_device,
+        int vocab_size,
+        int row_stride,
+        float temperature,
+        float threshold,
+        int device_id,
+        void *stream,
+        void *out_logits_device,
+        int out_row_stride,
+        void *out_token_device,
+        void *out_probability_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || vocab_size <= 0 || row_stride < vocab_size ||
+            out_row_stride < vocab_size || !stream ||
+            !out_logits_device || !out_token_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_scale_sample_temperature_logits_f32(
+            static_cast<const float *>(logits_device),
+            vocab_size,
+            row_stride,
+            temperature,
+            threshold,
+            static_cast<float *>(out_logits_device),
+            out_row_stride,
+            static_cast<int *>(out_token_device),
+            static_cast<float *>(out_probability_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSoftmaxProcessedLogitsF32Device(
+        const void *logits_device,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        int device_id,
+        void *stream,
+        void *out_probabilities_device,
+        int out_row_stride)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !logits_device || row_count <= 0 || vocab_size <= 0 ||
+            row_stride < vocab_size || out_row_stride < vocab_size ||
+            !stream || !out_probabilities_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_softmax_processed_logits_f32(
+            static_cast<const float *>(logits_device),
+            row_count,
+            vocab_size,
+            row_stride,
+            static_cast<float *>(out_probabilities_device),
+            out_row_stride,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueFillInverseExponentialSamplesF32Device(
+        void *out_samples_device,
+        int row_count,
+        int vocab_size,
+        int row_stride,
+        uint64_t seed,
+        int first_logical_position,
+        int device_id,
+        void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !out_samples_device || row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 || row_stride < vocab_size || !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_fill_inverse_exponential_samples_f32(
+            static_cast<float *>(out_samples_device),
+            row_count,
+            vocab_size,
+            row_stride,
+            static_cast<unsigned long long>(seed),
+            first_logical_position,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyDistributionsF32DeviceThresholds(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int draft_token,
+        float accept_threshold,
+        float residual_threshold,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            !draft_token_ids_device || !draft_probs_device ||
+            top_k <= 0 || top_k > 256 || !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_distribution_threshold_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            draft_token,
+            accept_threshold,
+            residual_threshold,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatch(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int distribution_stride,
+        const int *draft_tokens_host,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
+        int row_count,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            !draft_token_ids_device || !draft_probs_device ||
+            top_k <= 0 || top_k > 256 ||
+            distribution_stride < top_k ||
+            row_count <= 0 || row_count > 4 ||
+            !draft_tokens_host || !accept_thresholds_host ||
+            !residual_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        int draft_tokens[4] = {-1, -1, -1, -1};
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+        {
+            draft_tokens[i] = draft_tokens_host[i];
+            accept_thresholds[i] = accept_thresholds_host[i];
+            residual_thresholds[i] = residual_thresholds_host[i];
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_distribution_thresholds_batch_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            distribution_stride,
+            draft_tokens[0],
+            draft_tokens[1],
+            draft_tokens[2],
+            draft_tokens[3],
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            residual_thresholds[0],
+            residual_thresholds[1],
+            residual_thresholds[2],
+            residual_thresholds[3],
+            row_count,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyDistributionsF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_token_ids_device,
+        const void *target_probs_device,
+        const void *draft_token_ids_device,
+        const void *draft_probs_device,
+        int top_k,
+        int distribution_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
+        int row_count,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        const void *draft_token_probabilities_device,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int inverse_sample_vocab_size)
+    {
+        const bool has_draft_distribution =
+            draft_token_ids_device != nullptr && draft_probs_device != nullptr;
+        const bool has_one_hot_draft_distribution =
+            draft_token_ids_device == nullptr && draft_probs_device == nullptr;
+        const bool has_host_thresholds =
+            accept_thresholds_host != nullptr &&
+            residual_thresholds_host != nullptr;
+        const bool uses_seeded_device_thresholds =
+            accept_thresholds_host == nullptr &&
+            residual_thresholds_host == nullptr &&
+            has_one_hot_draft_distribution &&
+            inverse_sample_seed != 0 &&
+            inverse_sample_first_logical_position >= 0;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_token_ids_device || !target_probs_device ||
+            (!has_draft_distribution && !has_one_hot_draft_distribution) ||
+            !draft_tokens_device ||
+            top_k <= 0 || top_k > 256 ||
+            distribution_stride < top_k ||
+            row_count <= 0 || row_count > 4 ||
+            (!has_host_thresholds && !uses_seeded_device_thresholds) ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (has_host_thresholds)
+        {
+            for (int i = 0; i < row_count; ++i)
+            {
+                accept_thresholds[i] = accept_thresholds_host[i];
+                residual_thresholds[i] = residual_thresholds_host[i];
+            }
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_distribution_thresholds_batch_device_tokens_f32(
+            static_cast<const int *>(target_token_ids_device),
+            static_cast<const float *>(target_probs_device),
+            static_cast<const int *>(draft_token_ids_device),
+            static_cast<const float *>(draft_probs_device),
+            top_k,
+            distribution_stride,
+            static_cast<const int *>(draft_tokens_device),
+            static_cast<const float *>(draft_token_probabilities_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            residual_thresholds[0],
+            residual_thresholds[1],
+            residual_thresholds[2],
+            residual_thresholds[3],
+            row_count,
+            inverse_sample_seed,
+            inverse_sample_first_logical_position,
+            inverse_sample_vocab_size,
+            uses_seeded_device_thresholds ? inverse_sample_seed : 0ull,
+            inverse_sample_first_logical_position,
+            uses_seeded_device_thresholds ? 1 : 0,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyProcessedLogitsF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_logits_device,
+        const void *draft_logits_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        const float *residual_thresholds_host,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        const void *draft_token_probabilities_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_logits_device || !draft_logits_device ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            draft_row_stride < vocab_size ||
+            !accept_thresholds_host || !residual_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        float residual_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+        {
+            accept_thresholds[i] = accept_thresholds_host[i];
+            residual_thresholds[i] = residual_thresholds_host[i];
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_processed_logits_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_logits_device),
+            static_cast<const float *>(draft_logits_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            residual_thresholds[0],
+            residual_thresholds[1],
+            residual_thresholds[2],
+            residual_thresholds[3],
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            static_cast<const float *>(draft_token_probabilities_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyProcessedTargetDraftProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_logits_device,
+        const void *draft_probabilities_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        bool no_draft_probabilities)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_logits_device ||
+            (!no_draft_probabilities && !draft_probabilities_device) ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+            !accept_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+            accept_thresholds[i] = accept_thresholds_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_processed_target_draft_probabilities_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_logits_device),
+            static_cast<const float *>(draft_probabilities_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            static_cast<unsigned long long>(inverse_sample_seed),
+            inverse_sample_first_logical_position,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            no_draft_probabilities ? 1 : 0,
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyProcessedTargetDraftLogitsF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_logits_device,
+        const void *draft_logits_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        uint64_t inverse_sample_seed,
+        int inverse_sample_first_logical_position,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        const void *draft_token_probabilities_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_logits_device || !draft_logits_device ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            draft_row_stride < vocab_size ||
+            !accept_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+            accept_thresholds[i] = accept_thresholds_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_processed_target_draft_logits_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_logits_device),
+            static_cast<const float *>(draft_logits_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            static_cast<const float *>(draft_token_probabilities_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            static_cast<unsigned long long>(inverse_sample_seed),
+            inverse_sample_first_logical_position,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSpeculativeVerifyProbabilitiesF32DeviceThresholdsBatchDeviceTokens(
+        const void *target_probabilities_device,
+        const void *draft_probabilities_device,
+        const void *inverse_rejection_samples_device,
+        int row_count,
+        int vocab_size,
+        int target_row_stride,
+        int draft_row_stride,
+        int inverse_sample_row_stride,
+        const void *draft_tokens_device,
+        const float *accept_thresholds_host,
+        int device_id,
+        void *stream,
+        void *out_token_device,
+        void *out_accepted_device,
+        void *out_accept_probability_device,
+        void *out_accept_threshold_device,
+        bool no_draft_probabilities)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !target_probabilities_device || !inverse_rejection_samples_device ||
+            (!no_draft_probabilities && !draft_probabilities_device) ||
+            !draft_tokens_device ||
+            row_count <= 0 || row_count > 4 ||
+            vocab_size <= 0 ||
+            target_row_stride < vocab_size ||
+            (!no_draft_probabilities && draft_row_stride < vocab_size) ||
+            inverse_sample_row_stride < vocab_size ||
+            !accept_thresholds_host ||
+            !stream || !out_token_device || !out_accepted_device)
+        {
+            return false;
+        }
+
+        float accept_thresholds[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int i = 0; i < row_count; ++i)
+            accept_thresholds[i] = accept_thresholds_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_speculative_verify_probabilities_thresholds_batch_device_tokens_f32(
+            static_cast<const float *>(target_probabilities_device),
+            static_cast<const float *>(draft_probabilities_device),
+            static_cast<const float *>(inverse_rejection_samples_device),
+            row_count,
+            vocab_size,
+            target_row_stride,
+            draft_row_stride,
+            inverse_sample_row_stride,
+            static_cast<const int *>(draft_tokens_device),
+            accept_thresholds[0],
+            accept_thresholds[1],
+            accept_thresholds[2],
+            accept_thresholds[3],
+            no_draft_probabilities ? 1 : 0,
+            static_cast<int *>(out_token_device),
+            static_cast<int *>(out_accepted_device),
+            static_cast<float *>(out_accept_probability_device),
+            static_cast<float *>(out_accept_threshold_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSummarizeSpeculativeVerifyBatch(
+        const void *verify_tokens_device,
+        const void *verify_accepted_device,
+        int row_count,
+        int first_token,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        const void *bonus_token_device,
+        bool has_bonus_token,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_meta_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !verify_accepted_device ||
+            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            (has_bonus_token && !bonus_token_device) ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_speculative_verify_batch(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            row_count,
+            first_token,
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
+            static_cast<const int *>(bonus_token_device),
+            has_bonus_token ? 1 : 0,
+            static_cast<int *>(out_tokens_device),
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSummarizeSpeculativeVerifyBatchDeviceFirstToken(
+        const void *verify_tokens_device,
+        const void *verify_accepted_device,
+        int row_count,
+        const void *first_token_device,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        const void *bonus_token_device,
+        bool has_bonus_token,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_meta_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !verify_accepted_device ||
+            !first_token_device ||
+            row_count < 0 || row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            (has_bonus_token && !bonus_token_device) ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_speculative_verify_batch_device_first_token(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(verify_accepted_device),
+            row_count,
+            static_cast<const int *>(first_token_device),
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
+            static_cast<const int *>(bonus_token_device),
+            has_bonus_token ? 1 : 0,
+            static_cast<int *>(out_tokens_device),
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueSummarizeGreedySpeculativeVerifyBatch(
+        const void *verify_tokens_device,
+        const void *draft_tokens_device,
+        int compare_row_count,
+        int first_token,
+        const int *stop_tokens_host,
+        int stop_token_count,
+        int device_id,
+        void *stream,
+        void *out_tokens_device,
+        void *out_meta_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !verify_tokens_device || !draft_tokens_device ||
+            compare_row_count < 0 ||
+            compare_row_count > kSpeculativeBatchMaxRows ||
+            stop_token_count < 0 ||
+            stop_token_count > kSpeculativeBatchMaxStopTokens ||
+            (stop_token_count > 0 && !stop_tokens_host) ||
+            !stream || !out_tokens_device || !out_meta_device)
+        {
+            return false;
+        }
+
+        int stop_tokens[kSpeculativeBatchMaxStopTokens] =
+            {-1, -1, -1, -1, -1, -1, -1, -1};
+        for (int i = 0; i < stop_token_count; ++i)
+            stop_tokens[i] = stop_tokens_host[i];
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_summarize_greedy_speculative_verify_batch(
+            static_cast<const int *>(verify_tokens_device),
+            static_cast<const int *>(draft_tokens_device),
+            compare_row_count,
+            first_token,
+            stop_tokens[0],
+            stop_tokens[1],
+            stop_tokens[2],
+            stop_tokens[3],
+            stop_tokens[4],
+            stop_tokens[5],
+            stop_tokens[6],
+            stop_tokens[7],
+            stop_token_count,
+            static_cast<int *>(out_tokens_device),
+            static_cast<int *>(out_meta_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueDeriveSpeculativePublicationMetadata(
+        const void *meta_device,
+        int meta_stride,
+        const void *base_cached_tokens_device,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int device_id,
+        void *stream,
+        void *out_restore_rows_device,
+        void *out_target_cached_tokens_device,
+        void *out_accepted_state_counts_device,
+        void *out_ok_device,
+        void *out_next_condition_tokens_device,
+        const void *output_tokens_device,
+        int output_token_stride,
+        void *out_all_drafts_accepted_flags_device,
+        void *out_stopped_flags_device)
+    {
+        using namespace sampling_math;
+        if (device_id >= device_count_ || device_id < 0 ||
+            !meta_device || !base_cached_tokens_device ||
+            meta_stride < kSpeculativeBatchMetaCount ||
+            request_count <= 0 ||
+            padded_state_rows_per_request <= 0 ||
+            max_state_commit_rows < 0 ||
+            max_state_commit_rows > padded_state_rows_per_request ||
+            !stream ||
+            !out_restore_rows_device ||
+            !out_target_cached_tokens_device ||
+            !out_accepted_state_counts_device ||
+            !out_ok_device ||
+            ((out_next_condition_tokens_device || output_tokens_device) &&
+             (!out_next_condition_tokens_device ||
+              !output_tokens_device ||
+              output_token_stride <= 0)))
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_derive_speculative_publication_metadata(
+            static_cast<const int *>(meta_device),
+            meta_stride,
+            static_cast<const int *>(base_cached_tokens_device),
+            request_count,
+            padded_state_rows_per_request,
+            max_state_commit_rows,
+            static_cast<int *>(out_restore_rows_device),
+            static_cast<int *>(out_target_cached_tokens_device),
+            static_cast<int *>(out_accepted_state_counts_device),
+            static_cast<int *>(out_ok_device),
+            static_cast<int *>(out_next_condition_tokens_device),
+            static_cast<const int32_t *>(output_tokens_device),
+            output_token_stride,
+            static_cast<int *>(out_all_drafts_accepted_flags_device),
+            static_cast<int *>(out_stopped_flags_device),
+            device_id,
+            stream);
+    }
+
+    bool ROCmBackend::enqueueDeriveShiftedSpeculativePublicationMetadata(
+        const void *meta_device,
+        int meta_stride,
+        const void *base_cached_tokens_device,
+        int request_count,
+        int padded_state_rows_per_request,
+        int max_state_commit_rows,
+        int mtp_depth,
+        int device_id,
+        void *stream,
+        void *out_target_cached_tokens_device,
+        void *out_accepted_state_counts_device,
+        void *out_ok_device)
+    {
+        if (device_id >= device_count_ || device_id < 0 ||
+            !meta_device || !base_cached_tokens_device ||
+            meta_stride < sampling_math::kSpeculativeBatchMetaCount ||
+            request_count <= 0 ||
+            padded_state_rows_per_request <= 0 ||
+            max_state_commit_rows < 0 ||
+            max_state_commit_rows > padded_state_rows_per_request ||
+            mtp_depth < 0 ||
+            !stream ||
+            !out_target_cached_tokens_device ||
+            !out_accepted_state_counts_device ||
+            !out_ok_device)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_derive_shifted_speculative_publication_metadata(
+            static_cast<const int *>(meta_device),
+            meta_stride,
+            static_cast<const int *>(base_cached_tokens_device),
+            request_count,
+            padded_state_rows_per_request,
+            max_state_commit_rows,
+            mtp_depth,
+            static_cast<int *>(out_target_cached_tokens_device),
+            static_cast<int *>(out_accepted_state_counts_device),
+            static_cast<int *>(out_ok_device),
+            device_id,
+            stream);
+    }
+
+    // Forward declaration for HIP penalty kernel (implemented in ROCmSamplingKernels.hip)
+    extern "C" bool rocmOps_apply_logit_penalties_f32(
+        float *logits, const int *token_ids, const float *penalties,
+        int num_penalties, int vocab_size, int device_idx, void *stream);
+
+    bool ROCmBackend::applyLogitPenaltiesF32(void *logits_device,
+                                              const int *token_ids_host,
+                                              const float *penalties_host,
+                                              int num_penalties, int vocab_size,
+                                              int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !logits_device ||
+            !token_ids_host || !penalties_host || num_penalties <= 0)
+            return false;
+
+        // Lazily allocate per-device penalty upload buffers
+        if (penalty_buffers_.empty())
+            penalty_buffers_.resize(device_count_);
+
+        auto &bufs = penalty_buffers_[device_id];
+
+        // Reallocate if num_penalties exceeds current allocation
+        if (bufs.allocated_count < num_penalties)
+        {
+            HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+            if (bufs.token_ids_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
+            if (bufs.penalties_ptr)
+                HIP_WARN_IF_FAIL(hipFree(bufs.penalties_ptr));
+
+            hipError_t err = hipMalloc(&bufs.token_ids_ptr, num_penalties * sizeof(int));
+            if (err != hipSuccess)
+            {
+                bufs.token_ids_ptr = nullptr;
+                bufs.allocated_count = 0;
+                return false;
+            }
+            err = hipMalloc(&bufs.penalties_ptr, num_penalties * sizeof(float));
+            if (err != hipSuccess)
+            {
+                HIP_WARN_IF_FAIL(hipFree(bufs.token_ids_ptr));
+                bufs.token_ids_ptr = nullptr;
+                bufs.allocated_count = 0;
+                return false;
+            }
+            bufs.allocated_count = num_penalties;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        hipStream_t s = resolveStream(device_id, stream);
+
+        // Upload penalty data to device
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(bufs.token_ids_ptr, token_ids_host,
+                                           num_penalties * sizeof(int),
+                                           hipMemcpyHostToDevice, s));
+        HIP_CHECK_OR_THROW(hipMemcpyAsync(bufs.penalties_ptr, penalties_host,
+                                           num_penalties * sizeof(float),
+                                           hipMemcpyHostToDevice, s));
+
+        // Apply penalties in-place on device
+        if (!rocmOps_apply_logit_penalties_f32(
+                static_cast<float *>(logits_device),
+                static_cast<const int *>(bufs.token_ids_ptr),
+                static_cast<const float *>(bufs.penalties_ptr),
+                num_penalties, vocab_size, device_id, s))
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipStreamSynchronize(s));
+        return true;
+    }
+
+    bool ROCmBackend::enqueueLogitPenaltiesF32Device(void *logits_device,
+                                                     const void *token_ids_device,
+                                                     const void *penalties_device,
+                                                     int num_penalties,
+                                                     int vocab_size,
+                                                     int device_id,
+                                                     void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0 || !logits_device ||
+            !token_ids_device || !penalties_device || num_penalties <= 0 ||
+            vocab_size <= 0 || !stream)
+        {
+            return false;
+        }
+
+        HIP_CHECK_OR_THROW(hipSetDevice(device_id));
+        return rocmOps_apply_logit_penalties_f32(
+            static_cast<float *>(logits_device),
+            static_cast<const int *>(token_ids_device),
+            static_cast<const float *>(penalties_device),
+            num_penalties,
+            vocab_size,
+            device_id,
+            stream);
     }
 
     bool ROCmBackend::hostToDevice(void *dst, const void *src, size_t bytes, int device_id, void *stream)
@@ -511,13 +2333,44 @@ namespace llaminar2
         }
 
         hipEvent_t event;
-        err = hipEventCreate(&event);
+        /*
+         * Match CUDA's event contract: ordinary events are used as cheap
+         * stream-ordering tokens and must not collect elapsed-time data.  HIP
+         * timing events can introduce extra dependency cost on hot paths such
+         * as stochastic MTP response bridging, so callers that need elapsed
+         * time must request createTimingEvent() explicitly.
+         */
+        err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmBackend::createEvent] hipEventCreate failed: " << hipGetErrorString(err));
             return nullptr;
         }
 
+        return reinterpret_cast<void *>(event);
+    }
+
+    void *ROCmBackend::createTimingEvent(int device_id)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            return nullptr;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            return nullptr;
+        }
+
+        hipEvent_t event;
+        err = hipEventCreate(&event);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createTimingEvent] hipEventCreate failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
         return reinterpret_cast<void *>(event);
     }
 
@@ -550,6 +2403,16 @@ namespace llaminar2
 
         hipEvent_t hip_event = reinterpret_cast<hipEvent_t>(event);
         hipStream_t hip_stream = reinterpret_cast<hipStream_t>(stream); // nullptr = default stream
+        if (hip_stream)
+        {
+            hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+            if (hipStreamIsCapturing(hip_stream, &capture_status) == hipSuccess &&
+                capture_status != hipStreamCaptureStatusNone)
+            {
+                return true;
+            }
+        }
+
         err = hipEventRecord(hip_event, hip_stream);
         if (err != hipSuccess)
         {
@@ -557,6 +2420,37 @@ namespace llaminar2
             return false;
         }
 
+        return true;
+    }
+
+    bool ROCmBackend::eventElapsedTimeMs(
+        void *start_event,
+        void *stop_event,
+        int device_id,
+        float *out_ms)
+    {
+        if (!start_event || !stop_event || !out_ms ||
+            device_id >= device_count_ || device_id < 0)
+        {
+            return false;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            return false;
+        }
+
+        err = hipEventElapsedTime(
+            out_ms,
+            reinterpret_cast<hipEvent_t>(start_event),
+            reinterpret_cast<hipEvent_t>(stop_event));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::eventElapsedTimeMs] hipEventElapsedTime failed: " << hipGetErrorString(err));
+            return false;
+        }
         return true;
     }
 
@@ -677,6 +2571,16 @@ namespace llaminar2
             return nullptr;
         }
 
+        if ((reinterpret_cast<std::uintptr_t>(ptr) & (kDeviceAllocationAlignment - 1)) != 0)
+        {
+            LOG_ERROR("[ROCmBackend] hipMalloc returned unaligned pointer " << ptr
+                                                                            << " for " << bytes << " bytes on device "
+                                                                            << device_id << " (required "
+                                                                            << kDeviceAllocationAlignment << "-byte alignment)");
+            (void)hipFree(ptr);
+            return nullptr;
+        }
+
         // TRACE: Log allocation with device and pointer for debugging multi-GPU memory issues
         LOG_TRACE("[ROCmBackend::allocate] ALLOC ptr=" << ptr << " bytes=" << bytes
                                                        << " device_id=" << device_id << " (ROCm ordinal)");
@@ -694,7 +2598,7 @@ namespace llaminar2
             recordPointerEvent("alloc", ptr, bytes, device_id, true);
         }
 
-        LOG_DEBUG("[ROCM_PTR_ALLOC] ptr=" << ptr
+        LOG_TRACE("[ROCM_PTR_ALLOC] ptr=" << ptr
                                           << " bytes=" << bytes
                                           << " device=" << device_id);
 
@@ -860,7 +2764,7 @@ namespace llaminar2
         }
         else
         {
-            LOG_DEBUG("[ROCM_PTR_FREE] ptr=" << ptr
+            LOG_TRACE("[ROCM_PTR_FREE] ptr=" << ptr
                                              << " bytes=" << recorded_size
                                              << " device=" << device_id);
         }
@@ -944,6 +2848,35 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool ROCmBackend::vectorAddInplace(void *output, const void *input, size_t count,
+                                       int element_size, int device_id, void *stream)
+    {
+        if (count == 0)
+            return true;
+        if (!output || !input)
+        {
+            LOG_ERROR("[ROCmBackend::vectorAddInplace] Null output or input pointer");
+            return false;
+        }
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[ROCmBackend::vectorAddInplace] Invalid device ID " << device_id);
+            return false;
+        }
+        if (element_size != static_cast<int>(sizeof(float)))
+        {
+            LOG_ERROR("[ROCmBackend::vectorAddInplace] unsupported element_size: " << element_size);
+            return false;
+        }
+
+        return rocmOps_vector_add_inplace_fp32(
+            static_cast<float *>(output),
+            static_cast<const float *>(input),
+            count,
+            device_id,
+            stream ? stream : resolveStream(device_id, nullptr));
     }
 
     // ====================================================================
@@ -1120,6 +3053,197 @@ namespace llaminar2
         (void)device_id;
 
         return false;
+    }
+
+    // ====================================================================
+    // Stream Management
+    // ====================================================================
+
+    void *ROCmBackend::createStream(int device_id)
+    {
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createStream] hipSetDevice(" << device_id
+                      << ") failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
+
+        hipStream_t stream;
+        err = hipStreamCreateWithFlags(&stream, hipStreamNonBlocking);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::createStream] hipStreamCreateWithFlags failed: "
+                      << hipGetErrorString(err));
+            return nullptr;
+        }
+        return stream;
+    }
+
+    void ROCmBackend::destroyStream(void *stream, int device_id)
+    {
+        if (!stream)
+            return;
+        (void)hipSetDevice(device_id);
+        (void)hipStreamDestroy(static_cast<hipStream_t>(stream));
+    }
+
+    bool ROCmBackend::synchronizeStream(void *stream, int device_id)
+    {
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+            return false;
+        err = hipStreamSynchronize(static_cast<hipStream_t>(stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::synchronizeStream] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::streamWaitEvent(void *stream, void *event, int device_id)
+    {
+        (void)device_id;
+        hipError_t err = hipStreamWaitEvent(
+            static_cast<hipStream_t>(stream),
+            static_cast<hipEvent_t>(event), 0);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::streamWaitEvent] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Async H2D Without Sync (Pipeline Support)
+    // ====================================================================
+
+    bool ROCmBackend::hostToDeviceOnStream(void *dst, const void *src, size_t bytes,
+                                            int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+            return false;
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] refused to use HIP null stream");
+            return false;
+        }
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+            return false;
+
+        err = hipMemcpyAsync(dst, src, bytes, hipMemcpyHostToDevice,
+                             static_cast<hipStream_t>(stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::hostToDeviceOnStream] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool ROCmBackend::deviceToHostOnStream(void *dst, const void *src, size_t bytes,
+                                            int device_id, void *stream)
+    {
+        if (device_id >= device_count_ || device_id < 0)
+            return false;
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmBackend::deviceToHostOnStream] refused to use HIP null stream");
+            return false;
+        }
+
+        hipError_t err = hipSetDevice(device_id);
+        if (err != hipSuccess)
+            return false;
+
+        err = hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToHost,
+                             static_cast<hipStream_t>(stream));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::deviceToHostOnStream] failed: " << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    // ====================================================================
+    // Pinned Host Memory
+    // ====================================================================
+
+    void *ROCmBackend::allocatePinned(size_t bytes, int device_id)
+    {
+        hipError_t set_err = hipSetDevice(device_id);
+        if (set_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::allocatePinned] hipSetDevice(" << device_id
+                      << ") failed: " << hipGetErrorString(set_err));
+            return nullptr;
+        }
+
+        void *ptr = nullptr;
+        hipError_t err = hipHostMalloc(&ptr, bytes, hipHostMallocDefault);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::allocatePinned] hipHostMalloc(" << bytes
+                      << ") failed: " << hipGetErrorString(err));
+            return nullptr;
+        }
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            rocmPinnedAllocations()[ptr] = device_id;
+        }
+        return ptr;
+    }
+
+    void ROCmBackend::freePinned(void *ptr, int device_id)
+    {
+        if (!ptr)
+            return;
+
+        int owner_device = device_id;
+        {
+            std::lock_guard<std::mutex> lock(rocmPinnedAllocationsMutex());
+            auto &allocations = rocmPinnedAllocations();
+            auto it = allocations.find(ptr);
+            if (it != allocations.end())
+            {
+                owner_device = it->second;
+                allocations.erase(it);
+            }
+            else
+            {
+                // Pointer not found in tracking map. This can happen during static
+                // destruction when the Meyers singleton (rocmPinnedAllocations) was
+                // destroyed before KernelFactory's static caches, causing the map
+                // to be re-created empty. Still proceed with hipHostFree using the
+                // caller-provided device_id.
+                LOG_DEBUG("[ROCmBackend::freePinned] untracked pinned pointer " << ptr
+                          << " (normal during static destruction)");
+            }
+        }
+
+        hipError_t set_err = hipSetDevice(owner_device);
+        if (set_err != hipSuccess)
+        {
+            // During static destruction, hipSetDevice may fail if the HIP runtime
+            // has already been torn down. This is expected — skip the free.
+            LOG_DEBUG("[ROCmBackend::freePinned] hipSetDevice(" << owner_device
+                     << ") failed before hipHostFree: " << hipGetErrorString(set_err)
+                     << " (may be normal during shutdown)");
+            return;
+        }
+
+        hipError_t err = hipHostFree(ptr);
+        if (err != hipSuccess)
+        {
+            LOG_DEBUG("[ROCmBackend::freePinned] hipHostFree failed for " << ptr
+                     << " on device " << owner_device << ": " << hipGetErrorString(err)
+                     << " (may be normal during shutdown)");
+        }
     }
 
     // ====================================================================
@@ -1333,6 +3457,78 @@ namespace llaminar2
             return false;
         err = hipStreamSynchronize(s);
         return (err == hipSuccess);
+    }
+
+    bool ROCmBackend::deviceCopyAsync(void *dst, const void *src, size_t bytes,
+                                      int device_id, void *stream)
+    {
+        if (bytes == 0)
+            return true;
+        if (!dst || !src)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] null pointer: dst=" << dst
+                                                                          << " src=" << src
+                                                                          << " bytes=" << bytes);
+            return false;
+        }
+        if (device_id >= device_count_ || device_id < 0)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] invalid device_id=" << device_id);
+            return false;
+        }
+
+        HipDeviceSaveRestore device_guard;
+        hipError_t err_set = hipSetDevice(device_id);
+        if (err_set != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] hipSetDevice(" << device_id
+                                                                      << ") failed: "
+                                                                      << hipGetErrorString(err_set));
+            return false;
+        }
+
+        hipStream_t s = resolveStream(device_id, stream);
+        if (!s)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] refused to use HIP null stream");
+            return false;
+        }
+
+        /*
+         * The MTP sidecar path copies tiny INT32 token slots between arena
+         * buffers. Checking both endpoints here gives junior maintainers a
+         * useful failure message if a future caller accidentally passes a host
+         * shadow pointer or a pointer from a different GPU.
+         */
+        hipPointerAttribute_t dst_attrs{};
+        hipPointerAttribute_t src_attrs{};
+        hipError_t dst_attr_err = hipPointerGetAttributes(&dst_attrs, dst);
+        hipError_t src_attr_err = hipPointerGetAttributes(&src_attrs, src);
+        if (dst_attr_err != hipSuccess || src_attr_err != hipSuccess)
+        {
+            (void)hipGetLastError(); // clear any sticky pointer-query error
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] pointer attribute query failed: dst_err="
+                      << hipGetErrorString(dst_attr_err)
+                      << " src_err=" << hipGetErrorString(src_attr_err));
+            return false;
+        }
+        if (dst_attrs.device != device_id || src_attrs.device != device_id)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] device mismatch: dst_device="
+                      << dst_attrs.device << " src_device=" << src_attrs.device
+                      << " requested_device=" << device_id);
+            return false;
+        }
+
+        hipError_t err =
+            hipMemcpyAsync(dst, src, bytes, hipMemcpyDeviceToDevice, s);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmBackend::deviceCopyAsync] hipMemcpyAsync failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        return true;
     }
 
     bool ROCmBackend::registerIoMemory(void *ptr, size_t size, void **device_ptr)

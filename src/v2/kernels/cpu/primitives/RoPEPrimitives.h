@@ -99,6 +99,39 @@ namespace llaminar2::primitives
         int n_past, float freq_base);
 
     /**
+     * @brief Apply the MTP verifier RoPE contract for M=2..4 rows.
+     *
+     * The all-position verifier must publish state that is numerically
+     * equivalent to feeding the same rows through serial one-token decode.  The
+     * normal multi-row prefill path intentionally uses angle recurrence over the
+     * whole block and can drift slightly from that decode contract.  This helper
+     * keeps the row-ordered decode recurrence inside the RoPE primitive, while
+     * allowing stages to call one grouped kernel contract instead of allocating
+     * one-row scratch tensors and replaying the stage.
+     *
+     * @param q Query rows [verifier_rows, q_heads * head_dim], modified in-place.
+     * @param k Key rows [verifier_rows, k_heads * head_dim], modified in-place, nullable.
+     * @param position_ids Optional absolute position for each row.
+     * @param verifier_rows Number of verifier rows. Production MTP uses M=2..4.
+     * @param head_dim Physical per-head stride.
+     * @param rotary_dim Number of dimensions to rotate. 0 means full head_dim.
+     * @param q_heads Number of query heads.
+     * @param k_heads Number of key heads.
+     * @param pos_offset Contiguous-position fallback when position_ids is null.
+     * @param freq_base RoPE frequency base.
+     * @param persistent_state Thread-local decode recurrence state to preserve
+     *                         the exact single-row decode math.
+     */
+    void apply_rope_decode_equivalent_rows(
+        float *q, float *k,
+        const int *position_ids,
+        int verifier_rows,
+        int head_dim, int rotary_dim,
+        int q_heads, int k_heads,
+        int pos_offset, float freq_base,
+        RoPEPersistentState *persistent_state);
+
+    /**
      * @brief Update persistent state cache for a specific position
      *
      * Ensures that the sin/cos cache in the persistent state is valid for the target position.

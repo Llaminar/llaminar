@@ -147,7 +147,15 @@ namespace llaminar2
 
         // === Stage Tracing (Task 3) ===
         if (success)
+        {
+            if (params_.device_id.is_gpu())
+            {
+                output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                                   params_.device_id,
+                                                   gpuStream());
+            }
             traceOutput("output", params_.output);
+        }
         return success;
     }
 

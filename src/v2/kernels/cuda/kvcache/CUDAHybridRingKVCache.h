@@ -15,6 +15,11 @@
 #include "CUDARingKVCache.h"
 #include "../../HybridKVCacheConfig.h"
 #include "../../IHybridKVCache.h"
+#include "../../../tensors/TensorKernels.h"
+#include "../../../backends/GPUDeviceContextPool.h"
+
+#include <cstdint>
+#include <cstring>
 
 namespace llaminar2
 {
@@ -107,6 +112,7 @@ namespace llaminar2
         // =====================================================================
 
         int n_layers() const override { return total_layers_; }
+        int first_layer_index() const override { return first_layer_index_; }
 
         // =====================================================================
         // IKVCache Overrides — Layer-Indexed Methods
@@ -114,17 +120,45 @@ namespace llaminar2
 
         int get_cached_tokens(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return 0;
             return Base::get_cached_tokens(kv_idx, seq_idx);
+        }
+
+        /**
+         * @brief Device pointer to the compressed FA slot's live cached-token count.
+         *
+         * Hybrid caches allocate CUDA KV entries only for full-attention layers,
+         * so model-layer ids must be remapped before exposing device-owned
+         * sequence metadata.  Attention and graph replay use this pointer to
+         * derive dynamic KV lengths on device; returning the un-remapped base
+         * pointer would make the payload path and metadata path disagree.
+         */
+        const int *deviceCachedTokenCountPtr(int layer, int seq_idx = 0) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return nullptr;
+            return Base::deviceCachedTokenCountPtr(kv_idx, seq_idx);
+        }
+
+        /**
+         * @brief Device pointer to the compressed FA slot's live ring head.
+         */
+        const int *deviceRingHeadPtr(int layer, int seq_idx = 0) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return nullptr;
+            return Base::deviceRingHeadPtr(kv_idx, seq_idx);
         }
 
         bool get_kv(int layer, int seq_idx,
                     ITensor **out_k, ITensor **out_v,
                     int *out_kv_len = nullptr) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -142,7 +176,7 @@ namespace llaminar2
                     const ITensor **out_k, const ITensor **out_v,
                     int *out_kv_len = nullptr) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -158,7 +192,7 @@ namespace llaminar2
 
         ITensor *get_k(int layer, int seq_idx = 0) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_k(kv_idx, seq_idx);
@@ -166,7 +200,7 @@ namespace llaminar2
 
         const ITensor *get_k(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_k(kv_idx, seq_idx);
@@ -174,7 +208,7 @@ namespace llaminar2
 
         ITensor *get_v(int layer, int seq_idx = 0) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_v(kv_idx, seq_idx);
@@ -182,7 +216,7 @@ namespace llaminar2
 
         const ITensor *get_v(int layer, int seq_idx = 0) const override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return nullptr;
             return Base::get_v(kv_idx, seq_idx);
@@ -191,19 +225,42 @@ namespace llaminar2
         // CUDA-specific append (device pointer version)
         bool append(int layer, int seq_idx,
                     const void *d_k, const void *d_v,
-                    int num_tokens, cudaStream_t stream = 0) override
+                    int num_tokens, cudaStream_t stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return true; // GDN layer — no-op
             return Base::append(kv_idx, seq_idx, d_k, d_v, num_tokens, stream);
         }
 
+        /**
+         * @brief Publish grouped verifier K/V rows through the hybrid FA map.
+         *
+         * Qwen3.6 hybrid graphs address stages by global model layer, while the
+         * base GPU ring cache stores only full-attention layers in compressed
+         * FA-slot order.  Keeping this remap in the hybrid cache makes normal
+         * decode, grouped verifier decode, prefix restore, and graph-captured
+         * replay all use the same ownership rule.
+         */
+        bool appendVerifierRowsDecodeEquivalent(int layer,
+                                                int seq_idx,
+                                                const ITensor *K,
+                                                const ITensor *V,
+                                                int verifier_rows,
+                                                void *gpu_stream = nullptr) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return true; // GDN layer — no KV payload to publish.
+            return Base::appendVerifierRowsDecodeEquivalent(
+                kv_idx, seq_idx, K, V, verifier_rows, gpu_stream);
+        }
+
         bool get_kv_for_attention(int layer, int seq_idx,
                                   const void **d_k_out, const void **d_v_out,
-                                  int *kv_len, cudaStream_t stream = 0) override
+                                  int *kv_len, cudaStream_t stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (d_k_out)
@@ -219,9 +276,9 @@ namespace llaminar2
 
         bool linearize_to(int layer, int seq_idx,
                           void *d_k_out, void *d_v_out,
-                          int *kv_len, cudaStream_t stream = 0) override
+                          int *kv_len, cudaStream_t stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return false;
             return Base::linearize_to(kv_idx, seq_idx, d_k_out, d_v_out, kv_len, stream);
@@ -229,7 +286,7 @@ namespace llaminar2
 
         void evict_oldest(int layer, int seq_idx, int num_tokens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return;
             Base::evict_oldest(kv_idx, seq_idx, num_tokens);
@@ -237,7 +294,7 @@ namespace llaminar2
 
         void evict_oldest_layer(int layer, int num_tokens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return;
             Base::evict_oldest_layer(kv_idx, num_tokens);
@@ -246,9 +303,9 @@ namespace llaminar2
         int gather_kv_batched(int layer, int num_seqs,
                               void *d_k_out, void *d_v_out,
                               int *kv_lens, int max_kv_len,
-                              cudaStream_t stream = 0) override
+                              cudaStream_t stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return -1;
             return Base::gather_kv_batched(kv_idx, num_seqs, d_k_out, d_v_out,
@@ -257,6 +314,9 @@ namespace llaminar2
 
         void clear() override
         {
+            // Base::clear() resets compressed FA entries directly and scrubs
+            // CUDA sidecar/device buffers without dispatching through the hybrid
+            // global-layer clear_layer() override.
             Base::clear();
             for (auto &state : gdn_states_)
             {
@@ -267,7 +327,7 @@ namespace llaminar2
 
         void clear_sequence(int layer, int seq_idx) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return;
             // Qualify fully to avoid name hiding from 'using IKVCache::clear_sequence' in Base
@@ -276,17 +336,68 @@ namespace llaminar2
 
         void clear_layer(int layer) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx >= 0)
             {
-                CUDARingKVCacheBase::clear_layer(kv_idx);
+                for (int seq = 0; seq < this->batch_size_; ++seq)
+                {
+                    CUDARingKVCacheBase::clear_sequence(kv_idx, seq);
+                }
             }
             else
             {
-                int gdn_idx = layer_map_.toGDNIndex(layer);
+                int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
                 if (gdn_idx >= 0 && gdn_idx < static_cast<int>(gdn_states_.size()))
+                {
                     gdn_states_[gdn_idx].reset();
+                    gdn_states_[gdn_idx].resetGPUKernelState();
+                }
             }
+        }
+
+        typename IKVCache::KVCacheLogicalBlockLayout logicalBlockLayout(int global_layer, int token_count) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(global_layer));
+            if (kv_idx < 0)
+                return {};
+            return Base::logicalBlockLayout(baseLayerIndexForKVIndex(kv_idx), token_count);
+        }
+
+        typename IKVCache::KVCacheSequenceState sequenceState(int global_layer, int seq_idx) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(global_layer));
+            if (kv_idx < 0)
+                return {};
+            return Base::sequenceState(baseLayerIndexForKVIndex(kv_idx), seq_idx);
+        }
+
+        bool exportLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
+                                void *dst_k,
+                                void *dst_v) const override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(desc.layer));
+            if (kv_idx < 0)
+                return false;
+            auto remapped = desc;
+            remapped.layer = baseLayerIndexForKVIndex(kv_idx);
+            return Base::exportLogicalBlock(remapped, dst_k, dst_v);
+        }
+
+        bool importLogicalBlock(const IKVCache::KVCacheLogicalBlockDescriptor &desc,
+                                const void *src_k,
+                                const void *src_v) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(desc.layer));
+            if (kv_idx < 0)
+                return false;
+            auto remapped = desc;
+            remapped.layer = baseLayerIndexForKVIndex(kv_idx);
+            return Base::importLogicalBlock(remapped, src_k, src_v);
+        }
+
+        bool truncateSequence(int seq_idx, int cached_tokens, void *stream = nullptr) override
+        {
+            return Base::truncateSequence(seq_idx, cached_tokens, stream);
         }
 
         bool get_kv_converted(int layer, int seq_idx,
@@ -295,7 +406,7 @@ namespace llaminar2
                               int *out_kv_len = nullptr,
                               const typename IKVCache::KVReadParams *rope = nullptr) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
             {
                 if (out_k)
@@ -312,15 +423,23 @@ namespace llaminar2
         // Graph capture support with remapping
         void setDynamicHead(int layer, int seq_idx, void *gpu_stream) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return;
             Base::setDynamicHead(kv_idx, seq_idx, gpu_stream);
         }
 
+        bool setDynamicAppendState(int layer, int seq_idx, int append_tokens, void *gpu_stream) override
+        {
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
+            if (kv_idx < 0)
+                return false;
+            return Base::setDynamicAppendState(kv_idx, seq_idx, append_tokens, gpu_stream);
+        }
+
         void advanceHead(int layer, int seq_idx, int num_tokens) override
         {
-            int kv_idx = layer_map_.toKVIndex(layer);
+            int kv_idx = layer_map_.toKVIndex(normalizeLayerIndex(layer));
             if (kv_idx < 0)
                 return;
             Base::advanceHead(kv_idx, seq_idx, num_tokens);
@@ -330,12 +449,20 @@ namespace llaminar2
         // GDN State Access (IHybridKVCache)
         // =====================================================================
 
-        bool isGDNLayer(int layer) const override { return !layer_map_.isFullAttention(layer); }
-        bool isFullAttentionLayer(int layer) const override { return layer_map_.isFullAttention(layer); }
+        bool isGDNLayer(int layer) const override
+        {
+            const int local_layer = normalizeLayerIndex(layer);
+            return local_layer >= 0 && local_layer < total_layers_ &&
+                   !layer_map_.isFullAttention(local_layer);
+        }
+        bool isFullAttentionLayer(int layer) const override
+        {
+            return layer_map_.isFullAttention(normalizeLayerIndex(layer));
+        }
 
         HybridGDNLayerState *getGDNState(int layer) override
         {
-            int gdn_idx = layer_map_.toGDNIndex(layer);
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0)
                 return nullptr;
             return &gdn_states_[gdn_idx];
@@ -343,7 +470,7 @@ namespace llaminar2
 
         const HybridGDNLayerState *getGDNState(int layer) const override
         {
-            int gdn_idx = layer_map_.toGDNIndex(layer);
+            int gdn_idx = layer_map_.toGDNIndex(normalizeLayerIndex(layer));
             if (gdn_idx < 0)
                 return nullptr;
             return &gdn_states_[gdn_idx];
@@ -393,15 +520,280 @@ namespace llaminar2
             return total;
         }
 
+        HybridPrefixStateMetadata hybridPrefixStateMetadata() const override
+        {
+            return buildHybridPrefixStateMetadata();
+        }
+
+        bool exportHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            void *dst_host,
+            void *dst_device) const override
+        {
+            if (desc.seq_idx < 0)
+                return false;
+
+            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
+            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            const bool host_staged_device_state = needs_device && !dst_device && dst_host;
+            if ((needs_host && !dst_host) ||
+                (needs_device && !dst_device && !host_staged_device_state))
+            {
+                return false;
+            }
+
+            void *effective_stream = desc.stream;
+            if (!effective_stream && this->device_id() >= 0)
+                effective_stream = GPUDeviceContextPool::instance()
+                                       .getNvidiaContext(this->device_id())
+                                       .defaultStream();
+
+            auto *host_cursor = (needs_host || host_staged_device_state)
+                                    ? reinterpret_cast<uint8_t *>(dst_host)
+                                    : nullptr;
+            auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
+            const bool ok = exportHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                effective_stream,
+                desc.include_host_state,
+                desc.include_device_state);
+            if (ok && effective_stream && desc.synchronize)
+                GPUDeviceContextPool::instance()
+                    .getNvidiaContext(this->device_id())
+                    .synchronizeStream(effective_stream);
+            return ok;
+        }
+
+        bool importHybridPrefixState(
+            const HybridPrefixStateDescriptor &desc,
+            const void *src_host,
+            const void *src_device) override
+        {
+            if (desc.seq_idx < 0)
+                return false;
+
+            HybridPrefixStateMetadata metadata = buildHybridPrefixStateMetadata();
+            const bool needs_host = desc.include_host_state && metadata.host_bytes > 0;
+            const bool needs_device = desc.include_device_state && metadata.device_bytes > 0;
+            const bool host_staged_device_state = needs_device && !src_device && src_host;
+            if ((needs_host && !src_host) ||
+                (needs_device && !src_device && !host_staged_device_state))
+            {
+                return false;
+            }
+
+            void *effective_stream = desc.stream;
+            if (!effective_stream && this->device_id() >= 0)
+                effective_stream = GPUDeviceContextPool::instance()
+                                       .getNvidiaContext(this->device_id())
+                                       .defaultStream();
+
+            const auto *host_cursor = (needs_host || host_staged_device_state)
+                                          ? reinterpret_cast<const uint8_t *>(src_host)
+                                          : nullptr;
+            const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
+            const bool ok = importHybridStatePayload(
+                host_cursor,
+                device_cursor,
+                effective_stream,
+                desc.include_host_state,
+                desc.include_device_state);
+            if (ok && effective_stream && desc.synchronize)
+                GPUDeviceContextPool::instance()
+                    .getNvidiaContext(this->device_id())
+                    .synchronizeStream(effective_stream);
+            return ok;
+        }
+
         const HybridLayerMap &layerMap() const { return layer_map_; }
 
     private:
         int total_layers_;
+        int first_layer_index_ = 0;
         HybridLayerMap layer_map_;
         std::vector<HybridGDNLayerState> gdn_states_;
 
+        int normalizeLayerIndex(int layer) const
+        {
+            if (layer >= first_layer_index_ &&
+                layer < first_layer_index_ + total_layers_)
+            {
+                return layer - first_layer_index_;
+            }
+            return layer;
+        }
+
+        int baseLayerIndexForKVIndex(int kv_idx) const
+        {
+            return first_layer_index_ + kv_idx;
+        }
+
+        HybridPrefixStateMetadata buildHybridPrefixStateMetadata() const
+        {
+            HybridPrefixStateMetadata metadata;
+            metadata.total_layers = total_layers_;
+            metadata.gdn_layers = layer_map_.gdnLayerCount();
+            metadata.host_bytes = gdnMemoryBytes();
+
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                const auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+                if (state->conv_kernel)
+                    metadata.device_bytes += state->conv_kernel->stateBytes();
+                if (state->rec_kernel)
+                    metadata.device_bytes += state->rec_kernel->stateBytes();
+            }
+            metadata.has_device_kernel_state = metadata.device_bytes > 0;
+            return metadata;
+        }
+
+        bool exportHybridStatePayload(
+            uint8_t *&host_cursor,
+            uint8_t *&device_cursor,
+            void *stream,
+            bool include_host_state = true,
+            bool include_device_state = true) const
+        {
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                const auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+
+                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                if (include_host_state && recurrence_bytes > 0)
+                {
+                    std::memcpy(host_cursor, state->recurrence_state.data(), recurrence_bytes);
+                    host_cursor += recurrence_bytes;
+                }
+                if (include_host_state && conv_bytes > 0)
+                {
+                    std::memcpy(host_cursor, state->conv_state.data(), conv_bytes);
+                    host_cursor += conv_bytes;
+                }
+
+                if (include_device_state && state->conv_kernel)
+                {
+                    const size_t bytes = state->conv_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (device_cursor)
+                        {
+                            if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->conv_kernel->exportState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
+                    }
+                }
+                if (include_device_state && state->rec_kernel)
+                {
+                    const size_t bytes = state->rec_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (device_cursor)
+                        {
+                            if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->rec_kernel->exportState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
+        bool importHybridStatePayload(
+            const uint8_t *&host_cursor,
+            const uint8_t *&device_cursor,
+            void *stream,
+            bool include_host_state = true,
+            bool include_device_state = true)
+        {
+            for (int layer = 0; layer < total_layers_; ++layer)
+            {
+                auto *state = getGDNState(layer);
+                if (!state)
+                    continue;
+
+                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                if (include_host_state && recurrence_bytes > 0)
+                {
+                    std::memcpy(state->recurrence_state.data(), host_cursor, recurrence_bytes);
+                    host_cursor += recurrence_bytes;
+                }
+                if (include_host_state && conv_bytes > 0)
+                {
+                    std::memcpy(state->conv_state.data(), host_cursor, conv_bytes);
+                    host_cursor += conv_bytes;
+                }
+
+                if (include_device_state && state->conv_kernel)
+                {
+                    const size_t bytes = state->conv_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (device_cursor)
+                        {
+                            if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->conv_kernel->importState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
+                    }
+                }
+                if (include_device_state && state->rec_kernel)
+                {
+                    const size_t bytes = state->rec_kernel->stateBytes();
+                    if (bytes > 0)
+                    {
+                        if (device_cursor)
+                        {
+                            if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
+                                return false;
+                            device_cursor += bytes;
+                        }
+                        else
+                        {
+                            if (!host_cursor ||
+                                !state->rec_kernel->importState(host_cursor, nullptr, stream))
+                                return false;
+                            host_cursor += bytes;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+
         void initHybrid(const HybridKVCacheConfig &config)
         {
+            first_layer_index_ = config.first_layer_index;
             layer_map_.build(config.layer_types);
 
             const int n_gdn = layer_map_.gdnLayerCount();
@@ -453,10 +845,10 @@ namespace llaminar2
                 state.initialize(qkv_dim);
             }
 
-            LOG_INFO("[CUDAHybridRingKVCache] Created: " << total_layers_ << " total layers, "
-                                                         << layer_map_.kvLayerCount() << " KV (FA), "
-                                                         << n_gdn << " GDN. "
-                                                         << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
+            LOG_DEBUG("[CUDAHybridRingKVCache] Created: " << total_layers_ << " total layers, "
+                                                          << layer_map_.kvLayerCount() << " KV (FA), "
+                                                          << n_gdn << " GDN. "
+                                                          << "GDN state: " << (gdnMemoryBytes() / 1024) << " KB");
         }
     };
 

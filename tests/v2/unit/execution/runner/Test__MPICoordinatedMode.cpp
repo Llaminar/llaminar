@@ -89,13 +89,14 @@ namespace
         // Test inspection
         const std::vector<BroadcastRecord> &broadcasts() const { return broadcasts_; }
         size_t broadcastCount() const { return broadcasts_.size(); }
+        size_t barrierCount() const { return barrier_count_; }
         void clearRecords() { broadcasts_.clear(); }
 
         // =====================================================================
         // Remaining IMPIContext stubs (no-ops)
         // =====================================================================
 
-        void barrier() const override {}
+        void barrier() const override { ++barrier_count_; }
         void allreduce_sum(const float *send, float *recv, size_t count) const override
         {
             std::memcpy(recv, send, count * sizeof(float));
@@ -163,6 +164,7 @@ namespace
         int rank_;
         int world_size_;
         mutable std::vector<BroadcastRecord> broadcasts_;
+        mutable size_t barrier_count_{0};
     };
 
     // =========================================================================
@@ -197,7 +199,15 @@ namespace
         int get_position() const override { return 0; }
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock"; }
-        int sampleGreedyOnDevice() override { return -1; }
+        int sampleGreedyOnDevice() override
+        {
+            sample_greedy_on_device_count_++;
+            return sample_greedy_on_device_token_;
+        }
+        bool requiresMPICoordinatedDecodeSampling(const SamplingParams &) const override
+        {
+            return requires_mpi_coordinated_decode_sampling_;
+        }
 
         void setSkipLogitsGatherDecode(bool skip) override
         {
@@ -208,6 +218,7 @@ namespace
         // Test inspection
         int forwardCallCount() const { return forward_call_count_; }
         int clearCacheCount() const { return clear_cache_count_; }
+        int sampleGreedyOnDeviceCount() const { return sample_greedy_on_device_count_; }
         int skipLogitsCalls() const { return skip_logits_calls_; }
         bool skipLogitsGather() const { return skip_logits_gather_; }
         const std::vector<int> &lastForwardTokens() const { return last_forward_tokens_; }
@@ -217,15 +228,23 @@ namespace
         void setThrowOnForward(bool throw_on) { throw_on_forward_ = throw_on; }
         /// Make forward() return false after the Nth successful call
         void setFailAfterNForwards(int n) { fail_after_n_forwards_ = n; }
+        void setSampleGreedyOnDeviceToken(int token) { sample_greedy_on_device_token_ = token; }
+        void setRequiresMPICoordinatedDecodeSampling(bool required)
+        {
+            requires_mpi_coordinated_decode_sampling_ = required;
+        }
 
     private:
         std::vector<float> logits_;
         int forward_call_count_{0};
         int clear_cache_count_{0};
+        int sample_greedy_on_device_count_{0};
         int skip_logits_calls_{0};
+        int sample_greedy_on_device_token_{-1};
         bool skip_logits_gather_{false};
         bool forward_success_{true};
         bool throw_on_forward_{false};
+        bool requires_mpi_coordinated_decode_sampling_{false};
         int fail_after_n_forwards_{0}; // 0 = disabled
         std::vector<int> last_forward_tokens_;
     };
@@ -396,6 +415,92 @@ namespace
         ASSERT_EQ(cmd.int_data.size(), 1u);
         EXPECT_EQ(cmd.int_data[0],
                   static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
+    }
+
+    TEST_F(Test__MPICoordinatedMode, DecodeStepPublishesRootTokenToWorkers)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        // Prefill makes token 3 available from the mock logits.  Coordinated
+        // server mode must publish that root-owned sample before rank 0 returns
+        // to the command loop, otherwise worker ranks can drift before the next
+        // decode/forced-token command.
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mpi->clearRecords();
+
+        GenerationResult result = runner->decodeStep();
+
+        ASSERT_TRUE(result.success()) << result.error;
+        ASSERT_THAT(result.tokens, ElementsAre(3));
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
+        EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
+                  static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
+    }
+
+    TEST_F(Test__MPICoordinatedMode, DecodeStepSkipsDeviceSamplerWhenCoordinatedSamplingDisabled)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+        mock->setSampleGreedyOnDeviceToken(7);
+        mock->setRequiresMPICoordinatedDecodeSampling(false);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mpi->clearRecords();
+
+        GenerationResult result = runner->decodeStep();
+
+        ASSERT_TRUE(result.success()) << result.error;
+        EXPECT_THAT(result.tokens, ElementsAre(3));
+        EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 0);
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
+        EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
+                  static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(3));
+    }
+
+    TEST_F(Test__MPICoordinatedMode, DecodeStepUsesDeviceSamplerWhenCoordinatedSamplingEnabled)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+        mock->setSampleGreedyOnDeviceToken(7);
+        mock->setRequiresMPICoordinatedDecodeSampling(true);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mpi->clearRecords();
+
+        GenerationResult result = runner->decodeStep();
+
+        ASSERT_TRUE(result.success()) << result.error;
+        EXPECT_THAT(result.tokens, ElementsAre(7));
+        EXPECT_EQ(mock->sampleGreedyOnDeviceCount(), 1);
+        ASSERT_EQ(mpi->broadcastCount(), 3u);
+        EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
+                  static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(0));
+        EXPECT_THAT(mpi->broadcasts()[2].int_data, ElementsAre(7));
+    }
+
+    TEST_F(Test__MPICoordinatedMode, ForceDecodeTokenBroadcastsCommandTokenAndFence)
+    {
+        auto [runner, mock, mpi] = createRunner(0, 2);
+        runner->setMPICoordinatedMode(true);
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mpi->clearRecords();
+
+        GenerationResult result = runner->forceDecodeToken(90);
+
+        ASSERT_TRUE(result.success()) << result.error;
+        ASSERT_THAT(result.tokens, ElementsAre(90));
+        ASSERT_EQ(mpi->broadcastCount(), 2u);
+        EXPECT_EQ(mpi->broadcasts()[0].int_data[0],
+                  static_cast<int32_t>(OrchestrationRunner::MPICommand::FORCE_DECODE_TOKEN));
+        EXPECT_THAT(mpi->broadcasts()[1].int_data, ElementsAre(90));
+        EXPECT_EQ(mpi->barrierCount(), 1u);
     }
 
     // =========================================================================
@@ -748,9 +853,10 @@ namespace
         size_t broadcastCount() const { return broadcast_count_; }
         size_t scriptPosition() const { return script_pos_; }
         size_t scriptSize() const { return script_.size(); }
+        size_t barrierCount() const { return barrier_count_; }
 
         // Remaining stubs (same as RecordingMPIContext)
-        void barrier() const override {}
+        void barrier() const override { ++barrier_count_; }
         void allreduce_sum(const float *send, float *recv, size_t count) const override
         {
             std::memcpy(recv, send, count * sizeof(float));
@@ -820,6 +926,7 @@ namespace
         mutable std::vector<ScriptEntry> script_;
         mutable size_t script_pos_{0};
         mutable size_t broadcast_count_{0};
+        mutable size_t barrier_count_{0};
     };
 
     // =========================================================================
@@ -856,6 +963,13 @@ namespace
 
         auto runner = std::make_unique<OrchestrationRunner>(
             std::move(config), plan, std::move(mock), scripted_mpi);
+        /*
+         * Server/interactive modes enable coordinated mode before calling the
+         * worker loop.  Keep this helper aligned with that production contract
+         * so worker tests exercise decode token publication and forced-token
+         * fences instead of the standalone rank path.
+         */
+        runner->setMPICoordinatedMode(true);
 
         return {std::move(runner), mock_ptr, mpi_ptr};
     }
@@ -904,8 +1018,12 @@ namespace
         scripted->scriptInt32({42});
         // First decode: consumes prefill logits (no forward)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({7}); // root-published token for next decode
         // Second decode: must call forward
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({8}); // root-published token before shutdown
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
@@ -914,6 +1032,28 @@ namespace
         // Prefill = 1 forward, first decode skips (prefill logits),
         // second decode = 1 forward. Total: 2.
         EXPECT_EQ(mock->forwardCallCount(), 2);
+    }
+
+    TEST_F(Test__MPICoordinatedMode, WorkerLoopUsesRootPublishedTokenForNextDecode)
+    {
+        auto scripted = std::make_shared<ScriptedMPIContext>(1, 2);
+        scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::PREFILL)});
+        scripted->scriptInt32({1});
+        scripted->scriptInt32({42});
+        scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({777}); // authoritative root sample
+        scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({778});
+        scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
+
+        auto [runner, mock, mpi] = createWorkerRunner(scripted);
+        runner->runMPIWorkerLoop();
+
+        EXPECT_EQ(mock->forwardCallCount(), 2);
+        EXPECT_THAT(mock->lastForwardTokens(), ElementsAre(777));
+        EXPECT_EQ(mpi->scriptPosition(), mpi->scriptSize());
     }
 
     TEST_F(Test__MPICoordinatedMode, WorkerLoopDispatchesSetSampling)
@@ -958,7 +1098,11 @@ namespace
         scripted->scriptInt32({2}); // token count
         scripted->scriptInt32({10, 20}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({30}); // root-published token
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({31}); // root-published token
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
 
         auto [runner, mock, mpi] = createWorkerRunner(scripted);
@@ -1094,8 +1238,11 @@ namespace
         scripted->scriptInt32({10, 20});
         // First decode uses prefill logits (no forward call)
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({21}); // root-published token after first decode
         // Second decode calls forward — the 2nd forward call — which we fail
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
         // Should still continue past the failed decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});
@@ -1143,7 +1290,11 @@ namespace
         scripted->scriptInt32({3}); // token count
         scripted->scriptInt32({1, 2, 3}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({13}); // root-published token
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({14}); // root-published token
 
         // Request 2: clear → prefill → decode
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::CLEAR_CACHE)});
@@ -1151,6 +1302,8 @@ namespace
         scripted->scriptInt32({2}); // token count
         scripted->scriptInt32({4, 5}); // tokens
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::DECODE_STEP)});
+        scripted->scriptInt32({0}); // decode token budget
+        scripted->scriptInt32({15}); // root-published token
 
         // Shutdown
         scripted->scriptInt32({static_cast<int32_t>(OrchestrationRunner::MPICommand::SHUTDOWN)});

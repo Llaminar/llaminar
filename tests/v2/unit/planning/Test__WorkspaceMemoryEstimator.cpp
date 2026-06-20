@@ -31,12 +31,22 @@ TEST(Test__WorkspaceMemoryEstimator, GPU_HasMinimumFloor)
     EXPECT_GE(bytes, 768ULL * 1024 * 1024);
 }
 
-TEST(Test__WorkspaceMemoryEstimator, LargeVocab_ExceedsFloor)
+TEST(Test__WorkspaceMemoryEstimator, PreparedEmbeddingPathDoesNotReserveEmbeddingTableTemp)
 {
-    // With d_model=4096 and vocab=151936, embed_temp alone is ~2.5 GB,
-    // which exceeds the 768 MB floor after the 1.1x safety margin.
+    // Qwen3.6-scale vocab and hidden dimensions should not force a
+    // vocab×d_model embedding-table workspace reservation in production.
+    // The embedding kernel declares that fallback buffer only when prepared
+    // embedding weights are unavailable.
     size_t bytes = WorkspaceMemoryEstimator::estimate(
-        1, 4096, 4096, 16384, 151936, DeviceId::cuda(0));
+        1, 4096, 5120, 27648, 151936, DeviceId::cuda(0));
+
+    EXPECT_EQ(bytes, 768ULL * 1024 * 1024);
+}
+
+TEST(Test__WorkspaceMemoryEstimator, VeryLongContextCanExceedFloorFromGemmOverhead)
+{
+    size_t bytes = WorkspaceMemoryEstimator::estimate(
+        1, 32768, 5120, 27648, 151936, DeviceId::cuda(0));
 
     EXPECT_GT(bytes, 768ULL * 1024 * 1024);
 }

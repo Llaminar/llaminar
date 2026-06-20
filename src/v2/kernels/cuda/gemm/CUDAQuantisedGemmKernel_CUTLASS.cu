@@ -98,6 +98,7 @@ namespace
         const float *__restrict__ A_fp32,       // [M × K]
         int8_t *__restrict__ A_int8,            // [M × K] output
         float *__restrict__ scales_A_blockwise, // [M × num_blocks] output
+        int32_t *__restrict__ sums_A_blockwise, // [M × num_blocks] optional quantized activation sums
         int M, int K)
     {
         const int row = blockIdx.y;
@@ -138,9 +139,22 @@ namespace
             if (lane == 0)
                 row_scales[b] = scale;
 
-            // Quantize and coalesced write
+            // Quantize, coalesced write, and optionally record the quantized
+            // block sum. Asymmetric NativeVNNI prefill uses this sum for the
+            // min correction instead of recomputing it for every output tile.
             float qval = val * inv_scale;
-            row_int8[k_start + lane] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+            const int32_t q = static_cast<int32_t>(rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+            row_int8[k_start + lane] = static_cast<int8_t>(q);
+
+            if (sums_A_blockwise)
+            {
+                int32_t sum_q = q;
+#pragma unroll
+                for (int mask = 16; mask > 0; mask >>= 1)
+                    sum_q += __shfl_xor_sync(0xFFFFFFFF, sum_q, mask);
+                if (lane == 0)
+                    sums_A_blockwise[row * num_blocks + b] = sum_q;
+            }
         }
     }
 
@@ -244,13 +258,77 @@ extern "C"
 
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
-            d_A_fp32, d_A_int8, d_scales_A_blockwise, M, K);
+            d_A_fp32, d_A_int8, d_scales_A_blockwise, nullptr, M, K);
 
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess)
         {
             std::ostringstream oss;
             oss << "[CUDAQuantGemm] blockwise quantize kernel launch failed: "
+                << cudaGetErrorString(err)
+                << " (M=" << M << ", K=" << K << ")";
+            throw std::runtime_error(oss.str());
+        }
+
+        return true;
+    }
+
+    /**
+     * @brief Quantize FP32 activations and also emit per-32-block INT8 sums.
+     */
+    bool cudaQuantGemm_quantizeActivationsBlockwiseWithSums(
+        const float *d_A_fp32,
+        int8_t *d_A_int8,
+        float *d_scales_A_blockwise,
+        int32_t *d_sums_A_blockwise,
+        int M, int K,
+        int cuda_device_id,
+        void *stream)
+    {
+        if (!d_sums_A_blockwise)
+        {
+            return cudaQuantGemm_quantizeActivationsBlockwise(
+                d_A_fp32, d_A_int8, d_scales_A_blockwise,
+                M, K, cuda_device_id, stream);
+        }
+        if (!d_A_fp32 || !d_A_int8 || !d_scales_A_blockwise)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::quantizeActivationsBlockwiseWithSums] Null pointer: "
+                << "d_A_fp32=" << (void *)d_A_fp32
+                << " d_A_int8=" << (void *)d_A_int8
+                << " d_scales_A_blockwise=" << (void *)d_scales_A_blockwise
+                << " d_sums_A_blockwise=" << (void *)d_sums_A_blockwise;
+            throw std::runtime_error(oss.str());
+        }
+        if ((K % BLOCKWISE_BLOCK_SIZE) != 0)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm::quantizeActivationsBlockwiseWithSums] K=" << K
+                << " is not divisible by " << BLOCKWISE_BLOCK_SIZE;
+            throw std::runtime_error(oss.str());
+        }
+
+        CUDA_CHECK_THROW(cudaSetDevice(cuda_device_id));
+
+        constexpr int NUM_WARPS = 4;
+        constexpr int BLOCK_SIZE = NUM_WARPS * 32;
+        const int num_k_blocks = K / BLOCKWISE_BLOCK_SIZE;
+        int grid_x = (num_k_blocks + NUM_WARPS - 1) / NUM_WARPS;
+        if (grid_x > 256)
+            grid_x = 256;
+
+        dim3 grid(grid_x, M);
+        dim3 block(BLOCK_SIZE);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        quantize_activations_blockwise_kernel<<<grid, block, 0, cuda_stream>>>(
+            d_A_fp32, d_A_int8, d_scales_A_blockwise, d_sums_A_blockwise, M, K);
+
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess)
+        {
+            std::ostringstream oss;
+            oss << "[CUDAQuantGemm] blockwise quantize-with-sums kernel launch failed: "
                 << cudaGetErrorString(err)
                 << " (M=" << M << ", K=" << K << ")";
             throw std::runtime_error(oss.str());
@@ -349,6 +427,12 @@ extern "C"
      */
     bool cudaQuantGemm_copyDeviceToDeviceAsync(float *d_dst, const float *d_src, size_t count, int cuda_device_id, void *stream)
     {
+        if (!stream)
+        {
+            std::cerr << "[CUDAQuantGemm] Refusing async D2D copy on the CUDA default stream; "
+                      << "callers must bind an explicit stream\n";
+            return false;
+        }
         CUDA_CHECK(cudaSetDevice(cuda_device_id));
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         CUDA_CHECK(cudaMemcpyAsync(d_dst, d_src, count * sizeof(float),

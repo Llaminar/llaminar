@@ -20,11 +20,69 @@
 #include <algorithm>
 
 #include "utils/Sampler.h"
+#include "kernels/common/SamplingMath.h"
+#include "kernels/cpu/sampling/CPUSamplerPrimitives.h"
 
 using namespace llaminar2;
 
 namespace
 {
+    std::vector<float> make_unique_logits(size_t vocab_size)
+    {
+        std::vector<float> logits(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i)
+        {
+            const float wave = std::sin(static_cast<float>(i) * 0.01731f) * 7.0f;
+            const float saw = static_cast<float>((i * 37u) % 997u) * 0.00037f;
+            const float trend = static_cast<float>(i % 19u) * 0.0031f;
+            logits[i] = wave + saw - trend;
+        }
+        return logits;
+    }
+
+    void expect_topk_variants_equal(const std::vector<float> &logits, int top_k)
+    {
+        std::vector<float> scalar_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<float> avx2_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<float> avx512_logits(static_cast<size_t>(top_k), 0.0f);
+        std::vector<int> scalar_ids(static_cast<size_t>(top_k), -1);
+        std::vector<int> avx2_ids(static_cast<size_t>(top_k), -1);
+        std::vector<int> avx512_ids(static_cast<size_t>(top_k), -1);
+
+        const int scalar_count = cpu_sampling::select_topk_scalar(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            scalar_logits.data(),
+            scalar_ids.data());
+        const int avx2_count = cpu_sampling::select_topk_avx2(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            avx2_logits.data(),
+            avx2_ids.data());
+        const int avx512_count = cpu_sampling::select_topk_avx512(
+            logits.data(),
+            static_cast<int>(logits.size()),
+            top_k,
+            avx512_logits.data(),
+            avx512_ids.data());
+
+        ASSERT_EQ(avx2_count, scalar_count);
+        ASSERT_EQ(avx512_count, scalar_count);
+        ASSERT_EQ(scalar_count, std::min<int>(top_k, static_cast<int>(logits.size())));
+        for (int i = 0; i < scalar_count; ++i)
+        {
+            EXPECT_EQ(avx2_ids[static_cast<size_t>(i)], scalar_ids[static_cast<size_t>(i)])
+                << "AVX2 top-k id mismatch at rank " << i;
+            EXPECT_EQ(avx512_ids[static_cast<size_t>(i)], scalar_ids[static_cast<size_t>(i)])
+                << "AVX512 top-k id mismatch at rank " << i;
+            EXPECT_FLOAT_EQ(avx2_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
+                << "AVX2 top-k logit mismatch at rank " << i;
+            EXPECT_FLOAT_EQ(avx512_logits[static_cast<size_t>(i)], scalar_logits[static_cast<size_t>(i)])
+                << "AVX512 top-k logit mismatch at rank " << i;
+        }
+    }
 
     /**
      * @brief Test fixture for Sampler tests
@@ -356,6 +414,342 @@ namespace
 
         EXPECT_GE(token, 0);
         EXPECT_LT(token, static_cast<int>(standard_logits_.size()));
+    }
+
+    TEST_F(SamplerTest, ComputeDistributionCombinesTopKAndTopP)
+    {
+        std::vector<float> logits = {4.0f, 3.0f, 2.0f, 1.0f};
+
+        SamplingParams params;
+        params.temperature = 1.0f;
+        params.top_k = 3;
+        params.top_p = 0.8f;
+
+        auto distribution =
+            sampler_->compute_distribution(logits.data(), logits.size(), params);
+
+        ASSERT_EQ(distribution.size(), 2u)
+            << "top-p should be applied inside the top-k candidate set";
+        EXPECT_EQ(distribution[0].token_id, 0);
+        EXPECT_EQ(distribution[1].token_id, 1);
+        EXPECT_NEAR(distribution[0].probability + distribution[1].probability,
+                    1.0f,
+                    1e-6f);
+        EXPECT_GT(distribution[0].probability, distribution[1].probability);
+        EXPECT_FLOAT_EQ(Sampler::probability_of_token(distribution, 2), 0.0f);
+    }
+
+    TEST_F(SamplerTest, ComputeDistributionMatchesSharedCompactSamplingMath)
+    {
+        std::vector<float> logits = {0.1f, 4.5f, 3.8f, 0.0f,
+                                     2.2f, 5.0f, -1.0f, 3.2f};
+
+        SamplingParams params;
+        params.temperature = 0.6f;
+        params.top_k = 5;
+        params.top_p = 0.85f;
+
+        std::vector<std::pair<float, int>> sorted;
+        sorted.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i)
+        {
+            sorted.emplace_back(logits[i], static_cast<int>(i));
+        }
+        std::partial_sort(
+            sorted.begin(),
+            sorted.begin() + params.top_k,
+            sorted.end(),
+            [](const auto &a, const auto &b)
+            {
+                return a.first > b.first;
+            });
+
+        std::vector<float> sorted_logits(static_cast<size_t>(params.top_k));
+        std::vector<int> sorted_ids(static_cast<size_t>(params.top_k));
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            sorted_logits[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].first;
+            sorted_ids[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].second;
+        }
+
+        std::vector<float> scratch(static_cast<size_t>(params.top_k), 0.0f);
+        std::vector<int> expected_ids(static_cast<size_t>(params.top_k), -1);
+        std::vector<float> expected_probs(static_cast<size_t>(params.top_k), 0.0f);
+        sampling_math::build_topk_topp_distribution_from_sorted(
+            sorted_logits.data(),
+            sorted_ids.data(),
+            params.top_k,
+            params.top_p,
+            params.temperature,
+            expected_ids.data(),
+            expected_probs.data(),
+            scratch.data());
+
+        const auto distribution =
+            sampler_->compute_distribution(logits.data(), logits.size(), params);
+
+        std::vector<int> actual_ids;
+        std::vector<float> actual_probs;
+        for (const auto &entry : distribution)
+        {
+            actual_ids.push_back(entry.token_id);
+            actual_probs.push_back(entry.probability);
+        }
+
+        size_t expected_active = 0;
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            if (expected_ids[static_cast<size_t>(i)] >= 0)
+            {
+                ASSERT_LT(expected_active, actual_ids.size());
+                EXPECT_EQ(actual_ids[expected_active], expected_ids[static_cast<size_t>(i)]);
+                EXPECT_NEAR(actual_probs[expected_active],
+                            expected_probs[static_cast<size_t>(i)],
+                            1e-6f);
+                ++expected_active;
+            }
+        }
+        EXPECT_EQ(actual_ids.size(), expected_active);
+    }
+
+    TEST_F(SamplerTest, CPUSelectTopKVariantsMatchScalar)
+    {
+        const auto logits = make_unique_logits(4099);
+        for (int top_k : {1, 4, 20, 40, sampling_math::kMaxTopK})
+        {
+            expect_topk_variants_equal(logits, top_k);
+        }
+    }
+
+    TEST_F(SamplerTest, CPUSelectTopKHandlesNonVectorTail)
+    {
+        const auto logits = make_unique_logits(257);
+        expect_topk_variants_equal(logits, 31);
+    }
+
+    TEST_F(SamplerTest, ComputeDistributionTopKFastPathMatchesPartialSortBaseline)
+    {
+        const auto logits = make_unique_logits(8193);
+
+        SamplingParams params;
+        params.temperature = 0.72f;
+        params.top_k = 40;
+        params.top_p = 0.93f;
+
+        std::vector<std::pair<float, int>> sorted;
+        sorted.reserve(logits.size());
+        for (size_t i = 0; i < logits.size(); ++i)
+        {
+            sorted.emplace_back(logits[i], static_cast<int>(i));
+        }
+        std::partial_sort(
+            sorted.begin(),
+            sorted.begin() + params.top_k,
+            sorted.end(),
+            [](const auto &a, const auto &b)
+            {
+                return a.first > b.first;
+            });
+
+        std::vector<float> sorted_logits(static_cast<size_t>(params.top_k));
+        std::vector<int> sorted_ids(static_cast<size_t>(params.top_k));
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            sorted_logits[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].first;
+            sorted_ids[static_cast<size_t>(i)] = sorted[static_cast<size_t>(i)].second;
+        }
+
+        std::vector<float> scratch(static_cast<size_t>(params.top_k), 0.0f);
+        std::vector<int> expected_ids(static_cast<size_t>(params.top_k), -1);
+        std::vector<float> expected_probs(static_cast<size_t>(params.top_k), 0.0f);
+        sampling_math::build_topk_topp_distribution_from_sorted(
+            sorted_logits.data(),
+            sorted_ids.data(),
+            params.top_k,
+            params.top_p,
+            params.temperature,
+            expected_ids.data(),
+            expected_probs.data(),
+            scratch.data());
+
+        const auto distribution =
+            sampler_->compute_distribution(logits.data(), logits.size(), params);
+
+        size_t expected_active = 0;
+        for (int i = 0; i < params.top_k; ++i)
+        {
+            if (expected_ids[static_cast<size_t>(i)] < 0)
+            {
+                continue;
+            }
+            ASSERT_LT(expected_active, distribution.size());
+            EXPECT_EQ(distribution[expected_active].token_id, expected_ids[static_cast<size_t>(i)]);
+            EXPECT_NEAR(distribution[expected_active].probability,
+                        expected_probs[static_cast<size_t>(i)],
+                        1e-6f);
+            ++expected_active;
+        }
+        EXPECT_EQ(distribution.size(), expected_active);
+    }
+
+    TEST_F(SamplerTest, SharedSamplingMathSpeculativeVerifyMatchesSamplerHelpers)
+    {
+        const int target_ids[] = {10, 20, 30, -1};
+        const float target_probs[] = {0.2f, 0.3f, 0.5f, 0.0f};
+        const int draft_ids[] = {10, 20, 40, -1};
+        const float draft_probs[] = {0.4f, 0.1f, 0.5f, 0.0f};
+
+        int out_token = -1;
+        int out_accepted = -1;
+        float out_accept_probability = -1.0f;
+        float out_accept_threshold = -1.0f;
+        sampling_math::speculative_verify_with_thresholds(
+            target_ids,
+            target_probs,
+            draft_ids,
+            draft_probs,
+            4,
+            10,
+            0.75f,
+            0.25f,
+            &out_token,
+            &out_accepted,
+            &out_accept_probability,
+            &out_accept_threshold);
+
+        EXPECT_EQ(out_accepted, 0);
+        EXPECT_EQ(out_token, 20);
+        EXPECT_NEAR(out_accept_probability,
+                    Sampler::speculative_accept_probability(0.2f, 0.4f),
+                    1e-6f);
+        EXPECT_NEAR(out_accept_threshold, 0.75f, 1e-6f);
+
+        std::vector<SamplingDistributionEntry> residual =
+            Sampler::residual_distribution({{10, 0.2f}, {20, 0.3f}, {30, 0.5f}},
+                                           {{10, 0.4f}, {20, 0.1f}, {40, 0.5f}});
+        std::vector<int> residual_ids;
+        std::vector<float> residual_probs;
+        for (const auto &entry : residual)
+        {
+            residual_ids.push_back(entry.token_id);
+            residual_probs.push_back(entry.probability);
+        }
+        EXPECT_EQ(sampling_math::sample_distribution_with_threshold(
+                      residual_ids.data(),
+                      residual_probs.data(),
+                      static_cast<int>(residual_ids.size()),
+                      0.25f),
+                  out_token);
+    }
+
+    TEST_F(SamplerTest, ResidualDistributionSamplesPositiveTargetMinusDraftMass)
+    {
+        Sampler sampler(123);
+        std::vector<SamplingDistributionEntry> target = {
+            {1, 0.2f},
+            {2, 0.8f},
+        };
+        std::vector<SamplingDistributionEntry> draft = {
+            {1, 0.9f},
+            {2, 0.1f},
+        };
+
+        for (int i = 0; i < 20; ++i)
+        {
+            EXPECT_EQ(sampler.sample_from_residual_distribution(target, draft), 2);
+        }
+    }
+
+    TEST_F(SamplerTest, SpeculativeAcceptProbabilityUsesTargetOverDraftMass)
+    {
+        EXPECT_FLOAT_EQ(Sampler::speculative_accept_probability(0.8f, 0.2f), 1.0f)
+            << "p >= q should always accept the draft token";
+        EXPECT_NEAR(Sampler::speculative_accept_probability(0.2f, 0.5f), 0.4f, 1e-6f);
+        EXPECT_FLOAT_EQ(Sampler::speculative_accept_probability(0.2f, 0.0f), 0.0f)
+            << "a draft token absent from q cannot be accepted";
+        EXPECT_FLOAT_EQ(Sampler::speculative_accept_probability(-0.2f, 0.5f), 0.0f)
+            << "negative probability inputs should clamp to no accept";
+    }
+
+    TEST_F(SamplerTest, ResidualDistributionNormalizesTargetMinusDraftMass)
+    {
+        std::vector<SamplingDistributionEntry> target = {
+            {1, 0.2f},
+            {2, 0.3f},
+            {3, 0.5f},
+        };
+        std::vector<SamplingDistributionEntry> draft = {
+            {1, 0.1f},
+            {2, 0.5f},
+            {4, 0.4f},
+        };
+
+        const auto residual = Sampler::residual_distribution(target, draft);
+
+        ASSERT_EQ(residual.size(), 2u);
+        EXPECT_EQ(residual[0].token_id, 1);
+        EXPECT_EQ(residual[1].token_id, 3);
+        EXPECT_NEAR(residual[0].probability, 1.0f / 6.0f, 1e-6f);
+        EXPECT_NEAR(residual[1].probability, 5.0f / 6.0f, 1e-6f);
+        EXPECT_FLOAT_EQ(Sampler::probability_of_token(residual, 2), 0.0f)
+            << "tokens where q exceeds p must not appear in the residual";
+        EXPECT_FLOAT_EQ(Sampler::probability_of_token(residual, 4), 0.0f)
+            << "draft-only tokens must not appear in the residual";
+    }
+
+    TEST_F(SamplerTest, SpeculativeAcceptRejectReconstructsTargetDistribution)
+    {
+        std::vector<SamplingDistributionEntry> target = {
+            {1, 0.2f},
+            {2, 0.3f},
+            {3, 0.5f},
+        };
+        std::vector<SamplingDistributionEntry> draft = {
+            {1, 0.5f},
+            {2, 0.25f},
+            {3, 0.25f},
+        };
+        const auto residual = Sampler::residual_distribution(target, draft);
+
+        std::vector<SamplingDistributionEntry> reconstructed = {
+            {1, 0.0f},
+            {2, 0.0f},
+            {3, 0.0f},
+        };
+        auto add_probability = [&](int token_id, float mass) {
+            for (auto &entry : reconstructed)
+            {
+                if (entry.token_id == token_id)
+                {
+                    entry.probability += mass;
+                    return;
+                }
+            }
+        };
+
+        for (const auto &draft_entry : draft)
+        {
+            const float p = Sampler::probability_of_token(target, draft_entry.token_id);
+            const float q = draft_entry.probability;
+            const float accept_probability =
+                Sampler::speculative_accept_probability(p, q);
+            add_probability(draft_entry.token_id, q * accept_probability);
+
+            const float reject_mass = q * (1.0f - accept_probability);
+            for (const auto &residual_entry : residual)
+            {
+                add_probability(residual_entry.token_id,
+                                reject_mass * residual_entry.probability);
+            }
+        }
+
+        for (const auto &target_entry : target)
+        {
+            EXPECT_NEAR(Sampler::probability_of_token(reconstructed, target_entry.token_id),
+                        target_entry.probability,
+                        1e-6f)
+                << "speculative accept/reject path must preserve the target distribution";
+        }
     }
 
     // =============================================================================
@@ -1265,6 +1659,411 @@ namespace
         // Token 42 (9.0) should now be argmax
         int token = sampler_->sample(logits, params);
         EXPECT_EQ(token, 42);
+    }
+
+    // =============================================================================
+    // DRY Penalty Tests
+    // =============================================================================
+
+    TEST_F(SamplerTest, DRY_NoPenaltyWhenDisabled)
+    {
+        // DRY is disabled when multiplier == 0 (default)
+        const int vocab_size = 100;
+        sampler_->record_token(5);
+        sampler_->record_token(6);
+        sampler_->record_token(5);
+        sampler_->record_token(6);
+
+        SamplingParams params;
+        params.dry_multiplier = 0.0f; // disabled
+        auto penalties = sampler_->compute_penalty_map(params, vocab_size);
+        EXPECT_TRUE(penalties.empty());
+    }
+
+    TEST_F(SamplerTest, DRY_NoPenaltyWithNoHistory)
+    {
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty());
+    }
+
+    TEST_F(SamplerTest, DRY_DetectsSimpleRepeat)
+    {
+        // History: [A, B, C, A, B, C] — "A B C" repeated
+        // The token that would continue the repeat is A (token 10)
+        const int A = 10, B = 20, C = 30;
+        for (int token : {A, B, C, A, B, C})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 1; // Trigger on repeat_len > 1
+        params.dry_penalty_last_n = -1; // Use full history
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // Token A should be penalized (extending the repeat "A B C" → "A B C A")
+        bool found_A = false;
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+            {
+                found_A = true;
+                EXPECT_GT(p.penalty, 0.0f);
+            }
+        }
+        EXPECT_TRUE(found_A) << "Token A should be penalized for extending the repeat";
+    }
+
+    TEST_F(SamplerTest, DRY_AllowedLengthPreventsShortRepeats)
+    {
+        // History: [A, B, A, B] — "A B" is length 2
+        // llama.cpp semantics: allowed_length means "penalize repeats >= this length"
+        // So allowed_length=3 means repeats of length 2 are NOT penalized
+        const int A = 10, B = 20;
+        for (int token : {A, B, A, B})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 3; // Don't penalize repeats of length < 3
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        // The repeat is length 2, which is < allowed_length 3, so no penalty
+        EXPECT_TRUE(penalties.empty())
+            << "Repeats < allowed_length should not be penalized";
+    }
+
+    TEST_F(SamplerTest, DRY_ExponentialPenaltyScaling)
+    {
+        // History: [A, B, C, D, A, B, C, D] — repeat of length 4
+        const int A = 10, B = 20, C = 30, D = 40;
+        for (int token : {A, B, C, D, A, B, C, D})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 2.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // Find penalty for A (the token that would extend the repeat)
+        float penalty_A = 0.0f;
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+                penalty_A = p.penalty;
+        }
+
+        // Expected: multiplier * base^(repeat_len - allowed_length) = 2.0 * 1.75^(4-1) = 2.0 * 5.359375
+        float expected = 2.0f * std::pow(1.75f, 3.0f);
+        EXPECT_NEAR(penalty_A, expected, 0.01f)
+            << "DRY penalty should scale exponentially";
+    }
+
+    TEST_F(SamplerTest, DRY_WindowLimitsHistory)
+    {
+        // Fill history: [1, 2, 3, 4, 5, 1, 2, 3, 4, 5]
+        for (int token : {1, 2, 3, 4, 5, 1, 2, 3, 4, 5})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = 3; // Only look at last 3 tokens [4, 5]... wait, [3,4,5]
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // With only 3 tokens of history visible, longer repeats won't be detected
+        // The 3-token window sees [3, 4, 5] — need at least repeat_len+1 tokens to detect
+        // So the full 5-token repeat can't be seen
+        // But smaller sub-patterns within the window might still trigger
+        // The key test is that with dry_penalty_last_n=3, we don't get the full-length penalty
+        float full_penalty = std::pow(1.75f, 4.0f); // 5-1-0 = 4, never reached
+        for (const auto &p : penalties)
+        {
+            EXPECT_LT(p.penalty, full_penalty)
+                << "Window should prevent detection of full repeat";
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_SequenceBreakersResetDetection)
+    {
+        // History: [A, NEWLINE, A] where NEWLINE is a breaker
+        const int A = 10, NEWLINE = 50;
+        for (int token : {A, NEWLINE, A})
+            sampler_->record_token(token);
+
+        // Set up breaker: token 50 (NEWLINE) is a single-token breaker
+        sampler_->initDryBreakers({"\n"}, [&](const std::string &) -> std::vector<int> {
+            return {NEWLINE}; // Mock: "\n" tokenizes to [NEWLINE]
+        });
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 1;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // The NEWLINE between the two A tokens should break repeat detection
+        // So A should NOT be penalized
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+            {
+                FAIL() << "Token A should not be penalized when a sequence breaker intervenes";
+            }
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_CombinesWithPresenceFrequencyPenalty)
+    {
+        const int A = 10;
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+
+        SamplingParams params;
+        params.presence_penalty = 1.0f;
+        params.frequency_penalty = 0.5f;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // Token A should have combined penalty from presence + frequency + DRY
+        float total_penalty = 0.0f;
+        for (const auto &p : penalties)
+        {
+            if (p.token_id == A)
+                total_penalty = p.penalty;
+        }
+
+        // Presence: 1.0, Frequency: 0.5 * 4 = 2.0, total presence+freq = 3.0
+        // DRY also adds on top of that
+        EXPECT_GT(total_penalty, 3.0f)
+            << "DRY should add to presence+frequency penalties";
+    }
+
+    TEST_F(SamplerTest, DRY_AffectsSampling)
+    {
+        // Create a scenario where DRY penalty changes the argmax
+        const int vocab_size = 10;
+        std::vector<float> logits(vocab_size, 0.0f);
+
+        // Token 5 has the highest logit
+        logits[5] = 10.0f;
+        logits[3] = 9.5f;
+
+        // Build history that would cause DRY to penalize token 5
+        // History: [5, 7, 5, 7] — repeating pattern, next would be 5
+        sampler_->record_token(5);
+        sampler_->record_token(7);
+        sampler_->record_token(5);
+        sampler_->record_token(7);
+
+        SamplingParams params;
+        params.temperature = 0.0f; // Greedy
+        params.dry_multiplier = 5.0f;
+        params.dry_base = 1.75f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        int token = sampler_->sample(logits, params);
+        // Token 5 should be penalized enough that token 3 wins
+        EXPECT_EQ(token, 3) << "DRY penalty should prevent repeating token 5";
+    }
+
+    TEST_F(SamplerTest, DRY_ResetHistoryClearsDryState)
+    {
+        sampler_->record_token(1);
+        sampler_->record_token(2);
+        sampler_->record_token(1);
+        sampler_->record_token(2);
+
+        sampler_->reset_history();
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty())
+            << "After reset, DRY should have no history to detect repeats from";
+    }
+
+    TEST_F(SamplerTest, DRY_PenaltyLastN_Zero_DisablesDRY)
+    {
+        sampler_->record_token(5);
+        sampler_->record_token(5);
+        sampler_->record_token(5);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_penalty_last_n = 0; // Disabled
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty());
+    }
+
+    TEST_F(SamplerTest, DRY_LogitPenaltyStruct)
+    {
+        // Basic sanity check for LogitPenalty
+        LogitPenalty lp{42, 3.14f};
+        EXPECT_EQ(lp.token_id, 42);
+        EXPECT_FLOAT_EQ(lp.penalty, 3.14f);
+    }
+
+    TEST_F(SamplerTest, DRY_HasPenaltiesIncludesDRY)
+    {
+        SamplingParams params;
+        params.dry_multiplier = 0.0f;
+        EXPECT_FALSE(params.has_penalties());
+
+        params.dry_multiplier = 1.0f;
+        EXPECT_TRUE(params.has_penalties());
+    }
+
+    TEST_F(SamplerTest, DRY_OverflowProtection)
+    {
+        // With a very large repeat, pow() should not overflow to infinity
+        // History: 50 copies of token A → repeat_len = 49
+        const int A = 10;
+        for (int i = 0; i < 50; ++i)
+            sampler_->record_token(A);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 2.0f;         // 2^49 would overflow float
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        for (const auto &p : penalties)
+        {
+            EXPECT_FALSE(std::isinf(p.penalty))
+                << "DRY penalty should not overflow to infinity";
+            EXPECT_FALSE(std::isnan(p.penalty))
+                << "DRY penalty should not be NaN";
+            EXPECT_GT(p.penalty, 0.0f)
+                << "DRY penalty should still be positive after clamping";
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_SingleTokenBreakerExemption)
+    {
+        // If a token is itself a single-token sequence breaker, it should be
+        // exempt from DRY penalty even if it would extend a repeat.
+        // This aligns with llama.cpp's Step 4 breaker exemption.
+        const int A = 10, NEWLINE = 50;
+
+        // History: [NEWLINE, A, NEWLINE, A, NEWLINE]
+        // The repeat "NEWLINE A" appears twice, so NEWLINE would normally be penalized
+        // as the token that extends the repeat. But NEWLINE is a breaker → exempt.
+        for (int token : {NEWLINE, A, NEWLINE, A, NEWLINE})
+            sampler_->record_token(token);
+
+        sampler_->initDryBreakers({"\n"}, [&](const std::string &) -> std::vector<int> {
+            return {NEWLINE};
+        });
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+
+        // NEWLINE should be exempt from penalty because it's a single-token breaker
+        for (const auto &p : penalties)
+        {
+            EXPECT_NE(p.token_id, NEWLINE)
+                << "Single-token breaker should be exempt from DRY penalty";
+        }
+    }
+
+    TEST_F(SamplerTest, DRY_BaseLessThanOneDisabled)
+    {
+        // dry_base < 1.0 should disable DRY (aligned with llama.cpp)
+        const int A = 10;
+        for (int token : {A, A, A, A})
+            sampler_->record_token(token);
+
+        SamplingParams params;
+        params.dry_multiplier = 1.0f;
+        params.dry_base = 0.5f;  // < 1.0 → disabled
+        params.dry_allowed_length = 0;
+        params.dry_penalty_last_n = -1;
+
+        auto penalties = sampler_->compute_penalty_map(params, 100);
+        EXPECT_TRUE(penalties.empty())
+            << "DRY should be disabled when dry_base < 1.0";
+    }
+
+    TEST_F(SamplerTest, DRY_PenaltyIsAddedToPresenceFrequency)
+    {
+        // Verify DRY penalty is ADDED to presence+frequency, not max'd
+        const int A = 10;
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+        sampler_->record_token(A);
+
+        // Compute presence+frequency only
+        SamplingParams params_pf;
+        params_pf.presence_penalty = 1.0f;
+        params_pf.frequency_penalty = 0.5f;
+
+        Sampler sampler_pf(42);
+        sampler_pf.record_token(A);
+        sampler_pf.record_token(A);
+        sampler_pf.record_token(A);
+        auto penalties_pf = sampler_pf.compute_penalty_map(params_pf, 100);
+        float pf_only = 0.0f;
+        for (const auto &p : penalties_pf)
+            if (p.token_id == A) pf_only = p.penalty;
+
+        // Compute DRY only
+        SamplingParams params_dry;
+        params_dry.dry_multiplier = 1.0f;
+        params_dry.dry_allowed_length = 0;
+        params_dry.dry_penalty_last_n = -1;
+
+        Sampler sampler_dry(42);
+        sampler_dry.record_token(A);
+        sampler_dry.record_token(A);
+        sampler_dry.record_token(A);
+        auto penalties_dry = sampler_dry.compute_penalty_map(params_dry, 100);
+        float dry_only = 0.0f;
+        for (const auto &p : penalties_dry)
+            if (p.token_id == A) dry_only = p.penalty;
+
+        // Compute combined
+        SamplingParams params_both;
+        params_both.presence_penalty = 1.0f;
+        params_both.frequency_penalty = 0.5f;
+        params_both.dry_multiplier = 1.0f;
+        params_both.dry_allowed_length = 0;
+        params_both.dry_penalty_last_n = -1;
+
+        auto penalties_both = sampler_->compute_penalty_map(params_both, 100);
+        float combined = 0.0f;
+        for (const auto &p : penalties_both)
+            if (p.token_id == A) combined = p.penalty;
+
+        // Combined should equal pf + dry (additive, not max)
+        EXPECT_NEAR(combined, pf_only + dry_only, 0.001f)
+            << "DRY should be added to presence+frequency penalties, not max'd";
     }
 
 } // anonymous namespace

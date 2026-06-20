@@ -10,12 +10,61 @@
 #include "../../../backends/BackendManager.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../compute_stages/IComputeStage.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include <algorithm>
 #include <cctype>
+#include <limits>
 
 namespace llaminar2
 {
+    namespace
+    {
+        /// @brief Emit a coarse per-device VRAM checkpoint when LLAMINAR_VRAM_TRACE is enabled.
+        void logWorkspaceVramTrace(DeviceId device, const char *label, size_t bytes = 0)
+        {
+            if (!debugEnv().vram_trace || !device.is_gpu())
+                return;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+                return;
+
+            const int ordinal = device.gpu_ordinal();
+            const size_t free_bytes = backend->deviceMemoryFree(ordinal);
+            const size_t total_bytes = backend->deviceMemoryTotal(ordinal);
+            const size_t used_bytes = total_bytes > free_bytes ? total_bytes - free_bytes : 0;
+            LOG_TRACE("[VRAM_TRACE] " << label
+                                      << " device=" << device.toString()
+                                      << " used_mib=" << (used_bytes / (1024 * 1024))
+                                      << " free_mib=" << (free_bytes / (1024 * 1024))
+                                      << " total_mib=" << (total_bytes / (1024 * 1024))
+                                      << " bytes=" << bytes);
+        }
+
+        bool synchronizeBeforeWorkspaceRelease(DeviceId device)
+        {
+            if (!device.is_gpu())
+                return true;
+
+            IBackend *backend = getBackendFor(device);
+            if (!backend)
+            {
+                LOG_ERROR("[WorkspaceAllocator] Cannot synchronize " << device.toString()
+                                                                      << " before workspace release: backend unavailable");
+                return false;
+            }
+
+            const int device_idx = device.gpu_ordinal();
+            if (!backend->synchronize(device_idx))
+            {
+                LOG_ERROR("[WorkspaceAllocator] Failed to synchronize " << device.toString()
+                                                                        << " before workspace release");
+                return false;
+            }
+            return true;
+        }
+    }
 
     // =========================================================================
     // Memory Query
@@ -65,10 +114,10 @@ namespace llaminar2
         budget = std::max(budget, config.min_budget);
         budget = std::min(budget, config.max_budget);
 
-        LOG_INFO("[WorkspaceAllocator] " << device.toString()
-                                         << " available=" << (available / (1024 * 1024)) << "MB"
-                                         << ", budget=" << (budget / (1024 * 1024)) << "MB"
-                                         << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
+        LOG_TRACE("[WorkspaceAllocator] " << device.toString()
+                                          << " available=" << (available / (1024 * 1024)) << "MB"
+                                          << ", budget=" << (budget / (1024 * 1024)) << "MB"
+                                          << " (fraction=" << fraction << ", headroom=" << (config.headroom / (1024 * 1024)) << "MB)");
 
         return budget;
     }
@@ -92,8 +141,11 @@ namespace llaminar2
         // Per-layer GEMM workspace uses full max_seq_len (prefill processes all tokens)
         const size_t mk_overhead = static_cast<size_t>(max_seq_len) * static_cast<size_t>(d_model) * sizeof(float) * 2;
         const size_t padded_n_buffer = 8ULL * static_cast<size_t>(vocab_size) * sizeof(float);
-        const size_t embed_table_temp = static_cast<size_t>(vocab_size) * static_cast<size_t>(d_model) * sizeof(float);
-        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer + embed_table_temp;
+        // Prepared embedding weights live in their own device allocation. The
+        // large embed_table_temp workspace is requested by the embedding kernel
+        // only for fallback/test paths without prepared weights, so it must not
+        // inflate every production graph's baseline workspace floor.
+        const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer;
         const size_t safety_margin = base_workspace / 10;
         const size_t min_budget = 768ULL * 1024 * 1024;
         return std::max(min_budget, base_workspace + safety_margin);
@@ -113,6 +165,95 @@ namespace llaminar2
             int k = 0;
         };
 
+        auto requirementsForGraphBinding = [](const ConsumerBinding &binding) -> WorkspaceRequirements
+        {
+            WorkspaceRequirements combined;
+            if (!binding.consumer)
+                return combined;
+
+            /**
+             * Production graphs are often allocated with a prefill-sized M but
+             * later replayed for one-row decode. Several CUDA fused projection
+             * stages need decode-only side-stream GEMV buffers that are not
+             * visible from a large-M sizing request. Merge an explicit M=1
+             * request so a single graph workspace covers both regimes.
+             *
+             * Query the auxiliary decode shape first, then the active graph
+             * shape. Some tests and diagnostic consumers record the last sizing
+             * request they saw; leaving the graph shape last keeps that
+             * observability meaningful while preserving the merged decode-only
+             * buffers.
+             */
+            if (binding.m != 1)
+            {
+                combined.merge(binding.consumer->getWorkspaceRequirements(
+                    1,
+                    binding.n,
+                    binding.k));
+            }
+
+            combined.merge(binding.consumer->getWorkspaceRequirements(
+                binding.m,
+                binding.n,
+                binding.k));
+
+            return combined;
+        };
+
+        auto clampDimToInt = [](size_t value) -> int
+        {
+            if (value > static_cast<size_t>(std::numeric_limits<int>::max()))
+            {
+                return std::numeric_limits<int>::max();
+            }
+            return static_cast<int>(value);
+        };
+
+        auto applyDeclaredStageShape = [&](const IComputeStage &stage,
+                                           ConsumerBinding &binding) -> bool
+        {
+            const StageBufferRequirements buffer_reqs = stage.getBufferRequirements();
+            int declared_m = 0;
+            int declared_k = 0;
+
+            for (const auto &buffer : buffer_reqs.buffers)
+            {
+                if (buffer.shape.size() < 2 || buffer.shape[0] == 0 || buffer.shape.back() == 0)
+                {
+                    continue;
+                }
+
+                const bool activation_like =
+                    buffer.role == BufferRole::INPUT ||
+                    buffer.role == BufferRole::INOUT ||
+                    buffer.role == BufferRole::OUTPUT ||
+                    buffer.role == BufferRole::SCRATCH;
+                if (!activation_like)
+                {
+                    continue;
+                }
+
+                declared_m = clampDimToInt(buffer.shape[0]);
+                if (buffer.role == BufferRole::INPUT || buffer.role == BufferRole::INOUT)
+                {
+                    declared_k = clampDimToInt(buffer.shape.back());
+                }
+                break;
+            }
+
+            if (declared_m <= 0)
+            {
+                return false;
+            }
+
+            binding.m = std::max(1, declared_m);
+            if (declared_k > 0)
+            {
+                binding.k = declared_k;
+            }
+            return true;
+        };
+
         std::unordered_map<DeviceId, std::vector<ConsumerBinding>> consumers_by_device;
 
         const auto execution_order = graph.getExecutionOrder();
@@ -130,7 +271,16 @@ namespace llaminar2
                 continue;
             }
 
-            const DeviceId device = node->device;
+            DeviceId device = node->device;
+            if ((!device.is_valid() || !device.is_gpu()) &&
+                node->stage->device().is_valid())
+            {
+                device = node->stage->device();
+            }
+            if (!device.is_gpu() && node->stage->device().is_gpu())
+            {
+                device = node->stage->device();
+            }
             if (!device.is_gpu())
             {
                 continue;
@@ -172,6 +322,7 @@ namespace llaminar2
                 binding.m = std::max(1, hints.max_seq_len);
                 binding.n = 0;
                 binding.k = 0;
+                (void)applyDeclaredStageShape(*node->stage, binding);
             }
 
             consumers_by_device[device].push_back(binding);
@@ -179,7 +330,8 @@ namespace llaminar2
 
         for (const auto &request : extra_consumers)
         {
-            if (!request.consumer || !request.device.is_gpu())
+            if (!request.consumer ||
+                !request.device.is_gpu())
             {
                 continue;
             }
@@ -211,19 +363,18 @@ namespace llaminar2
             auto existing = device_workspaces_.find(device);
             if (existing != device_workspaces_.end() && existing->second)
             {
-                // Check if new consumers need buffers not yet in the existing workspace.
-                // This happens when per-layer graphs create new GEMM kernel instances
-                // with unique per-instance buffer names (e.g., gemm_temp_c_fp32_<id>).
+                // Check if new consumers need buffers that are absent or larger
+                // than the existing workspace allocation. Bucketed prefill can
+                // warm a smaller graph before a larger bucket arrives; name-only
+                // reuse would bind undersized scratch to the larger graph.
                 bool needs_realloc = false;
                 for (const auto &consumer_binding : consumers)
                 {
-                    auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
-                        consumer_binding.m,
-                        consumer_binding.n,
-                        consumer_binding.k);
+                    auto reqs = requirementsForGraphBinding(consumer_binding);
                     for (const auto &buf : reqs.buffers)
                     {
-                        if (!existing->second->hasBuffer(buf.name))
+                        if (!existing->second->hasBuffer(buf.name) ||
+                            existing->second->getBufferSize(buf.name) < buf.size_bytes)
                         {
                             needs_realloc = true;
                             break;
@@ -252,6 +403,24 @@ namespace llaminar2
 
                 // Release old workspace so we can reallocate with merged requirements
                 size_t old_budget = existing->second->budget();
+
+                // Unbind consumers BEFORE destroying old workspace to prevent
+                // ABA pointer aliasing: if the new DeviceWorkspaceManager host
+                // object is allocated at the same heap address as the old one,
+                // kernels' `if (workspace_ != workspace)` guard would falsely
+                // evaluate to false and skip re-initialization of GPU buffers
+                // (e.g., RoPE inv_freq). Nulling first ensures the subsequent
+                // bindWorkspace(new_ptr) always triggers state invalidation.
+                for (const auto &consumer_binding : consumers)
+                {
+                    consumer_binding.consumer->bindWorkspace(nullptr);
+                }
+
+                if (!synchronizeBeforeWorkspaceRelease(device))
+                {
+                    return false;
+                }
+
                 existing->second->release();
                 existing->second.reset();
                 device_workspaces_.erase(device);
@@ -261,14 +430,12 @@ namespace llaminar2
                 WorkspaceRequirements combined = existing_reqs;
                 for (const auto &consumer_binding : consumers)
                 {
-                    auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
-                        consumer_binding.m,
-                        consumer_binding.n,
-                        consumer_binding.k);
-                    combined.merge(reqs);
+                    combined.merge(requirementsForGraphBinding(consumer_binding));
                 }
 
-                size_t budget = std::max(old_budget, model_floor_budget);
+                size_t budget = device.is_gpu()
+                                    ? std::max(old_budget, model_floor_budget)
+                                    : old_budget;
                 const size_t needed = combined.total_bytes_with_alignment();
                 if (needed > budget)
                 {
@@ -282,11 +449,12 @@ namespace llaminar2
                     }
                 }
 
-                LOG_INFO("[WorkspaceAllocator] Reallocating workspace on "
-                         << device.toString() << " with "
-                         << combined.buffers.size() << " buffers ("
-                         << (needed / (1024 * 1024)) << "MB needed, budget="
-                         << (budget / (1024 * 1024)) << "MB)");
+                LOG_TRACE("[WorkspaceAllocator] Reallocating workspace on "
+                          << device.toString() << " with "
+                          << combined.buffers.size() << " buffers ("
+                          << (needed / (1024 * 1024)) << "MB needed, budget="
+                          << (budget / (1024 * 1024)) << "MB)");
+                logWorkspaceVramTrace(device, "workspace.before_reallocate", needed);
 
                 auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
                 if (!manager->allocate(combined))
@@ -303,26 +471,27 @@ namespace llaminar2
                     consumer_binding.consumer->bindWorkspace(manager.get());
                 }
 
-                LOG_INFO("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
-                                                             << "MB workspace on " << device.toString()
-                                                             << " (" << manager->bufferCount() << " buffers)");
+                LOG_TRACE("[WorkspaceAllocator] Reallocated " << (manager->used() / (1024 * 1024))
+                                                              << "MB workspace on " << device.toString()
+                                                              << " (" << manager->bufferCount() << " buffers)");
+                logWorkspaceVramTrace(device, "workspace.after_reallocate", manager->used());
 
                 device_workspace_budgets_[device] = budget;
+                bumpDeviceGeneration(device);
                 device_workspaces_[device] = std::move(manager);
                 continue;
             }
 
             size_t budget = computeWorkspaceBudget(device, config);
-            budget = std::max(budget, model_floor_budget);
+            if (device.is_gpu())
+            {
+                budget = std::max(budget, model_floor_budget);
+            }
 
             WorkspaceRequirements combined;
             for (const auto &consumer_binding : consumers)
             {
-                auto reqs = consumer_binding.consumer->getWorkspaceRequirements(
-                    consumer_binding.m,
-                    consumer_binding.n,
-                    consumer_binding.k);
-                combined.merge(reqs);
+                combined.merge(requirementsForGraphBinding(consumer_binding));
             }
 
             if (combined.buffers.empty())
@@ -345,16 +514,17 @@ namespace llaminar2
                                                   : 0;
                 if (needed <= max_expandable)
                 {
-                    LOG_INFO("[WorkspaceAllocator] Expanding budget on "
-                             << device.toString() << " from "
-                             << (budget / (1024 * 1024)) << "MB to "
-                             << (needed / (1024 * 1024)) << "MB (available="
-                             << (available / (1024 * 1024)) << "MB)");
+                    LOG_TRACE("[WorkspaceAllocator] Expanding budget on "
+                              << device.toString() << " from "
+                              << (budget / (1024 * 1024)) << "MB to "
+                              << (needed / (1024 * 1024)) << "MB (available="
+                              << (available / (1024 * 1024)) << "MB)");
                     budget = needed;
                 }
             }
 
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            logWorkspaceVramTrace(device, "workspace.before_allocate", needed);
             if (!manager->allocate(combined))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
@@ -369,11 +539,13 @@ namespace llaminar2
                 consumer_binding.consumer->bindWorkspace(manager.get());
             }
 
-            LOG_INFO("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
-                                                       << "MB workspace on " << device.toString()
-                                                       << " (" << manager->bufferCount() << " buffers, model-aware budget)");
+            LOG_TRACE("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
+                                                        << "MB workspace on " << device.toString()
+                                                        << " (" << manager->bufferCount() << " buffers, model-aware budget)");
+            logWorkspaceVramTrace(device, "workspace.after_allocate", manager->used());
 
             device_workspace_budgets_[device] = budget;
+            bumpDeviceGeneration(device);
             device_workspaces_[device] = std::move(manager);
         }
 
@@ -406,7 +578,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_DEBUG("[WorkspaceAllocator] Found " << device_consumers.size()
+        LOG_TRACE("[WorkspaceAllocator] Found " << device_consumers.size()
                                                 << " devices with workspace consumers");
 
         for (const auto &[device, consumers] : device_consumers)
@@ -428,8 +600,8 @@ namespace llaminar2
             WorkspaceRequirements combined;
             for (auto *consumer : consumers)
             {
-                auto reqs = consumer->getWorkspaceRequirements(/*max_m=*/4096);
-                combined.merge(reqs);
+                combined.merge(consumer->getWorkspaceRequirements(/*max_m=*/4096));
+                combined.merge(consumer->getWorkspaceRequirements(/*decode_m=*/1));
             }
 
             if (combined.buffers.empty())
@@ -439,12 +611,13 @@ namespace llaminar2
                 continue;
             }
 
-            LOG_DEBUG("[WorkspaceAllocator] Device " << device.toString()
+            LOG_TRACE("[WorkspaceAllocator] Device " << device.toString()
                                                      << ": " << consumers.size() << " consumers, "
                                                      << combined.buffers.size() << " buffers, "
                                                      << combined.total_bytes_with_alignment() << " bytes needed");
 
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            logWorkspaceVramTrace(device, "workspace.before_allocate_legacy", combined.total_bytes_with_alignment());
             if (!manager->allocate(combined))
             {
                 LOG_ERROR("[WorkspaceAllocator] Failed to allocate workspace on "
@@ -459,9 +632,10 @@ namespace llaminar2
                 consumer->bindWorkspace(manager.get());
             }
 
-            LOG_INFO("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
-                                                       << "MB workspace on " << device.toString()
-                                                       << " (" << manager->bufferCount() << " buffers)");
+            LOG_TRACE("[WorkspaceAllocator] Allocated " << (manager->used() / (1024 * 1024))
+                                                        << "MB workspace on " << device.toString()
+                                                        << " (" << manager->bufferCount() << " buffers)");
+            logWorkspaceVramTrace(device, "workspace.after_allocate_legacy", manager->used());
 
             device_workspace_budgets_[device] = budget;
             device_workspaces_[device] = std::move(manager);
@@ -474,8 +648,13 @@ namespace llaminar2
     {
         if (!device_workspaces_.empty())
         {
-            LOG_DEBUG("[WorkspaceAllocator] Releasing " << device_workspaces_.size()
+            LOG_TRACE("[WorkspaceAllocator] Releasing " << device_workspaces_.size()
                                                         << " workspace managers");
+        }
+
+        for (const auto &[device, _manager] : device_workspaces_)
+        {
+            bumpDeviceGeneration(device);
         }
 
         device_workspaces_.clear();
@@ -490,6 +669,12 @@ namespace llaminar2
     {
         auto it = device_workspaces_.find(device);
         return (it != device_workspaces_.end()) ? it->second.get() : nullptr;
+    }
+
+    uint64_t WorkspaceAllocator::deviceGeneration(DeviceId device) const
+    {
+        auto it = device_workspace_generations_.find(device);
+        return (it != device_workspace_generations_.end()) ? it->second : 0;
     }
 
     // =========================================================================
@@ -510,6 +695,11 @@ namespace llaminar2
     {
         auto it = device_workspaces_.find(device);
         return (it != device_workspaces_.end()) ? it->second->used() : 0;
+    }
+
+    void WorkspaceAllocator::bumpDeviceGeneration(DeviceId device)
+    {
+        device_workspace_generations_[device] = next_workspace_generation_++;
     }
 
 } // namespace llaminar2

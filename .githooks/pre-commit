@@ -5,8 +5,15 @@
 #   cp .githooks/pre-commit .git/hooks/pre-commit
 #   chmod +x .git/hooks/pre-commit
 #
-# This hook builds, runs unit tests, Qwen2 + Qwen35 parity tests, and E2E server tests
-# before allowing a commit to catch accuracy and API regressions early.
+# This hook builds and runs tests before allowing a commit.
+# Feature branches run a 6-step suite:
+#   1. Integration build
+#   2. Unit tests (parallel)
+#   3. Focused parity baseline (40 tests, all model families, sequential)
+#   4. E2E release build
+#   5. E2E server integration tests
+#   6. Performance regression benchmarks
+# develop/master add full integration as step 3 and shift the later steps to 4-7.
 # Override with: git commit --no-verify
 
 set -e
@@ -18,17 +25,38 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}==============================================================${NC}"
-echo -e "${BLUE}Pre-commit Hook: Build, Unit Test, Parity (Qwen2+Qwen35), NodeLocalTP, E2E & Benchmarks${NC}"
-echo -e "${BLUE}==============================================================${NC}"
+# Determine current branch and run mode
+CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown")"
+if [[ "$CURRENT_BRANCH" == "develop" || "$CURRENT_BRANCH" == "master" ]]; then
+    FULL_SUITE=true
+else
+    FULL_SUITE=false
+fi
+
+if $FULL_SUITE; then
+    echo -e "${BLUE}==============================================================${NC}"
+    echo -e "${BLUE}Pre-commit Hook: Build, Unit, Integration, Parity, E2E & Benchmarks${NC}"
+    echo -e "${BLUE}==============================================================${NC}"
+else
+    echo -e "${BLUE}==============================================================${NC}"
+    echo -e "${BLUE}Pre-commit Hook [feature branch: ${CURRENT_BRANCH}]: Build, Unit, Parity, E2E & Benchmarks${NC}"
+    echo -e "${BLUE}==============================================================${NC}"
+fi
 echo ""
 
-# Build directory
+# Build directories
 BUILD_V2_INTEGRATION="build_v2_integration"
+BUILD_V2_RELEASE="build_v2_release"
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+if $FULL_SUITE; then
+    TOTAL_STEPS=7
+else
+    TOTAL_STEPS=6
+fi
 
 # Step 1: Build Integration (Release optimizations + debug symbols + assertions)
-echo -e "${YELLOW}[1/8] Building V2 Integration...${NC}"
-if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration > /dev/null 2>&1; then
+echo -e "${YELLOW}[1/${TOTAL_STEPS}] Building V2 Integration...${NC}"
+if ! cmake -B "$BUILD_V2_INTEGRATION" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Integration -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
     echo -e "${RED}❌ CMake configuration failed (Integration)${NC}"
     exit 1
 fi
@@ -42,7 +70,7 @@ echo -e "${GREEN}✓ Integration build successful${NC}"
 echo ""
 
 # Step 2: Run Unit Tests (Integration build — fast, isolated component tests only)
-echo -e "${YELLOW}[2/8] Running V2 unit tests (Integration build)...${NC}"
+echo -e "${YELLOW}[2/${TOTAL_STEPS}] Running V2 unit tests (Integration build)...${NC}"
 echo ""
 
 # Filter: ^V2_Unit_ matches all unit tests (excludes Integration, E2E, Performance)
@@ -64,122 +92,96 @@ fi
 echo -e "${GREEN}✓ Unit tests passed${NC}"
 echo ""
 
-# Step 3: Run Qwen2 SingleDevice Parity Tests (prefill + decode, ~2 min)
-# Validates inference accuracy across CPU/CUDA/ROCm with multiple KV cache configs.
-# Catches accuracy regressions in attention, GEMM, and graph wiring.
-echo -e "${YELLOW}[3/8] Running Qwen2 SingleDevice parity tests (prefill + decode)...${NC}"
+# Step 3 (develop/master only): Run Integration Tests
+# Full integration test suite (excludes Parity and RCCL tests).
+# RCCL tests are excluded due to known driver-level flakiness.
+if $FULL_SUITE; then
+    INTEG_STEP=3
+    echo -e "${YELLOW}[${INTEG_STEP}/${TOTAL_STEPS}] Running V2 integration tests (excluding Parity & RCCL)...${NC}"
+    echo ""
+
+    set +e
+    ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_" -E "Parity|RCCL" --output-on-failure
+    INTEG_EXIT_CODE=$?
+    set -e
+
+    if [ $INTEG_EXIT_CODE -ne 0 ]; then
+        echo ""
+        echo -e "${RED}❌ Integration tests failed.${NC}"
+        echo ""
+        echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
+        echo -e "${YELLOW}  git commit --no-verify${NC}"
+        echo -e "${YELLOW}to skip this check.${NC}"
+        exit 1
+    fi
+    echo -e "${GREEN}✓ Integration tests passed${NC}"
+    echo ""
+fi
+
+# Step 3/4: Run Focused Parity Baseline (40 tests, all model families, sequential)
+# Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
+# Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
+# HybridPPTP (pipeline+tensor parallel),
+# and ExpertOverlay (tiered same-layer expert residency).
+# Runs on ALL branches to catch accuracy regressions early.
+if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
+echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (40 tests, all model families)...${NC}"
 echo ""
 
 set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen2_SingleDevice" --no-tests=error --output-on-failure --timeout 600
+"$REPO_ROOT/.githooks/run_parity_baseline.sh" "$BUILD_V2_INTEGRATION"
 PARITY_EXIT_CODE=$?
 set -e
 
 echo ""
 if [ $PARITY_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ Qwen2 parity tests failed — possible accuracy regression.${NC}"
+    echo -e "${RED}❌ Parity baseline failed — possible accuracy regression.${NC}"
     echo ""
-    echo -e "${YELLOW}Run manually for details:${NC}"
-    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen2_SingleDevice -V${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
-    exit 1
-fi
-echo -e "${GREEN}✓ Qwen2 parity tests passed${NC}"
-echo ""
-
-# Step 4: Run Qwen35 SingleDevice Parity Tests (prefill + decode)
-# Validates Qwen3.5 hybrid GDN/FA architecture: GatedDeltaNet recurrence,
-# short convolution, Q-gate split, partial RoPE, and sigmoid output gate.
-# NOTE: 4B ROCm tests are excluded — known pre-existing workspace OOM on MI60
-# (4B model needs ~34GB workspace, MI60 budget is 4GB).
-echo -e "${YELLOW}[4/8] Running Qwen35 SingleDevice parity tests (prefill + decode)...${NC}"
-echo ""
-
-set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_SingleDevice" -E "Qwen35_4B_ROCm" --no-tests=error --output-on-failure --timeout 600
-QWEN35_PARITY_EXIT_CODE=$?
-set -e
-
-echo ""
-if [ $QWEN35_PARITY_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ Qwen35 parity tests failed — possible accuracy regression in GDN/FA layers.${NC}"
-    echo ""
-    echo -e "${YELLOW}Run manually for details:${NC}"
-    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen35_SingleDevice -V${NC}"
+    echo -e "${YELLOW}Re-run standalone for details:${NC}"
+    echo -e "${YELLOW}  .githooks/run_parity_baseline.sh $BUILD_V2_INTEGRATION${NC}"
     echo ""
     echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
     echo -e "${YELLOW}  git commit --no-verify${NC}"
     echo -e "${YELLOW}to skip this check.${NC}"
     exit 1
 fi
-echo -e "${GREEN}✓ Qwen35 parity tests passed${NC}"
+echo -e "${GREEN}✓ Parity baseline passed${NC}"
 echo ""
 
-# Step 5: Run Qwen2 NodeLocalTP Parity Tests (multi-device TP)
-# Validates node-local tensor parallel correctness: weight sharding,
-# AllReduce/AllGather collectives, and multi-device inference parity.
-echo -e "${YELLOW}[5/8] Running Qwen2 NodeLocalTP parity tests...${NC}"
-echo ""
-
-set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_NodeLocalTP" --no-tests=error --output-on-failure --timeout 600
-QWEN2_NLTP_EXIT_CODE=$?
-set -e
-
-echo ""
-if [ $QWEN2_NLTP_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ Qwen2 NodeLocalTP parity tests failed — possible TP regression.${NC}"
-    echo ""
-    echo -e "${YELLOW}Run manually for details:${NC}"
-    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_NodeLocalTP -V${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
+# Step 4: Build Release (for E2E — no assertions/debug overhead = faster inference)
+if $FULL_SUITE; then E2E_BUILD_STEP=5; else E2E_BUILD_STEP=4; fi
+echo -e "${YELLOW}[${E2E_BUILD_STEP}/${TOTAL_STEPS}] Building V2 Release for E2E tests...${NC}"
+if ! cmake -B "$BUILD_V2_RELEASE" -S src/v2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DHAVE_CUDA=ON -DHAVE_ROCM=ON > /dev/null 2>&1; then
+    echo -e "${RED}❌ CMake configuration failed (Release)${NC}"
     exit 1
 fi
-echo -e "${GREEN}✓ Qwen2 NodeLocalTP parity tests passed${NC}"
-echo ""
 
-# Step 6: Run Qwen35 NodeLocalTP Parity Tests (multi-device TP)
-# Validates Qwen3.5 GDN/FA hybrid architecture under tensor parallelism:
-# FusedQKV 3-sub-block sharding, tied embedding LM head, GDN weight distribution.
-# NOTE: 4B ROCm tests excluded (same workspace OOM issue as step 4).
-echo -e "${YELLOW}[6/8] Running Qwen35 NodeLocalTP parity tests...${NC}"
-echo ""
-
-set +e
-ctest --test-dir "$BUILD_V2_INTEGRATION" -R "^V2_Integration_Parity_Qwen35_NodeLocalTP" -E "Qwen35_4B_ROCm" --no-tests=error --output-on-failure --timeout 600
-QWEN35_NLTP_EXIT_CODE=$?
-set -e
-
-echo ""
-if [ $QWEN35_NLTP_EXIT_CODE -ne 0 ]; then
-    echo -e "${RED}❌ Qwen35 NodeLocalTP parity tests failed — possible TP regression in GDN/FA layers.${NC}"
-    echo ""
-    echo -e "${YELLOW}Run manually for details:${NC}"
-    echo -e "${YELLOW}  ctest --test-dir $BUILD_V2_INTEGRATION -R V2_Integration_Parity_Qwen35_NodeLocalTP -V${NC}"
-    echo ""
-    echo -e "${YELLOW}Commit blocked. Fix failing tests or use:${NC}"
-    echo -e "${YELLOW}  git commit --no-verify${NC}"
-    echo -e "${YELLOW}to skip this check.${NC}"
+if ! cmake --build "$BUILD_V2_RELEASE" --parallel > /dev/null 2>&1; then
+    echo -e "${RED}❌ Build failed (Release)${NC}"
+    echo -e "${YELLOW}Run manually to see errors: cmake --build $BUILD_V2_RELEASE --parallel${NC}"
     exit 1
 fi
-echo -e "${GREEN}✓ Qwen35 NodeLocalTP parity tests passed${NC}"
+echo -e "${GREEN}✓ Release build successful${NC}"
 echo ""
 
-# Step 7: E2E Server Integration Tests (~2 min)
+# Step 5: E2E Server Integration Tests (Release binary — no assertions = faster inference)
 # Spins up llaminar2 --serve on CPU, CUDA, and ROCm, validates multi-turn
-# inference via the REST API with curl.
-echo -e "${YELLOW}[7/8] Running E2E Server integration tests (cpu, cuda:0, rocm:0)...${NC}"
+# inference via the REST API with curl, and runs long-context checks for the
+# default 35B CPU/ROCm suites. The 30B gate keeps smaller smoke models fast.
+if $FULL_SUITE; then E2E_STEP=6; else E2E_STEP=5; fi
+echo -e "${YELLOW}[${E2E_STEP}/${TOTAL_STEPS}] Running E2E Server integration tests (cpu, cuda:0, rocm:0 + 35B long-context)...${NC}"
 echo ""
 
 set +e
+LLAMINAR_E2E_LONG_CONTEXT=1 \
+LLAMINAR_E2E_LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-full}" \
+LLAMINAR_E2E_CONTEXT_LENGTH="${LLAMINAR_E2E_CONTEXT_LENGTH:-4096}" \
+LLAMINAR_E2E_LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-1024}" \
+LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}" \
+LLAMINAR_E2E_LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-1800}" \
+LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}" \
 tests/v2/e2e/server/test_server_e2e.sh \
-    --binary "$BUILD_V2_INTEGRATION/llaminar2" \
+    --binary "$BUILD_V2_RELEASE/llaminar2" \
     --backends "cpu,cuda:0,rocm:0"
 SERVER_EXIT_CODE=$?
 set -e
@@ -203,10 +205,10 @@ echo ""
 # Runs 'llaminar2 benchmark' for each model × device combination defined in
 # benchmark_baseline.json and compares prefill/decode throughput against
 # canonical baselines. Devices that are unavailable are skipped gracefully.
-echo -e "${YELLOW}[8/8] Running performance regression benchmarks...${NC}"
+if $FULL_SUITE; then BENCH_STEP=7; else BENCH_STEP=6; fi
+echo -e "${YELLOW}[${BENCH_STEP}/${TOTAL_STEPS}] Running performance regression benchmarks...${NC}"
 echo ""
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
 set +e
 "$REPO_ROOT/.githooks/run_benchmark_check.sh"
 BENCH_EXIT_CODE=$?
@@ -231,10 +233,10 @@ echo "================================================"
 echo -e "${GREEN}✅ SUCCESS: All checks passed!${NC}"
 echo -e "${GREEN}  • Integration build: OK${NC}"
 echo -e "${GREEN}  • Unit tests: OK${NC}"
-echo -e "${GREEN}  • Qwen2 parity: OK${NC}"
-echo -e "${GREEN}  • Qwen35 parity: OK${NC}"
-echo -e "${GREEN}  • Qwen2 NodeLocalTP parity: OK${NC}"
-echo -e "${GREEN}  • Qwen35 NodeLocalTP parity: OK${NC}"
+if $FULL_SUITE; then
+echo -e "${GREEN}  • Integration tests: OK${NC}"
+fi
+echo -e "${GREEN}  • Parity baseline (40 tests): OK${NC}"
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
 echo ""

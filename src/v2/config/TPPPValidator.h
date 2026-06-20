@@ -163,6 +163,24 @@ namespace llaminar2
         }
 
     private:
+        static int decoderLayerCountExcludingTrailingMTP(const IModelContext &model)
+        {
+            int n_layers = model.blockCount();
+            if (n_layers <= 0)
+            {
+                return n_layers;
+            }
+
+            const std::string trailing_nextn_fc =
+                "blk." + std::to_string(n_layers - 1) + ".nextn.eh_proj.weight";
+            if (model.hasTensor(trailing_nextn_fc))
+            {
+                return n_layers - 1;
+            }
+
+            return n_layers;
+        }
+
         // =========================================================================
         // TP Validation Helpers
         // =========================================================================
@@ -393,7 +411,7 @@ namespace llaminar2
             const IModelContext &model,
             TPPPValidationResult &result)
         {
-            int n_layers = model.blockCount();
+            int n_layers = decoderLayerCountExcludingTrailingMTP(model);
             int pp_degree = config.pp_degree;
 
             // For EQUAL split mode, layers must be evenly divisible
@@ -467,7 +485,7 @@ namespace llaminar2
             const IModelContext &model,
             TPPPValidationResult &result)
         {
-            int n_layers = model.blockCount();
+            int n_layers = decoderLayerCountExcludingTrailingMTP(model);
 
             // Validate CPU layers don't exceed total
             if (config.cpu_layers > n_layers)
@@ -572,7 +590,7 @@ namespace llaminar2
             }
 
             // Check that layers per PP stage is reasonable
-            int n_layers = model.blockCount();
+            int n_layers = decoderLayerCountExcludingTrailingMTP(model);
             int layers_per_stage = n_layers / config.pp_degree;
             if (layers_per_stage < 1)
             {

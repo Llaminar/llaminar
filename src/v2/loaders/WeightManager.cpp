@@ -5,6 +5,13 @@
  */
 
 #include "WeightManager.h"
+#include "MmapRegion.h"
+#include "PreparedWeightStore.h"
+#include "GPUVramPreflight.h"
+#include "../execution/moe/ExpertWeightPayloadProvider.h"
+#include "../execution/moe/MoEExpertOverlayExecutionPlan.h"
+#include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
+#include "../execution/moe/MoEExpertWeightService.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/DebugEnv.h"
@@ -12,15 +19,35 @@
 #include "../tensors/TensorSlice.h"
 #include "../kernels/KernelFactory.h"
 #include "../backends/BackendManager.h"
+
+// GPU weight loading pipeline
+#include "gpu_pipeline/LoadOrchestrator.h"
+#include "gpu_pipeline/WeightVRAMPool.h"
+#include "WeightLoadProgress.h"
+#include "gpu_pipeline/RepackFormat.h"
+
+// Backend-specific GEMM kernels (for GPU pipeline kernel creation)
+#ifdef HAVE_ROCM
+#include "../kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "../kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include "../kernels/rocm/ROCmWeightPacker.h"
+#endif
+#ifdef HAVE_CUDA
+#include "../kernels/cuda/gemm/CUDAQuantisedGemmKernel.h"
+#include "../kernels/cuda/gemm/CUDAFloatingPointGemmKernel.h"
+#endif
+#include "../tensors/BlockStructures.h"
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
 #include <regex>
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <deque>
 #include <atomic>
+#include <iomanip>
 #include <thread>
 #include <future>
 #include <unordered_map>
@@ -31,6 +58,69 @@
 
 namespace llaminar2
 {
+
+    namespace
+    {
+        uint64_t stableMaterializedBindingId(
+            const WeightRequirement &requirement,
+            const InferenceStrategy &strategy)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            auto mixByte = [&](uint8_t byte)
+            {
+                hash ^= static_cast<uint64_t>(byte);
+                hash *= 1099511628211ull;
+            };
+            auto mixString = [&](const std::string &value)
+            {
+                for (unsigned char ch : value)
+                    mixByte(ch);
+                mixByte(0xffu);
+            };
+            auto mixInt = [&](int64_t value)
+            {
+                uint64_t bits = static_cast<uint64_t>(value);
+                for (int i = 0; i < 8; ++i)
+                    mixByte(static_cast<uint8_t>((bits >> (i * 8)) & 0xffu));
+            };
+            auto mixSize = [&](size_t value)
+            {
+                mixInt(static_cast<int64_t>(value));
+            };
+
+            mixInt(static_cast<int64_t>(strategy.model_id.value));
+            mixString(requirement.canonical_name);
+            mixString(requirement.source_name);
+            mixInt(static_cast<int>(requirement.role));
+            mixInt(static_cast<int>(requirement.derivation));
+            mixInt(requirement.layer);
+            mixInt(requirement.expert);
+            mixInt(requirement.pp_stage);
+            mixInt(requirement.tp_domain);
+            mixInt(requirement.tp_rank_or_device_index);
+            mixInt(static_cast<int>(requirement.residency_category));
+            mixString(requirement.overlay_domain);
+            mixInt(requirement.overlay_participant_index);
+            mixInt(requirement.overlay_participant_world_rank);
+            mixInt(static_cast<int>(requirement.target_device.type));
+            mixInt(requirement.target_device.ordinal);
+            mixSize(requirement.slice.row_start);
+            mixSize(requirement.slice.row_count);
+            mixSize(requirement.slice.col_start);
+            mixSize(requirement.slice.col_count);
+            mixSize(requirement.slice.expert_start);
+            mixSize(requirement.slice.expert_count);
+
+            return hash == 0 ? 1 : hash;
+        }
+
+        bool hasVnniPackedQuantizedPayload(const TensorBase *tensor)
+        {
+            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+            return unpackable && unpackable->vnniFormatInfo() != nullptr;
+        }
+
+    }
 
     const char *WeightManager::weightPrepStateName(WeightPrepState state)
     {
@@ -156,9 +246,7 @@ namespace llaminar2
             // the tensor has a valid GPU copy OR kernel-managed device data.
             if (!ptr->deviceValid())
             {
-                bool has_kernel_device_data =
-                    ptr->hasCachedDeviceData(DeviceType::CUDA) ||
-                    ptr->hasCachedDeviceData(DeviceType::ROCm);
+                bool has_kernel_device_data = ptr->hasPreparedDeviceState();
 
                 if (!has_kernel_device_data)
                 {
@@ -206,7 +294,8 @@ namespace llaminar2
                                  WeightDistributionStrategy strategy,
                                  WeightPrecision weight_precision)
         : loader_(loader), mpi_ctx_(mpi_ctx), placement_map_(placement_map),
-          strategy_(strategy), weight_precision_(weight_precision)
+          strategy_(strategy), weight_precision_(weight_precision),
+          weight_metadata_(std::make_shared<WeightMetadataRegistry>())
     {
         int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
 
@@ -263,6 +352,94 @@ namespace llaminar2
         }
     }
 
+    WeightSliceSpec WeightManager::fullSliceSpec(const TensorBase &tensor) const
+    {
+        WeightSliceSpec spec;
+        const auto &shape = tensor.shape();
+        spec.source_rows = shape.empty() ? 0 : shape[0];
+        spec.source_cols = shape.size() > 1 ? shape[1] : 1;
+        spec.row_start = 0;
+        spec.row_count = spec.source_rows;
+        spec.col_start = 0;
+        spec.col_count = spec.source_cols;
+        if (shape.size() > 2)
+        {
+            spec.expert_start = 0;
+            spec.expert_count = shape[2];
+        }
+        return spec;
+    }
+
+    void WeightManager::registerSourceMetadata(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &tensor,
+        DeviceId device)
+    {
+        if (!tensor || !weight_metadata_)
+            return;
+
+        if (!weight_metadata_->has(tensor.get()))
+            weight_metadata_->registerSource(tensor.get(), name, device);
+
+        WeightLifecycleTrace::record(
+            WeightLifecycleEventType::SourceLoad,
+            name,
+            inferWeightRole(name),
+            inferWeightLayer(name),
+            device,
+            "source tensor loaded");
+    }
+
+    void WeightManager::registerDerivedMetadata(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &tensor,
+        WeightDerivationKind derivation,
+        WeightSliceSpec slice,
+        DeviceId device)
+    {
+        if (!tensor || !weight_metadata_)
+            return;
+
+        WeightIdentity identity = makeSourceWeightIdentity(name);
+        identity.derivation = derivation;
+        weight_metadata_->registerWeight(tensor.get(), std::move(identity), slice, WeightResidency{device, device});
+
+        WeightLifecycleTrace::record(
+            derivation == WeightDerivationKind::DeviceClone ? WeightLifecycleEventType::Clone : WeightLifecycleEventType::Slice,
+            name,
+            inferWeightRole(name),
+            inferWeightLayer(name),
+            device,
+            toString(derivation));
+    }
+
+    void WeightManager::registerCloneMetadata(
+        const std::string &name,
+        const std::shared_ptr<TensorBase> &source,
+        const std::shared_ptr<TensorBase> &clone,
+        DeviceId device)
+    {
+        if (!source || !clone || !weight_metadata_)
+            return;
+
+        if (!weight_metadata_->has(source.get()))
+            registerSourceMetadata(name, source, DeviceId::cpu());
+
+        if (!weight_metadata_->registerDerived(
+                clone.get(), source.get(), WeightDerivationKind::DeviceClone, fullSliceSpec(*source), device))
+        {
+            registerDerivedMetadata(name, clone, WeightDerivationKind::DeviceClone, fullSliceSpec(*source), device);
+        }
+
+        WeightLifecycleTrace::record(
+            WeightLifecycleEventType::Clone,
+            name,
+            inferWeightRole(name),
+            inferWeightLayer(name),
+            device,
+            "device clone");
+    }
+
     bool WeightManager::isGemmWeight(const std::string &name) const
     {
         if (!has_sharding_config_)
@@ -289,6 +466,7 @@ namespace llaminar2
             return nullptr;
         }
 
+        registerSourceMetadata(name, tensor, device);
         return tensor;
     }
 
@@ -302,6 +480,8 @@ namespace llaminar2
             return ShardingMode::ROW_PARALLEL;
         case WeightShardingMode::InputParallel:
             return ShardingMode::INPUT_PARALLEL;
+        case WeightShardingMode::ExpertParallel:
+            return ShardingMode::EXPERT_PARALLEL;
         case WeightShardingMode::Replicate:
         default:
             return ShardingMode::REPLICATE;
@@ -322,6 +502,8 @@ namespace llaminar2
 
     ShardingMode WeightManager::getShardingMode(const std::string &name) const
     {
+        std::lock_guard<std::mutex> lock(sharding_mode_cache_mutex_);
+
         // Check cache first
         auto it = sharding_mode_cache_.find(name);
         if (it != sharding_mode_cache_.end())
@@ -451,8 +633,43 @@ namespace llaminar2
         return sliced;
     }
 
+    bool WeightManager::hostDataRequired(const TensorBase *tensor, const std::string &key) const
+    {
+        // Phase 9 final: All expert GEMM preparation happens upfront at graph-build
+        // time. No lazy host-data fallback exists. Expert weights are always
+        // releasable after device preparation completes. Dynamic rebalancing uses
+        // serialized transfer blobs, never raw host tensor data.
+        //
+        // The only case where host data must be retained is explicit CPU execution
+        // (RequiredForCPUExecution policy in metadata).
+
+        if (weight_metadata_ && weight_metadata_->has(tensor))
+        {
+            auto res = weight_metadata_->residency(tensor);
+            if (res)
+            {
+                switch (res->host_policy)
+                {
+                case WeightHostPolicy::RequiredForCPUExecution:
+                    return true;
+                case WeightHostPolicy::Released:
+                case WeightHostPolicy::ReleasableAfterPreparation:
+                case WeightHostPolicy::RequiredUntilPreparedOrTransferred:
+                case WeightHostPolicy::RequiredUntilGraphMaterialized:
+                    return false;
+                }
+            }
+        }
+
+        // No metadata or no explicit policy: host data is not required.
+        // All preparation (GEMM packing, embedding prep, GPU upload) completes
+        // before releaseAllHostWeightData() is called.
+        return false;
+    }
+
     namespace
     {
+
         /**
          * @brief Create a typed tensor from raw bytes (generic for all tensor types)
          *
@@ -622,6 +839,15 @@ namespace llaminar2
                 true /* inner_is_presliced=true - slice already loaded */);
 
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+            WeightSliceSpec row_slice;
+            row_slice.source_rows = total_rows;
+            row_slice.source_cols = cols;
+            row_slice.row_start = row_start;
+            row_slice.row_count = row_count;
+            row_slice.col_start = 0;
+            row_slice.col_count = cols;
+            row_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice, WeightDerivationKind::RowSlice, row_slice, device);
             return slice;
         }
         else if (mode == ShardingMode::COLUMN_PARALLEL)
@@ -656,9 +882,9 @@ namespace llaminar2
                 auto embd_dims = loader_.getTensorShape("token_embd.weight");
                 if (embd_dims && embd_dims->size() == 2)
                 {
-                    LOG_INFO("[WeightManager] Rank " << rank
-                                                     << " output.weight not in GGUF — using tied embedding "
-                                                     << "token_embd.weight as column-parallel LM head");
+                    LOG_DEBUG("[WeightManager] Rank " << rank
+                                                      << " output.weight not in GGUF — using tied embedding "
+                                                      << "token_embd.weight as column-parallel LM head");
                     dims_opt = embd_dims;
                     load_name = "token_embd.weight";
                 }
@@ -988,6 +1214,16 @@ namespace llaminar2
                     auto result = std::make_shared<TensorSlice>(
                         std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
 
+                    WeightSliceSpec fused_slice;
+                    fused_slice.source_rows = total_rows;
+                    fused_slice.source_cols = cols;
+                    fused_slice.row_start = 0;
+                    fused_slice.row_count = total_out_rows;
+                    fused_slice.col_start = 0;
+                    fused_slice.col_count = cols;
+                    fused_slice.inner_is_presliced = true;
+                    registerDerivedMetadata(name, result, WeightDerivationKind::FusedSubblockConcat, fused_slice, device);
+
                     LOG_DEBUG("[WeightManager] Rank " << rank
                                                       << " fused-QKV column-parallel " << name
                                                       << " [" << total_rows << ", " << cols << "]"
@@ -1041,6 +1277,15 @@ namespace llaminar2
                 true /* inner_is_presliced=true - slice already loaded */);
 
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+            WeightSliceSpec column_slice;
+            column_slice.source_rows = total_rows;
+            column_slice.source_cols = cols;
+            column_slice.row_start = row_start;
+            column_slice.row_count = row_count;
+            column_slice.col_start = 0;
+            column_slice.col_count = cols;
+            column_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice, WeightDerivationKind::RowSlice, column_slice, device);
             return slice;
         }
         else if (mode == ShardingMode::INPUT_PARALLEL)
@@ -1119,7 +1364,94 @@ namespace llaminar2
                 true /* inner_is_presliced=true - slice already loaded */);
 
             auto slice = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+            WeightSliceSpec input_slice;
+            input_slice.source_rows = rows;
+            input_slice.source_cols = total_cols;
+            input_slice.row_start = 0;
+            input_slice.row_count = rows;
+            input_slice.col_start = col_start;
+            input_slice.col_count = col_count;
+            input_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice, WeightDerivationKind::ColumnSlice, input_slice, device);
             return slice;
+        }
+        else if (mode == ShardingMode::EXPERT_PARALLEL)
+        {
+            // Expert-parallel: split the EXPERT dimension of 3D MoE weight tensors
+            //
+            // Expert weights are stored as 3D tensors [ne0, ne1, num_experts] where:
+            //   ne0 = columns (fastest varying)
+            //   ne1 = rows per expert
+            //   ne2 = num_experts (slowest varying)
+            //
+            // Each rank loads only its assigned expert subset:
+            //   expert_start = rank * experts_per_rank
+            //   expert_count = experts_per_rank (or remainder for last rank)
+            //
+            // The resulting tensor has shape [ne0, ne1, local_count] and contains
+            // only the local expert data. extractExpertViews() must account for
+            // the reduced expert count when creating 2D views.
+
+            int rank = mpi_ctx_->rank();
+            int world_size = mpi_ctx_->world_size();
+
+            auto dims_opt = loader_.getTensorShape(name);
+            if (!dims_opt || dims_opt->empty())
+            {
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 3)
+            {
+                throw std::runtime_error("[WeightManager] Expert-parallel requires 3D tensor, got " +
+                                         std::to_string(dims_opt->size()) + "D for: " + name);
+            }
+            const auto &dims = *dims_opt;
+            size_t ne0 = dims[0]; // cols
+            size_t ne1 = dims[1]; // rows per expert
+            size_t ne2 = dims[2]; // num_experts
+
+            // Equal split of experts across ranks
+            size_t experts_per_rank = ne2 / world_size;
+            size_t expert_start = experts_per_rank * rank;
+            size_t expert_count = (rank == world_size - 1) ? (ne2 - expert_start) : experts_per_rank;
+            size_t expert_end = expert_start + expert_count;
+
+            if (experts_per_rank == 0)
+            {
+                throw std::runtime_error("[WeightManager] Cannot shard " + std::to_string(ne2) +
+                                         " experts across " + std::to_string(world_size) +
+                                         " ranks for: " + name);
+            }
+
+            auto slice_tensor = loader_.loadTensorExpertSlice(
+                name, expert_start, expert_end, device, WeightPrecision::NATIVE);
+
+            if (!slice_tensor)
+            {
+                throw std::runtime_error("[WeightManager] Rank " + std::to_string(rank) +
+                                         " failed to load expert slice for: " + name);
+            }
+
+            LOG_DEBUG("[WeightManager] Rank " << rank << " expert-parallel " << name
+                                              << " [" << ne0 << ", " << ne1 << ", " << ne2
+                                              << "] -> loaded ONLY experts [" << expert_start << ", " << expert_end
+                                              << ") = " << expert_count << "/" << ne2 << " experts");
+
+            // Return the sliced 3D tensor directly (no TensorSlice wrapping needed —
+            // expert parallelism uses allreduce on the MoE output, not on weights)
+            WeightSliceSpec expert_slice;
+            expert_slice.source_rows = ne0;
+            expert_slice.source_cols = ne1;
+            expert_slice.row_start = 0;
+            expert_slice.row_count = ne0;
+            expert_slice.col_start = 0;
+            expert_slice.col_count = ne1;
+            expert_slice.expert_start = expert_start;
+            expert_slice.expert_count = expert_count;
+            expert_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, slice_tensor, WeightDerivationKind::ExpertSlice, expert_slice, device);
+            return slice_tensor;
         }
 
         throw std::runtime_error("[WeightManager] Unknown sharding mode for: " + name);
@@ -1138,6 +1470,227 @@ namespace llaminar2
 
         LOG_ERROR("[WeightManager] INTERLEAVED strategy not yet implemented, falling back to REPLICATED");
         return getReplicatedWeight(name, device);
+    }
+
+    void WeightManager::forEachWeight(std::function<void(const std::string &, TensorBase *)> visitor) const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        for (const auto &[name, tensor] : cache_)
+        {
+            if (tensor)
+                visitor(name, tensor.get());
+        }
+    }
+
+    void WeightManager::forEachPreparedWeight(std::function<void(const std::string &, TensorBase *)> visitor) const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        // Primary cache (original tensors, used in single-device mode)
+        for (const auto &[name, tensor] : cache_)
+        {
+            if (tensor)
+                visitor(name, tensor.get());
+        }
+        // Per-device cache (TP-sliced tensors, used in LOCAL TP mode)
+        // Keys are "device:name", extract the weight name after the first ':'
+        for (const auto &[cache_key, tensor] : per_device_cache_)
+        {
+            if (!tensor)
+                continue;
+            auto colon_pos = cache_key.find(':');
+            if (colon_pos == std::string::npos)
+                continue;
+            std::string name = cache_key.substr(colon_pos + 1);
+            visitor(name, tensor.get());
+        }
+    }
+
+    std::shared_ptr<PreparedWeightStore> WeightManager::preparedWeightStore()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        if (!prepared_weight_store_)
+            prepared_weight_store_ = std::make_shared<PreparedWeightStore>();
+        return prepared_weight_store_;
+    }
+
+    std::shared_ptr<PreparedWeightStore> WeightManager::preparedWeightStoreIfInitialized() const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        return prepared_weight_store_;
+    }
+
+    void WeightManager::setPreparedWeightStore(std::shared_ptr<PreparedWeightStore> store)
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+        prepared_weight_store_ = std::move(store);
+    }
+
+    FrozenModelWeightSet WeightManager::materialize(const WeightPlan &plan)
+    {
+        ModelWeightSetBuilder builder(plan.strategy());
+
+        for (const auto &requirement : plan.requirements())
+        {
+            const std::string &load_name = requirement.source_name.empty()
+                                               ? requirement.canonical_name
+                                               : requirement.source_name;
+            const DeviceId lookup_device = requirement.lookup_device.value_or(requirement.target_device);
+            std::shared_ptr<TensorBase> tensor;
+            if (tp_config_ && requirement.tp_domain >= 0 && requirement.tp_rank_or_device_index >= 0)
+            {
+                try
+                {
+                    const auto &assignment = tp_config_->forRank(requirement.tp_rank_or_device_index);
+                    tensor = getShardedWeightForAssignment(
+                        load_name,
+                        lookup_device,
+                        assignment,
+                        requirement.layer);
+                }
+                catch (const std::out_of_range &)
+                {
+                    LOG_WARN("[WeightManager] TP rank " << requirement.tp_rank_or_device_index
+                                                        << " not in TensorParallelConfig while materializing "
+                                                        << requirement.canonical_name
+                                                        << "; falling back to device lookup");
+                }
+            }
+            if (!tensor)
+            {
+                tensor = getWeightForDevice(
+                    load_name,
+                    lookup_device,
+                    requirement.layer);
+            }
+
+            if (!tensor)
+            {
+                if (requirement.required)
+                {
+                    throw std::runtime_error("[WeightManager] Required weight missing during materialization: " +
+                                             requirement.canonical_name +
+                                             (load_name == requirement.canonical_name ? "" : " (source: " + load_name + ")"));
+                }
+                continue;
+            }
+
+            WeightBinding binding;
+            binding.binding_id = stableMaterializedBindingId(requirement, plan.strategy());
+            binding.identity = makeSourceWeightIdentity(
+                requirement.canonical_name,
+                plan.strategy().model_id,
+                binding.binding_id);
+            binding.identity.derivation = requirement.derivation;
+            binding.identity.role = requirement.role == WeightRole::Other
+                                        ? inferWeightRole(requirement.canonical_name)
+                                        : requirement.role;
+            binding.identity.layer = requirement.layer >= 0
+                                         ? requirement.layer
+                                         : inferWeightLayer(requirement.canonical_name);
+            binding.identity.expert = requirement.expert >= 0
+                                          ? requirement.expert
+                                          : inferWeightExpert(requirement.canonical_name);
+            binding.identity.pp_stage = requirement.pp_stage;
+            binding.identity.tp_domain = requirement.tp_domain;
+            binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
+            binding.identity.residency_category = requirement.residency_category;
+            binding.identity.overlay_domain = requirement.overlay_domain;
+            binding.identity.overlay_participant_index = requirement.overlay_participant_index;
+            binding.identity.overlay_participant_world_rank = requirement.overlay_participant_world_rank;
+
+            binding.slice = requirement.slice;
+            binding.residency.home_device = requirement.target_device;
+            binding.residency.resident_device = requirement.target_device;
+            binding.residency.host_policy = requirement.host_policy;
+            binding.tensor_owner = tensor;
+            binding.tensor = tensor.get();
+
+            if (weight_metadata_)
+            {
+                if (auto metadata = weight_metadata_->metadata(tensor.get()))
+                {
+                    binding.identity = metadata->identity;
+                    binding.identity.canonical_name = requirement.canonical_name;
+                    binding.identity.model_id = plan.strategy().model_id;
+                    binding.identity.role = requirement.role == WeightRole::Other
+                                                ? metadata->identity.role
+                                                : requirement.role;
+                    binding.identity.derivation = requirement.derivation;
+                    binding.identity.layer = requirement.layer >= 0
+                                                 ? requirement.layer
+                                                 : metadata->identity.layer;
+                    binding.identity.expert = requirement.expert >= 0
+                                                  ? requirement.expert
+                                                  : metadata->identity.expert;
+                    binding.identity.pp_stage = requirement.pp_stage;
+                    binding.identity.tp_domain = requirement.tp_domain;
+                    binding.identity.tp_rank_or_device_index = requirement.tp_rank_or_device_index;
+                    binding.identity.residency_category = requirement.residency_category;
+                    binding.identity.overlay_domain = requirement.overlay_domain;
+                    binding.identity.overlay_participant_index = requirement.overlay_participant_index;
+                    binding.identity.overlay_participant_world_rank = requirement.overlay_participant_world_rank;
+                    binding.slice = metadata->slice;
+                    binding.residency = metadata->residency;
+                    binding.residency.home_device = requirement.target_device;
+                    binding.residency.resident_device = requirement.target_device;
+                    binding.residency.host_policy = requirement.host_policy;
+                }
+            }
+
+            if (requirement.slice.source_rows != 0 || requirement.slice.source_cols != 0 ||
+                requirement.slice.row_count != 0 || requirement.slice.col_count != 0 ||
+                requirement.slice.expert_count != 0)
+            {
+                binding.slice = requirement.slice;
+            }
+
+            if (binding.slice.source_rows == 0 && tensor)
+                binding.slice = fullSliceSpec(*tensor);
+
+            binding.identity.instance_id = binding.binding_id;
+
+            if (requirement.expected_prepared_kind != PreparedWeightKind::None)
+            {
+                binding.prepared = PreparedWeightRef{
+                    plan.strategy().model_id,
+                    0,
+                    requirement.expected_prepared_kind,
+                    requirement.target_device};
+            }
+
+            auto &added = builder.addBinding(std::move(binding));
+            if (added.prepared)
+                added.prepared->binding_id = added.binding_id;
+
+            if (added.prepared.has_value())
+            {
+                if (auto store = preparedWeightStoreIfInitialized())
+                {
+                    if (store->adoptPreparedGemmForBinding(added, requirement.target_device))
+                    {
+                        WeightLifecycleTrace::record(
+                            WeightLifecycleEventType::RegisterPrepared,
+                            requirement.canonical_name,
+                            added.identity.role,
+                            added.identity.layer,
+                            requirement.target_device,
+                            "adopted prepared handle for materialized binding");
+                    }
+                }
+            }
+
+            WeightLifecycleTrace::record(
+                WeightLifecycleEventType::GraphBind,
+                requirement.canonical_name,
+                added.identity.role,
+                added.identity.layer,
+                requirement.target_device,
+                "materialized binding " + std::to_string(added.binding_id));
+        }
+
+        FrozenModelWeightSet frozen(plan.strategy(), builder.freezeBindings());
+        frozen.validateForGraph();
+        return frozen;
     }
 
     // =========================================================================
@@ -1260,6 +1813,14 @@ namespace llaminar2
             break;
         }
 
+        case ShardingMode::EXPERT_PARALLEL:
+        {
+            // Expert-parallel weights are 3D MoE tensors — decode sharding
+            // not applicable. Return the full tensor as-is.
+            decode_shard = full_tensor;
+            break;
+        }
+
         default:
             throw std::runtime_error("[WeightManager] Unknown sharding mode for decode weight: " + name);
         }
@@ -1267,6 +1828,26 @@ namespace llaminar2
         // Cache the decode shard
         if (decode_shard)
         {
+            if (decode_shard.get() != full_tensor.get())
+            {
+                WeightSliceSpec decode_slice = fullSliceSpec(*full_tensor);
+                decode_slice.inner_is_presliced = true;
+                if (mode == ShardingMode::COLUMN_PARALLEL)
+                {
+                    decode_slice.row_count = decode_shard->shape()[0];
+                    decode_slice.row_start = decode_slice.source_rows - decode_slice.row_count;
+                    decode_slice.col_start = 0;
+                    decode_slice.col_count = decode_slice.source_cols;
+                }
+                else
+                {
+                    decode_slice.row_start = 0;
+                    decode_slice.row_count = decode_slice.source_rows;
+                    decode_slice.col_count = decode_shard->shape().size() > 1 ? decode_shard->shape()[1] : 1;
+                    decode_slice.col_start = decode_slice.source_cols - decode_slice.col_count;
+                }
+                registerDerivedMetadata(name, decode_shard, WeightDerivationKind::DecodeShard, decode_slice, decode_device);
+            }
             decode_cache_[cache_key] = decode_shard;
         }
 
@@ -1785,6 +2366,7 @@ namespace llaminar2
                                                                 << " size_bytes=" << clone->size_bytes());
         }
 
+        registerCloneMetadata(name, original, clone, target_device);
         return clone;
     }
 
@@ -1821,7 +2403,8 @@ namespace llaminar2
         {
             try
             {
-                const auto &assignment = tp_config_->forDevice(device);
+                const auto assignment = tp_config_->forDevice(device);
+                lock.unlock();
                 return getShardedWeightForAssignment(name, device, assignment, layer_idx);
             }
             catch (const std::out_of_range &)
@@ -1961,7 +2544,7 @@ namespace llaminar2
             return true;
         }
 
-        LOG_INFO("[WeightManager] Pre-loading weights for " << devices.size() << " devices");
+        LOG_DEBUG("[WeightManager] Pre-loading weights for " << devices.size() << " devices");
 
         std::vector<std::string> weight_names;
         bool seeded_from_loader = false;
@@ -1996,8 +2579,28 @@ namespace llaminar2
                 return true;
             }
 
-            LOG_INFO("[WeightManager] Cache empty; seeding preload from model tensor list ("
-                     << weight_names.size() << " tensors)");
+            LOG_DEBUG("[WeightManager] Cache empty; seeding preload from model tensor list ("
+                      << weight_names.size() << " tensors)");
+        }
+
+        // Add virtual weights that exist in the sharding config but not in
+        // the GGUF file. Example: "output.weight" when tied to
+        // "token_embd.weight" — the GGUF has no "output.weight" tensor, but
+        // getShardedWeightForAssignment() knows how to synthesize one.
+        // Without this, packGemmWeightsViaPipeline() never sees the LM head,
+        // and the later buildWeights() call creates a different tensor object
+        // that misses the prepared-GEMM registry.
+        if (has_sharding_config_)
+        {
+            std::unordered_set<std::string> name_set(weight_names.begin(), weight_names.end());
+            for (const auto &[name, mode] : sharding_config_.exact_matches)
+            {
+                if (name_set.find(name) == name_set.end())
+                {
+                    weight_names.push_back(name);
+                    LOG_DEBUG("[WeightManager] Adding virtual weight to preload: " << name);
+                }
+            }
         }
 
         size_t loaded_tensors = 0;
@@ -2042,7 +2645,13 @@ namespace llaminar2
                 //   and never reads the raw Q8_0 gpu_data_ptr_. Without this,
                 //   both the raw Q8_0 AND the VNNI copy sit on GPU — ~1.9 GB
                 //   wasted per device.
-                if (device.is_gpu() && (name == "token_embd.weight" || is_gemm_weight))
+                //
+                // - MoE 3D expert tensors (_exps.weight): MoEExpertWeightService
+                //   reads host views and batch-packs into VNNI slabs with its own
+                //   GPU upload.  Uploading the raw 3D tensor here wastes ~8 GB/device
+                //   and fragments VRAM, making subsequent hipMalloc calls very slow.
+                const bool is_moe_expert = (name.find("_exps.weight") != std::string::npos);
+                if (device.is_gpu() && (name == "token_embd.weight" || is_gemm_weight || is_moe_expert))
                 {
                     tensor->setHostResident();
                 }
@@ -2071,10 +2680,10 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[WeightManager] Preload complete: loaded=" << loaded_tensors
-                                                             << ", uploads=" << total_uploads
-                                                             << ", failures=" << load_failures
-                                                             << (seeded_from_loader ? " (seeded from loader names)" : ""));
+        LOG_DEBUG("[WeightManager] Preload complete: loaded=" << loaded_tensors
+                                                              << ", uploads=" << total_uploads
+                                                              << ", failures=" << load_failures
+                                                              << (seeded_from_loader ? " (seeded from loader names)" : ""));
         return true;
     }
 
@@ -2088,6 +2697,87 @@ namespace llaminar2
     }
 
     bool WeightManager::prepareWeightsForDevice(
+        const FrozenModelWeightSet &frozen_weights,
+        DeviceId device,
+        bool include_expert_jobs)
+    {
+        LOG_DEBUG("[WeightManager] prepareWeightsForDevice(" << device.to_string()
+                                                             << ", frozen_bindings=" << frozen_weights.bindings().size() << ")");
+        if (!lifecycle_gates_.materialization_complete)
+            markMaterializationComplete();
+
+        if (device.is_cpu())
+        {
+            auto store = preparedWeightStore();
+            int registered = 0;
+
+            for (const auto &binding : frozen_weights.bindings())
+            {
+                if (!binding.prepared.has_value() || binding.prepared->device != device)
+                    continue;
+                if (!binding.tensor || binding.tensor->shape().size() != 2)
+                    continue;
+                if (binding.identity.role == WeightRole::Embedding ||
+                    binding.identity.role == WeightRole::Norm ||
+                    binding.identity.role == WeightRole::Bias)
+                {
+                    continue;
+                }
+                if (!store->preparedRefForBinding(binding.binding_id, device).has_value())
+                {
+                    store->prepareGemm(binding);
+                    ++registered;
+                }
+            }
+
+            if (!lifecycle_gates_.device_preparation_complete)
+                markDevicePreparationComplete();
+            LOG_DEBUG("[WeightManager] Binding-driven CPU preparation registered "
+                      << registered << " GEMM bindings for " << device.to_string());
+
+            // Release raw host data for quantized weights now that VNNI packing
+            // is complete. The kernel owns its own packed buffer (native_interleaved
+            // + payload); the original Q4_K/Q5_K/Q6_K/etc TensorSlice heap data is
+            // no longer needed. TensorSlice implements IINT8Unpackable for forwarding,
+            // so require actual VNNI format metadata before releasing.
+            size_t released_count = 0;
+            for (const auto &binding : frozen_weights.bindings())
+            {
+                if (!binding.prepared.has_value() || binding.prepared->device != device)
+                    continue;
+                if (!binding.tensor || binding.tensor->shape().size() != 2)
+                    continue;
+                if (binding.identity.role == WeightRole::Embedding ||
+                    binding.identity.role == WeightRole::Norm ||
+                    binding.identity.role == WeightRole::Bias)
+                {
+                    continue;
+                }
+                if (hasVnniPackedQuantizedPayload(binding.tensor))
+                {
+                    binding.tensor->release_host_weight_data();
+                    ++released_count;
+                }
+            }
+#ifdef __linux__
+            if (released_count > 0)
+            {
+                ::malloc_trim(0);
+            }
+#endif
+            LOG_DEBUG("[WeightManager] Released raw host data for " << released_count
+                                                                    << " quantized CPU weights after VNNI packing");
+
+            return true;
+        }
+
+        const bool ok = prepareWeightsForDeviceImpl(device, nullptr, &frozen_weights, include_expert_jobs);
+        if (ok && !lifecycle_gates_.device_preparation_complete)
+            markDevicePreparationComplete();
+        return ok;
+    }
+
+    bool WeightManager::prepareWeightsForDevice(
         DeviceId device,
         int first_layer, int last_layer,
         bool has_embedding, bool has_lm_head)
@@ -2098,26 +2788,32 @@ namespace llaminar2
             return isWeightInLayerRange(name, first_layer, last_layer, has_embedding, has_lm_head);
         };
 
-        LOG_INFO("[WeightManager] prepareWeightsForDevice(" << device.to_string()
-                                                            << " layers=[" << first_layer << ", " << last_layer << ")"
-                                                            << " embed=" << has_embedding << " lm_head=" << has_lm_head << ")");
+        LOG_DEBUG("[WeightManager] prepareWeightsForDevice(" << device.to_string()
+                                                             << " layers=[" << first_layer << ", " << last_layer << ")"
+                                                             << " embed=" << has_embedding << " lm_head=" << has_lm_head << ")");
 
         return prepareWeightsForDeviceImpl(device, layer_filter);
     }
 
     bool WeightManager::prepareWeightsForDeviceImpl(
         DeviceId device,
-        std::function<bool(const std::string &)> layer_filter)
+        std::function<bool(const std::string &)> layer_filter,
+        const FrozenModelWeightSet *frozen_weights,
+        bool include_expert_jobs)
     {
         const bool is_gpu = device.is_gpu();
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
 
         // Step 1: Pack GEMM weights (async on GPU for overlap with step 2)
+        // GPU devices use the GPU-native pipeline (LoadOrchestrator) which does
+        // single VRAM alloc + pipelined H2D + GPU repack kernels.
+        // CPU devices use the CPU-side VNNI packing path.
         std::future<bool> gemm_future;
         if (is_gpu)
         {
-            gemm_future = std::async(std::launch::async, [this, device, &layer_filter]()
-                                     { return packGemmWeights(device, nullptr, /*release_raw_data=*/false, layer_filter); });
+            LOG_DEBUG("[WeightManager] Using GPU weight loading pipeline for " << device_name);
+            gemm_future = std::async(std::launch::async, [this, device, &layer_filter, frozen_weights, include_expert_jobs]()
+                                     { return packGemmWeightsViaPipeline(device, layer_filter, frozen_weights, include_expert_jobs); });
         }
 
         // Step 2: Upload non-GEMM weights (norms, embeddings) to device
@@ -2131,41 +2827,6 @@ namespace llaminar2
             }
         }
 
-        // Step 2b: Prepare embedding weights for GPU devices.
-        // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
-        // and uploads to GPU memory, following the PreparedGemmWeights pattern.
-        // Only if no layer_filter or if filter includes embedding.
-        if (is_gpu && (!layer_filter || layer_filter("token_embd.weight")))
-        {
-            using namespace llaminar::v2::kernels;
-            const int d_model = static_cast<int>(loader_.embeddingLength());
-
-            const TensorBase *embed_tensor = nullptr;
-            {
-                std::lock_guard<std::mutex> lock(cache_mutex_);
-                const std::string device_key = device.to_string() + ":token_embd.weight";
-                auto pdit = per_device_cache_.find(device_key);
-                if (pdit != per_device_cache_.end() && pdit->second)
-                    embed_tensor = pdit->second.get();
-                else
-                {
-                    auto it = cache_.find("token_embd.weight");
-                    if (it != cache_.end() && it->second)
-                        embed_tensor = it->second.get();
-                }
-            }
-
-            if (embed_tensor && d_model > 0)
-            {
-                auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-                    embed_tensor, d_model, device, /*vocab_offset=*/0, /*total_vocab=*/0);
-                if (!handle)
-                    LOG_ERROR("[WeightManager] Embedding preparation failed for " << device_name);
-                else
-                    LOG_DEBUG("[WeightManager] Embedding prepared for " << device_name);
-            }
-        }
-
         // Step 3: Wait for GEMM pack (or do sync pack for CPU)
         bool gemm_ok = true;
         if (is_gpu)
@@ -2174,77 +2835,62 @@ namespace llaminar2
         }
         else
         {
-            gemm_ok = packGemmWeights(device, nullptr, /*release_raw_data=*/false, layer_filter);
+            // Wire progress tracker for CPU weight packing (count-based progress).
+            // We use weight count as the progress unit since CPU packing is compute-bound.
+            PreloadProgressCallback cpu_progress_cb;
+            int cpu_progress_idx = -1;
+            if (weight_load_progress_)
+            {
+                // Estimate total bytes from cache (GEMM weights only)
+                size_t estimated_bytes = 0;
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    for (const auto &[name, tensor] : cache_)
+                    {
+                        if (isGemmWeight(name) && tensor)
+                        {
+                            if (layer_filter && !layer_filter(name))
+                                continue;
+                            estimated_bytes += tensor->size_bytes();
+                        }
+                    }
+                }
+                if (estimated_bytes > 0)
+                {
+                    cpu_progress_idx = weight_load_progress_->registerDevice(
+                        weight_load_progress_->makeDeviceLabel(device.to_string()), estimated_bytes);
+                    cpu_progress_cb = [this, cpu_progress_idx, estimated_bytes](size_t current, size_t total, const std::string &)
+                    {
+                        // Map count progress to byte progress
+                        const size_t approx_bytes = (current * estimated_bytes) / total;
+                        weight_load_progress_->update(cpu_progress_idx, approx_bytes);
+                    };
+                }
+            }
+
+            gemm_ok = packGemmWeights(device, cpu_progress_cb, /*release_raw_data=*/true, layer_filter);
+
+            if (weight_load_progress_ && cpu_progress_idx >= 0)
+            {
+                weight_load_progress_->finish(cpu_progress_idx);
+            }
+
+            // Return freed memory to the OS after releasing raw quantized weight data.
+            // VNNI packing creates its own packed buffer; the original Q4_K/Q5_K/Q6_K/etc
+            // heap data (from TensorSlice sharding) is now released. Without
+            // malloc_trim, glibc retains these freed pages in its arena indefinitely.
+#ifdef __linux__
+            if (gemm_ok)
+            {
+                ::malloc_trim(0);
+            }
+#endif
         }
 
         if (!gemm_ok)
         {
             LOG_WARN("[WeightManager] GEMM weight packing failed for " << device_name
-                                                                       << ", will use lazy kernel creation");
-        }
-
-        // Step 4: For tied-embedding models, pre-pack token_embd.weight as GEMM
-        // so it can be used for lm_head projection. Without this, the lm_head
-        // kernel would lazy-pack on first forward() — but by that point host
-        // weight data may have been released by releaseAllHostWeightData(),
-        // causing a segfault when reading the original quantized blocks.
-        //
-        // Applies to PP stages that own the lm_head (has_lm_head=true) when
-        // output.weight is absent in the GGUF (tied to token_embd.weight).
-        if (is_gpu && layer_filter)
-        {
-            bool stage_has_lm_head = layer_filter("output.weight");
-            if (stage_has_lm_head)
-            {
-                auto output_shape = loader_.getTensorShape("output.weight");
-                bool tied = !output_shape || output_shape->empty();
-                if (tied)
-                {
-                    using namespace llaminar::v2::kernels;
-                    const TensorBase *embed_for_lm = nullptr;
-                    {
-                        std::lock_guard<std::mutex> lock(cache_mutex_);
-                        const std::string device_key = device.to_string() + ":token_embd.weight";
-                        auto pdit = per_device_cache_.find(device_key);
-                        if (pdit != per_device_cache_.end() && pdit->second)
-                            embed_for_lm = pdit->second.get();
-                        else
-                        {
-                            auto it = cache_.find("token_embd.weight");
-                            if (it != cache_.end() && it->second)
-                                embed_for_lm = it->second.get();
-                        }
-                    }
-
-                    if (!embed_for_lm)
-                    {
-                        throw std::runtime_error(
-                            std::string("[WeightManager] Tied lm_head requested for ") +
-                            device_name + " but token_embd.weight is not loaded on the device");
-                    }
-
-                    const auto *handle = KernelFactory::getOrCreatePreparedGemmWeights(
-                        embed_for_lm, device);
-                    if (!handle)
-                    {
-                        throw std::runtime_error(
-                            std::string("[WeightManager] Failed to prepare tied lm_head GEMM weights for ") +
-                            device_name);
-                    }
-
-                    auto *kernel = KernelFactory::getOrCreateGemmEngine(handle);
-                    if (!kernel)
-                    {
-                        throw std::runtime_error(
-                            std::string("[WeightManager] Failed to create GEMM engine for tied lm_head on ") +
-                            device_name);
-                    }
-
-                    kernel->prepareWeights();
-                    LOG_INFO("[WeightManager] Pre-packed tied lm_head (token_embd.weight) as GEMM for "
-                             << device_name);
-                }
-            }
+                                                                       << "; required prepared kernels may be unavailable");
         }
 
         return gemm_ok && non_gemm_ok;
@@ -2259,15 +2905,28 @@ namespace llaminar2
         const bool is_gpu = device.is_gpu();
         const char *device_name = device.is_rocm() ? "ROCm" : (device.is_cuda() ? "CUDA" : "CPU");
 
+        // Phase 9: Mark materialization complete before preparation
+        if (!lifecycle_gates_.materialization_complete)
+        {
+            markMaterializationComplete();
+        }
+
         // Phase 1: Prepare (pack + upload, no release)
         bool ok = prepareWeightsForDevice(device);
 
-        // Phase 2: Release host copies (only for GPU, since CPU reads from host)
+        // Phase 9: Mark device preparation complete after packing/upload
+        if (ok && !lifecycle_gates_.device_preparation_complete)
+        {
+            markDevicePreparationComplete();
+        }
+
+        // Phase 2: Release host copies (GPU only — CPU quantized weights are
+        // released inline during packGemmWeights via release_raw_data=true).
         if (is_gpu && ok)
         {
             size_t released = releaseAllHostWeightData();
-            LOG_INFO("[WeightManager] finalizeForDevice(" << device_name
-                                                          << "): released " << released << " host tensors");
+            LOG_DEBUG("[WeightManager] finalizeForDevice(" << device_name
+                                                           << "): released " << released << " host tensors");
         }
 
         return ok;
@@ -2283,92 +2942,72 @@ namespace llaminar2
         }
 
         // Step 1: Clone and upload all weights to all devices
-        LOG_INFO("[WeightManager] finalizeForDevices: pre-loading weights for "
-                 << devices.size() << " devices");
+        LOG_DEBUG("[WeightManager] finalizeForDevices: pre-loading weights for "
+                  << devices.size() << " devices");
         if (!preloadForDevices(devices))
         {
             LOG_ERROR("[WeightManager] finalizeForDevices: preloadForDevices failed");
             return false;
         }
 
-        // Step 2: Pack GEMM weights per device (sequential across devices to
-        // avoid HIP/CUDA runtime races from concurrent multi-device hipMemcpy).
-        // Each packGemmWeights call has internal producer/consumer parallelism
-        // for the single target device's weights.
+        // Step 2: Pack GEMM weights per device.
+        // GPU devices use the GPU-native pipeline (LoadOrchestrator) with
+        // pipelined H2D + GPU repack kernels. CPU devices use CPU-side packing.
+        // Each GPU gets its own LoadOrchestrator, VRAM pool, and pinned ring
+        // buffer — fully independent, safe to parallelize.
         bool all_ok = true;
-        for (const auto &dev : devices)
+
+        const auto gemm_wall_start = std::chrono::high_resolution_clock::now();
+
         {
-            if (!packGemmWeights(dev, nullptr, /*release_raw_data=*/false))
+            std::vector<std::future<bool>> gemm_futures;
+            std::vector<std::chrono::high_resolution_clock::time_point> per_device_start(devices.size());
+            gemm_futures.reserve(devices.size());
+
+            for (size_t i = 0; i < devices.size(); ++i)
             {
-                LOG_WARN("[WeightManager] GEMM packing failed for device " << dev.toString());
-                all_ok = false;
+                const auto &dev = devices[i];
+                per_device_start[i] = std::chrono::high_resolution_clock::now();
+
+                if (dev.is_gpu())
+                {
+                    LOG_DEBUG("[WeightManager] finalizeForDevices: launching GPU pipeline for "
+                              << dev.toString());
+                    gemm_futures.push_back(std::async(std::launch::async,
+                                                      [this, dev]()
+                                                      { return packGemmWeightsViaPipeline(dev, nullptr); }));
+                }
+                else
+                {
+                    gemm_futures.push_back(std::async(std::launch::async,
+                                                      [this, dev]()
+                                                      { return packGemmWeights(dev, nullptr, /*release_raw_data=*/false); }));
+                }
+            }
+
+            for (size_t i = 0; i < devices.size(); ++i)
+            {
+                const bool ok = gemm_futures[i].get();
+                const auto pack_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::high_resolution_clock::now() - per_device_start[i])
+                                         .count();
+                if (!ok)
+                {
+                    LOG_WARN("[WeightManager] GEMM packing failed for device " << devices[i].toString());
+                    all_ok = false;
+                }
+                const char *mode = devices[i].is_gpu() ? "GPU pipeline" : "CPU repack";
+                LOG_DEBUG("[WeightManager] packGemmWeights for " << devices[i].toString()
+                                                                 << " completed in " << pack_ms << " ms (" << mode << ")");
             }
         }
 
-        // Step 2b: Prepare embedding weights for each device.
-        // Repacks from native quantized format (Q8_0, etc.) → EmbedQ8Block
-        // and uploads to GPU memory, following the PreparedGemmWeights pattern.
-        // With TP, each device gets only its vocab shard (vocab-parallel embedding).
-        {
-            using namespace llaminar::v2::kernels;
-            const int d_model = static_cast<int>(loader_.embeddingLength());
-
-            for (const auto &dev : devices)
-            {
-                if (!dev.is_gpu())
-                    continue;
-
-                // Find the embedding tensor for this device
-                const TensorBase *embed_tensor = nullptr;
-                {
-                    std::lock_guard<std::mutex> lock(cache_mutex_);
-
-                    // Check per-device cache first (LOCAL TP — may hold a vocab slice)
-                    const std::string device_key = dev.to_string() + ":token_embd.weight";
-                    auto pdit = per_device_cache_.find(device_key);
-                    if (pdit != per_device_cache_.end() && pdit->second)
-                    {
-                        embed_tensor = pdit->second.get();
-                    }
-                    else
-                    {
-                        // Fall back to global cache
-                        auto it = cache_.find("token_embd.weight");
-                        if (it != cache_.end() && it->second)
-                        {
-                            embed_tensor = it->second.get();
-                        }
-                    }
-                }
-
-                if (embed_tensor && d_model > 0)
-                {
-                    // Determine vocab sharding metadata for this device
-                    size_t vocab_offset = 0;
-                    size_t total_vocab = 0;
-                    if (tp_config_)
-                    {
-                        // Find the assignment for this device
-                        for (const auto &a : tp_config_->assignments())
-                        {
-                            if (a.device == dev)
-                            {
-                                vocab_offset = static_cast<size_t>(a.vocab_start);
-                                total_vocab = static_cast<size_t>(tp_config_->totalVocab());
-                                break;
-                            }
-                        }
-                    }
-
-                    auto *handle = KernelFactory::getOrCreatePreparedEmbeddingWeights(
-                        embed_tensor, d_model, dev, vocab_offset, total_vocab);
-                    if (!handle)
-                    {
-                        LOG_ERROR("[WeightManager] Embedding preparation failed for " << dev.toString());
-                    }
-                }
-            }
-        }
+        const auto gemm_wall_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::high_resolution_clock::now() - gemm_wall_start)
+                                      .count();
+        LOG_DEBUG("[WeightManager] All " << devices.size() << " devices GEMM packed in "
+                                         << gemm_wall_ms << " ms wall-clock"
+                                         << (devices.size() > 1 ? " (parallel)" : ""));
 
         // Step 3: Release all host weight data (unless caller opts out — e.g.
         // nested TP-in-PP, where a later PP stage on a different device still
@@ -2376,13 +3015,13 @@ namespace llaminar2
         if (release_host_data)
         {
             size_t released = releaseAllHostWeightData();
-            LOG_INFO("[WeightManager] finalizeForDevices: released " << released
-                                                                     << " host tensors across " << devices.size() << " devices");
+            LOG_DEBUG("[WeightManager] finalizeForDevices: released " << released
+                                                                      << " host tensors across " << devices.size() << " devices");
         }
         else
         {
-            LOG_INFO("[WeightManager] finalizeForDevices: retaining host weight data "
-                     "(nested TP-in-PP; outer caller will release)");
+            LOG_DEBUG("[WeightManager] finalizeForDevices: retaining host weight data "
+                      "(nested TP-in-PP; outer caller will release)");
         }
 
         // Step 4: Return freed memory to the OS.
@@ -2402,7 +3041,7 @@ namespace llaminar2
                     if (line.compare(0, 6, "VmRSS:") == 0 ||
                         line.compare(0, 8, "RssAnon:") == 0)
                     {
-                        LOG_INFO("[WeightManager] " << label << " " << line);
+                        LOG_DEBUG("[WeightManager] " << label << " " << line);
                     }
                 }
             };
@@ -2495,9 +3134,11 @@ namespace llaminar2
                     }
                 }
             }
-            else
+
+            // Fall back to main cache if per_device_cache had no GEMM weights
+            // (e.g. only non-GEMM entries exist in per_device_cache for this device)
+            if (gemm_weights.empty())
             {
-                // Single-device: iterate cache_ as before
                 gemm_weights.reserve(cache_.size());
                 for (const auto &[name, tensor] : cache_)
                 {
@@ -2544,8 +3185,8 @@ namespace llaminar2
 
             if (preprocessed_count > 0)
             {
-                LOG_INFO("[WeightManager] Preprocessed " << preprocessed_count << "/" << gemm_weights.size()
-                                                         << " weights in " << preproc_ms << " ms");
+                LOG_DEBUG("[WeightManager] Preprocessed " << preprocessed_count << "/" << gemm_weights.size()
+                                                          << " weights in " << preproc_ms << " ms");
             }
         }
 
@@ -2553,27 +3194,18 @@ namespace llaminar2
                                              << target_device.to_string());
 
         const size_t total = gemm_weights.size();
-        const unsigned hardware_threads = std::max(1u, std::thread::hardware_concurrency());
 
-        unsigned prepare_workers = target_device.is_gpu()
-                                       ? std::min<unsigned>(8u, hardware_threads)
-                                       : 1u;
-        unsigned upload_workers = target_device.is_gpu()
-                                      ? std::min<unsigned>(2u, hardware_threads)
-                                      : 1u;
-        size_t queue_capacity = std::max<size_t>(4, static_cast<size_t>(upload_workers) * 4);
-
-        // Architectural direction is now VNNI-only startup preparation. The
-        // legacy ROCm CK row-major startup repack pipeline (and its per-device
-        // budget/worker shaping) has been removed. We intentionally keep the
-        // default producer/consumer topology since there is no corresponding
-        // GPU overlap benefit to recover.
+        // CPU-only path: single producer, single consumer.
+        // GPU devices use packGemmWeightsViaPipeline() instead.
+        constexpr unsigned prepare_workers = 1;
+        constexpr unsigned upload_workers = 1;
+        constexpr size_t queue_capacity = 4;
 
         struct PreparedJob
         {
             std::string name;
             std::shared_ptr<TensorBase> tensor;
-            const KernelFactory::PreparedGemmHandle *prepared = nullptr;
+            std::shared_ptr<KernelFactory::PreparedGemmHandle> prepared;
             bool preparation_ok = false;
         };
 
@@ -2587,7 +3219,6 @@ namespace llaminar2
         std::atomic<bool> producer_done{false};
         std::atomic<bool> all_success{true};
         std::atomic<size_t> local_cpu_packed{0};
-        std::atomic<size_t> local_gpu_packed{0};
 
         auto prepare_job = [&](const std::pair<std::string, std::shared_ptr<TensorBase>> &entry) -> PreparedJob
         {
@@ -2597,7 +3228,7 @@ namespace llaminar2
 
             try
             {
-                job.prepared = KernelFactory::getOrCreatePreparedGemmWeights(job.tensor.get(), target_device);
+                job.prepared = KernelFactory::prepareGemmHandleLocal(job.tensor.get(), target_device);
                 job.preparation_ok = (job.prepared != nullptr);
             }
             catch (const std::exception &e)
@@ -2616,9 +3247,9 @@ namespace llaminar2
                 return false;
             }
 
-            auto run_upload = [&]() -> bool
+            try
             {
-                auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared);
+                auto *kernel = KernelFactory::getOrCreateGemmEngine(job.prepared.get());
                 if (!kernel)
                 {
                     return false;
@@ -2631,21 +3262,6 @@ namespace llaminar2
                     return false;
                 }
                 return true;
-            };
-
-            try
-            {
-                if (target_device.is_rocm())
-                {
-                    KernelFactory::ROCmOrdinalGuard guard(target_device.ordinal);
-                    return run_upload();
-                }
-                if (target_device.is_cuda())
-                {
-                    KernelFactory::CUDAOrdinalGuard guard(target_device.ordinal);
-                    return run_upload();
-                }
-                return run_upload();
             }
             catch (const std::exception &e)
             {
@@ -2748,35 +3364,32 @@ namespace llaminar2
                 }
                 else
                 {
-                    if (target_device.is_gpu())
+                    markPrepState(job.name, target_device, WeightPrepState::PACKED_HOST, true, "GEMM packed on CPU");
+                    local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
+                    // Only release host data for quantized tensors on CPU.
+                    // Quantized GEMM kernels (VNNI) prepack data into their own buffers,
+                    // so the original host data is no longer needed.
+                    // Floating-point GEMM (oneDNN) reads weight_tensor_->data() live
+                    // at every inference call — releasing would cause a null dereference.
+                    if (release_raw_data && hasVnniPackedQuantizedPayload(job.tensor.get()))
                     {
-                        markPrepState(job.name, target_device, WeightPrepState::UPLOADED_DEVICE, true, "GEMM packed + uploaded");
-                        local_gpu_packed.fetch_add(1, std::memory_order_relaxed);
-                        // Release heap-allocated row-slice data now that weights are on GPU.
-                        // Mmap-backed tensors (is_view()==true) are zero-copy and cost nothing.
-                        if (release_raw_data && job.tensor && !job.tensor->is_view())
-                        {
-                            job.tensor->release_raw_data();
-                        }
-                    }
-                    else
-                    {
-                        markPrepState(job.name, target_device, WeightPrepState::PACKED_HOST, true, "GEMM packed on CPU");
-                        local_cpu_packed.fetch_add(1, std::memory_order_relaxed);
-                        // Only release host data for quantized tensors on CPU.
-                        // Quantized GEMM kernels (VNNI) prepack data into their own buffers,
-                        // so the original host data is no longer needed.
-                        // Floating-point GEMM (oneDNN) reads weight_tensor_->data() live
-                        // at every inference call — releasing would cause a null dereference.
-                        if (release_raw_data && job.tensor &&
-                            dynamic_cast<IINT8Unpackable *>(job.tensor.get()))
-                        {
-                            job.tensor->release_host_weight_data();
-                        }
+                        job.tensor->release_host_weight_data();
                     }
 
                     markPrepState(job.name, target_device, WeightPrepState::READY, true, "GEMM weight ready");
                     evaluateReclaimEligibility(job.name, true);
+
+                    // Release mmap pages for this weight now that the GEMM engine
+                    // has its own copy (VNNI-packed on CPU).
+                    // is_mmap_data() checks the tensor's data is actually in an
+                    // mmap'd region. is_view() is NOT safe here — TensorSlice
+                    // (from TP sharding) returns is_view()=true but has heap data.
+                    // MADV_DONTNEED on heap pages zeroes them, causing corruption.
+                    if (job.tensor && job.tensor->is_mmap_data())
+                    {
+                        MmapRegion::adviseDontneedRange(
+                            job.tensor->raw_data(), job.tensor->size_bytes());
+                    }
                 }
 
                 const size_t finished = completed_count.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2817,7 +3430,6 @@ namespace llaminar2
         {
             std::lock_guard<std::mutex> lock(cache_mutex_);
             num_cpu_packed_ += local_cpu_packed.load(std::memory_order_relaxed);
-            num_gpu_packed_ += local_gpu_packed.load(std::memory_order_relaxed);
         }
 
         if (detail_enabled)
@@ -2848,6 +3460,1808 @@ namespace llaminar2
         return all_success.load(std::memory_order_relaxed);
     }
 
+    // -------------------------------------------------------------------------
+    // Helper: compute raw byte size for a 2D quantized view whose size_bytes()
+    // may report 0 (views alias parent storage without tracking their own size).
+    // Duplicated from MoEExpertWeightService.cpp — kept as a static helper here
+    // to avoid cross-module dependencies.
+    // -------------------------------------------------------------------------
+    static size_t quantizedViewRawBytes(const TensorBase &tensor)
+    {
+        const size_t reported = tensor.size_bytes();
+        if (reported > 0)
+            return reported;
+
+        const auto &shape = tensor.shape();
+        if (shape.size() != 2)
+            return 0;
+
+        const size_t rows = shape[0];
+        const size_t cols = shape[1];
+        auto bytes_for = [rows, cols](size_t block_size, size_t block_bytes) -> size_t
+        {
+            const size_t blocks_per_row = (cols + block_size - 1) / block_size;
+            return rows * blocks_per_row * block_bytes;
+        };
+
+        switch (tensor.native_type())
+        {
+        case TensorType::IQ4_NL:
+            return bytes_for(IQ4_NLBlock::BLOCK_SIZE, sizeof(IQ4_NLBlock));
+        case TensorType::IQ4_XS:
+            return bytes_for(IQ4_XSBlock::BLOCK_SIZE, sizeof(IQ4_XSBlock));
+        case TensorType::Q8_0:
+            return bytes_for(Q8_0Block::BLOCK_SIZE, sizeof(Q8_0Block));
+        case TensorType::Q4_0:
+            return bytes_for(Q4_0Block::BLOCK_SIZE, sizeof(Q4_0Block));
+        case TensorType::Q4_1:
+            return bytes_for(Q4_1Block::BLOCK_SIZE, sizeof(Q4_1Block));
+        case TensorType::Q5_0:
+            return bytes_for(Q5_0Block::BLOCK_SIZE, sizeof(Q5_0Block));
+        case TensorType::Q5_1:
+            return bytes_for(Q5_1Block::BLOCK_SIZE, sizeof(Q5_1Block));
+        case TensorType::Q2_K:
+            return bytes_for(Q2_KBlock::BLOCK_SIZE, sizeof(Q2_KBlock));
+        case TensorType::Q3_K:
+            return bytes_for(Q3_KBlock::BLOCK_SIZE, sizeof(Q3_KBlock));
+        case TensorType::Q4_K:
+            return bytes_for(Q4_KBlock::BLOCK_SIZE, sizeof(Q4_KBlock));
+        case TensorType::Q5_K:
+            return bytes_for(Q5_KBlock::BLOCK_SIZE, sizeof(Q5_KBlock));
+        case TensorType::Q6_K:
+            return bytes_for(Q6_KBlock::BLOCK_SIZE, sizeof(Q6_KBlock));
+        case TensorType::Q8_K:
+            return bytes_for(Q8_KBlock::BLOCK_SIZE, sizeof(Q8_KBlock));
+        case TensorType::IQ2_XXS:
+            return bytes_for(IQ2_XXSBlock::BLOCK_SIZE, sizeof(IQ2_XXSBlock));
+        case TensorType::IQ2_XS:
+            return bytes_for(IQ2_XSBlock::BLOCK_SIZE, sizeof(IQ2_XSBlock));
+        case TensorType::IQ2_S:
+            return bytes_for(IQ2_SBlock::BLOCK_SIZE, sizeof(IQ2_SBlock));
+        case TensorType::IQ3_XXS:
+            return bytes_for(IQ3_XXSBlock::BLOCK_SIZE, sizeof(IQ3_XXSBlock));
+        case TensorType::IQ3_S:
+            return bytes_for(IQ3_SBlock::BLOCK_SIZE, sizeof(IQ3_SBlock));
+        case TensorType::IQ1_S:
+            return bytes_for(IQ1_SBlock::BLOCK_SIZE, sizeof(IQ1_SBlock));
+        case TensorType::IQ1_M:
+            return bytes_for(IQ1_MBlock::BLOCK_SIZE, sizeof(IQ1_MBlock));
+        default:
+            return 0;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helper: parse layer index from "blk.N.ffn_gate_exps.weight" etc.
+    // Returns -1 on parse failure.
+    // -------------------------------------------------------------------------
+    static int parseMoELayerIndex(const std::string &name)
+    {
+        // Expect "blk.N.<suffix>"
+        if (name.compare(0, 4, "blk.") != 0)
+            return -1;
+        auto dot2 = name.find('.', 4);
+        if (dot2 == std::string::npos)
+            return -1;
+        try
+        {
+            return std::stoi(name.substr(4, dot2 - 4));
+        }
+        catch (...)
+        {
+            return -1;
+        }
+    }
+
+    static const char *moeWeightRoleName(ExpertGemmRegistry::WeightRole role)
+    {
+        switch (role)
+        {
+        case ExpertGemmRegistry::WeightRole::GATE:
+            return "gate";
+        case ExpertGemmRegistry::WeightRole::UP:
+            return "up";
+        case ExpertGemmRegistry::WeightRole::DOWN:
+            return "down";
+        default:
+            return "unknown";
+        }
+    }
+
+    static std::string registrySlotComponent(const std::string &value)
+    {
+        std::string result;
+        result.reserve(value.size());
+        for (unsigned char ch : value)
+            result.push_back(std::isalnum(ch) ? static_cast<char>(std::tolower(ch)) : '_');
+        return result.empty() ? std::string("default") : result;
+    }
+
+    static bool parseMoEExpertParentName(const std::string &name,
+                                         int &layer_idx,
+                                         ExpertGemmRegistry::WeightRole &role)
+    {
+        layer_idx = parseMoELayerIndex(name);
+        if (layer_idx < 0)
+            return false;
+
+        if (name.find("ffn_gate_exps.weight") != std::string::npos)
+        {
+            role = ExpertGemmRegistry::WeightRole::GATE;
+            return true;
+        }
+        if (name.find("ffn_up_exps.weight") != std::string::npos)
+        {
+            role = ExpertGemmRegistry::WeightRole::UP;
+            return true;
+        }
+        if (name.find("ffn_down_exps.weight") != std::string::npos)
+        {
+            role = ExpertGemmRegistry::WeightRole::DOWN;
+            return true;
+        }
+
+        return false;
+    }
+
+    static std::string moeParentNameForRole(int layer_idx, ExpertGemmRegistry::WeightRole role)
+    {
+        switch (role)
+        {
+        case ExpertGemmRegistry::WeightRole::GATE:
+            return "blk." + std::to_string(layer_idx) + ".ffn_gate_exps.weight";
+        case ExpertGemmRegistry::WeightRole::UP:
+            return "blk." + std::to_string(layer_idx) + ".ffn_up_exps.weight";
+        case ExpertGemmRegistry::WeightRole::DOWN:
+            return "blk." + std::to_string(layer_idx) + ".ffn_down_exps.weight";
+        }
+        return {};
+    }
+
+    static int moeExpertCountFromParentTensor(const TensorBase &tensor)
+    {
+        const auto &shape = tensor.shape();
+        if (shape.size() != 3)
+            return 0;
+        return static_cast<int>(shape[2]);
+    }
+
+    static size_t estimateMoEOverlayRoutedExpertBytesPerExpert(
+        const std::unordered_map<std::string, std::shared_ptr<TensorBase>> &cache)
+    {
+        struct LayerEstimate
+        {
+            size_t bytes = 0;
+            int role_count = 0;
+        };
+
+        std::unordered_map<int, LayerEstimate> by_layer;
+        for (const auto &[name, tensor] : cache)
+        {
+            if (!tensor)
+                continue;
+
+            int layer_idx = -1;
+            ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+            if (!parseMoEExpertParentName(name, layer_idx, role))
+                continue;
+
+            const int num_experts = moeExpertCountFromParentTensor(*tensor);
+            if (num_experts <= 0)
+                continue;
+
+            auto &estimate = by_layer[layer_idx];
+            estimate.bytes += tensor->size_bytes() / static_cast<size_t>(num_experts);
+            ++estimate.role_count;
+        }
+
+        size_t best_partial = 0;
+        for (const auto &[_, estimate] : by_layer)
+        {
+            if (estimate.role_count >= 3)
+                return estimate.bytes;
+            best_partial = std::max(best_partial, estimate.bytes);
+        }
+        return best_partial;
+    }
+
+    static std::string formatMiB(size_t bytes)
+    {
+        return std::to_string(bytes / (1024 * 1024)) + " MiB";
+    }
+
+    struct MoEOverlayCpuPreparationGroup
+    {
+        std::string domain_name;
+        DeviceId device = DeviceId::cpu();
+        int participant_world_rank = -1;
+        int participant_index = -1;
+        int layer = -1;
+        std::vector<int> experts;
+    };
+
+    static bool sameMoEOverlayCpuPreparationGroup(
+        const MoEOverlayCpuPreparationGroup &group,
+        const MoEExpertOverlayPreparationRequest &request)
+    {
+        const int request_world_rank = request.participant_world_rank_known
+                                           ? request.participant_world_rank
+                                           : -1;
+        return group.domain_name == request.domain_name &&
+               group.device == request.device &&
+               group.participant_world_rank == request_world_rank &&
+               group.participant_index == request.participant_index &&
+               group.layer == request.layer;
+    }
+
+    static std::shared_ptr<ITensorGemm> ownerForExpertEngine(
+        const std::vector<std::shared_ptr<ITensorGemm>> &owners,
+        ITensorGemm *engine)
+    {
+        auto it = std::find_if(owners.begin(), owners.end(),
+                               [&](const auto &owner)
+                               { return owner.get() == engine; });
+        return it == owners.end() ? nullptr : *it;
+    }
+
+    bool WeightManager::prepareMoEExpertOverlayWeights(
+        const MoEExpertOverlayRuntimePlan &runtime_plan,
+        const FrozenModelWeightSet *frozen_weights,
+        const MoEExpertOverlayExecutionPlan *execution_plan)
+    {
+        (void)frozen_weights;
+
+        if (!runtime_plan.sourcePlan().isTieredOverlay())
+            return true;
+
+        size_t routed_expert_bytes_per_expert = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            routed_expert_bytes_per_expert = estimateMoEOverlayRoutedExpertBytesPerExpert(cache_);
+        }
+
+        auto preparation_plan = MoEExpertOverlayPreparationPlan::build(
+            runtime_plan,
+            routed_expert_bytes_per_expert);
+        if (execution_plan)
+            preparation_plan = preparation_plan.filteredForRank(execution_plan->currentRankPlan());
+        moe_overlay_preparation_diagnostics_ = preparation_plan.diagnostics();
+
+        LOG_DEBUG("[WeightManager] " << moe_overlay_preparation_diagnostics_.render());
+
+        {
+            std::unordered_set<std::string> cpu_owned_parent_names;
+            for (const auto &request : preparation_plan.requests())
+            {
+                if (!request.device.is_cpu())
+                    continue;
+                auto parent_name = moeParentNameForRole(request.layer, request.role);
+                if (!parent_name.empty())
+                    cpu_owned_parent_names.insert(std::move(parent_name));
+            }
+
+            for (const auto &parent_name : cpu_owned_parent_names)
+            {
+                markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::LOADED_HOST, true,
+                              "MoE overlay CPU fallback owns routed expert host parent");
+            }
+        }
+
+        bool ok = true;
+
+        // Accelerator H2D/repack must consume the mmap-backed expert parents
+        // before CPU fallback packing advises those pages DONTNEED.
+        if (!preparation_plan.empty() && preparation_plan.hasAcceleratorRequests())
+        {
+            for (const auto &device : preparation_plan.acceleratorDevices())
+            {
+                auto layer_role_filter = [&preparation_plan, device](const std::string &name) -> bool
+                {
+                    int layer_idx = -1;
+                    ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+                    if (!parseMoEExpertParentName(name, layer_idx, role))
+                        return false;
+                    return preparation_plan.hasAnyRequestForDeviceLayerRole(device, layer_idx, role);
+                };
+
+                LOG_DEBUG("[WeightManager] Preparing MoE overlay experts for " << device.to_string());
+                const bool device_ok = packGemmWeightsViaPipeline(
+                    device,
+                    layer_role_filter,
+                    nullptr,
+                    true,
+                    &preparation_plan);
+                ok = ok && device_ok;
+            }
+        }
+
+        if (preparation_plan.hasCpuRoutedAssignments())
+        {
+            std::vector<MoEOverlayCpuPreparationGroup> groups;
+            for (const auto &request : preparation_plan.requests())
+            {
+                if (!request.device.is_cpu() ||
+                    request.role != ExpertGemmRegistry::WeightRole::GATE)
+                {
+                    continue;
+                }
+
+                auto it = std::find_if(groups.begin(), groups.end(),
+                                       [&](const auto &group)
+                                       { return sameMoEOverlayCpuPreparationGroup(group, request); });
+                if (it == groups.end())
+                {
+                    MoEOverlayCpuPreparationGroup group;
+                    group.domain_name = request.domain_name;
+                    group.device = request.device;
+                    group.participant_world_rank = request.participant_world_rank_known
+                                                       ? request.participant_world_rank
+                                                       : -1;
+                    group.participant_index = request.participant_index;
+                    group.layer = request.layer;
+                    group.experts.push_back(request.expert_id);
+                    groups.push_back(std::move(group));
+                }
+                else if (std::find(it->experts.begin(), it->experts.end(), request.expert_id) == it->experts.end())
+                {
+                    it->experts.push_back(request.expert_id);
+                }
+            }
+
+            for (auto &group : groups)
+            {
+                std::sort(group.experts.begin(), group.experts.end());
+
+                auto ensure_parent = [&](ExpertGemmRegistry::WeightRole role) -> std::shared_ptr<TensorBase>
+                {
+                    const auto parent_name = moeParentNameForRole(group.layer, role);
+                    {
+                        std::lock_guard<std::mutex> lock(cache_mutex_);
+                        auto it = cache_.find(parent_name);
+                        if (it != cache_.end() && it->second && it->second->raw_data() != nullptr)
+                            return it->second;
+                    }
+
+                    auto loaded = getReplicatedWeight(parent_name, DeviceId::cpu());
+                    if (!loaded)
+                        return nullptr;
+
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto [it, inserted] = cache_.emplace(parent_name, loaded);
+                    if (!inserted)
+                    {
+                        if (!it->second || it->second->raw_data() == nullptr)
+                            it->second = loaded;
+                    }
+                    return it->second;
+                };
+
+                std::shared_ptr<TensorBase> gate;
+                std::shared_ptr<TensorBase> up;
+                std::shared_ptr<TensorBase> down;
+                gate = ensure_parent(ExpertGemmRegistry::WeightRole::GATE);
+                up = ensure_parent(ExpertGemmRegistry::WeightRole::UP);
+                down = ensure_parent(ExpertGemmRegistry::WeightRole::DOWN);
+
+                if (!gate || !up || !down)
+                {
+                    LOG_ERROR("[WeightManager] MoE overlay CPU fallback missing expert parents for domain "
+                              << group.domain_name << " layer " << group.layer);
+                    ok = false;
+                    continue;
+                }
+
+                const auto &gate_shape = gate->shape();
+                if (gate_shape.size() != 3 || gate_shape[0] == 0 || gate_shape[1] == 0 || gate_shape[2] == 0)
+                {
+                    LOG_ERROR("[WeightManager] MoE overlay CPU fallback has invalid gate parent shape for layer "
+                              << group.layer);
+                    ok = false;
+                    continue;
+                }
+
+                const int num_experts = static_cast<int>(gate_shape[2]);
+                std::vector<bool> expert_mask(static_cast<size_t>(num_experts), false);
+                bool group_valid = true;
+                for (int expert_id : group.experts)
+                {
+                    if (expert_id < 0 || expert_id >= num_experts)
+                    {
+                        LOG_ERROR("[WeightManager] MoE overlay CPU fallback request for invalid expert "
+                                  << expert_id << " in layer " << group.layer
+                                  << " (num_experts=" << num_experts << ")");
+                        group_valid = false;
+                        break;
+                    }
+                    expert_mask[static_cast<size_t>(expert_id)] = true;
+                }
+                if (!group_valid)
+                {
+                    ok = false;
+                    continue;
+                }
+
+                std::vector<std::shared_ptr<TensorBase>> gate_views;
+                std::vector<std::shared_ptr<TensorBase>> up_views;
+                std::vector<std::shared_ptr<TensorBase>> down_views;
+                std::vector<ITensorGemm *> gate_gemm;
+                std::vector<ITensorGemm *> up_gemm;
+                std::vector<ITensorGemm *> down_gemm;
+                std::vector<std::shared_ptr<ITensorGemm>> owned_kernels;
+                std::shared_ptr<void> gate_lifetime;
+                std::shared_ptr<void> up_lifetime;
+                std::shared_ptr<void> down_lifetime;
+
+                MoEWeightContext ctx{
+                    group.device,
+                    num_experts,
+                    static_cast<int>(gate_shape[1]),
+                    static_cast<int>(gate_shape[0]),
+                    0,
+                    num_experts,
+                    group.layer,
+                    expert_mask,
+                    gate.get(),
+                    up.get(),
+                    down.get(),
+                    gate_views,
+                    up_views,
+                    down_views,
+                    gate_gemm,
+                    up_gemm,
+                    down_gemm,
+                    owned_kernels,
+                    gate_lifetime,
+                    up_lifetime,
+                    down_lifetime};
+                ctx.advise_raw_pages_after_prepare = !preparation_plan.hasAcceleratorRequests();
+
+                if (!MoEExpertWeightService::extractExpertViews(ctx) ||
+                    !MoEExpertWeightService::prepareGemmEngines(ctx))
+                {
+                    LOG_ERROR("[WeightManager] Failed to prepare MoE overlay CPU fallback expert engines for domain "
+                              << group.domain_name << " layer " << group.layer
+                              << " participant=" << group.participant_index);
+                    ok = false;
+                    continue;
+                }
+
+                auto register_role = [&](int expert_id,
+                                         ExpertGemmRegistry::WeightRole role,
+                                         ITensorGemm *engine)
+                {
+                    if (!engine)
+                        return false;
+                    auto owner = ownerForExpertEngine(owned_kernels, engine);
+                    expert_gemm_registry_.registerEngineForParticipant(
+                        group.domain_name,
+                        group.device,
+                        group.participant_world_rank,
+                        group.participant_index,
+                        group.layer,
+                        expert_id,
+                        role,
+                        engine,
+                        owner);
+                    expert_gemm_registry_.registerEngineForDomain(
+                        group.domain_name,
+                        group.device,
+                        group.layer,
+                        expert_id,
+                        role,
+                        engine,
+                        std::move(owner));
+                    return true;
+                };
+
+                for (int expert_id : group.experts)
+                {
+                    const bool registered =
+                        register_role(expert_id, ExpertGemmRegistry::WeightRole::GATE, gate_gemm[static_cast<size_t>(expert_id)]) &&
+                        register_role(expert_id, ExpertGemmRegistry::WeightRole::UP, up_gemm[static_cast<size_t>(expert_id)]) &&
+                        register_role(expert_id, ExpertGemmRegistry::WeightRole::DOWN, down_gemm[static_cast<size_t>(expert_id)]);
+                    if (!registered)
+                    {
+                        LOG_ERROR("[WeightManager] Failed to register MoE overlay CPU fallback expert "
+                                  << expert_id << " for domain " << group.domain_name
+                                  << " layer " << group.layer);
+                        ok = false;
+                    }
+                }
+
+                for (const auto role : {ExpertGemmRegistry::WeightRole::GATE,
+                                        ExpertGemmRegistry::WeightRole::UP,
+                                        ExpertGemmRegistry::WeightRole::DOWN})
+                {
+                    const auto parent_name = moeParentNameForRole(group.layer, role);
+                    markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::PACKED_HOST, true,
+                                  "MoE overlay CPU fallback expert engines packed");
+                    markPrepState(parent_name, DeviceId::cpu(), WeightPrepState::READY, true,
+                                  "MoE overlay CPU fallback expert engines ready");
+                }
+            }
+        }
+
+        return ok;
+    }
+
+    bool WeightManager::packGemmWeightsViaPipeline(
+        DeviceId target_device,
+        std::function<bool(const std::string &)> layer_filter,
+        const FrozenModelWeightSet *frozen_weights,
+        bool include_expert_jobs,
+        const MoEExpertOverlayPreparationPlan *overlay_preparation_plan)
+    {
+        using namespace llaminar::v2::kernels;
+        using Clock = std::chrono::high_resolution_clock;
+        const auto start = Clock::now();
+
+        if (!target_device.is_gpu())
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline only supports GPU devices");
+            return false;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 1: Collect GEMM weights (same logic as packGemmWeights)
+        // ------------------------------------------------------------------
+        struct DenseGemmJob
+        {
+            std::string name;
+            TensorBase *tensor = nullptr;
+            std::shared_ptr<TensorBase> owner;
+            std::optional<WeightBinding> binding;
+        };
+
+        std::vector<DenseGemmJob> gemm_weights;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            if (frozen_weights)
+            {
+                for (const auto &binding : frozen_weights->bindings())
+                {
+                    if (!binding.prepared.has_value() || binding.prepared->device != target_device)
+                        continue;
+                    if (!binding.tensor || binding.tensor->shape().size() != 2)
+                        continue;
+                    if (binding.identity.role == WeightRole::Embedding ||
+                        binding.identity.role == WeightRole::Norm ||
+                        binding.identity.role == WeightRole::Bias)
+                    {
+                        continue;
+                    }
+
+                    gemm_weights.push_back(DenseGemmJob{
+                        binding.identity.canonical_name,
+                        binding.tensor,
+                        nullptr,
+                        binding});
+                }
+            }
+            else
+            {
+                const std::string device_prefix = target_device.to_string() + ":";
+                bool has_per_device_entries = false;
+                std::unordered_set<std::string> collected_names;
+
+                for (const auto &[key, tensor] : per_device_cache_)
+                {
+                    if (key.compare(0, device_prefix.size(), device_prefix) == 0)
+                    {
+                        has_per_device_entries = true;
+                        break;
+                    }
+                }
+
+                if (has_per_device_entries)
+                {
+                    for (const auto &[key, tensor] : per_device_cache_)
+                    {
+                        if (key.compare(0, device_prefix.size(), device_prefix) != 0)
+                            continue;
+                        const std::string name = key.substr(device_prefix.size());
+                        if (isGemmWeight(name) && tensor)
+                        {
+                            if (layer_filter && !layer_filter(name))
+                                continue;
+                            gemm_weights.push_back(DenseGemmJob{name, tensor.get(), tensor, std::nullopt});
+                            collected_names.insert(name);
+                        }
+                    }
+                }
+
+                // Supplement from the main cache for weights that do not have a
+                // device-specific clone. Hybrid PP/TP can populate per_device_cache_
+                // partially; treating any per-device entry as complete skips dense
+                // PP-stage weights that still live in cache_.
+                {
+                    for (const auto &[name, tensor] : cache_)
+                    {
+                        if (collected_names.count(name) != 0)
+                            continue;
+                        if (isGemmWeight(name) && tensor)
+                        {
+                            if (layer_filter && !layer_filter(name))
+                                continue;
+                            gemm_weights.push_back(DenseGemmJob{name, tensor.get(), tensor, std::nullopt});
+                            collected_names.insert(name);
+                        }
+                    }
+                }
+
+                // Tied LM head: if this stage owns lm_head (layer_filter passes
+                // output.weight) but output.weight wasn't collected, the model
+                // ties token_embd.weight as the LM projection weight. Include
+                // it in the pipeline so it gets GPU-repacked with the rest of the
+                // resident GEMM weights.
+                if (!layer_filter || layer_filter("output.weight"))
+                {
+                    bool has_output_weight = false;
+                    for (const auto &job : gemm_weights)
+                    {
+                        if (job.name == "output.weight")
+                        {
+                            has_output_weight = true;
+                            break;
+                        }
+                    }
+                    if (!has_output_weight)
+                    {
+                        std::shared_ptr<TensorBase> embed_tensor;
+                        const std::string device_key = target_device.to_string() + ":token_embd.weight";
+                        auto pdit = per_device_cache_.find(device_key);
+                        if (pdit != per_device_cache_.end() && pdit->second)
+                            embed_tensor = pdit->second;
+                        else
+                        {
+                            auto it = cache_.find("token_embd.weight");
+                            if (it != cache_.end() && it->second)
+                                embed_tensor = it->second;
+                        }
+                        if (embed_tensor)
+                        {
+                            // The tensor data comes from token_embd.weight, but the
+                            // graph owns and resolves the LM projection through the
+                            // canonical output.weight binding. Registering the
+                            // prepared handle under output.weight keeps tied-embedding
+                            // models on the same binding-first path as untied models.
+                            gemm_weights.push_back(DenseGemmJob{"output.weight", embed_tensor.get(), embed_tensor, std::nullopt});
+                            collected_names.insert("output.weight");
+                            LOG_DEBUG("[WeightManager] GPU pipeline: including tied token_embd.weight as canonical output.weight LM head GEMM");
+                        }
+                    }
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Step 1b: Collect MoE expert weights (3D _exps.weight tensors)
+        //
+        // These are filtered OUT by isGemmWeight() because isNonGemmWeight()
+        // returns true for _exps.weight. We scan for them separately, create
+        // 2D views for each expert, and include them in the same orchestrator.
+        // ------------------------------------------------------------------
+        struct MoEExpertJob
+        {
+            int layer_idx;
+            int expert_idx;
+            ExpertGemmRegistry::WeightRole role;
+            std::string slot_name; // e.g., "moe_L0_gate_e5"
+            std::string domain_name;
+            std::string tier_name;
+            int tier_index = -1;
+            int participant_world_rank = -1;
+            int participant_index = -1;
+            std::shared_ptr<TensorBase> parent_owner; // keeps the 3D parent alive while view jobs are staged
+            std::shared_ptr<TensorBase> view; // 2D expert view (keeps parent alive)
+        };
+        std::vector<MoEExpertJob> moe_jobs;
+
+        // Track 3D parent tensors by name so release readiness is tensor-specific.
+        struct MoEParentTensorRecord
+        {
+            std::string name;
+            std::shared_ptr<TensorBase> parent;
+            std::vector<int> expected_experts;
+        };
+        std::vector<MoEParentTensorRecord> moe_parent_tensors;
+
+        if (include_expert_jobs)
+        {
+            // Group 3D expert tensors by layer: layer_idx -> {gate, up, down}
+            struct MoERoleTensor
+            {
+                std::shared_ptr<TensorBase> owner;
+                TensorBase *tensor = nullptr;
+                std::string name;
+                size_t tensor_expert_start = 0;
+                size_t global_expert_start = 0;
+                size_t expert_count = 0;
+            };
+            struct MoELayerTensors
+            {
+                MoERoleTensor gate;
+                MoERoleTensor up;
+                MoERoleTensor down;
+            };
+            std::unordered_map<int, MoELayerTensors> moe_layers;
+
+            auto add_moe_parent = [&](const std::string &name,
+                                      std::shared_ptr<TensorBase> owner,
+                                      TensorBase *tensor,
+                                      const WeightSliceSpec &slice)
+            {
+                if (!tensor || name.find("_exps.weight") == std::string::npos)
+                    return;
+                if (layer_filter && !layer_filter(name))
+                    return;
+
+                int layer_idx = parseMoELayerIndex(name);
+                if (layer_idx < 0)
+                    return;
+
+                const auto &shape = tensor->shape();
+                if (shape.size() != 3 || shape[2] == 0)
+                    return;
+
+                MoERoleTensor source;
+                source.owner = std::move(owner);
+                source.tensor = tensor;
+                source.name = name;
+
+                /**
+                 * Expert-parallel LocalTP freezes a tensor that already contains
+                 * only this participant's expert range. The registry, router, and
+                 * graph still use global expert ids, so keep two coordinates:
+                 *
+                 * - tensor_expert_start: local index inside this tensor for view offsets
+                 * - global_expert_start: model expert id registered in ExpertGemmRegistry
+                 */
+                source.expert_count = shape[2];
+                if (slice.expert_count != 0)
+                {
+                    source.global_expert_start = slice.expert_start;
+                    source.expert_count = std::min(slice.expert_count, shape[2]);
+                    if (!slice.inner_is_presliced)
+                    {
+                        source.tensor_expert_start = slice.expert_start;
+                        if (source.tensor_expert_start >= shape[2])
+                            source.expert_count = 0;
+                        else
+                            source.expert_count = std::min(source.expert_count,
+                                                           shape[2] - source.tensor_expert_start);
+                    }
+                }
+
+                if (name.find("ffn_gate_exps.weight") != std::string::npos)
+                {
+                    moe_layers[layer_idx].gate = std::move(source);
+                }
+                else if (name.find("ffn_up_exps.weight") != std::string::npos)
+                {
+                    moe_layers[layer_idx].up = std::move(source);
+                }
+                else if (name.find("ffn_down_exps.weight") != std::string::npos)
+                {
+                    moe_layers[layer_idx].down = std::move(source);
+                }
+            };
+
+            bool collected_from_frozen = false;
+            if (frozen_weights)
+            {
+                for (const auto &binding : frozen_weights->bindings())
+                {
+                    if (!binding.tensor)
+                        continue;
+                    const bool resident_on_target =
+                        binding.prepared.has_value()
+                            ? binding.prepared->device == target_device
+                            : (binding.residency.resident_device.has_value()
+                                   ? *binding.residency.resident_device == target_device
+                                   : binding.residency.home_device == target_device);
+                    if (!resident_on_target)
+                        continue;
+
+                    add_moe_parent(binding.identity.canonical_name,
+                                   binding.tensor_owner,
+                                   binding.tensor,
+                                   binding.slice);
+                    if (binding.identity.canonical_name.find("_exps.weight") != std::string::npos)
+                        collected_from_frozen = true;
+                }
+            }
+
+            if (!collected_from_frozen)
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                for (const auto &[name, tensor] : cache_)
+                {
+                    WeightSliceSpec full_slice;
+                    add_moe_parent(name, tensor, tensor.get(), full_slice);
+                }
+            }
+
+            // Create 2D expert views for each complete layer
+            for (auto &[layer_idx, tensors] : moe_layers)
+            {
+                if (!tensors.gate.tensor || !tensors.up.tensor || !tensors.down.tensor)
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: incomplete MoE expert tensors for layer "
+                             << layer_idx << " — skipping");
+                    continue;
+                }
+
+                // GGUF 3D: shape[0]=cols (K, fastest), shape[1]=rows_per_expert, shape[2]=num_experts
+                const auto &gate_shape = tensors.gate.tensor->shape();
+                if (gate_shape.size() != 3)
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: MoE gate tensor for layer "
+                             << layer_idx << " is not 3D — skipping");
+                    continue;
+                }
+
+                const size_t local_expert_count = std::min({tensors.gate.expert_count,
+                                                            tensors.up.expert_count,
+                                                            tensors.down.expert_count});
+                if (local_expert_count == 0 ||
+                    tensors.gate.global_expert_start != tensors.up.global_expert_start ||
+                    tensors.gate.global_expert_start != tensors.down.global_expert_start)
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: inconsistent MoE expert slices for layer "
+                             << layer_idx << " — skipping");
+                    continue;
+                }
+
+                std::vector<int> expected_experts;
+                expected_experts.reserve(local_expert_count);
+                for (size_t local_idx = 0; local_idx < local_expert_count; ++local_idx)
+                {
+                    expected_experts.push_back(static_cast<int>(tensors.gate.global_expert_start + local_idx));
+                }
+
+                moe_parent_tensors.push_back({tensors.gate.name, tensors.gate.owner, expected_experts});
+                moe_parent_tensors.push_back({tensors.up.name, tensors.up.owner, expected_experts});
+                moe_parent_tensors.push_back({tensors.down.name, tensors.down.owner, expected_experts});
+
+                struct RoleTensor
+                {
+                    ExpertGemmRegistry::WeightRole role;
+                    const char *tag;
+                    const MoERoleTensor *source;
+                };
+                RoleTensor roles[] = {
+                    {ExpertGemmRegistry::WeightRole::GATE, "gate", &tensors.gate},
+                    {ExpertGemmRegistry::WeightRole::UP, "up", &tensors.up},
+                    {ExpertGemmRegistry::WeightRole::DOWN, "down", &tensors.down},
+                };
+
+                for (const auto &rt : roles)
+                {
+                    // Each role tensor may have different dimensions
+                    // (e.g., down is [intermediate, d_model, num_experts] while gate/up are [d_model, intermediate, num_experts])
+                    const auto &role_shape = rt.source->tensor->shape();
+                    const size_t role_cols = role_shape[0];
+                    const size_t role_rows_per_expert = role_shape[1];
+                    const size_t role_elements_per_expert = role_rows_per_expert * role_cols;
+
+                    for (size_t local_idx = 0; local_idx < local_expert_count; ++local_idx)
+                    {
+                        const int global_expert = static_cast<int>(rt.source->global_expert_start + local_idx);
+                        const auto *overlay_request = overlay_preparation_plan
+                                                          ? overlay_preparation_plan->requestFor(target_device, layer_idx, global_expert, rt.role)
+                                                          : nullptr;
+                        if (overlay_preparation_plan && !overlay_request)
+                        {
+                            continue;
+                        }
+
+                        const size_t tensor_expert_idx = rt.source->tensor_expert_start + local_idx;
+                        const size_t element_offset = tensor_expert_idx * role_elements_per_expert;
+                        std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
+                        auto view = rt.source->tensor->create_view(view_shape, element_offset);
+                        if (!view)
+                        {
+                            throw std::runtime_error(
+                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(global_expert) + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols) + "], offset=" + std::to_string(element_offset) + ")");
+                        }
+
+                        std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_" + rt.tag + "_e" + std::to_string(global_expert);
+                        std::string domain_name;
+                        std::string tier_name;
+                        int tier_index = -1;
+                        int participant_world_rank = -1;
+                        int participant_index = -1;
+                        if (overlay_request)
+                        {
+                            domain_name = overlay_request->domain_name;
+                            tier_name = overlay_request->tier_name;
+                            tier_index = overlay_request->tier_index;
+                            participant_world_rank = overlay_request->participant_world_rank;
+                            participant_index = overlay_request->participant_index;
+                            slot_name = "moe_" + registrySlotComponent(domain_name) + "_tier" +
+                                        std::to_string(tier_index) + "_L" + std::to_string(layer_idx) +
+                                        "_" + rt.tag + "_e" + std::to_string(global_expert);
+                        }
+
+                        moe_jobs.push_back({layer_idx, global_expert, rt.role, std::move(slot_name),
+                                            std::move(domain_name), std::move(tier_name), tier_index,
+                                            participant_world_rank, participant_index,
+                                            rt.source->owner,
+                                            std::move(view)});
+                    }
+                }
+
+                LOG_DEBUG("[WeightManager] GPU pipeline: collected " << local_expert_count
+                                                                     << " local experts × 3 roles for MoE layer " << layer_idx
+                                                                     << " starting at global expert "
+                                                                     << tensors.gate.global_expert_start);
+            }
+        }
+
+        if (frozen_weights)
+        {
+            std::vector<DenseGemmJob> pending_gemm_weights;
+            pending_gemm_weights.reserve(gemm_weights.size());
+            size_t adopted_dense = 0;
+
+            for (auto &dense_job : gemm_weights)
+            {
+                if (!dense_job.binding.has_value())
+                {
+                    pending_gemm_weights.push_back(std::move(dense_job));
+                    continue;
+                }
+
+                const auto &binding = *dense_job.binding;
+                if (preparedWeightStore()->preparedRefForBinding(binding.binding_id, target_device).has_value() ||
+                    preparedWeightStore()->adoptPreparedGemmForBinding(binding, target_device))
+                {
+                    markPrepState(dense_job.name, target_device, WeightPrepState::READY, true,
+                                  "GPU pipeline: adopted already-loaded prepared GEMM handle");
+                    ++adopted_dense;
+                    continue;
+                }
+
+                pending_gemm_weights.push_back(std::move(dense_job));
+            }
+
+            if (adopted_dense > 0)
+            {
+                LOG_DEBUG("[WeightManager] GPU pipeline: adopted " << adopted_dense
+                                                                    << " already-prepared GEMM bindings for "
+                                                                    << target_device.to_string());
+            }
+
+            gemm_weights = std::move(pending_gemm_weights);
+        }
+
+        if (gemm_weights.empty() && moe_jobs.empty())
+        {
+            LOG_DEBUG("[WeightManager] GPU pipeline: no weights to load");
+            return true;
+        }
+
+        LOG_DEBUG("[WeightManager] GPU pipeline: loading " << gemm_weights.size()
+                                                           << " GEMM weights + " << moe_jobs.size()
+                                                           << " MoE expert slots for " << target_device.to_string());
+
+        // ------------------------------------------------------------------
+        // Step 2: Get backend
+        // ------------------------------------------------------------------
+        IBackend *backend = target_device.is_rocm()   ? getROCmBackend()
+                            : target_device.is_cuda() ? getCUDABackend()
+                                                      : nullptr;
+        if (!backend)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline: no backend for " << target_device.to_string());
+            return false;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 3: Create orchestrator and plan weights
+        // ------------------------------------------------------------------
+        auto orchestrator = std::make_shared<LoadOrchestrator>(backend);
+        orchestrator->addDevice(target_device.ordinal);
+
+        size_t max_raw_bytes = 0;
+        size_t planned_count = 0;
+        std::vector<std::pair<std::string, const NativeVnniFormatInfo *>> weight_formats;
+        weight_formats.reserve(gemm_weights.size());
+
+        for (const auto &job : gemm_weights)
+        {
+            const std::string &name = job.name;
+            TensorBase *tensor = job.tensor;
+            if (!tensor)
+                continue;
+
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor);
+            const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!vnni)
+            {
+                // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
+                // they go through the pipeline as raw H2D copies (no GPU repack kernel).
+                const auto type = tensor->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    const int N = static_cast<int>(tensor->rows());
+                    const int K = static_cast<int>(tensor->cols());
+                    const size_t raw_bytes = tensor->size_bytes();
+
+                    orchestrator->planRawWeight(target_device.ordinal, name, N, K, raw_bytes);
+                    max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+                    ++planned_count;
+                    weight_formats.emplace_back(name, nullptr);
+                    continue;
+                }
+                // Any quantized type that doesn't implement IINT8Unpackable is a bug.
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline: weight does not implement "
+                    "IINT8Unpackable (unsupported quantized type for GPU repack): " +
+                    name);
+            }
+
+            const int N = static_cast<int>(tensor->rows());
+            const int K = static_cast<int>(tensor->cols());
+            const size_t raw_bytes = tensor->size_bytes();
+
+            orchestrator->planWeight(target_device.ordinal, name, N, K,
+                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->has_emins, raw_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+            ++planned_count;
+            weight_formats.emplace_back(name, vnni);
+        }
+
+        // Plan MoE expert weights into the same orchestrator
+        std::vector<const NativeVnniFormatInfo *> moe_vnni_infos;
+        moe_vnni_infos.reserve(moe_jobs.size());
+        for (const auto &mj : moe_jobs)
+        {
+            auto *unpackable = dynamic_cast<IINT8Unpackable *>(mj.view.get());
+            const NativeVnniFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            if (!vnni)
+            {
+                // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
+                // they go through the pipeline as raw H2D copies.
+                const auto type = mj.view->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    const int N = static_cast<int>(mj.view->rows());
+                    const int K = static_cast<int>(mj.view->cols());
+                    const size_t raw_bytes = mj.view->size_bytes();
+
+                    orchestrator->planRawWeight(target_device.ordinal, mj.slot_name, N, K, raw_bytes);
+                    max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+                    ++planned_count;
+                    moe_vnni_infos.push_back(nullptr);
+                    continue;
+                }
+                // Any quantized type that doesn't implement IINT8Unpackable is a bug.
+                throw std::runtime_error(
+                    "[WeightManager] GPU pipeline: MoE expert view does not implement "
+                    "IINT8Unpackable (unsupported quantized type for GPU repack): " +
+                    mj.slot_name);
+            }
+
+            // 2D view: rows()=rows_per_expert, cols()=cols
+            const int N = static_cast<int>(mj.view->rows());
+            const int K = static_cast<int>(mj.view->cols());
+            const size_t raw_bytes = quantizedViewRawBytes(*mj.view);
+
+            orchestrator->planWeight(target_device.ordinal, mj.slot_name, N, K,
+                                     vnni->payload_bytes, vnni->is_asymmetric,
+                                     vnni->has_emins, raw_bytes);
+            max_raw_bytes = std::max(max_raw_bytes, raw_bytes);
+            ++planned_count;
+            moe_vnni_infos.push_back(vnni);
+        }
+
+        if (planned_count == 0)
+        {
+            LOG_WARN("[WeightManager] GPU pipeline: no weights to load");
+            return false;
+        }
+
+        if (max_raw_bytes == 0)
+        {
+            size_t adopted_dense = 0;
+            size_t missing_dense = 0;
+            for (const auto &dense_job : gemm_weights)
+            {
+                if (!dense_job.binding.has_value())
+                    continue;
+                const auto &binding = *dense_job.binding;
+                if (preparedWeightStore()->preparedRefForBinding(binding.binding_id, target_device).has_value() ||
+                    preparedWeightStore()->adoptPreparedGemmForBinding(binding, target_device))
+                {
+                    markPrepState(dense_job.name, target_device, WeightPrepState::READY, true,
+                                  "GPU pipeline: adopted already-loaded prepared GEMM handle");
+                    ++adopted_dense;
+                }
+                else
+                {
+                    ++missing_dense;
+                    LOG_WARN("[WeightManager] GPU pipeline: no already-loaded prepared GEMM handle for "
+                             << dense_job.name << " on " << target_device.to_string());
+                }
+            }
+
+            size_t aliased_experts = 0;
+            size_t missing_experts = 0;
+            for (const auto &moe_job : moe_jobs)
+            {
+                if (moe_job.domain_name.empty())
+                    continue;
+
+                bool has_domain_engine = expert_gemm_registry_.getEngineForDomain(
+                                             moe_job.domain_name,
+                                             target_device,
+                                             moe_job.layer_idx,
+                                             moe_job.expert_idx,
+                                             moe_job.role) != nullptr;
+                if (!has_domain_engine)
+                {
+                    has_domain_engine = expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                        moe_job.domain_name,
+                        target_device,
+                        moe_job.layer_idx,
+                        moe_job.expert_idx,
+                        moe_job.role);
+                }
+
+                bool has_participant_engine = true;
+                if (moe_job.participant_world_rank >= 0 || moe_job.participant_index >= 0)
+                {
+                    has_participant_engine = expert_gemm_registry_.getEngineForParticipant(
+                                                 moe_job.domain_name,
+                                                 target_device,
+                                                 moe_job.participant_world_rank,
+                                                 moe_job.participant_index,
+                                                 moe_job.layer_idx,
+                                                 moe_job.expert_idx,
+                                                 moe_job.role) != nullptr;
+                    if (!has_participant_engine)
+                    {
+                        has_participant_engine = expert_gemm_registry_.aliasEngineForParticipantFromDevice(
+                            moe_job.domain_name,
+                            target_device,
+                            moe_job.participant_world_rank,
+                            moe_job.participant_index,
+                            moe_job.layer_idx,
+                            moe_job.expert_idx,
+                            moe_job.role);
+                    }
+                }
+
+                if (has_domain_engine && has_participant_engine)
+                {
+                    ++aliased_experts;
+                }
+                else
+                {
+                    ++missing_experts;
+                    LOG_WARN("[WeightManager] GPU pipeline: no already-loaded expert GEMM engine for "
+                             << moe_job.domain_name << " layer=" << moe_job.layer_idx
+                             << " expert=" << moe_job.expert_idx
+                             << " role=" << moeWeightRoleName(moe_job.role)
+                             << " on " << target_device.to_string());
+                }
+            }
+
+            LOG_DEBUG("[WeightManager] GPU pipeline: planned " << planned_count
+                                                               << " weights for " << target_device.to_string()
+                                                               << " with no host-backed raw bytes; adopted_dense=" << adopted_dense
+                                                               << " missing_dense=" << missing_dense
+                                                               << " aliased_experts=" << aliased_experts
+                                                               << " missing_experts=" << missing_experts);
+
+            return missing_dense == 0 && missing_experts == 0;
+        }
+
+        // ------------------------------------------------------------------
+        // Step 4: Allocate VRAM pool + pinned ring buffer
+        // ------------------------------------------------------------------
+        const auto &rocm_cfg = debugEnv().rocm;
+        /**
+         * The upload pipeline is a ring of pinned host slots paired with H2D
+         * streams. A zero stream count is never meaningful once there are raw
+         * weights to stage; clamp here before both budgeting and allocation so
+         * the VRAM preflight describes the exact resources the orchestrator will
+         * bind.
+         */
+        const int repack_streams = std::clamp(rocm_cfg.repack_streams, 1, 8);
+        const auto *planned_pool = orchestrator->getPool(target_device.ordinal);
+        const size_t planned_weight_bytes = planned_pool ? planned_pool->totalPlannedBytes() : 0;
+        const size_t staging_bytes = max_raw_bytes * static_cast<size_t>(std::max(0, repack_streams));
+        const size_t required_vram_bytes = planned_weight_bytes + staging_bytes;
+        const size_t free_vram_bytes = backend->deviceMemoryFree(target_device.ordinal);
+        const size_t total_vram_bytes = backend->deviceMemoryTotal(target_device.ordinal);
+        const size_t safety_margin_bytes = std::max<size_t>(512ULL * 1024ULL * 1024ULL,
+                                                            total_vram_bytes / 20ULL); // 5%, at least 512 MiB
+
+        if (free_vram_bytes > 0 && required_vram_bytes + safety_margin_bytes > free_vram_bytes)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline VRAM preflight failed for "
+                      << target_device.to_string()
+                      << ": required=" << formatMiB(required_vram_bytes)
+                      << " available_after_margin="
+                      << formatMiB(free_vram_bytes > safety_margin_bytes ? free_vram_bytes - safety_margin_bytes : 0)
+                      << " free=" << formatMiB(free_vram_bytes)
+                      << " total=" << formatMiB(total_vram_bytes)
+                      << " planned_weights=" << formatMiB(planned_weight_bytes)
+                      << " staging=" << formatMiB(staging_bytes)
+                      << " safety_margin=" << formatMiB(safety_margin_bytes)
+                      << ". Mitigations: "
+                      << gpuPipelineVramPreflightMitigations(
+                             debugEnv().streaming.enabled,
+                             !moe_jobs.empty()));
+            return false;
+        }
+
+        LOG_DEBUG("[WeightManager] GPU pipeline VRAM preflight for " << target_device.to_string()
+                                                                     << ": required=" << formatMiB(required_vram_bytes)
+                                                                     << " planned_weights=" << formatMiB(planned_weight_bytes)
+                                                                     << " staging=" << formatMiB(staging_bytes)
+                                                                     << " free=" << formatMiB(free_vram_bytes)
+                                                                     << " safety_margin=" << formatMiB(safety_margin_bytes));
+
+        orchestrator->allocate(max_raw_bytes, repack_streams);
+
+        // ------------------------------------------------------------------
+        // Step 5: Create weight jobs
+        // ------------------------------------------------------------------
+        for (size_t i = 0; i < gemm_weights.size(); ++i)
+        {
+            const auto &dense_job = gemm_weights[i];
+            const std::string &name = dense_job.name;
+            TensorBase *tensor = dense_job.tensor;
+            const auto *vnni = weight_formats[i].second;
+            if (!tensor)
+                continue;
+            if (!vnni)
+            {
+                // Floating-point weight: submit as RAW_FP passthrough job
+                const auto type = tensor->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    WeightJob job;
+                    job.name = name;
+                    job.host_raw_data = tensor->raw_data();
+                    job.raw_bytes = tensor->size_bytes();
+                    job.format = RepackFormat::RAW_FP;
+                    job.N = static_cast<int>(tensor->rows());
+                    job.K = static_cast<int>(tensor->cols());
+                    job.is_asymmetric = false;
+                    orchestrator->addWeightJob(target_device.ordinal, job);
+                }
+                continue;
+            }
+
+            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+            if (!repack_fmt)
+            {
+                LOG_WARN("[WeightManager] GPU pipeline: unsupported format for " << name
+                                                                                 << " (codebook=" << static_cast<int>(vnni->codebook_id)
+                                                                                 << ", superblock=" << vnni->is_superblock << ")");
+                continue;
+            }
+
+#ifdef HAVE_ROCM
+            if (target_device.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
+            {
+                if (!rocm::ensureIQGridTablesInitialized(target_device.ordinal))
+                {
+                    LOG_ERROR("[WeightManager] GPU pipeline: failed to initialize ROCm IQ grid tables for "
+                              << target_device.to_string());
+                    return false;
+                }
+            }
+#endif
+
+            WeightJob job;
+            job.name = name;
+            job.host_raw_data = tensor->raw_data();
+            job.raw_bytes = tensor->size_bytes();
+            job.format = *repack_fmt;
+            job.N = static_cast<int>(tensor->rows());
+            job.K = static_cast<int>(tensor->cols());
+            job.is_asymmetric = vnni->is_asymmetric;
+
+            orchestrator->addWeightJob(target_device.ordinal, job);
+        }
+
+        // Add MoE expert weight jobs
+        for (size_t i = 0; i < moe_jobs.size(); ++i)
+        {
+            const auto *vnni = moe_vnni_infos[i];
+            if (!vnni)
+            {
+                // Floating-point MoE expert: submit as RAW_FP passthrough job
+                const auto &mj = moe_jobs[i];
+                const auto type = mj.view->native_type();
+                if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
+                {
+                    WeightJob job;
+                    job.name = mj.slot_name;
+                    job.host_raw_data = mj.view->raw_data();
+                    job.raw_bytes = mj.view->size_bytes();
+                    job.format = RepackFormat::RAW_FP;
+                    job.N = static_cast<int>(mj.view->rows());
+                    job.K = static_cast<int>(mj.view->cols());
+                    job.is_asymmetric = false;
+                    orchestrator->addWeightJob(target_device.ordinal, job);
+                }
+                continue;
+            }
+
+            auto repack_fmt = codebookIdToRepackFormat(vnni->codebook_id, vnni->is_superblock);
+            if (!repack_fmt)
+            {
+                LOG_WARN("[WeightManager] GPU pipeline: unsupported MoE format for "
+                         << moe_jobs[i].slot_name);
+                continue;
+            }
+
+#ifdef HAVE_ROCM
+            if (target_device.is_rocm() && vnni->codebook_id >= 11 && vnni->codebook_id <= 17)
+            {
+                if (!rocm::ensureIQGridTablesInitialized(target_device.ordinal))
+                {
+                    LOG_ERROR("[WeightManager] GPU pipeline: failed to initialize ROCm IQ grid tables for "
+                              << target_device.to_string());
+                    return false;
+                }
+            }
+#endif
+
+            WeightJob job;
+            job.name = moe_jobs[i].slot_name;
+            job.host_raw_data = moe_jobs[i].view->raw_data();
+            job.raw_bytes = quantizedViewRawBytes(*moe_jobs[i].view);
+            job.format = *repack_fmt;
+            job.N = static_cast<int>(moe_jobs[i].view->rows());
+            job.K = static_cast<int>(moe_jobs[i].view->cols());
+            job.is_asymmetric = vnni->is_asymmetric;
+
+            orchestrator->addWeightJob(target_device.ordinal, job);
+        }
+
+        // ------------------------------------------------------------------
+        // Step 6: Execute pipeline (H2D + GPU repack)
+        // ------------------------------------------------------------------
+        DeviceLoadPipeline::ProgressCallback progress_cb;
+        int progress_device_idx = -1;
+        if (weight_load_progress_)
+        {
+            const size_t total_raw = orchestrator->totalPendingBytes(target_device.ordinal);
+            progress_device_idx = weight_load_progress_->registerDevice(
+                weight_load_progress_->makeDeviceLabel(target_device.to_string()), total_raw);
+            progress_cb = weight_load_progress_->makeCallback(progress_device_idx);
+        }
+        orchestrator->load(progress_cb);
+        if (weight_load_progress_ && progress_device_idx >= 0)
+        {
+            weight_load_progress_->finish(progress_device_idx);
+        }
+
+        // ------------------------------------------------------------------
+        // Step 7: Create GEMM kernels from pool slots and register in KernelFactory
+        // ------------------------------------------------------------------
+        auto *pool = orchestrator->getPool(target_device.ordinal);
+        if (!pool)
+        {
+            LOG_ERROR("[WeightManager] GPU pipeline: pool not found after load");
+            return false;
+        }
+
+        size_t registered = 0;
+        auto prepared_kind_for_device = [](DeviceId device)
+        {
+            if (device.is_cuda())
+                return PreparedWeightKind::CudaInt8PackedGemm;
+            if (device.is_rocm())
+                return PreparedWeightKind::RocmInt8PackedGemm;
+            return PreparedWeightKind::CpuPackedGemm;
+        };
+
+        auto register_pipeline_gemm = [&](const DenseGemmJob &dense_job,
+                                          std::unique_ptr<ITensorGemm> kernel) -> bool
+        {
+            const std::string &name = dense_job.name;
+            TensorBase *tensor = dense_job.tensor;
+            if (!tensor || !kernel)
+                return false;
+
+            const bool quantized = hasVnniPackedQuantizedPayload(tensor);
+            KernelFactory::GemmPreparationKind resolved_kind = quantized
+                                                                   ? (target_device.is_cuda()   ? KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
+                                                                      : target_device.is_rocm() ? KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED
+                                                                                                : KernelFactory::GemmPreparationKind::CPU_PACKED)
+                                                                   : KernelFactory::GemmPreparationKind::FLOATING_POINT;
+
+            auto owned_kernel = std::shared_ptr<ITensorGemm>(std::move(kernel));
+            auto prepared_weights = std::make_shared<KernelFactory::PreparedGemmWeights>();
+            prepared_weights->kind = resolved_kind;
+            prepared_weights->owned_kernel = owned_kernel;
+            prepared_weights->kernel = owned_kernel.get();
+
+            auto handle = std::make_shared<KernelFactory::PreparedGemmHandle>();
+            handle->tensor = tensor;
+            handle->device_id = target_device;
+            handle->kind = resolved_kind;
+            handle->variant = static_cast<int>(tensor->native_type());
+            handle->prepared_weights = std::move(prepared_weights);
+
+            WeightBinding binding;
+            if (dense_job.binding.has_value())
+            {
+                binding = *dense_job.binding;
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                binding.binding_id = next_pipeline_prepared_binding_id_++;
+                binding.identity = makeSourceWeightIdentity(name, {}, binding.binding_id);
+            }
+            binding.tensor = tensor;
+            if (binding.slice.source_rows == 0 && binding.slice.source_cols == 0 &&
+                binding.slice.row_count == 0 && binding.slice.col_count == 0)
+            {
+                binding.slice = fullSliceSpec(*tensor);
+            }
+            binding.residency.home_device = target_device;
+            binding.residency.resident_device = target_device;
+            binding.residency.host_policy = WeightHostPolicy::ReleasableAfterPreparation;
+            binding.immutable = true;
+
+            try
+            {
+                preparedWeightStore()->registerPreparedGemmHandle(
+                    binding,
+                    prepared_kind_for_device(target_device),
+                    target_device,
+                    std::move(handle));
+                return true;
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[WeightManager] GPU pipeline: failed to register prepared store entry for "
+                          << name << ": " << e.what());
+                return false;
+            }
+        };
+
+        for (size_t i = 0; i < gemm_weights.size(); ++i)
+        {
+            const auto &dense_job = gemm_weights[i];
+            const std::string &name = dense_job.name;
+            TensorBase *tensor = dense_job.tensor;
+            const auto *vnni = weight_formats[i].second;
+            if (!tensor)
+                continue;
+
+            auto slot = pool->getSlot(name);
+            if (!slot)
+            {
+                // Slot missing means this weight wasn't planned (shouldn't happen)
+                if (vnni)
+                    LOG_WARN("[WeightManager] GPU pipeline: no slot for " << name);
+                continue;
+            }
+
+            const int N = static_cast<int>(tensor->rows());
+            const int K = static_cast<int>(tensor->cols());
+
+            std::unique_ptr<ITensorGemm> kernel;
+
+            if (!vnni)
+            {
+                // Floating-point weight: create FP GEMM kernel from raw device pointer
+                const auto type = tensor->native_type();
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    auto precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_unique<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    auto precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_unique<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+            }
+            else
+            {
+                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    kernel = std::make_unique<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                        N, K, target_device.ordinal,
+                        slot->d_native_vnni_payload,
+                        slot->d_native_vnni_scales,
+                        slot->d_native_vnni_mins,
+                        slot->d_native_vnni_emins,
+                        vnni->codebook_id, blocks_per_row,
+                        orchestrator); // lifetime owner: keeps VRAM pool alive
+                }
+#endif
+
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    kernel = std::make_unique<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                        N, K, target_device.ordinal,
+                        slot->d_native_vnni_payload,
+                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
+                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
+                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                        vnni->codebook_id, blocks_per_row,
+                        orchestrator); // lifetime owner: keeps VRAM pool alive
+                }
+#endif
+            } // end else (quantized path)
+
+            if (kernel)
+            {
+                if (register_pipeline_gemm(dense_job, std::move(kernel)))
+                {
+                    markPrepState(name, target_device, WeightPrepState::UPLOADED_DEVICE, true,
+                                  "GPU pipeline: loaded + registered");
+                    markPrepState(name, target_device, WeightPrepState::READY, true,
+                                  "GPU pipeline: GEMM weight ready");
+                    ++registered;
+
+                    // Release host weight data — the GEMM kernel now owns device copies
+                    // in the WeightVRAMPool. PreparedWeightStore registration marks
+                    // has_prepared_device_state_, so releaseAllHostWeightData() would
+                    // also catch these, but releasing inline saves peak host memory.
+                    // Skip for token_embd.weight: it's also used for embedding lookup,
+                    // which runs concurrently (Steps 2/2b). Its host data is freed
+                    // later by releaseAllHostWeightData().
+                    const bool tied_alias = dense_job.binding.has_value() &&
+                                            dense_job.binding->identity.derivation == WeightDerivationKind::TiedAlias;
+                    if (name != "token_embd.weight" && !tied_alias)
+                    {
+                        try
+                        {
+                            tensor->release_host_weight_data();
+                        }
+                        catch (const std::exception &e)
+                        {
+                            LOG_DEBUG("[WeightManager] GPU pipeline: failed to release host data for "
+                                      << name << ": " << e.what());
+                        }
+                    }
+                }
+                else
+                {
+                    LOG_ERROR("[WeightManager] GPU pipeline: failed to register kernel for " << name);
+                }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Step 7b: Create MoE expert GEMM kernels and register in ExpertGemmRegistry
+        // ------------------------------------------------------------------
+        size_t moe_registered = 0;
+        for (size_t i = 0; i < moe_jobs.size(); ++i)
+        {
+            const auto *vnni = moe_vnni_infos[i];
+            const auto &mj = moe_jobs[i];
+
+            auto slot = pool->getSlot(mj.slot_name);
+            if (!slot)
+            {
+                if (vnni)
+                    LOG_WARN("[WeightManager] GPU pipeline: no slot for MoE expert " << mj.slot_name);
+                continue;
+            }
+
+            const int N = static_cast<int>(mj.view->rows());
+            const int K = static_cast<int>(mj.view->cols());
+
+            std::shared_ptr<ITensorGemm> kernel;
+
+            if (!vnni)
+            {
+                // Floating-point MoE expert: create FP GEMM kernel
+                const auto type = mj.view->native_type();
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    auto precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = rocm::ROCmFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_shared<llaminar2::rocm::ROCmFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    auto precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP32;
+                    if (type == TensorType::FP16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::FP16;
+                    else if (type == TensorType::BF16)
+                        precision = cuda::CUDAFloatingPointGemmKernel::Precision::BF16;
+                    kernel = std::make_shared<llaminar2::cuda::CUDAFloatingPointGemmKernel>(
+                        slot->d_native_vnni_payload, N, K,
+                        target_device.ordinal, precision, orchestrator);
+                }
+#endif
+            }
+            else
+            {
+                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+
+#ifdef HAVE_ROCM
+                if (target_device.is_rocm())
+                {
+                    kernel = std::make_shared<llaminar2::rocm::ROCmQuantisedGemmKernel>(
+                        N, K, target_device.ordinal,
+                        slot->d_native_vnni_payload,
+                        slot->d_native_vnni_scales,
+                        slot->d_native_vnni_mins,
+                        slot->d_native_vnni_emins,
+                        vnni->codebook_id, blocks_per_row,
+                        orchestrator);
+                }
+#endif
+
+#ifdef HAVE_CUDA
+                if (target_device.is_cuda())
+                {
+                    kernel = std::make_shared<llaminar2::cuda::CUDAQuantisedGemmKernel>(
+                        N, K, target_device.ordinal,
+                        slot->d_native_vnni_payload,
+                        static_cast<uint16_t *>(slot->d_native_vnni_scales),
+                        static_cast<uint16_t *>(slot->d_native_vnni_mins),
+                        static_cast<uint32_t *>(slot->d_native_vnni_emins),
+                        vnni->codebook_id, blocks_per_row,
+                        orchestrator);
+                }
+#endif
+            } // end else (quantized path)
+
+            if (kernel)
+            {
+                ITensorGemm *raw_ptr = kernel.get();
+                if (!mj.domain_name.empty())
+                {
+                    expert_gemm_registry_.registerEngineForParticipant(
+                        mj.domain_name,
+                        target_device, mj.participant_world_rank, mj.participant_index,
+                        mj.layer_idx, mj.expert_idx, mj.role,
+                        raw_ptr, kernel);
+                    expert_gemm_registry_.registerEngineForDomain(
+                        mj.domain_name,
+                        target_device, mj.layer_idx, mj.expert_idx, mj.role,
+                        raw_ptr, std::move(kernel));
+                }
+                else
+                {
+                    expert_gemm_registry_.registerEngine(
+                        target_device, mj.layer_idx, mj.expert_idx, mj.role,
+                        raw_ptr, std::move(kernel));
+                }
+                ++moe_registered;
+            }
+        }
+
+        // Mark 3D MoE parent tensors ready only after their exact layer/role has
+        // all expert engines registered for this device. Host release happens in
+        // releaseAllHostWeightData(), after all expected device tickets are ready.
+        for (const auto &parent_record : moe_parent_tensors)
+        {
+            if (!parent_record.parent || parent_record.expected_experts.empty())
+                continue;
+
+            int layer_idx = -1;
+            ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+            if (!parseMoEExpertParentName(parent_record.name, layer_idx, role))
+            {
+                markPrepState(parent_record.name, target_device, WeightPrepState::FAILED, true,
+                              "GPU pipeline: invalid MoE parent tensor metadata");
+                continue;
+            }
+
+            if (expert_gemm_registry_.hasCompleteRoleForExperts(
+                    target_device, layer_idx, parent_record.expected_experts, role))
+            {
+                markPrepState(parent_record.name, target_device, WeightPrepState::READY, true,
+                              std::string("GPU pipeline: MoE ") + moeWeightRoleName(role) +
+                                  " expert parent ready");
+            }
+            else if (overlay_preparation_plan)
+            {
+                const auto expected_domains = overlay_preparation_plan->domainsForDeviceLayerRole(
+                    target_device, layer_idx, role);
+                bool overlay_ready = !expected_domains.empty();
+                std::string missing_domain;
+                for (const auto &domain_name : expected_domains)
+                {
+                    const auto expected_experts = overlay_preparation_plan->expertsForDomainDeviceLayerRole(
+                        domain_name, target_device, layer_idx, role);
+                    if (expected_experts.empty())
+                        continue;
+                    if (!expert_gemm_registry_.hasCompleteRoleForExpertsInDomain(
+                            domain_name, target_device, layer_idx, expected_experts, role))
+                    {
+                        overlay_ready = false;
+                        missing_domain = domain_name;
+                        break;
+                    }
+                }
+
+                if (overlay_ready)
+                {
+                    markPrepState(parent_record.name, target_device, WeightPrepState::READY, true,
+                                  std::string("GPU pipeline: MoE overlay ") + moeWeightRoleName(role) +
+                                      " expert subset ready");
+                }
+                else
+                {
+                    markPrepState(parent_record.name, target_device, WeightPrepState::FAILED, true,
+                                  std::string("GPU pipeline: incomplete MoE overlay ") + moeWeightRoleName(role) +
+                                      " expert registry entries" +
+                                      (missing_domain.empty() ? std::string() : " for domain " + missing_domain));
+                }
+            }
+            else
+            {
+                markPrepState(parent_record.name, target_device, WeightPrepState::FAILED, true,
+                              std::string("GPU pipeline: incomplete MoE ") + moeWeightRoleName(role) +
+                                  " expert registry entries");
+            }
+        }
+
+        if (moe_registered > 0)
+        {
+            LOG_DEBUG("[WeightManager] GPU pipeline: registered " << moe_registered
+                                                                  << " MoE expert GEMM kernels in ExpertGemmRegistry");
+        }
+
+        const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        LOG_DEBUG("[WeightManager] GPU pipeline: loaded " << registered << "/" << gemm_weights.size()
+                                                          << " dense + " << moe_registered << "/" << moe_jobs.size()
+                                                          << " MoE expert weights in " << std::fixed << std::setprecision(1) << elapsed << " ms");
+
+        // Release orchestrator staging resources now that all weights are loaded.
+        // The VRAM pool is kept alive by the GEMM kernels' lifetime_owner_ shared_ptrs,
+        // but the staging buffers (pinned ring) are no longer needed.
+        orchestrator->finalize();
+
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            num_gpu_packed_ += registered;
+        }
+
+        const size_t total_registered = registered + moe_registered;
+        return total_registered == planned_count;
+    }
+
     bool WeightManager::uploadNonGemmWeights(
         DeviceId target_device,
         std::function<bool(const std::string &)> layer_filter)
@@ -2872,6 +5286,12 @@ namespace llaminar2
             {
                 if (!isGemmWeight(name) && tensor)
                 {
+                    // MoE 3D expert parent tensors are prepared through per-expert
+                    // views in the unified GPU pipeline. Uploading the raw parent
+                    // as a non-GEMM tensor duplicates several GB of data and can
+                    // exhaust VRAM before graph execution.
+                    if (name.find("_exps.weight") != std::string::npos)
+                        continue;
                     if (layer_filter && !layer_filter(name))
                         continue;
                     non_gemm_names.push_back(name);
@@ -2889,8 +5309,8 @@ namespace llaminar2
                 auto base_it = cache_.find(name);
                 if (base_it == cache_.end() || !base_it->second)
                 {
-                    LOG_ERROR("[WeightManager] Non-GEMM weight missing from cache: " << name);
-                    continue;
+                    throw std::runtime_error(
+                        "[WeightManager] Non-GEMM weight missing from cache: " + name);
                 }
                 tensor = base_it->second;
 
@@ -2930,8 +5350,8 @@ namespace llaminar2
 
             if (!device_tensor_holder)
             {
-                LOG_ERROR("[WeightManager] Failed to get device tensor for: " << name);
-                continue;
+                throw std::runtime_error(
+                    "[WeightManager] Failed to get device tensor for: " + name);
             }
 
             TensorBase *device_tensor = device_tensor_holder.get();
@@ -2958,13 +5378,29 @@ namespace llaminar2
             }
         }
 
-        LOG_INFO("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
-                                             << target_device.to_string());
+        LOG_DEBUG("[WeightManager] Uploaded " << uploaded_count << " non-GEMM weights to "
+                                              << target_device.to_string());
         return true;
     }
 
     size_t WeightManager::releaseAllHostWeightData()
     {
+        // Phase 9: Hard gate — do NOT release host data until all lifecycle gates
+        // are complete. This replaces the old ad-hoc deferred_host_release_pending_
+        // flag in RankOrchestrator. The caller must mark graph_materialization_complete
+        // after all graphs have resolved their prepared weight bindings.
+        if (!lifecycle_gates_.canReleaseHostData())
+        {
+            LOG_DEBUG("[WeightManager] releaseAllHostWeightData() blocked by lifecycle gate "
+                      "(state="
+                      << toString(lifecycle_gates_.currentState())
+                      << "). Host data retained until all gates complete.");
+            return 0;
+        }
+
+        // Mark host_release_allowed now that we're proceeding
+        lifecycle_gates_.host_release_allowed = true;
+
         std::lock_guard<std::mutex> lock(cache_mutex_);
 
         size_t released_count = 0;
@@ -2974,6 +5410,37 @@ namespace llaminar2
         size_t retained_bytes = 0;
         size_t retained_count = 0;
         std::unordered_set<TensorBase *> visited_ptrs;
+
+        auto moe_parent_ready_for_release = [&](const TensorBase &tensor, const std::string &key) -> bool
+        {
+            int layer_idx = -1;
+            ExpertGemmRegistry::WeightRole role = ExpertGemmRegistry::WeightRole::GATE;
+            if (!parseMoEExpertParentName(key, layer_idx, role))
+                return false;
+
+            const int num_experts = moeExpertCountFromParentTensor(tensor);
+            if (num_experts <= 0)
+                return false;
+
+            std::lock_guard<std::mutex> prep_lock(prep_ticket_mutex_);
+            auto expected_it = expected_devices_by_weight_.find(key);
+            auto tickets_it = prep_tickets_.find(key);
+            if (expected_it == expected_devices_by_weight_.end() ||
+                tickets_it == prep_tickets_.end() ||
+                expected_it->second.empty())
+            {
+                return false;
+            }
+
+            const auto &tickets = tickets_it->second;
+            return std::all_of(expected_it->second.begin(), expected_it->second.end(),
+                               [&](const std::string &device_key)
+                               {
+                                   auto ticket_it = tickets.find(device_key);
+                                   return ticket_it != tickets.end() &&
+                                          ticket_it->second.state == WeightPrepState::READY;
+                               });
+        };
 
         auto try_release = [&](TensorBase *ptr, const std::string &key)
         {
@@ -2989,6 +5456,20 @@ namespace llaminar2
                 return;
             }
 
+            // Phase 9: hostDataRequired() handles policy-based retention. The
+            // lifecycle gate ensures graph construction has consumed prepared
+            // bindings before raw host data can be reclaimed.
+            if (hostDataRequired(ptr, key))
+            {
+                skipped_count++;
+                retained_bytes += tensor_bytes;
+                retained_count++;
+                LOG_DEBUG("[WeightManager] RETAINED host data for " << key
+                                                                    << " (" << (tensor_bytes / 1024) << " KB)"
+                                                                    << " (host policy requires retention)");
+                return;
+            }
+
             // Release host data for tensors that have valid GPU data OR
             // kernel-managed device data (GEMM packed weights, prepared embedding).
             // GEMM kernels upload pre-packed representations to their own device
@@ -2996,19 +5477,17 @@ namespace llaminar2
             // be freed. Similarly, PreparedEmbeddingWeights hold their own GPU copy.
             if (!ptr->deviceValid())
             {
-                // Check if kernel has its own device copy (CUDA/ROCm packed weights)
-                bool has_kernel_device_data =
-                    ptr->hasCachedDeviceData(DeviceType::CUDA) ||
-                    ptr->hasCachedDeviceData(DeviceType::ROCm);
+                bool has_kernel_device_data = ptr->hasPreparedDeviceState();
 
-                // Check if tensor has PreparedEmbeddingWeights (embedding table).
-                // Since we don't know which device the weights are prepared for,
-                // check if it's a host-resident tensor with prepared embeddings
-                // existing in the registry.
-                if (!has_kernel_device_data && ptr->isHostResident())
+                // 3D MoE expert tensors (_exps.weight) are safe to release only
+                // after this exact parent layer/role has complete expert engines
+                // for every expected device. A non-empty global registry is not
+                // sufficient proof for an unrelated parent tensor.
+                if (!has_kernel_device_data && key.find("_exps.weight") != std::string::npos)
                 {
-                    has_kernel_device_data = getPreparedEmbeddingCount() > 0;
+                    has_kernel_device_data = moe_parent_ready_for_release(*ptr, key);
                 }
+
                 if (!has_kernel_device_data)
                 {
                     skipped_count++;
@@ -3017,8 +5496,7 @@ namespace llaminar2
                     LOG_DEBUG("[WeightManager] RETAINED host data for " << key
                                                                         << " (" << (tensor_bytes / 1024) << " KB)"
                                                                         << " deviceValid=" << ptr->deviceValid()
-                                                                        << " hasCUDA=" << ptr->hasCachedDeviceData(DeviceType::CUDA)
-                                                                        << " hasROCm=" << ptr->hasCachedDeviceData(DeviceType::ROCm)
+                                                                        << " hasPreparedDeviceState=" << ptr->hasPreparedDeviceState()
                                                                         << " hostResident=" << ptr->isHostResident()
                                                                         << " type=" << static_cast<int>(ptr->native_type()));
                     return;
@@ -3052,20 +5530,14 @@ namespace llaminar2
             try_release(tensor.get(), key);
         }
 
-        LOG_INFO("[WeightManager] Released host weight data: " << released_count
-                                                               << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) released, "
-                                                               << retained_count << " tensors (" << (retained_bytes / (1024 * 1024)) << " MB) retained, "
-                                                               << skipped_count << " already released, " << error_count << " errors"
-                                                               << " | cache=" << cache_.size()
-                                                               << " per_device=" << per_device_cache_.size()
-                                                               << " decode=" << decode_cache_.size());
+        LOG_DEBUG("[WeightManager] Released host weight data: " << released_count
+                                                                << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) released, "
+                                                                << retained_count << " tensors (" << (retained_bytes / (1024 * 1024)) << " MB) retained, "
+                                                                << skipped_count << " already released, " << error_count << " errors"
+                                                                << " | cache=" << cache_.size()
+                                                                << " per_device=" << per_device_cache_.size()
+                                                                << " decode=" << decode_cache_.size());
         return released_count;
-    }
-
-    size_t WeightManager::getPreparedEmbeddingCount() const
-    {
-        using namespace llaminar::v2::kernels;
-        return KernelFactory::preparedEmbeddingRegistrySize();
     }
 
     size_t WeightManager::releaseHostResidentWeightData()
@@ -3084,13 +5556,19 @@ namespace llaminar2
                 return;
             if (!ptr->isHostResident())
                 return;
+            if (hostDataRequired(ptr, key))
+            {
+                LOG_DEBUG("[WeightManager] RETAINED host-resident weight for " << key
+                                                                               << " (host policy requires retention)");
+                return;
+            }
 
             size_t tensor_bytes = ptr->size_bytes();
             ptr->release_host_weight_data();
             released_bytes += tensor_bytes;
             released_count++;
-            LOG_INFO("[WeightManager] Released host-resident weight: " << key
-                                                                       << " (" << (tensor_bytes / (1024 * 1024)) << " MB)");
+            LOG_DEBUG("[WeightManager] Released host-resident weight: " << key
+                                                                        << " (" << (tensor_bytes / (1024 * 1024)) << " MB)");
         };
 
         for (auto &[name, tensor] : cache_)
@@ -3105,14 +5583,194 @@ namespace llaminar2
 
         if (released_count > 0)
         {
-            LOG_INFO("[WeightManager] Post-upload host-resident release: "
-                     << released_count << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) freed");
+            LOG_DEBUG("[WeightManager] Post-upload host-resident release: "
+                      << released_count << " tensors (" << (released_bytes / (1024 * 1024)) << " MB) freed");
+
 #if defined(__GLIBC__)
             ::malloc_trim(0);
 #endif
         }
 
+        // Advise the OS to reclaim mmap physical pages. All GEMM weight data
+        // has been packed into interleaved format (owned allocations). Small
+        // FP32 weights (norms, biases ~0.7 MB) will transparently re-fault
+        // from the page cache on next access.
+        loader_.adviseMmapDontneed();
+
         return released_count;
+    }
+
+    size_t WeightManager::adviseMmapDontneed()
+    {
+        size_t mmap_tensors_unregistered = 0;
+        {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            std::unordered_set<TensorBase *> visited;
+
+            auto release_registration = [&](const std::shared_ptr<TensorBase> &tensor)
+            {
+                TensorBase *ptr = tensor.get();
+                if (!ptr || !visited.insert(ptr).second || !ptr->is_mmap_data())
+                    return;
+
+                ptr->releaseMmapHostRegistration();
+                ++mmap_tensors_unregistered;
+            };
+
+            for (const auto &[_, tensor] : cache_)
+                release_registration(tensor);
+            for (const auto &[_, tensor] : per_device_cache_)
+                release_registration(tensor);
+            for (const auto &[_, tensor] : decode_cache_)
+                release_registration(tensor);
+        }
+
+        if (mmap_tensors_unregistered > 0)
+        {
+            LOG_DEBUG("[WeightManager] Released host registrations for "
+                      << mmap_tensors_unregistered
+                      << " mmap-backed tensors before MADV_DONTNEED");
+        }
+
+        return loader_.adviseMmapDontneed();
+    }
+
+    size_t WeightManager::releaseMoEExpertHostWeightData()
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        size_t released_count = 0;
+        size_t released_bytes = 0;
+        size_t skipped_views = 0;
+        size_t already_released = 0;
+        size_t error_count = 0;
+        std::unordered_set<TensorBase *> visited;
+
+        auto try_release = [&](const std::string &key, const std::shared_ptr<TensorBase> &tensor)
+        {
+            if (key.find("_exps.weight") == std::string::npos || !tensor)
+                return;
+
+            TensorBase *ptr = tensor.get();
+            if (!visited.insert(ptr).second)
+                return;
+
+            if (ptr->is_view())
+            {
+                ++skipped_views;
+                return;
+            }
+
+            if (ptr->is_raw_data_released())
+            {
+                ++already_released;
+                return;
+            }
+
+            const size_t bytes = ptr->size_bytes();
+            try
+            {
+                ptr->release_host_weight_data();
+                released_bytes += bytes;
+                ++released_count;
+            }
+            catch (const std::exception &e)
+            {
+                ++error_count;
+                LOG_WARN("[WeightManager] Failed to release cached MoE expert raw data for "
+                         << key << " (" << (bytes >> 20) << " MB): " << e.what());
+            }
+        };
+
+        for (const auto &[name, tensor] : cache_)
+            try_release(name, tensor);
+        for (const auto &[name, tensor] : per_device_cache_)
+            try_release(name, tensor);
+
+        LOG_DEBUG("[WeightManager] Released cached MoE expert raw data: "
+                  << released_count << " tensors (" << (released_bytes >> 20) << " MB) released, "
+                  << already_released << " already released, "
+                  << skipped_views << " borrowed views skipped, "
+                  << error_count << " errors");
+
+#if defined(__GLIBC__)
+        if (released_bytes > 0)
+            ::malloc_trim(0);
+#endif
+
+        return released_bytes;
+    }
+
+    void WeightManager::logHostMemorySummary(const char *context) const
+    {
+        std::lock_guard<std::mutex> lock(cache_mutex_);
+
+        struct Bucket
+        {
+            size_t entries = 0;
+            size_t unique_tensors = 0;
+            size_t live_heap_bytes = 0;
+            size_t live_mmap_bytes = 0;
+            size_t released = 0;
+            size_t borrowed_views = 0;
+        };
+
+        Bucket cache_bucket;
+        Bucket per_device_bucket;
+        Bucket decode_bucket;
+        std::unordered_set<TensorBase *> visited;
+
+        auto visit = [&](Bucket &bucket, const std::shared_ptr<TensorBase> &tensor)
+        {
+            ++bucket.entries;
+            TensorBase *ptr = tensor.get();
+            if (!ptr || !visited.insert(ptr).second)
+                return;
+            ++bucket.unique_tensors;
+            if (ptr->is_view())
+            {
+                ++bucket.borrowed_views;
+                return;
+            }
+            if (ptr->is_raw_data_released())
+            {
+                ++bucket.released;
+                return;
+            }
+            const size_t bytes = ptr->size_bytes();
+            if (ptr->is_mmap_data())
+                bucket.live_mmap_bytes += bytes;
+            else
+                bucket.live_heap_bytes += bytes;
+        };
+
+        for (const auto &[_, tensor] : cache_)
+            visit(cache_bucket, tensor);
+        for (const auto &[_, tensor] : per_device_cache_)
+            visit(per_device_bucket, tensor);
+        for (const auto &[_, tensor] : decode_cache_)
+            visit(decode_bucket, tensor);
+
+        auto total_heap = cache_bucket.live_heap_bytes + per_device_bucket.live_heap_bytes + decode_bucket.live_heap_bytes;
+        auto total_mmap = cache_bucket.live_mmap_bytes + per_device_bucket.live_mmap_bytes + decode_bucket.live_mmap_bytes;
+        auto total_released = cache_bucket.released + per_device_bucket.released + decode_bucket.released;
+        auto total_views = cache_bucket.borrowed_views + per_device_bucket.borrowed_views + decode_bucket.borrowed_views;
+
+        LOG_DEBUG("[WeightManager] Host memory summary"
+                  << (context ? std::string(" (") + context + ")" : std::string{})
+                  << ": heap=" << (total_heap >> 20) << " MB"
+                  << " mmap=" << (total_mmap >> 20) << " MB"
+                  << " released=" << total_released
+                  << " borrowed_views=" << total_views
+                  << " | cache=" << (cache_bucket.live_heap_bytes >> 20) << "/" << (cache_bucket.live_mmap_bytes >> 20)
+                  << " MB heap/mmap entries=" << cache_bucket.entries
+                  << " unique=" << cache_bucket.unique_tensors
+                  << " | per_device=" << (per_device_bucket.live_heap_bytes >> 20) << "/" << (per_device_bucket.live_mmap_bytes >> 20)
+                  << " MB heap/mmap entries=" << per_device_bucket.entries
+                  << " unique=" << per_device_bucket.unique_tensors
+                  << " | decode=" << (decode_bucket.live_heap_bytes >> 20) << "/" << (decode_bucket.live_mmap_bytes >> 20)
+                  << " MB heap/mmap entries=" << decode_bucket.entries
+                  << " unique=" << decode_bucket.unique_tensors);
     }
 
     // =============================================================================
@@ -3350,6 +6008,7 @@ namespace llaminar2
         {
             throw std::runtime_error("[WeightManager] Failed to load 1D tensor: " + name);
         }
+        registerSourceMetadata(name, full_tensor, device);
 
         // Create sliced tensor
         auto *fp32_full = dynamic_cast<FP32Tensor *>(full_tensor.get());
@@ -3370,6 +6029,16 @@ namespace llaminar2
                                             << " [" << total_size << "]"
                                             << " -> [" << slice_start << ", " << (slice_start + slice_count) << ")"
                                             << " = " << slice_count << " elements");
+
+        WeightSliceSpec bias_slice;
+        bias_slice.source_rows = total_size;
+        bias_slice.source_cols = 1;
+        bias_slice.row_start = slice_start;
+        bias_slice.row_count = slice_count;
+        bias_slice.col_start = 0;
+        bias_slice.col_count = 1;
+        bias_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, sliced, WeightDerivationKind::RowSlice, bias_slice, device);
 
         return sliced;
     }
@@ -3415,6 +6084,16 @@ namespace llaminar2
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+        WeightSliceSpec column_slice;
+        column_slice.source_rows = total_rows;
+        column_slice.source_cols = cols;
+        column_slice.row_start = row_start;
+        column_slice.row_count = row_count;
+        column_slice.col_start = 0;
+        column_slice.col_count = cols;
+        column_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, column_slice, device);
 
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
@@ -3585,6 +6264,16 @@ namespace llaminar2
         auto result = std::make_shared<TensorSlice>(
             std::shared_ptr<TensorBase>(std::move(result_tensor)), meta);
 
+        WeightSliceSpec fused_slice;
+        fused_slice.source_rows = total_rows;
+        fused_slice.source_cols = cols;
+        fused_slice.row_start = 0;
+        fused_slice.row_count = total_out_rows;
+        fused_slice.col_start = 0;
+        fused_slice.col_count = cols;
+        fused_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::FusedSubblockConcat, fused_slice, device);
+
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << rank << "/" << world_size << ")"
                                             << " fused-QKV column-parallel " << name
@@ -3628,6 +6317,16 @@ namespace llaminar2
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
 
+        WeightSliceSpec row_slice;
+        row_slice.source_rows = total_rows;
+        row_slice.source_cols = cols;
+        row_slice.row_start = row_start;
+        row_slice.row_count = row_count;
+        row_slice.col_start = 0;
+        row_slice.col_count = cols;
+        row_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::RowSlice, row_slice, device);
+
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
                                             << " row-parallel " << name
@@ -3661,7 +6360,22 @@ namespace llaminar2
 
         if (!slice_tensor)
         {
-            throw std::runtime_error("[WeightManager] Failed to load column slice for input-parallel: " + name);
+            LOG_DEBUG("[WeightManager] Native input-parallel column slice unavailable for " << name
+                                                                                           << " cols [" << col_start
+                                                                                           << ", " << (col_start + col_count)
+                                                                                           << "); falling back to FP32 slice");
+
+            // Some quantized GGUF formats require column slices to start and end on
+            // their packed block boundary. A 4-way TP shard can be narrower than
+            // that block (for example 128 columns from an IQ3_S 256-column block),
+            // so we dequantize once on the host and copy the exact logical columns.
+            auto full_fp32_tensor = loader_.loadTensor(name, DeviceId::cpu(), WeightPrecision::CONVERT_TO_FP32);
+            if (!full_fp32_tensor)
+            {
+                throw std::runtime_error("[WeightManager] Failed to load FP32 fallback for input-parallel: " + name);
+            }
+
+            slice_tensor = sliceColumnRange(full_fp32_tensor, col_start, col_count);
         }
 
         // Input-parallel uses row-parallel metadata (mathematically similar but with column slicing)
@@ -3670,6 +6384,16 @@ namespace llaminar2
             true /* inner_is_presliced */);
 
         auto result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+        WeightSliceSpec input_slice;
+        input_slice.source_rows = rows;
+        input_slice.source_cols = total_cols;
+        input_slice.row_start = 0;
+        input_slice.row_count = rows;
+        input_slice.col_start = col_start;
+        input_slice.col_count = col_count;
+        input_slice.inner_is_presliced = true;
+        registerDerivedMetadata(name, result, WeightDerivationKind::ColumnSlice, input_slice, device);
 
         LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                             << " (rank " << assignment.local_rank << "/" << tp_config_->worldSize() << ")"
@@ -3691,18 +6415,40 @@ namespace llaminar2
         const DeviceShardingAssignment &assignment,
         int layer_idx)
     {
+        // Get sharding mode for this weight before consulting the per-device
+        // cache. Older/preload paths may have populated the cache with a plain
+        // device clone; for TP-sharded weights graph builders must see the
+        // TensorSlice wrapper so row/column-parallel metadata is preserved.
+        ShardingMode mode = getShardingMode(name);
+
         // Check per-device cache first.
         // WeightManager is rank-local, so device string uniquely identifies the
         // cache entry. LOCAL TP devices have distinct DeviceIds (e.g. cuda:0, cuda:1).
         std::string cache_key = device.to_string() + ":" + name;
-        auto it = per_device_cache_.find(cache_key);
-        if (it != per_device_cache_.end())
         {
-            return it->second;
-        }
+            std::lock_guard<std::mutex> lock(cache_mutex_);
+            auto it = per_device_cache_.find(cache_key);
+            if (it != per_device_cache_.end())
+            {
+                TensorSlice *slice = dynamic_cast<TensorSlice *>(it->second.get());
+                const bool cache_matches_mode =
+                    (mode == ShardingMode::REPLICATE) ||
+                    (mode == ShardingMode::ROW_PARALLEL && slice && slice->is_row_parallel()) ||
+                    (mode == ShardingMode::INPUT_PARALLEL && slice && slice->is_row_parallel()) ||
+                    (mode == ShardingMode::COLUMN_PARALLEL && slice && slice->is_column_parallel()) ||
+                    (mode == ShardingMode::EXPERT_PARALLEL);
 
-        // Get sharding mode for this weight
-        ShardingMode mode = getShardingMode(name);
+                if (cache_matches_mode)
+                {
+                    return it->second;
+                }
+
+                LOG_DEBUG("[WeightManager] Ignoring stale per-device cache entry without TP slice metadata: "
+                          << cache_key << " mode=" << static_cast<int>(mode)
+                          << " tensor=" << it->second.get());
+                per_device_cache_.erase(it);
+            }
+        }
 
         LOG_TRACE("[WeightManager] getShardedWeightForAssignment: " << name
                                                                     << " device=" << device.to_string()
@@ -3721,24 +6467,37 @@ namespace llaminar2
             // clones because each device calls ensureOnDevice() which allocates
             // separate GPU memory and releaseAllHostWeightData() may free host data
             // after the first device uploads (breaking the second device's upload).
-            auto cached_it = cache_.find(name);
-            if (cached_it != cache_.end() && cached_it->second &&
-                cached_it->second->isHostResident())
+            std::shared_ptr<TensorBase> cached;
             {
-                result = cached_it->second;
+                std::lock_guard<std::mutex> lock(cache_mutex_);
+                auto cached_it = cache_.find(name);
+                if (cached_it != cache_.end())
+                    cached = cached_it->second;
+            }
+
+            if (!cached)
+            {
+                auto original = getReplicatedWeight(name, DeviceId::cpu());
+                if (original)
+                {
+                    std::lock_guard<std::mutex> lock(cache_mutex_);
+                    auto [cached_it, inserted] = cache_.emplace(name, original);
+                    if (!inserted && !cached_it->second)
+                        cached_it->second = original;
+                    cached = cached_it->second;
+                }
+            }
+
+            if (cached && cached->isHostResident())
+            {
+                result = cached;
                 LOG_DEBUG("[WeightManager] Sharing host-resident REPLICATE weight: " << name
                                                                                      << " for " << device.to_string()
                                                                                      << " (" << (result->size_bytes() / (1024 * 1024)) << " MB)");
             }
-            else
+            else if (cached)
             {
-                result = getReplicatedWeight(name, device);
-                // Cache in cache_ so subsequent devices can find and share
-                // host-resident tensors (e.g., token_embd.weight).
-                if (result)
-                {
-                    cache_[name] = result;
-                }
+                result = cloneTensorForDevice(name, cached, device);
             }
             if (result)
             {
@@ -3757,9 +6516,9 @@ namespace llaminar2
                 auto embd_dims = loader_.getTensorShape("token_embd.weight");
                 if (embd_dims && embd_dims->size() == 2)
                 {
-                    LOG_INFO("[WeightManager] Device " << device.to_string()
-                                                       << " output.weight not in GGUF — using tied embedding "
-                                                       << "token_embd.weight as column-parallel LM head");
+                    LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                                        << " output.weight not in GGUF — using tied embedding "
+                                                        << "token_embd.weight as column-parallel LM head");
 
                     // Vocab-dimension slicing: use assignment's vocab_start/vocab_count
                     size_t total_rows = (*embd_dims)[0];
@@ -3778,6 +6537,16 @@ namespace llaminar2
                         total_rows, cols, assignment.local_rank, tp_config_->worldSize(),
                         true /* inner_is_presliced */);
                     result = std::make_shared<TensorSlice>(std::move(slice_tensor), meta);
+
+                    WeightSliceSpec tied_slice;
+                    tied_slice.source_rows = total_rows;
+                    tied_slice.source_cols = cols;
+                    tied_slice.row_start = row_start;
+                    tied_slice.row_count = row_count;
+                    tied_slice.col_start = 0;
+                    tied_slice.col_count = cols;
+                    tied_slice.inner_is_presliced = true;
+                    registerDerivedMetadata(name, result, WeightDerivationKind::TiedAlias, tied_slice, device);
 
                     LOG_DEBUG("[WeightManager] Device " << device.to_string()
                                                         << " tied embedding LM head"
@@ -3843,6 +6612,65 @@ namespace llaminar2
             break;
         }
 
+        case ShardingMode::EXPERT_PARALLEL:
+        {
+            // Expert-parallel for LOCAL TP: split 3D expert tensors across local devices
+            auto dims_opt = loader_.getTensorShape(name);
+            if (!dims_opt || dims_opt->empty())
+            {
+                LOG_DEBUG("[WeightManager] Tensor not in GGUF for expert-parallel: " << name);
+                return nullptr;
+            }
+            if (dims_opt->size() != 3)
+            {
+                throw std::runtime_error("[WeightManager] Expert-parallel requires 3D tensor, got " +
+                                         std::to_string(dims_opt->size()) + "D for: " + name);
+            }
+            const auto &dims = *dims_opt;
+            size_t ne2 = dims[2]; // num_experts
+            int local_ws = tp_config_->worldSize();
+            size_t experts_per_rank = ne2 / local_ws;
+            size_t expert_start = experts_per_rank * assignment.local_rank;
+            size_t expert_count = (assignment.local_rank == local_ws - 1)
+                                      ? (ne2 - expert_start)
+                                      : experts_per_rank;
+
+            if (experts_per_rank == 0)
+            {
+                throw std::runtime_error("[WeightManager] Cannot shard " + std::to_string(ne2) +
+                                         " experts across " + std::to_string(local_ws) +
+                                         " devices for: " + name);
+            }
+
+            result = loader_.loadTensorExpertSlice(
+                name, expert_start, expert_start + expert_count, device, WeightPrecision::NATIVE);
+
+            if (!result)
+            {
+                throw std::runtime_error("[WeightManager] Failed to load expert slice for: " + name);
+            }
+
+            WeightSliceSpec expert_slice;
+            expert_slice.source_rows = dims[0];
+            expert_slice.source_cols = dims[1];
+            expert_slice.row_start = 0;
+            expert_slice.row_count = dims[0];
+            expert_slice.col_start = 0;
+            expert_slice.col_count = dims[1];
+            expert_slice.expert_start = expert_start;
+            expert_slice.expert_count = expert_count;
+            expert_slice.inner_is_presliced = true;
+            registerDerivedMetadata(name, result, WeightDerivationKind::ExpertSlice, expert_slice, device);
+
+            LOG_DEBUG("[WeightManager] Device " << device.to_string()
+                                                << " expert-parallel " << name
+                                                << " [" << dims[0] << ", " << dims[1] << ", " << ne2
+                                                << "] -> experts [" << expert_start << ", "
+                                                << (expert_start + expert_count) << ") = "
+                                                << expert_count << "/" << ne2);
+            break;
+        }
+
         default:
             throw std::runtime_error("[WeightManager] Unknown sharding mode for: " + name);
         }
@@ -3850,6 +6678,7 @@ namespace llaminar2
         // Cache the result for subsequent requests
         if (result)
         {
+            std::lock_guard<std::mutex> lock(cache_mutex_);
             per_device_cache_[cache_key] = result;
             result->setDebugName(name);
         }
@@ -3916,6 +6745,15 @@ namespace llaminar2
         if (std::regex_search(name, match, layer_pattern))
         {
             int layer_idx = std::stoi(match[1].str());
+            const std::string sidecar_prefix = "blk." + std::to_string(layer_idx) + ".";
+            if (loader_.hasTensor(sidecar_prefix + "nextn.eh_proj.weight"))
+            {
+                // Qwen3.6 encodes MTP as a trailing blk.N sidecar. The main graph
+                // layer range intentionally excludes that block. Pipeline stages
+                // treat the sidecar like final norm and LM head: only the stage
+                // that can produce terminal hidden/logits should load and bind it.
+                return has_lm_head;
+            }
             // Layer range is [first, last) - first inclusive, last exclusive
             return layer_idx >= first_layer && layer_idx < last_layer;
         }

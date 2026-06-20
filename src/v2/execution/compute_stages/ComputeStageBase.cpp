@@ -5,6 +5,7 @@
 
 #include "IComputeStage.h"
 #include "ComputeStageUtils.h"
+#include "../local_execution/graph/GraphCaptureGuard.h"
 #include "../../utils/DebugEnv.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/TensorVerification.h"
@@ -70,8 +71,20 @@ namespace llaminar2
             return "MOE_ROUTER";
         case ComputeStageType::MOE_EXPERT_FFN:
             return "MOE_EXPERT_FFN";
-        case ComputeStageType::MOE_COMBINE:
-            return "MOE_COMBINE";
+        case ComputeStageType::MOE_SHARED_EXPERT_FFN:
+            return "MOE_SHARED_EXPERT_FFN";
+        case ComputeStageType::MOE_SHARED_EXPERT_GATE:
+            return "MOE_SHARED_EXPERT_GATE";
+        case ComputeStageType::MOE_EXPERT_DISPATCH:
+            return "MOE_EXPERT_DISPATCH";
+        case ComputeStageType::MOE_EXPERT_PARALLEL_REDUCE:
+            return "MOE_EXPERT_PARALLEL_REDUCE";
+        case ComputeStageType::MOE_SPARSE_DISPATCH:
+            return "MOE_SPARSE_DISPATCH";
+        case ComputeStageType::MOE_LOCAL_EXPERT:
+            return "MOE_LOCAL_EXPERT";
+        case ComputeStageType::MOE_SPARSE_RETURN_REDUCE:
+            return "MOE_SPARSE_RETURN_REDUCE";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
         case ComputeStageType::ALLGATHER:
@@ -88,6 +101,8 @@ namespace llaminar2
             return "GLOBAL_PP_TRANSFER";
         case ComputeStageType::COPY:
             return "COPY";
+        case ComputeStageType::ROW_SELECT:
+            return "ROW_SELECT";
         case ComputeStageType::DEQUANTIZE:
             return "DEQUANTIZE";
         case ComputeStageType::QUANTIZE:
@@ -102,6 +117,8 @@ namespace llaminar2
             return "QK_NORM";
         case ComputeStageType::FUSED_RESIDUAL_NORM:
             return "FUSED_RESIDUAL_NORM";
+        case ComputeStageType::FUSED_ADD_ALLREDUCE:
+            return "FUSED_ADD_ALLREDUCE";
         case ComputeStageType::KV_CACHE_APPEND:
             return "KV_CACHE_APPEND";
         case ComputeStageType::KV_CACHE_GATHER:
@@ -122,6 +139,8 @@ namespace llaminar2
             return "GDN_RECURRENCE";
         case ComputeStageType::Q_GATE_SPLIT:
             return "Q_GATE_SPLIT";
+        case ComputeStageType::MTP_CONCAT:
+            return "MTP_CONCAT";
         default:
             return "UNKNOWN";
         }
@@ -198,6 +217,20 @@ namespace llaminar2
 
         const auto &cfg = debugEnv().execution;
 
+        if (isGraphCaptureActive())
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " INPUT '" << tensor_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                    << tensor->dtype_name() << "] ";
+            }
+            oss << "[payload skipped during graph capture]";
+            LOG_DEBUG(oss.str());
+            return;
+        }
+
         // Safe data access - numel() and fp32_data() may return nullptr for released tensors
         size_t count = 0;
         try
@@ -205,8 +238,8 @@ namespace llaminar2
             count = tensor->numel();
             if (count == 0)
             {
-                LOG_INFO("[TRACE] " << name() << " INPUT '" << tensor_name
-                                    << "' [empty tensor]");
+                LOG_DEBUG("[TRACE] " << name() << " INPUT '" << tensor_name
+                                     << "' [empty tensor]");
                 return;
             }
         }
@@ -246,7 +279,7 @@ namespace llaminar2
                     << tensor->dtype_name() << "] ";
             }
             oss << "[data unavailable - raw weights released after GEMM packing]";
-            LOG_INFO(oss.str());
+            LOG_DEBUG(oss.str());
             return;
         }
 
@@ -266,7 +299,7 @@ namespace llaminar2
             oss << " checksum=" << computeChecksum(data, count);
         }
 
-        LOG_INFO(oss.str());
+        LOG_DEBUG(oss.str());
     }
 
     void IComputeStage::traceOutput(const std::string &tensor_name, const ITensor *tensor) const
@@ -276,6 +309,20 @@ namespace llaminar2
 
         const auto &cfg = debugEnv().execution;
 
+        if (isGraphCaptureActive())
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " OUTPUT '" << tensor_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << tensor->rows() << "x" << tensor->cols() << " "
+                    << tensor->dtype_name() << "] ";
+            }
+            oss << "[payload skipped during graph capture]";
+            LOG_DEBUG(oss.str());
+            return;
+        }
+
         // Safe data access - numel() and fp32_data() may crash for invalid/empty tensors
         size_t count = 0;
         try
@@ -283,8 +330,8 @@ namespace llaminar2
             count = tensor->numel();
             if (count == 0)
             {
-                LOG_INFO("[TRACE] " << name() << " OUTPUT '" << tensor_name
-                                    << "' [empty tensor]");
+                LOG_DEBUG("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                     << "' [empty tensor]");
                 return;
             }
         }
@@ -315,8 +362,8 @@ namespace llaminar2
 
         if (!data)
         {
-            LOG_INFO("[TRACE] " << name() << " OUTPUT '" << tensor_name
-                                << "' [no fp32 data available]");
+            LOG_DEBUG("[TRACE] " << name() << " OUTPUT '" << tensor_name
+                                 << "' [no fp32 data available]");
             return;
         }
 
@@ -336,7 +383,7 @@ namespace llaminar2
             oss << " checksum=" << computeChecksum(data, count);
         }
 
-        LOG_INFO(oss.str());
+        LOG_DEBUG(oss.str());
     }
 
     void IComputeStage::traceIntermediate(const std::string &array_name, const float *data, size_t count) const
@@ -345,6 +392,19 @@ namespace llaminar2
             return;
 
         const auto &cfg = debugEnv().execution;
+
+        if (isGraphCaptureActive())
+        {
+            std::ostringstream oss;
+            oss << "[TRACE] " << name() << " INTERMEDIATE '" << array_name << "' ";
+            if (cfg.trace_shapes)
+            {
+                oss << "[" << count << " elems] ";
+            }
+            oss << "[payload skipped during graph capture]";
+            LOG_DEBUG(oss.str());
+            return;
+        }
 
         std::ostringstream oss;
         oss << "[TRACE] " << name() << " INTERMEDIATE '" << array_name << "' ";

@@ -18,7 +18,6 @@ namespace llaminar2
 {
     // Forward declarations
     class ITensorRoPE;
-
     /**
      * @brief Rotary position encoding stage
      *
@@ -58,6 +57,14 @@ namespace llaminar2
             // When set, this array should have seq_len elements (total_tokens for batched)
             // For batched mode with batch_size=2, seq_len=2: [pos0_t0, pos0_t1, pos1_t0, pos1_t1]
             const int *position_ids = nullptr; ///< Per-token position IDs array [seq_len]
+            /**
+             * @brief Device-resident INT32 position IDs for GPU graph replay.
+             *
+             * This is the resident counterpart to `position_ids`.  When it is
+             * set on a GPU stage, the RoPE kernel must read positions from
+             * this device buffer directly instead of uploading a host array.
+             */
+            const void *position_ids_device = nullptr;
 
             // Fixed-scale quantization for HybridQ16 mode (used when Q_out is Q16_1)
             // RoPE only processes K projections, so this is the K scale.
@@ -71,6 +78,17 @@ namespace llaminar2
             // When true, only Q gets RoPE applied. K will be stored pre-RoPE in the
             // KV cache and RoPE will be fused into the attention dequant path.
             bool skip_k = false;
+
+            /**
+             * @brief Force tiny verifier prefill through grouped decode-equivalent RoPE.
+             *
+             * MTP all-position verifier graphs use M=2..4 rows but must be
+             * numerically equivalent to running M one-token decode steps.
+             * Some kernels intentionally use different multi-row prefill math,
+             * so verifier graphs request this mode and require the backend to
+             * provide an explicit grouped decode-equivalent kernel contract.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
 
             // Optional BufferIds for contract-based coherence
             std::optional<BufferId> q_buffer_id;
@@ -87,25 +105,134 @@ namespace llaminar2
         size_t estimatedMemoryBytes() const override;
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override { return true; }
+        bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
+        bool needsGraphLaunchPreparation() const override { return params_.device_id.is_gpu(); }
         StageDumpInfo buildDumpInfoImpl() const override;
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
         /// Update position offset for cached graph reuse.
-        /// Also updates the kernel's pinned host device-params so the next
-        /// graph replay picks up the new pos_offset via the captured H2D memcpy.
+        /// Also pre-uploads the kernel's device params on the explicit stage
+        /// stream so captured RoPE execution records kernels only.
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             params_.pos_offset = pos_offset;
             params_.seq_len = seq_len;
+            params_.position_ids = nullptr;
+            params_.position_ids_device = nullptr;
+            position_ids_cache_.clear();
             if (cached_kernel_)
             {
-                // Propagate current stage stream to kernel so setDynamicPosOffset
-                // can issue H2D copies on the correct (capture/replay) stream.
+                // Propagate current stage stream so setDynamicPosOffset can
+                // pre-upload device params before capture/replay.
                 cached_kernel_->setGPUStream(gpuStream());
                 cached_kernel_->setDynamicPosOffset(pos_offset);
             }
+        }
+
+        /**
+         * @brief Update explicit per-row position IDs for cached graph reuse.
+         *
+         * Request-batched MTP sidecars flatten multiple logical requests into
+         * one tiny graph.  Rows can therefore share the same absolute position
+         * (for example `[595, 595]` for two requests), which is not equivalent
+         * to the contiguous scalar range `[595, 596]`.  This method keeps the
+         * stable host copy alive for CPU/eager execution and asks GPU kernels
+         * to pre-upload the workspace-owned device copy before graph capture.
+         */
+        void updateDynamicPositionIds(const int *position_ids, int seq_len) override
+        {
+            params_.seq_len = seq_len;
+            position_ids_cache_.clear();
+            if (position_ids && seq_len > 0)
+            {
+                position_ids_cache_.assign(position_ids, position_ids + seq_len);
+                params_.position_ids = position_ids_cache_.data();
+                params_.position_ids_device = nullptr;
+                params_.pos_offset = position_ids_cache_.front();
+            }
+            else
+            {
+                params_.position_ids = nullptr;
+                params_.position_ids_device = nullptr;
+                params_.pos_offset = 0;
+            }
+
+            if (cached_kernel_)
+            {
+                cached_kernel_->setGPUStream(gpuStream());
+                cached_kernel_->setDynamicPositionIds(params_.position_ids, seq_len);
+            }
+        }
+
+        /**
+         * @brief Update device-resident position IDs for cached graph reuse.
+         *
+         * The caller owns the device buffer lifetime and must publish it on a
+         * stream that is visible to this stage's stream before capture/replay.
+         * RoPEStage only records the pointer and forwards it to backend kernels;
+         * it never copies the positions through host memory.
+         */
+        void updateDynamicDevicePositionIds(const void *position_ids_device, int seq_len) override
+        {
+            params_.seq_len = seq_len;
+            params_.position_ids = nullptr;
+            params_.position_ids_device = position_ids_device;
+            position_ids_cache_.clear();
+
+            if (cached_kernel_)
+            {
+                cached_kernel_->setGPUStream(gpuStream());
+                cached_kernel_->setDynamicDevicePositionIds(position_ids_device, seq_len);
+            }
+        }
+
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            params_.pos_offset = 0;
+            params_.seq_len = 0;
+            params_.position_ids = nullptr;
+            params_.position_ids_device = nullptr;
+            position_ids_cache_.clear();
+            if (cached_kernel_)
+            {
+                cached_kernel_->resetDynamicState();
+                cached_kernel_->setGPUStream(nullptr);
+            }
+        }
+
+        /**
+         * @brief Reset request-local RoPE params without invalidating device-param storage.
+         *
+         * CUDA/HIP graphs capture the RoPE dynamic parameter buffer by address.
+         * The next replay updates that buffer on the graph stream before launch,
+         * so this hook clears host-side request mirrors but keeps the underlying
+         * kernel slot alive for the preserved executable.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            params_.pos_offset = 0;
+            params_.seq_len = 0;
+            params_.position_ids = nullptr;
+            params_.position_ids_device = nullptr;
+            position_ids_cache_.clear();
+            if (cached_kernel_)
+                cached_kernel_->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed RoPE dynamic buffers for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
         }
 
         const Params &getParams() const { return params_; }
@@ -114,9 +241,15 @@ namespace llaminar2
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
 
     private:
+        ITensorRoPE *getOrCreateStageKernel(TensorBase *Q_base);
+
         Params params_;
 
-        // Device-scoped cached RoPE kernel (owned by KernelFactory)
+        // Stage-owned RoPE kernel.  Graph-captured dynamic state such as the
+        // active stream, workspace pointer, scalar pos_offset, and explicit
+        // position-id upload validity is stage-local and must not be shared
+        // with other RoPE stages on the same device.
+        mutable std::unique_ptr<ITensorRoPE> owned_kernel_;
         mutable ITensorRoPE *cached_kernel_ = nullptr;
         mutable int cached_kernel_tensor_type_ = -1;
 
@@ -127,6 +260,7 @@ namespace llaminar2
 
         // Stable host-side position_ids for graph capture (copied to device each step).
         mutable std::vector<int> position_ids_cache_;
+
     };
 
 } // namespace llaminar2

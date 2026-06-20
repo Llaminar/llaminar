@@ -1,0 +1,9 @@
+backend,phase,format,codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,is_best
+rocm,prefill,Q4_1,5,alias_q4_1,MTP,2,512,2048,N128_M32_MB1_UG2,20.000,21.000,0.100,104.800,0.999900,1,1
+rocm,prefill,Q4_K,5,alias_q4_k,MTP,3,2048,512,N128_M32_MB1_UG2,18.000,19.000,0.100,174.700,0.999900,1,1
+rocm,prefill,Q5_1,7,alias_q5_1,MTP,4,512,2048,N128_M32_MB1_UG2,21.000,22.000,0.100,199.700,0.999900,1,1
+rocm,prefill,Q5_K,7,alias_q5_k,MTP,2,2048,512,N128_M32_MB1_UG2,19.000,20.000,0.100,220.700,0.999900,1,1
+rocm,prefill,IQ4_NL,4,alias_iq4_nl,MTP,3,512,2048,N128_M32_MB1_UG2,20.500,21.500,0.100,153.400,0.999900,1,1
+rocm,prefill,IQ4_XS,4,alias_iq4_xs,MTP,4,2048,512,N128_M32_MB1_UG2,18.500,19.500,0.100,226.700,0.999900,1,1
+rocm,prefill,Q8_0,19,alias_q8_0,MTP,4,5120,5120,N128_M32_MB1_UG2,32.000,33.000,0.200,6553.600,0.999900,1,1
+rocm,prefill,Q4_K,5,qwen36_ffn_down_bucket,DensePrefill,600,5120,17408,N128_M32_MB1_UG2,2350.000,2360.000,2.000,45500.000,0.999900,1,1

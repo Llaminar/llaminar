@@ -4,11 +4,15 @@
  */
 
 #include "LMHeadStage.h"
+#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../utils/PerfStatsCollector.h"
+#include "../../../loaders/PreparedWeightStore.h"
+
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -20,6 +24,50 @@ namespace llaminar2
     LMHeadStage::LMHeadStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool LMHeadStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.lm_head_weight)
+            return true;
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            if (error)
+                *error = "LMHeadStage requires PreparedWeightStore and PreparedWeightRef";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref.value()))
+        {
+            if (error)
+                *error = "LMHeadStage PreparedWeightRef is not present in PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
+    ITensorGemm *LMHeadStage::resolvePreparedKernel(const char *caller)
+    {
+        if (cached_gemm_)
+            return cached_gemm_;
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and PreparedWeightRef are required for LM head GEMM resolution");
+            return nullptr;
+        }
+
+        cached_gemm_ = params_.prepared_store->gemmKernel(params_.prepared_ref.value());
+        if (!cached_gemm_)
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightRef was provided but no GEMM kernel was found in PreparedWeightStore");
+        }
+        return cached_gemm_;
+    }
+
+    int LMHeadStage::activationRowOffsetForLogits() const
+    {
+        if (params_.effective_last_row_idx >= 0)
+            return params_.effective_last_row_idx;
+        return (params_.seq_len > 1) ? (params_.seq_len - 1) : 0;
     }
 
     bool LMHeadStage::execute(IDeviceContext *ctx)
@@ -64,8 +112,8 @@ namespace llaminar2
                                                                     << ", rocm_ordinal=" << (params_.device_id.is_rocm() ? params_.device_id.rocm_ordinal() : -1) << ")"
                                                                     << " lm_head_weight=" << (void *)lm_head_weight
                                                                     << " shape=" << lm_head_weight->shape()[0] << "x" << lm_head_weight->shape()[1]);
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+
+        ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage");
         LOG_DEBUG("[LMHeadStage] Got kernel=" << (void *)lm_gemm);
         if (!lm_gemm)
         {
@@ -85,23 +133,47 @@ namespace llaminar2
         //   - D2H copy from seq_len × vocab_size × 4 bytes to 1 × vocab_size × 4 bytes
         //     (e.g., 345 MB → 608 KB for Qwen2.5-7B with vocab_size=152064)
         // The result is written to row 0 of the logits tensor.
-        const int lm_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
-        const int lm_activation_offset = (params_.seq_len > 1) ? (params_.seq_len - 1) : 0;
+        const int lm_m = params_.compute_all_positions
+                             ? params_.seq_len
+                             : ((params_.seq_len > 1) ? 1 : params_.seq_len);
+        const int lm_activation_offset = params_.compute_all_positions ? 0 : activationRowOffsetForLogits();
+        if (lm_activation_offset < 0 || lm_activation_offset >= params_.seq_len)
+        {
+            LOG_ERROR("[LMHeadStage] Invalid activation row offset " << lm_activation_offset
+                                                                     << " for seq_len=" << params_.seq_len);
+            return false;
+        }
 
-        // Bias is passed directly to GEMM kernel for fused application
-        bool success = lm_gemm->multiply_tensor(
-            hidden_states,
-            logits,
-            lm_m,
-            params_.vocab_size,
-            params_.d_model,
-            true, // transpose_B (lm_head is [vocab_size, d_model])
-            1.0f, 0.0f,
-            params_.bias_tensor, // Bias fused into GEMM
-            params_.mpi_ctx,
-            params_.device_id.toKernelDeviceIndex(),
-            nullptr, // workspace
-            lm_activation_offset);
+        // Bias is passed directly to GEMM kernel for fused application.
+        // CPU NativeVNNI uses its batched M=2..4 path here for verifier rows;
+        // parity tests compare these rows against serial one-token decode.
+        bool success = false;
+        if (params_.force_decode_equivalent_verifier_prefill &&
+            params_.compute_all_positions &&
+            lm_m > 1)
+        {
+            success = executeDecodeEquivalentVerifierPrefill(
+                hidden_states,
+                logits,
+                lm_gemm,
+                lm_m);
+        }
+        else
+        {
+            success = lm_gemm->multiply_tensor(
+                hidden_states,
+                logits,
+                lm_m,
+                params_.vocab_size,
+                params_.d_model,
+                true, // transpose_B (lm_head is [vocab_size, d_model])
+                1.0f, 0.0f,
+                params_.bias_tensor, // Bias fused into GEMM
+                params_.mpi_ctx,
+                params_.device_id.toKernelDeviceIndex(),
+                bound_workspace_,
+                lm_activation_offset);
+        }
 
         if (!success)
         {
@@ -109,21 +181,87 @@ namespace llaminar2
             return false;
         }
 
+        if (params_.device_id.is_gpu())
+        {
+            logits->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                          params_.device_id,
+                                          gpuStream());
+        }
+
         return true;
+    }
+
+    bool LMHeadStage::executeDecodeEquivalentVerifierPrefill(
+        const TensorBase *hidden_states,
+        TensorBase *logits,
+        ITensorGemm *lm_gemm,
+        int lm_m)
+    {
+        if (!hidden_states || !logits || !lm_gemm)
+            return false;
+        if (lm_m > 4)
+        {
+            LOG_ERROR("[LMHeadStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << lm_m);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[LMHeadStage] Grouped verifier GPU LM-head requires an explicit stream");
+            return false;
+        }
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {lm_gemm, logits, params_.vocab_size, params_.bias_tensor, "lm_head"}};
+        const bool success = lm_gemm->multiply_fused_verifier_rows_decode_equivalent(
+            hidden_states,
+            projections,
+            lm_m,
+            params_.d_model,
+            params_.mpi_ctx,
+            bound_workspace_);
+
+        if (success)
+        {
+            if (is_gpu)
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    logits, params_.device_id, stream);
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "lm_head_decode_equivalent_verifier_prefill_rows",
+                static_cast<double>(lm_m),
+                {},
+                params_.device_id.to_string(),
+                {{"route", "grouped"}});
+        }
+        else
+        {
+            LOG_ERROR("[LMHeadStage] Grouped decode-equivalent verifier LM-head is unsupported or failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << lm_m
+                      << " vocab=" << params_.vocab_size
+                      << " d_model=" << params_.d_model);
+        }
+        return success;
     }
 
     size_t LMHeadStage::estimatedFlops() const
     {
-        // During prefill (seq_len > 1), only 1 row is computed
-        const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        const int effective_m = params_.compute_all_positions
+                                    ? params_.seq_len
+                                    : ((params_.seq_len > 1) ? 1 : params_.seq_len);
         // GEMM: 2 * m * vocab_size * d_model
         return 2ULL * effective_m * params_.vocab_size * params_.d_model;
     }
 
     size_t LMHeadStage::estimatedMemoryBytes() const
     {
-        // During prefill (seq_len > 1), only 1 row of hidden states and logits
-        const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+        const int effective_m = params_.compute_all_positions
+                                    ? params_.seq_len
+                                    : ((params_.seq_len > 1) ? 1 : params_.seq_len);
         // Read: hidden [m, d_model], lm_head [vocab_size, d_model]
         // Write: logits [m, vocab_size]
         size_t hidden_bytes = effective_m * params_.d_model * sizeof(float);
@@ -163,8 +301,9 @@ namespace llaminar2
 
         if (params_.logits)
         {
-            // During prefill, only 1 row of logits is computed (at row 0)
-            const int effective_m = (params_.seq_len > 1) ? 1 : params_.seq_len;
+            const int effective_m = params_.compute_all_positions
+                                        ? params_.seq_len
+                                        : ((params_.seq_len > 1) ? 1 : params_.seq_len);
             info.addOutput("logits", params_.logits,
                            effective_m, params_.vocab_size);
         }
@@ -172,6 +311,7 @@ namespace llaminar2
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("vocab_size", params_.vocab_size);
+        info.addScalarBool("compute_all_positions", params_.compute_all_positions);
         info.addScalarBool("has_bias", params_.bias_tensor != nullptr);
         info.addScalarInt("device_id", params_.device_id.toKernelDeviceIndex());
 
@@ -217,6 +357,32 @@ namespace llaminar2
     // IWorkspaceConsumerStage Implementation
     // =============================================================================
 
+    WorkspaceRequirements LMHeadStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        WorkspaceRequirements reqs = IWorkspaceConsumerStage::getWorkspaceRequirements(m, n, k);
+
+        const auto *logits = dynamic_cast<const TensorBase *>(params_.logits);
+        if (params_.device_id.is_rocm() && logits && logits->isMapped())
+        {
+            const int effective_m = params_.compute_all_positions
+                                        ? params_.seq_len
+                                        : ((params_.seq_len > 1) ? 1 : params_.seq_len);
+            if (effective_m > 0 && params_.vocab_size > 0)
+            {
+                const size_t bytes = static_cast<size_t>(effective_m) *
+                                     static_cast<size_t>(params_.vocab_size) *
+                                     sizeof(float);
+                reqs.buffers.push_back({
+                    GemmWorkspaceBuffers::ROCM_FP32_MAPPED_REDIRECT,
+                    bytes,
+                    256,
+                    true});
+            }
+        }
+
+        return reqs;
+    }
+
     IWorkspaceConsumer *LMHeadStage::getKernelAsWorkspaceConsumer()
     {
         // Get the GEMM kernel and return it as workspace consumer
@@ -230,8 +396,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        auto *prepared = llaminar::v2::kernels::KernelFactory::getOrCreatePreparedGemmWeights(lm_head_weight, params_.device_id);
-        ITensorGemm *lm_gemm = llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(prepared);
+        ITensorGemm *lm_gemm = resolvePreparedKernel("LMHeadStage::getKernelAsWorkspaceConsumer");
         if (!lm_gemm)
         {
             LOG_DEBUG("[LMHeadStage::getKernelAsWorkspaceConsumer] No GEMM kernel available");
@@ -250,8 +415,8 @@ namespace llaminar2
             return {};
 
         auto contract = StageBufferContract::build()
-            .addInput(*params_.input_buffer_id)
-            .addOutput(*params_.output_buffer_id);
+                            .addInput(*params_.input_buffer_id)
+                            .addOutput(*params_.output_buffer_id);
         // Model weight is not arena-managed
         if (params_.lm_head_weight)
             contract.addWeight(const_cast<ITensor *>(params_.lm_head_weight));

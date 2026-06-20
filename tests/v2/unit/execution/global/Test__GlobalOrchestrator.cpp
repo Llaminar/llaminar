@@ -11,6 +11,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <deque>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include "execution/global/GlobalOrchestrator.h"
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
@@ -20,6 +28,156 @@
 
 namespace llaminar2::test
 {
+    class MTPMockDeviceRunner : public MockDeviceRunner
+    {
+    public:
+        explicit MTPMockDeviceRunner(int mtp_token = 17,
+                                     int verifier_row0_token = 17,
+                                     int verifier_row1_token = 23)
+        {
+            mtp_logits_.assign(1000, -10.0f);
+            mtp_logits_[mtp_token] = 10.0f;
+            all_position_logits_.assign(2 * 1000, -10.0f);
+            all_position_logits_[verifier_row0_token] = 10.0f;
+            all_position_logits_[1000 + verifier_row1_token] = 10.0f;
+        }
+
+        bool forwardMTP(int32_t draft_condition_token) override
+        {
+            ++forward_mtp_calls_;
+            last_mtp_condition_token_ = draft_condition_token;
+            return forward_mtp_ok_;
+        }
+
+        const float *mtpLogits() const override
+        {
+            return mtp_logits_.data();
+        }
+
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            ++set_all_position_calls_;
+            all_position_enabled_ = enabled;
+            return set_all_position_ok_;
+        }
+
+        const float *getAllPositionLogits() const override
+        {
+            return all_position_logits_.data();
+        }
+
+        std::string mtpDecodeUnsupportedReason() const override
+        {
+            return mtp_unsupported_reason_;
+        }
+
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override
+        {
+            (void)seq_idx;
+            PrefixStateSnapshot snapshot;
+            snapshot.valid = capture_ok_;
+            snapshot.cached_tokens = get_position();
+            return snapshot;
+        }
+
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override
+        {
+            (void)seq_idx;
+            PrefixStateSnapshot snapshot;
+            snapshot.valid = capture_ok_;
+            snapshot.logical_checkpoint = true;
+            snapshot.cached_tokens = get_position();
+            return snapshot;
+        }
+
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            ++restore_live_calls_;
+            if (!restore_ok_ || !snapshot.valid)
+                return false;
+            set_position(snapshot.cached_tokens);
+            return true;
+        }
+
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override
+        {
+            (void)seq_idx;
+            ++truncate_live_calls_;
+            if (!truncate_ok_)
+                return false;
+            set_position(cached_tokens);
+            return true;
+        }
+
+        uint64_t moePlacementEpoch() const override { return moe_placement_epoch_; }
+
+        int forward_mtp_calls() const { return forward_mtp_calls_; }
+        int last_mtp_condition_token() const { return last_mtp_condition_token_; }
+        int set_all_position_calls() const { return set_all_position_calls_; }
+        bool all_position_enabled() const { return all_position_enabled_; }
+        int restore_live_calls() const { return restore_live_calls_; }
+        int truncate_live_calls() const { return truncate_live_calls_; }
+
+        void set_mtp_unsupported_reason(std::string reason)
+        {
+            mtp_unsupported_reason_ = std::move(reason);
+        }
+
+        void set_moe_placement_epoch(uint64_t epoch)
+        {
+            moe_placement_epoch_ = epoch;
+        }
+
+    private:
+        std::vector<float> mtp_logits_;
+        std::vector<float> all_position_logits_;
+        int forward_mtp_calls_ = 0;
+        int set_all_position_calls_ = 0;
+        int restore_live_calls_ = 0;
+        int truncate_live_calls_ = 0;
+        int last_mtp_condition_token_ = -1;
+        bool forward_mtp_ok_ = true;
+        bool set_all_position_ok_ = true;
+        bool all_position_enabled_ = false;
+        bool capture_ok_ = true;
+        bool restore_ok_ = true;
+        bool truncate_ok_ = true;
+        uint64_t moe_placement_epoch_ = 0;
+        std::string mtp_unsupported_reason_;
+    };
+
+    class ScriptedBroadcastMPIContext : public MockMPIContext
+    {
+    public:
+        ScriptedBroadcastMPIContext(int rank, int world_size)
+            : MockMPIContext(rank, world_size) {}
+
+        void scriptInt32(std::vector<int32_t> data)
+        {
+            scripted_int32_.push_back(std::move(data));
+        }
+
+        void broadcast_int32(int32_t *data, size_t count, int root) const override
+        {
+            MockMPIContext::broadcast_int32(data, count, root);
+            broadcast_roots_.push_back(root);
+            if (rank() == root || scripted_int32_.empty())
+                return;
+
+            const std::vector<int32_t> scripted = scripted_int32_.front();
+            scripted_int32_.pop_front();
+            const size_t n = std::min(count, scripted.size());
+            std::copy(scripted.begin(), scripted.begin() + static_cast<std::ptrdiff_t>(n), data);
+        }
+
+        size_t remainingScriptedInt32() const { return scripted_int32_.size(); }
+        const std::vector<int> &broadcastRoots() const { return broadcast_roots_; }
+
+    private:
+        mutable std::deque<std::vector<int32_t>> scripted_int32_;
+        mutable std::vector<int> broadcast_roots_;
+    };
 
     // =========================================================================
     // Test Fixture
@@ -115,6 +273,40 @@ namespace llaminar2::test
             config.d_model = D_MODEL;
             config.architecture_name = "test_qwen2";
             return config;
+        }
+
+        static RankStageAction actionForStage(const GlobalPPTopology &topology,
+                                              int rank,
+                                              int stage_id)
+        {
+            GlobalPPRankPlan plan = GlobalPPRankPlanBuilder::build(topology, rank);
+            for (const auto *action : plan.executeStages())
+            {
+                if (action->stage_id == stage_id)
+                {
+                    return *action;
+                }
+            }
+            throw std::invalid_argument("test topology does not execute requested stage on rank");
+        }
+
+        static StageRunnerEntry makeStageRunnerEntry(const GlobalPPTopology &topology,
+                                                     int rank,
+                                                     int stage_id,
+                                                     std::unique_ptr<MockDeviceRunner> runner)
+        {
+            StageRunnerEntry entry;
+            entry.stage_id = stage_id;
+            entry.action = actionForStage(topology, rank, stage_id);
+            entry.domain_name = entry.action.domain_name;
+            FactoryPPStageConfig pp_stage;
+            pp_stage.first_layer = entry.action.first_layer;
+            pp_stage.last_layer = entry.action.last_layer + 1;
+            pp_stage.has_embedding = entry.action.has_embedding;
+            pp_stage.has_lm_head = entry.action.has_lm_head;
+            entry.pp_stage_config = pp_stage;
+            entry.runner = std::move(runner);
+            return entry;
         }
 
         /**
@@ -256,7 +448,7 @@ namespace llaminar2::test
          *   Stage 0 (layers 0-11, has_embedding): ranks 0,1 (global TP)
          *   Stage 1 (layers 12-23, has_lm_head):  ranks 0,1 (global TP)
          *
-         * Same rank set — no transfers should be generated.
+         * Same rank set — each rank needs a local handoff between distinct stages.
          */
         static GlobalPPTopology buildTwoStageSameTPTopo()
         {
@@ -279,6 +471,41 @@ namespace llaminar2::test
             s1.is_global_tp = true;
             s1.participating_ranks = {0, 1};
             s1.per_rank_device = GlobalDeviceAddress::cpu();
+
+            return GlobalPPTopology::build({s0, s1}, TOTAL_LAYERS, 2);
+        }
+
+        /**
+         * @brief Build the Phase 6 named-domain shape: rank-local ROCm TP stage
+         *        followed by node-local CPU TP across ranks 0 and 1.
+         */
+        static GlobalPPTopology buildNamedDomainHybridTopo(int gpu_owner_rank = 0)
+        {
+            GlobalPPStageSpec s0;
+            s0.stage_id = 0;
+            s0.domain_name = gpu_owner_rank == 0 ? "rocm_socket0" : "rocm_socket1";
+            s0.first_layer = 0;
+            s0.last_layer = 11;
+            s0.has_embedding = true;
+            s0.has_lm_head = false;
+            s0.is_global_tp = false;
+            s0.owning_rank = gpu_owner_rank;
+            s0.inner_mode = InnerParallelism::LOCAL_TP;
+            s0.backend = CollectiveBackendType::RCCL;
+            s0.devices = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)};
+
+            GlobalPPStageSpec s1;
+            s1.stage_id = 1;
+            s1.domain_name = "cpu_sockets";
+            s1.first_layer = 12;
+            s1.last_layer = 23;
+            s1.has_embedding = false;
+            s1.has_lm_head = true;
+            s1.is_global_tp = true;
+            s1.backend = CollectiveBackendType::UPI;
+            s1.participating_ranks = {0, 1};
+            s1.per_rank_device = GlobalDeviceAddress::cpu(0);
+            s1.per_rank_devices = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
 
             return GlobalPPTopology::build({s0, s1}, TOTAL_LAYERS, 2);
         }
@@ -677,6 +904,102 @@ namespace llaminar2::test
     }
 
     // =========================================================================
+    // MTP Delegation Tests
+    // =========================================================================
+
+    TEST_F(Test__GlobalOrchestrator, SingleStageGlobalTPDelegatesMTPSurfacesAndLiveSnapshots)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildSingleStageTopo(2);
+        auto runner = std::make_unique<MTPMockDeviceRunner>();
+        auto *runner_raw = runner.get();
+        runner_raw->set_position(11);
+        runner_raw->set_moe_placement_epoch(13);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        EXPECT_TRUE(orch.mtpDecodeUnsupportedReason().empty());
+        EXPECT_TRUE(orch.supportsMTPTokenCoordination());
+        EXPECT_EQ(orch.moePlacementEpoch(), 13u);
+        EXPECT_TRUE(orch.forwardMTP(42));
+        EXPECT_EQ(runner_raw->forward_mtp_calls(), 1);
+        EXPECT_EQ(runner_raw->last_mtp_condition_token(), 42);
+
+        const float *mtp_logits = orch.mtpLogits();
+        ASSERT_NE(mtp_logits, nullptr);
+        EXPECT_FLOAT_EQ(mtp_logits[17], 10.0f);
+        EXPECT_EQ(orch.sampleGreedyFromMTPLogitsOnDevice(), 17);
+
+        EXPECT_TRUE(orch.setComputeAllPositionLogits(true));
+        EXPECT_EQ(runner_raw->set_all_position_calls(), 1);
+        EXPECT_TRUE(runner_raw->all_position_enabled());
+
+        const float *verifier_logits = orch.getAllPositionLogits();
+        ASSERT_NE(verifier_logits, nullptr);
+        EXPECT_FLOAT_EQ(verifier_logits[17], 10.0f);
+        EXPECT_FLOAT_EQ(verifier_logits[VOCAB_SIZE + 23], 10.0f);
+        EXPECT_EQ(orch.sampleGreedyFromAllPositionLogitsOnDevice(1), 23);
+
+        PrefixStateSnapshot snapshot = orch.captureLivePrefixState();
+        ASSERT_TRUE(snapshot.valid);
+        EXPECT_EQ(snapshot.cached_tokens, 11);
+        ASSERT_EQ(snapshot.participant_snapshots.size(), 1u);
+
+        runner_raw->set_position(19);
+        EXPECT_TRUE(orch.restoreLivePrefixState(snapshot));
+        EXPECT_EQ(runner_raw->restore_live_calls(), 1);
+        EXPECT_EQ(runner_raw->get_position(), 11);
+
+        EXPECT_TRUE(orch.truncateLivePrefixState(5));
+        EXPECT_EQ(runner_raw->truncate_live_calls(), 1);
+        EXPECT_EQ(runner_raw->get_position(), 5);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, GlobalTPMTPDraftSamplingUsesBroadcastRootTokenOnNonRootRank)
+    {
+        ScriptedBroadcastMPIContext mpi(1, 2);
+        mpi.scriptInt32({17});
+        mpi.scriptInt32({23});
+        auto topo = buildSingleStageTopo(2);
+        auto runner = std::make_unique<MTPMockDeviceRunner>(
+            /*mtp_token=*/99,
+            /*verifier_row0_token=*/88,
+            /*verifier_row1_token=*/77);
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 1, 2, &mpi, std::move(runner)));
+        ASSERT_TRUE(orch.isPipelineTail());
+        EXPECT_TRUE(orch.supportsMTPTokenCoordination());
+        EXPECT_TRUE(orch.forwardMTP(42));
+
+        EXPECT_EQ(orch.sampleGreedyFromMTPLogitsOnDevice(), 17);
+        EXPECT_TRUE(orch.setComputeAllPositionLogits(true));
+        EXPECT_EQ(orch.sampleGreedyFromAllPositionLogitsOnDevice(1), 23);
+        EXPECT_EQ(mpi.remainingScriptedInt32(), 0u);
+        ASSERT_EQ(mpi.broadcastRoots().size(), 2u);
+        EXPECT_EQ(mpi.broadcastRoots()[0], 0);
+        EXPECT_EQ(mpi.broadcastRoots()[1], 0);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, GlobalPPMTPReportsTopologyBypassBeforeDelegation)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildTwoStagePPTopo();
+        auto runner = std::make_unique<MTPMockDeviceRunner>();
+        auto *runner_raw = runner.get();
+
+        GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
+
+        EXPECT_NE(orch.mtpDecodeUnsupportedReason().find("GlobalPP"), std::string::npos);
+        EXPECT_FALSE(orch.supportsMTPTokenCoordination());
+        EXPECT_FALSE(orch.forwardMTP(7));
+        EXPECT_FALSE(orch.setComputeAllPositionLogits(true));
+        EXPECT_EQ(runner_raw->forward_mtp_calls(), 0);
+        EXPECT_EQ(runner_raw->set_all_position_calls(), 0);
+        EXPECT_EQ(orch.mtpLogits(), nullptr);
+        EXPECT_EQ(orch.getAllPositionLogits(), nullptr);
+    }
+
+    // =========================================================================
     // Rank Plan Query Tests
     // =========================================================================
 
@@ -704,6 +1027,132 @@ namespace llaminar2::test
 
         EXPECT_EQ(orch.topology().numStages(), 1);
         EXPECT_EQ(orch.topology().total_layers, TOTAL_LAYERS);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, NamedDomainStageRunnerAccessorsExposeLocalRunners)
+    {
+        {
+            MockMPIContext mpi(0, 2);
+            auto topo = buildNamedDomainHybridTopo(/*gpu_owner_rank=*/0);
+
+            auto gpu_raw = new MockDeviceRunner();
+            auto gpu_runner = std::unique_ptr<MockDeviceRunner>(gpu_raw);
+            auto cpu_raw = new MockDeviceRunner();
+            auto cpu_runner = std::unique_ptr<MockDeviceRunner>(cpu_raw);
+
+            GlobalOrchestrator::Config config;
+            config.topology = topo;
+            config.rank = 0;
+            config.world_size = 2;
+            config.mpi_ctx = &mpi;
+            config.stage_runners.push_back(makeStageRunnerEntry(topo, 0, 0, std::move(gpu_runner)));
+            config.stage_runners.push_back(makeStageRunnerEntry(topo, 0, 1, std::move(cpu_runner)));
+            config.vocab_size = VOCAB_SIZE;
+            config.d_model = D_MODEL;
+            config.architecture_name = "test_qwen35moe";
+
+            GlobalOrchestrator orch(std::move(config));
+
+            EXPECT_EQ(orch.stageRunnerCount(), 2u);
+            EXPECT_EQ(orch.stageRunnerForStage(0), gpu_raw);
+            EXPECT_EQ(orch.stageRunnerForStage(1), cpu_raw);
+            EXPECT_EQ(orch.stageRunnerForDomain("rocm_socket0"), gpu_raw);
+            EXPECT_EQ(orch.stageRunnerForDomain("cpu_sockets"), cpu_raw);
+            EXPECT_EQ(orch.stageRunnerForDomain("missing"), nullptr);
+
+            const auto *gpu_entry = orch.stageRunnerEntryForDomain("rocm_socket0");
+            ASSERT_NE(gpu_entry, nullptr);
+            EXPECT_EQ(gpu_entry->action.backend, CollectiveBackendType::RCCL);
+            EXPECT_EQ(gpu_entry->action.inner_mode, InnerParallelism::LOCAL_TP);
+            ASSERT_EQ(gpu_entry->action.devices.size(), 2u);
+            EXPECT_TRUE(gpu_entry->action.devices[0].isROCm());
+            EXPECT_TRUE(gpu_entry->action.devices[1].isROCm());
+
+            const auto *cpu_entry = orch.stageRunnerEntryForDomain("cpu_sockets");
+            ASSERT_NE(cpu_entry, nullptr);
+            EXPECT_TRUE(cpu_entry->action.is_global_tp);
+            EXPECT_EQ(cpu_entry->action.backend, CollectiveBackendType::UPI);
+            EXPECT_EQ(cpu_entry->action.tp_domain_size, 2);
+            EXPECT_EQ(cpu_entry->action.device.device_type, DeviceType::CPU);
+        }
+
+        {
+            MockMPIContext mpi(1, 2);
+            auto topo = buildNamedDomainHybridTopo(/*gpu_owner_rank=*/0);
+
+            auto cpu_raw = new MockDeviceRunner();
+            auto cpu_runner = std::unique_ptr<MockDeviceRunner>(cpu_raw);
+
+            GlobalOrchestrator::Config config;
+            config.topology = topo;
+            config.rank = 1;
+            config.world_size = 2;
+            config.mpi_ctx = &mpi;
+            config.stage_runners.push_back(makeStageRunnerEntry(topo, 1, 1, std::move(cpu_runner)));
+            config.vocab_size = VOCAB_SIZE;
+            config.d_model = D_MODEL;
+            config.architecture_name = "test_qwen35moe";
+
+            GlobalOrchestrator orch(std::move(config));
+
+            EXPECT_EQ(orch.stageRunnerCount(), 1u);
+            EXPECT_EQ(orch.stageRunnerForDomain("rocm_socket0"), nullptr);
+            EXPECT_EQ(orch.stageRunnerForStage(0), nullptr);
+            EXPECT_EQ(orch.stageRunnerForDomain("cpu_sockets"), cpu_raw);
+            EXPECT_EQ(orch.stageRunnerForStage(1), cpu_raw);
+        }
+    }
+
+    TEST_F(Test__GlobalOrchestrator, SnapshotKeysAreGlobalizedForPPStageRunners)
+    {
+        MockMPIContext mpi(0, 2);
+        auto topo = buildNamedDomainHybridTopo(/*gpu_owner_rank=*/0);
+
+        auto gpu_runner = std::make_unique<MockDeviceRunner>();
+        gpu_runner->add_snapshot("layer0_MOE_EXPERT_OUTPUT", {1.0f, 2.0f}, 1, 2);
+        auto cpu_runner = std::make_unique<MockDeviceRunner>();
+        cpu_runner->add_snapshot("layer0_MOE_EXPERT_OUTPUT", {12.0f, 13.0f}, 1, 2);
+        cpu_runner->add_snapshot("layer13_ATTENTION_NORM", {130.0f}, 1, 1);
+
+        GlobalOrchestrator::Config config;
+        config.topology = topo;
+        config.rank = 0;
+        config.world_size = 2;
+        config.mpi_ctx = &mpi;
+        config.stage_runners.push_back(makeStageRunnerEntry(topo, 0, 0, std::move(gpu_runner)));
+        config.stage_runners.push_back(makeStageRunnerEntry(topo, 0, 1, std::move(cpu_runner)));
+        config.vocab_size = VOCAB_SIZE;
+        config.d_model = D_MODEL;
+        config.architecture_name = "test_qwen35moe";
+
+        GlobalOrchestrator orch(std::move(config));
+        auto keys = orch.getSnapshotKeys();
+
+        EXPECT_NE(std::find(keys.begin(), keys.end(), "layer0_MOE_EXPERT_OUTPUT"), keys.end());
+        EXPECT_NE(std::find(keys.begin(), keys.end(), "layer12_MOE_EXPERT_OUTPUT"), keys.end());
+        EXPECT_NE(std::find(keys.begin(), keys.end(), "layer13_ATTENTION_NORM"), keys.end());
+
+        size_t size = 0;
+        const float *stage0 = orch.getSnapshot("layer0_MOE_EXPERT_OUTPUT", size);
+        ASSERT_NE(stage0, nullptr);
+        EXPECT_EQ(size, 2u);
+        EXPECT_FLOAT_EQ(stage0[0], 1.0f);
+
+        const float *stage1 = orch.getSnapshot("layer12_MOE_EXPERT_OUTPUT", size);
+        ASSERT_NE(stage1, nullptr);
+        EXPECT_EQ(size, 2u);
+        EXPECT_FLOAT_EQ(stage1[0], 12.0f);
+
+        const float *exact_global = orch.getSnapshot("layer13_ATTENTION_NORM", size);
+        ASSERT_NE(exact_global, nullptr);
+        EXPECT_EQ(size, 1u);
+        EXPECT_FLOAT_EQ(exact_global[0], 130.0f);
+
+        SnapshotInfo shaped = orch.getSnapshotWithShape("layer12_MOE_EXPERT_OUTPUT");
+        ASSERT_TRUE(shaped);
+        EXPECT_EQ(shaped.rows, 1u);
+        EXPECT_EQ(shaped.cols, 2u);
+        EXPECT_FLOAT_EQ(shaped.data[1], 13.0f);
     }
 
     // =========================================================================
@@ -1673,11 +2122,12 @@ namespace llaminar2::test
         EXPECT_EQ(send_count, 2); // To rank 2 and rank 3 (fan-out)
     }
 
-    // --- Same TP Rank Set (no transfers needed) ---
+    // --- Same TP Rank Set (local handoff between distinct stages) ---
 
-    TEST_F(Test__GlobalOrchestrator, SameTPTopo_NoTransfers)
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_LocalHandoffsForOverlappingRanks)
     {
-        // Same rank set {0,1} in both stages — all ranks already have data
+        // Same rank set {0,1} in both stages. Phase 1 represents the overlap
+        // as an explicit local handoff between distinct stage runners.
         for (int rank = 0; rank < 2; ++rank)
         {
             MockMPIContext mpi(rank, 2);
@@ -1688,26 +2138,98 @@ namespace llaminar2::test
 
             const auto &plan = orch.rankPlan();
             auto transfers = plan.transferActions();
-            EXPECT_TRUE(transfers.empty()) << "rank " << rank << " unexpectedly has transfers";
+            ASSERT_EQ(transfers.size(), 1u) << "rank " << rank << " should have one local handoff";
+            EXPECT_EQ(transfers[0]->direction, RankTransferAction::Direction::LOCAL_HANDOFF);
+            EXPECT_EQ(transfers[0]->peer_rank, rank);
+            EXPECT_EQ(transfers[0]->from_stage, 0);
+            EXPECT_EQ(transfers[0]->to_stage, 1);
         }
     }
 
-    TEST_F(Test__GlobalOrchestrator, SameTPTopo_Rank0_ForwardExecutesStage)
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_Rank0_ForwardExecutesLocalHandoffCompatibilityRunner)
     {
         MockMPIContext mpi(0, 2);
         auto topo = buildTwoStageSameTPTopo();
 
-        auto runner_raw = new MockDeviceRunner();
+        MockDeviceRunner::Config runner_config;
+        runner_config.vocab_size = VOCAB_SIZE;
+        runner_config.has_hidden_state = true;
+        runner_config.hidden_state_dim = D_MODEL;
+        auto runner_raw = new MockDeviceRunner(runner_config);
         auto runner = std::unique_ptr<MockDeviceRunner>(runner_raw);
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 2, &mpi, std::move(runner)));
 
         std::vector<int> tokens = {1, 2, 3};
         EXPECT_TRUE(orch.forward(tokens.data(), 3));
-        // Rank 0 participates in both stages, no MPI send/recv needed
         EXPECT_EQ(mpi.send_call_count(), 0u);
         EXPECT_EQ(mpi.recv_call_count(), 0u);
-        EXPECT_EQ(runner_raw->forward_call_count(), 2u); // Executes both stages
+        EXPECT_EQ(runner_raw->forward_call_count(), 2u);
+        EXPECT_EQ(runner_raw->set_hidden_state_call_count(), 1u);
+    }
+
+    TEST_F(Test__GlobalOrchestrator, SameTPTopo_AnyRankExecutesTwoStageRunnersInOrder)
+    {
+        for (int rank = 0; rank < 2; ++rank)
+        {
+            MockMPIContext mpi(rank, 2);
+            auto topo = buildTwoStageSameTPTopo();
+
+            MockDeviceRunner::Config stage0_config;
+            stage0_config.vocab_size = VOCAB_SIZE;
+            stage0_config.device_idx = rank;
+            stage0_config.has_hidden_state = true;
+            stage0_config.hidden_state_dim = D_MODEL;
+            auto stage0_raw = new MockDeviceRunner(stage0_config);
+            auto stage0_runner = std::unique_ptr<MockDeviceRunner>(stage0_raw);
+
+            MockDeviceRunner::Config stage1_config;
+            stage1_config.vocab_size = VOCAB_SIZE;
+            stage1_config.device_idx = rank + 10;
+            stage1_config.mock_logits = {0.0f, 42.0f + rank, 3.0f};
+            stage1_config.greedy_sample_token = 777 + rank;
+            auto stage1_raw = new MockDeviceRunner(stage1_config);
+            auto stage1_runner = std::unique_ptr<MockDeviceRunner>(stage1_raw);
+
+            GlobalOrchestrator::Config config;
+            config.topology = topo;
+            config.rank = rank;
+            config.world_size = 2;
+            config.mpi_ctx = &mpi;
+            config.stage_runners.push_back(makeStageRunnerEntry(topo, rank, 0, std::move(stage0_runner)));
+            config.stage_runners.push_back(makeStageRunnerEntry(topo, rank, 1, std::move(stage1_runner)));
+            config.vocab_size = VOCAB_SIZE;
+            config.d_model = D_MODEL;
+            config.architecture_name = "test_qwen2";
+
+            GlobalOrchestrator orch(std::move(config));
+
+            std::vector<int> tokens = {5, 6, 7};
+            EXPECT_TRUE(orch.forward(tokens.data(), 3)) << "rank " << rank;
+
+            EXPECT_EQ(stage0_raw->forward_call_count(), 1u) << "rank " << rank;
+            EXPECT_EQ(stage1_raw->set_hidden_state_call_count(), 1u) << "rank " << rank;
+            EXPECT_TRUE(stage1_raw->was_hidden_state_set()) << "rank " << rank;
+            EXPECT_EQ(stage1_raw->forward_call_count(), 1u) << "rank " << rank;
+            EXPECT_EQ(mpi.send_call_count(), 0u) << "rank " << rank;
+            EXPECT_EQ(mpi.recv_call_count(), 0u) << "rank " << rank;
+
+            TensorBase *handoff = stage1_raw->getHiddenState();
+            ASSERT_NE(handoff, nullptr) << "rank " << rank;
+            ASSERT_EQ(handoff->numel(), static_cast<size_t>(tokens.size()) * D_MODEL) << "rank " << rank;
+            const float *handoff_data = handoff->data();
+            EXPECT_FLOAT_EQ(handoff_data[0], static_cast<float>(rank * 1000)) << "rank " << rank;
+            EXPECT_FLOAT_EQ(handoff_data[1], static_cast<float>(rank * 1000 + 1)) << "rank " << rank;
+            EXPECT_FLOAT_EQ(handoff_data[D_MODEL], static_cast<float>(rank * 1000 + D_MODEL)) << "rank " << rank;
+
+            ASSERT_NE(orch.logits(), nullptr) << "rank " << rank;
+            EXPECT_FLOAT_EQ(orch.logits()[1], 42.0f + rank) << "rank " << rank;
+            EXPECT_EQ(orch.sampleGreedyOnDevice(), 777 + rank) << "rank " << rank;
+
+            orch.clear_cache();
+            EXPECT_EQ(stage0_raw->clear_cache_call_count(), 1u) << "rank " << rank;
+            EXPECT_EQ(stage1_raw->clear_cache_call_count(), 1u) << "rank " << rank;
+        }
     }
 
     // --- Partial Overlap TP Rank Sets ---
@@ -1760,10 +2282,10 @@ namespace llaminar2::test
         EXPECT_EQ(send_count, 1); // Sends to rank 2
     }
 
-    TEST_F(Test__GlobalOrchestrator, PartialOverlapTP_Rank1NoTransfers)
+    TEST_F(Test__GlobalOrchestrator, PartialOverlapTP_Rank1LocalHandoff)
     {
-        // Rank 1 is in BOTH domains {0,1} and {1,2} — already has data,
-        // and is not the designated sender (rank 0 is)
+        // Rank 1 is in BOTH domains {0,1} and {1,2}; Phase 1 makes the local
+        // handoff explicit, while rank 0 remains the designated MPI sender.
         MockMPIContext mpi(1, 3);
         auto topo = buildPartialOverlapTPTopo();
 
@@ -1774,7 +2296,11 @@ namespace llaminar2::test
 
         const auto &plan = orch.rankPlan();
         auto transfers = plan.transferActions();
-        EXPECT_TRUE(transfers.empty()) << "rank 1 unexpectedly has transfers";
+        ASSERT_EQ(transfers.size(), 1u) << "rank 1 should have one local handoff";
+        EXPECT_EQ(transfers[0]->direction, RankTransferAction::Direction::LOCAL_HANDOFF);
+        EXPECT_EQ(transfers[0]->peer_rank, 1);
+        EXPECT_EQ(transfers[0]->from_stage, 0);
+        EXPECT_EQ(transfers[0]->to_stage, 1);
     }
 
 } // namespace llaminar2::test

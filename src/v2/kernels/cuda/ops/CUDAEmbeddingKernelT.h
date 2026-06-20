@@ -68,6 +68,22 @@ namespace llaminar2
 
         // GPU stream for graph capture support
         void setGPUStream(void *stream) override { gpu_stream_ = stream; }
+        void setPreparedEmbeddingHandle(const PreparedEmbeddingHandle *handle) override
+        {
+            prepared_embedding_handle_ = handle;
+        }
+
+        void setVocabRange(int vocab_offset, int local_vocab_size) override
+        {
+            explicit_vocab_range_ = true;
+            vocab_offset_ = vocab_offset;
+            local_vocab_size_ = local_vocab_size;
+        }
+
+        void setAllowOutOfRangeTokenIds(bool allow) override
+        {
+            allow_out_of_range_token_ids_ = allow;
+        }
 
         bool supports_device(int device_idx) const override
         {
@@ -135,6 +151,7 @@ namespace llaminar2
             int device_idx = -1) override;
 
         void setDynamicTokenIds(const int *token_ids, int num_tokens) override;
+        void setDynamicDeviceTokenIds(const void *token_ids_device, int num_tokens) override;
 
         // =====================================================================
         // Session Lifecycle (ITensorKernel overrides)
@@ -235,6 +252,7 @@ namespace llaminar2
         int device_idx_ = 0;
         IWorkerGPUContext *device_ctx_ = nullptr;
         void *gpu_stream_ = nullptr;
+        const PreparedEmbeddingHandle *prepared_embedding_handle_ = nullptr;
 
         // IWorkspaceConsumer state
         DeviceWorkspaceManager *workspace_ = nullptr; ///< Bound workspace manager (not owned)
@@ -253,7 +271,15 @@ namespace llaminar2
         int max_token_ids_ = 0;
         int dynamic_token_count_ = 0;
         bool dynamic_params_active_ = false;
+        const int *device_token_ids_ = nullptr;
+        int device_token_count_ = 0;
+        bool device_token_ids_active_ = false;
         void *preload_stream_ = nullptr; ///< Stream used for the last setDynamicTokenIds H2D copy
+
+        int vocab_offset_ = 0;
+        int local_vocab_size_ = 0;
+        bool explicit_vocab_range_ = false;
+        bool allow_out_of_range_token_ids_ = false;
     };
 
     // Convenience alias

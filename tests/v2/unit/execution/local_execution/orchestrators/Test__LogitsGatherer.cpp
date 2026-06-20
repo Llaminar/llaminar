@@ -3,19 +3,93 @@
  * @brief Unit tests for LogitsGatherer extracted from RankOrchestrator
  *
  * Tests buffer allocation, skip-gather control, needsGather() logic,
- * single-device gather path, and copyFromStage delegation.
+ * single-device gather path, copyFromStage delegation, and host pinning cleanup.
  */
 
 #include <gtest/gtest.h>
 
 #include "execution/local_execution/orchestrators/LogitsGatherer.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
+#include "mocks/MockBackend.h"
 #include "tensors/Tensors.h"
 #include <cstring>
 #include <memory>
 #include <vector>
 
 using namespace llaminar2;
+
+namespace
+{
+    /**
+     * @brief Mock backend that records host pin/unpin calls for resolver-path tests.
+     */
+    class PinTrackingBackend : public test::MockBackend
+    {
+    public:
+        explicit PinTrackingBackend(DeviceType device_type)
+            : test::MockBackend(device_type) {}
+
+        bool pinHostMemory(void *ptr, size_t bytes) override
+        {
+            ++pin_count_;
+            last_pinned_ptr_ = ptr;
+            last_pinned_bytes_ = bytes;
+            return true;
+        }
+
+        bool unpinHostMemory(void *ptr) override
+        {
+            ++unpin_count_;
+            last_unpinned_ptr_ = ptr;
+            return true;
+        }
+
+        size_t pinCount() const { return pin_count_; }
+        size_t unpinCount() const { return unpin_count_; }
+        void *lastPinnedPtr() const { return last_pinned_ptr_; }
+        void *lastUnpinnedPtr() const { return last_unpinned_ptr_; }
+        size_t lastPinnedBytes() const { return last_pinned_bytes_; }
+
+    private:
+        size_t pin_count_ = 0;
+        size_t unpin_count_ = 0;
+        void *last_pinned_ptr_ = nullptr;
+        void *last_unpinned_ptr_ = nullptr;
+        size_t last_pinned_bytes_ = 0;
+    };
+
+    PinTrackingBackend *g_cuda_pin_backend = nullptr;
+    PinTrackingBackend *g_rocm_pin_backend = nullptr;
+
+    /// @brief Routes backend lookups to test-owned CUDA/ROCm tracking backends.
+    IBackend *resolvePinTrackingBackend(DeviceId device)
+    {
+        if (device.is_cuda())
+            return g_cuda_pin_backend;
+        if (device.is_rocm())
+            return g_rocm_pin_backend;
+        return nullptr;
+    }
+
+    /**
+     * @brief Temporarily installs tracking backends for LogitsGatherer resolver tests.
+     */
+    class PinTrackingResolverScope
+    {
+    public:
+        PinTrackingResolverScope(PinTrackingBackend &cuda_backend, PinTrackingBackend &rocm_backend)
+        {
+            g_cuda_pin_backend = &cuda_backend;
+            g_rocm_pin_backend = &rocm_backend;
+        }
+
+        ~PinTrackingResolverScope()
+        {
+            g_cuda_pin_backend = nullptr;
+            g_rocm_pin_backend = nullptr;
+        }
+    };
+} // namespace
 
 // =============================================================================
 // Minimal IInferenceRunner mock for LogitsGatherer tests
@@ -134,6 +208,35 @@ TEST_F(Test__LogitsGatherer, DataAccessible)
     ASSERT_NE(g->data(), nullptr);
     ASSERT_NE(g->mutableData(), nullptr);
     EXPECT_EQ(g->data(), g->mutableData());
+}
+
+TEST_F(Test__LogitsGatherer, DestructorUnpinsWithPinnedDeviceBackend)
+{
+    PinTrackingBackend cuda_backend(DeviceType::CUDA);
+    PinTrackingBackend rocm_backend(DeviceType::ROCm);
+    PinTrackingResolverScope resolver_scope(cuda_backend, rocm_backend);
+
+    const void *buffer_ptr = nullptr;
+    const size_t expected_bytes = static_cast<size_t>(VOCAB) * MAX_TOKENS * sizeof(float);
+
+    {
+        auto g = std::make_unique<LogitsGatherer>(VOCAB, MAX_TOKENS, resolvePinTrackingBackend);
+
+        // Pin via ROCm while a CUDA backend is also available; destruction must
+        // unpin through the stored ROCm backend type instead of probing CUDA first.
+        g->pinForDevice(DeviceId::rocm(0));
+        buffer_ptr = g->data();
+
+        ASSERT_NE(buffer_ptr, nullptr);
+        EXPECT_EQ(rocm_backend.pinCount(), 1u);
+        EXPECT_EQ(rocm_backend.lastPinnedPtr(), buffer_ptr);
+        EXPECT_EQ(rocm_backend.lastPinnedBytes(), expected_bytes);
+        EXPECT_EQ(cuda_backend.pinCount(), 0u);
+    }
+
+    EXPECT_EQ(rocm_backend.unpinCount(), 1u);
+    EXPECT_EQ(rocm_backend.lastUnpinnedPtr(), buffer_ptr);
+    EXPECT_EQ(cuda_backend.unpinCount(), 0u);
 }
 
 // =============================================================================
@@ -282,6 +385,7 @@ TEST_F(Test__LogitsGatherer, CopyFromStage_CopiesLogits)
     {
         EXPECT_FLOAT_EQ(result[i], expected[i]) << "Mismatch at index " << i;
     }
+    EXPECT_EQ(g->lastGatheredSize(), static_cast<size_t>(VOCAB));
 }
 
 TEST_F(Test__LogitsGatherer, CopyFromStage_AllocatesIfNull)

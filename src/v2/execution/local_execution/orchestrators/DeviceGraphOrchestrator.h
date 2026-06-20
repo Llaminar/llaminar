@@ -8,7 +8,7 @@
  * graph execution concerns from graph definition (IGraphBuilder implementations).
  *
  * Design Philosophy:
- * - Graph Builders (Qwen2Graph, etc.): Declarative, stateless, build ComputeGraph DAGs
+ * - Graph Builders (QwenStandardGraph, etc.): Declarative, stateless, build ComputeGraph DAGs
  * - DeviceGraphOrchestrator: Imperative executor (manages state, caching, device contexts)
  *
  * The orchestrator owns:
@@ -19,7 +19,7 @@
  *
  * Usage:
  * @code
- * auto graph_builder = std::make_shared<Qwen2Graph>(config, mpi_ctx);
+ * auto graph_builder = std::make_shared<QwenStandardGraph>(config, mpi_ctx);
  * DeviceGraphOrchestrator orchestrator(graph_builder, mpi_ctx);
  *
  * // Execute a layer
@@ -32,33 +32,43 @@
 #include "../graph/IGraphBuilder.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../backends/IGPUGraphCapture.h"
+#include "../../../backends/GPUDeviceContextPool.h"
 #include "IInferenceRunner.h"
 #include "../graph/DeviceGraphExecutor.h"
 #include "../device/DeviceContext.h"
 #include "../device/WorkspaceAllocator.h"
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
+#include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
+#include "../../moe/MoEExpertOverlayProfiler.h"        // For overlay profiling summary flush
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
 #include "../engine/ForwardExecutionEngine.h"          // Forward execution engine (extracted Phase 3)
 #include "../../../loaders/IWeightStreamer.h"          // For weight streaming (Option B)
 #include "../../../interfaces/IModelContext.h"         // For interface-based construction
 #include "../../../memory/BufferArena.h"               // Phase 2: unified buffer management
+#include "../../prefix_cache/PrefixCacheFingerprint.h"
+#include "../../prefix_cache/PrefixCacheStats.h"
+#include "../../mtp/MTPSpecDecodeMetadata.h"
 #include "../../../interfaces/IMPITopology.h"          // For interface-based construction
 #include "../../../interfaces/ICollectiveContext.h"    // For interface-based construction
 #include "../../../config/TPDomain.h"                  // For MultiDomainTPConfig (Phase 6.3)
 #include "../../../config/PipelineConfig.h"            // For unified PP+TP configuration (Phase 6)
 #include "../../../collective/ILocalPPContext.h"       // For unique_ptr<ILocalPPContext> in maps
+#include "../../../collective/ITPContext.h"            // For polymorphic TP context ownership
 #include "../../../collective/ILocalTPContext.h"       // For unique_ptr<ILocalTPContext> in maps
 #include "../../../collective/IGlobalTPContext.h"      // For shared_ptr<IGlobalTPContext> ownership
 #include <memory>
 #include <optional>
+#include <algorithm>
+#include <array>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
 #include <vector>
 #include <string>
 #include <cstring>
+#include <cstdint>
 
 namespace llaminar2
 {
@@ -66,11 +76,24 @@ namespace llaminar2
     // Forward declarations
     class IMPIContext;
     class IKVCache;
+    class IWeightManager;
+    class IWeightPlacementMap;
     class WeightManager;
     class WeightPlacementMap;
     class TensorParallelConfig;
     class TurboQuantContext;
+    class MoERebalanceController;
+    class ExpertWeightPayloadProvider;
+    class PreparedWeightStore;
+    class FrozenModelWeightSet;
+    class PrefixStateCache;
+    class RamPrefixStorageBackend;
+    class DiskPrefixStorageBackend;
+    class DeviceHotPrefixStorageBackend;
+    struct PrefixBlockHandle;
+    struct ExpertReplicaSet;
     class ActivationRotation;
+    enum class KVCacheLayoutMode : uint8_t;
 
     /**
      * @brief Configuration for graph caching behavior
@@ -89,7 +112,11 @@ namespace llaminar2
     {
         std::unique_ptr<ComputeGraph> attention_decode; ///< Cached attention graph for decode
         std::unique_ptr<ComputeGraph> ffn_decode;       ///< Cached FFN graph for decode
-        int cached_seq_len = 0;                         ///< Sequence length when cached
+        int cached_seq_len = 0;                         ///< Legacy/shared sequence length for compatibility.
+        int attention_cached_seq_len = 0;               ///< Sequence length for cached attention graph.
+        int ffn_cached_seq_len = 0;                     ///< Sequence length for cached FFN graph.
+        bool attention_cached_all_position_logits = false;
+        bool ffn_cached_all_position_logits = false;
         bool valid = false;                             ///< Whether cache entries are valid
 
         void invalidate()
@@ -97,7 +124,40 @@ namespace llaminar2
             attention_decode.reset();
             ffn_decode.reset();
             cached_seq_len = 0;
+            attention_cached_seq_len = 0;
+            ffn_cached_seq_len = 0;
+            attention_cached_all_position_logits = false;
+            ffn_cached_all_position_logits = false;
             valid = false;
+        }
+
+        /**
+         * @brief Reset request-scoped state while preserving cached graph topology.
+         *
+         * The decode graph cache is intended to survive prompt boundaries. Stages
+         * inside the cached graphs can still own request-derived metadata (for
+         * example stashed routing snapshots, dynamic stream pointers, or replay
+         * callbacks), so clear_cache() must reset that state explicitly instead
+         * of marking every cached graph invalid and rebuilding the topology.
+         */
+        void resetSessionState()
+        {
+            auto reset_graph = [](std::unique_ptr<ComputeGraph> &graph)
+            {
+                if (!graph)
+                    return;
+
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            };
+
+            reset_graph(attention_decode);
+            reset_graph(ffn_decode);
         }
     };
 
@@ -128,6 +188,18 @@ namespace llaminar2
          * Default: false (use device memory for best GPU performance)
          */
         bool use_mapped_memory = false;
+
+        /**
+         * @brief Sequence length used for transient graph/activation buffers.
+         *
+         * This may be smaller than max_seq_len. KV caches, positions, and request
+         * context validation still use max_seq_len; graph execution shapes must
+         * fit within this activation capacity or go through explicit chunked
+         * prefill scheduling.
+         *
+         * Default: 0 (use max_seq_len, preserving historical behavior).
+         */
+        int activation_seq_len = 0;
     };
 
     /**
@@ -150,6 +222,10 @@ namespace llaminar2
         // === Core Buffers ===
         std::shared_ptr<TensorBase> hidden; ///< [batch_size * seq_len, d_model]
         std::shared_ptr<TensorBase> logits; ///< [batch_size * seq_len, vocab_size]
+        std::shared_ptr<TensorBase> all_position_logits; ///< Runtime verifier logits [tokens, vocab_size]
+        std::shared_ptr<TensorBase> all_position_logits_local; ///< Runtime verifier logits [tokens, vocab_local]
+        std::unordered_map<int, std::shared_ptr<TensorBase>> all_position_logits_by_rows; ///< Stable verifier logits by row count.
+        std::unordered_map<int, std::shared_ptr<TensorBase>> all_position_logits_local_by_rows; ///< Stable local verifier logits by row count.
 
         /// Local logits for column-parallel LM head [batch_size * seq_len, vocab_local]
         /// Only allocated when lm_head_column_parallel is enabled
@@ -157,6 +233,35 @@ namespace llaminar2
 
         // === KV Cache ===
         std::unique_ptr<IKVCache> kv_cache; ///< Attention KV history (single-device mode)
+
+        /// Request-local MTP sidecar KV caches, one cache per MTP depth.
+        /// These are shifted relative to the main cache and are populated only
+        /// when MTP support is explicitly enabled.
+        std::vector<std::unique_ptr<IKVCache>> mtp_kv_caches;
+
+        /// Terminal state restored from a prefix hit. MTP full hits require the
+        /// hidden row as well as logits; dense prefix-cache reuse can use logits
+        /// alone to preserve first-token semantics.
+        std::shared_ptr<TensorBase> prefix_terminal_hidden;
+        std::shared_ptr<TensorBase> prefix_terminal_logits;
+
+        /// Shape of the most recent main-model forward that populated `hidden`.
+        /// MTP sidecars use this to decide whether `hidden` is already a single
+        /// terminal row or whether a compact row-select is required first.
+        int last_forward_seq_len = 0;
+        int last_forward_batch_size = 0;
+        /// Per-request token counts written by the most recent main forward.
+        ///
+        /// For padded request batches `last_forward_seq_len` is the padded row
+        /// width, not every request's true length.  MTP sidecar input refresh
+        /// uses this vector to gather each request's real terminal hidden row.
+        std::vector<int> last_forward_request_lengths;
+
+        /// True when `prefix_terminal_hidden` is the accepted terminal row for
+        /// the current live state. Ordinary forward makes this stale; prefix
+        /// restore, accepted-state publication, or an explicit terminal refresh
+        /// makes it current again.
+        bool mtp_terminal_hidden_current = false;
 
         /// Per-device KV caches for Pipeline Parallelism
         /// When PP is enabled, each PP stage device has its own KV cache containing
@@ -220,6 +325,7 @@ namespace llaminar2
         // === Configuration ===
         int batch_size = 0;
         int max_seq_len = 0;
+        int activation_seq_len = 0;
         int d_model = 0;
         int vocab_size = 0;
         DeviceId device_id = DeviceId::cpu();
@@ -233,12 +339,22 @@ namespace llaminar2
         }
 
         /**
-         * @brief Clear state (reset positions, clear KV cache)
+         * @brief Clear live sequence state owned by the inference buffers.
+         *
+         * This is the low-level state payload reset used by the public request
+         * boundary.  It clears KV and recurrent payloads plus host-side logical
+         * position/length vectors.  It deliberately does not touch graph
+         * topology, arena bindings, prepared weights, or backend contexts.
          */
         void clear()
         {
             if (kv_cache)
                 kv_cache->clear();
+            for (auto &cache : mtp_kv_caches)
+            {
+                if (cache)
+                    cache->clear();
+            }
             for (auto &[device, cache] : pp_kv_caches)
             {
                 if (cache)
@@ -246,6 +362,10 @@ namespace llaminar2
             }
             std::fill(positions.begin(), positions.end(), 0);
             std::fill(sequence_lengths.begin(), sequence_lengths.end(), 0);
+            last_forward_seq_len = 0;
+            last_forward_batch_size = 0;
+            last_forward_request_lengths.clear();
+            mtp_terminal_hidden_current = false;
         }
 
         /**
@@ -315,7 +435,7 @@ namespace llaminar2
      * - Execution state tracking
      *
      * This class is the imperative counterpart to declarative graph builders.
-     * Currently supports Qwen2Graph, designed for extension to other architectures.
+     * Currently supports QwenStandardGraph, designed for extension to other architectures.
      *
      * Implements IInferenceRunner for unified inference API.
      */
@@ -337,7 +457,7 @@ namespace llaminar2
          * @code
          * DeviceGraphOrchestrator::Dependencies deps;
          * deps.model_ctx = model_ctx;
-         * deps.graph_builder = std::make_shared<Qwen2Graph>(config, nullptr);
+         * deps.graph_builder = std::make_shared<QwenStandardGraph>(config, nullptr);
          * deps.turboquant_ctx = turboquant_ctx;              // optional
          * deps.pp_stage_config = pp_config;                  // optional
          * auto orchestrator = DeviceGraphOrchestrator(std::move(deps));
@@ -381,16 +501,20 @@ namespace llaminar2
             std::shared_ptr<IWeightStreamer> weight_streamer = nullptr;
 
             /// Weight manager for full weights and decode shards
-            std::shared_ptr<WeightManager> weight_manager = nullptr;
+            std::shared_ptr<IWeightManager> weight_manager = nullptr;
 
             /// Weight placement map for decode device selection
-            std::shared_ptr<WeightPlacementMap> weight_placement_map = nullptr;
+            std::shared_ptr<IWeightPlacementMap> weight_placement_map = nullptr;
 
             /// Tensor parallelism configuration (proportional TP splits)
             std::shared_ptr<TensorParallelConfig> tp_config = nullptr;
 
             /// Multi-domain TP configuration (heterogeneous TP domains)
             std::shared_ptr<MultiDomainTPConfig> domain_config = nullptr;
+
+            /// Domain-scoped TP contexts whose raw pointers are installed
+            /// into GraphConfig / graph builders before graph construction.
+            std::map<std::string, std::shared_ptr<ITPContext>> domain_tp_contexts;
 
             // ---- Optional: graph caching ----
 
@@ -426,16 +550,16 @@ namespace llaminar2
             std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
             const GraphCacheConfig &cache_config = {});
 
-        ~DeviceGraphOrchestrator() = default;
+        ~DeviceGraphOrchestrator();
 
         // Non-copyable, movable
         DeviceGraphOrchestrator(const DeviceGraphOrchestrator &) = delete;
         DeviceGraphOrchestrator &operator=(const DeviceGraphOrchestrator &) = delete;
-        DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) = default;
-        DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) = default;
+        DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept;
+        DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) noexcept;
 
         // =========================================================================
-        // Execution Methods (moved from Qwen2Graph)
+        // Execution Methods (moved from QwenStandardGraph)
         // =========================================================================
 
         /**
@@ -551,9 +675,13 @@ namespace llaminar2
         // =========================================================================
 
         /**
-         * @brief Clear all caches (graphs, device contexts, state)
+         * @brief Destructively invalidate execution caches and device contexts.
+         *
+         * This is a topology/workspace lifetime reset, not a request boundary.
+         * Normal prompt/session resets must use IInferenceRunner::clear_cache(),
+         * which preserves reusable graph topology and prepared runtime resources.
          */
-        void clearCache();
+        void invalidateExecutionCaches();
 
         /**
          * @brief Invalidate graph cache for a specific layer
@@ -605,6 +733,14 @@ namespace llaminar2
          * @param weights Model weights including embedding_table, final_norm, lm_head
          */
         void setWeights(const ModelWeights &weights);
+
+        /**
+         * @brief Set pre-materialized frozen model weight bindings.
+         *
+         * Used by planned weight setup paths where WeightManager has already
+         * resolved all graph-bound tensors into a FrozenModelWeightSet.
+         */
+        void setFrozenWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set);
 
         /**
          * @brief Set activation buffers for full forward pass
@@ -709,6 +845,116 @@ namespace llaminar2
             kv_rotation_ = std::move(rot);
         }
 
+        // =========================================================================
+        // MoE Expert Rebalance Controller
+        // =========================================================================
+
+        /// Set MoE rebalance controller (ownership transfer)
+        void setMoERebalanceController(std::unique_ptr<MoERebalanceController> controller);
+        void addMoERebalanceController(std::unique_ptr<MoERebalanceController> controller);
+
+        /// Initialize expert weight payload provider for metadata-based host retention.
+        /// Creates the provider, wires it to all cached MoE stages and the WeightManager.
+        /// Call after graph cache is populated and MoE stages are cached.
+        void initializeExpertPayloadProvider();
+
+        // =========================================================================
+        // Prepared Weight Store (Phase 4-5)
+        // =========================================================================
+
+        /// Initialize the model-context-owned prepared weight store.
+        /// Creates the store and populates it from already-prepared GEMM weights.
+        /// Call after weight finalization (finalizeForDevice) completes.
+        void initializePreparedWeightStore(DeviceId device);
+
+        /// Get prepared weight store (may be null if no GEMM weights prepared)
+        PreparedWeightStore *preparedWeightStore() const { return prepared_weight_store_.get(); }
+
+        /// Get frozen model weight set (may be null before setWeights is called)
+        const FrozenModelWeightSet *frozenWeightSet() const { return frozen_weight_set_.get(); }
+
+        /// Get expert weight payload provider (may be null for non-MoE models)
+        ExpertWeightPayloadProvider *expertPayloadProvider() const { return expert_payload_provider_.get(); }
+
+        /// Get MoE rebalance controller (for post-decode logging)
+        MoERebalanceController *moeRebalanceController() const
+        {
+            return moe_rebalance_controller_ ? moe_rebalance_controller_.get() : nullptr;
+        }
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const override;
+        int moeRebalanceParticipantId() const override;
+
+        /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
+        /// Called after rebalancing to update which experts each rank computes.
+        /// @param masks Per-layer expert masks (masks[layer][expert] == true means active)
+        /// @param received_weights Optional transferred packed weights from MPI transfer
+        void applyExpertMasks(
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received_weights = {});
+        void applyExpertMasksForDomain(
+            const std::string &domain_id,
+            const std::vector<std::vector<bool>> &masks,
+            const ReceivedWeightsMap &received_weights = {});
+
+        /// Non-destructively collect packed expert weights for experts requested
+        /// by masks. Used for intra-rank migration between composed TP domains
+        /// without falling back to raw GGUF host tensors.
+        ReceivedWeightsMap collectExpertWeightsForMasks(
+            const std::vector<std::vector<bool>> &masks) const;
+
+        /// Set expert replica info on all MoE stages for per-token dispatch.
+        /// Call after applyExpertMasks() so GEMM engines are already prepared.
+        void setExpertReplicaSetForParticipant(const ExpertReplicaSet &replicas, int participant_id);
+
+        /// Compatibility wrapper for older socket-oriented call sites.
+        void setExpertReplicaSet(const ExpertReplicaSet &replicas, int socket_id);
+
+        /// Release raw expert weight data from all MoE stages after initial VNNI packing.
+        /// For mmap: confirms DONTNEED already applied. For heap: frees raw_data_ vectors.
+        /// After this, fallback VNNI repacking from raw data is no longer possible —
+        /// only prepacked MPI transfer can provide weights for rebalanced experts.
+        /// @return Total bytes freed (or already DONTNEED'd)
+        size_t releaseRawExpertWeights();
+
+        /// Build and discard a forward graph for the requested shape without executing it.
+        /// This is used to force graph-build-time weight materialization, including
+        /// Qwen3.5 MoE expert GEMM preparation, before host weight data is released.
+        bool materializeForwardGraphForShape(int seq_len, int batch_size = 1);
+
+        /**
+         * @brief Prepare CPU MoE expert slabs used only by MTP/nextn sidecars.
+         *
+         * Qwen nextn/MTP blocks can live outside the main transformer layer loop,
+         * so ordinary eager forward-graph materialization may never construct a
+         * MoE stage for those expert tensors before raw mmap-backed host data is
+         * released.  This hook materializes the same local expert range that the
+         * sidecar graph will later request, ensuring sidecar graph construction
+         * resolves persistent PreparedWeightStore slabs instead of attempting a
+         * late raw repack.
+         *
+         * @return true when no MTP MoE slabs are needed or all required slabs
+         *         were prepared successfully.
+         */
+        bool prepareMTPMoEExpertSlabs(DeviceId device);
+
+        /// Transfer packed weights for migrating experts via MPI.
+        /// Returns received weights map: [layer_idx][expert_id] → blobs.
+        ReceivedWeightsMap transferExpertWeights(
+            const std::vector<ExpertMigration> &manifest,
+            int num_layers);
+
+        /// Transfer packed weights for replicated experts via MPI.
+        /// Unlike transferExpertWeights(), the sender keeps its weights (non-destructive).
+        /// The receiver gets pre-packed weights to avoid VNNI repacking from raw.
+        /// @param replicas The active replica set describing which experts to transfer
+        /// @param num_layers Number of MoE layers
+        /// @return Received weights map for this rank's new replicas
+        ReceivedWeightsMap transferReplicaWeights(
+            const ExpertReplicaSet &replicas,
+            int num_layers);
+
         /**
          * @brief Set GlobalTPContext for cross-MPI-rank tensor parallelism
          *
@@ -724,6 +970,9 @@ namespace llaminar2
             global_tp_ctx_ = std::move(ctx);
         }
 
+        /// Retain domain-scoped TP contexts and wire them to the graph builder.
+        void setDomainTPContexts(std::map<std::string, std::shared_ptr<ITPContext>> contexts);
+
         // =========================================================================
         // Weight Manager and Phase-Aware Weight Access (Gap 3)
         // =========================================================================
@@ -736,7 +985,7 @@ namespace llaminar2
          *
          * @param weight_manager Shared pointer to WeightManager
          */
-        void setWeightManager(std::shared_ptr<WeightManager> weight_manager);
+        void setWeightManager(std::shared_ptr<IWeightManager> weight_manager);
 
         /**
          * @brief Retain model context to prevent dangling WeightManager references
@@ -756,7 +1005,7 @@ namespace llaminar2
          * @brief Get weight manager
          * @return Shared pointer to WeightManager (may be nullptr)
          */
-        std::shared_ptr<WeightManager> weightManager() const { return weight_manager_; }
+        std::shared_ptr<IWeightManager> weightManager() const { return weight_manager_; }
 
         /**
          * @brief Set weight placement map for decode device selection
@@ -765,13 +1014,13 @@ namespace llaminar2
          *
          * @param placement_map Shared pointer to WeightPlacementMap
          */
-        void setWeightPlacementMap(std::shared_ptr<WeightPlacementMap> placement_map);
+        void setWeightPlacementMap(std::shared_ptr<IWeightPlacementMap> placement_map);
 
         /**
          * @brief Get weight placement map
          * @return Shared pointer to WeightPlacementMap (may be nullptr)
          */
-        std::shared_ptr<WeightPlacementMap> weightPlacementMap() const { return weight_placement_map_; }
+        std::shared_ptr<IWeightPlacementMap> weightPlacementMap() const { return weight_placement_map_; }
 
         // =========================================================================
         // Tensor Parallel Configuration (Phase 1c: Proportional TP)
@@ -830,6 +1079,11 @@ namespace llaminar2
          * @return Optional containing FactoryPPStageConfig if this is a PP stage
          */
         const std::optional<FactoryPPStageConfig> &ppStageConfig() const { return pp_stage_config_; }
+
+        /// Enable or disable this DGO's post-prefill host-resident weight release.
+        /// RankOrchestrator disables this for child DGOs because it owns the
+        /// synchronization point across sibling TP/PP runners.
+        void setHostResidentReleaseEnabled(bool enabled) { release_host_resident_after_forward_ = enabled; }
 
         /**
          * @brief Check if this orchestrator is running as a PP stage
@@ -966,8 +1220,25 @@ namespace llaminar2
 
         void flushStageTimeline() override
         {
+            // Print forward pass wall-clock profiler (always, when profiling is on)
+            if (forward_engine_ && forward_engine_->forwardPassProfiler().hasData())
+            {
+                if (debugEnv().profile.enabled)
+                {
+                    std::string dev_str = state_.device_id.toString();
+                    forward_engine_->forwardPassProfiler().printAndReset(dev_str.c_str());
+                }
+                else
+                {
+                    forward_engine_->forwardPassProfiler().reset();
+                }
+            }
+
             if (!debugEnv().gpu_stage_timing)
+            {
+                MoEExpertOverlayProfiler::flush();
                 return;
+            }
 
             auto &timeline = executor_.stageTimeline();
             std::string dev_str = state_.device_id.toString();
@@ -983,6 +1254,7 @@ namespace llaminar2
             {
                 timeline.printAccumulatedSummary("DECODE", dev_str.c_str());
             }
+            MoEExpertOverlayProfiler::flush();
         }
 
         /**
@@ -1055,7 +1327,7 @@ namespace llaminar2
         bool shouldUseCPUDecodeWeight(const std::string &name, int layer_idx) const;
 
         // =========================================================================
-        // Graph Buffer Management (Phase 3 - moved from Qwen2Graph)
+        // Graph Buffer Management (Phase 3 - moved from QwenStandardGraph)
         // =========================================================================
 
         /**
@@ -1159,6 +1431,59 @@ namespace llaminar2
          */
         const InferenceState &inferenceState() const { return state_; }
 
+        /**
+         * @brief Mark the current hidden tensor as freshly produced by main forward for tests.
+         *
+         * Unit tests that inject `state_.hidden` directly bypass the normal forward
+         * path that records terminal-hidden freshness for MTP sidecars. This helper
+         * preserves the production invariant: sidecar execution must only consume a
+         * hidden tensor that was explicitly published as current.
+         *
+         * @param seq_len Number of rows represented by the injected hidden tensor.
+         * @param batch_size Batch size represented by the injected hidden tensor.
+         */
+        void markMainForwardHiddenProducedForTesting(int seq_len, int batch_size)
+        {
+            noteMainForwardHiddenProducedForMTP(seq_len, batch_size);
+        }
+
+        /**
+         * @brief Mark a padded batched forward for terminal-hidden tests.
+         *
+         * `request_lengths[i]` is the number of real, non-padding tokens in
+         * request `i` from the most recent forward.
+         */
+        void markMainForwardHiddenProducedForTesting(
+            int seq_len,
+            int batch_size,
+            const std::vector<int> &request_lengths)
+        {
+            noteMainForwardHiddenProducedForMTP(
+                seq_len,
+                batch_size,
+                request_lengths);
+        }
+
+        /**
+         * @brief Refresh the stable MTP terminal-hidden buffer for tests.
+         *
+         * This exposes the same production helper used by MTP sidecar
+         * resolution, allowing unit tests to verify row selection and batch
+         * shape guards without constructing a full speculative scheduler.
+         */
+        bool refreshMTPTerminalHiddenForTesting(int seq_len, int batch_size)
+        {
+            return refreshMTPTerminalHiddenState(seq_len, batch_size);
+        }
+
+        /**
+         * @brief Inspect the stable MTP terminal-hidden buffer published by tests.
+         */
+        const TensorBase *mtpTerminalHiddenForTesting() const
+        {
+            return state_.prefix_terminal_hidden.get();
+        }
+
         // =====================================================================
         // IInferenceRunner: Device & Logits Local API overrides
         // =====================================================================
@@ -1172,11 +1497,196 @@ namespace llaminar2
             if (!state_.logits_local)
                 return {};
             const auto &shape = state_.logits_local->shape();
+            auto device_opt = state_.logits_local->current_device();
+            // Resolve the explicit worker stream for this device to avoid NULL stream races
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = GPUDeviceContextPool::instance().getContext(*device_opt).defaultStream();
+            }
             return LogitsLocalInfo{
                 state_.logits_local->gpu_data_ptr(),
-                state_.logits_local->current_device(),
+                device_opt,
                 shape.size() >= 2 ? shape[1] : 0,
-                state_.logits_local.get()};
+                state_.logits_local.get(),
+                stream,
+                // Expose this runner's arena-owned argmax scratch so the
+                // multi-device sampler can drive the multi-block reduction
+                // without any hot-path allocation.
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
+        }
+
+        LogitsLocalInfo consumeLogitsLocalInfoForSampling() override
+        {
+            if (!state_.logits_local)
+                return {};
+
+            const auto &shape = state_.logits_local->shape();
+            auto device_opt = state_.logits_local->current_device();
+
+            /*
+             * TP sampling is the semantic consumer of main-decode logits.  Use
+             * the stream published by graph replay when present; otherwise use
+             * this runner's explicit worker stream.  Sampling on any unrelated
+             * stream can race graph-captured decode and read an older logits
+             * row, which is both nondeterministic and very hard to diagnose.
+             */
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = consumePendingLogitsStream(
+                    PendingLogitsStreamRole::MainDecode,
+                    "consumeLogitsLocalInfoForSampling");
+                if (!stream)
+                    stream = explicitGPUStreamForOperation(
+                        "consumeLogitsLocalInfoForSampling");
+            }
+
+            return LogitsLocalInfo{
+                state_.logits_local->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                state_.logits_local.get(),
+                stream,
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
+        }
+
+        bool hasMTPLogitsLocal() const override
+        {
+            if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+                return false;
+            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+            return it != state_.extension_buffers.end() && it->second != nullptr;
+        }
+
+        LogitsLocalInfo getMTPLogitsLocalInfo() const override
+        {
+            if (!hasMTPLogitsLocal())
+                return {};
+
+            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+            TensorBase *mtp_logits = it->second.get();
+            const auto &shape = mtp_logits->shape();
+            auto device_opt = mtp_logits->current_device();
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = GPUDeviceContextPool::instance().getContext(*device_opt).defaultStream();
+            }
+            return LogitsLocalInfo{
+                mtp_logits->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                mtp_logits,
+                stream,
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
+        }
+
+        LogitsLocalInfo consumeMTPLogitsLocalInfoForSampling() override
+        {
+            if (!hasMTPLogitsLocal())
+                return {};
+
+            auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
+            TensorBase *mtp_logits = it->second.get();
+            const auto &shape = mtp_logits->shape();
+            auto device_opt = mtp_logits->current_device();
+
+            /*
+             * LocalTP MTP sampling is the semantic consumer of sidecar logits.
+             * Carry the exact sidecar producer stream into the TP sampler so
+             * each shard is sampled after its local MTP graph replay.  Falling
+             * back to the runner's explicit operation stream keeps CPU/no-graph
+             * paths simple without ever touching a null/default GPU stream.
+             */
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = consumePendingLogitsStream(
+                    PendingLogitsStreamRole::MTPSidecar,
+                    "consumeMTPLogitsLocalInfoForSampling");
+                if (!stream)
+                    stream = explicitGPUStreamForOperation(
+                        "consumeMTPLogitsLocalInfoForSampling");
+            }
+
+            return LogitsLocalInfo{
+                mtp_logits->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                mtp_logits,
+                stream,
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
+        }
+
+        bool hasAllPositionLogitsLocal() const override
+        {
+            if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+                return false;
+            return state_.all_position_logits_local != nullptr;
+        }
+
+        LogitsLocalInfo getAllPositionLogitsLocalInfo() const override
+        {
+            if (!hasAllPositionLogitsLocal())
+                return {};
+
+            const auto &shape = state_.all_position_logits_local->shape();
+            auto device_opt = state_.all_position_logits_local->current_device();
+            void *stream = nullptr;
+            if (device_opt.has_value() && device_opt->is_gpu())
+            {
+                stream = GPUDeviceContextPool::instance().getContext(*device_opt).defaultStream();
+            }
+            return LogitsLocalInfo{
+                state_.all_position_logits_local->gpu_data_ptr(),
+                device_opt,
+                shape.size() >= 2 ? shape[1] : 0,
+                state_.all_position_logits_local.get(),
+                stream,
+                argmax_partial_vals_dev_,
+                argmax_partial_idxs_dev_,
+                argmax_partial_capacity_};
+        }
+
+        LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling() override
+        {
+            if (!hasAllPositionLogitsLocal())
+                return {};
+
+            LogitsLocalInfo info = getAllPositionLogitsLocalInfo();
+            if (!info)
+                return {};
+
+            if (info.device.has_value() && info.device->is_gpu())
+            {
+                /*
+                 * All-position verifier sampling is the semantic consumer of
+                 * verifier graph replay.  Consume the replay stream here so
+                 * LocalTP argmax reads this shard only after graph replay has
+                 * produced it; non-captured execution still uses an explicit
+                 * non-null worker stream.
+                 */
+                void *stream = consumePendingLogitsStream(
+                    PendingLogitsStreamRole::AllPositionVerifier,
+                    "consumeAllPositionLogitsLocalInfoForSampling");
+                if (!stream)
+                {
+                    stream = explicitGPUStreamForOperation(
+                        "consumeAllPositionLogitsLocalInfoForSampling");
+                }
+                info.stream = stream;
+            }
+
+            return info;
         }
 
         /**
@@ -1194,6 +1704,34 @@ namespace llaminar2
             const int *tokens,
             int seq_len,
             int batch_size = 1);
+        bool forwardWithDeviceTokenIds(
+            const int *token_shadow,
+            const void *token_ids_device,
+            int seq_len) override;
+
+        /**
+         * @brief Batched verifier forward from a flat device token buffer.
+         *
+         * The host vectors are a logical shadow only; GPU embedding reads the
+         * padded `[batch, padded_seq_len]` INT32 rows from `token_ids_device`.
+         * This is the SingleDevice building block for request-batched MTP graph
+         * capture. Multi-participant topologies must provide participant-local
+         * device pointers before using the same contract.
+         */
+        bool forwardBatchWithDeviceTokenIds(
+            const std::vector<std::vector<int>> &token_batches,
+            const void *token_ids_device,
+            int padded_seq_len) override;
+
+        const void *prepareMTPVerifierInputTokensOnDevice(
+            int32_t first_token,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromHostRow(
+            const int32_t *verifier_tokens,
+            int total_verifier_input_tokens,
+            int draft_token_count) override;
 
         /**
          * @brief Get logits from last forward pass
@@ -1201,6 +1739,158 @@ namespace llaminar2
          * @return Pointer to logits buffer, or nullptr if not available
          */
         const float *logits() const override;
+
+        bool forwardMTP(int32_t draft_condition_token) override;
+        bool forwardMTPForDeviceSampling(int32_t draft_condition_token) override;
+        bool supportsChainedMTPDrafts() const override { return true; }
+        bool supportsMTPSidecarSampleFusion() const override;
+        bool supportsMTPSidecarLogitsStreamHandoff() const override;
+        bool supportsMTPDeviceDraftTokenInput() const override;
+        bool supportsMTPSidecarPreservesMainState() const override;
+        bool supportsMTPShiftedRowReuseFromSidecar() const override;
+        bool forwardMTPFromLastDraft(int32_t draft_condition_token, int position_id) override;
+        bool forwardMTPFromLastDraftForDeviceSampling(
+            int32_t draft_condition_token,
+            int position_id) override;
+        bool forwardMTPFromDeviceDraftForDeviceSampling(
+            int draft_sample_slot,
+            int position_id) override;
+        bool forwardMTPFromDeviceTargetForDeviceSampling(
+            int target_sample_slot,
+            int position_id) override;
+        bool forwardMTPFromDeviceResidentLogicalStateForDeviceSampling(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index = 0) override;
+        bool forwardMTPAndSampleGreedy(int32_t draft_condition_token, int32_t *out_token) override;
+        bool forwardMTPAndSampleGreedyToDeviceDraftSlot(
+            int32_t draft_condition_token,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        bool forwardMTPBatchAndSampleGreedy(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens) override;
+        bool forwardMTPBatchAndSampleGreedyToDeviceDraftSlots(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int first_draft_slot,
+            int slot_stride,
+            int32_t *out_tokens) override;
+        bool forwardMTPBatchFromLastDraftAndSampleGreedy(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int32_t *out_tokens) override;
+        bool forwardMTPBatchFromLastDraftAndSampleGreedyToDeviceDraftSlots(
+            const int32_t *draft_condition_tokens,
+            const int *position_ids,
+            int request_batch,
+            int first_draft_slot,
+            int slot_stride,
+            int32_t *out_tokens) override;
+        bool forwardMTPFromLastDraftAndSampleGreedy(
+            int32_t draft_condition_token,
+            int position_id,
+            int32_t *out_token) override;
+        bool forwardMTPFromLastDraftAndSampleGreedyToDeviceDraftSlot(
+            int32_t draft_condition_token,
+            int position_id,
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        bool flushPendingMTPWork() override;
+        void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
+        void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
+        bool supportsMTPSpecStatePublication() const override;
+        bool supportsDeviceResidentMTPSpecStatePublication() const override;
+        bool supportsLogicalMTPVerifierBaseCheckpoint() const override;
+        MTPVerifierRowCapability mtpVerifierRowCapability() const override;
+        MTPVerifierEconomyCapability mtpVerifierEconomyCapability() const override;
+        bool publishAcceptedMTPSpecState(
+            const MTPSpecStepPlan &plan,
+            std::string *error = nullptr) override;
+        bool publishAcceptedMTPSpecStateBatch(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        bool publishAcceptedMTPSpecStateBatchFromDeviceOutcome(
+            const DeviceSpeculativePublicationRequest &request,
+            std::string *error = nullptr) override;
+        bool adoptDeviceResidentMTPSpecPublishedHostState(
+            const MTPSpecStepPlanBatch &plans,
+            std::string *error = nullptr) override;
+        bool adoptDeviceResidentMTPSpecPublishedHostStateFromDeviceMetadata(
+            const DeviceResidentHostStateAdoptionRequest &request,
+            std::string *error = nullptr) override;
+        bool commitMTPShiftedRowsFromLastForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens) override;
+        bool commitMTPShiftedRowsFromPartialForward(
+            const int32_t *tokens,
+            int token_count,
+            int already_appended_tokens,
+            int main_forward_token_count,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1,
+            int already_appended_shifted_kv_tokens = -1) override;
+        bool commitMTPShiftedRowFromCurrentTerminalHidden(
+            int32_t token,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceTargetSample(
+            int target_sample_slot,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool commitMTPShiftedRowFromDeviceResidentLogicalState(
+            const DeviceResidentLogicalSequenceStateHandle &logical_state,
+            int request_index,
+            int already_appended_tokens,
+            bool allow_speculative_discard = false,
+            int position_offset_override = -1) override;
+        bool ensureMTPCheckpointTerminalHidden() override;
+        uint64_t forwardReplayLiveStateEpoch() const
+        {
+            return live_replay_state_epoch_;
+        }
+        std::vector<ForwardExecutionEngine::ReplayCacheObservation>
+            forwardReplayCacheObservations() const;
+        const float *mtpLogits() const override;
+        bool setComputeAllPositionLogits(bool enabled) override;
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override;
+        bool setMTPSpecVerifierInputPlan(
+            const MTPSpecDecodeVerifierInputPlan &plan) override;
+        void clearMTPSpecVerifierInputPlan() override;
+        const float *getAllPositionLogits() const override;
+        std::string mtpDecodeUnsupportedReason() const override;
+        bool supportsMTPTokenCoordination() const override;
+        int sampleGreedyFromMTPLogitsOnDevice() override;
+        bool sampleGreedyFromMTPLogitsToDeviceDraftSlot(
+            int draft_sample_slot,
+            int32_t *out_token) override;
+        bool sampleGreedyFromMainLogitsToDeviceTargetSlot(
+            int target_sample_slot,
+            int32_t *out_token) override;
+        int sampleGreedyFromAllPositionLogitsOnDevice(int row) override;
+        bool sampleGreedyFromAllPositionLogitsOnDeviceRows(
+            int start_row,
+            int row_count,
+            int32_t *out_tokens) override;
+        bool supportsGreedyAllPositionBatchOutcomeOnDevice() const override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDevice(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeVerifyBatchOutcome *out) override;
+        bool verifyGreedyAllPositionBatchOutcomeOnDeviceResident(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
 
         /**
          * @brief Get current position offset for a sequence
@@ -1211,7 +1901,13 @@ namespace llaminar2
         int getPosition(int seq_idx = 0) const;
 
         /**
-         * @brief Clear inference state (reset positions, clear KV cache)
+         * @brief Internal request-state reset that preserves graph topology.
+         *
+         * This helper is used by DGO paths that need the same live-state cleanup
+         * as clear_cache() without invalidating reusable graphs or workspaces.
+         * It clears request-local handoffs, mailbox pointers, KV/recurrent state,
+         * positions, and dynamic kernel metadata.  It must not free the arena,
+         * prepared weights, device contexts, or cached graph topology.
          */
         void clearInferenceState();
 
@@ -1238,7 +1934,22 @@ namespace llaminar2
 
             // Input configuration
             GraphBuildSession &forInput(const ForwardInput &input);
+            /**
+             * @brief Override the host-visible RoPE position rows for this graph build.
+             *
+             * Host positions are still used by CPU execution, graph-key metadata,
+             * and legacy attention offsets.  GPU execution may additionally carry
+             * a device-resident position pointer through withDevicePositionIds().
+             */
             GraphBuildSession &withPositionIds(const int *position_ids);
+            /**
+             * @brief Override the device-resident INT32 RoPE position rows.
+             *
+             * This pointer is consumed by GPU RoPE stages on their explicit graph
+             * stream.  It does not imply ownership transfer and must outlive the
+             * captured/replayed graph segment that consumes it.
+             */
+            GraphBuildSession &withDevicePositionIds(const void *position_ids_device);
             GraphBuildSession &withExternalHiddenState(TensorBase *hidden_state);
 
             // Pipeline configuration
@@ -1246,7 +1957,7 @@ namespace llaminar2
             GraphBuildSession &forPPStage(int first_layer, int last_layer,
                                           bool has_embedding = false, bool has_lm_head = false);
             GraphBuildSession &withPPContext(int from_stage, int to_stage, ILocalPPContext *context);
-            GraphBuildSession &withTPContext(const std::string &domain_name, ILocalTPContext *context);
+            GraphBuildSession &withTPContext(const std::string &domain_name, ITPContext *context);
 
             // Resource configuration
             GraphBuildSession &withWeights(const ModelWeights &weights);
@@ -1267,6 +1978,7 @@ namespace llaminar2
             DeviceGraphOrchestrator &orchestrator_;
             std::optional<ForwardInput> input_;
             const int *explicit_position_ids_ = nullptr;
+            const void *explicit_position_ids_device_ = nullptr;
             TensorBase *external_hidden_state_ = nullptr;
             std::shared_ptr<PipelineConfig> pipeline_config_;
             struct PPStageSpec
@@ -1278,7 +1990,7 @@ namespace llaminar2
             };
             std::optional<PPStageSpec> pp_stage_;
             std::map<std::pair<int, int>, ILocalPPContext *> pp_contexts_;
-            std::map<std::string, ILocalTPContext *> tp_contexts_;
+            std::map<std::string, ITPContext *> tp_contexts_;
             std::optional<ModelWeights> weights_;
             std::optional<ModelBuffers> buffers_;
             IKVCache *kv_cache_ = nullptr;
@@ -1345,7 +2057,14 @@ namespace llaminar2
 
             // Optional configuration
             AttentionGraphSession &withKVCache(IKVCache *kv_cache);
+            /**
+             * @brief Set host-visible RoPE position rows for this attention graph.
+             */
             AttentionGraphSession &withPositionIds(const int *position_ids);
+            /**
+             * @brief Set device-resident INT32 RoPE position rows for GPU attention.
+             */
+            AttentionGraphSession &withDevicePositionIds(const void *position_ids_device);
             AttentionGraphSession &withSequenceLengths(const std::vector<int> *lengths);
 
             // Build (terminal operation)
@@ -1369,6 +2088,7 @@ namespace llaminar2
             // Optional
             IKVCache *kv_cache_ = nullptr;
             const int *position_ids_ = nullptr;
+            const void *position_ids_device_ = nullptr;
             const std::vector<int> *sequence_lengths_ = nullptr;
         };
 
@@ -1475,6 +2195,14 @@ namespace llaminar2
          */
         IDeviceContext *getDeviceContext(DeviceId device) override;
 
+        /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
+        bool isMoeRebalancingActive() const override;
+
+        /** Return the active MoE placement epoch for graph-cache keying. */
+        uint64_t moePlacementEpoch() const override;
+        std::string prefillGraphDomainId() const override;
+        int prefillGraphParticipantId() const override;
+
         // =========================================================================
         // IInferenceRunner Interface Implementation
         // =========================================================================
@@ -1487,6 +2215,15 @@ namespace llaminar2
             return forward(tokens, seq_len, 1) != nullptr;
         }
 
+        bool supportsPrefillChunkSchedule(int seq_len) const override;
+
+        bool forwardPrefillChunkSchedule(
+            const int *tokens,
+            int seq_len,
+            const PrefillChunkSchedulerPolicy &policy,
+            int pad_token_id,
+            bool allow_padded_execution) override;
+
         /**
          * @brief GPU-side greedy argmax for single-device inference
          *
@@ -1497,7 +2234,158 @@ namespace llaminar2
          * @return Token ID (>= 0) on success, -1 if not GPU or backend unavailable
          */
         int sampleGreedyOnDevice() override;
+        int sampleOnDevice(const SamplingParams &params) override;
+        bool requiresMPICoordinatedDecodeSampling(const SamplingParams &params) const override;
+        bool sampleMainLogitsBatchRowsOnDevice(
+            int request_count,
+            const SamplingParams &params,
+            int32_t *out_tokens,
+            const float *stochastic_thresholds = nullptr) override;
 
+        /**
+         * @brief Apply sparse logit penalties on device
+         */
+        bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
+                                    int vocab_size) override;
+        bool applyPenaltiesToMTPLogitsOnDevice(const std::vector<LogitPenalty> &penalties,
+                                               int vocab_size) override;
+        bool applyPenaltiesToAllPositionLogitsOnDeviceRow(
+            int row,
+            const std::vector<LogitPenalty> &penalties,
+            int vocab_size) override;
+        bool supportsRowLocalAllPositionPenaltyApplication() const override;
+        bool supportsDeviceStochasticMTPVerification() const override;
+        bool buildStochasticDistributionOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            DeviceDistributionBuffer buffer,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticDistributionsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size) override;
+        int sampleStochasticDraftProposalOnDevice(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        bool sampleStochasticDraftProposalOnDeviceDeferred(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold) override;
+        bool stageStochasticDraftTokensForDeviceVerification(
+            const int32_t *draft_tokens,
+            int draft_token_count,
+            int first_draft_slot = 0) override;
+        int sampleStochasticDistributionOnDevice(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        bool sampleStochasticDistributionOnDeviceDeferred(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold) override;
+        const void *prepareMTPVerifierInputTokensOnDeviceFromDeviceFirstToken(
+            int first_target_sample_slot,
+            int first_draft_slot,
+            int draft_token_count,
+            int total_verifier_input_tokens) override;
+        bool verifyStochasticDistributionsOnDevice(
+            int target_slot,
+            int draft_slot,
+            int draft_token,
+            float accept_threshold,
+            float residual_threshold,
+            DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            DeviceSpeculativeVerifyResult *out) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDevice(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceFirstToken(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int first_target_sample_slot,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed = 0,
+            int inverse_sample_first_logical_position = 0,
+            bool use_vllm_probability_rejection = false) override;
+        /**
+         * @brief Reduce a logical stochastic request batch through compact GPU output rows.
+         *
+         * The method consumes the pending verifier stream once, queues each
+         * request's row verifier and summary into a distinct arena output row,
+         * then copies the compact `[request, fields]` summaries back in one
+         * host-visible boundary.  This keeps request-batched decode from
+         * repeatedly draining the GPU stream for every request.
+         */
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDevice(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
+        /**
+         * @brief Enqueue request-batch stochastic verification without host copy.
+         *
+         * The returned handle references runner-owned compact output rows in the
+         * activation arena.  It is valid until another stochastic outcome batch
+         * is staged on this runner.
+         */
+        bool verifyStochasticDistributionsRequestBatchOutcomesOnDeviceResident(
+            const DeviceStochasticBatchOutcomeRequest *requests,
+            int request_count,
+            DeviceSpeculativeOutcomeHandle *out_handle) override;
+        /**
+         * @brief Legacy host bridge for a device-resident stochastic outcome.
+         */
+        bool copyDeviceSpeculativeOutcomesToHost(
+            const DeviceSpeculativeOutcomeHandle &handle,
+            DeviceSpeculativeVerifyBatchOutcome *outcomes) override;
         /**
          * @brief Get logits (IInferenceRunner override - already declared above)
          */
@@ -1509,16 +2397,36 @@ namespace llaminar2
         int vocab_size() const override { return graph_builder_ ? graph_builder_->config().vocab_size : 0; }
 
         /**
-         * @brief Clear KV cache (IInferenceRunner override)
+         * @brief Policy for clearing deferred sampled-token readiness markers.
          *
-         * Resets inference state (KV cache, positions, model recurrence) but
-         * preserves the forward graph cache. Cached graphs remain valid because:
-         *   - KVCache::clear() resets ring positions, not buffer memory
-         *   - Stages hold IKVCache* interface pointers, not data pointers
-         *   - resetState() only zeros model-internal buffers (GDN conv/recurrence)
+         * Verifier-owned sample slots are part of the active MTP transaction:
+         * a GPU sidecar, verifier input materializer, and outcome reducer may
+         * all consume the same device token without a host read. Generic
+         * stream-handoff cleanup must preserve those slots, while request
+         * resets, new samples, and final outcome consumption force-clear them.
+         */
+        enum class StochasticSampleReadyClearMode
+        {
+            PreserveVerifierConsumer,
+            Force,
+        };
+
+        /**
+         * @brief IInferenceRunner request-boundary reset.
          *
-         * This avoids the expensive graph rebuild + weight re-coherence cycle
-         * (1-2s on GPU) that would occur if graphs were invalidated.
+         * Resets live sequence state (KV cache, positions, model recurrence,
+         * pending stream handoffs, resident mailboxes, and request-local stage
+         * metadata) while preserving cached ComputeGraphs, BufferArena
+         * bindings, prepared weights, and proven replay-safe kernel dynamic
+         * objects.  Captured GPU graphs may hold argument pointers into
+         * kernel-owned dynamic buffers, so this path must not globally wipe
+         * kernel dynamic state while it keeps those graph executables alive.
+         *
+         * Proven replay-safe GPU segments, such as single-token decode,
+         * all-position verifier replay, and MTP sidecar graphs, keep their
+         * captured executables; their stages are reset and rebound to explicit
+         * streams before the next launch.  Unproven request-stateful captures,
+         * such as monolithic prefill, still recapture.
          */
         void clear_cache() override
         {
@@ -1527,31 +2435,85 @@ namespace llaminar2
                 if (ctx && dev.is_gpu())
                     ctx->synchronize();
             }
-            // Invalidate layer graph caches (lightweight, just validity flags)
             for (auto &entry : layer_graph_cache_)
             {
-                entry.valid = false;
+                entry.resetSessionState();
             }
-            // NOTE: Forward engine cache is intentionally preserved.
-            // Cached graphs hold IKVCache* pointers that remain valid after
-            // state_.clear(). Graph rebuild would force weight re-coherence
-            // (~245ms CUDA, ~1840ms ROCm) with zero correctness benefit.
+            if (forward_engine_)
+            {
+                forward_engine_->resetSessionReplayState(
+                    /*preserve_replay_safe_segmented_captures=*/true);
+            }
+            mtp_sidecar_depth0_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_chained_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
+            for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
+                cache.resetSessionStatePreservingSegmentedReplay();
+            mtp_terminal_hidden_row_select_cache_.invalidate();
+            mtp_terminal_hidden_rows_select_cache_.invalidate();
             last_pos_offset_ = -1;
+            defer_next_mtp_main_decode_sync_ = false;
+            defer_all_position_verifier_sync_ = false;
+            clearAllPendingLogitsStreams("clear_cache");
+            std::fill(stochastic_target_distribution_streams_.begin(),
+                      stochastic_target_distribution_streams_.end(),
+                      nullptr);
+            std::fill(stochastic_draft_distribution_streams_.begin(),
+                      stochastic_draft_distribution_streams_.end(),
+                      nullptr);
+            std::fill(stochastic_target_row_formats_.begin(),
+                      stochastic_target_row_formats_.end(),
+                      StochasticRowFormat::Empty);
+            std::fill(stochastic_draft_row_formats_.begin(),
+                      stochastic_draft_row_formats_.end(),
+                      StochasticRowFormat::Empty);
+            std::fill(stochastic_target_top_k_.begin(),
+                      stochastic_target_top_k_.end(),
+                      0);
+            std::fill(stochastic_draft_top_k_.begin(),
+                      stochastic_draft_top_k_.end(),
+                      0);
+            clearStochasticTargetSampleReadySlots(StochasticSampleReadyClearMode::Force);
+            clearStochasticDraftSampleReadySlots(StochasticSampleReadyClearMode::Force);
+            pending_mtp_verifier_device_token_plan_.reset();
+            materialized_mtp_verifier_device_token_row_ = {};
+            shifted_mtp_kv_ready_.valid = false;
+            shifted_mtp_kv_ready_.producer_stream = nullptr;
+            clearPendingAllPositionVerifierStateReady();
+            clearDeviceResidentLogicalSequenceStateMailbox();
+            request_batched_prefill_logits_row_count_ = 0;
+            request_batched_prefill_logit_rows_.clear();
             cache_stats_ = CacheStats{};
             state_.clear();
             // NOTE: Do NOT reset arena_ here. Buffer registrations and allocations
             // are expensive and model-specific (e.g., GDN buffers for Qwen3.5).
             // The arena is created once in initializeBuffers() and persists for
             // the lifetime of the orchestrator.
-            // Reset input-dependent cached state on all kernels (e.g., stale token IDs)
-            resetKernelDynamicState();
+            /*
+             * Do not call resetKernelDynamicState() here.  The request reset
+             * above deliberately preserves replay-safe captured CUDA/HIP graph
+             * executables, and those executable nodes can reference
+             * kernel-owned dynamic pointer tables populated during graph
+             * warmup.  Hard dynamic resets are still used when graph replay is
+             * discarded (invalidateExecutionCaches(), clearInferenceState(),
+             * MoE rebalance, prefix restore), but request-boundary state must be
+             * reset through graph/stage contracts that keep capture-owned
+             * pointer identity stable.
+             */
+            recordKernelDynamicStatePreservedForCapturedReplay("clear_cache");
             // Reset model-internal state (no-op for models with hybrid cache since
             // state_.clear() → kv_cache->clear() already handles GDN state reset)
             if (graph_builder_)
                 graph_builder_->resetState();
             // Note: host_resident_released_ is NOT reset here —
             // the host data is gone and cannot be re-uploaded.
+            device_sampling_counter_ = 0;
             ++session_epoch_;
+            recordLivePrefixSessionReset("clear_cache",
+                                         /*preserve_gpu_replay_state=*/true);
         }
 
         /**
@@ -1619,6 +2581,31 @@ namespace llaminar2
          */
         const std::vector<int> &sequence_lengths() const override { return state_.sequence_lengths; }
 
+        /**
+         * @brief Expose the latest resident logical-state mailbox, if current.
+         *
+         * This is the structured device-side counterpart to get_position() and
+         * sequence_lengths().  It stays invalid until a verifier outcome has
+         * produced resident publication metadata on an explicit stream.
+         */
+        DeviceResidentLogicalSequenceStateHandle deviceResidentLogicalSequenceState() const override;
+        bool hostLogicalStateMirrorsDeviceResidentState() const override;
+
+        PrefixLookupResult lookupPrefix(const std::vector<int32_t> &tokens) override;
+        bool populatePrefix(const PrefixLookupResult &hit, int seq_idx = 0) override;
+        bool harvestPrefix(const std::vector<int32_t> &tokens, int prompt_token_count) override;
+        bool restorePrefixTerminalState(const PrefixLookupResult &hit) override;
+        PrefixStateSnapshot captureLivePrefixState(int seq_idx = 0) const override;
+        PrefixStateSnapshot captureLivePrefixCheckpoint(int seq_idx = 0) const override;
+        bool restoreLivePrefixState(const PrefixStateSnapshot &snapshot, int seq_idx = 0) override;
+        bool truncateLivePrefixState(int cached_tokens, int seq_idx = 0) override;
+        bool requiresMTPDecodeEquivalentVerifierReplay() const override;
+
+        /**
+         * @brief Inspect request-local runtime state for prefix-cache/MTP probes.
+         */
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+
         // =========================================================================
         // Snapshot Capture API (delegated to SnapshotCapture — Phase 2 extract)
         // =========================================================================
@@ -1629,10 +2616,12 @@ namespace llaminar2
             snapshot_capture_.clear();
             snapshot_enabled_ = true;
 
-            LOG_INFO("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
+            LOG_DEBUG("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {
+                    if (!snapshot_context_.empty())
+                        snapshot_capture_.captureStage(snapshot_context_ + "::" + name, dump);
                     snapshot_capture_.captureStage(name, dump);
                 });
         }
@@ -1734,6 +2723,29 @@ namespace llaminar2
         // =========================================================================
 
         /**
+         * @brief Backend-owned pinned host scratch for compact stochastic outcomes.
+         *
+         * GPU D2H copies are only truly asynchronous when the host destination is
+         * pinned/page-locked. This helper owns the small token and metadata arrays
+         * used by the host-visible compatibility bridge so decode does not allocate
+         * or pageable-stage these buffers on every MTP step.
+         */
+        struct PinnedHostScratch;
+
+        /**
+         * @brief Shared implementation for host-token and device-token forwards.
+         *
+         * `tokens` is always the host shadow used for request bookkeeping. When
+         * `token_ids_device` is non-null, graph embedding stages read token IDs
+         * from that stable device buffer instead of uploading from `tokens`.
+         */
+        const float *forwardImpl(
+            const int *tokens,
+            const void *token_ids_device,
+            int seq_len,
+            int batch_size);
+
+        /**
          * @brief Update dynamic parameters in a cached graph
          *
          * Updates position offset and sequence length in all stages
@@ -1824,11 +2836,468 @@ namespace llaminar2
         /** Get device contexts for all PP pipeline devices. */
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override;
 
-        /** Access the logits tensor for mapped-memory sync checks. */
+        /** Access the ordinary terminal logits tensor. */
         TensorBase *logitsTensor() override;
+
+        /**
+         * @brief Access the active logits tensor published by the current forward.
+         *
+         * All-position verifier forwards publish their own row tensor instead of
+         * the ordinary terminal logits tensor.  Keeping this accessor explicit
+         * prevents boundary sync and host publication code from accidentally
+         * marking or reading a stale logits buffer.
+         */
+        TensorBase *logitsPublicationTensor() override;
 
         /** Resolve PP copy info for cache-miss builds. */
         PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const override;
+
+        /** Whether forward graph construction should emit all-position logits. */
+        bool computeAllPositionLogitsEnabled() const override { return compute_all_position_logits_; }
+
+        /** Compact verifier logits row count; 0 means full all-position logits. */
+        int allPositionLogitRows() const override
+        {
+            return compute_row_indexed_all_position_logits_
+                       ? row_indexed_all_position_logits_row_count_
+                       : 0;
+        }
+
+        /** Whether the next all-position verifier forward has explicit MTP row metadata. */
+        bool mtpSpecVerifierInputPlanActive() const override
+        {
+            return pending_mtp_spec_verifier_input_plan_.has_value();
+        }
+
+        /** Upload any pending compact verifier row metadata before graph execution. */
+        bool prepareAllPositionVerifierGraphMetadata(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override;
+
+        /** Queue live-state publication waits before any forward graph reads live KV/GDN state. */
+        bool prepareLiveStateForForwardGraphExecution(
+            const ForwardInput &input,
+            void *execution_stream,
+            DeviceId execution_device) override;
+
+        /**
+         * @brief Materialize pending verifier token IDs on the graph execution stream.
+         *
+         * The all-position verifier metadata hook receives the exact stream that
+         * the forward engine will use for graph replay/capture.  Copying the
+         * compact token row here keeps the device-token embedding input ordered
+         * with the verifier graph without relying on the default stream or a
+         * host-side synchronization.
+         */
+        bool materializePendingMTPVerifierInputTokensOnDevice(
+            void *execution_stream,
+            DeviceId execution_device);
+
+        /**
+         * @brief Clear the device-side "sample token is ready" marker for one draft slot.
+         *
+         * Draft sample slots are reused across decode iterations.  Clearing
+         * the marker before a new distribution build prevents later verifier or
+         * sidecar stages from accidentally waiting on a previous sample's event.
+         */
+        void clearStochasticDraftSampleReadySlot(
+            int slot,
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
+
+        /** @brief Clear every draft sample readiness marker for request reset paths. */
+        void clearStochasticDraftSampleReadySlots(
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
+
+        /**
+         * @brief Clear the device-side "sample token is ready" marker for one target slot.
+         *
+         * Target sample slots feed the first sidecar and the stochastic batch
+         * reducer.  They are deliberately separate from target distribution
+         * slots: all-position verifier rows can reuse distribution slot 0
+         * after the first token is sampled, but must keep this ready marker so
+         * the summary kernel still waits for STOCHASTIC_TARGET_SAMPLE_TOKENS.
+         * Only request-reset paths and actual target-token sampling should
+         * clear this marker.
+         */
+        void clearStochasticTargetSampleReadySlot(
+            int slot,
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
+
+        /** @brief Clear every target sample readiness marker for request reset paths. */
+        void clearStochasticTargetSampleReadySlots(
+            StochasticSampleReadyClearMode mode =
+                StochasticSampleReadyClearMode::PreserveVerifierConsumer);
+
+        /**
+         * @brief Record that a GPU sampler has written a draft token slot.
+         *
+         * Host-visible and deferred stochastic paths both write the same
+         * runner-owned device slot.  A host D2H scalar read is only an optional
+         * observation of that slot; it must not erase the device readiness edge.
+         * This helper records a backend event on the producer stream immediately
+         * after the sample kernel so later GPU consumers can wait without using
+         * the device-default stream or synchronizing the CPU.
+         */
+        bool recordStochasticDraftSampleReady(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = false);
+
+        /**
+         * @brief Record that a GPU sampler has written a target token slot.
+         *
+         * This mirrors recordStochasticDraftSampleReady(). Target samples live
+         * in a separate arena buffer so verifier row outputs can overwrite
+         * STOCHASTIC_VERIFY_TOKENS without corrupting the first generated token,
+         * and a host read of the first token remains independent from device
+         * summary-kernel ownership.
+         */
+        bool recordStochasticTargetSampleReady(
+            int slot,
+            void *producer_stream,
+            bool verifier_consumer_pending = false);
+
+        /**
+         * @brief Make a consumer stream wait for deferred draft sample tokens.
+         *
+         * @param first_slot First draft-token slot consumed by the next stage.
+         * @param slot_count Number of contiguous slots consumed.
+         * @param consumer_stream Explicit stream used by the consuming copy/kernel.
+         * @param consumer_name Short perf/log tag naming the consumer.
+         * @return true if all required waits were queued successfully.
+         */
+        bool waitForStochasticDraftSampleReadyRange(
+            int first_slot,
+            int slot_count,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Wait for draft sample slots that must have a deferred producer.
+         *
+         * Device-token MTP paths consume sample slots without a host readback.
+         * In those paths a missing ready event is a correctness bug, not a
+         * synchronized fallback, because the consumer would otherwise read an
+         * uninitialized or stale token from the arena slot.
+         */
+        bool waitForRequiredStochasticDraftSampleReadyRange(
+            int first_slot,
+            int slot_count,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Make a consumer stream wait for a deferred target sample token.
+         *
+         * @param slot Target-token sample slot consumed by the next stage.
+         * @param consumer_stream Explicit stream used by the consuming copy/kernel.
+         * @param consumer_name Short perf/log tag naming the consumer.
+         * @return true if the required wait was queued successfully.
+         */
+        bool waitForStochasticTargetSampleReady(
+            int slot,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Wait for a target sample slot that must have a deferred producer.
+         *
+         * This is the target-token counterpart to
+         * waitForRequiredStochasticDraftSampleReadyRange(). It is used by the
+         * vLLM-style first-token fast lane where the MTP sidecar consumes the
+         * sampled target token directly on device.
+         */
+        bool waitForRequiredStochasticTargetSampleReady(
+            int slot,
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Record that an asynchronous shifted-MTP-KV append has been queued.
+         *
+         * KV-only MTP sidecar replay can avoid a CPU stream synchronization when
+         * the next operation does not need the cache immediately.  This helper
+         * records a backend event on the producer stream so the next MTP-KV
+         * consumer can establish a GPU-side dependency instead of racing or
+         * falling back to the legacy default stream.
+         */
+        bool recordShiftedMTPKVReady(void *producer_stream, const char *producer_name);
+
+        /**
+         * @brief Queue a wait for any deferred shifted-MTP-KV append.
+         *
+         * @param consumer_stream Explicit stream that will read, append, truncate,
+         *        or publish the shifted MTP KV cache.
+         * @param consumer_name Short perf/log tag naming the consumer boundary.
+         * @return true if no wait was needed or if the backend wait was queued.
+         */
+        bool waitForPendingShiftedMTPKVReady(
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Record that a deferred all-position verifier finished writing rows.
+         *
+         * The verifier produces two different surfaces on the same replay stream:
+         * logits consumed by samplers and row-local KV/GDN/short-conv state later
+         * consumed by accepted-state publication. Logits use a one-shot stream
+         * handoff because exactly one sampler owns them. Publication needs a
+         * separate event-backed dependency because samplers may consume that
+         * stream before publication restores the accepted verifier row.
+         */
+        bool recordAllPositionVerifierStateReady(
+            void *producer_stream,
+            const char *producer_name);
+
+        /**
+         * @brief Queue accepted-state publication after deferred verifier state.
+         *
+         * This consumes the verifier-state readiness marker. Call it before any
+         * publication path reads verifier-captured KV/recurrent/hidden rows.
+         */
+        bool waitForPendingAllPositionVerifierStateReady(
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /** Clear stale verifier-state readiness after reset or disabled deferral. */
+        void clearPendingAllPositionVerifierStateReady();
+
+        /** Record that accepted spec-state publication has finished queuing live-state writes. */
+        bool recordAcceptedSpecPublicationReady(void *producer_stream, const char *producer_name);
+
+        /** Make the next live-state consumer wait for accepted spec-state publication. */
+        bool waitForPendingAcceptedSpecPublicationReady(void *consumer_stream, const char *consumer_name);
+
+        /**
+         * @brief Queue an observation-only wait for accepted-state publication.
+         *
+         * Snapshot and probe helpers are diagnostic consumers: they must observe
+         * GPU publication in order, but they must not consume the pending handoff
+         * because the next real forward/sidecar graph still has to wait on the
+         * same event before reading live state.
+         */
+        bool waitForPendingAcceptedSpecPublicationReadyForObservation(
+            void *consumer_stream,
+            const char *consumer_name) const;
+
+        /** Clear accepted-publication ownership when a hard restore/reset replaces live state. */
+        void clearPendingAcceptedSpecPublicationReady();
+
+        /**
+         * @brief Record that a logical prefix checkpoint owns queued GPU payload copies.
+         *
+         * The event is stored both in the returned snapshot and in the runner.
+         * Snapshot restore waits on the snapshot-owned event before importing
+         * from device payload storage; the runner-owned copy prevents the next
+         * forward/restore/truncate mutation from overwriting the live source
+         * state while the asynchronous checkpoint export is still in flight.
+         */
+        bool recordLivePrefixCheckpointReady(
+            PrefixStateSnapshot *snapshot,
+            void *producer_stream,
+            const char *producer_name) const;
+
+        /**
+         * @brief Queue a wait for an event-backed prefix snapshot payload.
+         *
+         * This is a non-consuming wait because snapshots may be restored more
+         * than once by replay checkers or parity harnesses. The event is owned
+         * by the snapshot until the snapshot is destroyed.
+         */
+        bool waitForSnapshotReady(
+            const PrefixStateSnapshot &snapshot,
+            void *consumer_stream,
+            const char *consumer_name) const;
+
+        /** Consume the pending live-source checkpoint handoff before mutation. */
+        bool waitForPendingLivePrefixCheckpointReady(
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /** Clear the runner-side checkpoint handoff after it has been consumed or invalidated. */
+        void clearPendingLivePrefixCheckpointReady();
+
+        /**
+         * @brief Record that a prefix restore/truncate finished queuing live-state writes.
+         *
+         * Payload checkpoint restore imports KV, hybrid recurrent state, and
+         * terminal hidden through explicit GPU streams. Those imports are
+         * asynchronous: the next graph stream must wait on this event before
+         * reading live state. Keeping this as a separate handoff from accepted
+         * publication makes restore semantics explicit and testable.
+         */
+        bool recordLivePrefixMutationReady(void *producer_stream, const char *producer_name);
+
+        /** Consume a pending prefix restore/truncate handoff before live-state reads or writes. */
+        bool waitForPendingLivePrefixMutationReady(
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Queue an observation-only wait for a pending prefix mutation.
+         *
+         * Probes and checkpoint captures need to observe a completed restore,
+         * but they must not consume the event that the next forward/sidecar
+         * graph still has to wait on.
+         */
+        bool waitForPendingLivePrefixMutationReadyForObservation(
+            void *consumer_stream,
+            const char *consumer_name) const;
+
+        /** Clear any pending prefix restore/truncate handoff. */
+        void clearPendingLivePrefixMutationReady();
+
+        /**
+         * @brief Shared implementation for compact device-side stochastic sampling.
+         *
+         * The sample kernel always writes a runner-owned device slot and records
+         * a readiness event for later GPU consumers. When `out_token_host` is
+         * non-null the helper also performs the trusted fast D2H scalar read used
+         * by legacy host-driven callers; that read does not transfer ownership
+         * away from the device slot.
+         */
+        bool sampleStochasticDistributionOnDeviceImpl(
+            DeviceDistributionBuffer buffer,
+            int slot,
+            float threshold,
+            int32_t *out_token_host);
+
+        /**
+         * @brief Shared vLLM-style draft proposal implementation.
+         *
+         * This writes the sampled draft token plus q(sampled_token). It follows
+         * vLLM's default greedy draft branch, so later rejection verification
+         * treats the draft distribution as one-hot at the sampled token.
+         */
+        bool sampleStochasticDraftProposalOnDeviceImpl(
+            DeviceLogitsSource source,
+            int row,
+            int slot,
+            const SamplingParams &params,
+            int vocab_size,
+            float threshold,
+            int32_t *out_token_host,
+            bool verifier_consumer_pending);
+
+        /**
+         * @brief Sample batched MTP logits into contiguous stochastic draft slots.
+         *
+         * The sidecar graph leaves logits in `MTP_LOGITS`.  This helper binds
+         * the backend's device-output batched argmax to the runner-owned
+         * `STOCHASTIC_DRAFT_SAMPLE_TOKENS` / `STOCHASTIC_DRAFT_SAMPLE_PROBS`
+         * arena buffers and records one readiness event per slot.  The optional
+         * host shadow exists only for legacy metadata assembly and must not be
+         * used as verifier input.
+         */
+        bool sampleMTPBatchGreedyLogitsToDeviceDraftSlots(
+            int request_batch,
+            int first_draft_slot,
+            int slot_stride,
+            const char *context,
+            int32_t *out_tokens);
+
+        /**
+         * @brief Shared implementation for host-token and device-token batch summaries.
+         *
+         * `first_token_from_device=false` preserves the legacy host-scalar
+         * summary contract.  `true` reads the first sampled token from
+         * STOCHASTIC_TARGET_SAMPLE_TOKENS inside the backend summary kernel.
+         */
+        bool verifyStochasticDistributionsBatchOutcomeOnDeviceCommon(
+            int first_target_slot,
+            int first_draft_slot,
+            const int32_t *draft_tokens,
+            const float *accept_thresholds,
+            const float *residual_thresholds,
+            int row_count,
+            int32_t first_token,
+            int first_target_sample_slot,
+            bool first_token_from_device,
+            const int32_t *stop_tokens,
+            int stop_token_count,
+            int bonus_target_slot,
+            float bonus_threshold,
+            DeviceSpeculativeVerifyBatchOutcome *out,
+            uint64_t inverse_sample_seed,
+            int inverse_sample_first_logical_position,
+            bool use_vllm_probability_rejection,
+            int output_request_slot,
+            void *stream_override,
+            bool copy_summary_to_host);
+
+        /** Build processed verifier rows without the full-softmax writeback. */
+        bool buildStochasticProcessedLogitRowsOnDevice(
+            DeviceLogitsSource source,
+            int first_row,
+            DeviceDistributionBuffer buffer,
+            int first_slot,
+            int row_count,
+            const SamplingParams &params,
+            int vocab_size,
+            void *stream,
+            const char *operation_name);
+
+        /**
+         * @brief Pending GPU event timing measurement drained at an existing sync boundary.
+         *
+         * These records let profiling distinguish enqueue cost from true device
+         * work without inserting new synchronizations.  A producer queues start
+         * and stop events around kernels on an explicit stream; the next
+         * already-required host boundary calls drainPendingGpuTimingMeasurements().
+         */
+        struct PendingGpuTimingMeasurement
+        {
+            std::string name;
+            std::map<std::string, std::string> tags;
+            std::shared_ptr<void> start_event;
+            std::shared_ptr<void> stop_event;
+        };
+
+        /** Queue a timing start event when perfstats are enabled on a GPU device. */
+        bool beginPendingGpuTimingMeasurement(
+            const std::string &name,
+            void *stream,
+            std::shared_ptr<void> *out_start_event,
+            std::shared_ptr<void> *out_stop_event);
+
+        /** Queue the matching stop event and remember the measurement for later drain. */
+        void finishPendingGpuTimingMeasurement(
+            const std::string &name,
+            void *stream,
+            std::map<std::string, std::string> tags,
+            std::shared_ptr<void> start_event,
+            std::shared_ptr<void> stop_event);
+
+        /** Convert completed pending GPU timing events into structured perfstats. */
+        void drainPendingGpuTimingMeasurements(IBackend *backend);
+
+        /** Monotonic live-state epoch used by versioned decode replay. */
+        uint64_t liveReplayStateEpoch() const override { return live_replay_state_epoch_; }
+
+        /** Whether the current all-position verifier may hand its stream to the sampler. */
+        bool shouldDeferAllPositionVerifierFinalSync() const override;
+
+        /** Store the verifier replay stream for the next all-position logits consumer. */
+        void setPendingAllPositionVerifierStream(void *stream) override;
+
+        /** Whether the next MTP main condition forward may hand its stream to the sampler. */
+        bool shouldDeferMainDecodeFinalSync() const override;
+
+        /** Store the main-decode replay stream for the next main-logits consumer. */
+        void setPendingMainDecodeStream(void *stream) override;
+
+        /** Report host-side safety state for chunk-boundary maintenance. */
+        PrefillChunkMaintenanceState prefillChunkMaintenanceState(
+            const PrefillChunkPlan &chunk) const override;
+
+        /** Run local chunk-boundary maintenance after the engine gate allows it. */
+        bool onPrefillChunkMaintenance(
+            const PrefillChunkPlan &chunk,
+            const PrefillChunkMaintenanceDecision &decision) override;
 
         /** Create and return the ForwardExecutionEngine with current config. */
         void ensureForwardEngine();
@@ -1842,6 +3311,9 @@ namespace llaminar2
 
         /// Graph executor
         DeviceGraphExecutor executor_;
+
+        /// GPU timing events that should be read at the next existing sync boundary.
+        std::vector<PendingGpuTimingMeasurement> pending_gpu_timing_measurements_;
 
         /// MPI context for distributed execution
         std::shared_ptr<IMPIContext> mpi_ctx_;
@@ -1869,6 +3341,563 @@ namespace llaminar2
 
         /// Inference state (Phase 5 - owned buffers)
         InferenceState state_;
+
+        /// Persistent prefix cache state. This intentionally lives outside
+        /// InferenceState so clear_cache() preserves cross-request blocks.
+        std::shared_ptr<PrefixStateCache> prefix_cache_;
+        std::shared_ptr<RamPrefixStorageBackend> prefix_ram_backend_;
+        std::shared_ptr<DiskPrefixStorageBackend> prefix_disk_backend_;
+        std::shared_ptr<DeviceHotPrefixStorageBackend> prefix_device_hot_backend_;
+        PrefixPayloadLayout prefix_layout_;
+        PrefixCacheStats prefix_cache_stats_;
+        uint64_t prefix_fingerprint_ = 0;
+        bool prefix_cache_bypassed_ = false;
+        std::string prefix_cache_bypass_reason_;
+        struct LiveHybridCheckpointStorageSlot
+        {
+            size_t host_capacity_bytes = 0;
+            size_t device_capacity_bytes = 0;
+            DeviceId device = DeviceId::invalid();
+            std::shared_ptr<std::vector<uint8_t>> host_storage;
+            std::shared_ptr<TensorBase> device_storage;
+        };
+        mutable std::vector<LiveHybridCheckpointStorageSlot> live_hybrid_checkpoint_storage_pool_;
+        bool ensurePrefixCacheReady();
+        bool isPrefixCacheMoEModel() const;
+        bool mtpSpecStatePublicationRequiresCapturedStage() const;
+        void *explicitGPUStreamForOperation(const char *operation) const;
+        /**
+         * @brief Typed reasons for live inference-state mutations.
+         *
+         * Phase 5 treats live state as a versioned object.  Each mutation must
+         * say whether it came from accepted speculative publication, a rejected
+         * correction, prefix restore/truncate, or a full session reset.  This
+         * keeps graph replay invalidation and perf diagnostics aligned.
+         */
+        enum class LivePrefixMutationReason
+        {
+            Unknown,
+            AcceptedSpecPublication,
+            RejectedCorrection,
+            PrefixRestore,
+            PrefixTruncate,
+            ShiftedMTPKVUpdate,
+            SessionReset,
+        };
+
+        struct LivePrefixMutationRecord
+        {
+            uint64_t previous_epoch = 0;
+            uint64_t live_state_epoch = 0;
+            const char *reason_name = "unknown";
+        };
+
+        static const char *livePrefixMutationReasonName(
+            LivePrefixMutationReason reason);
+        LivePrefixMutationRecord recordLivePrefixMutation(
+            LivePrefixMutationReason reason,
+            const char *operation);
+        /**
+         * @brief Record a request/session state reset in live-state telemetry.
+         *
+         * `clear_cache()` is a request-boundary reset: it clears live KV/GDN
+         * and request-local metadata, but deliberately preserves replay-safe
+         * CUDA/HIP graph executables and their captured dynamic pointer tables.
+         * `clearInferenceState()` is a hard reset and must continue to report
+         * replay/kernel teardown.  Keeping the distinction explicit avoids
+         * misleading Phase 10 perf counters and makes the ownership contract
+         * visible to future reset call sites.
+         */
+        void recordLivePrefixSessionReset(
+            const char *operation,
+            bool preserve_gpu_replay_state = false);
+        /**
+         * @brief Reset every cached depth-0 MTP sidecar graph replay handle.
+         *
+         * This does not mean the sidecar mutated main-model state.  It only
+         * says the already-instantiated sidecar graph may have captured
+         * per-step metadata that is not safe after an accepted-state
+         * publication boundary.  Keeping the operation centralized makes the
+         * handoff rule easy to audit.
+         */
+        void resetMTPSidecarDepth0ReplayState();
+        /**
+         * @brief Advance the replay epoch after shifted MTP KV changes.
+         *
+         * A shifted MTP KV append does not change the main request position,
+         * main KV cache, or recurrent state. It does, however, change the
+         * auxiliary state read by multi-row MTP verifier graphs. Dense models
+         * keep the narrow fast path and recapture only verifier consumers.
+         * MoE models still invalidate the broader graph/kernel replay state
+         * because routed sidecar graph preservation has not yet been proven
+         * decode-equivalent after sequential shifted-row commits.
+         *
+         * The method must not clear deferred all-position verifier state
+         * readiness. Accepted-state publication can legally follow a shifted
+         * KV commit and still must wait on the verifier's row-snapshot event
+         * before restoring GDN/KV/short-conv rows.
+         */
+        void recordShiftedMTPKVReplayStateMutation(const char *operation);
+        /**
+         * @brief Whether depth-0 MTP sidecar graph replay is safe across
+         * accepted/rejected spec-state publication.
+         *
+         * This is deliberately narrower than
+         * supportsMTPSidecarPreservesMainState().  A sidecar can leave main KV,
+         * recurrent state, and positions untouched while its captured graph
+         * replay is still unsafe because routing or transaction metadata needs
+         * to be rebound after publication.
+         */
+        bool preservesMTPSidecarReplayAfterSpecPublication() const;
+        void handleLivePrefixReplayStateAfterMutation(
+            LivePrefixMutationReason reason,
+            const char *operation,
+            bool preserve_gpu_replay_state = false);
+        PrefixCacheFingerprintResult buildCurrentPrefixFingerprint(
+            const PrefixCacheRuntimeConfig &prefix_config) const;
+        PrefixCacheKey makePrefixKeyForBlock(
+            const std::vector<int32_t> &tokens,
+            int block_index,
+            uint64_t parent_hash) const;
+        void disablePrefixCacheForRunner(const std::string &reason);
+        bool acquireLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const;
+        bool ensureLiveHybridCheckpointStorage(PrefixBlockHandle &handle) const;
+        bool initializeMTPKVCaches(
+            int batch_size,
+            int max_seq_len,
+            ActivationPrecision kv_cache_prec,
+            KVCacheLayoutMode kv_layout_mode,
+            DeviceId device,
+            const std::shared_ptr<IMPIContext> &local_mpi_ctx,
+            bool use_sharded_cache,
+            bool has_tp,
+            bool is_global_tp);
+        bool selectMTPTerminalHiddenRow(int row_idx, int seq_len, void *stream = nullptr);
+        bool executeMTPDepth0(int32_t draft_condition_token,
+                              TensorBase *terminal_hidden,
+                              int position_id,
+                              const char *sidecar_perf_context,
+                              bool kv_cache_only = false,
+                              BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+                              bool defer_final_sync = false);
+        bool executeMTPDepth0Batched(const int32_t *draft_condition_tokens,
+                                     int token_count,
+                                     TensorBase *terminal_hidden,
+                                     int position_id,
+                                     const char *sidecar_perf_context,
+                                     bool kv_cache_only = false,
+                                     BufferId terminal_hidden_buffer_id = BufferId::PREFIX_TERMINAL_HIDDEN,
+                                     bool defer_final_sync = false,
+                                     const void *draft_condition_tokens_device = nullptr,
+                                     int draft_condition_ready_slot = -1,
+                                     bool draft_condition_ready_is_target = false,
+                                     int request_batch = 1,
+                                     const int *position_ids_override = nullptr,
+                                     const void *position_ids_device_override = nullptr);
+        bool populateMTPShiftedCacheFromPrefill(const int *tokens,
+                                                int seq_len,
+                                                int batch_size,
+                                                int position_offset);
+        void updateMTPShiftedCacheMetadata(int active_batch_size);
+
+        /**
+         * @brief Record that main forward produced a new hidden-state tensor.
+         *
+         * This deliberately invalidates any compact terminal-hidden cache.  A
+         * later MTP sidecar must either consume the one-row `HIDDEN_STATE`
+         * directly or explicitly refresh `PREFIX_TERMINAL_HIDDEN` from the
+         * latest multi-row forward output.
+         */
+        void noteMainForwardHiddenProducedForMTP(
+            int seq_len,
+            int batch_size,
+            std::vector<int> request_lengths = {});
+
+        /**
+         * @brief Resolve the terminal-hidden tensor that should seed a first MTP sidecar.
+         *
+         * The resolver centralizes freshness rules so ordinary forward never
+         * runs helper row-select graphs just because MTP is enabled, while MTP
+         * sidecar entry points cannot accidentally consume a stale prefix row.
+         */
+        bool resolveMTPTerminalHiddenInput(TensorBase **terminal_hidden,
+                                           BufferId *terminal_hidden_buffer_id,
+                                           const char *operation);
+
+        struct MTPSidecarGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            std::vector<IComputeStage *> dynamic_param_stages;
+            std::unordered_set<std::string> collective_nodes;
+            TensorBase *terminal_hidden = nullptr;
+            uint64_t workspace_generation = 0;
+            uint64_t moe_placement_epoch = 0;
+            bool moe_epoch_sensitive = false;
+            std::vector<int32_t> token_ids;
+            std::vector<int> position_ids;
+            int32_t token_id = 0;
+            int position_id = 0;
+            int seq_len = 0;
+            int batch_size = 1;
+            bool uses_device_token_ids = false;
+            bool uses_device_position_ids = false;
+            int condition_token_slot = -1;
+            void *condition_token_device = nullptr;
+            const void *position_ids_device = nullptr;
+            bool valid = false;
+
+            void resetReplayState()
+            {
+                segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+            }
+
+            void resetReplayStateAfterWorkspaceRebind()
+            {
+                resetReplayState();
+            }
+
+            void resetSessionState()
+            {
+                resetReplayState();
+                if (graph)
+                {
+                    graph->reset();
+                    for (const auto &node_name : graph->getExecutionOrder())
+                    {
+                        ComputeNode *node = graph->getNode(node_name);
+                        if (node && node->stage)
+                            node->stage->resetSessionState();
+                    }
+                }
+            }
+
+            /**
+             * @brief Clear request-local sidecar metadata without dropping replay graphs.
+             *
+             * MTP sidecar graphs read stable token/position/device-mailbox
+             * buffers that are rewritten before every launch.  Request reset
+             * must still clear stage-owned dynamic metadata and explicit stream
+             * bindings, but preserving the segmented capture avoids paying
+             * warmup/capture again for every served request with the same shape.
+             */
+            void resetSessionStatePreservingSegmentedReplay()
+            {
+                if (graph)
+                {
+                    graph->reset();
+                    for (const auto &node_name : graph->getExecutionOrder())
+                    {
+                        ComputeNode *node = graph->getNode(node_name);
+                        if (node && node->stage)
+                            node->stage->resetSessionStatePreservingCapturedReplay();
+                    }
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+                graph.reset();
+                dynamic_param_stages.clear();
+                collective_nodes.clear();
+                terminal_hidden = nullptr;
+                workspace_generation = 0;
+                moe_placement_epoch = 0;
+                moe_epoch_sensitive = false;
+                token_ids.clear();
+                position_ids.clear();
+                token_id = 0;
+                position_id = 0;
+                seq_len = 0;
+                batch_size = 1;
+                uses_device_token_ids = false;
+                uses_device_position_ids = false;
+                condition_token_slot = -1;
+                condition_token_device = nullptr;
+                position_ids_device = nullptr;
+                valid = false;
+            }
+        };
+
+        /**
+         * @brief Depth-0 MTP sidecar graph caches partitioned by input source.
+         *
+         * Host token IDs and device-resident token IDs build different graph
+         * signatures because the embedding stage reads from different stable
+         * buffers.  Keeping them in separate caches lets both paths progress
+         * from warmup to capture/replay independently; sharing one cache would
+         * make stochastic decode alternate signatures and repeatedly rebuild.
+         */
+        MTPSidecarGraphCache mtp_sidecar_depth0_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_device_token_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_chained_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_chained_device_token_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_cache_;
+        MTPSidecarGraphCache mtp_sidecar_depth0_kv_only_device_token_cache_;
+        std::array<MTPSidecarGraphCache, 5> mtp_sidecar_depth0_kv_only_batch_caches_;
+
+        /**
+         * @brief Identifies the logits stream handoff slot being manipulated.
+         *
+         * Captured GPU graph replay may finish asynchronously and hand its
+         * stream to the next logits consumer.  Keeping those handoffs behind a
+         * role-specific API avoids scattered raw pointer writes, which are hard
+         * to reason about and easy to turn into cross-stream races.
+         */
+        enum class PendingLogitsStreamRole
+        {
+            MTPSidecar,
+            MainDecode,
+            AllPositionVerifier,
+        };
+
+        /**
+         * @brief Publish a stream that produced logits for the next consumer.
+         *
+         * @param role Which logits buffer owns the handoff.
+         * @param stream Explicit backend stream; must be non-null to create a
+         *        real handoff.
+         * @param producer Human-readable producer name for debug/profiling.
+         *
+         * Publishing is a one-shot ownership transfer. A producer may refresh
+         * the same stream after an in-place logits mutation, but replacing an
+         * unconsumed stream with a different stream is a logic error because it
+         * would lose the ordering edge between graph replay and sampling.
+         */
+        void publishPendingLogitsStream(
+            PendingLogitsStreamRole role,
+            void *stream,
+            const char *producer);
+
+        /**
+         * @brief Consume and clear a one-shot pending logits stream.
+         *
+         * Use this for samplers or reducers that become the next ordered GPU
+         * operation after logits production.  The returned stream is never the
+         * device default/null stream; callers must request an explicit fallback
+         * if no handoff is pending.
+         */
+        void *consumePendingLogitsStream(
+            PendingLogitsStreamRole role,
+            const char *consumer);
+
+        /**
+         * @brief Inspect a pending stream without clearing ownership.
+         *
+         * This is intentionally rare.  It is used for in-place mutations such
+         * as logit penalties, where the mutator must remain in the same stream
+         * chain and then republish the stream for the final sampler.
+         */
+        void *peekPendingLogitsStream(PendingLogitsStreamRole role) const;
+
+        /** @brief Clear a pending stream because the associated state is reset. */
+        void clearPendingLogitsStream(
+            PendingLogitsStreamRole role,
+            const char *reason);
+
+        /**
+         * @brief Order a consumer stream after a pending logits producer stream.
+         *
+         * This is the graph-captured equivalent of `flushPendingMTPWork()` for
+         * code paths that need ordering but must not block the host.  The
+         * producer handoff is consumed exactly once, then the GPU context queues
+         * an event dependency from `consumer_stream` to the producer stream.
+         */
+        bool waitForPendingLogitsStream(
+            PendingLogitsStreamRole role,
+            void *consumer_stream,
+            const char *consumer);
+
+        /** @brief Clear every pending logits handoff during session teardown. */
+        void clearAllPendingLogitsStreams(const char *reason);
+
+        /**
+         * @brief Queue a restore/truncate stream after any live graph producers.
+         *
+         * A normal forward can return with KV/GDN/logits writes still queued on
+         * the captured graph stream.  Prefix restore and truncate both overwrite
+         * the same live KV/GDN surface, so they must consume those stream
+         * handoffs and make the mutation stream wait before touching state.
+         */
+        bool waitForPendingLiveGraphProducersBeforePrefixMutation(
+            void *mutation_stream,
+            const char *mutation_name);
+
+        /**
+         * @brief Drop transient stream/mailbox handoffs after restoring live state.
+         *
+         * `restoreLivePrefixState()` replaces the request-visible KV/GDN/logits
+         * timeline with a captured snapshot.  Any pending handoff from the
+         * abandoned timeline would describe ordering for old producers, not for
+         * the restored state, so restore must clear them all before the next graph
+         * is allowed to consume live state.
+         */
+        void clearLivePrefixRestoreTransientHandoffs(const char *reason);
+
+        /**
+         * @brief Storage for one pending logits stream handoff.
+         *
+         * The raw pointer is deliberately nested so production code cannot
+         * casually grab a role-specific member such as "main decode stream".
+         * All ownership checks and perf counters live in the helper API below.
+         */
+        struct PendingLogitsStreamHandoff
+        {
+            /** @brief True when a producer has handed off a stream. */
+            bool hasStream() const { return stream_ != nullptr; }
+
+            /**
+             * @brief Return whether `candidate` may replace the current state.
+             *
+             * A producer may republish the same stream after mutating logits in
+             * place. Publishing a different non-null stream before consumption
+             * would break the one-producer/one-consumer ordering contract.
+             */
+            bool canPublish(void *candidate) const
+            {
+                return !stream_ || stream_ == candidate;
+            }
+
+            /** @brief Publish a new pending stream after the caller validates it. */
+            void publish(void *candidate) { stream_ = candidate; }
+
+            /** @brief Observe the pending stream without consuming ownership. */
+            void *peek() const { return stream_; }
+
+            /** @brief Transfer ownership to the consumer and clear the slot. */
+            void *consume()
+            {
+                void *pending = stream_;
+                stream_ = nullptr;
+                return pending;
+            }
+
+            /** @brief Drop any pending stream without transferring ownership. */
+            void clear() { stream_ = nullptr; }
+
+        private:
+            void *stream_ = nullptr;
+        };
+
+        /** @brief Map a role to its storage slot. Only handoff helpers use this. */
+        PendingLogitsStreamHandoff &pendingLogitsStreamHandoff(PendingLogitsStreamRole role);
+
+        /** @brief Const view of a role's storage slot. */
+        const PendingLogitsStreamHandoff &pendingLogitsStreamHandoff(PendingLogitsStreamRole role) const;
+
+        /** @brief Const view of a role's raw storage slot. */
+        void *pendingLogitsStreamValue(PendingLogitsStreamRole role) const;
+
+        /** @brief Stable label used in profiling/debug records. */
+        static const char *pendingLogitsStreamRoleName(PendingLogitsStreamRole role);
+
+        std::array<PendingLogitsStreamHandoff, 3> pending_logits_streams_{};
+        bool defer_next_mtp_main_decode_sync_ = false;
+        bool defer_all_position_verifier_sync_ = false;
+
+        struct MTPTerminalHiddenRowSelectGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            HiddenStateRowSelectStage *stage = nullptr;
+            TensorBase *input = nullptr;
+            TensorBase *output = nullptr;
+            DeviceId device = DeviceId::invalid();
+            uint64_t workspace_generation = 0;
+            int seq_capacity = 0;
+            int d_model = 0;
+            bool valid = false;
+
+            /**
+             * @brief Reset dynamic stage state while preserving topology.
+             *
+             * This is safe only inside one live allocator generation. Request
+             * boundaries use invalidate() instead because terminal-hidden helper
+             * graphs cache graph-workspace scalar pointers and arena tensor
+             * identities that are cheap to rebuild but dangerous to reuse after a
+             * cache clear or workspace rebind.
+             */
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
+
+            void invalidate()
+            {
+                graph.reset();
+                stage = nullptr;
+                input = nullptr;
+                output = nullptr;
+                device = DeviceId::invalid();
+                workspace_generation = 0;
+                seq_capacity = 0;
+                d_model = 0;
+                valid = false;
+            }
+        };
+
+        struct MTPTerminalHiddenRowsSelectGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            HiddenStateRowsSelectStage *stage = nullptr;
+            TensorBase *input = nullptr;
+            TensorBase *output = nullptr;
+            DeviceId device = DeviceId::invalid();
+            uint64_t workspace_generation = 0;
+            int seq_capacity = 0;
+            int d_model = 0;
+            int selected_row_count = 0;
+            std::string row_buffer_name;
+            bool external_row_metadata = false;
+            bool valid = false;
+
+            /**
+             * @brief Reset dynamic stage state while preserving topology.
+             *
+             * Multi-row terminal-hidden selection also reads workspace-hosted row
+             * metadata.  It may keep topology within a request, but clear_cache()
+             * and allocator-generation changes must invalidate the cache outright.
+             */
+            void resetSessionState()
+            {
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
+
+            void invalidate()
+            {
+                graph.reset();
+                stage = nullptr;
+                input = nullptr;
+                output = nullptr;
+                device = DeviceId::invalid();
+                workspace_generation = 0;
+                seq_capacity = 0;
+                d_model = 0;
+                selected_row_count = 0;
+                row_buffer_name.clear();
+                external_row_metadata = false;
+                valid = false;
+            }
+        };
+
+        MTPTerminalHiddenRowSelectGraphCache mtp_terminal_hidden_row_select_cache_;
+        MTPTerminalHiddenRowsSelectGraphCache mtp_terminal_hidden_rows_select_cache_;
 
         // =========================================================================
         // Full Forward Graph Cache (Decode Optimization)
@@ -1898,11 +3927,14 @@ namespace llaminar2
         /// Whether snapshot capture is enabled
         bool snapshot_enabled_ = false;
 
+        /// Optional execution context prefix for disambiguating repeated stage keys.
+        std::string snapshot_context_;
+
         /// Snapshot capture engine (owns storage + routing logic)
         SnapshotCapture snapshot_capture_;
 
         // =========================================================================
-        // Graph Buffer Management Members (Phase 3 - moved from Qwen2Graph)
+        // Graph Buffer Management Members (Phase 3 - moved from QwenStandardGraph)
         // =========================================================================
 
         /// TensorFactory for buffer allocation (not owned, set via setTensorFactory())
@@ -1918,6 +3950,305 @@ namespace llaminar2
         /// Unified buffer arena — owns and tracks coherence for all activation buffers
         std::unique_ptr<BufferArena> arena_;
 
+        /// Cached device pointers for the arena-owned argmax partial-reduction
+        /// scratch (two-pass GPU greedy sampling). Resolved once after arena
+        /// allocation so the per-decode-step hot path avoids any arena lookups.
+        void *argmax_partial_vals_dev_ = nullptr; ///< FP32 [1, argmax_partial_capacity_]
+        void *argmax_partial_idxs_dev_ = nullptr; ///< INT32 [1, argmax_partial_capacity_]
+        int argmax_partial_capacity_ = 0;         ///< Entries in the partial scratch (0 = unavailable)
+
+        int stochastic_target_row_capacity_ = 0;
+        int stochastic_draft_row_capacity_ = 0;
+        int stochastic_batch_output_request_capacity_ = 1;
+        void *stochastic_target_token_ids_dev_ = nullptr; ///< INT32 [target_rows, 256]
+        void *stochastic_target_probs_dev_ = nullptr;     ///< FP32 [target_rows, 256]
+        void *stochastic_draft_token_ids_dev_ = nullptr;  ///< INT32 [draft_rows, 256]
+        void *stochastic_draft_probs_dev_ = nullptr;      ///< FP32 [draft_rows, 256]
+        void *stochastic_processed_logits_dev_ = nullptr; ///< FP32 staging [target_rows, vocab]
+        void *stochastic_inverse_rejection_samples_dev_ = nullptr; ///< FP32 [draft_rows, vocab]
+        void *stochastic_target_sample_tokens_dev_ = nullptr; ///< INT32 [1, 4]
+        void *stochastic_draft_sample_tokens_dev_ = nullptr; ///< INT32 [1, 3]
+        void *stochastic_draft_sample_probs_dev_ = nullptr; ///< FP32 [1, 3], p(sampled draft token)
+        void *mtp_sidecar_condition_token_dev_ = nullptr; ///< INT32 [1, mtp_sidecar_condition_token_capacity_]
+        int mtp_sidecar_condition_token_capacity_ = 0; ///< Total staged condition-token scalars across all sidecar slots.
+        void *mtp_verifier_input_tokens_dev_ = nullptr; ///< INT32 [1, 4], stable verifier token input
+        void *stochastic_topk_partial_vals_dev_ = nullptr; ///< FP32 target/verifier top-k partial scratch.
+        void *stochastic_topk_partial_idxs_dev_ = nullptr; ///< INT32 target/verifier top-k partial scratch.
+        int stochastic_topk_partial_capacity_ = 0;
+        void *stochastic_draft_topk_partial_vals_dev_ = nullptr; ///< FP32 MTP-draft top-k partial scratch.
+        void *stochastic_draft_topk_partial_idxs_dev_ = nullptr; ///< INT32 MTP-draft top-k partial scratch.
+        int stochastic_draft_topk_partial_capacity_ = 0;
+        void *stochastic_verify_tokens_dev_ = nullptr;    ///< INT32 [1, 4]
+        void *stochastic_verify_accepted_dev_ = nullptr;  ///< INT32 [1, 4]
+        void *stochastic_verify_accept_probs_dev_ = nullptr; ///< FP32 [1, 4]
+        void *stochastic_verify_thresholds_dev_ = nullptr;   ///< FP32 [1, 4]
+        void *stochastic_batch_output_tokens_dev_ = nullptr; ///< INT32 [request, 5]
+        void *stochastic_batch_output_meta_dev_ = nullptr;   ///< INT32 [request, 10]
+        std::unique_ptr<PinnedHostScratch> stochastic_batch_output_host_scratch_;
+
+        /**
+         * @brief Device representation stored in a stochastic verifier row slot.
+         *
+         * CompactDistribution rows own `(token_id, probability)` top-k tables.
+         * ProcessedLogits rows own full-vocab logits after temperature/top-k/top-p
+         * processing. Keeping this explicit prevents the verifier from silently
+         * interpreting stale compact buffers as processed rows, or vice versa.
+         */
+        enum class StochasticRowFormat
+        {
+            Empty,
+            CompactDistribution,
+            ProcessedLogits,
+        };
+
+        std::vector<int> stochastic_target_top_k_;
+        std::vector<int> stochastic_draft_top_k_;
+        std::vector<StochasticRowFormat> stochastic_target_row_formats_;
+        std::vector<StochasticRowFormat> stochastic_draft_row_formats_;
+
+        /**
+         * @brief Producer stream for each compact stochastic distribution slot.
+         *
+         * A distribution build can consume logits produced by captured replay on
+         * a non-context stream. The later sample kernel must run on that same
+         * explicit stream so it observes the finished token/probability arrays
+         * without inserting a host synchronization. Slots are cleared when the
+         * paired sampler consumes them or when request-scoped state is reset.
+         */
+        std::vector<void *> stochastic_target_distribution_streams_;
+
+        /**
+         * @brief Producer streams for MTP draft compact distributions.
+         *
+         * Draft distributions are normally built immediately after a sidecar
+         * graph. Keeping the stream here lets stochastic sampling follow a
+         * deferred sidecar graph replay on CUDA/ROCm without touching the device
+         * null stream or synchronizing the whole context.
+         */
+        std::vector<void *> stochastic_draft_distribution_streams_;
+
+        /**
+         * @brief Event-backed readiness state for deferred stochastic sample tokens.
+         *
+         * Each slot corresponds to one row in a stochastic sample-token buffer.
+         * The event is recorded after the sampler kernel writes the token; GPU
+         * consumers such as chained sidecars and all-position verifiers wait on
+         * it before reading the slot. `std::shared_ptr<void>` gives the raw
+         * backend event a move-safe owner, which matters because this
+         * orchestrator is movable in tests and factory paths.
+         */
+        struct StochasticSampleReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+            bool verifier_consumer_pending = false;
+        };
+
+        /**
+         * @brief Event-backed ownership state for deferred shifted-MTP-KV writes.
+         *
+         * Unlike logits handoff, the consumer is not a single sampler call: the
+         * next boundary may be another sidecar append, a cache truncate, or
+         * accepted-state publication.  Keeping one explicit event-backed slot
+         * makes that ownership transfer visible and testable.
+         */
+        struct PendingShiftedMTPKVReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+        };
+
+        /**
+         * @brief Event-backed ownership state for deferred verifier row state.
+         *
+         * A multi-row verifier may finish asynchronously and hand logits to a
+         * sampler first. Publication still has to wait for the same verifier
+         * graph before restoring accepted row state. This event is deliberately
+         * separate from PendingLogitsStreamHandoff so logits consumers cannot
+         * erase publication's dependency.
+         */
+        struct PendingAllPositionVerifierStateReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+        };
+
+        /**
+         * @brief Event-backed ownership state for accepted verifier publication.
+         *
+         * Publication restores KV and hybrid recurrent state on the verifier
+         * stream.  The next decode may replay on a fresh graph stream, so it
+         * must wait on this event before reading live state.
+         */
+        struct PendingAcceptedSpecPublicationReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+            uint64_t live_state_epoch = 0;
+        };
+        /**
+         * @brief Event-backed source ownership for async logical checkpoints.
+         *
+         * A checkpoint snapshot owns its payload destination.  This runner-side
+         * state owns the matching dependency on the live source tensors: no
+         * later graph may mutate KV/GDN state until this event has completed.
+         */
+        struct PendingLivePrefixCheckpointReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+            uint64_t live_state_epoch = 0;
+        };
+        /**
+         * @brief Event-backed readiness state for async prefix restore/truncate.
+         *
+         * Restore and truncate mutate the live KV/GDN/terminal-hidden surface
+         * on an explicit stream. Future graph replay may use a different stream,
+         * so every consumer must first wait on this event.
+         */
+        struct PendingLivePrefixMutationReadyState
+        {
+            std::shared_ptr<void> event;
+            void *producer_stream = nullptr;
+            bool valid = false;
+            uint64_t live_state_epoch = 0;
+        };
+        std::vector<StochasticSampleReadyState> stochastic_target_sample_ready_;
+        std::vector<StochasticSampleReadyState> stochastic_draft_sample_ready_;
+        PendingShiftedMTPKVReadyState shifted_mtp_kv_ready_;
+        PendingAllPositionVerifierStateReadyState all_position_verifier_state_ready_;
+        PendingAcceptedSpecPublicationReadyState accepted_spec_publication_ready_;
+        mutable PendingLivePrefixCheckpointReadyState live_prefix_checkpoint_ready_;
+        mutable PendingLivePrefixMutationReadyState live_prefix_mutation_ready_;
+
+        /**
+         * @brief Persistent explicit stream for compact stochastic response copies.
+         *
+         * The vLLM-style MTP path flushes compact outcome tokens to host only
+         * after device-resident state publication has already happened.  That
+         * response bridge still needs an explicit non-default stream, but HIP
+         * stream create/destroy is expensive enough to show up in fixed-depth
+         * decode timings.  Keep one owned stream per orchestrator/device and
+         * reuse it for each synchronized response flush.
+         */
+        std::shared_ptr<void> stochastic_outcome_response_bridge_stream_;
+
+        /**
+         * @brief Deferred device-token composition plan for the target verifier.
+         *
+         * OrchestrationRunner knows which host token and sampled draft slots
+         * should feed the verifier, but DeviceGraphOrchestrator knows the graph
+         * execution stream.  Keeping this plan pending until
+         * prepareAllPositionVerifierGraphMetadata() lets us compose the compact
+         * `[first_token, draft_0, ...]` device row on that same stream.
+         */
+        struct PendingMTPVerifierDeviceTokenPlan
+        {
+            int32_t first_token = -1;
+            int first_target_sample_slot = -1;
+            bool first_token_from_device = false;
+            bool all_tokens_from_host = false;
+            int first_draft_slot = 0;
+            int draft_token_count = 0;
+            int total_verifier_input_tokens = 0;
+            std::array<int32_t, sampling_math::kSpeculativeBatchMaxRows + 1>
+                host_tokens{};
+        };
+        std::optional<PendingMTPVerifierDeviceTokenPlan>
+            pending_mtp_verifier_device_token_plan_;
+        struct MaterializedMTPVerifierDeviceTokenRow
+        {
+            bool valid = false;
+            bool first_token_from_device = false;
+            int first_target_sample_slot = -1;
+            int total_verifier_input_tokens = 0;
+            int draft_token_count = 0;
+        };
+        MaterializedMTPVerifierDeviceTokenRow
+            materialized_mtp_verifier_device_token_row_;
+
+        /**
+         * @brief Device-resident logical sequence-state publication mailbox.
+         *
+         * The metadata derivation kernel writes target cached-token counts and
+         * next-condition tokens into the persistent MTP metadata workspace.  DGO
+         * treats target cached tokens as both the next logical position and the
+         * next request sequence length, but keeps them as device pointers until
+         * the graph-signature and scheduler paths can consume them without a
+         * host bridge.
+         */
+        struct DeviceResidentLogicalSequenceStateMailbox
+        {
+            int request_count = 0;
+            const int32_t *target_positions_device = nullptr;
+            const int32_t *target_sequence_lengths_device = nullptr;
+            const int32_t *accepted_state_counts_device = nullptr;
+            const int32_t *next_condition_tokens_device = nullptr;
+            const int32_t *all_drafts_accepted_flags_device = nullptr;
+            const int32_t *stopped_flags_device = nullptr;
+            const int32_t *publication_ok_flags_device = nullptr;
+            void *producer_stream = nullptr;
+            std::shared_ptr<void> ready_event;
+            uint64_t live_state_epoch = 0;
+
+            bool valid() const
+            {
+                return request_count > 0 &&
+                       target_positions_device != nullptr &&
+                       target_sequence_lengths_device != nullptr &&
+                       accepted_state_counts_device != nullptr &&
+                       next_condition_tokens_device != nullptr &&
+                       all_drafts_accepted_flags_device != nullptr &&
+                       stopped_flags_device != nullptr &&
+                       publication_ok_flags_device != nullptr &&
+                       producer_stream != nullptr &&
+                       ready_event != nullptr;
+            }
+
+            /**
+             * @brief True when @p handle is exactly this live mailbox.
+             *
+             * The resident logical-state handoff is a stream/event/pointer
+             * ownership contract, not just a bag of device addresses.  Keeping
+             * the comparison here prevents sidecar, forward, and future
+             * scheduler consumers from drifting apart as Phase 10 moves more
+             * state away from host-owned getters.
+             */
+            bool ownsHandle(
+                const DeviceResidentLogicalSequenceStateHandle &handle,
+                uint64_t current_live_state_epoch) const
+            {
+                return valid() &&
+                       handle.valid() &&
+                       live_state_epoch == current_live_state_epoch &&
+                       handle.live_state_epoch == live_state_epoch &&
+                       handle.request_count == request_count &&
+                       handle.device.is_valid() &&
+                       handle.target_positions_device == target_positions_device &&
+                       handle.target_sequence_lengths_device == target_sequence_lengths_device &&
+                       handle.accepted_state_counts_device == accepted_state_counts_device &&
+                       handle.next_condition_tokens_device == next_condition_tokens_device &&
+                       handle.all_drafts_accepted_flags_device == all_drafts_accepted_flags_device &&
+                       handle.stopped_flags_device == stopped_flags_device &&
+                       handle.publication_ok_flags_device == publication_ok_flags_device &&
+                       handle.stream == producer_stream &&
+                       handle.ready_event == ready_event.get();
+            }
+
+            void clear()
+            {
+                *this = {};
+            }
+        };
+        DeviceResidentLogicalSequenceStateMailbox
+            device_resident_logical_sequence_state_mailbox_;
+        uint64_t device_resident_logical_sequence_host_adopted_epoch_ = 0;
+
         /// Owned tensors when using graph-managed allocation
         std::vector<std::unique_ptr<TensorBase>> owned_buffers_;
 
@@ -1931,19 +4262,41 @@ namespace llaminar2
          * to GEMM kernels, eliminating hot-path allocations on GPU.
          *
          * @param graph The compute graph whose stages need workspace
+         * @param workspace_seq_len Optional active execution length for shape-sized scratch.
          * @return true if allocation succeeded (or was already done)
          */
-        bool ensureDeviceWorkspaceAllocated(const ComputeGraph &graph) override;
+        bool ensureDeviceWorkspaceAllocated(
+            const ComputeGraph &graph,
+            int workspace_seq_len = 0) override;
+
+        /**
+         * @brief Return the current workspace generation for a device.
+         */
+        uint64_t workspaceGeneration(DeviceId device) const override;
+
+        /**
+         * @brief Called once after the first graph build + workspace allocation.
+         *
+         * Graph-ready is too early for mmap page reclaim on GPU/TP paths because
+         * participant-local graph materialization can still be resolving captured
+         * transfers. mmap reclaim is performed after first successful prefill.
+         */
+        void onFirstGraphReady() override;
+
+        /**
+         * @brief Advise mmap pages away after first successful prefill.
+         */
+        void adviseMmapDontneedAfterFirstPrefill();
 
         // =========================================================================
         // Phase-Aware Weight Access Members (Gap 3 - CPU Decode Participation)
         // =========================================================================
 
         /// Weight manager for full weights and decode shards
-        std::shared_ptr<WeightManager> weight_manager_;
+        std::shared_ptr<IWeightManager> weight_manager_;
 
         /// Weight placement map for decode device selection
-        std::shared_ptr<WeightPlacementMap> weight_placement_map_;
+        std::shared_ptr<IWeightPlacementMap> weight_placement_map_;
 
         /// Current inference phase (PREFILL or DECODE)
         InferencePhase current_phase_ = InferencePhase::PREFILL;
@@ -1993,6 +4346,9 @@ namespace llaminar2
         /// Global TP context for cross-MPI-rank tensor parallelism (owns communicator lifetime)
         std::shared_ptr<IGlobalTPContext> global_tp_ctx_;
 
+        /// Resolve the active GlobalTP/NodeLocalTP domain context for scalar MTP coordination.
+        IGlobalTPContext *globalTPContextForMTPCoordination() const;
+
         // =========================================================================
         // Pipeline Parallelism Configuration (Legacy - Single Stage)
         // =========================================================================
@@ -2019,7 +4375,7 @@ namespace llaminar2
         /// TP contexts for each domain (one per domain name)
         /// Each domain may have internal tensor parallelism
         /// NOTE: Uses shared_ptr because PPStage can hold a reference to the TP context
-        std::map<std::string, std::shared_ptr<ILocalTPContext>> domain_tp_contexts_;
+        std::map<std::string, std::shared_ptr<ITPContext>> domain_tp_contexts_;
 
         /// Whether PP contexts have been initialized
         bool pp_contexts_initialized_ = false;
@@ -2030,13 +4386,239 @@ namespace llaminar2
         /// Session epoch counter — incremented on each clear_cache() call
         /// Used to detect stale kernel state across inference sessions
         uint64_t session_epoch_ = 0;
+        uint64_t live_replay_state_epoch_ = 1;
+        uint64_t live_state_mutation_count_ = 0;
+        uint64_t live_state_accepted_publications_ = 0;
+        uint64_t live_state_rejected_corrections_ = 0;
+        uint64_t live_state_prefix_restores_ = 0;
+        uint64_t live_state_prefix_truncates_ = 0;
+        uint64_t live_state_shifted_mtp_kv_updates_ = 0;
+        uint64_t live_state_session_resets_ = 0;
+        LivePrefixMutationReason last_live_state_mutation_reason_ =
+            LivePrefixMutationReason::Unknown;
+        std::string last_live_state_mutation_operation_;
+        uint64_t device_sampling_counter_ = 0;
+
+        bool compute_all_position_logits_ = false;
+        bool compute_row_indexed_all_position_logits_ = false;
+        int row_indexed_all_position_logits_row_count_ = 0;
+        int request_batched_prefill_logits_row_count_ = 0;
+        std::vector<int32_t> request_batched_prefill_logit_rows_;
+
+        /// Runner-owned graph metadata workspace for vLLM-style MTP verification.
+        MTPSpecDecodeMetadataWorkspaceBinding mtp_spec_decode_metadata_binding_{
+            MTPSpecDecodeMetadataShape{1, 3}};
+
+        /// Host copy of the verifier row plan waiting to be uploaded before replay.
+        std::optional<MTPSpecDecodeVerifierInputPlan>
+            pending_mtp_spec_verifier_input_plan_;
+        /**
+         * @brief Whether BASE_CACHED_TOKENS holds a pre-verifier device snapshot.
+         *
+         * prepareAllPositionVerifierGraphMetadata() captures the live KV count
+         * before verifier graph replay appends target rows.  Publication consumes
+         * that snapshot later, after the scoped verifier row plan has been
+         * cleared, so this flag is intentionally separate from
+         * pending_mtp_spec_verifier_input_plan_.
+         */
+        bool mtp_publication_base_cache_snapshot_ready_ = false;
+        int mtp_publication_base_cache_snapshot_request_count_ = 0;
 
         /// Whether host-resident weight data has been released after first prefill
         bool host_resident_released_ = false;
+        bool release_host_resident_after_forward_ = true;
+        bool mmap_dontneed_advised_ = false;
 
-        /// Reset input-dependent dynamic state on all cached kernels
-        /// Implemented in .cpp to avoid including KernelFactory.h in the header
+        /// Whether raw MoE expert tensors were released after eager graph-build packing.
+        bool raw_expert_weights_released_after_graph_build_ = false;
+
+        // =========================================================================
+        // MoE Expert Rebalance Controller
+        // =========================================================================
+
+        /// Optional primary MoE expert rebalance controller (owned)
+        std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
+
+        /// Additional routed overlay-domain rebalance controllers (owned).
+        std::vector<std::unique_ptr<MoERebalanceController>> moe_rebalance_extra_controllers_;
+
+        /// Optional expert weight payload provider for metadata-based host retention (owned)
+        std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;
+
+        /// Model-context-owned prepared weight store (Phase 4-5)
+        std::shared_ptr<PreparedWeightStore> prepared_weight_store_;
+
+        /// Frozen model weight set for audit/validation (Phase 6)
+        std::unique_ptr<FrozenModelWeightSet> frozen_weight_set_;
+
+        /// Build FrozenModelWeightSet from pre-resolved layer weights (Phase 6)
+        void buildFrozenWeightSet(
+            const ModelWeights &weights,
+            const std::unordered_map<int, LayerWeights> &resolved_layers,
+            int first_layer, int last_layer);
+
+        /**
+         * @brief Ensure a stable terminal-hidden scratch buffer exists for MTP sidecar input.
+         *
+         * Most callers need only row zero, which stores the live terminal
+         * hidden state restored from prefix cache or selected from the last
+         * forward. Batched shifted-cache catch-up asks for up to four rows so a
+         * single graph-native MTP sidecar can append several shifted KV rows at
+         * once. Growing the buffer invalidates row-select caches because their
+         * output tensor pointer changes.
+         */
+        bool ensureMTPTerminalHiddenBuffer(int min_rows = 1);
+
+        /// Execute the cached graph-native row select used for MTP terminal hidden refresh.
+        bool executeMTPTerminalHiddenRowSelect(int row_idx, int seq_len, void *stream = nullptr);
+
+        /// Execute a cached graph-native hidden row select into an MTP buffer.
+        bool executeMTPHiddenRowSelect(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowSelectGraphCache &cache,
+            const char *node_name,
+            int row_idx,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Execute a cached graph-native hidden rows select into an MTP buffer.
+        bool executeMTPHiddenRowsSelect(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            const char *node_name,
+            int row_start,
+            int row_count,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Execute a cached hidden-row select whose row indices are device-produced metadata.
+        bool executeMTPHiddenRowsSelectFromDeviceMetadata(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            const char *node_name,
+            const char *row_buffer_name,
+            int row_count,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Execute a cached graph-native arbitrary hidden-row select into an MTP buffer.
+        bool executeMTPHiddenRowsSelect(
+            TensorBase *input,
+            BufferId input_buffer_id,
+            TensorBase *output,
+            BufferId output_buffer_id,
+            MTPTerminalHiddenRowsSelectGraphCache &cache,
+            const char *node_name,
+            const std::vector<int> &row_indices,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Copy a contiguous verifier/prefill row range into the stable MTP input buffer.
+        bool selectMTPTerminalHiddenRows(
+            int row_start,
+            int row_count,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Copy arbitrary verifier rows into the stable MTP input buffer.
+        bool selectMTPTerminalHiddenRows(
+            const std::vector<int> &row_indices,
+            int seq_len,
+            void *stream = nullptr);
+
+        /// Copy accepted verifier rows named by the device-resident MTP metadata workspace.
+        bool selectMTPTerminalHiddenRowsFromDeviceAcceptedState(
+            int row_count,
+            int seq_len,
+            void *stream = nullptr);
+
+        /**
+         * @brief Derive Phase-10 publication metadata from a resident verifier outcome.
+         *
+         * This helper is the device-side half of
+         * publishAcceptedMTPSpecStateBatchFromDeviceOutcome().  It does not
+         * mutate KV, positions, or terminal hidden state; instead it validates
+         * that @p request belongs to the last all-position verifier graph,
+         * uploads the host-known base cache counts into the runner metadata
+         * workspace, and asks the backend to derive accepted restore rows,
+         * target cache counts, accepted-state counts, and per-request validity
+         * flags on the verifier stream.  Later publication slices consume those
+         * workspace buffers directly, so no code should reconstruct these
+         * counts from host-copied stochastic metadata.
+         */
+        bool prepareDeviceResidentMTPSpecPublicationMetadata(
+            const DeviceSpeculativePublicationRequest &request,
+            std::string *error = nullptr);
+
+        /// Drop any stale device logical-state mailbox after request/session mutation.
+        void clearDeviceResidentLogicalSequenceStateMailbox();
+
+        /// Record the device pointers that later DGO logical-state consumers must use.
+        bool recordDeviceResidentLogicalSequenceStateMailbox(
+            const MTPSpecDecodeMetadataDevicePointers &ptrs,
+            int request_count,
+            void *producer_stream,
+            std::string *error = nullptr);
+
+        /**
+         * @brief Retarget the current resident mailbox after a shifted-MTP KV append.
+         *
+         * Resident correction commits consume the next-condition token from the
+         * publication mailbox, then append one shifted-MTP KV row on their own
+         * stream.  That append advances the live replay epoch so old handles must
+         * not remain valid by accident.  When the append was driven by the current
+         * mailbox, the logical rows themselves are still the right device-owned
+         * source for the next pending condition; this helper advances only the
+         * mailbox epoch and readiness event to the commit stream.
+         */
+        bool retargetDeviceResidentLogicalSequenceStateMailboxAfterShiftedKVMutation(
+            const DeviceResidentLogicalSequenceStateHandle &handle,
+            void *producer_stream,
+            const char *producer_name);
+
+        /// Queue a stream wait for resident logical-state metadata, if present.
+        bool waitForDeviceResidentLogicalSequenceStateMailbox(
+            void *consumer_stream,
+            const char *consumer_name);
+
+        /**
+         * @brief Whether DGO can consume device-published logical sequence state.
+         *
+         * The cache can publish its device head/count mirrors independently,
+         * but the runner is not safe to mutate until positions,
+         * sequence_lengths(), and graph-signature inputs are also updated from
+         * the same resident metadata.  Keeping this as a separate gate prevents
+         * a future KV-cache implementation from partially publishing state
+         * before DGO has a device-owned logical-state mailbox.
+         */
+        bool supportsDeviceResidentLogicalSequenceStatePublication() const;
+
+        /// Copy the latest forward pass terminal hidden row into the stable MTP input buffer.
+        bool refreshMTPTerminalHiddenState(int seq_len, int batch_size);
+
+        /// Reset input-dependent dynamic state on all cached kernels.
+        ///
+        /// This is a hard graph-replay invalidation helper. Do not call it from
+        /// clear_cache(), because request-boundary reset preserves some captured
+        /// GPU graph executables and their kernel-owned dynamic argument tables.
+        /// Implemented in .cpp to avoid including KernelFactory.h in the header.
         void resetKernelDynamicState();
+
+        /// Record the intentional preservation of kernel dynamic state.
+        ///
+        /// Keeping this visible in perf counters makes request-boundary capture
+        /// reuse auditable and helps catch accidental hard resets in hot paths.
+        void recordKernelDynamicStatePreservedForCapturedReplay(
+            const char *reason) const;
     };
 
 } // namespace llaminar2

@@ -5,15 +5,37 @@
 
 #include "app/modes/CompletionMode.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "utils/Logger.h"
 #include "utils/Sampler.h"
-#include <mpi.h>
 #include <iostream>
 #include <climits>
 #include <sstream>
+#include <string>
 
 namespace llaminar2
 {
+    namespace
+    {
+        int finalizeAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
+        {
+            const bool has_mpi = ctx.mpi_ctx != nullptr;
+            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+
+            if (is_root)
+                LOG_ERROR(mode_name << " failed with unhandled exception: " << detail);
+
+            if (ctx.runner)
+            {
+                if (notify_workers)
+                    ctx.runner->abortMPIWorkers(detail);
+                ctx.runner->shutdown();
+            }
+            mpiShutdown();
+            return 1;
+        }
+    } // namespace
 
     bool CompletionMode::matches(const OrchestrationConfig & /*config*/) const
     {
@@ -22,11 +44,40 @@ namespace llaminar2
     }
 
     int CompletionMode::execute(AppContext &ctx)
+    try
     {
         auto &config = ctx.config;
         auto &mpi_ctx = ctx.mpi_ctx;
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
+
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        {
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
+                             << " entering MPI worker loop for completion inference");
+            runner->setMPICoordinatedMode(true);
+            runner->runMPIWorkerLoop();
+            runner->shutdown();
+            mpiShutdown();
+            return 0;
+        }
+
+        if (mpi_coordinated)
+        {
+            runner->setMPICoordinatedMode(true);
+        }
+
+        auto shutdownAndFinalize = [&](int exit_code) -> int
+        {
+            if (mpi_coordinated)
+            {
+                runner->shutdownMPIWorkers();
+            }
+            runner->shutdown();
+            mpiShutdown();
+            return exit_code;
+        };
 
         // Tokenize prompt
         std::vector<int32_t> tokens;
@@ -41,14 +92,12 @@ namespace llaminar2
                 {
                     LOG_ERROR("Tokenization resulted in empty token sequence");
                 }
-                runner->shutdown();
-                MPI_Finalize();
-                return 1;
+                return shutdownAndFinalize(1);
             }
 
             if (mpi_ctx->rank() == 0)
             {
-                LOG_INFO("Tokenized prompt: " << tokens.size() << " tokens");
+                LOG_DEBUG("Tokenized prompt: " << tokens.size() << " tokens");
                 std::ostringstream token_ids_str;
                 token_ids_str << "Token IDs: [";
                 for (size_t i = 0; i < tokens.size(); ++i)
@@ -58,7 +107,7 @@ namespace llaminar2
                         token_ids_str << ", ";
                 }
                 token_ids_str << "]";
-                LOG_INFO(token_ids_str.str());
+                LOG_DEBUG(token_ids_str.str());
             }
         }
         catch (const std::exception &e)
@@ -67,9 +116,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Error tokenizing prompt: " << e.what());
             }
-            runner->shutdown();
-            MPI_Finalize();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
         // Set up sampling parameters
@@ -100,9 +147,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Error: Prefill forward pass failed: " << runner->lastError());
             }
-            runner->shutdown();
-            MPI_Finalize();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
         if (mpi_ctx->rank() == 0)
@@ -120,48 +165,65 @@ namespace llaminar2
         // Configure GPU-side sampling
         runner->setSamplingParams(sampling_params);
 
-        // Generate tokens autoregressively
+        // Generate tokens autoregressively. decodeStep() may return more than
+        // one token when MTP accepts a draft, so count output tokens rather
+        // than decode calls.
         int max_tokens = (config.n_predict == -1) ? INT_MAX : config.n_predict;
-        for (int i = 0; i < max_tokens; ++i)
+        int generated_tokens = 0;
+        bool stop_generation = false;
+        while (generated_tokens < max_tokens && !stop_generation)
         {
-            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << i);
+            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Starting decode iteration " << generated_tokens);
 
+            const int remaining_budget =
+                (max_tokens == INT_MAX) ? 0 : (max_tokens - generated_tokens);
+            runner->setDecodeStepTokenBudget(remaining_budget);
             GenerationResult result = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
 
             if (!result.success())
             {
                 if (mpi_ctx->rank() == 0)
                 {
-                    LOG_ERROR("\nError: Decode step failed at token " << (i + 1) << ": " << result.error);
+                    LOG_ERROR("\nError: Decode step failed at token "
+                              << (generated_tokens + 1) << ": " << result.error);
                 }
-                runner->shutdown();
-                MPI_Finalize();
-                return 1;
+                return shutdownAndFinalize(1);
             }
 
             if (result.tokens.empty())
             {
-                LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] No token generated at iteration " << i);
+                LOG_DEBUG("[Rank " << mpi_ctx->rank()
+                                   << "] No token generated at iteration " << generated_tokens);
                 break;
             }
 
-            int32_t next_token = result.tokens[0];
-
-            LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Generated token: " << next_token);
-
-            if (mpi_ctx->rank() == 0 && !tokenizer->is_stop_token(next_token))
+            for (size_t token_idx = 0; token_idx < result.tokens.size() && generated_tokens < max_tokens; ++token_idx)
             {
-                std::string token_text = tokenizer->decode_token(next_token);
-                std::cout << token_text << std::flush;
-            }
+                const int32_t next_token = result.tokens[token_idx];
+                const bool is_final_returned_token = token_idx + 1 == result.tokens.size();
+                const bool is_stop = tokenizer->is_stop_token(next_token) ||
+                                     (result.is_complete && is_final_returned_token);
 
-            if (result.is_complete || tokenizer->is_stop_token(next_token))
-            {
-                if (mpi_ctx->rank() == 0 && config.verbose_level > 0)
+                LOG_DEBUG("[Rank " << mpi_ctx->rank() << "] Generated token: " << next_token);
+
+                ++generated_tokens;
+
+                if (mpi_ctx->rank() == 0 && !is_stop)
                 {
-                    LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
+                    std::string token_text = tokenizer->decode_token(next_token);
+                    std::cout << token_text << std::flush;
                 }
-                break;
+
+                if (is_stop)
+                {
+                    if (mpi_ctx->rank() == 0 && config.verbose_level > 0)
+                    {
+                        LOG_DEBUG("\nGeneration stopped: stop token " << next_token << " encountered");
+                    }
+                    stop_generation = true;
+                    break;
+                }
             }
         }
 
@@ -175,20 +237,15 @@ namespace llaminar2
             LOG_DEBUG("Generation complete.");
         }
 
-        if (mpi_ctx->world_size() > 1)
-        {
-            mpi_ctx->barrier();
-        }
-
-        runner->shutdown();
-
-        if (mpi_ctx->world_size() > 1)
-        {
-            mpi_ctx->barrier();
-        }
-
-        MPI_Finalize();
-        return 0;
+        return shutdownAndFinalize(0);
+    }
+    catch (const std::exception &e)
+    {
+        return finalizeAfterUnhandledException(ctx, "Completion mode", e.what());
+    }
+    catch (...)
+    {
+        return finalizeAfterUnhandledException(ctx, "Completion mode", "unknown non-std exception");
     }
 
 } // namespace llaminar2

@@ -125,6 +125,19 @@ protected:
         }
         EXPECT_TRUE(has_nonzero) << "Output tensor is all zeros";
     }
+
+    static void assertGraphStagesUseStream(ComputeGraph &graph, void *stream)
+    {
+        ASSERT_NE(stream, nullptr);
+        for (const auto &node_name : graph.getExecutionOrder())
+        {
+            ComputeNode *node = graph.getNode(node_name);
+            ASSERT_NE(node, nullptr) << "Missing node: " << node_name;
+            ASSERT_NE(node->stage, nullptr) << "Missing stage: " << node_name;
+            EXPECT_EQ(node->stage->gpuStream(), stream)
+                << "Stage should remain bound to the explicit capture stream: " << node_name;
+        }
+    }
 };
 
 TEST_F(SegmentedGraphCaptureExecutionTest, WarmupCaptureReplay_LifecycleStable)
@@ -235,5 +248,60 @@ TEST_F(SegmentedGraphCaptureExecutionTest, DISABLED_CollectiveMarkedMode_Remains
     graph.reset();
     ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, &collective_nodes));
+    assertFiniteAndNonZero(result->data(), num_elements);
+}
+
+TEST_F(SegmentedGraphCaptureExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)
+{
+    SKIP_IF_NO_GPU();
+    ASSERT_NE(gpu_ctx_, nullptr);
+    ASSERT_NE(device_ctx_, nullptr);
+
+    const size_t seq_len = 4;
+    const size_t d_model = 64;
+    const size_t num_elements = seq_len * d_model;
+
+    FP32Tensor *norm_input = nullptr;
+    FP32Tensor *residual = nullptr;
+    FP32Tensor *result = nullptr;
+    auto graph = buildNormResidualGraph(seq_len, d_model, norm_input, residual, result);
+
+    GraphExecutorConfig exec_config;
+    exec_config.enable_validation = false;
+    DeviceGraphExecutor executor(exec_config);
+    DeviceGraphExecutor::GraphSegmentCache segment_cache;
+    void *dispatch_stream = gpu_ctx_->defaultStream();
+    ASSERT_NE(dispatch_stream, nullptr);
+
+    // First warmup creates the dedicated segmented replay stream and binds all
+    // stages to it. This stream must not be replaced by retry/reset plumbing.
+    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+        graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
+    void *capture_stream = segment_cache.capture_stream;
+    ASSERT_NE(capture_stream, nullptr);
+    EXPECT_NE(capture_stream, dispatch_stream)
+        << "Segmented graph replay should use a dedicated explicit stream, not the dispatch/default stream";
+    assertGraphStagesUseStream(graph, capture_stream);
+    assertFiniteAndNonZero(result->data(), num_elements);
+
+    // Reset with Preserve simulates capture retry/replay failure handling. The
+    // next warmup must reuse the same live stream so cached stages never observe
+    // a dangling stream or fall back to default-stream execution.
+    segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+    EXPECT_EQ(segment_cache.capture_stream, capture_stream);
+
+    graph.reset();
+    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+        graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
+    EXPECT_EQ(segment_cache.capture_stream, capture_stream);
+    assertGraphStagesUseStream(graph, capture_stream);
+    assertFiniteAndNonZero(result->data(), num_elements);
+
+    // The recapture pass should continue using that same explicit stream.
+    graph.reset();
+    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+        graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
+    EXPECT_EQ(segment_cache.capture_stream, capture_stream);
+    assertGraphStagesUseStream(graph, capture_stream);
     assertFiniteAndNonZero(result->data(), num_elements);
 }

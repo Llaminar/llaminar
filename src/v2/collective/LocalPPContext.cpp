@@ -236,7 +236,7 @@ namespace llaminar2
             throw std::invalid_argument("LocalPPContext: invalid configuration");
         }
 
-        LOG_INFO("LocalPPContext created: " << numStages() << " stages, "
+        LOG_DEBUG("LocalPPContext created: " << numStages() << " stages, "
                                             << totalLayers() << " layers");
 
         // Log stage configuration
@@ -689,14 +689,14 @@ namespace llaminar2
             flat_devices_.push_back(stage.representativeDevice());
         }
 
-        LOG_INFO("HierarchicalPPContext created: " << numStages() << " stages, "
+        LOG_DEBUG("HierarchicalPPContext created: " << numStages() << " stages, "
                                                    << totalLayers() << " layers");
 
         // Log stage configuration with hierarchy info
         for (int s = 0; s < numStages(); ++s)
         {
             auto [first, last] = layerRangeForStage(s);
-            LOG_INFO("  Stage " << s << ": layers [" << first << ", " << last << ") on "
+            LOG_DEBUG("  Stage " << s << ": layers [" << first << ", " << last << ") on "
                                 << config_.stages[s].describe());
         }
     }

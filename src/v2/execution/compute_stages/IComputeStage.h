@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -285,7 +286,13 @@ namespace llaminar2
         // MoE specific
         MOE_ROUTER,
         MOE_EXPERT_FFN,
-        MOE_COMBINE,
+        MOE_SHARED_EXPERT_FFN,      ///< Shared expert FFN (distinct from per-expert MOE_EXPERT_FFN)
+        MOE_SHARED_EXPERT_GATE,     ///< Shared expert sigmoid gate
+        MOE_EXPERT_DISPATCH,        ///< Host-side dispatch descriptor builder for expert-parallel tiers
+        MOE_EXPERT_PARALLEL_REDUCE, ///< Host-side dense partial reduction for expert-parallel tiers
+        MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
+        MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
+        MOE_SPARSE_RETURN_REDUCE,   ///< Graph-native sparse MoE return reduce
 
         // Collective
         ALLREDUCE,
@@ -300,6 +307,7 @@ namespace llaminar2
 
         // Utility
         COPY,
+        ROW_SELECT, ///< Copy one dynamically selected source row into a stable scratch row.
         QUANTIZE,
         DEQUANTIZE,
 
@@ -321,6 +329,7 @@ namespace llaminar2
 
         // Fused operations (GPU optimization)
         FUSED_RESIDUAL_NORM,
+        FUSED_ADD_ALLREDUCE, ///< Fused residual-add + allreduce (MoE output combine + TP reduce)
 
         // GDN (Gated Delta Network) stages
         ATTENTION_OUTPUT_GATE, ///< Sigmoid gate on attention output
@@ -331,6 +340,9 @@ namespace llaminar2
 
         // Qwen 3.5 FA-specific
         Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers
+
+        // MTP sidecar
+        MTP_CONCAT, ///< Concatenate normalized draft embedding and terminal hidden rows
     };
 
     /**
@@ -351,6 +363,22 @@ namespace llaminar2
         {
             const char *name = nullptr;
             const void *ptr = nullptr;
+        };
+
+        /**
+         * @brief Dynamic bookkeeping for fixed-bucket prefill graph replay.
+         *
+         * Bucketed prefill graphs may execute a padded, fixed topology while
+         * only a prefix of that bucket is real prompt data. Stages that update
+         * host-side sequence state after graph replay use this metadata to keep
+         * KV heads, recurrent state, and future row-selection logic aligned to
+         * the real token count rather than the padded execution length.
+         */
+        struct PrefillReplayParams
+        {
+            int real_seq_len = 0;   ///< Real, non-padding token count in this replay.
+            int bucket_seq_len = 0; ///< Fixed graph execution length for this replay.
+            int token_offset = 0;   ///< Offset of this chunk within the original prompt.
         };
 
         /**
@@ -381,6 +409,20 @@ namespace llaminar2
          * @return true on success, false on error
          */
         virtual bool execute(IDeviceContext *ctx) = 0;
+
+        /**
+         * @brief Validate prepared model-weight references before execution.
+         *
+         * Non-weight stages return true. Model-weight-backed GEMM stages override
+         * this to ensure graph construction provided PreparedWeightStore refs and
+         * that the store still contains those refs.
+         */
+        virtual bool validatePreparedWeights(std::string *error) const
+        {
+            if (error)
+                error->clear();
+            return true;
+        }
 
         // =========================================================================
         // Introspection
@@ -542,6 +584,160 @@ namespace llaminar2
         virtual bool isGraphCapturable() const { return true; }
 
         /**
+         * @brief Variant signature for graph-captured launch topology.
+         *
+         * Most stages have a single stable graph-capture topology and return 0.
+         * Stages whose kernel launch shape is bucketed by runtime values may
+         * return a nonzero signature. Segmented graph replay uses this to
+         * intentionally warm/capture a new graph variant before replaying a
+         * graph whose baked launch topology no longer matches the current step.
+         *
+         * This is deliberately about launch topology, not mathematical inputs:
+         * dynamic scalar values that are read from device-side params should not
+         * change this signature unless they also alter grid/block/smem shape.
+         */
+        virtual uint64_t graphCaptureVariantSignature() const { return 0; }
+
+        /**
+         * @brief Whether warmup can make a cold stage graph-capturable.
+         *
+         * Stages return true here when their backend and shape support graph
+         * capture in principle, but their cold isGraphCapturable() answer may
+         * remain false until the first warmup execution creates runtime tables,
+         * descriptor banks, kernels, or scratch. The segmented planner may place
+         * these stages in capturable segments before warmup; the capture phase
+         * then hard-fails if isGraphCapturable() is still false.
+         */
+        virtual bool supportsWarmupDependentGraphCapture() const { return false; }
+
+        /**
+         * @brief Whether a capturable stage must start a fresh graph segment.
+         *
+         * Return true for stages that are graph-capturable on their own but
+         * cannot safely be fused after earlier captured work on a backend.
+         */
+        virtual bool requiresGraphCaptureSegmentBoundaryBefore() const { return false; }
+
+        /**
+         * @brief Whether a capturable stage must terminate its graph segment.
+         *
+         * Most capturable stages can be coalesced freely. Some stages are
+         * graph-capturable on their own but carry backend replay state, captured
+         * H2D parameter nodes, or callbacks that make fusing a following stage
+         * into the same GPU graph unsafe on a backend. Such stages should return
+         * true here so the planner starts a fresh segment for the next stage
+         * while still graph-capturing this stage.
+         */
+        virtual bool requiresGraphCaptureSegmentBoundaryAfter() const { return false; }
+
+        /**
+         * @brief Whether this manual stage must complete before a following graph segment may run.
+         *
+         * Segmented GPU graph execution runs non-capturable stages between
+         * captured graph segments. Sparse MoE dispatch/return stages are manual
+         * collective boundaries: a later captured continuation segment must not
+         * consume their outputs until every participant has completed the same
+         * collective key.
+         */
+        virtual bool isManualGraphBoundary() const { return false; }
+
+        /**
+         * @brief True when the last manual boundary execution completed globally.
+         *
+         * Only meaningful when isManualGraphBoundary() is true. Direct normal
+         * execution may still accept an incomplete nonblocking collective result,
+         * but segmented graph replay uses this to stop before launching the next
+         * captured segment.
+         */
+        virtual bool manualGraphBoundaryComplete() const { return true; }
+
+        /**
+         * @brief True when the stage captured mutable verifier-row state.
+         *
+         * MTP verifier forwards may compute multiple candidate rows in one
+         * graph. Stages with recurrent model state can snapshot their state
+         * after each row so rollback can restore the accepted prefix without
+         * replaying the main graph.
+         */
+        virtual bool hasVerifierStateCapture() const { return false; }
+
+        /**
+         * @brief True when missing verifier state capture makes publication unsafe.
+         *
+         * Some stages own mutable recurrent state that must be restored from
+         * an accepted verifier row for MTP state publication to be
+         * decode-equivalent.  Returning true here turns a missing capture slot
+         * into a hard publication error when the caller requires captured
+         * stage state, instead of silently skipping the stage and allowing a
+         * later continuation token to drift.
+         */
+        virtual bool requiresVerifierStateCaptureForPublication() const { return false; }
+
+        /**
+         * @brief Restore mutable model state captured after a verifier row.
+         *
+         * The row is zero-based within the most recent all-position verifier
+         * forward. Implementations should restore only stage-owned mutable
+         * model state; KV truncation and runner bookkeeping are handled above.
+         */
+        virtual bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr)
+        {
+            (void)row;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore mutable model state captured after a verifier row chosen on device.
+         *
+         * Device-resident stochastic MTP publication receives accepted-count
+         * metadata in GPU memory.  Stages that implement this method must read
+         * @p device_row_index on @p stream and restore the corresponding
+         * captured row without synchronizing that index or mutable stage state
+         * to the host. This is the device-owned hot path used by resident MTP
+         * publication; host mirror refresh must be a separate explicit action.
+         */
+        virtual bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream)
+        {
+            (void)device_row_index;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Restore one captured verifier row for each request in a batch.
+         *
+         * Batched device-resident MTP publication receives a device array of
+         * accepted verifier rows. Implementations that override this method
+         * must read `device_row_indices[request * row_index_stride]` on
+         * @p stream and restore that request's mutable model state into a
+         * request-owned live-state slot. A negative row index means that
+         * request accepted no verifier row and its live state must be left at
+         * the pre-verifier value. This is not equivalent to looping
+         * restoreVerifierStateCaptureRowFromDeviceIndex(): scalar restore would
+         * overwrite one layer-owned state buffer and leak state between
+         * requests.
+         *
+         * The default is a hard failure so backends cannot quietly opt into
+         * request batching before their capture layout and live-state ownership
+         * are request-aware.
+         */
+        virtual bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream)
+        {
+            (void)device_row_indices;
+            (void)request_count;
+            (void)row_index_stride;
+            (void)stream;
+            return false;
+        }
+
+        /**
          * @brief Whether this stage allows all-zero output tensors
          *
          * By default, all-zero outputs are treated as bugs (likely uninitialized
@@ -598,8 +794,10 @@ namespace llaminar2
          * When GPU graph capture is active, the executor sets this to the
          * capture stream so all GPU kernels submit work on the correct stream.
          * The pointer is backend-agnostic: cast to hipStream_t (ROCm) or
-         * cudaStream_t (CUDA) as needed. nullptr means "use default/legacy
-         * stream" (backward compatible).
+         * cudaStream_t (CUDA) as needed. New GPU stages must treat nullptr as
+         * "no explicit stream was assigned" and fail before launching GPU work
+         * that requires stream ordering; the device-default stream is not a
+         * valid fallback for graph-capturable execution.
          *
          * @param stream Opaque GPU stream pointer (hipStream_t / cudaStream_t as void*)
          */
@@ -632,6 +830,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Refresh explicit host position rows before cached graph replay.
+         *
+         * The forward graph cache reuses stage objects while token and position
+         * inputs change every decode step.  Most stages ignore explicit
+         * position rows; RoPE consumes them to preserve request-batched or
+         * otherwise non-contiguous absolute positions without rebuilding the
+         * graph.
+         */
+        virtual void updateDynamicPositionIds(const int *position_ids, int seq_len)
+        {
+            (void)position_ids;
+            (void)seq_len;
+        }
+
+        /**
+         * @brief Refresh device-resident position rows before cached graph replay.
+         *
+         * GPU MTP publication can keep logical continuation positions in device
+         * workspace memory.  Stages that understand this contract must bind the
+         * pointer on their explicit graph stream and must not copy it through
+         * host memory.  The default implementation is a no-op for stages that
+         * do not consume RoPE-style positions.
+         */
+        virtual void updateDynamicDevicePositionIds(const void *position_ids_device, int seq_len)
+        {
+            (void)position_ids_device;
+            (void)seq_len;
+        }
+
+        /**
+         * @brief Return whether replay can use device-resident position rows without a host scalar.
+         *
+         * Phase 10 MTP publication keeps accepted logical positions in a
+         * runner-owned device mailbox.  A stage that returns true here promises
+         * that, after updateDynamicDevicePositionIds() is called, any later
+         * updateDynamicParams() call either ignores its scalar position
+         * argument or derives equivalent metadata from device-resident state on
+         * the explicit stage stream.  Stages that still need a host position
+         * must keep the default false result so resident replay hard-fails
+         * instead of silently reading stale host shadows.
+         */
+        virtual bool supportsDeviceResidentDynamicPositionReplay() const
+        {
+            return false;
+        }
+
+        /**
          * @brief Returns true if this stage overrides updateDynamicParams().
          *
          * Used by DeviceGraphOrchestrator to precompute a list of stages
@@ -639,6 +884,139 @@ namespace llaminar2
          * ~339 stages with hash lookups on every decode step.
          */
         virtual bool hasDynamicParams() const { return false; }
+
+        /**
+         * @brief Reset request-scoped stage state without discarding the graph.
+         *
+         * Cached ComputeGraphs persist across prompt boundaries, so any stage
+         * state that depends on the previous request must be cleared when the
+         * orchestrator runs clear_cache(). Topology, tensor bindings, workspace
+         * bindings, and model weights must remain intact so graph reuse still
+         * works. Derived stages should reset only dynamic host metadata and
+         * kernel stream bindings here.
+         */
+        virtual void resetSessionState()
+        {
+            gpu_stream_ = nullptr;
+        }
+
+        /**
+         * @brief Reset request-scoped state while preserving captured replay metadata.
+         *
+         * A normal session reset may intentionally mark warmup-dependent
+         * backend metadata cold so the next execution warms and captures again.
+         * This hook is used only when the caller is keeping an already
+         * instantiated GPU graph executable alive across a request boundary.
+         * Derived stages must clear stream ownership and transient request
+         * mirrors, but must not invalidate descriptor tables, pointer slots, or
+         * other device metadata that the preserved graph launch reads by
+         * address. The default remains conservative for stages without a
+         * narrower contract.
+         */
+        virtual void resetSessionStatePreservingCapturedReplay()
+        {
+            resetSessionState();
+        }
+
+        /**
+         * @brief Reset request-scoped state while preserving lazy initialization.
+         *
+         * This is used for prefill buckets that warmed lazy kernels, descriptor
+         * banks, or workspace-backed helper allocations, but did not produce a
+         * graph executable before a request boundary. Implementations should
+         * clear host mirrors, dynamic stream ownership, per-request scalar
+         * values, and capture-arming flags while keeping model-weight
+         * preparations and backend objects that are safe to reuse before a
+         * fresh strict capture-readiness preflight.
+         */
+        virtual void resetSessionStatePreservingLazyInitialization()
+        {
+            resetSessionState();
+        }
+
+        /**
+         * @brief Update prefill replay bookkeeping before a captured graph launch.
+         *
+         * The executor calls this on cached prefill graph hits before normal
+         * dynamic params are refreshed and before capture/replay callbacks can
+         * run. Decode graph replay continues to use updateDynamicParams() only.
+         * Stages should ignore this unless their dynamic device metadata or
+         * host-side replay callback must distinguish real tokens from padded
+         * bucket rows.
+         *
+         * @param params Real-token and bucket metadata for the upcoming prefill replay.
+         */
+        virtual void updatePrefillReplayParams(const PrefillReplayParams &params)
+        {
+            (void)params;
+        }
+
+        /**
+         * @brief Returns true if this stage consumes updatePrefillReplayParams().
+         *
+         * Used by the forward graph cache to precompute a small stage list and
+         * avoid scanning every graph node before each cached prefill launch.
+         */
+        virtual bool hasPrefillReplayParams() const { return false; }
+
+        /**
+         * @brief Whether this stage can safely execute padded prefill buckets.
+         *
+         * Stateful prefill stages such as GDN recurrence and short convolution
+         * may run fixed bucket-shaped kernels, but their recurrent state must
+         * commit as though only the real prompt prefix executed. Stages return
+         * true here only when their backend implements that real-length
+         * contract for graph replay.
+         */
+        virtual bool supportsPaddedPrefillRealLengthContract() const { return false; }
+
+        /**
+         * @brief Whether cold padded-prefill graph preflight may allow this stage.
+         *
+         * Padded bucket preflight can run before the first normal warmup pass,
+         * while some stages intentionally allocate kernels, descriptor tables,
+         * or scratch buffers during that warmup. Such stages should return true
+         * here when their backend and shape support fixed-bucket prefill capture
+         * in principle, and keep isGraphCapturable() as the stricter
+         * capture-time readiness check.
+         *
+         * The default preserves legacy behavior for existing stages: if a stage
+         * has no separate cold-support contract, padded preflight still requires
+         * normal graph-capture readiness.
+         */
+        virtual bool supportsPaddedPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
+
+        /**
+         * @brief Prepare mutable device metadata before a captured graph launch.
+         *
+         * Device graphs may read tiny metadata buffers whose contents change
+         * between launches while the graph topology stays fixed, such as
+         * row-select indices for bucketed prefill or compact verifier rows.
+         * The executor calls this after it has rebound workspace ownership and
+         * assigned an explicit stream, but before starting capture or replaying
+         * an already captured segment. Implementations may enqueue small
+         * workspace uploads on @p stream, but must not allocate ad-hoc device
+         * memory or synchronize the device.
+         *
+         * @param ctx Device context for the launch.
+         * @param stream Explicit backend stream used for the upcoming launch.
+         * @return true on success.
+         */
+        virtual bool prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+        {
+            (void)ctx;
+            if (stream)
+                setGPUStream(stream);
+            return true;
+        }
+
+        /**
+         * @brief Whether this stage needs prepareGraphLaunch() callbacks.
+         *
+         * Used by graph replay/capture code to avoid calling the hook on every
+         * stage in hot paths.
+         */
+        virtual bool needsGraphLaunchPreparation() const { return false; }
 
         /**
          * @brief Called after a captured GPU graph segment is replayed.

@@ -5,7 +5,7 @@
  * @date December 19, 2025
  *
  * This interface defines the contract for building compute graphs in a
- * declarative, stateless manner. Model-specific implementations (Qwen2Graph,
+ * declarative, stateless manner. Model-specific implementations (QwenStandardGraph,
  * Qwen3Graph, LlamaGraph, etc.) derive from this interface.
  *
  * Design Principles:
@@ -22,6 +22,9 @@
 #include "../../../models/GraphTypes.h"
 #include "../../../backends/DeviceId.h"
 
+#include <memory>
+#include <vector>
+
 namespace llaminar2
 {
 
@@ -35,6 +38,10 @@ namespace llaminar2
     struct PipelineConfig;
     class ILocalPPContext;
     class ILocalTPContext;
+    class ITPContext;
+    class PreparedWeightStore;
+    class IModelContext;
+    struct PrefixFingerprintMaterial;
 
     // =========================================================================
     // Generic Input/Output Structures
@@ -49,10 +56,35 @@ namespace llaminar2
     struct ForwardInput
     {
         const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
-        const int *position_ids = nullptr; ///< Position IDs [batch_size * seq_len]
+        /**
+         * @brief Optional device-resident INT32 token IDs.
+         *
+         * GPU verifier and sidecar graphs can use this to keep token IDs in
+         * arena/workspace memory across graph capture/replay. When this pointer
+         * is set, embedding stages treat it as the execution source of truth;
+         * `token_ids` may still be populated as a stable host shadow for logs,
+         * cache bookkeeping, and CPU-only helpers.
+         */
+        const void *token_ids_device = nullptr;
+        const int *position_ids = nullptr; ///< Host position IDs [batch_size * seq_len]
+        /**
+         * @brief Optional device-resident INT32 position IDs.
+         *
+         * Phase 10 resident MTP continuation can publish the next logical
+         * positions directly in device memory.  GPU RoPE stages should consume
+         * this pointer without recording a host-to-device copy.  The host
+         * `position_ids` pointer may still be set for CPU execution, logging,
+         * and graph-key bookkeeping, but device execution must treat this
+         * pointer as the source of truth when it is present.
+         */
+        const void *position_ids_device = nullptr;
         int batch_size = 1;                ///< Number of sequences
         int seq_len = 0;                   ///< Sequence length per batch
         int position_offset = 0;           ///< KV cache position offset (legacy fallback)
+        int real_seq_len = 0;              ///< Real tokens in a bucketed prefill chunk (0 = seq_len)
+        int bucket_seq_len = 0;            ///< Fixed bucket length for graph shape (0 = seq_len)
+        int token_offset = 0;              ///< Chunk offset within the original prompt
+        int prefill_chunk_index = 0;       ///< Stable chunk ordinal for chunked graph-captured prefill.
         DeviceId device = DeviceId::cpu(); ///< Target device
         IKVCache *kv_cache = nullptr;      ///< KV cache (optional)
 
@@ -121,7 +153,8 @@ namespace llaminar2
         int seq_len = 0;                   ///< Sequence length
         int batch_size = 1;                ///< Batch size (number of sequences)
         DeviceId device = DeviceId::cpu(); ///< Target device
-        const int *position_ids = nullptr; ///< Position IDs for RoPE
+        const int *position_ids = nullptr; ///< Host position IDs for RoPE
+        const void *position_ids_device = nullptr; ///< Device INT32 position IDs for GPU RoPE
         IKVCache *kv_cache = nullptr;      ///< KV cache
         /// Sequence lengths for variable-length batching (nullptr = all equal)
         const std::vector<int> *sequence_lengths = nullptr;
@@ -142,7 +175,7 @@ namespace llaminar2
      *
      * Example usage:
      * @code
-     * std::unique_ptr<IGraphBuilder> builder = std::make_unique<Qwen2Graph>(...);
+     * std::unique_ptr<IGraphBuilder> builder = std::make_unique<QwenStandardGraph>(...);
      * ForwardInput input{...};
      * ForwardOutput output{...};
      * ComputeGraph graph = builder->buildForwardGraph(input, output);
@@ -182,6 +215,19 @@ namespace llaminar2
          */
         virtual ComputeGraph buildLayerGraph(const LayerContext &ctx) = 0;
 
+        virtual ComputeGraph buildMTPGraph(
+            int depth_idx,
+            const MTPDepthWeightBindings &bindings,
+            const MTPForwardInput &input,
+            MTPForwardOutput &output)
+        {
+            (void)depth_idx;
+            (void)bindings;
+            (void)input;
+            (void)output;
+            return {};
+        }
+
         // =====================================================================
         // Optional Methods (with default implementations)
         // =====================================================================
@@ -217,6 +263,12 @@ namespace llaminar2
         /// Get the architecture name (e.g. "qwen2", "qwen3", "llama")
         virtual std::string architectureName() const { return "unknown"; }
 
+        /// Append model-owned prefix-cache fingerprint material, such as MoE placement.
+        virtual void appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
+        {
+            (void)material;
+        }
+
         // =====================================================================
         // Weight / Buffer Management
         // =====================================================================
@@ -224,11 +276,50 @@ namespace llaminar2
         /// Set model weights
         virtual void setWeights(const ModelWeights &weights) = 0;
 
+        /// Set frozen model-weight bindings for graph-build validation and diagnostics.
+        virtual void setWeightBindings(const ModelWeightBindings &bindings) { (void)bindings; }
+
         /// Set activation buffers (for manual buffer management)
         virtual void setBuffers(const ModelBuffers &buffers) = 0;
 
         /// Set buffer arena for arena-managed allocation
         virtual void setArena(BufferArena *arena) { (void)arena; }
+
+        /// Set prepared weight store for kernel lifecycle management (Phase 10)
+        virtual void setPreparedWeightStore(PreparedWeightStore *store) { (void)store; }
+
+        /// Enable or disable all-position LM-head logits for speculative verification.
+        virtual bool setComputeAllPositionLogits(bool enabled)
+        {
+            (void)enabled;
+            return false;
+        }
+
+        /// Enable compact row-indexed all-position verifier logits.
+        virtual bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count)
+        {
+            (void)enabled;
+            (void)row_count;
+            return false;
+        }
+
+        /**
+         * @brief Set the source rows used by compact row-indexed verifier logits.
+         *
+         * Empty means "use the default leading rows". A non-empty vector must
+         * contain exactly the row count configured by
+         * setComputeRowIndexedAllPositionLogits(). Device runners install this
+         * from the MTP verifier metadata plan before building the verifier graph,
+         * so CPU and GPU graph paths consume the same logical row plan even when
+         * GPU stages later read the indices from workspace memory during replay.
+         */
+        virtual bool setRowIndexedAllPositionLogitRows(const std::vector<int> &selected_rows)
+        {
+            return selected_rows.empty();
+        }
+
+        /// Set model context for registry-created builders in tests/dependency injection.
+        virtual void setModelContext(std::shared_ptr<IModelContext> model_ctx) { (void)model_ctx; }
 
         /// Get current activation buffers
         virtual const ModelBuffers &buffers() const = 0;
@@ -266,7 +357,7 @@ namespace llaminar2
         }
 
         /// Register a TP context for a named domain
-        virtual void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx)
+        virtual void setTPContext(const std::string &domain_name, ITPContext *tp_ctx)
         {
             (void)domain_name;
             (void)tp_ctx;
@@ -338,7 +429,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr)
+            const std::vector<int> *sequence_lengths = nullptr,
+            const void *position_ids_device = nullptr)
         {
             (void)layer;
             (void)buffers;
@@ -347,6 +439,7 @@ namespace llaminar2
             (void)batch_size;
             (void)kv_cache;
             (void)position_ids;
+            (void)position_ids_device;
             (void)device;
             (void)sequence_lengths;
             return {};
@@ -554,6 +647,9 @@ namespace llaminar2
             num_layers_ = cfg.n_layers;
             hidden_dim_ = cfg.d_model;
         }
+
+        /// Access stored weights (for test assertions after setWeights())
+        const ModelWeights &storedWeights() const { return weights_; }
 
         // =====================================================================
         // Call Tracking (for test assertions)

@@ -1,540 +1,689 @@
 # Prefix Cache Project Plan
 
-**Status**: Planning  
+**Status**: New implementation plan, revised for dense, hybrid attention, and Qwen 3.5 MoE models  
+**Date**: 2026-04-26  
 **Priority**: High (server throughput multiplier)  
-**Scope**: New subsystem — additive, no existing API changes
+**Scope**: New persistent prefix-state cache for cross-request reuse, with RAM-backed capacity as an early feature
 
-## Motivation
+## Summary
 
-In server mode, Llaminar clears the KV cache between every HTTP request. Many requests share identical prefixes — system prompts, few-shot examples, tool definitions — often 500–2000 tokens. Today every request recomputes the full prefix KV from scratch.
+Llaminar currently clears request-local inference state before every server request. This is correct for isolation, but expensive for chat workloads where many requests share the same system prompt, tool definitions, few-shot examples, or conversation prefix.
 
-With prefix caching, a 2000-token system prompt is computed **once** and reused across all subsequent requests. For a typical chat workload where the system prompt is 80% of the input, this eliminates ~80% of prefill computation.
+The prefix cache should make repeated prefixes cheap by storing reusable **prefix state snapshots** at fixed token block boundaries. For dense transformer models, a snapshot is mostly full-attention KV. For hybrid attention models such as Qwen 3.5, a snapshot must also include GDN recurrence and short-convolution state. For Qwen 3.5 MoE variants, the cache must additionally be keyed by MoE execution placement/version so rebalanced expert layouts do not silently change numerics.
 
-### Prior Art
+Because the intended deployment target includes consumer GPUs with 24-32 GB of VRAM, the first practical implementation cannot rely on device memory as the main cache capacity. The early design should use **RAM as the primary capacity tier** and treat VRAM/HBM as a small optional hot tier for the most frequently reused blocks. Disk-backed persistence can come later once the snapshot format and promotion path are stable.
 
-| System | Approach | Granularity | Detection | Eviction |
-|--------|----------|-------------|-----------|----------|
-| **llama.cpp** | Seq bitmask sharing | Per-token | Manual (`seq_cp`) | Implicit ref-count + SWA |
-| **vLLM** | Hash-chain block pool | Per-block (16 tok) | Automatic (content hash) | LRU doubly-linked list |
-| **Llaminar (proposed)** | Hash-chain block cache on top of ring buffer | Per-block (64 tok) | Automatic (content hash) | LRU doubly-linked list |
+The core design remains vLLM-style hash-chain prefix detection, but the payload is generalized from "KV blocks" to "model prefix state".
 
-We adopt vLLM's automatic hash-chain approach but layer it on top of our existing ring buffer rather than replacing the cache architecture. This preserves all existing kernel, stage, and graph capture compatibility.
+## Current Code Anchors
 
-## Architecture Overview
+The current V2 codebase already gives us most of the places to integrate:
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                    PrefixBlockCache                       │
-│  (persistent across requests, lives in VRAM / host RAM)   │
-│                                                           │
-│  ┌─────────────┐  ┌──────────────────┐  ┌──────────────┐ │
-│  │ BlockHasher  │  │  BlockPool       │  │ LRU Evictor  │ │
-│  │ (xxHash-128  │  │  (pre-allocated  │  │ (doubly-     │ │
-│  │  hash-chain) │  │   K/V storage)   │  │  linked list)│ │
-│  └─────────────┘  └──────────────────┘  └──────────────┘ │
-│                                                           │
-│  hash_map: BlockHash → PrefixBlock*                       │
-│  Operations: lookup / store / evict                       │
-└─────────────────────┬─────────────────────────────────────┘
-                      │
-             populate / harvest
-                      │
-┌─────────────────────▼─────────────────────────────────────┐
-│               IKVCache (ring buffer)                       │
-│  (per-request, cleared between requests)                   │
-│  Unchanged API — stages and kernels see no difference      │
-└───────────────────────────────────────────────────────────┘
-```
+| Area | Current State | Implication |
+|------|---------------|-------------|
+| Server lifecycle | `ServerMode` serializes requests with a mutex; `ChatCompletionHandler::setupInference()` calls `runner_.clearCache()` before every request | Cross-request prefix reuse can be added without concurrent mutation in the first version |
+| Runner lifecycle | `OrchestrationRunner::prefill()` calls `runner_->forward(prompt_tokens.data(), prompt_tokens.size())`; first `decodeStep()` samples from prefill logits instead of re-feeding the last prompt token | Prefix cache must preserve prefill-logits semantics |
+| Local execution | `DeviceGraphOrchestrator::forward()` builds position IDs from `state_.positions`; `clearInferenceState()` clears KV and request-local graph caches | Prefix cache storage must live outside request-local graph caches |
+| KV cache | `IKVCache` supports `get_kv()`, `append()`, `clear()`, graph-capture head helpers, multiple precisions, sharding, and layouts | Add a narrow logical block import/export API instead of copying assumed tensor rows directly |
+| Hybrid state | `IHybridKVCache` exposes GDN state and kernels; `HybridGDNLayerState` owns recurrence and conv host vectors; CUDA/ROCm kernels also keep device state | Add snapshot/restore APIs that include both host and device-resident GDN state |
+| Qwen 3.5 graph | `Qwen35Graph` dispatches FA vs GDN layers from `layer_types`; FA uses ring KV, GDN uses hybrid cache state | Prefix cache must restore both FA and GDN state before suffix execution |
+| MoE | `MoERoutingStage`, `MoEExpertComputeStage`, `MoERebalanceController`, expert masks and replicas can change runtime expert placement | Prefix cache key must include a MoE placement/version fingerprint, or cache must invalidate on rebalance |
+| Config | `OrchestrationConfigParser` uses `CliSpec`; dry-run exits before model load | Prefix flags go through `CliSpec`; exact capacity is reported after metadata is available |
 
-### Design Principles
+## Goals
 
-1. **Ring buffer stays unchanged** — attention kernels, append stages, and graph capture are unaffected
-2. **Additive, not invasive** — new files, minimal modifications to existing code
-3. **Device-aware** — prefix blocks live on the same device as the KV cache (VRAM for GPU, host RAM for CPU)
-4. **Precision-agnostic** — stores raw bytes; works with FP16, BF16, Q8_1, TQ4, etc.
-5. **Hybrid-cache compatible** — only caches FA layers for Qwen 3.5-style models (GDN layers have recurrent state, not cacheable)
+1. Reuse shared request prefixes across HTTP requests without changing model outputs.
+2. Support dense full-attention models, hybrid FA+GDN models, and Qwen 3.5 MoE variants.
+3. Keep attention kernels, compute stages, and graph execution semantics intact.
+4. Make the hot path predictable: hash lookup plus RAM-to-device restore or device-local block copies, no dynamic allocation during suffix execution.
+5. Preserve request isolation: `clearCache()` resets request-local state but not the persistent prefix cache.
+6. Provide a RAM-backed cache early enough to make prefix caching useful on 24-32 GB consumer GPUs.
+7. Keep prefix caching disabled by default until parity and stress tests pass for each supported model class.
 
-## Key Concepts
+## Non-Goals
 
-### Hash-Chain Block Hashing
+- Cross-process shared prefix cache in the first version.
+- Disk-backed cache in the first version. Disk should be a later backend after RAM and device promotion are correct.
+- Concurrent request mutation in the first version. Server inference is currently serialized.
+- Pointer-swapping the request ring buffer. We copy into the existing ring/cache state so graph capture and kernels continue to see normal request-local storage.
+- Caching arbitrary partial blocks. Only complete blocks are cached; trailing tokens are recomputed.
 
-Each block's hash depends on the **previous block's hash**, creating a chain that ensures only true prefixes match:
+## Model Support Strategy
 
-```
-tokens:  [t₀ t₁ ... t₆₃] [t₆₄ t₆₅ ... t₁₂₇] [t₁₂₈ ...]
-           Block 0              Block 1            Block 2
+| Model Class | Prefix Payload | Initial Support Target |
+|-------------|----------------|------------------------|
+| Dense full attention | FA KV blocks, optional terminal logits, stored primarily in RAM | Phase 3 |
+| Hybrid FA+GDN, such as Qwen 3.5 | FA KV blocks plus GDN recurrence and conv state snapshot, stored primarily in RAM | Phase 6 |
+| Qwen 3.5 MoE | Hybrid payload plus MoE placement/version fingerprint | Phase 7 |
 
-hash₀ = H(SEED,  tokens[0:64])
-hash₁ = H(hash₀, tokens[64:128])    ← depends on hash₀
-hash₂ = H(hash₁, tokens[128:192])   ← depends on hash₁
-```
+Dense and hybrid models use the same lookup and LRU mechanics. The difference is what gets snapshotted at each matched block boundary.
 
-Identical tokens at different positions produce different hashes — only true shared prefixes match. This is the same approach as vLLM.
+## Core Concept: Prefix State Snapshot
 
-### Block Size: 64 Tokens
+A prefix block is identified by a hash-chain key and stores the exact model state after processing that block.
 
-We use 64-token blocks (vs vLLM's 16) because our populate/harvest operations are memcpy-based rather than pointer-based. Larger blocks mean:
-- Fewer hash computations and dict lookups
-- Fewer memcpy calls (each copy is larger but there are fewer of them)
-- Slightly coarser granularity (worst case: recompute up to 63 tokens that could have been cached)
-- Better amortization of per-block metadata overhead
+For a 64-token block size:
 
-Block size is configurable for tuning.
-
-### Block Lifecycle
-
-```
- FREE (in LRU eviction queue)
-   │
-   │ allocate_block() during harvest
-   ▼
- ALLOCATED (ref_cnt=1, KV data being copied in)
-   │
-   │ insert(hash, block) — added to hash map
-   ▼
- CACHED + IN-USE (ref_cnt≥1, in hash map, removed from LRU queue)
-   │
-   │ release() — request finishes
-   ▼
- CACHED + EVICTABLE (ref_cnt=0, in hash map AND LRU queue)
-   │                    ↑
-   │ touch() on hit     │ release() again
-   ├────────────────────┘
-   │
-   │ evict() — memory pressure
-   ▼
- FREE (hash cleared, back in LRU queue)
+```text
+tokens:    [0..63]       [64..127]       [128..191]
+hash:      H(seed,b0) ->  H(h0,b1)  ->   H(h1,b2)
+snapshot:  state@64       state@128       state@192
 ```
 
-## Data Structures
+When a future request has the same first 192 tokens, Llaminar can restore `state@192`, set positions to 192, and run prefill only for the suffix.
 
-### PrefixBlock
+For dense models, `state@N` is full-attention KV for tokens `0..N-1`. For Qwen 3.5, `state@N` is full-attention KV for FA layers plus all GDN recurrence and convolution state after token `N-1`. For MoE variants, expert routing is stateless, but the cache key must ensure the same expert placement/version is active when the snapshot is reused.
+
+## Cache Key
+
+The hash-chain token hash alone is not enough. A prefix state is reusable only if the model, execution layout, and state semantics match.
 
 ```cpp
-struct PrefixBlock {
-    int block_id;                          // Index in block pool
-    int ref_cnt = 0;                       // Active references
-    BlockHash block_hash;                  // Content hash (0 if free)
-
-    // Per-layer K/V storage (device pointers for GPU, host pointers for CPU)
-    // Layout: [block_size × kv_dim] per layer, contiguous
-    void* k_data;                          // Points into block pool allocation
-    void* v_data;                          // Points into block pool allocation
-
-    // LRU doubly-linked list pointers
-    PrefixBlock* lru_prev = nullptr;
-    PrefixBlock* lru_next = nullptr;
+struct PrefixCacheKey {
+    BlockHash content_hash;        // Hash-chain token content
+    uint64_t model_fingerprint;    // Model path, architecture, GGUF metadata, vocab/tokenizer version
+    uint64_t runtime_fingerprint;  // KV precision, layout, rope_on_read, activation mode, backend family
+    uint64_t topology_fingerprint; // TP/PP degree, rank shard, local device, first layer, local KV heads
+    uint64_t hybrid_fingerprint;   // Layer types and GDN dimensions; zero for dense
+    uint64_t moe_fingerprint;      // Expert placement/version/replica mask; zero for non-MoE
+    uint32_t block_index;          // Defensive; hash chain should imply this, but store explicitly
 };
 ```
 
-### BlockHash
+### Fingerprint Rules
+
+- `model_fingerprint` must include tokenizer/template identity. A different chat template can produce different token IDs, but including it prevents confusing cache diagnostics.
+- `runtime_fingerprint` must include `ActivationPrecision`, K/V cache precision, `TensorLayout`, RoPE-on-read, and quantization mode such as TQ4 or split TQ.
+- `topology_fingerprint` must differ per TP shard and PP slice. Each shard stores only its local payload.
+- `hybrid_fingerprint` must include `layer_types`, `gdn.state_size`, `gdn.inner_size`, `gdn.group_count`, `gdn.time_step_rank`, and `gdn.conv_kernel_size`.
+- `moe_fingerprint` must change when dynamic expert masks, ownership, replicas, or placement epoch change. Safest first behavior: invalidate or bypass prefix cache when `MoERebalanceMode::DYNAMIC` changes placement.
+
+## Payload Layout
 
 ```cpp
-// 128-bit hash (xxHash-128 output)
-struct BlockHash {
-    uint64_t low;
-    uint64_t high;
+enum class PrefixStorageTier {
+    DEVICE_HOT,  // Optional VRAM/HBM resident copy for very hot blocks
+    RAM,         // Primary capacity tier for the early implementation
+    DISK         // Later extension, not in the first implementation
+};
 
-    bool operator==(const BlockHash& o) const;
-    struct Hasher { size_t operator()(const BlockHash& h) const; };
+struct PrefixStateBlock {
+    PrefixCacheKey key;
+    int block_id = -1;
+    int token_count = 0;           // Complete block size, normally 64
+    int ref_count = 0;
+    PrefixStorageTier resident_tier = PrefixStorageTier::RAM;
 
-    static constexpr BlockHash SEED = {0, 0};
+    PrefixPayloadLayout layout;
+
+    // Dense and FA portion of hybrid models.
+    void* kv_storage = nullptr;
+    size_t kv_storage_bytes = 0;
+
+    // Hybrid-only state after this block.
+    void* hybrid_state_storage = nullptr;
+    size_t hybrid_state_bytes = 0;
+
+    // Optional. Used only when this block is a terminal complete prompt.
+    void* terminal_logits = nullptr;
+    size_t terminal_logits_bytes = 0;
+
+    PrefixStateBlock* lru_prev = nullptr;
+    PrefixStateBlock* lru_next = nullptr;
 };
 ```
 
-### PrefixBlockCache
+## Storage Architecture
+
+Prefix-cache storage should be tiered from the beginning, but only the first two tiers are required for the initial production feature:
+
+| Tier | Role | Backing | Initial Status |
+|------|------|---------|----------------|
+| L1 device hot cache | Fastest restore for the hottest blocks | VRAM/HBM on the local device | Optional early optimization, small budget |
+| L2 RAM cache | Primary capacity tier for useful prefix reuse on consumer GPUs | Host memory, preferably pinned for GPU restore paths | Required in Phase 3 |
+| L3 disk cache | Large persistent cache across process restarts | Local NVMe directory | Future extension |
+
+The RAM tier is the source of truth for early prefix caching. A device-resident block is only a promotion of a RAM block, not the only copy. This keeps capacity useful on 24-32 GB devices and avoids using scarce VRAM for cold prefixes.
+
+Recommended early policy:
+
+1. Store new blocks in RAM after harvest.
+2. Promote a block to the device hot tier after repeated hits or when a request is actively restoring it.
+3. Keep the device hot tier small and evictable under pressure from KV cache, weights, workspace, or graph capture needs.
+4. Never require device-tier residency for correctness; every cache hit must be restorable from RAM.
+5. Use pinned host allocations for RAM blocks when the active backend is CUDA/ROCm and the configured RAM budget is not too large. Fall back to pageable RAM if pinned allocation fails.
+
+This yields a simple restore path:
+
+```text
+lookup block
+if block is in device hot tier:
+    import from device block into request-local KV/GDN state
+else:
+    import from RAM block into request-local KV/GDN state
+    optionally promote to device hot tier
+run suffix prefill
+```
+
+Disk should reuse the same abstraction later, but with an explicit deserialize-and-promote step into RAM before device restore.
+
+### Storage Backend Interface
+
+The cache manager should depend on a narrow storage interface rather than embedding allocation policy in `PrefixStateCache`:
 
 ```cpp
-class PrefixBlockCache {
+struct PrefixBlockHandle {
+    PrefixCacheKey key;
+    PrefixStorageTier tier;
+    void* kv_payload = nullptr;
+    void* hybrid_payload = nullptr;
+    void* logits_payload = nullptr;
+    size_t total_bytes = 0;
+};
+
+class IPrefixStorageBackend {
 public:
-    PrefixBlockCache(const PrefixCacheConfig& config,
-                     int n_layers, int kv_dim, int kv_element_size,
-                     DeviceId device);
-
-    // --- Core operations ---
-
-    // Find longest prefix match. Returns number of matched tokens.
-    // On hit, matched blocks have ref_cnt incremented.
-    int lookup(const BlockHash* block_hashes, int num_blocks,
-               std::vector<PrefixBlock*>& matched_blocks);
-
-    // Store completed blocks from ring buffer into cache.
-    void store(const BlockHash* block_hashes, int num_blocks,
-               const IKVCache& source_cache, int seq_idx);
-
-    // Release references (called when request completes).
-    void release(const std::vector<PrefixBlock*>& blocks);
-
-    // --- Memory management ---
-    int num_cached_blocks() const;
-    int num_free_blocks() const;
-    size_t memory_usage_bytes() const;
-
-    // --- Stats ---
-    struct Stats {
-        uint64_t lookups = 0;
-        uint64_t hits = 0;          // Block-level hits
-        uint64_t tokens_saved = 0;  // Tokens not recomputed
-        uint64_t evictions = 0;
-        uint64_t stores = 0;
-    };
-    const Stats& stats() const;
-
-private:
-    std::unordered_map<BlockHash, PrefixBlock*, BlockHash::Hasher> hash_map_;
-    LRUQueue lru_queue_;                   // Doubly-linked eviction list
-    std::vector<PrefixBlock> block_pool_;  // Pre-allocated block metadata
-    void* block_storage_;                  // Contiguous K/V memory allocation
-
-    PrefixCacheConfig config_;
-    int n_layers_, kv_dim_, kv_element_size_;
-    DeviceId device_;
-    Stats stats_;
-
-    PrefixBlock* allocate_block();         // Pop from LRU, may evict
-    void evict(PrefixBlock* block);        // Remove from hash map, reset
+    virtual ~IPrefixStorageBackend() = default;
+    virtual bool canStore(size_t bytes) const = 0;
+    virtual PrefixBlockHandle allocate(const PrefixCacheKey& key,
+                                       const PrefixPayloadLayout& layout) = 0;
+    virtual bool release(const PrefixBlockHandle& handle) = 0;
+    virtual bool copyToRequestState(const PrefixBlockHandle& handle,
+                                    IKVCache& kv_cache,
+                                    IHybridKVCache* hybrid_cache,
+                                    int cached_tokens) = 0;
 };
 ```
 
-### PrefixBlockHasher
+Initial backends:
+
+- `RamPrefixStorageBackend`: required; owns the main LRU capacity.
+- `DeviceHotPrefixStorageBackend`: optional; owns a small hot LRU and can be disabled by setting budget to zero.
+- `DiskPrefixStorageBackend`: future extension.
+
+### PrefixPayloadLayout
 
 ```cpp
-class PrefixBlockHasher {
-public:
-    explicit PrefixBlockHasher(int block_size = 64);
-
-    // Hash a token sequence into block hashes.
-    // Only complete blocks are hashed (trailing tokens ignored).
-    // Returns number of complete block hashes written.
-    int hash_blocks(const int* token_ids, int num_tokens,
-                    BlockHash* out_hashes, int max_blocks) const;
-
-    int block_size() const;
-
-private:
-    int block_size_;
+struct PrefixPayloadLayout {
+    DeviceId device;
+    ActivationPrecision k_precision;
+    ActivationPrecision v_precision;
+    TensorLayout kv_layout;
+    int first_layer_index = 0;
+    int total_layers = 0;
+    int fa_kv_layers = 0;
+    int gdn_layers = 0;
+    int local_kv_heads = 0;
+    int kv_head_start = 0;
+    int head_dim = 0;
+    int block_size = 64;
+    size_t bytes_per_fa_layer_k = 0;
+    size_t bytes_per_fa_layer_v = 0;
+    size_t bytes_per_gdn_snapshot = 0;
 };
 ```
 
-### PrefixCacheConfig
+## Required APIs
+
+### IKVCache Logical Block I/O
+
+`PrefixStateCache` should not know how each KV cache arranges rows, heads, quantized blocks, ring wrap, or device streams. Add backend-neutral block I/O to `IKVCache`:
 
 ```cpp
-struct PrefixCacheConfig {
-    bool enabled = false;
-    size_t memory_budget_mb = 512;     // Max memory for prefix cache
-    int block_size = 64;               // Tokens per block
-    // Computed at init:
-    // num_blocks = memory_budget / (n_layers * block_size * kv_dim * elem_size * 2)
+struct KVCacheBlockDescriptor {
+    int layer = 0;                 // Global layer index for hybrid caches
+    int seq_idx = 0;
+    int logical_token_start = 0;   // Oldest-to-newest logical index
+    int num_tokens = 0;
+    void* stream = nullptr;        // cudaStream_t / hipStream_t / nullptr
 };
+
+struct KVCacheBlockMetadata {
+    ActivationPrecision k_precision;
+    ActivationPrecision v_precision;
+    TensorLayout layout;
+    int local_kv_heads = 0;
+    int kv_head_start = 0;
+    int head_dim = 0;
+    size_t k_bytes = 0;
+    size_t v_bytes = 0;
+};
+
+virtual KVCacheBlockMetadata blockMetadata(int global_layer, int num_tokens) const;
+virtual bool exportLogicalBlock(const KVCacheBlockDescriptor& desc,
+                                void* dst_k, void* dst_v) const;
+virtual bool importLogicalBlock(const KVCacheBlockDescriptor& desc,
+                                const void* src_k, const void* src_v);
 ```
 
-## Integration Points
+Dense caches implement this directly. Hybrid caches remap FA global layer indices through `HybridLayerMap`; GDN layer export/import is handled by the hybrid-state API below, not KV block I/O.
 
-### Modified Files
+### IHybridKVCache Prefix State I/O
 
-| File | Change | LOC |
-|------|--------|-----|
-| `KernelFactory.h` | Add `PrefixCacheConfig` to `KVCacheConfig` | ~10 |
-| `DeviceGraphOrchestrator.h` | Add `PrefixBlockCache` member, `prefix_hasher_` member | ~10 |
-| `DeviceGraphOrchestrator.cpp` | Create prefix cache during init; wire populate/harvest into `forward()` and `clear_cache()` | ~80 |
-| `IInferenceRunner.h` | Add `prefix_cache_stats()` query method (optional) | ~5 |
-| `ChatCompletionHandler.cpp` | Log prefix cache hit rate in response headers (optional) | ~10 |
-| `OrchestrationConfig.h/cpp` | Add `--prefix-cache`, `--prefix-cache-budget` CLI flags | ~20 |
-| `DebugEnv.h` | Add `LLAMINAR_PREFIX_CACHE`, `LLAMINAR_PREFIX_CACHE_BUDGET_MB` env vars | ~5 |
-
-### New Files
-
-| File | Purpose | LOC |
-|------|---------|-----|
-| `src/v2/memory/prefix_cache/BlockHash.h` | 128-bit hash type + xxHash-128 wrapper | ~80 |
-| `src/v2/memory/prefix_cache/PrefixBlockHasher.h/cpp` | Hash-chain block hasher | ~100 |
-| `src/v2/memory/prefix_cache/PrefixBlock.h` | Block metadata struct | ~40 |
-| `src/v2/memory/prefix_cache/LRUQueue.h` | Doubly-linked eviction queue | ~120 |
-| `src/v2/memory/prefix_cache/PrefixBlockCache.h/cpp` | Main cache: hash map + pool + LRU + populate/harvest | ~500 |
-| `src/v2/memory/prefix_cache/PrefixCacheConfig.h` | Configuration struct | ~30 |
-| `tests/v2/unit/memory/Test__PrefixBlockHasher.cpp` | Hasher unit tests | ~150 |
-| `tests/v2/unit/memory/Test__LRUQueue.cpp` | LRU queue unit tests | ~100 |
-| `tests/v2/unit/memory/Test__PrefixBlockCache.cpp` | Cache logic unit tests (CPU) | ~300 |
-| `tests/v2/integration/Test__PrefixCacheE2E.cpp` | End-to-end server-style test | ~200 |
-
-### Unchanged (No Modifications Required)
-
-- `IKVCache.h` — interface unchanged
-- `CPURingKVCache.h` — ring buffer unchanged
-- `CUDARingKVCache.h/.cu` — ring buffer unchanged
-- `ROCmRingKVCache.h/.cpp` — ring buffer unchanged
-- `KVCacheAppendStage` — appends after pre-populated region, no change
-- `AttentionComputeStage` — reads from ring buffer as before
-- All attention kernels — see contiguous ring buffer data
-- CUDA/ROCm graph capture — ring buffer state populated before capture
-- Hybrid KV cache — prefix cache operates at ring buffer level
-
-## Populate and Harvest Operations
-
-### Populate (Cache → Ring Buffer)
-
-Called at the start of `forward()` before prefill. Copies cached KV blocks into the ring buffer so the model skips recomputing them.
-
-```
-populate(tokens, seq_len, kv_cache):
-    block_hashes = hasher.hash_blocks(tokens, seq_len)
-    matched = []
-    for hash in block_hashes:
-        block = cache.lookup(hash)
-        if block == null:
-            break                          // Chain broken — stop
-        matched.push(block)
-
-    if matched.empty():
-        return 0                           // Full miss
-
-    num_cached_tokens = matched.size() * block_size
-
-    for each matched block:
-        for layer in 0..n_layers:
-            offset = block_index * block_size * kv_dim * elem_size
-            // CPU: memcpy
-            // CUDA: cudaMemcpyAsync (D2D if both in VRAM)
-            // ROCm: hipMemcpyAsync
-            copy(kv_cache.K[layer] + offset, block.k_data + layer_offset, ...)
-            copy(kv_cache.V[layer] + offset, block.v_data + layer_offset, ...)
-        kv_cache.advance_head(block_size)  // Update ring buffer state
-
-    return num_cached_tokens
-```
-
-**Performance**: For a 2000-token prefix (31 blocks at size 64) on a 7B model with FP16 KV:
-- Per-block copy: `32 layers × 2 (K+V) × 64 tokens × 1024 dim × 2 bytes = 8 MB`
-- Total: `31 × 8 MB = 248 MB` copy, at ~50 GB/s PCIe → ~5 ms
-- vs recomputing 2000 tokens at ~300 tok/s → ~6700 ms
-- **Speedup: ~1300×** for the prefix portion
-
-### Harvest (Ring Buffer → Cache)
-
-Called after prefill completes (or at `clear_cache()` time). Copies computed KV blocks from the ring buffer into the prefix cache for future reuse.
-
-```
-harvest(tokens, seq_len, kv_cache):
-    block_hashes = hasher.hash_blocks(tokens, seq_len)
-    for i, hash in enumerate(block_hashes):
-        if cache.contains(hash):
-            continue                       // Already cached
-        block = cache.allocate_block()     // May evict LRU
-        if block == null:
-            break                          // Cache full, no evictable blocks
-
-        for layer in 0..n_layers:
-            offset = i * block_size * kv_dim * elem_size
-            copy(block.k_data + layer_offset, kv_cache.K[layer] + offset, ...)
-            copy(block.v_data + layer_offset, kv_cache.V[layer] + offset, ...)
-        cache.insert(hash, block)
-```
-
-### Orchestrator Integration
+Hybrid support should be explicit, not inferred from raw `HybridGDNLayerState` vectors. Extend `IHybridKVCache` with snapshot APIs:
 
 ```cpp
-// In DeviceGraphOrchestrator::forward():
-bool forward(const int* tokens, int seq_len) {
-    int cached_tokens = 0;
+struct HybridPrefixStateMetadata {
+    int total_layers = 0;
+    int gdn_layers = 0;
+    size_t host_bytes = 0;
+    size_t device_bytes = 0;
+    bool has_device_kernel_state = false;
+};
 
-    if (prefix_cache_ && prefix_cache_->config().enabled && is_prefill) {
-        cached_tokens = prefix_cache_->populate(tokens, seq_len, *state_.kv_cache);
+struct HybridPrefixStateDescriptor {
+    int seq_idx = 0;
+    int logical_token_count = 0;   // State after this many prefix tokens
+    void* stream = nullptr;
+};
+
+virtual HybridPrefixStateMetadata hybridPrefixStateMetadata() const = 0;
+virtual bool exportHybridPrefixState(const HybridPrefixStateDescriptor& desc,
+                                     void* dst_host, void* dst_device) const = 0;
+virtual bool importHybridPrefixState(const HybridPrefixStateDescriptor& desc,
+                                     const void* src_host, const void* src_device) = 0;
+```
+
+CPU hybrid caches can copy `HybridGDNLayerState::recurrence_state` and `conv_state` directly. CUDA and ROCm hybrid caches must also snapshot the device-resident state owned by `ITensorShortConvolution` and `ITensorGatedDeltaNet` implementations. If those kernels only expose reset today, add kernel-level export/import methods so D2D copies can be used when the prefix cache lives on the same GPU.
+
+### Optional Terminal Logits
+
+The current decode flow samples the first generated token from prefill logits. If a request is a full cache hit and no suffix is computed, there are no fresh logits.
+
+Use this policy:
+
+1. When harvesting a prompt whose length ends on a complete block boundary, store terminal logits for the final block if affordable.
+2. On lookup, if the request would be a full hit and terminal logits are available, restore them into the runner's logits buffer and set `prefill_logits_ready_ = true`.
+3. If terminal logits are unavailable, reduce the match by one block and recompute the final block. This preserves correctness without a special no-append graph path.
+
+Terminal logits are optional because they can be large for vocab-heavy models. The fallback costs one block of prefill, which is acceptable and much simpler than duplicating a logits-only graph.
+
+## Lookup, Populate, Harvest
+
+### Lookup
+
+```text
+hash complete prompt blocks
+for each block in order:
+    find block by full PrefixCacheKey
+    stop at first miss
+if full hit and no terminal logits:
+    reduce match by one block
+coordinate matched block count across ranks/devices
+return matched blocks and cached token count
+```
+
+### Populate
+
+```text
+clear request-local state
+import FA KV blocks into IKVCache
+if hybrid payload exists:
+    import GDN recurrence/conv state from last matched block
+set positions and sequence_lengths to cached_tokens
+if terminal logits used:
+    restore logits buffer and mark prefill logits ready
+run suffix prefill if suffix_tokens > 0
+```
+
+For dense models, populate is only KV import. For hybrid models, populate is KV import plus hybrid-state import. For MoE models, populate also validates the MoE fingerprint.
+
+### Harvest
+
+Harvest immediately after successful prompt prefill, before decode adds generated tokens.
+
+```text
+hash complete prompt blocks
+for each uncached complete block:
+    allocate/eject PrefixStateBlock
+    export FA KV blocks for all local FA layers
+    if hybrid cache:
+        export hybrid GDN state after this block
+    if this is the final complete block of the prompt:
+        optionally store terminal logits
+    insert into hash map
+```
+
+For hybrid models, exporting state after every block can be expensive if it copies all GDN state every 64 tokens. Start with correctness, then optimize with larger block sizes or sparse checkpointing if needed.
+
+## Runner Integration
+
+`OrchestrationRunner::prefill()` should own the high-level flow because it already has the full prompt token vector and coordinates MPI workers.
+
+```cpp
+bool OrchestrationRunner::prefill(const std::vector<int32_t>& prompt_tokens) {
+    runner_->clear_cache();
+
+    PrefixLookupResult hit;
+    if (prefix_cache_enabled_) {
+        hit = runner_->lookupAndPopulatePrefix(prompt_tokens);
+        hit.cached_tokens = coordinateMatchedTokensAcrossRanks(hit.cached_tokens);
     }
 
-    if (cached_tokens < seq_len) {
-        // Run prefill for remaining tokens only
-        run_prefill(tokens + cached_tokens, seq_len - cached_tokens,
-                    /*position_offset=*/cached_tokens);
+    const int suffix_start = hit.cached_tokens;
+    const int suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
+
+    if (suffix_len > 0) {
+        runner_->forward(prompt_tokens.data() + suffix_start, suffix_len);
+        prefill_logits_ready_ = true;
+    } else if (hit.has_terminal_logits) {
+        runner_->restorePrefixTerminalLogits(hit);
+        prefill_logits_ready_ = true;
+    } else {
+        // Defensive fallback: do not allow a no-logits full hit.
+        // Reduce match by one block and recompute that final block.
     }
 
-    // ... decode loop ...
-}
-
-// In DeviceGraphOrchestrator::clear_cache():
-void clear_cache() {
-    if (prefix_cache_ && prefix_cache_->config().enabled) {
-        // Harvest current ring buffer contents before clearing
-        prefix_cache_->harvest(last_tokens_, last_seq_len_, *state_.kv_cache);
-        prefix_cache_->release(current_matched_blocks_);
-    }
-    state_.clear();  // Clear ring buffer (not prefix cache)
-    ++session_epoch_;
+    runner_->harvestPrefix(prompt_tokens);
+    return true;
 }
 ```
 
-## Memory Budget Analysis
+`DeviceGraphOrchestrator` should expose lower-level operations:
 
-Per-token KV storage cost depends on model size:
+- `lookupAndPopulatePrefix(tokens)`
+- `harvestPrefix(tokens)`
+- `restorePrefixTerminalLogits(hit)`
+- `prefixCacheStats()`
+- `setPrefixCache(std::shared_ptr<PrefixStateCache>)` or construction-time injection
 
-| Model | Layers | KV Heads | Head Dim | KV Dim | FP16 Per-Token | Per 64-Token Block |
-|-------|--------|----------|----------|--------|----------------|-------------------|
-| Qwen2.5 0.5B | 24 | 2 | 64 | 128 | 12 KB | 768 KB |
-| Qwen2.5 7B | 28 | 4 | 128 | 512 | 56 KB | 3.5 MB |
-| Llama 3.1 8B | 32 | 8 | 128 | 1024 | 128 KB | 8 MB |
-| Llama 3.1 70B | 80 | 8 | 128 | 1024 | 320 KB | 20 MB |
+`clear_cache()` continues clearing request-local ring state, positions, sequence lengths, and forward graph cache. It should release current prefix-cache references, but it must not evict the persistent prefix cache.
 
-With a 512 MB budget:
+## Parallelism Integration
 
-| Model | Blocks Available | Tokens Cacheable | Typical System Prompts |
-|-------|------------------|------------------|-----------------------|
-| Qwen2.5 0.5B | 682 | 43,648 | ~20 different prompts |
-| Qwen2.5 7B | 149 | 9,536 | ~5 different prompts |
-| Llama 3.1 8B | 65 | 4,160 | ~2 different prompts |
-| Llama 3.1 70B | 26 | 1,664 | ~1 system prompt |
+### Single Device
 
-For 70B+ models, increase budget to 2–4 GB for practical multi-prompt caching.
+One `DeviceGraphOrchestrator` owns one local prefix cache for its KV/state payload. The RAM tier is the durable in-process source of truth; the device hot tier, if enabled, is an accelerator for recently reused blocks.
 
-## Hybrid Cache Considerations (Qwen 3.5)
+### LOCAL TP (`RankOrchestrator`)
 
-Qwen 3.5 uses a mixed FA (full attention) + GDN (gated delta net) architecture. GDN layers have recurrent state that depends on the full sequence — not just the prefix — so they cannot be prefix-cached.
+Each child `DeviceGraphOrchestrator` stores the local shard for its device. All children use the same token hashes but different `topology_fingerprint` values. In LOCAL TP, each child can have its own device hot tier, while the RAM budget can either be per child or shared by the parent `RankOrchestrator` depending on the final allocator design.
 
-**Approach**: The prefix cache only stores blocks for FA layers. The `n_layers` parameter passed to `PrefixBlockCache` is `config.countKVLayers()` (FA layers only), not `total_layers`.
+Lookup must choose the minimum matched block count across children. If device 0 has 20 blocks and device 1 has 18, the rank may restore only 18 blocks.
 
-During populate, only FA layer slots in the ring buffer are filled. GDN layers are always recomputed. This works because `HybridRingKVCache` already separates FA and GDN state.
+### GLOBAL / NODE_LOCAL TP
 
-During harvest, only FA layer data is copied from the ring buffer to the prefix cache.
+Every rank receives the same prompt tokens through existing server MPI coordination. Each rank performs local lookup, then ranks run `MPI_Allreduce(MIN)` over matched block counts. All ranks restore and run the same suffix positions.
+
+If a rank lacks a block that another rank has, the minimum rule prevents divergence.
+
+### Pipeline Parallelism
+
+Each PP stage stores only its local layer payload. Prefix lookup is still based on global tokens and a stage-specific topology fingerprint. The matched count must be coordinated across all PP stages before any suffix execution.
+
+### MoE Expert Parallelism and Rebalancing
+
+MoE does not add recurrent prefix state. Router outputs and expert FFN results are deterministic functions of hidden state and weights. However, runtime expert placement can affect execution path and floating-point reduction order.
+
+Rules:
+
+- Include expert mask, ownership, replica set, and placement epoch in `moe_fingerprint`.
+- When `MoERebalanceController` changes placement, increment a prefix-cache MoE epoch or invalidate MoE-prefixed entries for that runner.
+- In `OBSERVE` mode, placement does not change, so reuse is safe under the same fingerprint.
+- In `DYNAMIC` mode, reuse is safe only while the placement epoch matches.
+- Do not replay or synthesize decode histograms from prefix hits. The histogram is runtime telemetry, not model state.
 
 ## Configuration
 
-### CLI Flags
+### CLI
 
+```text
+--prefix-cache                         Enable prefix caching (default: off)
+--prefix-cache-storage <mode>          ram|device|tiered (default: tiered)
+--prefix-cache-ram-budget-mb <MB>      RAM capacity budget per local runner/rank (default: 4096)
+--prefix-cache-device-budget-mb <MB>   Optional device hot-tier budget (default: 256, 0 disables)
+--prefix-cache-block-size <N>          Complete tokens per block (default: 64)
+--prefix-cache-terminal-logits <mode>  off|auto|always (default: auto)
+--prefix-cache-hybrid <mode>           off|on|auto (default: auto)
+--prefix-cache-moe-policy <mode>       disabled|placement-fingerprint|invalidate-on-rebalance
 ```
---prefix-cache                     Enable prefix caching (default: off)
---prefix-cache-budget <MB>         Memory budget in MB (default: 512)
---prefix-cache-block-size <N>      Tokens per block (default: 64)
-```
+
+Recommended defaults after implementation:
+
+- `--prefix-cache` remains opt-in.
+- `--prefix-cache-storage tiered` means RAM primary plus optional device hot tier.
+- `--prefix-cache-ram-budget-mb` is the main capacity knob and should be large enough to hold useful shared prompts on consumer GPUs.
+- `--prefix-cache-device-budget-mb 0` is valid and should still preserve full prefix-cache functionality through RAM restore.
+- `--prefix-cache-hybrid auto` enables hybrid only when hybrid snapshot APIs are implemented for the active backend.
+- `--prefix-cache-terminal-logits auto` stores terminal logits only when they fit within a small fraction of the cache budget.
+- `--prefix-cache-moe-policy placement-fingerprint` is the default for Qwen 3.5 MoE.
 
 ### Environment Variables
 
-```
-LLAMINAR_PREFIX_CACHE=1                   Enable prefix caching
-LLAMINAR_PREFIX_CACHE_BUDGET_MB=512       Memory budget
-LLAMINAR_PREFIX_CACHE_BLOCK_SIZE=64       Block size
+Environment variables are optional overrides, parsed through `debugEnv()` or config setup rather than hot-path `std::getenv` calls.
+
+```text
+LLAMINAR_PREFIX_CACHE=1
+LLAMINAR_PREFIX_CACHE_STORAGE=tiered
+LLAMINAR_PREFIX_CACHE_RAM_BUDGET_MB=4096
+LLAMINAR_PREFIX_CACHE_DEVICE_BUDGET_MB=256
+LLAMINAR_PREFIX_CACHE_BLOCK_SIZE=64
+LLAMINAR_PREFIX_CACHE_TERMINAL_LOGITS=auto
+LLAMINAR_PREFIX_CACHE_HYBRID=auto
+LLAMINAR_PREFIX_CACHE_MOE_POLICY=placement-fingerprint
 ```
 
-### Dry-Run Output
+### Reporting
 
-```
-$ llaminar2 --prefix-cache --prefix-cache-budget 1024 --dry-run -m model.gguf
+`--dry-run` currently exits before model load. It can report requested prefix-cache settings, but exact capacity requires model metadata and parallelism resolution.
 
+Accurate reporting should happen after model metadata is available:
+
+```text
 Prefix Cache Configuration:
-  Enabled:      Yes
-  Budget:       1024 MB
-  Block Size:   64 tokens
-  Blocks:       131 blocks (per KV dim 1024, 32 layers, FP16)
-  Capacity:     8384 tokens
+  Enabled:              yes
+  Model Class:          qwen35_moe_hybrid
+  Device:               cuda:0
+    Storage:              tiered
+    RAM Budget:           8192 MB
+    Device Hot Budget:    512 MB
+  Block Size:           64 tokens
+  FA KV Layers:         9
+  GDN Layers:           27
+  KV Payload/Block:     144 MB
+  GDN Payload/Block:    18 MB
+  Terminal Logits:      auto
+    RAM Blocks Available: 50
+    Device Hot Blocks:    3
+    RAM Capacity:         3200 tokens
 ```
 
-## Phased Implementation Plan
+The numbers above are illustrative; final values should come from actual metadata and selected precision.
 
-### Phase 1: Core Data Structures (CPU-only)
+## Memory Budgeting
 
-**Goal**: Build and unit-test the foundational components in isolation.
+The dense KV formula is:
 
-**Deliverables**:
-- `BlockHash` — 128-bit hash type with xxHash-128 integration
-- `PrefixBlockHasher` — hash-chain computation over token arrays
-- `LRUQueue` — doubly-linked eviction queue with O(1) insert/remove/touch
-- `PrefixBlock` — block metadata struct
-- Unit tests for hasher (determinism, chain dependency, partial blocks)
-- Unit tests for LRU queue (eviction order, touch promotion, empty/full)
+```text
+bytes_per_block = fa_kv_layers * block_size * local_kv_heads * head_dim *
+                  (bytes_per_k + bytes_per_v)
+```
 
-**Dependencies**: xxHash library (header-only, add to `external/`)
+For hybrid models:
 
-**Tests**: ~250 LOC across `Test__PrefixBlockHasher.cpp`, `Test__LRUQueue.cpp`
+```text
+bytes_per_block = fa_kv_bytes_per_block + gdn_snapshot_bytes_per_block
+```
 
-### Phase 2: PrefixBlockCache (CPU, Host Memory)
+GDN snapshot bytes are approximately:
 
-**Goal**: Complete cache with hash map + LRU + block pool, tested on CPU.
+```text
+sum over GDN layers:
+    recurrence_state_floats * 4 + conv_state_floats * 4 + device_kernel_state_bytes
+```
 
-**Deliverables**:
-- `PrefixBlockCache` — full cache implementation with host memory block pool
-- `PrefixCacheConfig` — configuration struct
-- CPU populate operation (memcpy from cache → CPURingKVCache)
-- CPU harvest operation (memcpy from CPURingKVCache → cache)
-- Unit tests: lookup miss, lookup hit, chain-break, eviction, store+lookup round-trip, ref counting, stats tracking
+For MoE variants, expert weights are not stored in prefix blocks. Only the MoE placement/version fingerprint is stored. Terminal logits, if enabled, add `vocab_size * sizeof(float)` per terminal block, or local vocab size per TP shard.
 
-**Tests**: ~300 LOC in `Test__PrefixBlockCache.cpp`
+RAM and device memory must be budgeted separately:
 
-### Phase 3: Orchestrator Integration (CPU Path)
+- The RAM budget is the primary capacity budget. If it cannot hold at least one complete block for the active model/backend, initialization should warn and disable prefix caching rather than fail inference.
+- The device hot-tier budget is optional. If it cannot hold one complete block, disable only the device tier and continue with RAM-backed caching.
+- `MemoryPlanner` should subtract only the device hot-tier budget from available VRAM/HBM. The RAM tier should be tracked by prefix-cache allocation itself and reported separately from KV cache, workspace, and graph-capture budgets.
+- For CUDA/ROCm, prefer pinned host RAM for small and medium RAM budgets because restores become H2D transfers on the active stream. For very large budgets, use a capped pinned pool plus pageable backing storage to avoid starving the OS and driver.
 
-**Goal**: Wire prefix cache into the inference pipeline for CPU execution.
+The critical production rule is: **a valid prefix-cache hit must not require spare VRAM beyond the request-local KV/GDN state that inference already needs**. VRAM improves hit latency; RAM provides useful capacity.
 
-**Deliverables**:
-- Add `PrefixCacheConfig` to `KVCacheConfig` and `OrchestrationConfig`
-- Create `PrefixBlockCache` in `DeviceGraphOrchestrator` constructor
-- Call `populate()` at start of `forward()` for prefill
-- Call `harvest()` + `release()` in `clear_cache()`
-- Skip recomputing cached prefix tokens (adjust `run_prefill` offset)
-- Add CLI flags and environment variables
-- Add `--dry-run` prefix cache info output
+## Implementation Phases
 
-**Tests**: Integration test simulating two requests with shared prefix
+### Phase 1: Hashing, Keys, LRU, Storage Interfaces, and Layout Metadata
 
-### Phase 4: GPU Support (CUDA + ROCm)
+Goal: Build cache metadata without touching inference.
 
-**Goal**: Device-memory prefix cache for GPU execution paths.
+Deliverables:
 
-**Deliverables**:
-- Device-memory block pool allocation (`cudaMalloc` / `hipMalloc`)
-- GPU populate: `cudaMemcpyAsync(D2D)` / `hipMemcpyAsync(D2D)` from cache blocks to ring buffer
-- GPU harvest: reverse direction copy
-- Handle stream synchronization (harvest must wait for prefill compute to complete)
-- Device-aware `PrefixBlockCache` constructor (CPU vs CUDA vs ROCm allocation)
+- `BlockHash` and hash-chain hasher.
+- `PrefixCacheKey` with model/runtime/topology/hybrid/MoE fingerprints.
+- `PrefixPayloadLayout` and size estimator.
+- `PrefixStateBlock` metadata.
+- `PrefixStorageTier`, `PrefixBlockHandle`, and `IPrefixStorageBackend` interfaces.
+- `LRUQueue` with O(1) insert/remove/touch.
+- Unit tests for hash determinism, chain dependency, partial-block behavior, key equality, LRU ordering, and backend allocation failure behavior.
 
-**Tests**: GPU integration test with CUDA and ROCm parity checks
+### Phase 2: Dense KV Logical Block I/O
 
-### Phase 5: Hybrid Cache Support (Qwen 3.5)
+Goal: Add safe import/export for request-local ring KV caches.
 
-**Goal**: Prefix caching for hybrid FA+GDN models.
+Deliverables:
 
-**Deliverables**:
-- Filter to FA-only layers during populate and harvest
-- Use `HybridLayerMap` to translate layer indices
-- Skip GDN layers (always recomputed)
-- Correct block size calculation (FA layers only)
+- `IKVCache::blockMetadata`, `exportLogicalBlock`, `importLogicalBlock`.
+- CPU implementation for `POSITION_MAJOR` and `HEAD_MAJOR`.
+- CUDA and ROCm implementations using async device copies where possible.
+- Tests for ring wrap, sharded KV heads, Q16_1 head-major layout, TQ formats, and stream synchronization.
 
-**Tests**: Qwen 3.5 prefix cache integration test
+### Phase 3: Dense RAM-Backed Prefix Cache End to End
 
-### Phase 6: Telemetry and Observability
+Goal: Reuse prefixes for dense full-attention models with RAM as the primary cache capacity tier.
 
-**Goal**: Production-ready monitoring.
+Deliverables:
 
-**Deliverables**:
-- `PrefixCacheStats` — hit rate, tokens saved, eviction count, memory usage
-- Log prefix cache stats at INFO level on each request
-- Optional: expose stats via REST API response headers
-- Optional: `--show-prefix-cache-stats` flag for periodic reporting
-- Benchmark: measure prefill speedup with/without prefix cache
+- `RamPrefixStorageBackend` with hard memory budget, LRU, stats, populate, and harvest.
+- `PrefixStateCache` manager that indexes blocks by key and stores payloads through `IPrefixStorageBackend`.
+- `OrchestrationConfig` / `CliSpec` flags.
+- `OrchestrationRunner` lookup, rank coordination, RAM-to-request-state restore, suffix prefill, harvest.
+- `DeviceGraphOrchestrator` populate/harvest helpers.
+- Terminal logits policy with final-block fallback.
+- Dense integration test: same prompt twice, second request restores complete blocks from RAM and produces identical tokens.
+- Stress test: RAM budget holds multiple shared prompts without VRAM growth.
 
-### Phase 7: Advanced Features (Future)
+### Phase 4: Optional Device Hot Tier
 
-**Goal**: Optimize for production workloads.
+Goal: Reduce hit latency for very hot prefixes without making VRAM the main capacity tier.
 
-**Potential features** (not committed):
-- **Multi-tenant isolation**: Per-user cache salt to prevent cross-user cache sharing
-- **Disk offload**: Evicted blocks written to SSD for larger effective cache
-- **Warm-up mode**: Pre-populate cache from a list of known system prompts at startup
-- **Concurrent request support**: Thread-safe cache for parallel HTTP requests (requires mutex on hash map)
-- **Adaptive block size**: Smaller blocks for short prefixes, larger for long ones
-- **LoRA-aware hashing**: Include LoRA adapter ID in hash (like vLLM's extra keys)
+Deliverables:
 
-## Risk Assessment
+- `DeviceHotPrefixStorageBackend` with a small independent budget and LRU.
+- Promotion policy from RAM to device hot tier after hit-count or recency threshold.
+- Demotion/eviction policy that leaves the RAM copy intact.
+- Restore path that prefers device-hot blocks and falls back to RAM blocks.
+- Tests proving `--prefix-cache-device-budget-mb 0` still gives correct RAM-backed cache hits.
+- Tests proving device hot-tier eviction does not invalidate the RAM source-of-truth entry.
 
-| Risk | Likelihood | Impact | Mitigation |
-|------|-----------|--------|------------|
-| memcpy overhead dominates small prefixes | Low | Low | Only activate for prefixes ≥ 1 block (64 tokens); below that, recompute is fast |
-| Hash collision produces wrong KV | Negligible | High | xxHash-128: collision probability $2^{-128}$ per lookup; effectively impossible |
-| Memory fragmentation from block pool | Low | Medium | Pre-allocate contiguous pool at init; no dynamic allocation on hot path |
-| Quantized formats (Q8_1, TQ4) break | Low | Medium | Copy raw bytes; format is preserved. Unit test each precision mode |
-| Graph capture incompatibility | None | — | Ring buffer populated *before* graph capture; graphs see normal state |
-| Hybrid cache layer mismatch | Low | High | Unit test FA-only layer filtering with actual Qwen 3.5 config |
-| Thread safety for concurrent requests | Medium | Medium | Phase 7; initially serialize requests (current server behavior) |
+### Phase 5: Hybrid GDN Snapshot API
+
+Goal: Make Qwen 3.5 hybrid state cacheable.
+
+Deliverables:
+
+- `IHybridKVCache` prefix-state metadata/export/import APIs.
+- CPU implementation copying `HybridGDNLayerState` recurrence and conv vectors.
+- CUDA and ROCm implementation copying device-resident short-conv and recurrence kernel state.
+- Kernel-level state export/import where needed for `ITensorShortConvolution` and `ITensorGatedDeltaNet`.
+- Tests that restore state after N tokens and produce identical GDN outputs for suffix tokens.
+
+### Phase 6: Hybrid Prefix Cache End to End
+
+Goal: Reuse prefixes for Qwen 3.5 FA+GDN models.
+
+Deliverables:
+
+- Hybrid payload support in RAM-backed `PrefixStateCache`.
+- FA-layer-only KV export/import using `HybridLayerMap`.
+- GDN state snapshot per cached block.
+- Hybrid integration test: shared system prompt, differing user suffixes, identical outputs versus no-cache.
+- Full-hit test with terminal logits or final-block recompute fallback.
+
+### Phase 7: Qwen 3.5 MoE Safety and Rebalance Integration
+
+Goal: Support Qwen 3.5 MoE variants without stale expert-placement assumptions.
+
+Deliverables:
+
+- `moe_fingerprint` derived from expert masks, placement, replica set, and rebalance epoch.
+- Prefix-cache invalidation or epoch bump when `MoERebalanceController` applies new placement.
+- Tests for `OFF`, `OBSERVE`, and `DYNAMIC` rebalance modes.
+- MoE integration test proving cache hit results match no-cache under stable placement.
+- Rebalance test proving old prefix entries are not reused after placement changes unless fingerprint matches.
+
+### Phase 8: Multi-Device and MPI Hardening
+
+Goal: Make all supported parallelism modes deterministic and safe.
+
+Deliverables:
+
+- LOCAL TP minimum matched-block coordination across child device runners.
+- GLOBAL/NODE_LOCAL TP `MPI_Allreduce(MIN)` matched-block coordination.
+- PP stage coordination so every stage restores the same prefix length.
+- MPI worker loop integration for lookup, populate, harvest, and cache stats.
+- Multi-rank tests for cache hit/miss asymmetry and fallback to common prefix length.
+
+### Phase 9: Observability and Production Controls
+
+Goal: Make behavior visible and tunable in server deployments.
+
+Deliverables:
+
+- `PrefixCacheStats`: lookups, hits, matched blocks, tokens saved, stores, RAM evictions, device-hot promotions, device-hot evictions, memory usage by tier, terminal-logit hits, hybrid-state bytes.
+- INFO-level per-request summary when enabled.
+- Optional response metadata or headers in server mode.
+- `--show-prefix-cache-stats` or periodic stats logging.
+- Benchmark comparing repeated system prompts with and without prefix cache.
+
+## Test Matrix
+
+| Test Area | Required Cases |
+|-----------|----------------|
+| Hashing | Same tokens same chain, same block tokens at different positions different key, trailing partial block ignored |
+| LRU | Free block allocation, touch promotion, eviction skips referenced blocks, no leaks |
+| Dense KV I/O | CPU/CUDA/ROCm, ring wrap, head-major Q16_1, position-major FP16/Q8_1/TQ, sharded KV |
+| RAM storage | Budget enforcement, LRU eviction, pinned/pageable fallback, RAM-to-device restore, no VRAM growth when device tier disabled |
+| Device hot tier | Promotion, hit preference, hot-tier eviction, RAM source-of-truth preservation, zero-budget disabled behavior |
+| Dense E2E | Identical prompt, shared prefix with differing suffix, full-hit terminal logits, final-block recompute fallback, RAM-backed second-request hit |
+| Hybrid state | Export/import GDN state after block N, suffix output matches no-cache, reset still clears request-local state |
+| Qwen 3.5 E2E | FA+GDN cache hit with suffix, full hit, cache miss after runtime fingerprint change |
+| Qwen 3.5 MoE | Stable placement hit, rebalance invalidation, replica fingerprint change, no histogram replay |
+| Parallelism | LOCAL TP min match, GLOBAL TP allreduce min match, PP stage local payloads, MPI worker loop |
+| Memory | RAM budget holds at least one block, insufficient RAM disables cache with warning, insufficient device budget disables only hot tier, no unbounded growth after many requests |
+
+## Risks and Mitigations
+
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| Hybrid cache restores KV but not device GDN kernel state | Wrong outputs | Make hybrid support depend on explicit `IHybridKVCache` and kernel state export/import tests |
+| Full-prefix hit has no logits | Decode starts from stale/missing logits | Store terminal logits when practical; otherwise recompute final block |
+| MoE rebalance changes execution path | Subtle numerical drift or wrong expert ownership | Include placement epoch/fingerprint; invalidate on rebalance |
+| Async GPU copy races suffix execution | Corrupted or incomplete state | Use active backend stream and synchronize before suffix graph execution |
+| Ring wrap breaks logical block ordering | Wrong attention history | Implement logical import/export in each KV cache and test wrapped cases |
+| Cache memory overwhelms large hybrid models | Startup OOM or tiny useful capacity | Treat RAM and device budgets as hard caps; disable cache only if RAM cannot hold one block; disable hot tier independently if VRAM cannot hold one block |
+| Pinned RAM budget starves OS or GPU driver | System instability or allocation failures | Cap pinned pool separately, fall back to pageable RAM, report pinned/pageable split |
+| MPI ranks match different prefix lengths | Rank divergence or collective mismatch | Coordinate common matched block count with min reduction before populate |
+| Cache key misses important runtime feature | Incorrect reuse | Centralize fingerprint construction and test changes in precision/layout/topology/hybrid/MoE placement |
 
 ## Success Criteria
 
-1. **Functional**: Two sequential requests with identical 1000-token system prompt — second request skips 960 tokens of prefill (15 blocks × 64 tokens)
-2. **Performance**: Prefix cache populate is ≥100× faster than recomputing the same prefix
-3. **Correctness**: Output tokens are bit-identical with and without prefix cache enabled
-4. **Memory**: Cache stays within configured budget; no leaks after 1000 requests
-5. **Stability**: All existing parity tests pass unchanged with prefix cache disabled (default)
+1. Dense full-attention repeated-prefix requests skip complete cached blocks and produce identical tokens to no-cache.
+2. Qwen 3.5 hybrid repeated-prefix requests restore FA KV plus GDN state and produce identical tokens to no-cache.
+3. Qwen 3.5 MoE repeated-prefix requests are safe under stable expert placement and do not reuse stale entries after rebalance.
+4. Full-prefix hits either restore terminal logits or deliberately recompute the final block.
+5. Prefix-cache disabled remains the default and leaves existing parity tests unchanged.
+6. RAM-backed cache hits work with `--prefix-cache-device-budget-mb 0`, proving useful capacity does not depend on spare VRAM.
+7. Cache memory stays within configured RAM and device budgets after long server runs.
+8. LOCAL TP, GLOBAL/NODE_LOCAL TP, and PP modes restore a common prefix length across all participants.
+
+## Future Extensions
+
+- Multi-tenant cache salting.
+- Disk-backed cache for large persistent prefix stores.
+- Warm-up API for known system prompts.
+- Adaptive block size per model or prompt distribution.
+- Cross-process shared cache for multi-worker server mode.
+- LoRA/adaptor-aware cache keys.

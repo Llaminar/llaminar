@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <unordered_set>
 
 namespace llaminar2
@@ -146,6 +147,16 @@ namespace llaminar2
         static void prepareDeviceForSegmentedCapture(IDeviceContext *ctx);
 
         /**
+         * @brief Compute a graph-wide launch-topology variant signature.
+         *
+         * The signature is zero when every stage reports the default variant.
+         * Nonzero stage signatures are folded with stage identity so the
+         * segmented cache can recapture before replaying a graph whose baked
+         * launch topology no longer matches current dynamic parameters.
+         */
+        static uint64_t computeCaptureVariantSignature(ComputeGraph &graph);
+
+        /**
          * @brief Execute warmup-phase bookkeeping (segment build + state transition).
          */
         static void executeWarmupPhase(
@@ -215,6 +226,8 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
             bool needs_segment_sync,
+            const std::string &perf_context,
+            const std::string &device_name,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -267,9 +280,19 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegment &segment,
             IDeviceContext *ctx,
             IWorkerGPUContext *gpu_ctx,
+            void *capture_stream,
             bool has_collective_nodes,
             uint64_t current_step,
             const std::function<bool(ComputeNode &)> &execute_node_cb);
+
+        /**
+         * @brief Run stage-owned dynamic metadata uploads before capture/replay.
+         */
+        static bool prepareGraphLaunchMetadata(
+            ComputeGraph &graph,
+            const DeviceGraphExecutor::GraphSegment &segment,
+            IDeviceContext *ctx,
+            void *stream);
 
         /**
          * @brief Execute one capturable replay segment under selected diagnostics mode.
@@ -284,6 +307,7 @@ namespace llaminar2
             bool verify_mode,
             bool recapture_mode,
             int segment_index,
+            const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
@@ -302,6 +326,7 @@ namespace llaminar2
             bool recapture_mode,
             uint64_t current_step,
             int segment_index,
+            const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
@@ -328,7 +353,9 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             bool has_collective_nodes,
             uint64_t current_step,
-            const ReplayHooks &hooks);
+            const ReplayHooks &hooks,
+            bool force_recapture = false,
+            bool defer_final_sync = false);
 
         /**
          * @brief Coherence helper for all stages in one replay segment.
@@ -353,7 +380,7 @@ namespace llaminar2
             DeviceGraphExecutor::GraphSegment &segment,
             uint64_t current_step,
             void *stream,
-            const std::function<void(ComputeNode &, void *)> &mark_stage_outputs_dirty_cb,
+            const std::function<void(BufferId, DeviceId)> &mark_arena_write_dirty_cb,
             bool skip_replay_callbacks = false);
     };
 

@@ -5,6 +5,16 @@
 #include <cstring>
 #include <stdexcept>
 
+/**
+ * @file ModelMemoryProfile.cpp
+ * @brief Builds and serializes compact model weight inventories for placement planning.
+ *
+ * The memory profile keeps the planning layer independent of loaded Tensor objects.
+ * It records GGUF tensor names, element counts, native byte sizes, quantization
+ * type strings, and inferred layer ownership so higher-level placement code can
+ * estimate per-device weight pressure before constructing the execution graph.
+ */
+
 namespace llaminar2
 {
 
@@ -39,8 +49,26 @@ namespace llaminar2
                 return "Q5_K";
             case GGUFTensorType::Q6_K:
                 return "Q6_K";
+            case GGUFTensorType::Q8_K:
+                return "Q8_K";
+            case GGUFTensorType::IQ2_XXS:
+                return "IQ2_XXS";
+            case GGUFTensorType::IQ2_XS:
+                return "IQ2_XS";
+            case GGUFTensorType::IQ3_XXS:
+                return "IQ3_XXS";
+            case GGUFTensorType::IQ1_S:
+                return "IQ1_S";
             case GGUFTensorType::IQ4_NL:
                 return "IQ4_NL";
+            case GGUFTensorType::IQ3_S:
+                return "IQ3_S";
+            case GGUFTensorType::IQ2_S:
+                return "IQ2_S";
+            case GGUFTensorType::IQ4_XS:
+                return "IQ4_XS";
+            case GGUFTensorType::IQ1_M:
+                return "IQ1_M";
             case GGUFTensorType::BF16:
                 return "BF16";
             default:

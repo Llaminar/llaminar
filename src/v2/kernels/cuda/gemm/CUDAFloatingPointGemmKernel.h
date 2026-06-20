@@ -26,6 +26,7 @@
 #include "tensors/TensorKernels.h"
 #include <memory>
 #include <cstdint>
+#include <vector>
 
 namespace llaminar2
 {
@@ -59,7 +60,7 @@ namespace llaminar2
          * - Single kernel instance should be used from one thread
          * - cuBLAS handle is per-kernel (not shared)
          */
-        class CUDAFloatingPointGemmKernel : public ITensorGemm
+        class CUDAFloatingPointGemmKernel : public ITensorGemm, public IWorkspaceConsumer
         {
         public:
             /**
@@ -85,6 +86,26 @@ namespace llaminar2
                 const TensorBase *weights,
                 int cuda_device_id,
                 Precision precision = Precision::FP32);
+
+            /**
+             * @brief Construct kernel from raw device pointer (GPU pipeline path)
+             *
+             * Used when weights have been uploaded to a VRAM pool and the caller
+             * already has the device pointer. No TensorBase needed.
+             *
+             * @param d_weights Device pointer to weight data (already on GPU)
+             * @param N Output features (weight rows)
+             * @param K Input features (weight cols)
+             * @param cuda_device_id CUDA device ID
+             * @param precision Precision mode
+             * @param lifetime_owner Shared pointer that keeps the VRAM pool alive
+             */
+            CUDAFloatingPointGemmKernel(
+                const void *d_weights,
+                int N, int K,
+                int cuda_device_id,
+                Precision precision,
+                std::shared_ptr<void> lifetime_owner);
 
             ~CUDAFloatingPointGemmKernel() override;
 
@@ -130,6 +151,22 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
+            bool supports_fused_projection() const override { return precision_ == Precision::FP32; }
+
+            bool multiply_fused_tensor(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
+            bool multiply_fused_verifier_rows_decode_equivalent(
+                const TensorBase *input,
+                const std::vector<TensorProjectionDesc> &projections,
+                int m, int k,
+                const IMPIContext *mpi_ctx = nullptr,
+                DeviceWorkspaceManager *workspace = nullptr) override;
+
             /**
              * @brief Activation-activation GEMM (not supported for FP CUDA kernel)
              *
@@ -164,6 +201,12 @@ namespace llaminar2
 
             void setGPUStream(void *stream) override;
 
+            WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+            void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+            void unbindWorkspace() override;
+            bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+            DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+
             // =========================================================================
             // IKernelSnapshotCapable interface
             // =========================================================================
@@ -180,7 +223,7 @@ namespace llaminar2
             Precision precision() const { return precision_; }
 
         private:
-            const TensorBase *weights_; // Weight tensor (stored for metadata)
+            const TensorBase *weights_; // Weight tensor (stored for metadata, may be null for pool path)
             const void *d_weights_;     // Device pointer to weight data
             int cuda_device_id_;
             Precision precision_;
@@ -190,14 +233,14 @@ namespace llaminar2
             // cuBLAS kernel (created at construction)
             std::unique_ptr<CuBLASGemmKernel> cublas_kernel_;
 
+            // Lifetime owner: keeps VRAM pool alive when constructed from raw pointer
+            std::shared_ptr<void> lifetime_owner_;
+
             // GPU stream for graph capture (nullptr = default stream)
             void *gpu_stream_ = nullptr;
 
-            // Cached HBM redirect buffer for mapped output memory
-            // When output is host-mapped (e.g., logits), scattered GPU writes go over PCIe.
-            // This provides an HBM staging buffer; we bulk-DMA to mapped memory after.
-            float *d_mapped_redirect_ = nullptr;
-            size_t mapped_redirect_capacity_ = 0;
+            DeviceWorkspaceManager *bound_workspace_ = nullptr;
+
         };
 
     } // namespace cuda

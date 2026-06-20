@@ -4,7 +4,7 @@
  * @author David Sanftenberg
  * @date January 2026
  *
- * QwenGraphBase extracts the shared graph-building infrastructure from Qwen2Graph.
+ * QwenGraphBase extracts the shared graph-building infrastructure from QwenStandardGraph.
  * All Qwen-family models (Qwen2, Qwen3, Qwen3.5) inherit from this base class
  * rather than from each other, promoting a clean separation of model-specific
  * attention implementations from shared transformer infrastructure.
@@ -12,7 +12,7 @@
  * The hierarchy is:
  *   IGraphBuilder (pure interface)
  *   └── QwenGraphBase (shared Qwen infrastructure)
- *       ├── Qwen2Graph (standard multi-head attention)
+ *       ├── QwenStandardGraph (standard multi-head attention)
  *       └── Qwen35Graph (hybrid GDN + full attention)
  *
  * Shared infrastructure includes:
@@ -58,6 +58,7 @@ namespace llaminar2
 {
 
     // Forward declarations
+    class ITensorGemm;
     class Qwen2Pipeline;
 
     /**
@@ -121,7 +122,8 @@ namespace llaminar2
             IKVCache *kv_cache,
             const int *position_ids,
             DeviceId device,
-            const std::vector<int> *sequence_lengths = nullptr) override = 0;
+            const std::vector<int> *sequence_lengths = nullptr,
+            const void *position_ids_device = nullptr) override = 0;
 
         // =====================================================================
         // Configuration
@@ -139,12 +141,13 @@ namespace llaminar2
             config_.pp_contexts[{from_stage, to_stage}] = pp_ctx;
         }
 
-        void setTPContext(const std::string &domain_name, ILocalTPContext *tp_ctx) override
+        void setTPContext(const std::string &domain_name, ITPContext *tp_ctx) override
         {
             config_.domain_tp_contexts[domain_name] = tp_ctx;
         }
 
         void setWeights(const ModelWeights &weights) override { weights_ = weights; }
+        void setWeightBindings(const ModelWeightBindings &bindings) override { weight_bindings_ = bindings; }
         void setBuffers(const ModelBuffers &buffers) override { buffers_ = buffers; }
 
         /**
@@ -154,6 +157,57 @@ namespace llaminar2
          * methods to use arena-allocated tensors via the existing buffers_ paths.
          */
         void setArena(BufferArena *arena) override;
+
+        void setPreparedWeightStore(PreparedWeightStore *store) override
+        {
+            prepared_weight_store_ = store;
+        }
+
+        bool setComputeAllPositionLogits(bool enabled) override
+        {
+            config_.compute_all_position_logits = enabled;
+            return true;
+        }
+
+        bool setComputeRowIndexedAllPositionLogits(bool enabled, int row_count) override
+        {
+            const int max_rows = resolveMTPMaxTargetQueryRows(config_.mtp);
+            if (enabled && (row_count <= 0 || row_count > max_rows))
+                return false;
+            if (enabled &&
+                !config_.row_indexed_logits_selected_rows.empty() &&
+                static_cast<int>(config_.row_indexed_logits_selected_rows.size()) != row_count)
+            {
+                return false;
+            }
+            config_.compute_row_indexed_logits = enabled;
+            config_.row_indexed_logits_row_count = enabled ? row_count : 0;
+            if (!enabled)
+                config_.row_indexed_logits_selected_rows.clear();
+            return true;
+        }
+
+        /**
+         * @brief Install explicit compact verifier source rows for the next graph.
+         *
+         * Empty keeps the legacy leading-row behavior. A non-empty row plan is
+         * accepted before or after row-indexed mode is enabled; when enabled,
+         * the size must match the fixed compact LM-head row count so graph
+         * capture cannot race against a changing output shape.
+         */
+        bool setRowIndexedAllPositionLogitRows(const std::vector<int> &selected_rows) override
+        {
+            if (!selected_rows.empty() &&
+                config_.compute_row_indexed_logits &&
+                static_cast<int>(selected_rows.size()) != config_.row_indexed_logits_row_count)
+            {
+                return false;
+            }
+            config_.row_indexed_logits_selected_rows = selected_rows;
+            return true;
+        }
+
+        void setModelContext(std::shared_ptr<IModelContext> model_ctx) override;
 
         BufferArena *arena() const { return arena_; }
         const ModelBuffers &buffers() const override;
@@ -191,7 +245,7 @@ namespace llaminar2
 
         bool isInitialized() const override
         {
-            return weights_.get_layer_weights != nullptr;
+            return weight_bindings_.get_layer_weights != nullptr || weights_.get_layer_weights != nullptr;
         }
 
         // =====================================================================
@@ -226,6 +280,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device);
 
         ComputeGraph buildLayerGraph(
@@ -233,6 +288,7 @@ namespace llaminar2
             TensorBase *input_hidden,
             IKVCache *kv_cache,
             const int *position_ids,
+            const void *position_ids_device,
             DeviceId device);
 
         ComputeGraph buildLMHeadGraph(
@@ -263,7 +319,9 @@ namespace llaminar2
         std::shared_ptr<IMPIContext> mpi_ctx_;
         TensorFactory *tensor_factory_ = nullptr;
         BufferArena *arena_ = nullptr;
+        PreparedWeightStore *prepared_weight_store_ = nullptr;
         ModelWeights weights_;
+        ModelWeightBindings weight_bindings_;
         ModelBuffers buffers_;
         StageSnapshotCallback snapshot_callback_;
 
@@ -273,6 +331,62 @@ namespace llaminar2
 
         TensorContext buildTensorContext() const;
         bool needsTPAllreduce() const;
+        bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;
+        bool hasLayerWeightSource() const;
+        LayerWeightBindings layerWeightBindingsForGraph(int layer_idx) const;
+        LayerWeights layerWeightsForGraph(int layer_idx) const;
+        TensorBase *modelEmbeddingTable() const;
+        TensorBase *modelFinalNorm() const;
+        TensorBase *modelLMHead() const;
+        const WeightBinding *modelEmbeddingBinding() const;
+        const WeightBinding *modelFinalNormBinding() const;
+        const WeightBinding *modelLMHeadBinding() const;
+        std::optional<PreparedWeightRef> preparedRefForGraphWeight(
+            const WeightBinding *binding,
+            DeviceId device) const;
+
+        std::string describeMissingExpertGemmEngine(
+            int num_experts,
+            const std::vector<bool> &expert_mask,
+            const std::vector<ITensorGemm *> &gate_gemm,
+            const std::vector<ITensorGemm *> &up_gemm,
+            const std::vector<ITensorGemm *> &down_gemm) const;
+
+        /**
+         * @brief Insert bucketed-prefill LM-head row selection when needed.
+         *
+         * Bucketed prefill graph replay must not bake a real-length-dependent
+         * LM-head activation offset into the captured GEMM. When the input is a
+         * fixed bucket, this helper adds a row-select stage from final norm into
+         * the one-row LM-head scratch buffer and returns that scratch tensor.
+         * Non-bucket graphs return final_norm_output unchanged.
+         *
+         * @param graph Graph receiving the optional row-select node.
+         * @param dependency_node Node name that produces final_norm_output.
+         * @param final_norm_output Full [seq_len, d_model] final norm output.
+         * @param total_tokens Fixed graph token count for the bucket.
+         * @param real_seq_len Real token count for initial execution (0 = total_tokens).
+         * @param bucket_seq_len Bucket length marker (0 = non-bucket path).
+         * @param device Device assigned to the row-select stage.
+         * @param dependency_out Receives the node name LM head should depend on.
+         * @param input_buffer_id BufferId for final_norm_output.
+         * @return Tensor that LM head should read.
+         */
+        TensorBase *maybeAddLMHeadRowSelect(
+            ComputeGraph &graph,
+            const std::string &dependency_node,
+            TensorBase *final_norm_output,
+            int total_tokens,
+            int real_seq_len,
+            int bucket_seq_len,
+            DeviceId device,
+            std::string &dependency_out,
+            BufferId input_buffer_id = BufferId::NORMALIZED) const;
+
+        [[noreturn]] void failMissingGpuExpertGemmEngines(
+            DeviceId device,
+            int layer_idx,
+            const std::string &reason) const;
 
         std::unique_ptr<IComputeStage> createTPAllreduceStage(
             TensorBase *buffer,
@@ -283,6 +397,127 @@ namespace llaminar2
             const std::string &stage_name = "",
             std::optional<BufferId> tensor_buffer_id = std::nullopt) const;
 
+        // =====================================================================
+        // Shared Attention Building Blocks
+        // =====================================================================
+
+        /** Resolve TP-aware local head counts. */
+        std::pair<int, int> resolveLocalHeadCounts() const;
+
+        /**
+         * Add pre-attention RMSNorm (fused residual+norm or standalone).
+         * @param check_hybrid_q16 If true, skip fusion in HybridQ16 mode
+         * @return Node name (prefix + "attn_norm")
+         */
+        std::string addPreAttentionNorm(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            TensorBase *norm_gamma,
+            int total_tokens,
+            int layer_idx,
+            DeviceId device,
+            bool check_hybrid_q16 = true);
+
+        /**
+         * Add per-head QK RMSNorm stages if norms are present.
+         * @return true if norms were added
+         */
+        bool addQKNorms(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            const LayerWeights &layer,
+            int local_n_heads,
+            int local_n_kv_heads,
+            int total_tokens,
+            DeviceId device,
+            const std::string &q_dependency,
+            const std::string &k_dependency);
+
+        /**
+         * Add RoPE stage on Q and K.
+         * @return Node name (prefix + "rope")
+         */
+        std::string addRoPE(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            int local_n_heads,
+            int local_n_kv_heads,
+            int total_tokens,
+            const int *position_ids,
+            const void *position_ids_device,
+            DeviceId device);
+
+        /**
+         * @brief Add a KV cache append stage.
+         *
+         * Normal transformer graphs pass a global model layer id and the helper
+         * translates it to the PP-stage-local KV cache layer. Sidecar graphs,
+         * such as MTP, own a separate cache whose layer ids are already local.
+         *
+         * @param layer_idx Global model layer id by default, or cache-local id
+         *                  when @p layer_idx_is_cache_local is true.
+         * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
+         *                                 KV cache layer id.
+         * @return KV append node name, or rope_dependency when no KV cache is present.
+         */
+        std::string addKVCacheAppend(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            IKVCache *kv_cache,
+            DeviceId device,
+            const std::string &rope_dependency,
+            bool layer_idx_is_cache_local = false);
+
+        /**
+         * @brief Add KV cache append, attention compute, and optional gather stages.
+         *
+         * @param layer_idx Global model layer id by default, or cache-local id
+         *                  when @p layer_idx_is_cache_local is true.
+         * @param layer_idx_is_cache_local Treat @p layer_idx as an already-local
+         *                                 KV cache layer id.
+         * @return Terminal attention node name
+         */
+        std::string addKVCacheAndAttention(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            int layer_idx,
+            int seq_len,
+            int batch_size,
+            int local_n_heads,
+            int local_n_kv_heads,
+            IKVCache *kv_cache,
+            const int *position_ids,
+            const void *position_ids_device,
+            DeviceId device,
+            bool has_qkv_proj,
+            const std::string &rope_dependency,
+            bool layer_idx_is_cache_local = false);
+
+        /**
+         * Add Wo GEMM projection + optional TP allreduce.
+         * @return Terminal node name
+         */
+        std::string addWoProjectionAndAllreduce(
+            ComputeGraph &graph,
+            const std::string &prefix,
+            ActivationBuffers &buffers,
+            TensorBase *wo_weight,
+            const WeightBinding *wo_binding,
+            int total_tokens,
+            int layer_idx,
+            DeviceId device,
+            const std::string &dependency,
+            const std::string &wo_node_suffix = "wo_proj",
+            const std::string &allreduce_node_suffix = "wo_allreduce");
+
     public:
         static std::vector<int> buildPositionIds(int seq_len, int batch_size, int offset);
 
@@ -292,7 +527,8 @@ namespace llaminar2
             TensorBase *normalized_out,
             const std::string &prev_node,
             int seq_len,
-            DeviceId device);
+            DeviceId device,
+            BufferId input_buffer_id = BufferId::HIDDEN_STATE);
 
         const TPDomain *getDomainForLayer(int layer_idx, bool is_attention) const;
     };

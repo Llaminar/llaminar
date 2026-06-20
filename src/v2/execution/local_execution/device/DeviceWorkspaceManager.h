@@ -146,6 +146,15 @@ namespace llaminar2
         DeviceId device() const { return device_; }
 
         /**
+         * @brief Monotonic host identity for this manager instance.
+         *
+         * Kernels that cache raw workspace sub-buffer pointers use this to
+         * distinguish a genuinely unchanged manager from a new manager that
+         * happened to be allocated at the same host address.
+         */
+        uint64_t id() const { return id_; }
+
+        /**
          * @brief Get the total budget in bytes
          */
         size_t budget() const { return budget_bytes_; }
@@ -167,6 +176,7 @@ namespace llaminar2
 
     private:
         DeviceId device_;
+        uint64_t id_;
         size_t budget_bytes_;
         size_t used_bytes_ = 0;
         bool allocated_ = false;

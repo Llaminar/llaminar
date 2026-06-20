@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 #include "config/TPPPValidator.h"
+#include <unordered_set>
 
 namespace llaminar2::test
 {
@@ -26,6 +27,7 @@ namespace llaminar2::test
         int vocab_size_ = 151936;
         int ffn_hidden_ = 4864;
         int embedding_dim_ = 896;
+        std::unordered_set<std::string> tensors_;
 
         // IModelContext interface
         const std::string &path() const override
@@ -40,7 +42,7 @@ namespace llaminar2::test
         }
         std::shared_ptr<IModelLoader> loader() override { return nullptr; }
         std::shared_ptr<TensorBase> getWeightForDevice(const std::string &, DeviceId) override { return nullptr; }
-        bool hasTensor(const std::string &) const override { return false; }
+        bool hasTensor(const std::string &name) const override { return tensors_.find(name) != tensors_.end(); }
         std::shared_ptr<IWeightManager> weightManager() override { return nullptr; }
 
         int blockCount() const override { return n_layers_; }
@@ -233,6 +235,23 @@ namespace llaminar2::test
     {
         // 24 layers / 2 = 12 layers per stage
         config_.pp_degree = 2;
+
+        auto result = TPPPValidator::validate(config_, model_);
+
+        EXPECT_TRUE(result.valid) << result.toString();
+    }
+
+    TEST_F(Test__TPPPValidator, PPManual_Qwen36NextNSidecarExcludedFromLayerCoverage)
+    {
+        model_.n_layers_ = 65;
+        model_.tensors_.insert("blk.64.nextn.eh_proj.weight");
+
+        config_.pp_degree = 2;
+        config_.pp_split = PPSplitMode::MANUAL;
+        config_.pp_stage_definitions = {
+            PPStageDefinition::parse("0=stage0:0-31"),
+            PPStageDefinition::parse("1=stage1:32-63"),
+        };
 
         auto result = TPPPValidator::validate(config_, model_);
 

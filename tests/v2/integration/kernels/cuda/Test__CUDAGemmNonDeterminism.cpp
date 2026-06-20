@@ -27,6 +27,8 @@
 #include "../../../utils/TestModelHelper.h"
 #include "loaders/ModelLoader.h"
 #include "tensors/TensorFactory.h"
+#include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/MPIContext.h"
 #ifdef HAVE_CUDA
 #include "backends/cuda/CUDABackend.h"
@@ -34,6 +36,7 @@
 #endif
 
 #include "../../../utils/CUDATestUtils.h"
+#include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/TestTensorFactory.h"
 
 #include <vector>
@@ -72,6 +75,99 @@ namespace
     constexpr const char *MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
     constexpr int NUM_REPETITIONS = 10;
 
+#ifdef HAVE_CUDA
+    class ScopedCudaPrefillModes
+    {
+    public:
+        ScopedCudaPrefillModes()
+            : streamk_(cudaNativeVNNIPrefill_getStreamKMode()),
+              bk256_(cudaNativeVNNIPrefill_getBK256Mode()),
+              deterministic_(cudaNativeVNNIPrefill_getDeterministicMode())
+        {
+            cudaNativeVNNIPrefill_getForceTile(&force_tile_, &force_split_k_);
+        }
+
+        ~ScopedCudaPrefillModes()
+        {
+            cudaNativeVNNIPrefill_setForceTile(force_tile_, force_split_k_);
+            cudaNativeVNNIPrefill_setStreamKMode(streamk_);
+            cudaNativeVNNIPrefill_setBK256Mode(bk256_);
+            cudaNativeVNNIPrefill_setDeterministicMode(deterministic_);
+        }
+
+        ScopedCudaPrefillModes(const ScopedCudaPrefillModes &) = delete;
+        ScopedCudaPrefillModes &operator=(const ScopedCudaPrefillModes &) = delete;
+
+    private:
+        int force_tile_ = -1;
+        int force_split_k_ = 0;
+        int streamk_ = 0;
+        int bk256_ = 0;
+        bool deterministic_ = false;
+    };
+
+    class ScopedDebugEnvOverride
+    {
+    public:
+        ScopedDebugEnvOverride(const char *name, const char *value)
+            : name_(name)
+        {
+            if (const char *old = std::getenv(name))
+            {
+                had_old_ = true;
+                old_value_ = old;
+            }
+            setenv(name, value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedDebugEnvOverride()
+        {
+            if (had_old_)
+                setenv(name_.c_str(), old_value_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedDebugEnvOverride(const ScopedDebugEnvOverride &) = delete;
+        ScopedDebugEnvOverride &operator=(const ScopedDebugEnvOverride &) = delete;
+
+    private:
+        std::string name_;
+        bool had_old_ = false;
+        std::string old_value_;
+    };
+#endif
+
+    ITensorGemm *getPreparedKernel(const TensorBase *tensor, DeviceId device_id)
+    {
+        auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
+        const bool is_gpu_quantized =
+            (device_id.is_cuda() || device_id.is_rocm()) &&
+            unpackable != nullptr &&
+            const_cast<IINT8Unpackable *>(unpackable)->vnniFormatInfo() != nullptr;
+
+        if (is_gpu_quantized)
+        {
+            static std::vector<GpuPreparedGemm> gpu_prepared;
+            const uint64_t prepared_id = static_cast<uint64_t>(gpu_prepared.size());
+            gpu_prepared.push_back(makeGpuPreparedGemm(
+                const_cast<TensorBase *>(tensor),
+                device_id,
+                "test.cuda_gemm_nondet.weight." + std::to_string(prepared_id),
+                ModelContextId{11100 + prepared_id}));
+            return gpu_prepared.back().kernel;
+        }
+
+        static std::vector<std::shared_ptr<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>> handles;
+        auto prepared = llaminar::v2::kernels::KernelFactory::prepareGemmHandleLocal(tensor, device_id);
+        if (!prepared)
+            return nullptr;
+        handles.push_back(std::move(prepared));
+        return llaminar::v2::kernels::KernelFactory::getOrCreateGemmEngine(handles.back().get());
+    }
+
     double cosineSimilarity(const float *a, const float *b, size_t count)
     {
         double dot = 0.0, norm_a = 0.0, norm_b = 0.0;
@@ -102,6 +198,17 @@ namespace
         for (size_t i = 0; i < count; ++i)
             m = std::max(m, std::abs(a[i] - b[i]));
         return m;
+    }
+
+    void expectBitwiseEqual(const std::vector<float> &actual,
+                            const std::vector<float> &expected,
+                            const char *label)
+    {
+        ASSERT_EQ(actual.size(), expected.size()) << label;
+        EXPECT_EQ(countDiffs(actual.data(), expected.data(), actual.size()), 0u)
+            << label << " changed bitwise across deterministic repeated runs";
+        EXPECT_FLOAT_EQ(maxAbsDiff(actual.data(), expected.data(), actual.size()), 0.0f)
+            << label << " drifted across deterministic repeated runs";
     }
 
     int32_t orderedFloatBits(float value)
@@ -286,12 +393,12 @@ protected:
         if (!weight->ensureOnDevice(gpu_device_))
             return false;
 
-        auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-            weight, KernelDeviceType::CUDA);
+        auto *kernel = getPreparedKernel(
+            weight, gpu_device_);
         if (!kernel)
             return false;
 
-        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
         if (!ws)
             return false;
 
@@ -474,16 +581,16 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
     ASSERT_TRUE(w_up->ensureOnDevice(gpu_device_));
 
     // Create CUDA kernels
-    auto kernel_gate = llaminar::v2::kernels::KernelFactory::createGemm(
-        w_gate, KernelDeviceType::CUDA);
-    auto kernel_up = llaminar::v2::kernels::KernelFactory::createGemm(
-        w_up, KernelDeviceType::CUDA);
+    auto *kernel_gate = getPreparedKernel(
+        w_gate, gpu_device_);
+    auto *kernel_up = getPreparedKernel(
+        w_up, gpu_device_);
     ASSERT_NE(kernel_gate, nullptr);
     ASSERT_NE(kernel_up, nullptr);
 
     // Set up SHARED workspace (mirrors FusedGateUpGEMMStage)
     ASSERT_TRUE(setupSharedWorkspace(
-        {kernel_gate.get(), kernel_up.get()},
+        {kernel_gate, kernel_up},
         M, {N_gate, N_up}, K));
 
     // Create fixed input (deterministic seed)
@@ -511,9 +618,9 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
 
         // Build projection descriptors
         std::vector<TensorProjectionDesc> projections;
-        projections.emplace_back(kernel_gate.get(), out_gate.get(), N_gate,
+        projections.emplace_back(kernel_gate, out_gate.get(), N_gate,
                                  nullptr, "gate");
-        projections.emplace_back(kernel_up.get(), out_up.get(), N_up,
+        projections.emplace_back(kernel_up, out_up.get(), N_up,
                                  nullptr, "up");
 
         // Call fused method with coherence wrapper
@@ -580,7 +687,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedGateUp_SelfConsistency)
     EXPECT_GE(min_up_cos, 0.9999)
         << "Up projection is non-deterministic across " << NUM_REPETITIONS << " calls";
 
-    cleanupSharedWorkspace({kernel_gate.get(), kernel_up.get()});
+    cleanupSharedWorkspace({kernel_gate, kernel_up});
 }
 
 // ============================================================================
@@ -627,15 +734,15 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
     ASSERT_TRUE(w_k->ensureOnDevice(gpu_device_));
     ASSERT_TRUE(w_v->ensureOnDevice(gpu_device_));
 
-    auto k_q = llaminar::v2::kernels::KernelFactory::createGemm(w_q, KernelDeviceType::CUDA);
-    auto k_k = llaminar::v2::kernels::KernelFactory::createGemm(w_k, KernelDeviceType::CUDA);
-    auto k_v = llaminar::v2::kernels::KernelFactory::createGemm(w_v, KernelDeviceType::CUDA);
+    auto *k_q = getPreparedKernel(w_q, gpu_device_);
+    auto *k_k = getPreparedKernel(w_k, gpu_device_);
+    auto *k_v = getPreparedKernel(w_v, gpu_device_);
     ASSERT_NE(k_q, nullptr);
     ASSERT_NE(k_k, nullptr);
     ASSERT_NE(k_v, nullptr);
 
     ASSERT_TRUE(setupSharedWorkspace(
-        {k_q.get(), k_k.get(), k_v.get()},
+        {k_q, k_k, k_v},
         M, {N_q, N_k, N_v}, K));
 
     auto input = std::make_unique<FP32Tensor>(
@@ -658,9 +765,9 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
             std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N_v)});
 
         std::vector<TensorProjectionDesc> projections;
-        projections.emplace_back(k_q.get(), out_q.get(), N_q, nullptr, "Q");
-        projections.emplace_back(k_k.get(), out_k.get(), N_k, nullptr, "K");
-        projections.emplace_back(k_v.get(), out_v.get(), N_v, nullptr, "V");
+        projections.emplace_back(k_q, out_q.get(), N_q, nullptr, "Q");
+        projections.emplace_back(k_k, out_k.get(), N_k, nullptr, "K");
+        projections.emplace_back(k_v, out_v.get(), N_v, nullptr, "V");
 
         ASSERT_TRUE(with_gpu_coherence(
             gpu_device_,
@@ -736,7 +843,7 @@ TEST_F(Test__CUDAGemmNonDeterminism, FusedQKV_SelfConsistency)
     EXPECT_FLOAT_EQ(max_k_abs, 0.0f) << "K projection max_abs drift should be zero";
     EXPECT_FLOAT_EQ(max_v_abs, 0.0f) << "V projection max_abs drift should be zero";
 
-    cleanupSharedWorkspace({k_q.get(), k_k.get(), k_v.get()});
+    cleanupSharedWorkspace({k_q, k_k, k_v});
 }
 
 // ============================================================================
@@ -774,12 +881,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, SingleKernel_SelfConsistency)
 
     ASSERT_TRUE(w_up->ensureOnDevice(gpu_device_));
 
-    auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(
-        w_up, KernelDeviceType::CUDA);
+    auto *kernel = getPreparedKernel(
+        w_up, gpu_device_);
     ASSERT_NE(kernel, nullptr);
 
     // Set up workspace for single kernel
-    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
     if (ws)
     {
         auto reqs = ws->getWorkspaceRequirements(M, N, K);
@@ -890,6 +997,12 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
 #else
     // NativeVNNI is now the sole CUDA GEMM path. Verify it produces
     // bitwise-identical results across repeated invocations.
+    ScopedCudaPrefillModes mode_guard;
+
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
 
     const int M = 9;
     const int N = 896;
@@ -901,10 +1014,10 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     ASSERT_NE(w_down, nullptr);
     ASSERT_TRUE(w_down->ensureOnDevice(gpu_device_));
 
-    auto kernel = llaminar::v2::kernels::KernelFactory::createGemm(w_down, KernelDeviceType::CUDA);
+    auto *kernel = getPreparedKernel(w_down, gpu_device_);
     ASSERT_NE(kernel, nullptr);
 
-    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel.get());
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
     ASSERT_NE(ws, nullptr);
     auto reqs = ws->getWorkspaceRequirements(M, N, K);
     workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
@@ -957,8 +1070,854 @@ TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_SelfConsistency)
     EXPECT_FLOAT_EQ(max_abs, 0.0f) << "NativeVNNI path drift should be zero";
     EXPECT_GE(min_cos, 0.999999) << "NativeVNNI path should be deterministic";
 
+    int selected_tile = -1;
+    int selected_split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+    std::cout << "NativeVNNI final auto selection: tile=" << selected_tile
+              << " split_k=" << selected_split_k
+              << " bk256=" << used_bk256
+              << " streamk=" << used_streamk << "\n";
     ws->unbindWorkspace();
     workspace_.reset();
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_GroupedSmallMDeterministicModeIsStable)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(true);
+
+    const int M = 72;
+    const int N = 4864;
+    const int K = 896;
+
+    auto weight = TestTensorFactory::createQ4_0Random(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 23);
+    auto *w_down = dynamic_cast<Q4_0Tensor *>(weight.get());
+    ASSERT_NE(w_down, nullptr);
+    ASSERT_TRUE(w_down->ensureOnDevice(gpu_device_));
+
+    auto *kernel = getPreparedKernel(w_down, gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
+    ASSERT_NE(ws, nullptr);
+    auto reqs = ws->getWorkspaceRequirements(M, N, K);
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    ws->bindWorkspace(workspace_.get());
+
+    auto input = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(K)});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    auto output = std::make_unique<FP32Tensor>(
+        std::vector<size_t>{static_cast<size_t>(M), static_cast<size_t>(N)});
+    ASSERT_TRUE(with_gpu_coherence(
+        gpu_device_,
+        {input.get()},
+        {output.get()},
+        [&]
+        {
+            return kernel->multiply_tensor(
+                input.get(), output.get(), M, N, K, true, 1.0f, 0.0f, nullptr, nullptr, -1);
+        }));
+
+    int selected_tile = -1;
+    int selected_split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+    std::cout << "NativeVNNI grouped-small-M deterministic selection: tile=" << selected_tile
+              << " split_k=" << selected_split_k
+              << " bk256=" << used_bk256
+              << " streamk=" << used_streamk << "\n";
+    EXPECT_EQ(selected_split_k, 1)
+        << "deterministic grouped-small-M prefill must avoid split-K accumulation-order drift";
+    EXPECT_EQ(used_streamk, 0)
+        << "deterministic grouped-small-M prefill must avoid stream-K atomic accumulation";
+
+    ws->unbindWorkspace();
+    workspace_.reset();
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36DenseQ4KPromptPrefillUsesSweepTiles)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedEnvVar perf_stats_env("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    ASSERT_TRUE(PerfStatsCollector::isEnabled());
+
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    struct Shape
+    {
+        const char *name;
+        int codebook;
+        int m;
+        int n;
+        int k;
+        int expected_tile;
+        int expected_split_k;
+    };
+
+    const Shape shapes[] = {
+        {"Qwen36_FFN_GateUp_Q4_K", 5, 595, 17408, 5120, 4, 1},
+        {"Qwen36_FFN_DownProjection_Q4_K_policy_bucket", 5, 595, 5120, 17408, 4, 4},
+        {"Qwen36_FFN_DownProjection_Q4_K_bucketed", 5, 600, 5120, 17408, 4, 4},
+        {"Qwen36_Attention_KVProjection_Q4_K_bucketed", 5, 600, 1024, 5120, 4, 4},
+        {"Qwen36_GDN_InnerProjection_Q4_K", 5, 595, 10240, 5120, 4, 1},
+        {"Qwen36_GDN_ZProjection_Q4_K", 5, 595, 6144, 5120, 4, 2},
+        {"Qwen36_GDN_OutputProjection_Q4_K", 5, 595, 5120, 6144, 4, 2},
+        {"Qwen36_GDN_InnerProjection_Q5_1", 7, 595, 10240, 5120, 4, 1},
+        {"Qwen36_GDN_ZProjection_Q5_1", 7, 595, 6144, 5120, 4, 2},
+        {"Qwen36_GDN_OutputProjection_Q5_1", 7, 595, 5120, 6144, 4, 2},
+        {"Qwen36_FFN_GateUp_Q5_1_bucketed", 7, 600, 17408, 5120, 4, 1},
+        {"Qwen36_FFN_DownProjection_Q5_1_bucketed", 7, 600, 5120, 17408, 4, 8},
+    };
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    for (const auto &shape : shapes)
+    {
+        SCOPED_TRACE(shape.name);
+
+        std::unique_ptr<TensorBase> weight;
+        if (shape.codebook == 5)
+        {
+            weight = TestTensorFactory::createQ4_KRandom(
+                {static_cast<size_t>(shape.n), static_cast<size_t>(shape.k)},
+                static_cast<uint32_t>(9000 + shape.n + shape.k));
+        }
+        else
+        {
+            ASSERT_EQ(shape.codebook, 7);
+            weight = TestTensorFactory::createQ5_1Random(
+                {static_cast<size_t>(shape.n), static_cast<size_t>(shape.k)},
+                static_cast<uint32_t>(9000 + shape.n + shape.k));
+        }
+        ASSERT_TRUE(weight->ensureOnDevice(gpu_device_, stream));
+
+        auto *kernel = getPreparedKernel(weight.get(), gpu_device_);
+        ASSERT_NE(kernel, nullptr);
+
+        auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
+        ASSERT_NE(ws, nullptr);
+        auto reqs = ws->getWorkspaceRequirements(shape.m, shape.n, shape.k);
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 512 * 1024 * 1024);
+        ASSERT_TRUE(workspace_->allocate(reqs));
+        ws->bindWorkspace(workspace_.get());
+
+        FP32Tensor input({static_cast<size_t>(shape.m), static_cast<size_t>(shape.k)});
+        FP32Tensor output({static_cast<size_t>(shape.m), static_cast<size_t>(shape.n)});
+        for (int i = 0; i < shape.m * shape.k; ++i)
+            input.mutable_data()[i] = dist_(rng_);
+
+        ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+        ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        kernel->setGPUStream(stream);
+        ASSERT_TRUE(kernel->multiply_tensor(
+            &input,
+            &output,
+            shape.m,
+            shape.n,
+            shape.k,
+            true,
+            1.0f,
+            0.0f,
+            nullptr,
+            nullptr,
+            gpu_device_.ordinal,
+            workspace_.get()));
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+        int selected_tile = -1;
+        int selected_split_k = 0;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+
+        EXPECT_EQ(selected_tile, shape.expected_tile);
+        EXPECT_EQ(selected_split_k, shape.expected_split_k);
+        EXPECT_EQ(used_bk256, 0);
+        EXPECT_EQ(used_streamk, 0);
+
+        const auto records = PerfStatsCollector::snapshot({"kernel"});
+        bool found = false;
+        for (const auto &record : records)
+        {
+            if (record.name != "cuda_native_vnni_prefill_calls")
+                continue;
+
+            auto tag = [&](const char *name) -> std::string
+            {
+                auto it = record.tags.find(name);
+                return it == record.tags.end() ? std::string{} : it->second;
+            };
+
+            if (tag("codebook") == std::to_string(shape.codebook) &&
+                tag("m") == std::to_string(shape.m) &&
+                tag("n") == std::to_string(shape.n) &&
+                tag("k") == std::to_string(shape.k))
+            {
+                found = true;
+                EXPECT_EQ(tag("codebook"), std::to_string(shape.codebook));
+                EXPECT_EQ(tag("tile_id"), std::to_string(shape.expected_tile));
+                EXPECT_EQ(tag("split_k"), std::to_string(shape.expected_split_k));
+                EXPECT_EQ(tag("bk256"), "0");
+                EXPECT_EQ(tag("streamk"), "0");
+                EXPECT_EQ(tag("sums_a"), "1")
+                    << "Qwen3.6 dense asymmetric NativeVNNI prefill must consume the "
+                       "workspace-owned activation block sums instead of recomputing them "
+                       "inside every output tile.";
+                EXPECT_EQ(record.device, "cuda:" + std::to_string(gpu_device_.ordinal));
+                EXPECT_EQ(record.phase, "gemm");
+                break;
+            }
+        }
+        EXPECT_TRUE(found) << "NativeVNNI prefill dispatch must emit structured route counters for "
+                           << shape.name << "\n"
+                           << PerfStatsCollector::summaryString({"kernel"}, 0);
+
+        ws->unbindWorkspace();
+        workspace_.reset();
+    }
+
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+    PerfStatsCollector::reset();
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIPrefillForcedSplitKDeclaresWorkspaceScratch)
+{
+#ifdef HAVE_CUDA
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w2x2=*/1, /*split_k=*/2);
+    cudaNativeVNNIPrefill_setStreamKMode(-1);
+    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int M = 32;
+    constexpr int N = 512;
+    constexpr int K = 512;
+    constexpr size_t padded_m = 128;
+    constexpr size_t expected_splitk_bytes = 2ULL * padded_m * N * sizeof(float);
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto weight = TestTensorFactory::createQ4_KRandom(
+        {static_cast<size_t>(N), static_cast<size_t>(K)}, 424242u);
+    ASSERT_TRUE(weight->ensureOnDevice(gpu_device_, stream));
+
+    auto *kernel = getPreparedKernel(weight.get(), gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+
+    auto *ws = dynamic_cast<IWorkspaceConsumer *>(kernel);
+    ASSERT_NE(ws, nullptr);
+    auto reqs = ws->getWorkspaceRequirements(M, N, K);
+
+    bool found_splitk = false;
+    for (const auto &buf : reqs.buffers)
+    {
+        if (buf.name == GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS)
+        {
+            found_splitk = true;
+            EXPECT_GE(buf.size_bytes, expected_splitk_bytes);
+            EXPECT_TRUE(buf.required);
+        }
+    }
+    ASSERT_TRUE(found_splitk) << "Forced split-K prefill must declare workspace-owned partials";
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    ws->bindWorkspace(workspace_.get());
+
+    FP32Tensor input({static_cast<size_t>(M), static_cast<size_t>(K)});
+    FP32Tensor output({static_cast<size_t>(M), static_cast<size_t>(N)});
+    for (int i = 0; i < M * K; ++i)
+        input.mutable_data()[i] = dist_(rng_);
+
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    kernel->setGPUStream(stream);
+    ASSERT_TRUE(kernel->multiply_tensor(
+        &input,
+        &output,
+        M,
+        N,
+        K,
+        true,
+        1.0f,
+        0.0f,
+        nullptr,
+        nullptr,
+        gpu_device_.ordinal,
+        workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    int selected_tile = -1;
+    int selected_split_k = 0;
+    int used_bk256 = 0;
+    int used_streamk = 0;
+    cudaNativeVNNIPrefill_getLastLaunchSelection(
+        &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+    EXPECT_EQ(selected_tile, 1);
+    EXPECT_EQ(selected_split_k, 2);
+    EXPECT_EQ(used_bk256, 0);
+    EXPECT_EQ(used_streamk, 0);
+
+    ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36QKVConcurrentPrefillUsesSplitKScratchSlots)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int M = 600;
+    constexpr int N = 1024;
+    constexpr int K = 5120;
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto wq = TestTensorFactory::createQ4_KRandom({N, K}, 8101u);
+    auto wk = TestTensorFactory::createQ4_KRandom({N, K}, 8102u);
+    auto wv = TestTensorFactory::createQ4_KRandom({N, K}, 8103u);
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_, stream));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+
+    auto *q_ws = dynamic_cast<IWorkspaceConsumer *>(q_kernel);
+    auto *k_ws = dynamic_cast<IWorkspaceConsumer *>(k_kernel);
+    auto *v_ws = dynamic_cast<IWorkspaceConsumer *>(v_kernel);
+    ASSERT_NE(q_ws, nullptr);
+    ASSERT_NE(k_ws, nullptr);
+    ASSERT_NE(v_ws, nullptr);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(q_ws->getWorkspaceRequirements(M, N, K));
+    reqs.merge(k_ws->getWorkspaceRequirements(M, N, K));
+    reqs.merge(v_ws->getWorkspaceRequirements(M, N, K));
+
+    const auto *splitk =
+        reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    ASSERT_NE(splitk, nullptr);
+    EXPECT_GE(splitk->size_bytes,
+              3ULL * 4ULL * 640ULL * static_cast<size_t>(N) * sizeof(float))
+        << "Fused concurrent Q/K/V prefill needs one split-K partial slot per side stream.";
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    q_ws->bindWorkspace(workspace_.get());
+    k_ws->bindWorkspace(workspace_.get());
+    v_ws->bindWorkspace(workspace_.get());
+
+    FP32Tensor input({M, K});
+    FP32Tensor q_output({M, N});
+    FP32Tensor k_output({M, N});
+    FP32Tensor v_output({M, N});
+    for (int i = 0; i < M * K; ++i)
+        input.mutable_data()[i] = dist_(rng_);
+
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(q_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(k_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(v_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    q_kernel->setGPUStream(stream);
+    k_kernel->setGPUStream(stream);
+    v_kernel->setGPUStream(stream);
+
+    std::vector<TensorProjectionDesc> projections = {
+        {q_kernel, &q_output, N, nullptr, "Q"},
+        {k_kernel, &k_output, N, nullptr, "K"},
+        {v_kernel, &v_output, N, nullptr, "V"}};
+
+    ASSERT_TRUE(q_kernel->multiply_fused_tensor(
+        &input,
+        projections,
+        M,
+        K,
+        nullptr,
+        workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    q_ws->unbindWorkspace();
+    k_ws->unbindWorkspace();
+    v_ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36IQ3SQKVConcurrentPrefillLaunches)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int M = 600;
+    constexpr int N = 1024;
+    constexpr int K = 5120;
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto wq = TestTensorFactory::createIQ3_SRandom({N, K}, 8111u);
+    auto wk = TestTensorFactory::createIQ3_SRandom({N, K}, 8112u);
+    auto wv = TestTensorFactory::createIQ3_SRandom({N, K}, 8113u);
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_, stream));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+
+    auto *q_ws = dynamic_cast<IWorkspaceConsumer *>(q_kernel);
+    auto *k_ws = dynamic_cast<IWorkspaceConsumer *>(k_kernel);
+    auto *v_ws = dynamic_cast<IWorkspaceConsumer *>(v_kernel);
+    ASSERT_NE(q_ws, nullptr);
+    ASSERT_NE(k_ws, nullptr);
+    ASSERT_NE(v_ws, nullptr);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(q_ws->getWorkspaceRequirements(M, N, K));
+    reqs.merge(k_ws->getWorkspaceRequirements(M, N, K));
+    reqs.merge(v_ws->getWorkspaceRequirements(M, N, K));
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    q_ws->bindWorkspace(workspace_.get());
+    k_ws->bindWorkspace(workspace_.get());
+    v_ws->bindWorkspace(workspace_.get());
+
+    FP32Tensor input({M, K});
+    FP32Tensor q_output({M, N});
+    FP32Tensor k_output({M, N});
+    FP32Tensor v_output({M, N});
+    for (int i = 0; i < M * K; ++i)
+        input.mutable_data()[i] = dist_(rng_);
+
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(q_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(k_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(v_output.ensureOnDevice(gpu_device_, stream));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    q_kernel->setGPUStream(stream);
+    k_kernel->setGPUStream(stream);
+    v_kernel->setGPUStream(stream);
+
+    std::vector<TensorProjectionDesc> projections = {
+        {q_kernel, &q_output, N, nullptr, "Q"},
+        {k_kernel, &k_output, N, nullptr, "K"},
+        {v_kernel, &v_output, N, nullptr, "V"}};
+
+    ASSERT_TRUE(q_kernel->multiply_fused_tensor(
+        &input,
+        projections,
+        M,
+        K,
+        nullptr,
+        workspace_.get()));
+    ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+
+    q_ws->unbindWorkspace();
+    k_ws->unbindWorkspace();
+    v_ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNI_Qwen36MoEMixedQKVConcurrentDecodeBindsGemvWorkspace)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(false);
+
+    constexpr int M = 1;
+    constexpr int N_Q = 8192;
+    constexpr int N_KV = 512;
+    constexpr int K = 2048;
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    auto wq = TestTensorFactory::createIQ3_SRandom({N_Q, K}, 8121u);
+    auto wk = TestTensorFactory::createQ8_0Random({N_KV, K}, 8122u);
+    auto wv = TestTensorFactory::createQ8_0Random({N_KV, K}, 8123u);
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_, stream));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+
+    auto *q_ws = dynamic_cast<IWorkspaceConsumer *>(q_kernel);
+    auto *k_ws = dynamic_cast<IWorkspaceConsumer *>(k_kernel);
+    auto *v_ws = dynamic_cast<IWorkspaceConsumer *>(v_kernel);
+    ASSERT_NE(q_ws, nullptr);
+    ASSERT_NE(k_ws, nullptr);
+    ASSERT_NE(v_ws, nullptr);
+
+    WorkspaceRequirements reqs;
+    reqs.merge(q_ws->getWorkspaceRequirements(M, N_Q, K));
+    reqs.merge(k_ws->getWorkspaceRequirements(M, N_KV, K));
+    reqs.merge(v_ws->getWorkspaceRequirements(M, N_KV, K));
+
+    const auto *kpar =
+        reqs.find(GemmWorkspaceBuffers::GEMV_KPAR_PARTIALS);
+    ASSERT_NE(kpar, nullptr)
+        << "Q8_0 K/V decode may use two-phase KPAR and must have declared partials.";
+    const auto *concurrent_kpar =
+        reqs.find(GemmWorkspaceBuffers::CUDA_CONCURRENT_DECODE_GEMV_KPAR_PARTIALS);
+    ASSERT_NE(concurrent_kpar, nullptr)
+        << "Concurrent decode must reserve side-stream GEMV partial slots; otherwise "
+           "Q/K/V projections can race through the same KPAR reduction buffer.";
+    EXPECT_GE(concurrent_kpar->size_bytes, 7ULL * kpar->size_bytes);
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 256 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    q_ws->bindWorkspace(workspace_.get());
+    k_ws->bindWorkspace(workspace_.get());
+    v_ws->bindWorkspace(workspace_.get());
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    struct DecodeSnapshot
+    {
+        std::vector<float> q;
+        std::vector<float> k;
+        std::vector<float> v;
+    };
+
+    auto run_decode = [&](const char *concurrent_decode) -> DecodeSnapshot
+    {
+        ScopedDebugEnvOverride concurrent_env("LLAMINAR_CUDA_CONCURRENT_DECODE", concurrent_decode);
+        auto q_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_Q});
+        auto k_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        auto v_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        std::vector<TensorProjectionDesc> projections = {
+            {q_kernel, q_output.get(), N_Q, nullptr, "Q"},
+            {k_kernel, k_output.get(), N_KV, nullptr, "K"},
+            {v_kernel, v_output.get(), N_KV, nullptr, "V"}};
+
+        EXPECT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {q_output.get(), k_output.get(), v_output.get()},
+            [&]
+            {
+                return q_kernel->multiply_fused_tensor(
+                    input.get(), projections, M, K, nullptr, workspace_.get());
+            }))
+            << "fused decode with LLAMINAR_CUDA_CONCURRENT_DECODE=" << concurrent_decode;
+
+        const float *q = q_output->data();
+        const float *k = k_output->data();
+        const float *v = v_output->data();
+        return {
+            std::vector<float>(q, q + N_Q),
+            std::vector<float>(k, k + N_KV),
+            std::vector<float>(v, v + N_KV),
+        };
+    };
+
+    q_kernel->setGPUStream(stream);
+    k_kernel->setGPUStream(stream);
+    v_kernel->setGPUStream(stream);
+
+    const DecodeSnapshot serial = run_decode("0");
+    const DecodeSnapshot concurrent = run_decode("1");
+
+    const DiffSummary q_diff = summarizeDiffs(concurrent.q.data(), serial.q.data(), concurrent.q.size());
+    const DiffSummary k_diff = summarizeDiffs(concurrent.k.data(), serial.k.data(), concurrent.k.size());
+    const DiffSummary v_diff = summarizeDiffs(concurrent.v.data(), serial.v.data(), concurrent.v.size());
+    printDiffSummary("concurrent-vs-serial Q", q_diff);
+    printDiffSummary("concurrent-vs-serial K", k_diff);
+    printDiffSummary("concurrent-vs-serial V", v_diff);
+
+    EXPECT_LT(q_diff.max_abs, 1e-4f);
+    EXPECT_LT(k_diff.max_abs, 1e-4f);
+    EXPECT_LT(v_diff.max_abs, 1e-4f);
+
+    q_ws->unbindWorkspace();
+    k_ws->unbindWorkspace();
+    v_ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurrentPrefillAndRepeatsBitwise)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride concurrent_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    ScopedDebugEnvOverride force_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+
+    cudaNativeVNNIPrefill_setForceTile(/*T64x128_w4x2=*/4, /*split_k=*/4);
+    cudaNativeVNNIPrefill_setStreamKMode(2);
+    cudaNativeVNNIPrefill_setBK256Mode(-1);
+    cudaNativeVNNIPrefill_setDeterministicMode(debugEnv().gemm.deterministic);
+
+    constexpr int M = 72;
+    constexpr int N = 1024;
+    constexpr int K = 896;
+
+    auto w_gate = TestTensorFactory::createQ4_0Random({N, K}, 9101u);
+    auto w_up = TestTensorFactory::createQ4_0Random({N, K}, 9102u);
+    ASSERT_TRUE(w_gate->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(w_up->ensureOnDevice(gpu_device_));
+
+    auto *gate_kernel = getPreparedKernel(w_gate.get(), gpu_device_);
+    auto *up_kernel = getPreparedKernel(w_up.get(), gpu_device_);
+    ASSERT_NE(gate_kernel, nullptr);
+    ASSERT_NE(up_kernel, nullptr);
+
+    ASSERT_TRUE(setupSharedWorkspace({gate_kernel, up_kernel}, M, {N, N}, K));
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    std::vector<float> ref_gate;
+    std::vector<float> ref_up;
+    for (int rep = 0; rep < 3; ++rep)
+    {
+        auto out_gate = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+        auto out_up = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N});
+        std::vector<TensorProjectionDesc> projections = {
+            {gate_kernel, out_gate.get(), N, nullptr, "gate"},
+            {up_kernel, out_up.get(), N, nullptr, "up"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {out_gate.get(), out_up.get()},
+            [&]
+            {
+                return gate_kernel->multiply_fused_tensor(
+                    input.get(), projections, M, K, nullptr, workspace_.get());
+            }))
+            << "deterministic fused prefill repetition " << rep;
+
+        int selected_tile = -1;
+        int selected_split_k = 0;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(
+            &selected_tile, &selected_split_k, &used_bk256, &used_streamk);
+        EXPECT_EQ(selected_split_k, 1)
+            << "LLAMINAR_DETERMINISTIC must clamp forced split-K prefill to serial K";
+        EXPECT_EQ(used_streamk, 0)
+            << "LLAMINAR_DETERMINISTIC must disable Stream-K prefill atomics";
+
+        const float *gate = out_gate->data();
+        const float *up = out_up->data();
+        std::vector<float> gate_snapshot(gate, gate + static_cast<size_t>(M) * N);
+        std::vector<float> up_snapshot(up, up + static_cast<size_t>(M) * N);
+        if (rep == 0)
+        {
+            ref_gate = std::move(gate_snapshot);
+            ref_up = std::move(up_snapshot);
+            continue;
+        }
+        expectBitwiseEqual(gate_snapshot, ref_gate, "deterministic fused prefill gate");
+        expectBitwiseEqual(up_snapshot, ref_up, "deterministic fused prefill up");
+    }
+
+    cleanupSharedWorkspace({gate_kernel, up_kernel});
+#endif
+}
+
+TEST_F(Test__CUDAGemmNonDeterminism, NativeVNNIDeterministicEnvDisablesConcurrentDecodeAndRepeatsBitwise)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA build required";
+#else
+    ScopedCudaPrefillModes mode_guard;
+    ScopedDebugEnvOverride deterministic_env("LLAMINAR_DETERMINISTIC", "1");
+    ScopedDebugEnvOverride concurrent_prefill_env("LLAMINAR_CUDA_CONCURRENT_PREFILL", "1");
+    ScopedDebugEnvOverride concurrent_decode_env("LLAMINAR_CUDA_CONCURRENT_DECODE", "1");
+    ASSERT_TRUE(debugEnv().gemm.deterministic);
+    EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+    cudaNativeVNNIPrefill_setBK256Mode(0);
+    cudaNativeVNNIPrefill_setDeterministicMode(debugEnv().gemm.deterministic);
+
+    constexpr int M = 1;
+    constexpr int N_Q = 512;
+    constexpr int N_KV = 256;
+    constexpr int K = 2048;
+
+    auto wq = TestTensorFactory::createQ8_0Random({N_Q, K}, 9201u);
+    auto wk = TestTensorFactory::createQ8_0Random({N_KV, K}, 9202u);
+    auto wv = TestTensorFactory::createQ8_0Random({N_KV, K}, 9203u);
+    ASSERT_TRUE(wq->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wk->ensureOnDevice(gpu_device_));
+    ASSERT_TRUE(wv->ensureOnDevice(gpu_device_));
+
+    auto *q_kernel = getPreparedKernel(wq.get(), gpu_device_);
+    auto *k_kernel = getPreparedKernel(wk.get(), gpu_device_);
+    auto *v_kernel = getPreparedKernel(wv.get(), gpu_device_);
+    ASSERT_NE(q_kernel, nullptr);
+    ASSERT_NE(k_kernel, nullptr);
+    ASSERT_NE(v_kernel, nullptr);
+
+    WorkspaceRequirements reqs;
+    auto *q_ws = dynamic_cast<IWorkspaceConsumer *>(q_kernel);
+    auto *k_ws = dynamic_cast<IWorkspaceConsumer *>(k_kernel);
+    auto *v_ws = dynamic_cast<IWorkspaceConsumer *>(v_kernel);
+    ASSERT_NE(q_ws, nullptr);
+    ASSERT_NE(k_ws, nullptr);
+    ASSERT_NE(v_ws, nullptr);
+    reqs.merge(q_ws->getWorkspaceRequirements(M, N_Q, K));
+    reqs.merge(k_ws->getWorkspaceRequirements(M, N_KV, K));
+    reqs.merge(v_ws->getWorkspaceRequirements(M, N_KV, K));
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    cudaStream_t stream = nullptr;
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), cudaSuccess);
+
+    workspace_ = std::make_unique<DeviceWorkspaceManager>(gpu_device_, 128 * 1024 * 1024);
+    ASSERT_TRUE(workspace_->allocate(reqs));
+    q_ws->bindWorkspace(workspace_.get());
+    k_ws->bindWorkspace(workspace_.get());
+    v_ws->bindWorkspace(workspace_.get());
+    q_kernel->setGPUStream(stream);
+    k_kernel->setGPUStream(stream);
+    v_kernel->setGPUStream(stream);
+
+    auto input = std::make_unique<FP32Tensor>(std::vector<size_t>{M, K});
+    for (int i = 0; i < M * K; ++i)
+        input->mutable_data()[i] = dist_(rng_);
+
+    std::vector<float> ref_q;
+    std::vector<float> ref_k;
+    std::vector<float> ref_v;
+    for (int rep = 0; rep < 4; ++rep)
+    {
+        auto q_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_Q});
+        auto k_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        auto v_output = std::make_unique<FP32Tensor>(std::vector<size_t>{M, N_KV});
+        std::vector<TensorProjectionDesc> projections = {
+            {q_kernel, q_output.get(), N_Q, nullptr, "Q"},
+            {k_kernel, k_output.get(), N_KV, nullptr, "K"},
+            {v_kernel, v_output.get(), N_KV, nullptr, "V"}};
+
+        ASSERT_TRUE(with_gpu_coherence(
+            gpu_device_,
+            {input.get()},
+            {q_output.get(), k_output.get(), v_output.get()},
+            [&]
+            {
+                return q_kernel->multiply_fused_tensor(
+                    input.get(), projections, M, K, nullptr, workspace_.get());
+            }))
+            << "deterministic fused decode repetition " << rep;
+
+        const float *q = q_output->data();
+        const float *k = k_output->data();
+        const float *v = v_output->data();
+        std::vector<float> q_snapshot(q, q + N_Q);
+        std::vector<float> k_snapshot(k, k + N_KV);
+        std::vector<float> v_snapshot(v, v + N_KV);
+        if (rep == 0)
+        {
+            ref_q = std::move(q_snapshot);
+            ref_k = std::move(k_snapshot);
+            ref_v = std::move(v_snapshot);
+            continue;
+        }
+        expectBitwiseEqual(q_snapshot, ref_q, "deterministic fused decode Q");
+        expectBitwiseEqual(k_snapshot, ref_k, "deterministic fused decode K");
+        expectBitwiseEqual(v_snapshot, ref_v, "deterministic fused decode V");
+    }
+
+    q_ws->unbindWorkspace();
+    k_ws->unbindWorkspace();
+    v_ws->unbindWorkspace();
+    workspace_.reset();
+    ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
 #endif
 }
 

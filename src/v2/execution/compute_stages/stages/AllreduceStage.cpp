@@ -61,7 +61,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllreduceStage] Using CollectiveContext, count=" << count
+            LOG_DEBUG("[AllreduceStage] Using CollectiveContext, count=" << count
                                                                         << " dtype=" << params_.buffer->dtype_name());
         }
 
@@ -78,7 +78,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[AllreduceStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
+            LOG_DEBUG("[AllreduceStage] CollectiveContext result=" << (success ? "SUCCESS" : "FAILED"));
         }
 
         return success;
@@ -101,7 +101,7 @@ namespace llaminar2
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[MPI] AllReduce START: count=" << count
+            LOG_DEBUG("[MPI] AllReduce START: count=" << count
                                                      << " dtype=" << params_.buffer->dtype_name());
         }
 
@@ -206,13 +206,13 @@ namespace llaminar2
             double ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
             double bytes = count * sizeof(float); // Approximate
             double bandwidth_gbps = (bytes / (ms / 1000.0)) / (1024.0 * 1024.0 * 1024.0);
-            LOG_INFO("[MPI] AllReduce timing: " << ms << " ms for " << count
+            LOG_DEBUG("[MPI] AllReduce timing: " << ms << " ms for " << count
                                                 << " elements (" << bandwidth_gbps << " GB/s)");
         }
 
         if (mpi_env.log_collectives)
         {
-            LOG_INFO("[MPI] AllReduce END: result=" << (success ? "SUCCESS" : "FAILED"));
+            LOG_DEBUG("[MPI] AllReduce END: result=" << (success ? "SUCCESS" : "FAILED"));
         }
 
         return success;

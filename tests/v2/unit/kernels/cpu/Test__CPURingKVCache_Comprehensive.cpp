@@ -124,10 +124,49 @@ static std::shared_ptr<BF16Tensor> taggedBF16(int rows, float base)
     return t;
 }
 
+/// Create Q8_1 tensor where row r has all elements = base + r.
+static std::shared_ptr<Q8_1Tensor> taggedQ8_1(int rows, int cols, int base)
+{
+    const size_t blocks_per_row = (static_cast<size_t>(cols) + Q8_1Block::BLOCK_SIZE - 1) / Q8_1Block::BLOCK_SIZE;
+    std::vector<Q8_1Block> blocks(static_cast<size_t>(rows) * blocks_per_row);
+
+    for (int r = 0; r < rows; ++r)
+    {
+        const int value = base + r;
+        for (size_t b = 0; b < blocks_per_row; ++b)
+        {
+            Q8_1Block &block = blocks[static_cast<size_t>(r) * blocks_per_row + b];
+            // Use an exact unit scale so dequantized rows identify stale shadows unambiguously.
+            block.d = fp32_to_fp16_bits(1.0f);
+            block.sum_qs = 0;
+            for (int i = 0; i < static_cast<int>(Q8_1Block::BLOCK_SIZE); ++i)
+            {
+                const int col = static_cast<int>(b * Q8_1Block::BLOCK_SIZE) + i;
+                const int8_t q = col < cols ? static_cast<int8_t>(value) : static_cast<int8_t>(0);
+                block.qs[i] = q;
+                block.sum_qs += q;
+            }
+        }
+    }
+
+    return std::make_shared<Q8_1Tensor>(
+        std::vector<size_t>{static_cast<size_t>(rows), static_cast<size_t>(cols)},
+        blocks.data(), blocks.size(), DeviceId::cpu());
+}
+
 /// Check that an FP32 row has all elements near expected_val.
 static bool rowNear(const float *row, float expected, float tol = 0.01f)
 {
     for (int c = 0; c < KV_DIM; ++c)
+        if (std::abs(row[c] - expected) > tol)
+            return false;
+    return true;
+}
+
+/// Check a row with an explicit column count; useful for Q8_1 rows with 32 columns.
+static bool rowNearCols(const float *row, int cols, float expected, float tol = 0.01f)
+{
+    for (int c = 0; c < cols; ++c)
         if (std::abs(row[c] - expected) > tol)
             return false;
     return true;
@@ -488,6 +527,142 @@ TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_ClearLayer_InvalidatesShad
                                        &out_k, &out_v, &len));
     EXPECT_EQ(len, 3);
     EXPECT_TRUE(rowNear(out_k->data(), 10.0f));
+}
+
+TEST_F(Test__CPURingKVCache_Comprehensive, FP16Shadow_Clear_ThenSameLengthReappend_DoesNotReuseStaleRows)
+{
+    // Same-length reappend is the regression case: without clear() resetting
+    // shadow metadata, kv_len == converted_rows and get_kv_converted skips reconversion.
+    constexpr int MAX_SEQ = 4;
+    CPURingKVCacheFP16 cache(testMPI(), 1, 1, MAX_SEQ, NKV, HD, DeviceId::cpu());
+
+    auto old_k = taggedFP16(2, 10.0f);
+    auto old_v = taggedFP16(2, 20.0f);
+    ASSERT_TRUE(cache.append_kv(0, 0, old_k.get(), old_v.get(), 2));
+
+    ITensor *out_k = nullptr;
+    ITensor *out_v = nullptr;
+    int len = 0;
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    ASSERT_EQ(len, 2);
+    ASSERT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 10.0f));
+    ASSERT_TRUE(rowNear(out_v->data() + 0 * KV_DIM, 20.0f));
+
+    cache.clear();
+    ASSERT_EQ(cache.ring_size(0, 0), 0);
+    ASSERT_EQ(cache.ring_head(0, 0), 0);
+
+    auto new_k = taggedFP16(2, 50.0f);
+    auto new_v = taggedFP16(2, 60.0f);
+    ASSERT_TRUE(cache.append_kv(0, 0, new_k.get(), new_v.get(), 2));
+
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    EXPECT_EQ(len, 2);
+    EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 50.0f))
+        << "clear() left stale K shadow row, got " << out_k->data()[0];
+    EXPECT_TRUE(rowNear(out_k->data() + 1 * KV_DIM, 51.0f))
+        << "clear() left stale K shadow row, got " << out_k->data()[KV_DIM];
+    EXPECT_TRUE(rowNear(out_v->data() + 0 * KV_DIM, 60.0f))
+        << "clear() left stale V shadow row, got " << out_v->data()[0];
+    EXPECT_TRUE(rowNear(out_v->data() + 1 * KV_DIM, 61.0f))
+        << "clear() left stale V shadow row, got " << out_v->data()[KV_DIM];
+}
+
+TEST_F(Test__CPURingKVCache_Comprehensive, BF16Shadow_ClearSequence_ThenSameLengthReappend_DoesNotReuseStaleRows)
+{
+    // Per-sequence reset must invalidate only the targeted converted shadow.
+    constexpr int MAX_SEQ = 4;
+    CPURingKVCacheBF16 cache(testMPI(), 1, 2, MAX_SEQ, NKV, HD, DeviceId::cpu());
+
+    auto seq0_k = taggedBF16(2, 10.0f);
+    auto seq0_v = taggedBF16(2, 20.0f);
+    auto seq1_k = taggedBF16(2, 100.0f);
+    auto seq1_v = taggedBF16(2, 110.0f);
+    ASSERT_TRUE(cache.append_kv(0, 0, seq0_k.get(), seq0_v.get(), 2));
+    ASSERT_TRUE(cache.append_kv(0, 1, seq1_k.get(), seq1_v.get(), 2));
+
+    ITensor *out_k = nullptr;
+    ITensor *out_v = nullptr;
+    int len = 0;
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    ASSERT_EQ(len, 2);
+    ASSERT_TRUE(cache.get_kv_converted(0, 1, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    ASSERT_EQ(len, 2);
+
+    cache.clear_sequence(0, 0);
+    ASSERT_EQ(cache.ring_size(0, 0), 0);
+    ASSERT_EQ(cache.ring_size(0, 1), 2);
+
+    auto new_k = taggedBF16(2, 50.0f);
+    auto new_v = taggedBF16(2, 60.0f);
+    ASSERT_TRUE(cache.append_kv(0, 0, new_k.get(), new_v.get(), 2));
+
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    EXPECT_EQ(len, 2);
+    EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 50.0f, 0.1f))
+        << "clear_sequence() left stale K shadow row, got " << out_k->data()[0];
+    EXPECT_TRUE(rowNear(out_v->data() + 1 * KV_DIM, 61.0f, 0.1f))
+        << "clear_sequence() left stale V shadow row, got " << out_v->data()[KV_DIM];
+
+    ASSERT_TRUE(cache.get_kv_converted(0, 1, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    EXPECT_EQ(len, 2);
+    EXPECT_TRUE(rowNear(out_k->data() + 0 * KV_DIM, 100.0f, 0.1f))
+        << "clear_sequence() should not disturb sibling sequence";
+}
+
+TEST_F(Test__CPURingKVCache_Comprehensive, Q8_1Shadow_ClearLayer_ThenSameLengthReappend_DoesNotReuseStaleRows)
+{
+    // Q8_1 dequantization works in 32-wide blocks, matching the long-context KV precision path.
+    constexpr int Q8_HD = 32;
+    constexpr int Q8_DIM = Q8_HD;
+    CPURingKVCacheQ8_1 cache(testMPI(), 2, 1, 4, 1, Q8_HD, DeviceId::cpu());
+
+    auto layer0_k = taggedQ8_1(2, Q8_DIM, 10);
+    auto layer0_v = taggedQ8_1(2, Q8_DIM, 20);
+    auto layer1_k = taggedQ8_1(2, Q8_DIM, 80);
+    auto layer1_v = taggedQ8_1(2, Q8_DIM, 90);
+    ASSERT_TRUE(cache.append_kv(0, 0, layer0_k.get(), layer0_v.get(), 2));
+    ASSERT_TRUE(cache.append_kv(1, 0, layer1_k.get(), layer1_v.get(), 2));
+
+    ITensor *out_k = nullptr;
+    ITensor *out_v = nullptr;
+    int len = 0;
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    ASSERT_EQ(len, 2);
+    ASSERT_TRUE(cache.get_kv_converted(1, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    ASSERT_EQ(len, 2);
+
+    cache.clear_layer(0);
+    ASSERT_EQ(cache.ring_size(0, 0), 0);
+    ASSERT_EQ(cache.ring_size(1, 0), 2);
+
+    auto new_k = taggedQ8_1(2, Q8_DIM, 40);
+    auto new_v = taggedQ8_1(2, Q8_DIM, 50);
+    ASSERT_TRUE(cache.append_kv(0, 0, new_k.get(), new_v.get(), 2));
+
+    ASSERT_TRUE(cache.get_kv_converted(0, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    EXPECT_EQ(len, 2);
+    EXPECT_TRUE(rowNearCols(out_k->data() + 0 * Q8_DIM, Q8_DIM, 40.0f))
+        << "clear_layer() left stale Q8_1 K shadow row, got " << out_k->data()[0];
+    EXPECT_TRUE(rowNearCols(out_k->data() + 1 * Q8_DIM, Q8_DIM, 41.0f))
+        << "clear_layer() left stale Q8_1 K shadow row, got " << out_k->data()[Q8_DIM];
+    EXPECT_TRUE(rowNearCols(out_v->data() + 0 * Q8_DIM, Q8_DIM, 50.0f))
+        << "clear_layer() left stale Q8_1 V shadow row, got " << out_v->data()[0];
+
+    ASSERT_TRUE(cache.get_kv_converted(1, 0, ActivationPrecision::FP32,
+                                       &out_k, &out_v, &len));
+    EXPECT_EQ(len, 2);
+    EXPECT_TRUE(rowNearCols(out_k->data() + 0 * Q8_DIM, Q8_DIM, 80.0f))
+        << "clear_layer() should not disturb sibling layer";
 }
 
 // =========================================================================

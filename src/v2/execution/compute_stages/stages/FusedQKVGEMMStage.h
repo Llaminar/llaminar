@@ -9,7 +9,9 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
@@ -17,6 +19,8 @@ namespace llaminar2
 
     // Forward declarations for cached kernel pointers
     class ITensorGemm;
+    class FP32Tensor;
+    class PreparedWeightStore;
 
     /**
      * @brief Fused Q/K/V projection stage
@@ -63,11 +67,34 @@ namespace llaminar2
             std::optional<BufferId> output_q_buffer_id;
             std::optional<BufferId> output_k_buffer_id;
             std::optional<BufferId> output_v_buffer_id;
+
+            /**
+             * @brief Execute tiny verifier batches with grouped decode-equivalent Q/K/V projections.
+             *
+             * MTP publication compares the state produced by an all-position verifier
+             * pass against the state that would have been produced by accepting the
+             * same rows through normal decode. Quantized GEMM kernels can choose
+             * different small-M routes for m=2..4 than they do for m=1. When this
+             * flag is set the stage preserves the single graph node contract while
+             * requiring a grouped M=2..4 path whose numerical contract has been
+             * proven equivalent to serial decode with cosine, L2, KLD, max-abs, and
+             * token gates.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_q;
+            std::optional<PreparedWeightRef> prepared_ref_k;
+            std::optional<PreparedWeightRef> prepared_ref_v;
+            PreparedWeightStore *prepared_store = nullptr;
         };
 
         explicit FusedQKVGEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM_FUSED_QKV; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -83,7 +110,7 @@ namespace llaminar2
         /**
          * @brief Get a GEMM kernel as IWorkspaceConsumer for delegation
          *
-         * Returns the Q projection kernel from KernelFactory. Used for
+         * Returns the Q projection kernel from PreparedWeightStore. Used for
          * single-kernel operations (e.g., hasWorkspace checks).
          *
          * @return Kernel implementing IWorkspaceConsumer, or nullptr if not available
@@ -93,9 +120,8 @@ namespace llaminar2
         /**
          * @brief Get workspace requirements from ALL THREE GEMM kernels (Q, K, V)
          *
-         * Override the default single-kernel delegation because each kernel has
-         * per-instance unique buffer names (e.g., gemm_temp_c_fp32_<id>).
-         * Reporting only Q's requirements would miss K's and V's unique buffers.
+         * Override the default single-kernel delegation so projection-specific
+         * dimensions are represented before workspace requirements are merged.
          */
         WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
@@ -120,6 +146,24 @@ namespace llaminar2
         ITensorGemm *cached_gemm_k_ = nullptr;
         ITensorGemm *cached_gemm_v_ = nullptr;
         bool cache_resolved_individual_ = false;
+
+        bool resolveIndividualKernels(const char *caller);
+        bool executeDecodeEquivalentVerifierPrefill(
+            TensorBase *input_base,
+            TensorBase *output_q_base,
+            TensorBase *output_k_base,
+            TensorBase *output_v_base,
+            ITensorGemm *gemm_q,
+            ITensorGemm *gemm_k,
+            ITensorGemm *gemm_v);
+
+        // Reused tiny row tensors for device-side verifier publication.  They are
+        // deliberately owned by the stage so repeated decode steps do not allocate
+        // a fresh scratch tensor for every verifier row.
+        std::shared_ptr<FP32Tensor> verifier_input_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_q_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_k_row_;
+        std::shared_ptr<FP32Tensor> verifier_output_v_row_;
     };
 
 } // namespace llaminar2

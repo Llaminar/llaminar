@@ -20,8 +20,13 @@
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 
+#include <cstdint>
+#include <memory>
 #include <optional>
+#include <string>
+#include <vector>
 
 namespace llaminar2
 {
@@ -36,9 +41,14 @@ namespace llaminar2
      *
      * Delegates to ITensorShortConvolution* kernel for the actual computation.
      */
-    class ShortConv1dStage : public IComputeStage
+    class ShortConv1dStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
+        static constexpr const char *WS_INPLACE_PREFILL_SCRATCH = "gdn_shortconv_inplace_scratch";
+        static constexpr const char *WS_EFFECTIVE_SEQ_LEN_SCALAR = "gdn_shortconv_effective_seq_len_scalar";
+        static constexpr const char *WS_SPECULATIVE_STATE_SLOTS = "gdn_shortconv_speculative_state_slots";
+        static constexpr const char *WS_SPECULATIVE_STATE_WORK = "gdn_shortconv_speculative_state_work";
+
         struct Params
         {
             STAGE_PARAMS_COMMON_FIELDS;
@@ -50,8 +60,21 @@ namespace llaminar2
 
             float *conv_state = nullptr; ///< Conv state buffer [channels, kernel_size-1] (from GDNLayerState)
             int seq_len = 0;             ///< Sequence length
+            int request_count = 1;       ///< Number of independent requests in the flattened verifier tensor.
+            int request_seq_len = 0;     ///< Per-request rows before flattening; 0 means seq_len for legacy graphs.
             int channels = 0;            ///< Number of channels (= QKV dim)
             int kernel_size = 4;         ///< Convolution kernel width
+            int layer_idx = -1;          ///< Logical model layer for stable graph workspace naming.
+            /**
+             * @brief Stable graph/workspace namespace for capture-sensitive buffers.
+             *
+             * All-position verifier rows and MTP sidecar rows may be built for the
+             * same logical layer.  The namespace keeps short-conv verifier-state
+             * snapshots graph-role local instead of sharing one layer-only key.
+             */
+            std::string workspace_namespace;
+            int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
+            int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 
             /// Kernel implementation (set during graph construction)
             ITensorShortConvolution *kernel = nullptr;
@@ -64,6 +87,7 @@ namespace llaminar2
         static_assert(StageParamsRequired<Params>);
 
         explicit ShortConv1dStage(Params params);
+        ~ShortConv1dStage() override;
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::SHORT_CONV1D; }
@@ -74,20 +98,126 @@ namespace llaminar2
         StageBufferRequirements getBufferRequirements() const override;
         StageBufferContract bufferContract() const override;
 
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
+
         void updateDynamicParams(int pos_offset, int seq_len) override
         {
             (void)pos_offset; // Conv1d doesn't use position offsets
             params_.seq_len = seq_len;
         }
         bool hasDynamicParams() const override { return true; }
+        bool supportsDeviceResidentDynamicPositionReplay() const override
+        {
+            return true;
+        }
+        void resetSessionState() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+            {
+                params_.kernel->setGPUStream(nullptr);
+                clearKernelVerifierStateWorkspace();
+            }
+        }
 
+        /**
+         * @brief Reset request-local short-conv metadata while preserving capture slots.
+         *
+         * Preserved prefill graphs replay over the same verifier-state capture
+         * workspace and effective-length scalar addresses. The scalar is
+         * restamped before launch, so request reset only clears host mirrors and
+         * stream ownership here.
+         */
+        void resetSessionStatePreservingCapturedReplay() override
+        {
+            IComputeStage::resetSessionState();
+            prefill_effective_seq_len_ = 0;
+            prefill_bucket_seq_len_ = 0;
+            prefill_replay_params_set_ = false;
+            if (params_.kernel)
+                params_.kernel->setGPUStream(nullptr);
+        }
+
+        /**
+         * @brief Preserve warmed short-conv workspaces for capture-from-Initialized.
+         */
+        void resetSessionStatePreservingLazyInitialization() override
+        {
+            resetSessionStatePreservingCapturedReplay();
+        }
+
+        bool hasPrefillReplayParams() const override { return true; }
+        void updatePrefillReplayParams(const PrefillReplayParams &replay) override;
+        bool supportsPaddedPrefillRealLengthContract() const override;
+        bool hasVerifierStateCapture() const override;
+        bool requiresVerifierStateCaptureForPublication() const override
+        {
+            return verifierStateCaptureWorkspaceRequired();
+        }
+        bool restoreVerifierStateCaptureRow(int row, void *stream = nullptr) override;
+        bool restoreVerifierStateCaptureRowFromDeviceIndex(
+            const int *device_row_index,
+            void *stream) override;
+        /**
+         * @brief Restore one captured short-conv state row per request.
+         *
+         * Batched publication is only correct when the backend owns a separate
+         * live conv-state slot per request.  This hook exists so CUDA, ROCm,
+         * and CPU can share the same publication contract once those state
+         * banks are implemented; it must not be replaced by a scalar loop.
+         */
+        bool restoreVerifierStateCaptureRowsFromDeviceIndices(
+            const int *device_row_indices,
+            int request_count,
+            int row_index_stride,
+            void *stream) override;
+        void onGraphReplayed() override;
+        bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
         // Short conv1d operates fully on-device when GPU is active — graph-capturable
         bool isGraphCapturable() const override { return true; }
 
         const Params &getParams() const { return params_; }
 
     private:
+        struct GpuEffectiveSeqLenState;
+
         Params params_;
+        int prefill_effective_seq_len_ = 0;
+        int prefill_bucket_seq_len_ = 0;
+        bool prefill_replay_params_set_ = false;
+        std::unique_ptr<GpuEffectiveSeqLenState> gpu_effective_seq_len_state_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
+        uint32_t workspace_slice_id_ = 0;
+        bool verifier_capture_workspace_bound_ = false;
+        bool speculative_state_work_bound_ = false;
+        int verifier_capture_rows_bound_ = 0;
+        int verifier_capture_state_size_bound_ = 0;
+        std::vector<float> host_verifier_state_slots_;
+
+        int effectivePrefillSeqLen() const;
+        bool shouldUseRealLengthContract() const;
+        std::string workspaceStableId() const;
+        std::string effectiveSeqLenScalarBufferName() const;
+        std::string speculativeStateSlotsBufferName() const;
+        std::string speculativeStateWorkBufferName() const;
+        int requestedSpeculativeStateSlotRows() const;
+        bool verifierStateCaptureWorkspaceRequired() const;
+        bool ensureVerifierStateCaptureWorkspaceBound() const;
+        bool ensureGpuEffectiveSeqLenStateInitialized();
+        bool uploadGpuEffectiveSeqLen();
+        void refreshPinnedEffectiveSeqLen();
+        void releaseGpuEffectiveSeqLenState();
+        void bindKernelWorkspace();
+        void clearKernelVerifierStateWorkspace();
+        const float *cpuVerifierStateCaptureSource() const;
+        bool restoreCPUVerifierStateCaptureRowDirect(int row);
     };
 
 } // namespace llaminar2

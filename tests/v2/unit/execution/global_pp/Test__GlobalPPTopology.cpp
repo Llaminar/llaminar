@@ -15,6 +15,8 @@
 
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <initializer_list>
+#include <vector>
 
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/global_pp/GlobalPPRankPlan.h"
@@ -63,6 +65,89 @@ static GlobalPPTopology buildCanonical3Stage()
     s2.per_rank_device = GlobalDeviceAddress::cpu(0);
 
     return GlobalPPTopology::build({s0, s1, s2}, 24, 2);
+}
+
+static GlobalPPStageSpec makeLocalTPStage(int stage_id,
+                                          int first_layer,
+                                          int last_layer,
+                                          int owning_rank,
+                                          std::initializer_list<GlobalDeviceAddress> devices,
+                                          bool has_embedding = false,
+                                          bool has_lm_head = false)
+{
+    GlobalPPStageSpec spec;
+    spec.stage_id = stage_id;
+    spec.first_layer = first_layer;
+    spec.last_layer = last_layer;
+    spec.has_embedding = has_embedding;
+    spec.has_lm_head = has_lm_head;
+    spec.is_global_tp = false;
+    spec.owning_rank = owning_rank;
+    spec.inner_mode = InnerParallelism::LOCAL_TP;
+    spec.devices = devices;
+    return spec;
+}
+
+static GlobalPPStageSpec makeNodeLocalCpuTPStage(int stage_id,
+                                                 int first_layer,
+                                                 int last_layer,
+                                                 std::initializer_list<int> participating_ranks,
+                                                 bool has_embedding = false,
+                                                 bool has_lm_head = false)
+{
+    GlobalPPStageSpec spec;
+    spec.stage_id = stage_id;
+    spec.first_layer = first_layer;
+    spec.last_layer = last_layer;
+    spec.has_embedding = has_embedding;
+    spec.has_lm_head = has_lm_head;
+    spec.is_global_tp = true;
+    spec.participating_ranks = participating_ranks;
+    spec.per_rank_device = GlobalDeviceAddress::cpu(0);
+    return spec;
+}
+
+static std::vector<int> executeStageIds(const GlobalPPRankPlan &plan)
+{
+    std::vector<int> ids;
+    for (const auto *stage : plan.executeStages())
+    {
+        ids.push_back(stage->stage_id);
+    }
+    return ids;
+}
+
+static size_t countTransferActions(const GlobalPPRankPlan &plan, int from_stage, int to_stage)
+{
+    size_t count = 0;
+    for (const auto *transfer : plan.transferActions())
+    {
+        if (transfer->from_stage == from_stage && transfer->to_stage == to_stage)
+        {
+            ++count;
+        }
+    }
+    return count;
+}
+
+static size_t countTransferActions(const GlobalPPRankPlan &plan,
+                                   int from_stage,
+                                   int to_stage,
+                                   RankTransferAction::Direction direction,
+                                   int peer_rank)
+{
+    size_t count = 0;
+    for (const auto *transfer : plan.transferActions())
+    {
+        if (transfer->from_stage == from_stage &&
+            transfer->to_stage == to_stage &&
+            transfer->direction == direction &&
+            transfer->peer_rank == peer_rank)
+        {
+            ++count;
+        }
+    }
+    return count;
 }
 
 // =============================================================================
@@ -339,11 +424,12 @@ TEST_F(Test__GlobalPPTopology, TransferSingleToSingle)
 }
 
 /**
- * @test Same-rank transfer is a no-op
+ * @test Same-rank adjacent stages create an explicit local handoff
  */
-TEST_F(Test__GlobalPPTopology, TransferSameRankIsNoop)
+TEST_F(Test__GlobalPPTopology, TransferSameRankCreatesLocalHandoff)
 {
-    // 2 stages both owned by rank 0 — no MPI transfer needed
+    // 2 stages both owned by rank 0 — no MPI transfer needed, but the
+    // distinct stage runners still need an explicit local handoff.
     GlobalPPStageSpec s0;
     s0.stage_id = 0;
     s0.first_layer = 0;
@@ -361,7 +447,10 @@ TEST_F(Test__GlobalPPTopology, TransferSameRankIsNoop)
     auto topo = GlobalPPTopology::build({s0, s1}, 24, 1);
 
     ASSERT_EQ(topo.transfers.size(), 1u);
-    EXPECT_TRUE(topo.transfers[0].isNoop());
+    EXPECT_EQ(topo.transfers[0].kind, GlobalPPTransferKind::LOCAL_HANDOFF);
+    EXPECT_EQ(topo.transfers[0].sender_rank, 0);
+    EXPECT_EQ(topo.transfers[0].receiver_rank, 0);
+    EXPECT_FALSE(topo.transfers[0].isNoop());
 }
 
 /**
@@ -426,6 +515,53 @@ TEST(Test__GlobalPPStageSpec, InnerParallelismName)
     EXPECT_STREQ(innerParallelismName(InnerParallelism::SINGLE_DEVICE), "SINGLE_DEVICE");
     EXPECT_STREQ(innerParallelismName(InnerParallelism::LOCAL_TP), "LOCAL_TP");
     EXPECT_STREQ(innerParallelismName(InnerParallelism::LOCAL_PP), "LOCAL_PP");
+}
+
+/**
+ * @test globalPPTransferKindName returns correct strings
+ */
+TEST(Test__GlobalPPTransferKind, GlobalPPTransferKindName)
+{
+    EXPECT_STREQ(globalPPTransferKindName(GlobalPPTransferKind::MPI), "MPI");
+    EXPECT_STREQ(globalPPTransferKindName(GlobalPPTransferKind::LOCAL_HANDOFF), "LOCAL_HANDOFF");
+}
+
+/**
+ * @test Domain names appear in topology and rank-plan output
+ */
+TEST_F(Test__GlobalPPTopology, DomainNamesAppearInOutputAndRankPlan)
+{
+    auto s0 = makeLocalTPStage(0, 0, 11, 0,
+                               {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+                               true,
+                               false);
+    s0.domain_name = "gpu_fast";
+
+    auto s1 = makeNodeLocalCpuTPStage(1, 12, 23, {0, 1}, false, true);
+    s1.domain_name = "cpu_tail";
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2);
+    EXPECT_TRUE(topo.validate().empty());
+
+    const auto topo_string = topo.toString();
+    EXPECT_NE(topo_string.find("domain=gpu_fast"), std::string::npos);
+    EXPECT_NE(topo_string.find("domain=cpu_tail"), std::string::npos);
+
+    const auto topo_table = topo.toTable();
+    EXPECT_NE(topo_table.find("Domain"), std::string::npos);
+    EXPECT_NE(topo_table.find("gpu_fast"), std::string::npos);
+    EXPECT_NE(topo_table.find("cpu_tail"), std::string::npos);
+    EXPECT_NE(topo_table.find("LOCAL_HANDOFF"), std::string::npos);
+
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto exec_stages = plan0.executeStages();
+    ASSERT_EQ(exec_stages.size(), 2u);
+    EXPECT_EQ(exec_stages[0]->domain_name, "gpu_fast");
+    EXPECT_EQ(exec_stages[1]->domain_name, "cpu_tail");
+
+    const auto plan_string = plan0.toString();
+    EXPECT_NE(plan_string.find("domain=gpu_fast"), std::string::npos);
+    EXPECT_NE(plan_string.find("domain=cpu_tail"), std::string::npos);
 }
 
 // =============================================================================
@@ -541,6 +677,103 @@ TEST_F(Test__GlobalPPRankPlanBuilder, TransferMatching)
         }
     }
     EXPECT_TRUE(rank1_recvs) << "Rank 1 should receive from rank 0";
+}
+
+/**
+ * @test Phase 0 red test: LocalTP rank 0 -> node-local CPU TP ranks 0 and 1.
+ *
+ * Rank 0 needs a local handoff into its CPU shard, alongside the SEND to rank 1.
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, Phase0_LocalTPToNodeLocalCpuTPRequiresSourceLocalHandoff)
+{
+    auto s0 = makeLocalTPStage(0, 0, 11, 0,
+                               {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+                               true,
+                               false);
+    auto s1 = makeNodeLocalCpuTPStage(1, 12, 23, {0, 1}, false, true);
+
+    auto topo = GlobalPPTopology::build({s0, s1}, 24, 2);
+    EXPECT_TRUE(topo.validate().empty());
+
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    EXPECT_EQ(executeStageIds(plan0), std::vector<int>({0, 1}));
+    EXPECT_EQ(countTransferActions(plan0, 0, 1), 2u)
+        << "Rank 0 needs the existing SEND plus a local handoff action for 0 -> 1";
+    EXPECT_EQ(countTransferActions(plan0, 0, 1, RankTransferAction::Direction::SEND, 1), 1u);
+    EXPECT_EQ(countTransferActions(plan0, 0, 1, RankTransferAction::Direction::LOCAL_HANDOFF, 0), 1u);
+
+    EXPECT_EQ(executeStageIds(plan1), std::vector<int>({1}));
+    EXPECT_EQ(countTransferActions(plan1, 0, 1, RankTransferAction::Direction::RECV, 0), 1u);
+}
+
+/**
+ * @test Phase 0 red test: LocalTP ROCm rank 0 -> LocalTP CUDA rank 0 -> node-local CPU TP.
+ *
+ * Rank 0 should execute all three stage runners and have transfer actions for
+ * both local domain handoffs plus the fan-out SEND to rank 1.
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, Phase0_ThreeStageRank0OwnershipRequiresTwoLocalHandoffs)
+{
+    auto s0 = makeLocalTPStage(0, 0, 7, 0,
+                               {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
+                               true,
+                               false);
+    auto s1 = makeLocalTPStage(1, 8, 15, 0,
+                               {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    auto s2 = makeNodeLocalCpuTPStage(2, 16, 23, {0, 1}, false, true);
+
+    auto topo = GlobalPPTopology::build({s0, s1, s2}, 24, 2);
+    EXPECT_TRUE(topo.validate().empty());
+
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    EXPECT_EQ(executeStageIds(plan0), std::vector<int>({0, 1, 2}));
+    EXPECT_EQ(plan0.transferActions().size(), 3u)
+        << "Rank 0 needs local handoff 0 -> 1, local handoff 1 -> 2, and SEND 1 -> 2 to rank 1";
+    EXPECT_EQ(countTransferActions(plan0, 0, 1, RankTransferAction::Direction::LOCAL_HANDOFF, 0), 1u);
+    EXPECT_EQ(countTransferActions(plan0, 1, 2, RankTransferAction::Direction::LOCAL_HANDOFF, 0), 1u);
+    EXPECT_EQ(countTransferActions(plan0, 1, 2, RankTransferAction::Direction::SEND, 1), 1u);
+
+    EXPECT_EQ(executeStageIds(plan1), std::vector<int>({2}));
+    EXPECT_EQ(countTransferActions(plan1, 1, 2, RankTransferAction::Direction::RECV, 0), 1u);
+}
+
+/**
+ * @test Phase 0 red test: mirrored socket ownership has rank 1 local GPU domains.
+ *
+ * Rank 1 should execute the node-local CPU shard and both local GPU TP stages,
+ * with local handoff actions between 0 -> 1 and 1 -> 2. Rank 0 should execute
+ * only stage 0; it does not need to send to rank 1 because rank 1 already
+ * participates in the source node-local TP stage.
+ */
+TEST_F(Test__GlobalPPRankPlanBuilder, Phase0_MirroredSocketLocalityRequiresRank1LocalHandoffs)
+{
+    auto s0 = makeNodeLocalCpuTPStage(0, 0, 7, {0, 1}, true, false);
+    auto s1 = makeLocalTPStage(1, 8, 15, 1,
+                               {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+    auto s2 = makeLocalTPStage(2, 16, 23, 1,
+                               {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)},
+                               false,
+                               true);
+
+    auto topo = GlobalPPTopology::build({s0, s1, s2}, 24, 2);
+    EXPECT_TRUE(topo.validate().empty());
+
+    auto plan0 = GlobalPPRankPlanBuilder::build(topo, 0);
+    auto plan1 = GlobalPPRankPlanBuilder::build(topo, 1);
+
+    EXPECT_EQ(executeStageIds(plan1), std::vector<int>({0, 1, 2}));
+    EXPECT_EQ(plan1.transferActions().size(), 2u)
+        << "Rank 1 needs local handoff actions for 0 -> 1 and 1 -> 2";
+    EXPECT_EQ(countTransferActions(plan1, 0, 1, RankTransferAction::Direction::LOCAL_HANDOFF, 1), 1u);
+    EXPECT_EQ(countTransferActions(plan1, 1, 2, RankTransferAction::Direction::LOCAL_HANDOFF, 1), 1u);
+
+    EXPECT_EQ(executeStageIds(plan0), std::vector<int>({0}));
+    EXPECT_EQ(countTransferActions(plan0, 0, 1), 0u)
+        << "Rank 0 should not send because rank 1 already has stage 0 output from its node-local TP shard";
 }
 
 /**

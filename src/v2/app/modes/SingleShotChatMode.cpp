@@ -5,15 +5,37 @@
 
 #include "app/modes/SingleShotChatMode.h"
 #include "app/AppContext.h"
+#include "app/MPIShutdown.h"
 #include "utils/Logger.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Sampler.h"
-#include <mpi.h>
 #include <iostream>
+#include <string>
 #include <vector>
 
 namespace llaminar2
 {
+    namespace
+    {
+        int finalizeAfterUnhandledException(AppContext &ctx, const char *mode_name, const std::string &detail)
+        {
+            const bool has_mpi = ctx.mpi_ctx != nullptr;
+            const bool is_root = !has_mpi || ctx.mpi_ctx->rank() == 0;
+            const bool notify_workers = has_mpi && ctx.mpi_ctx->world_size() > 1 && ctx.mpi_ctx->rank() == 0;
+
+            if (is_root)
+                LOG_ERROR(mode_name << " failed with unhandled exception: " << detail);
+
+            if (ctx.runner)
+            {
+                if (notify_workers)
+                    ctx.runner->abortMPIWorkers(detail);
+                ctx.runner->shutdown();
+            }
+            mpiShutdown();
+            return 1;
+        }
+    } // namespace
 
     bool SingleShotChatMode::matches(const OrchestrationConfig &config) const
     {
@@ -21,11 +43,40 @@ namespace llaminar2
     }
 
     int SingleShotChatMode::execute(AppContext &ctx)
+    try
     {
         auto &config = ctx.config;
         auto &mpi_ctx = ctx.mpi_ctx;
         auto &runner = ctx.runner;
         auto &tokenizer = ctx.tokenizer;
+
+        const bool mpi_coordinated = mpi_ctx->world_size() > 1;
+        if (mpi_coordinated && mpi_ctx->rank() != 0)
+        {
+            LOG_DEBUG("Rank " << mpi_ctx->rank()
+                             << " entering MPI worker loop for single-shot chat inference");
+            runner->setMPICoordinatedMode(true);
+            runner->runMPIWorkerLoop();
+            runner->shutdown();
+            mpiShutdown();
+            return 0;
+        }
+
+        if (mpi_coordinated)
+        {
+            runner->setMPICoordinatedMode(true);
+        }
+
+        auto shutdownAndFinalize = [&](int exit_code) -> int
+        {
+            if (mpi_coordinated)
+            {
+                runner->shutdownMPIWorkers();
+            }
+            runner->shutdown();
+            mpiShutdown();
+            return exit_code;
+        };
 
         if (!tokenizer->hasChatTemplate())
         {
@@ -34,11 +85,7 @@ namespace llaminar2
                 LOG_ERROR("Chat mode requires a model with a chat template.");
                 LOG_ERROR("Use --chat-template to specify one (e.g., --chat-template chatml)");
             }
-            if (mpi_ctx->world_size() > 1)
-                mpi_ctx->barrier();
-            runner->shutdown();
-            MPI_Finalize();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
         if (mpi_ctx->rank() == 0)
@@ -46,11 +93,12 @@ namespace llaminar2
             LOG_INFO("Running single-shot chat...");
         }
 
-        // Build conversation and encode with chat template (rank 0 only, then broadcast)
+        // Build conversation and encode with chat template on rank 0. Coordinated
+        // prefill broadcasts the tokens to worker ranks when MPI is enabled.
         std::vector<int32_t> token_ids;
         int token_count = 0;
 
-        if (mpi_ctx->rank() == 0)
+        try
         {
             std::vector<ChatMessage> conversation;
             if (!config.system_prompt.empty())
@@ -73,27 +121,17 @@ namespace llaminar2
                 LOG_DEBUG("Encoded " << token_count << " tokens with chat template");
             }
         }
-
-        // Broadcast token count first
-        if (mpi_ctx->world_size() > 1)
-            mpi_ctx->broadcast_int32(&token_count, 1, 0);
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("Error encoding conversation with chat template: " << e.what());
+            return shutdownAndFinalize(1);
+        }
 
         if (token_count <= 0)
         {
-            runner->shutdown();
-            MPI_Finalize();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
-        // Resize token_ids on non-rank-0 processes and broadcast the tokens
-        if (mpi_ctx->rank() != 0)
-        {
-            token_ids.resize(token_count);
-        }
-        if (mpi_ctx->world_size() > 1)
-            mpi_ctx->broadcast_int32(token_ids.data(), token_count, 0);
-
-        // All ranks participate in prefill
         if (mpi_ctx->rank() == 0)
         {
             LOG_DEBUG("Running prefill (" << token_count << " tokens)...");
@@ -105,9 +143,7 @@ namespace llaminar2
             {
                 LOG_ERROR("Chat prefill failed: " << runner->lastError());
             }
-            runner->shutdown();
-            MPI_Finalize();
-            return 1;
+            return shutdownAndFinalize(1);
         }
 
         // Determine max tokens: -1 means unlimited
@@ -130,10 +166,15 @@ namespace llaminar2
         sampling_params.seed = config.seed;
         runner->setSamplingParams(sampling_params);
 
-        // Decode loop
-        for (int i = 0; i < max_tokens; ++i)
+        // Decode loop. MTP can return multiple accepted tokens in one step, so
+        // keep the loop bounded by emitted tokens rather than decode calls.
+        int generated_tokens = 0;
+        bool stop_generation = false;
+        while (generated_tokens < max_tokens && !stop_generation)
         {
+            runner->setDecodeStepTokenBudget(max_tokens - generated_tokens);
             GenerationResult result = runner->decodeStep();
+            runner->setDecodeStepTokenBudget(0);
 
             if (!result.success())
             {
@@ -141,9 +182,7 @@ namespace llaminar2
                 {
                     LOG_ERROR("Decode step failed: " << result.error);
                 }
-                runner->shutdown();
-                MPI_Finalize();
-                return 1;
+                return shutdownAndFinalize(1);
             }
 
             if (result.tokens.empty())
@@ -151,21 +190,30 @@ namespace llaminar2
                 break;
             }
 
-            int32_t next_token = result.tokens[0];
-
-            if (mpi_ctx->rank() == 0 && !tokenizer->is_stop_token(next_token))
+            for (size_t token_idx = 0; token_idx < result.tokens.size() && generated_tokens < max_tokens; ++token_idx)
             {
-                std::string token_text = tokenizer->decode_token(next_token);
-                std::cout << token_text << std::flush;
-            }
+                const int32_t next_token = result.tokens[token_idx];
+                const bool is_final_returned_token = token_idx + 1 == result.tokens.size();
+                const bool is_stop = tokenizer->is_stop_token(next_token) ||
+                                     (result.is_complete && is_final_returned_token);
 
-            if (result.is_complete || tokenizer->is_stop_token(next_token))
-            {
-                if (mpi_ctx->rank() == 0)
+                ++generated_tokens;
+
+                if (mpi_ctx->rank() == 0 && !is_stop)
                 {
-                    LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
+                    std::string token_text = tokenizer->decode_token(next_token);
+                    std::cout << token_text << std::flush;
                 }
-                break;
+
+                if (is_stop)
+                {
+                    if (mpi_ctx->rank() == 0)
+                    {
+                        LOG_DEBUG("Stop token encountered (" << next_token << "), stopping generation");
+                    }
+                    stop_generation = true;
+                    break;
+                }
             }
         }
 
@@ -178,9 +226,15 @@ namespace llaminar2
             LOG_INFO("Chat generation complete.");
         }
 
-        runner->shutdown();
-        MPI_Finalize();
-        return 0;
+        return shutdownAndFinalize(0);
+    }
+    catch (const std::exception &e)
+    {
+        return finalizeAfterUnhandledException(ctx, "Single-shot chat mode", e.what());
+    }
+    catch (...)
+    {
+        return finalizeAfterUnhandledException(ctx, "Single-shot chat mode", "unknown non-std exception");
     }
 
 } // namespace llaminar2

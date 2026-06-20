@@ -79,21 +79,21 @@ namespace llaminar2
             {
                 if (trace_coherence)
                 {
-                    LOG_INFO("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                    LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
                                                         << "' already on " << target_device.to_string()
                                                         << " (state=" << to_string(tensor_base->coherenceState()) << ")");
                 }
                 continue;
             }
 
-            // Check if tensor has cached device data (e.g., packed INT8 weights for CUDA GEMM)
-            // These tensors don't need raw data upload - the kernel uses its own representation
-            if (tensor_base->hasCachedDeviceData(target_device.type))
+            // Skip tensors whose GEMM weights are managed by the GPU pipeline.
+            // The prepared GEMM kernel owns the device copy in pooled VRAM.
+            if (tensor_base->hasPreparedDeviceState())
             {
                 if (trace_coherence)
                 {
-                    LOG_INFO("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
-                                                        << "' has cached device data for " << target_device.to_string()
+                    LOG_DEBUG("[StageCoherence] Input '" << (buf.name ? buf.name : "unknown")
+                                                        << "' is in prepared GEMM registry for " << target_device.to_string()
                                                         << " (skipping raw upload)");
                 }
                 continue;
@@ -134,7 +134,7 @@ namespace llaminar2
 
                 if (trace_coherence)
                 {
-                    LOG_INFO("[StageCoherence] ensureOnDevice('" << (buf.name ? buf.name : "unknown")
+                    LOG_DEBUG("[StageCoherence] ensureOnDevice('" << (buf.name ? buf.name : "unknown")
                                                                  << "') to " << target_device.to_string()
                                                                  << " took " << elapsed_us << " us"
                                                                  << " (numel=" << tensor_base->numel() << ")"
@@ -195,7 +195,7 @@ namespace llaminar2
             {
                 // Debug: why is_on_device returned false?
                 auto current_dev = tensor_base->current_device();
-                LOG_INFO("[StageCoherence] OUTPUT '" << (buf.name ? buf.name : "unknown")
+                LOG_DEBUG("[StageCoherence] OUTPUT '" << (buf.name ? buf.name : "unknown")
                                                      << "' NOT on " << target_device.to_string()
                                                      << " | gpu_device=" << (current_dev.has_value() ? current_dev->to_string() : "none")
                                                      << " ptr=" << static_cast<void *>(tensor_base));
@@ -204,7 +204,7 @@ namespace llaminar2
             {
                 if (trace_coherence)
                 {
-                    LOG_INFO("[StageCoherence] Output '" << (buf.name ? buf.name : "unknown")
+                    LOG_DEBUG("[StageCoherence] Output '" << (buf.name ? buf.name : "unknown")
                                                          << "' already on " << target_device.to_string());
                 }
                 continue;
@@ -220,7 +220,7 @@ namespace llaminar2
 
             if (trace_coherence)
             {
-                LOG_INFO("[StageCoherence] allocateOnDevice OUTPUT('" << (buf.name ? buf.name : "unknown")
+                LOG_DEBUG("[StageCoherence] allocateOnDevice OUTPUT('" << (buf.name ? buf.name : "unknown")
                                                                       << "') to " << target_device.to_string()
                                                                       << " took " << elapsed_us << " us"
                                                                       << " (numel=" << tensor_base->numel() << ")");

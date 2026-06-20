@@ -31,6 +31,7 @@ struct DevicePlanConfig
     // Runtime parameters
     int batch_size = 1;
     int max_seq_len = 0;  // 0 = use profile.max_seq_len
+    int activation_seq_len = 0;  // 0 = use max_seq_len for activation/workspace
 
     // Headroom
     size_t headroom_bytes = 128ULL * 1024 * 1024;

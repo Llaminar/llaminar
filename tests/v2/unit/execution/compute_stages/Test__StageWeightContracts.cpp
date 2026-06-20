@@ -65,7 +65,7 @@ protected:
     static constexpr int N_HEADS = 14;
     static constexpr int N_KV_HEADS = 2;
     static constexpr int HEAD_DIM = 64;
-    static constexpr int VOCAB_SIZE = 151936;
+    static constexpr int VOCAB_SIZE = 1024;
 };
 
 // =============================================================================

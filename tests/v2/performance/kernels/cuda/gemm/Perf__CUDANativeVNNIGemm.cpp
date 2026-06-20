@@ -34,6 +34,29 @@ extern "C"
 
 namespace
 {
+    const llaminar2::NativeVnniFormatInfo &requireNativeVnniInfo(
+        const TensorBase *weights,
+        const std::string &format_name)
+    {
+        const auto *unpackable = dynamic_cast<const llaminar2::IINT8Unpackable *>(weights);
+        const llaminar2::NativeVnniFormatInfo *info = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+        if (!info)
+            throw std::runtime_error("CUDA NativeVNNI sweep format " + format_name + " did not expose vnniFormatInfo()");
+        return *info;
+    }
+
+    TEST(CUDANativeVNNIGemmPerfOffline, FormatListCodebookIdsMatchTensorMetadata)
+    {
+        for (const auto &format : kFormats)
+        {
+            auto weights = format.create(/*n=*/2, /*k=*/256);
+            ASSERT_NE(weights, nullptr) << format.name;
+
+            const auto &info = requireNativeVnniInfo(weights.get(), format.name);
+            EXPECT_EQ(info.codebook_id, format.codebook_id) << format.name;
+        }
+    }
+
     class CUDANativeVNNIGemmPerf : public ::testing::Test
     {
     protected:
@@ -243,6 +266,7 @@ namespace
                 for (int m : cfg.performance_prefill_m)
                 {
                     auto weights = format.create(static_cast<size_t>(shape.n), static_cast<size_t>(shape.k));
+                    const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), format.name).codebook_id;
                     const size_t weight_bytes = weights->size_bytes();
                     const RunResult result = runKernel(weights.get(), m, shape.n, shape.k, RunPath::NativeVNNITensorCore, cfg.warmup_runs, cfg.bench_runs, device_id);
 
@@ -255,7 +279,7 @@ namespace
                                      "family=%s min_us=%.3f tops=%.3f pct_tc_peak=%.1f%%\n",
                                      device_id,
                                      format.name.c_str(),
-                                     static_cast<unsigned>(format.codebook_id),
+                                     static_cast<unsigned>(codebook_id),
                                      shape.name.c_str(),
                                      m,
                                      shape.n,
@@ -268,7 +292,7 @@ namespace
 
                     rows.push_back(PerfRow{
                         format.name,
-                        format.codebook_id,
+                        codebook_id,
                         shape.name,
                         m,
                         shape.n,
@@ -361,7 +385,8 @@ namespace
     //
     // Environment variables:
     //   LLAMINAR_TILE_SWEEP_SHAPES       - Comma-separated shape names (default: all kQwenShapes)
-    //   LLAMINAR_TILE_SWEEP_PREFILL_M    - Comma-separated M values (default: 64,128,256,512,596)
+    //   LLAMINAR_TILE_SWEEP_PREFILL_M    - Comma-separated M values
+    //                                     (default: MTP rows + canonical prefill buckets)
     //   LLAMINAR_TILE_SWEEP_TILES        - Comma-separated tile IDs 0..5 for BK64 (default: all)
     //   LLAMINAR_TILE_SWEEP_STRATEGIES   - Comma-separated: auto,std,sk1,sk2,bk256,bk256_sk (default: all)
     //   LLAMINAR_TILE_SWEEP_WARMUP       - Warmup runs (default: 3)
@@ -404,7 +429,7 @@ namespace
     {
         int warmup_runs = 3;
         int bench_runs = 10;
-        std::vector<int> prefill_m = {64, 128, 256, 512, 596};
+        std::vector<int> prefill_m = llaminar2::defaultNativeVNNIDispatchTrainingRows();
         std::set<std::string> shape_filters;
         std::vector<int> tile_ids = {0, 1, 2, 3, 4, 5};
         std::vector<Strategy> strategies = {Strategy::Auto, Strategy::Standard, Strategy::SK1, Strategy::SK2, Strategy::BK256, Strategy::BK256_SK};
@@ -496,6 +521,8 @@ namespace
 
     struct SweepRow
     {
+        std::string format_name;
+        uint8_t codebook_id = 0;
         std::string shape_name;
         int m, n, k;
         std::string tile_name;
@@ -528,10 +555,12 @@ namespace
         // Q4_0 weight: n*k / 2 (4 bits per element) + scale overhead
         const size_t w_bytes = static_cast<size_t>(n) * k / 2 + static_cast<size_t>(n) * (k / 32) * 2;
         // Workspace: quant_a(M*K) + scales_a(M*4) + acc_int32(M*N*4) +
+        //            concurrent prefill extra acc slots(2*M*N*4) +
         //            scales_a_blockwise(M*(K/32)*4) + temp_c_fp32(M*N*4)
         const size_t workspace_bytes = static_cast<size_t>(m) * k                     // quant_a (int8)
                                        + static_cast<size_t>(m) * 4                   // scales_a
                                        + static_cast<size_t>(m) * n * 4               // acc_int32
+                                       + 2 * static_cast<size_t>(m) * n * 4           // concurrent prefill extra acc
                                        + static_cast<size_t>(m) * ((k + 31) / 32) * 4 // scales_a_blockwise
                                        + static_cast<size_t>(m) * n * 4;              // temp_c_fp32
         return a_bytes + c_bytes + w_bytes + workspace_bytes;
@@ -557,6 +586,7 @@ namespace
 
         // Find the format factory
         std::function<std::unique_ptr<TensorBase>(size_t, size_t)> create_weights;
+        std::string resolved_format_name;
         {
             std::string fmt_lower = toLower(cfg.format_name);
             bool found = false;
@@ -565,6 +595,7 @@ namespace
                 if (toLower(f.name) == fmt_lower)
                 {
                     create_weights = f.create;
+                    resolved_format_name = f.name;
                     found = true;
                     break;
                 }
@@ -646,7 +677,7 @@ namespace
             csv_fp = std::fopen(cfg.csv_path.c_str(), "w");
             ASSERT_NE(csv_fp, nullptr) << "Failed to open CSV: " << cfg.csv_path;
             std::fprintf(csv_fp,
-                         "shape,m,n,k,tile,tile_id,strategy,split_k,tiles,"
+                         "format,codebook,shape,m,n,k,tile,tile_id,strategy,split_k,tiles,"
                          "min_us,mean_us,tops,pct_peak,gpu\n");
             std::fflush(csv_fp);
         }
@@ -684,6 +715,7 @@ namespace
                     auto weights = create_weights(
                         static_cast<size_t>(shape.n),
                         static_cast<size_t>(shape.k));
+                    const uint8_t codebook_id = requireNativeVnniInfo(weights.get(), resolved_format_name).codebook_id;
 
                     RunResult rr;
                     {
@@ -732,6 +764,8 @@ namespace
                         task.m, shape.n, shape.k, rr.min_us, peak_tops);
 
                     SweepRow &row = rows[task_idx];
+                    row.format_name = resolved_format_name;
+                    row.codebook_id = codebook_id;
                     row.shape_name = shape.name;
                     row.m = task.m;
                     row.n = shape.n;
@@ -753,7 +787,8 @@ namespace
                     {
                         std::lock_guard<std::mutex> lock(log_mutex);
                         std::fprintf(csv_fp,
-                                     "%s,%d,%d,%d,%s,%d,%s,%d,%d,%.3f,%.3f,%.4f,%.2f,%d\n",
+                                     "%s,%u,%s,%d,%d,%d,%s,%d,%s,%d,%d,%.3f,%.3f,%.4f,%.2f,%d\n",
+                                     row.format_name.c_str(), static_cast<unsigned>(row.codebook_id),
                                      row.shape_name.c_str(), row.m, row.n, row.k,
                                      row.tile_name.c_str(), row.tile_id, row.strategy.c_str(),
                                      row.split_k, row.tiles, row.min_us, row.mean_us,

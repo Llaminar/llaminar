@@ -90,6 +90,18 @@ __global__ void rocm_residual_add_fp32_kernel(
     }
 }
 
+__global__ void rocm_vector_add_inplace_fp32_kernel(
+    float* __restrict__ output,
+    const float* __restrict__ input,
+    size_t size)
+{
+    const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t stride = blockDim.x * gridDim.x;
+
+    for (size_t i = idx; i < size; i += stride)
+        output[i] += input[i];
+}
+
 // ============================================================================
 // BF16 Residual Add Kernel (FP32 computation with BF16 I/O)
 // ============================================================================
@@ -217,6 +229,37 @@ bool rocmOps_residual_add_fp16(
     if (err != hipSuccess)
     {
         fprintf(stderr, "ROCm Residual Add FP16 kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmOps_vector_add_inplace_fp32(
+    float* output,
+    const float* input,
+    size_t size,
+    int device_idx,
+    void* stream)
+{
+    if (size == 0)
+        return true;
+    if (!output || !input)
+        return false;
+
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+
+    constexpr int threads_per_block = 256;
+    const int num_blocks = static_cast<int>((size + threads_per_block - 1) / threads_per_block);
+
+    hipLaunchKernelGGL(
+        rocm_vector_add_inplace_fp32_kernel,
+        dim3(num_blocks), dim3(threads_per_block), 0, static_cast<hipStream_t>(stream),
+        output, input, size);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "ROCm vector add inplace FP32 kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

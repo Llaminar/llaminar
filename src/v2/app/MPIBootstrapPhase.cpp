@@ -363,9 +363,9 @@ namespace llaminar2
                     nlist += ",";
                 nlist += std::to_string(*it);
             }
-            LOG_INFO("[Main] Inference NUMA nodes: {" << nlist << "} ("
-                                                      << inference_numas.size() << " of "
-                                                      << cpu_topology.numa_nodes << " total)");
+            LOG_DEBUG("[Main] Inference NUMA nodes: {" << nlist << "} ("
+                                                       << inference_numas.size() << " of "
+                                                       << cpu_topology.numa_nodes << " total)");
         }
 
         // =================================================================
@@ -405,8 +405,8 @@ namespace llaminar2
             launch_config.map_by_socket = true;
             launch_config.use_physical_cores = true;
 
-            LOG_INFO("[Main] MPI bootstrap profile: tuned"
-                     << (config.mpi_profile == MPIProfile::AUTO ? " (auto-selected for CPU intent)" : ""));
+            LOG_DEBUG("[Main] MPI bootstrap profile: tuned"
+                      << (config.mpi_profile == MPIProfile::AUTO ? " (auto-selected for CPU intent)" : ""));
         }
 
         // Override with user-specified values
@@ -432,8 +432,8 @@ namespace llaminar2
             launch_config.omp_threads_per_rank = std::max(1, cpu_topology.cores_per_socket);
             launch_config.omp_places = "cores";
             launch_config.omp_proc_bind = "close";
-            LOG_INFO("[Main] CPU shorthand detected: launching " << launch_config.num_procs
-                                                                 << " rank(s) for CPU GLOBAL TP across local NUMA nodes");
+            LOG_DEBUG("[Main] CPU shorthand detected: launching " << launch_config.num_procs
+                                                                  << " rank(s) for CPU GLOBAL TP across local NUMA nodes");
         }
         else if (config.device_for_this_rank.has_value() &&
                  config.device_for_this_rank->isCPU() &&
@@ -492,8 +492,8 @@ namespace llaminar2
                     launch_config.omp_places = "cores";
                     launch_config.omp_proc_bind = "close";
 
-                    LOG_INFO("[Main] All target devices on NUMA node " << target_numa
-                                                                       << "; binding MPI process to cpu-set='" << cpu_set << "'");
+                    LOG_DEBUG("[Main] All target devices on NUMA node " << target_numa
+                                                                        << "; binding MPI process to cpu-set='" << cpu_set << "'");
                 }
             }
             else if (inference_numas.size() > 1)

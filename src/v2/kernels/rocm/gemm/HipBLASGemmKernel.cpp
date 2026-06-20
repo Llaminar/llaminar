@@ -365,6 +365,53 @@ namespace llaminar2
             return true;
         }
 
+        bool HipBLASGemmKernel::execute_batched(
+            const float *const *d_A_array,
+            const float *const *d_B_array,
+            float *const *d_C_array,
+            int M, int N, int K,
+            int batch_count,
+            bool transA, bool transB,
+            float alpha, float beta)
+        {
+            if (!handle_)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_batched] hipBLAS handle is null");
+                return false;
+            }
+            if (!d_A_array || !d_B_array || !d_C_array || M <= 0 || N <= 0 || K <= 0 || batch_count <= 0)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_batched] Invalid arguments");
+                return false;
+            }
+
+            hipError_t hip_err = static_cast<hipError_t>(HipDeviceGuard::setDevice(device_id_.ordinal));
+            if (hip_err != hipSuccess)
+            {
+                HIP_LOG_ERROR("[HipBLASGemmKernel::execute_batched] Failed to set device: " << hipGetErrorString(hip_err));
+                return false;
+            }
+
+            hipblasOperation_t opA = transA ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+            hipblasOperation_t opB = transB ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+            int lda = K;
+            int ldb = transB ? K : N;
+            int ldc = N;
+
+            HIPBLAS_CHECK(hipblasSgemmBatched(
+                static_cast<hipblasHandle_t>(handle_),
+                opB, opA,
+                N, M, K,
+                &alpha,
+                d_B_array, ldb,
+                d_A_array, lda,
+                &beta,
+                d_C_array, ldc,
+                batch_count));
+
+            return true;
+        }
+
         // =====================================================================
         // GEMM with Fused Bias (using hipBLASLt)
         // =====================================================================

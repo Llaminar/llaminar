@@ -10,6 +10,7 @@
 #include "../../../utils/KernelProfiler.h"
 #include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../loaders/PreparedWeightStore.h"
 #include <cstring>
 
 namespace llaminar2
@@ -22,6 +23,34 @@ namespace llaminar2
     EmbeddingStage::EmbeddingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool EmbeddingStage::validatePreparedWeights(std::string *error) const
+    {
+        auto *embed_base = dynamic_cast<const TensorBase *>(params_.embed_table);
+        if (!embed_base || !params_.device_id.is_gpu())
+            return true;
+
+        // FP32 weights already resident on GPU do not need prepared embedding data.
+        if (!dynamic_cast<const IINT8Unpackable *>(embed_base))
+            return true;
+
+        if (!params_.prepared_store || !params_.prepared_ref.has_value())
+        {
+            if (error) *error = "EmbeddingStage requires PreparedWeightStore and PreparedWeightRef for quantized GPU embedding";
+            return false;
+        }
+
+        if (!params_.prepared_store->contains(params_.prepared_ref.value()) ||
+            !params_.prepared_store->embeddingHandle(params_.prepared_ref.value()))
+        {
+            if (error) *error = "EmbeddingStage PreparedWeightRef is not present in PreparedWeightStore or has no embedding handle";
+            return false;
+        }
+
+        if (error)
+            error->clear();
+        return true;
     }
 
     ITensorEmbedding *EmbeddingStage::getOrCreateKernel()
@@ -61,6 +90,17 @@ namespace llaminar2
             return nullptr;
         }
 
+        if (params_.device_id.is_gpu() && params_.prepared_store && params_.prepared_ref.has_value())
+        {
+            const auto *handle = params_.prepared_store->embeddingHandle(params_.prepared_ref.value());
+            if (!handle)
+            {
+                LOG_ERROR("[EmbeddingStage::getOrCreateKernel] Prepared embedding ref was provided but no handle was found in PreparedWeightStore");
+                return nullptr;
+            }
+            kernel->setPreparedEmbeddingHandle(handle);
+        }
+
         auto dev_type = llaminar::v2::kernels::KernelFactory::getDeviceType(params_.device_id);
 
         LOG_DEBUG("[EmbeddingStage::getOrCreateKernel] Created "
@@ -97,7 +137,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!params_.token_ids && !params_.token_batches)
+        if (!params_.token_ids && !params_.token_ids_device && !params_.token_batches)
         {
             LOG_ERROR("[EmbeddingStage] No token input provided");
             return false;
@@ -145,6 +185,12 @@ namespace llaminar2
 
         // Thread GPU stream for graph capture
         bindStageStream(kernel);
+
+        const int local_vocab_size = params_.local_vocab_size > 0
+                         ? params_.local_vocab_size
+                         : static_cast<int>(embed_table_base->rows());
+        kernel->setVocabRange(params_.vocab_offset, local_vocab_size);
+        kernel->setAllowOutOfRangeTokenIds(allowsZeroOutput());
 
         // Handle batched vs single sequence input
         if (params_.token_batches)
@@ -196,6 +242,18 @@ namespace llaminar2
         else
         {
             // Single sequence input: delegate directly to kernel
+            // For GPU MTP sidecar/verifier graphs, token_ids may be a harmless
+            // stable host shadow while token_ids_device is the real execution
+            // source. Rebind the device pointer here as well as in
+            // updateDynamicParams(); cached graph stages can be replayed after
+            // their token source changes, and this host-side state update keeps
+            // the embedding kernel from falling back to the shadow sentinel.
+            if (params_.token_ids_device)
+            {
+                kernel->setDynamicDeviceTokenIds(
+                    params_.token_ids_device,
+                    params_.num_tokens);
+            }
             if (!kernel->apply_tensor(embed_table_base, params_.token_ids, params_.num_tokens,
                                       params_.d_model, output_base, params_.mpi_ctx, params_.device_id.toKernelDeviceIndex()))
             {
@@ -204,16 +262,17 @@ namespace llaminar2
             }
         }
 
-        // Mark output as device-dirty WITH EVENT immediately after GPU kernel launch.
-        // This ensures any subsequent read (e.g., DEBUG logging below) will properly
-        // sync via event wait rather than reading stale data. The DeviceGraphExecutor's
-        // markOutputsDirty() call is too late for reads inside execute().
-        if (params_.device_id.type != DeviceType::CPU)
+        // Direct/manual GPU execution owns its tensor event. Graph-managed
+        // execution owns coherence through BufferArena/DeviceGraphExecutor.
+        if (params_.device_id.type != DeviceType::CPU && !params_.output_buffer_id.has_value())
         {
             auto *output_base_tb = dynamic_cast<TensorBase *>(params_.output);
             if (output_base_tb)
             {
-                output_base_tb->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, gpuStream());
+                output_base_tb->transitionToWithEvent(
+                    TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                    params_.device_id,
+                    gpuStream());
             }
         }
 

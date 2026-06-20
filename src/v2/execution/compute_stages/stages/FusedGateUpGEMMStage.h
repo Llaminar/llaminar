@@ -9,14 +9,19 @@
 #include "../IWorkspaceConsumerStage.h"
 #include "../StageParamsBase.h"
 #include "../../../memory/BufferId.h"
+#include "../../../loaders/WeightPlan.h"
 
+#include <memory>
 #include <optional>
 
 namespace llaminar2
 {
 
-    // Forward declaration
+    // Forward declarations
     class ITensorFusedGateUpGemm;
+    class FP32Tensor;
+    class PreparedWeightStore;
+    class TensorBase;
 
     /**
      * @brief Fused Gate/Up projection stage for FFN
@@ -63,11 +68,31 @@ namespace llaminar2
             std::optional<BufferId> input_buffer_id;
             std::optional<BufferId> output_gate_buffer_id;
             std::optional<BufferId> output_up_buffer_id;
+
+            // =================================================================
+            // Phase 7: PreparedWeightRef for direct kernel resolution
+            // =================================================================
+            std::optional<PreparedWeightRef> prepared_ref_gate;
+            std::optional<PreparedWeightRef> prepared_ref_up;
+            PreparedWeightStore *prepared_store = nullptr;
+
+            /**
+             * @brief Execute tiny verifier batches with grouped decode-equivalent gate/up GEMVs.
+             *
+             * The vLLM-style MTP verifier may batch M=2..4 rows into one graph,
+             * but accepted-state publication must be decode-equivalent. This flag
+             * keeps the public output tensors shaped as [M, N] while requiring the
+             * kernel layer to use a grouped route with strict serial-decode
+             * equivalence proof. It must not silently fall back to hidden row-wise
+             * replay.
+             */
+            bool force_decode_equivalent_verifier_prefill = false;
         };
 
         explicit FusedGateUpGEMMStage(Params params);
 
         bool execute(IDeviceContext *ctx) override;
+        bool validatePreparedWeights(std::string *error) const override;
         ComputeStageType type() const override { return ComputeStageType::GEMM_FUSED_GATE_UP; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;
@@ -80,10 +105,23 @@ namespace llaminar2
         // IWorkspaceConsumerStage Implementation
         // =============================================================================
         IWorkspaceConsumer *getKernelAsWorkspaceConsumer() override;
+        WorkspaceRequirements getWorkspaceRequirements(int m, int n = 0, int k = 0) const override;
 
     private:
         Params params_;
         ITensorFusedGateUpGemm *cached_kernel_ = nullptr; ///< Cached for workspace binding
+
+        ITensorFusedGateUpGemm *resolvePreparedKernel(const char *caller);
+        bool executeDecodeEquivalentVerifierPrefill(
+            IDeviceContext *ctx,
+            const TensorBase *input,
+            TensorBase *output_gate,
+            TensorBase *output_up,
+            ITensorFusedGateUpGemm *kernel);
+
+        std::shared_ptr<FP32Tensor> verifier_input_row_;
+        std::shared_ptr<FP32Tensor> verifier_gate_row_;
+        std::shared_ptr<FP32Tensor> verifier_up_row_;
     };
 
 } // namespace llaminar2

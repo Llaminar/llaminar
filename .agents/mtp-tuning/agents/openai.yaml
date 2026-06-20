@@ -1,0 +1,4 @@
+interface:
+  display_name: "MTP Tuning"
+  short_description: "Tune Llaminar MTP with strict parity."
+  default_prompt: "Use the MTP tuning workflow to profile, fix, and validate this speculative decode path."

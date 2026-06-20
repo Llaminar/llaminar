@@ -8,8 +8,13 @@
 #include "../../../tensors/Tensors.h"
 #include "../../../utils/Logger.h"
 #include "../../../tensors/SIMDHelpers.h"
+#include "../../../backends/BackendManager.h"
+#include "../../../backends/IBackend.h"
 #include "../../local_execution/device/DeviceContext.h"
 #include "../../../kernels/KernelFactory.h"
+
+#include <cstdint>
+#include <cstring>
 
 namespace llaminar2
 {
@@ -32,7 +37,6 @@ namespace llaminar2
 
         if (!ensureRequiredPointers("ResidualAddStage", {
                                                             {"input", params_.input},
-                                                            {"residual", params_.residual},
                                                             {"output", params_.output},
                                                         }))
         {
@@ -43,6 +47,59 @@ namespace llaminar2
         // CRITICAL: For decode mode with pre-allocated buffers, params_.num_elements must be set
         // to avoid reading/writing beyond the actual sequence data.
         const size_t num_elements = params_.num_elements > 0 ? params_.num_elements : params_.input->numel();
+
+        if (!params_.residual)
+        {
+            auto *input_base = const_cast<TensorBase *>(requireTensorBasePtr(params_.input, "input"));
+            auto *output_base = requireTensorBasePtr(params_.output, "output");
+            if (!input_base || !output_base)
+            {
+                LOG_ERROR("[ResidualAddStage::Copy] Failed to cast tensors to TensorBase");
+                return false;
+            }
+            if (params_.input->native_type() != params_.output->native_type())
+            {
+                LOG_ERROR("[ResidualAddStage::Copy] Input/output tensor type mismatch: input="
+                          << params_.input->dtype_name() << " output=" << params_.output->dtype_name());
+                return false;
+            }
+
+            size_t bytes = 0;
+            if (num_elements == params_.input->numel())
+                bytes = params_.input->size_bytes();
+            else if (params_.input->native_type() == TensorType::FP32)
+                bytes = num_elements * sizeof(float);
+            else if (params_.input->native_type() == TensorType::BF16 ||
+                     params_.input->native_type() == TensorType::FP16)
+                bytes = num_elements * sizeof(uint16_t);
+            else
+            {
+                LOG_ERROR("[ResidualAddStage::Copy] Partial copy is unsupported for "
+                          << params_.input->dtype_name());
+                return false;
+            }
+
+            if (params_.device_id.is_gpu())
+            {
+                if (!input_base->ensureOnDevice(params_.device_id) ||
+                    !output_base->allocateOnDevice(params_.device_id))
+                    return false;
+                IBackend *backend = getBackendFor(params_.device_id);
+                if (!backend)
+                    return false;
+                const bool ok = backend->deviceToDevice(
+                    output_base->active_mutable_data_ptr(),
+                    input_base->active_data_ptr(),
+                    bytes,
+                    params_.device_id.ordinal);
+                if (ok)
+                    output_base->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, params_.device_id);
+                return ok;
+            }
+
+            std::memcpy(params_.output->raw_mutable_data(), params_.input->raw_data(), bytes);
+            return true;
+        }
 
         TensorType input_type = params_.input->native_type();
         TensorType residual_type = params_.residual->native_type();
@@ -205,6 +262,12 @@ namespace llaminar2
         // Use apply_tensor() which handles GPU pointers correctly via active_data_ptr()
         bool ok = kernel->apply_tensor(input_base, residual_base, output_base, n, params_.mpi_ctx,
                                        params_.device_id.toKernelDeviceIndex());
+        if (ok && params_.device_id.is_gpu())
+        {
+            output_base->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                                               params_.device_id,
+                                               gpuStream());
+        }
 
         if (Logger::getInstance().shouldLog(LogLevel::TRACE) && !params_.device_id.is_gpu())
         {
@@ -618,7 +681,7 @@ namespace llaminar2
     {
         StageDumpInfo info;
 
-        if (!params_.input || !params_.residual || !params_.output)
+        if (!params_.input || !params_.output)
             return info;
 
         // Use explicit num_elements if provided (for pre-allocated buffers)
@@ -635,7 +698,8 @@ namespace llaminar2
         {
             // Fast path: tensor-based addInput/addOutput (no GPU sync)
             info.addInput("input", params_.input, rows, cols);
-            info.addInput("residual", params_.residual, rows, cols);
+            if (params_.residual)
+                info.addInput("residual", params_.residual, rows, cols);
             info.addOutput("output", params_.output, rows, cols);
         }
         else
@@ -661,7 +725,7 @@ namespace llaminar2
 
             // Input tensors - use safe FP32 accessor
             const float *input_data = getSafeFp32Data(params_.input);
-            const float *residual_data = getSafeFp32Data(params_.residual);
+            const float *residual_data = params_.residual ? getSafeFp32Data(params_.residual) : nullptr;
             const float *output_data = getSafeFp32Data(params_.output);
 
             if (input_data)
@@ -698,7 +762,7 @@ namespace llaminar2
     {
         StageBufferRequirements reqs;
 
-        if (!params_.input || !params_.residual || !params_.output)
+        if (!params_.input || !params_.output)
             return reqs; // Empty if tensors not set
 
         // Get dimensions from tensors
@@ -710,7 +774,8 @@ namespace llaminar2
 
         // INPUT buffers (read-only)
         reqs.addInput("input", {rows, cols}, buf_type);
-        reqs.addInput("residual", {rows, cols}, buf_type);
+        if (params_.residual)
+            reqs.addInput("residual", {rows, cols}, buf_type);
 
         // OUTPUT buffer (may alias residual for in-place operation)
         reqs.addOutput("output", {rows, cols}, buf_type);
@@ -720,11 +785,17 @@ namespace llaminar2
 
     StageBufferContract ResidualAddStage::bufferContract() const
     {
-        if (!params_.input_buffer_id || !params_.residual_buffer_id || !params_.output_buffer_id)
+        if (!params_.input_buffer_id || !params_.output_buffer_id)
             return {};
 
         auto contract = StageBufferContract::build();
         contract.addInput(*params_.input_buffer_id);
+
+        if (!params_.residual_buffer_id)
+        {
+            contract.addOutput(*params_.output_buffer_id);
+            return contract;
+        }
 
         if (*params_.output_buffer_id == *params_.residual_buffer_id)
         {

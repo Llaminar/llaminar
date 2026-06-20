@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <iomanip>
 #include <mutex>
 #include <numeric>
 #include <stdexcept>
@@ -66,11 +67,15 @@ extern "C"
 
 namespace llaminar2
 {
-    bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
+    std::atomic<uint64_t> LocalTPContext::next_context_id_{1};
+
+    bool LocalTPContext::isLocalTPGpuGraphPolicySupported(
+        CollectiveBackendType backend,
+        std::string *reason_out)
     {
         const auto &exec = debugEnv().execution;
 
-        // No graph capture in use: LocalTP NCCL is unaffected.
+        // No graph capture in use: LocalTP GPU-native collectives are unaffected.
         if (!exec.gpu_graphs)
         {
             if (reason_out)
@@ -80,8 +85,26 @@ namespace llaminar2
             return true;
         }
 
-        // Phase 3 support matrix: collectives under graph mode are only supported
-        // when segmented collective replay is explicitly enabled.
+        if (backend == CollectiveBackendType::RCCL)
+        {
+            if (exec.gpu_graph_collective_segmented)
+            {
+                if (reason_out)
+                {
+                    *reason_out = "rccl_segmented_collectives_unsafe";
+                }
+                return false;
+            }
+
+            if (reason_out)
+            {
+                *reason_out = "rccl_gpu_graphs_without_segmented_collectives";
+            }
+            return true;
+        }
+
+        // Phase 3 support matrix: NCCL collectives under graph mode are only
+        // supported when segmented collective replay is explicitly enabled.
         if (exec.gpu_graph_collective_segmented)
         {
             if (reason_out)
@@ -96,6 +119,11 @@ namespace llaminar2
             *reason_out = "gpu_graphs_on_without_segmented_collectives";
         }
         return false;
+    }
+
+    bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
+    {
+        return isLocalTPGpuGraphPolicySupported(backend_, reason_out);
     }
 
     bool LocalTPContext::validateBarrierTensorSetForMultiGpuAllreduce(
@@ -380,7 +408,8 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
         CollectiveBackendType backend)
-        : devices_(std::move(devices))
+        : context_id_(next_context_id_.fetch_add(1, std::memory_order_relaxed)),
+          devices_(std::move(devices))
     {
         // Validate devices
         if (devices_.empty())
@@ -417,9 +446,30 @@ namespace llaminar2
 
         // Build lookup index
         buildDeviceIndex();
+        onstream_sequence_by_slot_.assign(devices_.size(), 0);
+        fp16_scratch_buffers_.assign(devices_.size(), nullptr);
+        fp16_scratch_counts_.assign(devices_.size(), 0);
 
         LOG_DEBUG("LocalTPContext created: degree=" << degree()
                                                     << ", backend=" << collectiveBackendTypeToString(backend_));
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_create"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " degree=" << degree()
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " devices=" << [&]()
+                      {
+                            std::string out;
+                            for (size_t i = 0; i < devices_.size(); ++i)
+                            {
+                                if (i > 0)
+                                    out += ",";
+                                out += devices_[i].toString();
+                            }
+                            return out; }());
+        }
 
         // Initialize backend for multi-device scenarios
         if (degree() > 1)
@@ -465,11 +515,11 @@ namespace llaminar2
             return;
         }
 
-        LOG_INFO("[LocalTPContext][Telemetry] "
-                 << "backend=" << collectiveBackendTypeToString(backend_)
-                 << " nccl_allreduce_attempts=" << attempts
-                 << " nccl_allreduce_success=" << success
-                 << " nccl_allreduce_failures=" << failures);
+        LOG_DEBUG("[LocalTPContext][Telemetry] "
+                  << "backend=" << collectiveBackendTypeToString(backend_)
+                  << " nccl_allreduce_attempts=" << attempts
+                  << " nccl_allreduce_success=" << success
+                  << " nccl_allreduce_failures=" << failures);
     }
 
     // =========================================================================
@@ -486,7 +536,28 @@ namespace llaminar2
             return;
         }
 
-        LOG_WARN("[LocalTPContext] Abort requested — aborting collective backend to unblock stuck devices");
+        LOG_WARN("[LocalTPContext] Abort requested — aborting collective backend to unblock stuck devices"
+                 << " context_id=" << context_id_
+                 << " context=" << static_cast<const void *>(this));
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            std::lock_guard<std::mutex> trace_lock(contract_trace_mutex_);
+            for (const auto &entry_pair : onstream_contracts_)
+            {
+                const auto &entry = entry_pair.second;
+                LOG_WARN("[TP_COLLECTIVE_CONTRACT] event=localtp_abort_pending"
+                         << " context_id=" << context_id_
+                         << " context=" << static_cast<const void *>(this)
+                         << " sequence=" << entry_pair.first
+                         << " stage=" << (entry.stage_name.empty() ? "(none)" : entry.stage_name)
+                         << " arrivals=" << entry.arrivals << "/" << degree()
+                         << " seen_slots_mask=0x" << std::hex << entry.seen_slots << std::dec
+                         << " count=" << entry.count
+                         << " dtype=" << entry.dtype
+                         << " precision=" << (entry.precision.empty() ? "(default)" : entry.precision));
+            }
+        }
 
         if (backend_impl_)
         {
@@ -676,6 +747,41 @@ namespace llaminar2
 
         const size_t effective_count = (count > 0) ? count : tensor->numel();
 
+        // HOST collectives are host-staged by definition (including mixed CPU/GPU TP).
+        // Synchronize the producer stream and go directly to the CPU barrier path.
+        if (backend_ == CollectiveBackendType::HOST)
+        {
+            auto tensor_device = tensor->current_device();
+            if (stream && tensor_device.has_value())
+            {
+#ifdef HAVE_CUDA
+                if (tensor_device->is_cuda())
+                {
+                    cudaError_t err = cudaStreamSynchronize(static_cast<cudaStream_t>(stream));
+                    if (err != cudaSuccess)
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceOnStream: cudaStreamSynchronize failed for HOST fallback: "
+                                  << cudaGetErrorString(err));
+                        return false;
+                    }
+                }
+#endif
+#ifdef HAVE_ROCM
+                if (tensor_device->is_rocm())
+                {
+                    auto *rocm_backend = dynamic_cast<ROCmBackend *>(getBackendForDevice(*tensor_device));
+                    if (rocm_backend && !rocm_backend->synchronize(tensor_device->toKernelDeviceIndex()))
+                    {
+                        LOG_ERROR("LocalTPContext::allreduceOnStream: ROCm synchronize failed for HOST fallback on "
+                                  << tensor_device->toString());
+                        return false;
+                    }
+                }
+#endif
+            }
+            return allreduce(tensor, stage_name, effective_count);
+        }
+
         // Determine device index from tensor placement
         int device_index = -1;
         auto tensor_device = tensor->current_device();
@@ -719,6 +825,12 @@ namespace llaminar2
 
         // Issue allreduce directly on the caller's stream (graph-capturable)
         CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+        if (!traceOnStreamCollectiveContract(device_index, tensor, stage_name,
+                                             effective_count, dtype, stream, precision))
+        {
+            requestAbort();
+            return false;
+        }
 
         // =================================================================
         // FP16 mixed-precision allreduce path
@@ -734,18 +846,29 @@ namespace llaminar2
 
         if (use_fp16_allreduce)
         {
-            // Lazy-init scratch buffer vectors
-            if (fp16_scratch_buffers_.empty())
+            constexpr size_t kFP16ScratchGuardBytes = 4096;
+
+            // The on-stream collective path runs concurrently on one worker
+            // thread per device. Scratch metadata must therefore be fully sized
+            // before workers enter this method; resizing either vector here can
+            // race another participant and corrupt the vector pair.
+            if (fp16_scratch_buffers_.size() != devices_.size() ||
+                fp16_scratch_counts_.size() != devices_.size())
             {
-                fp16_scratch_buffers_.resize(degree(), nullptr);
-                fp16_scratch_counts_.resize(degree(), 0);
+                LOG_ERROR("LocalTPContext::allreduceOnStream: FP16 scratch metadata invariant broken "
+                          << "(buffers=" << fp16_scratch_buffers_.size()
+                          << ", counts=" << fp16_scratch_counts_.size()
+                          << ", degree=" << devices_.size() << ")");
+                requestAbort();
+                return false;
             }
 
             // Ensure scratch buffer is large enough for this allreduce
             if (fp16_scratch_counts_[device_index] < effective_count)
             {
                 const int ordinal = devices_[device_index].device_ordinal;
-                const size_t alloc_bytes = effective_count * sizeof(uint16_t); // FP16 = 2 bytes
+                const size_t live_bytes = effective_count * sizeof(uint16_t); // FP16 = 2 bytes
+                const size_t alloc_bytes = live_bytes + kFP16ScratchGuardBytes;
 
                 // Free old buffer if resizing
                 if (fp16_scratch_buffers_[device_index])
@@ -781,8 +904,9 @@ namespace llaminar2
                 else
                 {
                     fp16_scratch_counts_[device_index] = effective_count;
-                    LOG_INFO("LocalTPContext: Allocated FP16 scratch buffer: "
-                             << (alloc_bytes / 1024) << " KB on device " << ordinal);
+                    LOG_DEBUG("LocalTPContext: Allocated FP16 scratch buffer: "
+                              << (alloc_bytes / 1024) << " KB (live="
+                              << (live_bytes / 1024) << " KB) on device " << ordinal);
                 }
             }
 
@@ -1152,6 +1276,22 @@ namespace llaminar2
                       << ", count=" << count
                       << ", waiting for " << (num_participants - 1) << " more CPU devices");
         }
+        else if (!barrier_stage_name_.empty() && !stage_name.empty() && barrier_stage_name_ != stage_name)
+        {
+            LOG_ERROR("LocalTPContext::allreduceCpuBarrier: stage mismatch while waiting for HOST allreduce: first='"
+                      << barrier_stage_name_ << "' arrival='" << stage_name
+                      << "' arrival_order=" << arrival_order
+                      << ", expected=" << num_participants);
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            barrier_tensors_.clear();
+            barrier_stage_name_.clear();
+            barrier_element_count_ = 0;
+
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
 
         // Use arrival_order for slot assignment (sum is commutative, order doesn't matter)
         barrier_tensors_[arrival_order] = tensor;
@@ -1198,24 +1338,113 @@ namespace llaminar2
                                                               << " CPU devices arrived, reducing "
                                                               << effective_count << " elements");
 
-        // Use tensor[0] as accumulator
-        float *accum = barrier_tensors_[0]->mutable_data();
+        const size_t bytes = effective_count * sizeof(float);
+
+        if (debugEnv().runtime_debug.tp_host_allreduce_trace)
+        {
+            for (int i = 0; i < num_participants; ++i)
+            {
+                TensorBase *tb = barrier_tensors_[i];
+                LOG_DEBUG("[LocalTPContext][HostAllreduceTrace] slot=" << i
+                                                                       << " tensor=" << static_cast<void *>(tb)
+                                                                       << " current_device=" << (tb && tb->current_device() ? tb->current_device()->toString() : "none")
+                                                                       << " host=" << (tb ? tb->raw_data() : nullptr)
+                                                                       << " gpu=" << (tb ? tb->gpu_data_ptr() : nullptr)
+                                                                       << " numel=" << (tb ? tb->numel() : 0)
+                                                                       << " count=" << effective_count
+                                                                       << " stage=" << barrier_stage_name_);
+            }
+        }
+
+        auto copy_to_host = [&](TensorBase *tb, float *dst) -> bool
+        {
+            if (!tb || !dst)
+                return false;
+
+            auto dev = tb->current_device();
+            if (dev && dev->is_gpu() && tb->gpu_data_ptr())
+            {
+                IBackend *backend = getBackendForDevice(*dev);
+                if (!backend)
+                    return false;
+                return backend->deviceToHost(dst, tb->gpu_data_ptr(), bytes, dev->gpu_ordinal());
+            }
+
+            const float *src = tb->data();
+            if (!src)
+                return false;
+            std::memcpy(dst, src, bytes);
+            return true;
+        };
+
+        auto copy_from_host = [&](TensorBase *tb, const float *src) -> bool
+        {
+            if (!tb || !src)
+                return false;
+
+            auto dev = tb->current_device();
+            if (dev && dev->is_gpu() && tb->gpu_data_ptr())
+            {
+                IBackend *backend = getBackendForDevice(*dev);
+                if (!backend)
+                    return false;
+                if (!backend->hostToDevice(tb->gpu_data_ptr(), src, bytes, dev->gpu_ordinal()))
+                    return false;
+                tb->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, *dev);
+                return true;
+            }
+
+            float *dst = tb->mutable_data();
+            if (!dst)
+                return false;
+            std::memcpy(dst, src, bytes);
+            return true;
+        };
+
+        std::vector<float> accum(effective_count, 0.0f);
+        std::vector<float> temp(effective_count, 0.0f);
+
+        if (!copy_to_host(barrier_tensors_[0], accum.data()))
+        {
+            LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to stage slot 0 to host");
+            barrier_result_ = false;
+            barrier_count_.store(0);
+            barrier_generation_.fetch_add(1);
+            lock.unlock();
+            barrier_cv_.notify_all();
+            return false;
+        }
 
         // Sum contributions from all other tensors
         for (int i = 1; i < num_participants; ++i)
         {
-            const float *src = barrier_tensors_[i]->data();
-            for (size_t j = 0; j < effective_count; ++j)
+            if (!copy_to_host(barrier_tensors_[i], temp.data()))
             {
-                accum[j] += src[j];
+                LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to stage slot " << i << " to host");
+                barrier_result_ = false;
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                lock.unlock();
+                barrier_cv_.notify_all();
+                return false;
             }
+            for (size_t j = 0; j < effective_count; ++j)
+                accum[j] += temp[j];
         }
 
         // Copy reduced result to all other tensors
-        for (int i = 1; i < num_participants; ++i)
+        for (int i = 0; i < num_participants; ++i)
         {
-            float *dst = barrier_tensors_[i]->mutable_data();
-            std::memcpy(dst, accum, effective_count * sizeof(float));
+            if (!copy_from_host(barrier_tensors_[i], accum.data()))
+            {
+                LOG_ERROR("LocalTPContext::allreduceCpuBarrier: failed to write reduced data to slot " << i);
+                barrier_result_ = false;
+                barrier_count_.store(0);
+                barrier_generation_.fetch_add(1);
+                lock.unlock();
+                barrier_cv_.notify_all();
+                return false;
+            }
         }
 
         // Cleanup and release waiters
@@ -1799,7 +2028,8 @@ namespace llaminar2
             // If users enable global GPU graph mode without segmented-collective
             // support, we fail fast with a clear marker instead of attempting an
             // undefined collective scheduling path.
-            if (backend_ == CollectiveBackendType::NCCL)
+            if (backend_ == CollectiveBackendType::NCCL ||
+                (backend_ == CollectiveBackendType::RCCL && debugEnv().execution.gpu_graph_collective_segmented))
             {
                 std::string graph_policy_reason;
                 const bool graph_supported = isLocalTPNCCLGraphPolicySupported(&graph_policy_reason);
@@ -1807,18 +2037,23 @@ namespace llaminar2
                 {
                     if (!logged_graph_policy_reject_marker_.exchange(true))
                     {
-                        LOG_ERROR("LOCALTP_NCCL_GRAPH_POLICY=UNSUPPORTED reason=" << graph_policy_reason);
+                        LOG_ERROR("LOCALTP_GPU_GRAPH_POLICY=UNSUPPORTED backend="
+                                  << collectiveBackendTypeToString(backend_)
+                                  << " reason=" << graph_policy_reason);
                     }
 
-                    LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: Unsupported LocalTP NCCL graph mode. "
-                              << "Enable LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1 when LLAMINAR_GPU_GRAPHS=1");
+                    LOG_ERROR("LocalTPContext::allreduceWithBarrierMultiGpu: Unsupported LocalTP GPU-native graph mode. "
+                              << "backend=" << collectiveBackendTypeToString(backend_)
+                              << " reason=" << graph_policy_reason);
                     barrier_result_ = false;
                     goto cleanup;
                 }
 
                 if (!logged_graph_policy_allow_marker_.exchange(true))
                 {
-                    LOG_INFO("LOCALTP_NCCL_GRAPH_POLICY=SUPPORTED reason=" << graph_policy_reason);
+                    LOG_DEBUG("LOCALTP_GPU_GRAPH_POLICY=SUPPORTED backend="
+                              << collectiveBackendTypeToString(backend_)
+                              << " reason=" << graph_policy_reason);
                 }
             }
 
@@ -2017,8 +2252,8 @@ namespace llaminar2
                 nccl_allreduce_success_.fetch_add(1);
                 if (!logged_real_path_marker_.exchange(true))
                 {
-                    LOG_INFO("LOCALTP_NCCL_PATH=REAL backend=NCCL collective=allreduce_multi count="
-                             << effective_count << " participants=" << num_participants);
+                    LOG_DEBUG("LOCALTP_NCCL_PATH=REAL backend=NCCL collective=allreduce_multi count="
+                              << effective_count << " participants=" << num_participants);
                 }
             }
 
@@ -2463,10 +2698,133 @@ namespace llaminar2
 
     void LocalTPContext::setComputeStreams(const std::vector<void *> &compute_streams)
     {
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_set_compute_streams"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                      << " stream_count=" << compute_streams.size());
+            for (size_t i = 0; i < compute_streams.size(); ++i)
+            {
+                LOG_DEBUG("[TP_COLLECTIVE_CONTEXT] event=localtp_compute_stream"
+                          << " context_id=" << context_id_
+                          << " slot=" << i
+                          << " stream=" << compute_streams[i]
+                          << " device=" << (i < devices_.size() ? devices_[i].toString() : std::string("(unknown)")));
+            }
+        }
+
         if (backend_initialized_ && backend_impl_)
         {
             backend_impl_->setComputeStreams(compute_streams);
         }
+    }
+
+    bool LocalTPContext::traceOnStreamCollectiveContract(int device_index,
+                                                         TensorBase *tensor,
+                                                         const std::string &stage_name,
+                                                         size_t effective_count,
+                                                         CollectiveDataType dtype,
+                                                         void *stream,
+                                                         const std::string &precision)
+    {
+        if (!debugEnv().tp_collective_contract_trace)
+        {
+            return true;
+        }
+
+        uint64_t sequence = 0;
+        bool mismatch = false;
+        std::string mismatch_reason;
+        {
+            std::lock_guard<std::mutex> lock(contract_trace_mutex_);
+            if (onstream_sequence_by_slot_.size() != devices_.size())
+            {
+                onstream_sequence_by_slot_.assign(devices_.size(), 0);
+            }
+
+            sequence = onstream_sequence_by_slot_[static_cast<size_t>(device_index)]++;
+            auto &entry = onstream_contracts_[sequence];
+            const int dtype_value = static_cast<int>(dtype);
+            if (!entry.initialized)
+            {
+                entry.initialized = true;
+                entry.stage_name = stage_name;
+                entry.count = effective_count;
+                entry.dtype = dtype_value;
+                entry.precision = precision;
+            }
+            else
+            {
+                if (entry.stage_name != stage_name)
+                {
+                    mismatch = true;
+                    mismatch_reason = "stage mismatch expected=" + (entry.stage_name.empty() ? std::string("(none)") : entry.stage_name) +
+                                      " actual=" + (stage_name.empty() ? std::string("(none)") : stage_name);
+                }
+                else if (entry.count != effective_count)
+                {
+                    mismatch = true;
+                    mismatch_reason = "count mismatch expected=" + std::to_string(entry.count) +
+                                      " actual=" + std::to_string(effective_count);
+                }
+                else if (entry.dtype != dtype_value)
+                {
+                    mismatch = true;
+                    mismatch_reason = "dtype mismatch expected=" + std::to_string(entry.dtype) +
+                                      " actual=" + std::to_string(dtype_value);
+                }
+            }
+
+            if (device_index >= 0 && device_index < 64)
+            {
+                const uint64_t bit = 1ull << static_cast<uint64_t>(device_index);
+                if ((entry.seen_slots & bit) != 0)
+                {
+                    mismatch = true;
+                    mismatch_reason = "duplicate slot arrival for sequence=" + std::to_string(sequence) +
+                                      " slot=" + std::to_string(device_index);
+                }
+                entry.seen_slots |= bit;
+            }
+            ++entry.arrivals;
+
+            if (entry.arrivals >= degree())
+            {
+                onstream_contracts_.erase(sequence);
+            }
+        }
+
+        LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_arrival"
+                  << " context_id=" << context_id_
+                  << " context=" << static_cast<const void *>(this)
+                  << " backend=" << collectiveBackendTypeToString(backend_)
+                  << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                  << " sequence=" << sequence
+                  << " slot=" << device_index
+                  << " degree=" << degree()
+                  << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                  << " count=" << effective_count
+                  << " dtype=" << static_cast<int>(dtype)
+                  << " precision=" << (precision.empty() ? "(default)" : precision)
+                  << " stream=" << stream
+                  << " tensor=" << static_cast<void *>(tensor)
+                  << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)")
+                  << " gpu_ptr=" << (tensor ? tensor->gpu_data_ptr() : nullptr));
+
+        if (mismatch)
+        {
+            LOG_ERROR("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_mismatch"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " sequence=" << sequence
+                      << " slot=" << device_index
+                      << " reason=" << mismatch_reason);
+            return false;
+        }
+
+        return true;
     }
 
     // =========================================================================
@@ -2793,16 +3151,16 @@ namespace llaminar2
         }
 
         backend_initialized_ = true;
-        LOG_INFO("LocalTPContext: Backend " << backend_impl_->name()
-                                            << " initialized for " << degree() << " devices");
+        LOG_DEBUG("LocalTPContext: Backend " << backend_impl_->name()
+                                             << " initialized for " << degree() << " devices");
 
         if (backend_ == CollectiveBackendType::NCCL)
         {
-            LOG_INFO("[LocalTPContext][NCCLReady] "
-                     << "status=ready"
-                     << " backend_impl=" << backend_impl_->name()
-                     << " degree=" << degree()
-                     << " multi_gpu_single_process=" << (backend_impl_->isMultiGpuSingleProcess() ? 1 : 0));
+            LOG_DEBUG("[LocalTPContext][NCCLReady] "
+                      << "status=ready"
+                      << " backend_impl=" << backend_impl_->name()
+                      << " degree=" << degree()
+                      << " multi_gpu_single_process=" << (backend_impl_->isMultiGpuSingleProcess() ? 1 : 0));
         }
         return true;
     }

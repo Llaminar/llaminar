@@ -4,13 +4,17 @@
  */
 
 #include "FusedGateUpGEMMStage.h"
+#include "VerifierDecodeEquivalentGemmRows.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
 #include "../../../tensors/TensorKernels.h"
 #include "../../../utils/Logger.h"
-#include "../../../kernels/KernelFactory.h"
 #include "../../../utils/GemmContext.h"
+#include "../../../utils/PerfStatsCollector.h"
+#include "../../../loaders/PreparedWeightStore.h"
+
+#include <algorithm>
 
 namespace llaminar2
 {
@@ -22,6 +26,49 @@ namespace llaminar2
     FusedGateUpGEMMStage::FusedGateUpGEMMStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+    }
+
+    bool FusedGateUpGEMMStage::validatePreparedWeights(std::string *error) const
+    {
+        if (!params_.w_gate && !params_.w_up)
+            return true;
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            if (error) *error = "FusedGateUpGEMMStage requires PreparedWeightStore and gate/up PreparedWeightRefs";
+            return false;
+        }
+        if (!params_.prepared_store->contains(params_.prepared_ref_gate.value()) ||
+            !params_.prepared_store->contains(params_.prepared_ref_up.value()))
+        {
+            if (error) *error = "FusedGateUpGEMMStage has a PreparedWeightRef missing from PreparedWeightStore";
+            return false;
+        }
+        return true;
+    }
+
+    ITensorFusedGateUpGemm *FusedGateUpGEMMStage::resolvePreparedKernel(const char *caller)
+    {
+        if (cached_kernel_)
+            return cached_kernel_;
+
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightStore and gate/up PreparedWeightRefs are required");
+            return nullptr;
+        }
+
+        cached_kernel_ = params_.prepared_store->fusedGateUpKernel(
+            params_.prepared_ref_gate.value(),
+            params_.prepared_ref_up.value());
+        if (!cached_kernel_)
+        {
+            LOG_ERROR("[" << caller << "] PreparedWeightRefs were provided but no fused gate/up kernel was found in PreparedWeightStore");
+        }
+        return cached_kernel_;
     }
 
     bool FusedGateUpGEMMStage::execute(IDeviceContext *ctx)
@@ -53,9 +100,12 @@ namespace llaminar2
             LOG_ERROR("[FusedGateUpGEMMStage] Null output buffer(s)");
             return false;
         }
-        if (params_.m <= 0 || params_.k <= 0)
+        if (params_.m <= 0 || params_.k <= 0 || params_.n_gate <= 0 || params_.n_up <= 0)
         {
-            LOG_ERROR("[FusedGateUpGEMMStage] Invalid dimensions: m=" << params_.m << " k=" << params_.k);
+            LOG_ERROR("[FusedGateUpGEMMStage] Invalid dimensions: m=" << params_.m
+                                                                       << " k=" << params_.k
+                                                                       << " n_gate=" << params_.n_gate
+                                                                       << " n_up=" << params_.n_up);
             return false;
         }
 
@@ -63,7 +113,7 @@ namespace llaminar2
                                                        << " output_gate_type=" << params_.output_gate->dtype_name()
                                                        << " output_up_type=" << params_.output_up->dtype_name());
 
-        // Cast ITensor* to TensorBase* for KernelFactory
+        // Validate weight tensor types for diagnostics and dump coherence.
         auto *w_gate_base = requireTensorBase(params_.w_gate, "w_gate");
         auto *w_up_base = requireTensorBase(params_.w_up, "w_up");
         if (!w_gate_base || !w_up_base)
@@ -72,17 +122,47 @@ namespace llaminar2
             return false;
         }
 
+        // Cast input/output tensors before resolving the prepared kernel so
+        // graph-declared arena buffer mismatches fail on the CPU side.
+        auto *input_base = requireTensorBase(params_.input, "input");
+        auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
+        auto *output_up_base = asTensorBase(params_.output_up, "output_up");
+
+        if (!input_base || !output_gate_base || !output_up_base)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Failed to cast input/output tensors");
+            return false;
+        }
+
+        auto has_capacity = [](const TensorBase *tensor,
+                               const char *name,
+                               size_t rows,
+                               size_t cols) -> bool
+        {
+            const auto &shape = tensor->shape();
+            if (shape.size() < 2 || shape[0] < rows || shape[1] < cols)
+            {
+                LOG_ERROR("[FusedGateUpGEMMStage] " << name
+                                                    << " shape is too small: got ["
+                                                    << (shape.size() > 0 ? shape[0] : 0) << ", "
+                                                    << (shape.size() > 1 ? shape[1] : 0) << "], need at least ["
+                                                    << rows << ", " << cols << "]");
+                return false;
+            }
+            return true;
+        };
+
+        if (!has_capacity(input_base, "input", static_cast<size_t>(params_.m), static_cast<size_t>(params_.k)) ||
+            !has_capacity(output_gate_base, "output_gate", static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_gate)) ||
+            !has_capacity(output_up_base, "output_up", static_cast<size_t>(params_.m), static_cast<size_t>(params_.n_up)))
+        {
+            return false;
+        }
+
         LOG_DEBUG("[FusedGateUpGEMMStage] Looking up kernel for gate=" << (void *)w_gate_base
                                                                        << " up=" << (void *)w_up_base << " device=" << params_.device_id.to_string());
 
-        // Get fused Gate/Up kernel — use stage-level cache to avoid KernelFactory mutex per call
-        ITensorFusedGateUpGemm *fused_kernel = cached_kernel_;
-        if (!fused_kernel)
-        {
-            fused_kernel = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-                w_gate_base, w_up_base, params_.device_id);
-            cached_kernel_ = fused_kernel;
-        }
+        ITensorFusedGateUpGemm *fused_kernel = resolvePreparedKernel("FusedGateUpGEMMStage");
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Got fused_kernel=" << (void *)fused_kernel);
 
@@ -93,15 +173,14 @@ namespace llaminar2
         }
         fused_kernel->setGPUStream(gpuStream());
 
-        // Cast input/output tensors
-        auto *input_base = requireTensorBase(params_.input, "input");
-        auto *output_gate_base = asTensorBase(params_.output_gate, "output_gate");
-        auto *output_up_base = asTensorBase(params_.output_up, "output_up");
-
-        if (!input_base || !output_gate_base || !output_up_base)
+        if (params_.force_decode_equivalent_verifier_prefill && params_.m > 1)
         {
-            LOG_ERROR("[FusedGateUpGEMMStage] Failed to cast input/output tensors");
-            return false;
+            return executeDecodeEquivalentVerifierPrefill(
+                ctx,
+                input_base,
+                output_gate_base,
+                output_up_base,
+                fused_kernel);
         }
 
         // Check if we have bias - use appropriate execute method
@@ -135,6 +214,92 @@ namespace llaminar2
 
         LOG_DEBUG("[FusedGateUpGEMMStage] Complete");
         return true;
+    }
+
+    bool FusedGateUpGEMMStage::executeDecodeEquivalentVerifierPrefill(
+        IDeviceContext *ctx,
+        const TensorBase *input,
+        TensorBase *output_gate,
+        TensorBase *output_up,
+        ITensorFusedGateUpGemm *kernel)
+    {
+        if (!input || !output_gate || !output_up || !kernel)
+            return false;
+        (void)ctx;
+        (void)kernel;
+        if (params_.m > 4)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Decode-equivalent verifier prefill is only supported "
+                      << "for tiny MTP verifier batches, got m=" << params_.m);
+            return false;
+        }
+
+        const bool is_gpu = params_.device_id.is_gpu();
+        void *stream = gpuStream();
+        if (is_gpu && !stream)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Grouped verifier GPU gate/up requires an explicit stream");
+            return false;
+        }
+
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Grouped verifier gate/up requires prepared gate/up refs");
+            return false;
+        }
+
+        auto *gate_gemm = params_.prepared_store->gemmKernel(params_.prepared_ref_gate.value());
+        auto *up_gemm = params_.prepared_store->gemmKernel(params_.prepared_ref_up.value());
+        if (!gate_gemm || !up_gemm)
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Prepared gate/up GEMM kernels were missing"
+                      << " gate=" << static_cast<const void *>(gate_gemm)
+                      << " up=" << static_cast<const void *>(up_gemm));
+            return false;
+        }
+        gate_gemm->setGPUStream(gpuStream());
+        up_gemm->setGPUStream(gpuStream());
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+            {gate_gemm, output_gate, params_.n_gate, params_.bias_gate, "gate"},
+            {up_gemm, output_up, params_.n_up, params_.bias_up, "up"}};
+        const bool success = gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
+            input,
+            projections,
+            params_.m,
+            params_.k,
+            params_.mpi_ctx,
+            bound_workspace_);
+
+        if (success)
+        {
+            if (is_gpu)
+            {
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    output_gate, params_.device_id, stream);
+                verifier_gemm_rows::markDeviceOutputWritten(
+                    output_up, params_.device_id, stream);
+            }
+            PerfStatsCollector::addCounter(
+                "mtp",
+                "gate_up_decode_equivalent_verifier_prefill_rows",
+                static_cast<double>(params_.m),
+                {},
+                params_.device_id.to_string(),
+                {{"route", "grouped"}});
+        }
+        else
+        {
+            LOG_ERROR("[FusedGateUpGEMMStage] Grouped decode-equivalent verifier gate/up is unsupported or failed"
+                      << " device=" << params_.device_id.to_string()
+                      << " m=" << params_.m
+                      << " k=" << params_.k
+                      << " n_gate=" << params_.n_gate
+                      << " n_up=" << params_.n_up);
+        }
+        return success;
     }
 
     size_t FusedGateUpGEMMStage::estimatedFlops() const
@@ -252,7 +417,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Cast to TensorBase for KernelFactory
+        // Validate tensor types before resolving the prepared fused kernel.
         auto *w_gate_base = dynamic_cast<const TensorBase *>(params_.w_gate);
         auto *w_up_base = dynamic_cast<const TensorBase *>(params_.w_up);
         if (!w_gate_base || !w_up_base)
@@ -262,9 +427,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        // Get the fused kernel (cached by KernelFactory) using explicit DeviceId
-        cached_kernel_ = llaminar::v2::kernels::KernelFactory::getOrCreateFusedGateUpGemm(
-            w_gate_base, w_up_base, params_.device_id);
+        cached_kernel_ = resolvePreparedKernel("FusedGateUpGEMMStage::getKernelAsWorkspaceConsumer");
 
         if (!cached_kernel_)
         {
@@ -275,6 +438,37 @@ namespace llaminar2
 
         // The FusedGateUpGemmAdapter now implements IWorkspaceConsumer
         return dynamic_cast<IWorkspaceConsumer *>(cached_kernel_);
+    }
+
+    WorkspaceRequirements FusedGateUpGEMMStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        if (!params_.prepared_store ||
+            !params_.prepared_ref_gate.has_value() ||
+            !params_.prepared_ref_up.has_value())
+        {
+            LOG_TRACE("[FusedGateUpGEMMStage::getWorkspaceRequirements] PreparedWeightStore and gate/up refs are required");
+            return {};
+        }
+
+        const int workspace_m = (m > 0) ? m : params_.m;
+        const int workspace_k = (k > 0) ? k : params_.k;
+
+        WorkspaceRequirements combined;
+        auto mergeFrom = [&](const PreparedWeightRef &ref, int projection_n)
+        {
+            auto *gemm = params_.prepared_store->gemmKernel(ref);
+            auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+            if (!consumer)
+                return;
+            const int workspace_n = (projection_n > 0) ? projection_n : n;
+            combined.merge(consumer->getWorkspaceRequirements(workspace_m, workspace_n, workspace_k));
+        };
+
+        mergeFrom(params_.prepared_ref_gate.value(), params_.n_gate);
+        mergeFrom(params_.prepared_ref_up.value(), params_.n_up);
+        addCudaConcurrentDecodeGemvSideStreamWorkspace(
+            combined, params_.device_id, workspace_m, /*projection_count=*/2);
+        return combined;
     }
 
     StageBufferContract FusedGateUpGEMMStage::bufferContract() const

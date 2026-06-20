@@ -105,6 +105,17 @@ namespace llaminar2
                 return true;
             }
 
+            bool get_kv_converted(int layer, int seq_idx,
+                                  ActivationPrecision target,
+                                  ITensor **out_k, ITensor **out_v,
+                                  int *out_kv_len = nullptr,
+                                  const KVReadParams *rope = nullptr) override
+            {
+                (void)target;
+                (void)rope;
+                return get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
+            }
+
             ITensor *get_k(int layer, int seq_idx = 0) override
             {
                 (void)seq_idx;

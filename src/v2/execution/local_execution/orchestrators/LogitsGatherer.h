@@ -16,12 +16,16 @@
 #include <memory>
 #include <vector>
 
+#include "../../../backends/DeviceId.h"
+
 namespace llaminar2
 {
 
     class TensorBase;
+    class IBackend;
     class IInferenceRunner;
     struct DeviceId;
+    struct LogitsLocalInfo;
 
     /**
      * @brief Manages the combined logits buffer and gather operations for multi-device inference.
@@ -37,13 +41,18 @@ namespace llaminar2
     class LogitsGatherer
     {
     public:
+        /// Backend resolver hook used by unit tests; production callers leave it null.
+        using BackendResolver = IBackend *(*)(DeviceId);
+
         /**
          * @brief Construct a LogitsGatherer with a pre-allocated FP32 buffer.
          *
          * @param vocab_size Full vocabulary size (total across all TP devices)
          * @param max_tokens Maximum tokens (batch_size * max_seq_len)
+         * @param backend_resolver Optional backend resolver for deterministic unit tests.
+         *                         When null, LogitsGatherer uses the global BackendManager.
          */
-        LogitsGatherer(int vocab_size, size_t max_tokens);
+        LogitsGatherer(int vocab_size, size_t max_tokens, BackendResolver backend_resolver = nullptr);
 
         ~LogitsGatherer();
 
@@ -89,6 +98,17 @@ namespace llaminar2
          */
         bool gather(const std::vector<std::unique_ptr<IInferenceRunner>> &runners,
                     size_t seq_len, int full_vocab_size);
+
+        /**
+         * @brief Gather already-resolved local logits shards into the combined buffer.
+         *
+         * This is used for logits surfaces that are not the main LOGITS_LOCAL buffer,
+         * such as MTP sidecar logits. The copy semantics and CPU/GPU fallbacks are
+         * identical to gather().
+         */
+        bool gatherLocalInfos(const std::vector<LogitsLocalInfo> &device_infos,
+                              size_t seq_len,
+                              int full_vocab_size);
 
         /**
          * @brief Copy logits from a PP stage runner into the combined buffer.
@@ -139,8 +159,13 @@ namespace llaminar2
         bool needsGather(size_t seq_len) const;
 
     private:
+        /// @brief Resolve a backend through the injected test resolver or global BackendManager.
+        IBackend *resolveBackend(DeviceId device) const;
+
         std::unique_ptr<TensorBase> buffer_;
+        BackendResolver backend_resolver_ = nullptr; ///< Optional test hook for backend selection.
         bool pinned_ = false;
+        DeviceType pinned_device_type_ = DeviceType::CPU; ///< Backend type used for pinning (for correct unpin)
         bool skip_decode_ = false;
         bool skip_prefill_ = false;
         size_t last_gathered_size_ = 0;
