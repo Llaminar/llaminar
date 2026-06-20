@@ -1790,6 +1790,24 @@ namespace llaminar2
                 LOG_DEBUG("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path M="
                           << m << " projections=" << projections.size());
 
+                if (!gpu_stream_)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV path requires an explicit CUDA stream");
+                    return false;
+                }
+
+                struct SmallMProjectionBinding
+                {
+                    CUDAQuantisedGemmKernel *kernel = nullptr;
+                    float *output = nullptr;
+                    const float *bias = nullptr;
+                    int n = 0;
+                    const char *name = nullptr;
+                };
+
+                std::vector<SmallMProjectionBinding> bindings;
+                bindings.reserve(projections.size());
+
                 for (size_t i = 0; i < projections.size(); ++i)
                 {
                     const auto &proj = projections[i];
@@ -1853,7 +1871,7 @@ namespace llaminar2
                         }
                         else
                         {
-                            if (!fp32_bias->ensureOnDevice(target_device))
+                            if (!fp32_bias->ensureOnDevice(target_device, gpu_stream_))
                             {
                                 LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
                                           << i << " failed to upload bias to CUDA:" << cuda_device_id_);
@@ -1864,18 +1882,73 @@ namespace llaminar2
                     }
 
                     cuda_kernel->setGPUStream(gpu_stream_);
-                    if (!cuda_kernel->multiply_fp32_to_fp32_small_m_gemv(
-                            d_input,
-                            d_output,
-                            d_bias,
+                    cuda_kernel->validateWorkspace();
+                    cuda_kernel->ensureWeightsConverted();
+                    if (!canUseNativeVNNIBlockwise(cuda_kernel->impl_.get(), 1, k))
+                    {
+                        LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M projection "
+                                  << i << " does not support native-VNNI decode-equivalent GEMV"
+                                  << " codebook="
+                                  << (cuda_kernel->impl_
+                                          ? std::to_string(static_cast<int>(cuda_kernel->impl_->native_codebook_id))
+                                          : std::string("unknown"))
+                                  << " N=" << proj.n << " K=" << k);
+                        return false;
+                    }
+
+                    bindings.push_back(SmallMProjectionBinding{
+                        cuda_kernel,
+                        d_output,
+                        d_bias,
+                        proj.n,
+                        proj.name});
+                }
+
+                // All small-M verifier projections share the same activation rows.
+                // Quantize those rows once, then feed the same quantized block into
+                // each decode-equivalent GEMV. This removes repeated hot-path work
+                // while preserving the exact per-projection GEMV kernels and
+                // accumulator order used by the serial verifier path.
+                validateWorkspace();
+                int8_t *d_A_int8 = static_cast<int8_t *>(workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+                float *d_scales_A_blockwise =
+                    static_cast<float *>(workspace_->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+                if (!d_A_int8 || !d_scales_A_blockwise)
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier workspace missing quantized activation buffers");
+                    return false;
+                }
+
+                if (!cudaQuantGemm_quantizeActivationsBlockwise(
+                        d_input,
+                        d_A_int8,
+                        d_scales_A_blockwise,
+                        m,
+                        k,
+                        cuda_device_id_,
+                        gpu_stream_))
+                {
+                    LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier shared activation quantization failed");
+                    return false;
+                }
+
+                for (size_t i = 0; i < bindings.size(); ++i)
+                {
+                    const auto &binding = bindings[i];
+                    binding.kernel->setGPUStream(gpu_stream_);
+                    if (!binding.kernel->multiply_quantized_small_m_gemv(
+                            d_A_int8,
+                            d_scales_A_blockwise,
+                            binding.output,
+                            binding.bias,
                             m,
-                            proj.n,
+                            binding.n,
                             k,
                             1.0f,
                             0.0f))
                     {
                         LOG_ERROR("[CUDAQuantisedGemmKernel::multiply_fused_tensor] Small-M verifier GEMV failed for projection "
-                                  << i << " (" << (proj.name ? proj.name : "unnamed") << ")");
+                                  << i << " (" << (binding.name ? binding.name : "unnamed") << ")");
                         return false;
                     }
                 }
@@ -1892,7 +1965,7 @@ namespace llaminar2
                             {"m", std::to_string(m)},
                             {"k", std::to_string(k)},
                             {"projections", std::to_string(projections.size())},
-                            {"route", "specialized"}});
+                            {"route", "shared_quantized_activation"}});
                 }
 
                 return true;

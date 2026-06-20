@@ -22,6 +22,13 @@ Acceptance stayed at `30/39` (`76.92%`) on both CUDA and ROCm. This slice
 added a semantic runtime-table reset regression and made shared-gate graph
 capture require a device-resident gate tensor after warmup.
 
+Focused verifier FFN refresh after the reset guard:
+`v2_perf_moe_verifier_prefill` CUDA gates are green. Routed M4 grouped verifier
+is `0.1068 ms` vs `9.6632 ms` row replay (`90.5x`); combined routed+shared
+upper-bound M4 is `0.1880 ms` vs `10.1835 ms` (`54.2x`). Production
+`SharedExpertFFNStage` all-codebook M=2/3/4 is exact under cos/L2/KLD/max_abs
+and stays speed-positive (`2.6x-5.5x` in the latest run).
+
 ## Device And Topology Matrix
 
 | Mode | Device / degree | Dense greedy | Dense stoch | MoE greedy | MoE stoch | Status |
@@ -78,6 +85,9 @@ the active bottleneck is verifier producer time.
   until the effective gate tensor is device-resident on the stage device.
 - Shared-expert `SharedExpertFFNStage` M=2/3/4 all-codebook gates pass on
   CUDA/ROCm with cosine, relative L2, KLD, and max_abs checks.
+- The experimental lower-level shared-as-MoE prefill route is not accepted and
+  has been pruned from perf gates; the accepted shared route is GEMV-many via
+  production `SharedExpertFFNStage`.
 - Token equality alone is not an accepted verifier parity proof.
 
 ## Next Phase 10 Moves
