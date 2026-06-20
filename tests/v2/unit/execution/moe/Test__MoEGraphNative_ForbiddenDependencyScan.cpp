@@ -754,6 +754,49 @@ namespace llaminar2::test
                "before graph-captured MoE decode can run.";
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmMoEResetPreservesDeclaredGroupedWorkspace)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path kernel_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(kernel_path)) << kernel_path;
+
+        const std::string contents = readFile(kernel_path);
+        ASSERT_FALSE(contents.empty()) << kernel_path;
+
+        const size_t reset_start = contents.find("void ROCmMoEKernel::resetDynamicState()");
+        ASSERT_NE(reset_start, std::string::npos);
+        const size_t reset_end = contents.find("void ROCmMoEKernel::syncBlasStream()", reset_start);
+        ASSERT_NE(reset_end, std::string::npos);
+        const std::string reset_body = contents.substr(reset_start, reset_end - reset_start);
+
+        EXPECT_EQ(reset_body.find("clearWorkspaceScratchBindings()"), std::string::npos)
+            << "Session reset must not drop graph-owned ROCm MoE workspace bindings. "
+               "Captured verifier graphs replay stable scratch addresses across requests.";
+        EXPECT_EQ(reset_body.find("d_grouped_gate_ptrs_"), std::string::npos)
+            << "Grouped pointer arrays are declared workspace, not per-session "
+               "routing state. Resetting them here can make the next verifier "
+               "replay use missing graph-captured addresses.";
+        EXPECT_EQ(reset_body.find("d_grouped_swiglu_int8_"), std::string::npos)
+            << "Grouped SwiGLU scratch is declared workspace and must keep stable "
+               "addresses across request/session reset.";
+        EXPECT_EQ(reset_body.find("grouped_decode_active_cap_"), std::string::npos)
+            << "Grouped decode capacity metadata belongs to workspace binding "
+               "lifetime, not request/session reset lifetime.";
+
+        const size_t clear_start = contents.find("void ROCmMoEKernel::clearWorkspaceScratchBindings()");
+        ASSERT_NE(clear_start, std::string::npos);
+        const size_t clear_end = contents.find("ROCmMoEKernel::~ROCmMoEKernel()",
+                                               clear_start);
+        ASSERT_NE(clear_end, std::string::npos);
+        const std::string clear_body = contents.substr(clear_start, clear_end - clear_start);
+
+        EXPECT_NE(clear_body.find("d_grouped_gate_ptrs_ = nullptr"), std::string::npos)
+            << "Unbinding workspace must clear cached grouped pointer arrays.";
+        EXPECT_NE(clear_body.find("d_grouped_swiglu_int8_ = nullptr"), std::string::npos)
+            << "Unbinding workspace must clear cached grouped scratch pointers.";
+        EXPECT_NE(clear_body.find("grouped_decode_active_cap_ = 0"), std::string::npos);
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixTerminalRestoreUsesStreamfulTransfers)
     {
         const fs::path root = findRepoRoot();
