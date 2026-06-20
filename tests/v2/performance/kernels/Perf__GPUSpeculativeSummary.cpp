@@ -404,12 +404,15 @@ namespace
             GTEST_SKIP() << backend_name << " backend unavailable";
         ASSERT_TRUE(device.is_gpu());
 
-        constexpr int kTopK = 40;
         constexpr int kOutStride = 64;
         constexpr float kTopP = 0.95f;
         constexpr float kTemperature = 0.6f;
         constexpr int kFirstToken = 100;
         constexpr int kScratchBlocksPerRow = 128;
+        const int kTopK = envInt("LLAMINAR_PERF_GPU_SPEC_TOP_K", 40);
+        ASSERT_GE(kTopK, 1);
+        ASSERT_LE(kTopK, kOutStride)
+            << "compact distribution perf output stride is fixed for small-k sweeps";
 
         const int device_id = device.gpu_ordinal();
         auto &ctx = GPUDeviceContextPool::instance().getContext(device);
@@ -809,7 +812,6 @@ namespace
             GTEST_SKIP() << backend_name << " backend unavailable";
         ASSERT_TRUE(device.is_gpu());
 
-        constexpr int kTopK = 40;
         constexpr int kFirstToken = 100;
         constexpr float kTopP = 0.95f;
         constexpr float kTemperature = 0.6f;
@@ -817,6 +819,10 @@ namespace
         constexpr float kResidualThreshold = 0.42f;
         constexpr float kBonusThreshold = 0.42f;
         constexpr int kScratchBlocksPerRow = 128;
+        const int kTopK = envInt("LLAMINAR_PERF_GPU_SPEC_TOP_K", 40);
+        ASSERT_GE(kTopK, 1);
+        ASSERT_LE(kTopK, 64)
+            << "processed-logit perf sweeps are intended for small-k MTP sampling";
 
         const int device_id = device.gpu_ordinal();
         auto &ctx = GPUDeviceContextPool::instance().getContext(device);
@@ -1090,7 +1096,6 @@ namespace
             GTEST_SKIP() << backend_name << " backend unavailable";
         ASSERT_TRUE(device.is_gpu());
 
-        constexpr int kTopK = 40;
         constexpr int kFirstToken = 100;
         constexpr float kTopP = 0.95f;
         constexpr float kTargetTemperature = 0.6f;
@@ -1098,6 +1103,10 @@ namespace
         constexpr float kAcceptThreshold = 0.5f;
         constexpr float kBonusThreshold = 0.42f;
         constexpr int kScratchBlocksPerRow = 128;
+        const int kTopK = envInt("LLAMINAR_PERF_GPU_SPEC_TOP_K", 40);
+        ASSERT_GE(kTopK, 1);
+        ASSERT_LE(kTopK, 64)
+            << "production stochastic perf sweeps are intended for small-k MTP sampling";
 
         const int device_id = device.gpu_ordinal();
         auto &ctx = GPUDeviceContextPool::instance().getContext(device);
@@ -1760,7 +1769,10 @@ namespace
             GTEST_SKIP() << backend_name << " backend unavailable";
         ASSERT_TRUE(device.is_gpu());
 
-        constexpr int kTopK = 40;
+        const int kTopK = envInt("LLAMINAR_PERF_GPU_SPEC_TOP_K", 40);
+        ASSERT_GE(kTopK, 1);
+        ASSERT_LE(kTopK, 64)
+            << "processed-logit softmax perf sweeps are intended for small-k MTP sampling";
         const int device_id = device.gpu_ordinal();
         auto &ctx = GPUDeviceContextPool::instance().getContext(device);
         void *stream = ctx.defaultStream();

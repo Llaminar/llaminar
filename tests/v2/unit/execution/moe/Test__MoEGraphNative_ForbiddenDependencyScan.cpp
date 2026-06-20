@@ -856,6 +856,133 @@ namespace llaminar2::test
         EXPECT_NE(clear_body.find("grouped_decode_active_cap_ = 0"), std::string::npos);
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, MoEWorkspaceRebindResetContractIsSymmetric)
+    {
+        const fs::path root = findRepoRoot();
+
+        struct BackendCase
+        {
+            fs::path path;
+            std::string class_name;
+            std::vector<std::string> representative_scratch_members;
+            std::vector<std::string> required_clear_members;
+        };
+
+        const std::vector<BackendCase> cases = {
+            {
+                "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
+                "CUDAMoEKernel",
+                {
+                    "d_grouped_gateup_gate_partials_",
+                    "d_grouped_down_partials_",
+                    "d_decode_swiglu_int8_",
+                },
+                {
+                    "d_grouped_gateup_gate_partials_ = nullptr",
+                    "d_grouped_down_partials_ = nullptr",
+                    "d_decode_swiglu_int8_ = nullptr",
+                },
+            },
+            {
+                "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
+                "ROCmMoEKernel",
+                {
+                    "d_grouped_gate_ptrs_",
+                    "d_grouped_swiglu_int8_",
+                    "grouped_decode_active_cap_",
+                },
+                {
+                    "d_grouped_gate_ptrs_ = nullptr",
+                    "d_grouped_swiglu_int8_ = nullptr",
+                    "grouped_decode_active_cap_ = 0",
+                },
+            },
+        };
+
+        for (const auto &backend : cases)
+        {
+            SCOPED_TRACE(backend.class_name);
+            const fs::path kernel_path = root / backend.path;
+            ASSERT_TRUE(fs::exists(kernel_path)) << kernel_path;
+
+            const std::string contents = readFile(kernel_path);
+            ASSERT_FALSE(contents.empty()) << kernel_path;
+
+            const std::string bind_signature =
+                "void " + backend.class_name + "::bindWorkspace(DeviceWorkspaceManager *workspace)";
+            const size_t bind_start = contents.find(bind_signature);
+            ASSERT_NE(bind_start, std::string::npos);
+            const size_t bind_end = contents.find(
+                "bool " + backend.class_name + "::bindWorkspaceBuffer",
+                bind_start);
+            ASSERT_NE(bind_end, std::string::npos);
+            const std::string bind_body = contents.substr(bind_start, bind_end - bind_start);
+
+            EXPECT_NE(bind_body.find("workspace->id()"), std::string::npos)
+                << "Workspace ABA protection must use DeviceWorkspaceManager::id().";
+            EXPECT_NE(bind_body.find("bound_workspace_id_"), std::string::npos);
+            EXPECT_NE(bind_body.find("workspace_ == workspace && bound_workspace_id_"), std::string::npos)
+                << "Same-pointer rebinding is only a no-op when the workspace id also matches.";
+
+            const size_t early_return = bind_body.find("return;");
+            const size_t bind_base =
+                bind_body.find(backend.class_name == "CUDAMoEKernel"
+                                   ? "CUDAKernelBase::bindWorkspace(workspace)"
+                                   : "ROCmKernelBase::bindWorkspace(workspace)");
+            const size_t assign_id = bind_body.find("bound_workspace_id_", early_return + 1);
+            const size_t clear_bind = bind_body.find("clearWorkspaceScratchBindings()", early_return + 1);
+            ASSERT_NE(early_return, std::string::npos);
+            ASSERT_NE(bind_base, std::string::npos);
+            ASSERT_NE(assign_id, std::string::npos);
+            ASSERT_NE(clear_bind, std::string::npos);
+            EXPECT_LT(early_return, bind_base);
+            EXPECT_LT(bind_base, assign_id);
+            EXPECT_LT(assign_id, clear_bind)
+                << "Scratch caches must be invalidated after binding the new workspace identity.";
+
+            const std::string reset_signature =
+                "void " + backend.class_name + "::resetDynamicState()";
+            const size_t reset_start = contents.find(reset_signature);
+            ASSERT_NE(reset_start, std::string::npos);
+            const size_t reset_end = contents.find(
+                backend.class_name == "CUDAMoEKernel"
+                    ? "void CUDAMoEKernel::releaseDeviceBuffers()"
+                    : "void ROCmMoEKernel::syncBlasStream()",
+                reset_start);
+            ASSERT_NE(reset_end, std::string::npos);
+            const std::string reset_body = contents.substr(reset_start, reset_end - reset_start);
+
+            EXPECT_EQ(reset_body.find("clearWorkspaceScratchBindings()"), std::string::npos)
+                << "Dynamic reset is request/session metadata cleanup only; it must not "
+                   "drop graph-owned scratch bindings.";
+            for (const std::string &member : backend.representative_scratch_members)
+            {
+                EXPECT_EQ(reset_body.find(member), std::string::npos)
+                    << "Dynamic reset must not directly mutate workspace-owned scratch member "
+                    << member;
+            }
+
+            const std::string clear_signature =
+                "void " + backend.class_name + "::clearWorkspaceScratchBindings()";
+            const size_t clear_start = contents.find(clear_signature);
+            ASSERT_NE(clear_start, std::string::npos);
+            const size_t clear_end = contents.find(
+                backend.class_name == "CUDAMoEKernel"
+                    ? "void CUDAMoEKernel::resetDynamicState()"
+                    : "ROCmMoEKernel::~ROCmMoEKernel()",
+                clear_start);
+            ASSERT_NE(clear_end, std::string::npos);
+            const std::string clear_body = contents.substr(clear_start, clear_end - clear_start);
+
+            for (const std::string &member_reset : backend.required_clear_members)
+            {
+                EXPECT_NE(clear_body.find(member_reset), std::string::npos)
+                    << "Workspace lifetime handoff must invalidate " << member_reset;
+            }
+            EXPECT_NE(clear_body.find("scratch_workspace_bound_ = false"), std::string::npos);
+        }
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefixTerminalRestoreUsesStreamfulTransfers)
     {
         const fs::path root = findRepoRoot();

@@ -9,11 +9,11 @@ RAG: **G** correct and speed-positive, **A** correct but slow/stale,
 
 ## Snapshot
 
-Latest MoE run: `20260620T022609Z-moe-fused-gateup-reduce-swiglu`.
+Latest MoE run: `20260620T023333Z-moe-fixed-depth-sweep`.
 The verifier grouped path is correct on CUDA/ROCm, but SingleDevice MoE MTP
-remains speed-negative. This slice fused split-K gate/up reduction with SwiGLU
-quantization for CUDA/ROCm verifier prefill. It removed one graph node and moved
-tok/s slightly, but not enough to change the phase status.
+remains speed-negative. The fixed-depth sweep shows d3 is still the best
+MoE stochastic setting on both GPUs; d1/d2 are worse because verifier fixed
+overhead dominates before deeper drafting can amortize it.
 
 Accepted MoE verifier route: routed experts use grouped verifier; shared expert
 uses decode-equivalent GEMV-many plus normal shared-gate combine. Do not revive
@@ -43,15 +43,22 @@ token, and continuation proof.
 | CUDA dense stoch | `44.47` | `57.07 tok/s` d1 (`1.28x`) | n/a | G |
 | ROCm dense greedy | `31.30` | `39.79 tok/s` dyn (`1.27x`) | n/a | A |
 | ROCm dense stoch | `31.79` | `32.16 tok/s` dyn (`1.01x`) | n/a | A |
-| CUDA MoE stoch | `139.29` | `89.36 tok/s` d3 (`0.64x`) | `30/39` | R |
-| ROCm MoE stoch | `84.46` | `69.00 tok/s` d3 (`0.82x`) | `30/39` | A/R |
+| CUDA MoE stoch | `138.31` | `88.75 tok/s` d3 (`0.64x`) | `30/39` | R |
+| ROCm MoE stoch | `84.18` | `69.40 tok/s` d3 (`0.82x`) | `30/39` | A/R |
+
+MoE depth sweep:
+
+| Device | d1 | d2 | d3 | Dynamic |
+|---|---:|---:|---:|---:|
+| CUDA | `74.02` (`0.54x`) | `77.96` (`0.56x`) | `88.75` (`0.64x`) | `88.74` (`0.64x`) |
+| ROCm | `61.78` (`0.73x`) | `61.98` (`0.74x`) | `69.40` (`0.82x`) | `61.67` (`0.73x`) |
 
 Latest MoE stage blockers:
 
 | Device | Main verifier | Stage body | Largest buckets |
 |---|---:|---:|---|
-| CUDA | `440.4 ms` | `142.4 ms` | routed FFN `26.4`, GDN proj `17.6`, router `7.1` |
-| ROCm | `516.7 ms` | `167.1 ms` | routed FFN `47.1`, shared FFN `16.2`, router `15.2` |
+| CUDA | `443.1 ms` | n/a | graph replay `180.9`, routed FFN `26.4`, dist build `19.7` |
+| ROCm | `512.1 ms` | n/a | graph replay `201.6`, dist build `57.8`, routed FFN `50.2` |
 
 ## Focused Proofs
 
