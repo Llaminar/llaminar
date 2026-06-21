@@ -12141,6 +12141,11 @@ add_v2_test(V2_Unit_PrefillGraphCaptureDynamicParams
 
 add_executable(v2_test_hidden_state_row_select_stage unit/stages/Test__HiddenStateRowSelectStage.cpp)
 target_include_directories(v2_test_hidden_state_row_select_stage PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_compile_definitions(v2_test_hidden_state_row_select_stage
+    PRIVATE
+        LLAMINAR_HIDDEN_STATE_ROW_SELECT_STAGE_SOURCE="${CMAKE_CURRENT_LIST_DIR}/../../src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp"
+        LLAMINAR_HIDDEN_STATE_ROWS_SELECT_STAGE_SOURCE="${CMAKE_CURRENT_LIST_DIR}/../../src/v2/execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp"
+)
 target_link_libraries(v2_test_hidden_state_row_select_stage llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_HiddenStateRowSelectStage
     COMMAND $<TARGET_FILE:v2_test_hidden_state_row_select_stage>

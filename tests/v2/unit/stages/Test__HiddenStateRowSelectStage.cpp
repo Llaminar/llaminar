@@ -125,23 +125,35 @@ namespace
         return max_difference;
     }
 
-    /// @brief Read a source file relative to the repository root derived from __FILE__.
-    std::string readRepoFile(const std::string &relative_path)
+#ifndef LLAMINAR_HIDDEN_STATE_ROW_SELECT_STAGE_SOURCE
+#define LLAMINAR_HIDDEN_STATE_ROW_SELECT_STAGE_SOURCE "src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp"
+#endif
+
+#ifndef LLAMINAR_HIDDEN_STATE_ROWS_SELECT_STAGE_SOURCE
+#define LLAMINAR_HIDDEN_STATE_ROWS_SELECT_STAGE_SOURCE "src/v2/execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp"
+#endif
+
+    /// @brief Read a source file from the CMake-configured path, with repo-root fallbacks for ad hoc builds.
+    std::string readSourceFile(const std::string &source_path)
     {
         std::vector<std::filesystem::path> candidates;
-        candidates.push_back(std::filesystem::path(__FILE__).parent_path());
+        candidates.push_back(std::filesystem::path(source_path));
         candidates.push_back(std::filesystem::current_path());
         candidates.push_back("/src");
 
         std::ifstream input;
-        for (auto root : candidates)
+        for (size_t candidate_idx = 0; candidate_idx < candidates.size(); ++candidate_idx)
         {
+            auto root = candidates[candidate_idx];
             for (int depth = 0; depth < 8 && !root.empty(); ++depth)
             {
-                const auto path = root / relative_path;
+                const auto path = candidate_idx == 0
+                    ? root
+                    : root / source_path;
                 input.open(path);
                 if (input)
                     break;
+                input.close();
                 input.clear();
                 root = root.parent_path();
             }
@@ -460,9 +472,9 @@ TEST(Test__HiddenStateRowSelectStage, MultiRowReplayUpdateKeepsDeclaredWorkspace
 TEST(Test__HiddenStateRowSelectStage, ReplayMutatorsDoNotTouchGpuWorkspace)
 {
     const std::string single_source =
-        readRepoFile("src/v2/execution/compute_stages/stages/HiddenStateRowSelectStage.cpp");
+        readSourceFile(LLAMINAR_HIDDEN_STATE_ROW_SELECT_STAGE_SOURCE);
     const std::string multi_source =
-        readRepoFile("src/v2/execution/compute_stages/stages/HiddenStateRowsSelectStage.cpp");
+        readSourceFile(LLAMINAR_HIDDEN_STATE_ROWS_SELECT_STAGE_SOURCE);
     ASSERT_FALSE(single_source.empty());
     ASSERT_FALSE(multi_source.empty());
 
