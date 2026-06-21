@@ -26,9 +26,25 @@ APT_OPTS=(
     -o Acquire::https::Timeout=30
 )
 
+curl_download() {
+    local url="$1"
+    local output="$2"
+
+    curl -fsSL \
+        --connect-timeout 30 \
+        --max-time 300 \
+        --retry 8 \
+        --retry-all-errors \
+        --retry-delay 5 \
+        --retry-max-time 900 \
+        -o "${output}" \
+        "${url}"
+}
+
 # amdgpu-install is the canonical installer for ROCm on Ubuntu.
-curl -fsSL --retry 5 --retry-delay 5 -o /tmp/amdgpu-install.deb \
-    "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb"
+curl_download \
+    "https://repo.radeon.com/amdgpu-install/${ROCM_VERSION}/ubuntu/noble/amdgpu-install_${ROCM_DEB_VERSION}_all.deb" \
+    /tmp/amdgpu-install.deb
 apt-get "${APT_OPTS[@]}" update
 apt-get "${APT_OPTS[@]}" install -y --allow-change-held-packages /tmp/amdgpu-install.deb
 rm /tmp/amdgpu-install.deb
@@ -77,8 +93,9 @@ esac
 
 # Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages zstd
-curl -fsSL --retry 5 --retry-delay 5 -o /tmp/rocblas-arch.pkg.tar.zst \
-    "https://archlinux.org/packages/extra/x86_64/rocblas/download"
+curl_download \
+    "https://archlinux.org/packages/extra/x86_64/rocblas/download" \
+    /tmp/rocblas-arch.pkg.tar.zst
 mkdir -p /tmp/rocblas-arch
 tar -I zstd -xf /tmp/rocblas-arch.pkg.tar.zst -C /tmp/rocblas-arch
 if compgen -G "/tmp/rocblas-arch/opt/rocm/lib/rocblas/library/*gfx906*" >/dev/null; then
