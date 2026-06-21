@@ -109,10 +109,10 @@ for path in \
     /host-dev/nvidia-uvm \
     /host-dev/nvidia-uvm-tools \
     /host-dev/nvidia-modeset; do
-    [ -e "$path" ] && printf "%s\n" "${path#/host-dev}"
+    [ -e "$path" ] && printf "/dev%s\n" "${path#/host-dev}"
 done
 for path in /host-dev/nvidia[0-9]* /host-dev/nvidia-caps/*; do
-    [ -e "$path" ] && printf "%s\n" "${path#/host-dev}"
+    [ -e "$path" ] && printf "/dev%s\n" "${path#/host-dev}"
 done
 ' 2>/dev/null | sort -u
 }
