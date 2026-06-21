@@ -9887,26 +9887,37 @@ if(HAVE_ROCM)
 
     # Performance Test: hipBLAS INT8 GEMM Roofline
     # Measures raw hipBLAS INT8 GEMM throughput to establish roofline on MI50
-    set_source_files_properties(
-        performance/rocm/Perf__HipblasInt8Roofline.hip
-        PROPERTIES LANGUAGE HIP
+    find_path(CK_INCLUDE_DIR ck/ck.hpp
+        PATHS
+            /opt/rocm/include
+            /usr/local/include
+            /usr/include
     )
-    add_executable(v2_perf_hipblas_int8_roofline 
-        performance/rocm/Perf__HipblasInt8Roofline.hip
-    )
-    target_link_libraries(v2_perf_hipblas_int8_roofline 
-        hip::host
-        hip::device
-        hipblas
-        GTest::gtest 
-        GTest::gtest_main
-    )
-    add_v2_test(V2_Perf_HipblasInt8Roofline
-        COMMAND $<TARGET_FILE:v2_perf_hipblas_int8_roofline>
-        LABELS "V2;Performance;ROCm;GEMM;INT8;hipBLAS;Roofline;gfx906;Benchmark"
-        MPI_PROCS 1
-    )
-    message(STATUS "V2 Tests: Added hipBLAS INT8 GEMM roofline benchmarks")
+    if(CK_INCLUDE_DIR)
+        set_source_files_properties(
+            performance/rocm/Perf__HipblasInt8Roofline.hip
+            PROPERTIES LANGUAGE HIP
+        )
+        add_executable(v2_perf_hipblas_int8_roofline
+            performance/rocm/Perf__HipblasInt8Roofline.hip
+        )
+        target_include_directories(v2_perf_hipblas_int8_roofline PRIVATE ${CK_INCLUDE_DIR})
+        target_link_libraries(v2_perf_hipblas_int8_roofline
+            hip::host
+            hip::device
+            hipblas
+            GTest::gtest
+            GTest::gtest_main
+        )
+        add_v2_test(V2_Perf_HipblasInt8Roofline
+            COMMAND $<TARGET_FILE:v2_perf_hipblas_int8_roofline>
+            LABELS "V2;Performance;ROCm;GEMM;INT8;hipBLAS;Roofline;gfx906;Benchmark"
+            MPI_PROCS 1
+        )
+        message(STATUS "V2 Tests: Added hipBLAS INT8 GEMM roofline benchmarks")
+    else()
+        message(STATUS "V2 Tests: Skipping hipBLAS INT8 GEMM roofline benchmark; Composable Kernel headers (ck/ck.hpp) not found")
+    endif()
 
     # =============================================================================
     # ROCm Ring Buffer KV Cache Tests
