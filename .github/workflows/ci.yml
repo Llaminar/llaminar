@@ -101,24 +101,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Restore ccache from previous runs
-        uses: actions/cache@v5
-        with:
-          path: ${{ runner.temp }}/.ccache-llaminar
-          key: ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-${{ github.sha }}
-          restore-keys: |
-            ccache-builder-${{ runner.os }}-${{ hashFiles('Dockerfile', 'scripts/docker/**', 'src/v2/CMakeLists.txt') }}-
-            ccache-builder-${{ runner.os }}-
-
-      - name: Inject ccache into BuildKit
-        uses: reproducible-containers/buildkit-cache-dance@v3.3.2
-        with:
-          cache-map: |
-            {
-              "${{ runner.temp }}/.ccache-llaminar": "/root/.ccache"
-            }
-          skip-extraction: true
-
       - name: Build builder image
         uses: docker/build-push-action@v7
         with:
@@ -137,16 +119,6 @@ jobs:
             BUILD_DATE=${{ github.event.repository.updated_at }}
             LLAMINAR_CUDA_ARCHS=86
             RCCL_ONLY_FUNCS=${{ env.RCCL_ONLY_FUNCS }}
-
-      - name: Extract ccache from BuildKit
-        if: always()
-        uses: reproducible-containers/buildkit-cache-dance@v3.3.2
-        with:
-          cache-map: |
-            {
-              "${{ runner.temp }}/.ccache-llaminar": "/root/.ccache"
-            }
-          skip-extraction: false
 
       - name: Stage runner host state
         run: |
