@@ -692,6 +692,7 @@ if(HAVE_ROCM)
     
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
+    set(RCCL_SOURCE_REF_FILE "${RCCL_EXTERNAL_DIR}/.llaminar-rccl-source-ref")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
     set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
     set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
@@ -747,18 +748,28 @@ if(HAVE_ROCM)
         message(STATUS "V2: RCCL already present at ${RCCL_EXTERNAL_DIR}; leaving existing checkout untouched")
     endif()
     
-    # Get current commit hash for cache validation
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
-        WORKING_DIRECTORY "${RCCL_EXTERNAL_DIR}"
-        RESULT_VARIABLE RCCL_REV_PARSE_RESULT
-        OUTPUT_VARIABLE RCCL_COMMIT
-        ERROR_VARIABLE RCCL_REV_PARSE_ERROR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_STRIP_TRAILING_WHITESPACE
-    )
-    if(NOT RCCL_REV_PARSE_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to determine RCCL commit: ${RCCL_REV_PARSE_ERROR}")
+    # Get current source identity for cache validation. Docker release builds
+    # unpack GitHub source archives instead of cloning, so they carry an
+    # explicit ref marker rather than a .git directory.
+    if(EXISTS "${RCCL_EXTERNAL_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+            WORKING_DIRECTORY "${RCCL_EXTERNAL_DIR}"
+            RESULT_VARIABLE RCCL_REV_PARSE_RESULT
+            OUTPUT_VARIABLE RCCL_COMMIT
+            ERROR_VARIABLE RCCL_REV_PARSE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT RCCL_REV_PARSE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to determine RCCL commit: ${RCCL_REV_PARSE_ERROR}")
+        endif()
+    elseif(EXISTS "${RCCL_SOURCE_REF_FILE}")
+        file(READ "${RCCL_SOURCE_REF_FILE}" RCCL_COMMIT_RAW)
+        string(STRIP "${RCCL_COMMIT_RAW}" RCCL_COMMIT)
+    else()
+        set(RCCL_COMMIT "${RCCL_GIT_REF}")
+        message(STATUS "V2: RCCL source is not a git checkout and has no ref marker; using ${RCCL_COMMIT} for cache validation")
     endif()
     
     # Check if RCCL build is up-to-date
@@ -977,6 +988,7 @@ if(USE_ONEDNN)
     # Note: Repository root is two levels up from src/v2
     get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
     set(ONEDNN_EXTERNAL_DIR "${REPO_ROOT}/external/onednn")
+    set(ONEDNN_SOURCE_REF_FILE "${ONEDNN_EXTERNAL_DIR}/.llaminar-onednn-source-ref")
     set(ONEDNN_GIT_URL "https://github.com/uxlfoundation/oneDNN.git")
     # Pinned to an upstream SemVer release tag for reproducible builds.
     # We previously tracked dbsanfte/oneDNN@main for "fused softmax matmul"
@@ -1027,17 +1039,27 @@ if(USE_ONEDNN)
         message(STATUS "V2: OneDNN already present at ${ONEDNN_EXTERNAL_DIR}; leaving existing checkout untouched")
     endif()
 
-    execute_process(
-        COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
-        WORKING_DIRECTORY ${ONEDNN_EXTERNAL_DIR}
-        RESULT_VARIABLE ONEDNN_REV_PARSE_RESULT
-        OUTPUT_VARIABLE ONEDNN_COMMIT
-        ERROR_VARIABLE ONEDNN_REV_PARSE_ERROR
-        OUTPUT_STRIP_TRAILING_WHITESPACE
-        ERROR_STRIP_TRAILING_WHITESPACE
-    )
-    if(NOT ONEDNN_REV_PARSE_RESULT EQUAL 0)
-        message(FATAL_ERROR "V2: Failed to determine OneDNN commit: ${ONEDNN_REV_PARSE_ERROR}")
+    # Docker release builds unpack GitHub source archives before CMake runs, so
+    # archive trees are identified by an explicit ref marker instead of .git.
+    if(EXISTS "${ONEDNN_EXTERNAL_DIR}/.git")
+        execute_process(
+            COMMAND ${GIT_EXECUTABLE} rev-parse HEAD
+            WORKING_DIRECTORY ${ONEDNN_EXTERNAL_DIR}
+            RESULT_VARIABLE ONEDNN_REV_PARSE_RESULT
+            OUTPUT_VARIABLE ONEDNN_COMMIT
+            ERROR_VARIABLE ONEDNN_REV_PARSE_ERROR
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_STRIP_TRAILING_WHITESPACE
+        )
+        if(NOT ONEDNN_REV_PARSE_RESULT EQUAL 0)
+            message(FATAL_ERROR "V2: Failed to determine OneDNN commit: ${ONEDNN_REV_PARSE_ERROR}")
+        endif()
+    elseif(EXISTS "${ONEDNN_SOURCE_REF_FILE}")
+        file(READ "${ONEDNN_SOURCE_REF_FILE}" ONEDNN_COMMIT_RAW)
+        string(STRIP "${ONEDNN_COMMIT_RAW}" ONEDNN_COMMIT)
+    else()
+        set(ONEDNN_COMMIT "${ONEDNN_GIT_REF}")
+        message(STATUS "V2: OneDNN source is not a git checkout and has no ref marker; using ${ONEDNN_COMMIT} for cache validation")
     endif()
 
     # Now check if OneDNN is built for the requested commit

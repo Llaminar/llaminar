@@ -111,16 +111,23 @@ WORKDIR /src
 ARG ONEDNN_GIT_REF=v3.11.3
 RUN set -e; \
     mkdir -p /src/external; \
-    for attempt in 1 2 3 4 5; do \
+    ONEDNN_TARBALL_URL="https://codeload.github.com/uxlfoundation/oneDNN/tar.gz/refs/tags/${ONEDNN_GIT_REF}"; \
+    echo "==> [onednn] fetch ${ONEDNN_GIT_REF} from ${ONEDNN_TARBALL_URL}"; \
+    for attempt in 1 2 3 4 5 6 7 8; do \
         rm -rf /src/external/onednn; \
-        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
-            clone --depth 1 --branch ${ONEDNN_GIT_REF} \
-            https://github.com/uxlfoundation/oneDNN.git /src/external/onednn; then \
+        mkdir -p /src/external/onednn; \
+        if curl -fL --show-error \
+            --connect-timeout 30 --max-time 600 \
+            --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 1200 \
+            -o /tmp/onednn.tar.gz "${ONEDNN_TARBALL_URL}" \
+            && tar -xzf /tmp/onednn.tar.gz -C /src/external/onednn --strip-components=1; then \
             break; \
         fi; \
-        if [ "${attempt}" = "5" ]; then exit 1; fi; \
+        if [ "${attempt}" = "8" ]; then exit 1; fi; \
         sleep $((attempt * 10)); \
     done; \
+    rm -f /tmp/onednn.tar.gz; \
+    printf '%s\n' "${ONEDNN_GIT_REF}" > /src/external/onednn/.llaminar-onednn-source-ref; \
     cmake -B /src/external/onednn/build -S /src/external/onednn \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
@@ -132,11 +139,10 @@ RUN set -e; \
         -DCMAKE_CXX_FLAGS=-march=native \
         -DCMAKE_C_FLAGS=-march=native; \
     cmake --build /src/external/onednn/build --parallel --target install; \
-    git -C /src/external/onednn rev-parse HEAD \
+    printf '%s\n' "${ONEDNN_GIT_REF}" \
         > /src/external/onednn/build/.llaminar-onednn-commit; \
     # Drop OneDNN's intermediate .o / .d files but keep the installed lib +
-    # headers + .git (cmake checks `git remote get-url origin` to validate
-    # the checkout matches the expected upstream URL).
+    # headers + source ref marker used by CMake cache validation.
     find /src/external/onednn/build \
         \( -name '*.o' -o -name '*.d' -o -name CMakeFiles \) \
         -prune -exec rm -rf {} +
@@ -152,17 +158,23 @@ ARG RCCL_ONLY_FUNCS=
 RUN --mount=type=cache,target=/root/.ccache \
     set -e; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
-        echo "==> [rccl] clone ${RCCL_GIT_REF}"; \
-        for attempt in 1 2 3 4 5; do \
+        RCCL_TARBALL_URL="https://codeload.github.com/ROCm/rccl/tar.gz/refs/tags/${RCCL_GIT_REF}"; \
+        echo "==> [rccl] fetch ${RCCL_GIT_REF} from ${RCCL_TARBALL_URL}"; \
+        for attempt in 1 2 3 4 5 6 7 8; do \
             rm -rf /src/external/rccl; \
-            if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
-                clone --depth 1 --branch "${RCCL_GIT_REF}" \
-                https://github.com/ROCm/rccl.git /src/external/rccl; then \
+            mkdir -p /src/external/rccl; \
+            if curl -fL --show-error \
+                --connect-timeout 30 --max-time 600 \
+                --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 1200 \
+                -o /tmp/rccl.tar.gz "${RCCL_TARBALL_URL}" \
+                && tar -xzf /tmp/rccl.tar.gz -C /src/external/rccl --strip-components=1; then \
                 break; \
             fi; \
-            if [ "${attempt}" = "5" ]; then exit 1; fi; \
+            if [ "${attempt}" = "8" ]; then exit 1; fi; \
             sleep $((attempt * 10)); \
         done; \
+        rm -f /tmp/rccl.tar.gz; \
+        printf '%s\n' "${RCCL_GIT_REF}" > /src/external/rccl/.llaminar-rccl-source-ref; \
         echo "==> [rccl] configure for GPU_TARGETS=${RCCL_GPU_TARGETS}"; \
         if [ -n "${RCCL_ONLY_FUNCS}" ]; then \
             echo "==> [rccl] ONLY_FUNCS=${RCCL_ONLY_FUNCS}"; \
@@ -196,7 +208,7 @@ RUN --mount=type=cache,target=/root/.ccache \
         fi; \
         ln -sf librccl.so.1.0 /src/external/rccl/build/librccl.so.1; \
         ln -sf librccl.so.1 /src/external/rccl/build/librccl.so; \
-        git -C /src/external/rccl rev-parse HEAD \
+        printf '%s\n' "${RCCL_GIT_REF}" \
             > /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
     elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
