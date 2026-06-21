@@ -48,6 +48,10 @@ echo ""
 BUILD_V2_INTEGRATION="build_v2_integration"
 BUILD_V2_RELEASE="build_v2_release"
 REPO_ROOT="$(git rev-parse --show-toplevel)"
+E2E_CONTAINER_MODE="${LLAMINAR_PRECOMMIT_E2E_CONTAINER:-0}"
+E2E_CONTAINER_IMAGE="${LLAMINAR_E2E_CONTAINER_IMAGE:-llaminar:precommit}"
+E2E_CONTAINER_BUILD="${LLAMINAR_PRECOMMIT_E2E_CONTAINER_BUILD:-1}"
+E2E_CONTAINER_CUDA_ARCHS="${LLAMINAR_PRECOMMIT_E2E_CUDA_ARCHS:-${LLAMINAR_CUDA_ARCHS:-86}}"
 if $FULL_SUITE; then
     TOTAL_STEPS=7
 else
@@ -162,6 +166,22 @@ if ! cmake --build "$BUILD_V2_RELEASE" --parallel > /dev/null 2>&1; then
     exit 1
 fi
 echo -e "${GREEN}✓ Release build successful${NC}"
+if [[ "$E2E_CONTAINER_MODE" == "1" ]]; then
+    if [[ "$E2E_CONTAINER_BUILD" == "1" ]]; then
+        echo -e "${YELLOW}Packaging Llaminar runtime container for E2E tests (${E2E_CONTAINER_IMAGE})...${NC}"
+        if ! "$REPO_ROOT/scripts/docker/build-runtime-image.sh" \
+            --tag "$E2E_CONTAINER_IMAGE" \
+            --cuda-archs "$E2E_CONTAINER_CUDA_ARCHS"; then
+            echo -e "${RED}❌ Runtime container build failed${NC}"
+            echo -e "${YELLOW}Run manually for details:${NC}"
+            echo -e "${YELLOW}  scripts/docker/build-runtime-image.sh --tag $E2E_CONTAINER_IMAGE --cuda-archs $E2E_CONTAINER_CUDA_ARCHS${NC}"
+            exit 1
+        fi
+        echo -e "${GREEN}✓ Runtime container packaged (${E2E_CONTAINER_IMAGE})${NC}"
+    else
+        echo -e "${YELLOW}Using existing runtime container for E2E tests (${E2E_CONTAINER_IMAGE})${NC}"
+    fi
+fi
 echo ""
 
 # Step 5: E2E Server Integration Tests (Release binary — no assertions = faster inference)
@@ -172,6 +192,13 @@ if $FULL_SUITE; then E2E_STEP=6; else E2E_STEP=5; fi
 echo -e "${YELLOW}[${E2E_STEP}/${TOTAL_STEPS}] Running E2E Server integration tests (cpu, cuda:0, rocm:0 + 35B long-context)...${NC}"
 echo ""
 
+E2E_SERVER_ARGS=(--backends "cpu,cuda:0,rocm:0")
+if [[ "$E2E_CONTAINER_MODE" == "1" ]]; then
+    E2E_SERVER_ARGS=(--container-image "$E2E_CONTAINER_IMAGE" "${E2E_SERVER_ARGS[@]}")
+else
+    E2E_SERVER_ARGS=(--binary "$BUILD_V2_RELEASE/llaminar2" "${E2E_SERVER_ARGS[@]}")
+fi
+
 set +e
 LLAMINAR_E2E_LONG_CONTEXT=1 \
 LLAMINAR_E2E_LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-full}" \
@@ -180,9 +207,7 @@ LLAMINAR_E2E_LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-1024}" \
 LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}" \
 LLAMINAR_E2E_LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-1800}" \
 LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}" \
-tests/v2/e2e/server/test_server_e2e.sh \
-    --binary "$BUILD_V2_RELEASE/llaminar2" \
-    --backends "cpu,cuda:0,rocm:0"
+tests/v2/e2e/server/test_server_e2e.sh "${E2E_SERVER_ARGS[@]}"
 SERVER_EXIT_CODE=$?
 set -e
 

@@ -630,11 +630,11 @@ if(HAVE_ROCM)
     # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
     # See: https://github.com/ROCm/rocm-systems/issues/2805
     #
-    # This is OPT-IN because building RCCL from source takes 30-60+ minutes
-    # and requires hipcc (so it can't share the C++23 compiler we use for
-    # llaminar). The Docker release image and CI default to OFF and rely on
-    # the system librccl.so loaded dynamically at runtime via dlopen(). Set
-    # LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON locally if you need the gfx906 fix.
+    # This is OPT-IN for local source builds because building RCCL from source
+    # takes 30-60+ minutes and requires hipcc (so it can't share the C++23
+    # compiler we use for llaminar). The Docker release image enables it by
+    # default so releasable ROCm multi-GPU containers do not fall back to the
+    # broken packaged gfx906 binaries.
     option(LLAMINAR_BUILD_RCCL_FROM_SOURCE
            "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
            OFF)
@@ -646,6 +646,12 @@ if(HAVE_ROCM)
     set(RCCL_EXTERNAL_DIR "${REPO_ROOT}/external/rccl")
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
     set(RCCL_GIT_REF "rocm-7.1.1")  # Match our ROCm version
+    set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
+        "C compiler used for the nested RCCL source build")
+    set(RCCL_CXX_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH
+        "C++ compiler used for the nested RCCL source build")
+    set(RCCL_ONLY_FUNCS "" CACHE STRING
+        "Optional RCCL ONLY_FUNCS generator pattern for nested source builds")
     
     # Auto-detect GPU architecture for RCCL build
     # Default to gfx906 (MI50/MI60) which is known to be broken in packaged RCCL
@@ -726,22 +732,36 @@ if(HAVE_ROCM)
     if(NOT EXISTS "${RCCL_BUILD_DIR}/librccl.so")
         message(STATUS "V2: Building RCCL (${RCCL_GIT_URL}@${RCCL_GIT_REF} @ ${RCCL_COMMIT}) from source...")
         message(STATUS "V2: RCCL GPU targets: ${RCCL_GPU_TARGETS}")
+        if(RCCL_ONLY_FUNCS)
+            message(STATUS "V2: RCCL ONLY_FUNCS: ${RCCL_ONLY_FUNCS}")
+        endif()
         message(STATUS "V2: NOTE: This may take 30-60+ minutes on first build")
+
+        set(RCCL_CONFIG_ARGS
+            -B "${RCCL_BUILD_DIR}"
+            -S "${RCCL_EXTERNAL_DIR}"
+            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_C_COMPILER=${RCCL_C_COMPILER}
+            -DCMAKE_CXX_COMPILER=${RCCL_CXX_COMPILER}
+            -DCMAKE_PREFIX_PATH=/opt/rocm
+            -DROCM_PATH=${ROCM_PATH}
+            -DGPU_TARGETS=${RCCL_GPU_TARGETS}
+            -DBUILD_TESTS=OFF
+        )
+        if(RCCL_ONLY_FUNCS)
+            list(APPEND RCCL_CONFIG_ARGS "-DONLY_FUNCS=${RCCL_ONLY_FUNCS}")
+        endif()
         
         # Configure RCCL
         execute_process(
-            COMMAND ${CMAKE_COMMAND} -B "${RCCL_BUILD_DIR}" -S "${RCCL_EXTERNAL_DIR}"
-                    -DCMAKE_BUILD_TYPE=Release
-                    -DCMAKE_PREFIX_PATH=/opt/rocm
-                    -DGPU_TARGETS=${RCCL_GPU_TARGETS}
-                    -DBUILD_TESTS=OFF
+            COMMAND ${CMAKE_COMMAND} ${RCCL_CONFIG_ARGS}
             RESULT_VARIABLE RCCL_CONFIG_RESULT
             OUTPUT_VARIABLE RCCL_CONFIG_OUTPUT
             ERROR_VARIABLE RCCL_CONFIG_ERROR
         )
         
         if(NOT RCCL_CONFIG_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to configure RCCL: ${RCCL_CONFIG_ERROR}")
+            message(FATAL_ERROR "V2: Failed to configure RCCL:\n${RCCL_CONFIG_OUTPUT}\n${RCCL_CONFIG_ERROR}")
         endif()
         
         # Build RCCL
@@ -753,7 +773,7 @@ if(HAVE_ROCM)
         )
         
         if(NOT RCCL_BUILD_RESULT EQUAL 0)
-            message(FATAL_ERROR "V2: Failed to build RCCL: ${RCCL_BUILD_ERROR}")
+            message(FATAL_ERROR "V2: Failed to build RCCL:\n${RCCL_BUILD_OUTPUT}\n${RCCL_BUILD_ERROR}")
         endif()
         
         # Write version file for cache validation

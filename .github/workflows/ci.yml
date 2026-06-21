@@ -507,19 +507,18 @@ jobs:
           needs.parity.result == 'success' &&
           needs.e2e.result == 'success' &&
           needs.perf.result == 'success'
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: Dockerfile
-          target: runtime
-          push: ${{ github.event_name != 'pull_request' }}
-          load: ${{ github.event_name == 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            VERSION=${{ github.ref_name }}
-            VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ github.event.repository.updated_at }}
+        env:
+          LLAMINAR_IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          LLAMINAR_IMAGE_LABELS: ${{ steps.meta.outputs.labels }}
+          VERSION: ${{ github.ref_name }}
+          VCS_REF: ${{ github.sha }}
+          BUILD_DATE: ${{ github.event.repository.updated_at }}
+        run: |
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            scripts/docker/build-runtime-image.sh --load
+          else
+            scripts/docker/build-runtime-image.sh --push
+          fi
 
       - name: Prune builder image
         if: always()

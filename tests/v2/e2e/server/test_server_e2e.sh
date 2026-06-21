@@ -32,6 +32,7 @@
 # Usage:
 #   ./test_server_e2e.sh [--binary <path>] [--model <path>] [--backends <list>]
 #   ./test_server_e2e.sh [--binary <path>] [--suite "model_path|backend1,backend2[|max_tokens[|extra_flags[|label[|suite_options]]]]]"] ...
+#   ./test_server_e2e.sh --container-image llaminar:local [--model <path>] [--backends <list>]
 #   LLAMINAR_E2E_LONG_CONTEXT=1 ./test_server_e2e.sh [options]
 #
 # Optional long-context mode runs only when the model path, basename, or label
@@ -39,6 +40,19 @@
 #
 # Environment:
 #   LLAMINAR_BINARY     Override binary path
+#   LLAMINAR_E2E_CONTAINER_IMAGE Run server from this Docker image instead of
+#                       launching LLAMINAR_BINARY on the host/devcontainer
+#   LLAMINAR_E2E_DOCKER_NETWORK Docker network mode for container server
+#                       (default: auto; shares devcontainer netns when inside
+#                       Docker, otherwise host)
+#   LLAMINAR_E2E_DOCKER_GPUS GPU flag for docker run: auto|all|none (default: auto)
+#                       Uses NVIDIA Container Toolkit when available. In a
+#                       GPU-enabled devcontainer, falls back to pass-through
+#                       of visible NVIDIA driver libraries and device nodes.
+#   LLAMINAR_E2E_DOCKER_USER User passed to docker run --user. Defaults to
+#                       0:0 so nested devcontainer bind mounts are writable.
+#   LLAMINAR_E2E_DOCKER_ARGS Extra docker run args, shell-split. Use this for
+#                       host-specific privileges such as --cap-add or seccomp.
 #   LLAMINAR_MODEL      Override model path (overrides default suite 1)
 #   LLAMINAR_BACKENDS   Override backends for suite 1
 #   LLAMINAR_LOG_LEVEL  Log level for server (default: WARN; ERROR is promoted
@@ -70,6 +84,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../../.." && pwd)"
 
 BINARY="${LLAMINAR_BINARY:-${REPO_ROOT}/build_v2_integration/llaminar2}"
+SERVER_MODE="${LLAMINAR_E2E_SERVER_MODE:-local}"
+CONTAINER_IMAGE="${LLAMINAR_E2E_CONTAINER_IMAGE:-}"
+if [[ -n "$CONTAINER_IMAGE" && "${LLAMINAR_E2E_SERVER_MODE:-}" == "" ]]; then
+    SERVER_MODE="docker"
+fi
+DOCKER_NETWORK="${LLAMINAR_E2E_DOCKER_NETWORK:-auto}"
+DOCKER_GPUS="${LLAMINAR_E2E_DOCKER_GPUS:-auto}"
+DOCKER_SHM_SIZE="${LLAMINAR_E2E_DOCKER_SHM_SIZE:-16g}"
+DOCKER_NAME_PREFIX="${LLAMINAR_E2E_DOCKER_NAME_PREFIX:-llaminar-e2e}"
+DOCKER_USER="${LLAMINAR_E2E_DOCKER_USER:-0:0}"
+declare -a DOCKER_EXTRA_ARGS=()
+if [[ -n "${LLAMINAR_E2E_DOCKER_ARGS:-}" ]]; then
+    # Intentional shell-style word splitting for advanced docker run flags.
+    read -r -a DOCKER_EXTRA_ARGS <<< "${LLAMINAR_E2E_DOCKER_ARGS}"
+fi
 LOG_LEVEL="${LLAMINAR_LOG_LEVEL:-WARN}"
 if [[ "${LOG_LEVEL^^}" == "ERROR" ]]; then
     LOG_LEVEL="WARN"
@@ -109,10 +138,48 @@ declare -a SUITES=()
 OVERRIDE_MODEL=""
 OVERRIDE_BACKENDS=""
 
+show_usage() {
+    cat <<'EOF'
+Usage:
+  tests/v2/e2e/server/test_server_e2e.sh [--binary <path>] [--model <path>] [--backends <list>]
+  tests/v2/e2e/server/test_server_e2e.sh --container-image <image> [--model <path>] [--backends <list>]
+  tests/v2/e2e/server/test_server_e2e.sh --suite "model|backend1,backend2[|max_tokens[|extra_flags[|label[|suite_options]]]]"
+
+Container options:
+  --container                         Use llaminar:local unless LLAMINAR_E2E_CONTAINER_IMAGE is set
+  --container-image, --docker-image   Run the server from this image
+  --docker-network                    auto|host|bridge|container:<id> (default: auto)
+  --docker-gpus                       auto|all|none|<docker --gpus value> (default: auto)
+  --docker-arg                        Additional docker run argument; repeatable
+
+Environment:
+  LLAMINAR_E2E_CONTAINER_IMAGE        Docker image to run instead of the local binary
+  LLAMINAR_E2E_DOCKER_NETWORK         Docker network mode (default: auto)
+  LLAMINAR_E2E_DOCKER_GPUS            GPU flag for docker run (default: auto)
+  LLAMINAR_E2E_DOCKER_USER            docker run --user value (default: 0:0)
+  LLAMINAR_E2E_DOCKER_ARGS            Extra docker run args, shell-split
+  LLAMINAR_MODEL                      Override default suite model
+  LLAMINAR_BACKENDS                   Override default suite backends
+  LLAMINAR_E2E_LONG_CONTEXT=1         Enable optional long-context checks
+EOF
+}
+
 # Parse CLI flags
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -h|--help) show_usage; exit 0 ;;
         --binary)   BINARY="$2";            shift 2 ;;
+        --container) SERVER_MODE="docker"; CONTAINER_IMAGE="${CONTAINER_IMAGE:-llaminar:local}"; shift ;;
+        --container-image|--docker-image)
+                    CONTAINER_IMAGE="$2"; SERVER_MODE="docker"; shift 2 ;;
+        --server-mode)
+                    SERVER_MODE="$2";       shift 2 ;;
+        --docker-network)
+                    DOCKER_NETWORK="$2";    shift 2 ;;
+        --docker-gpus)
+                    DOCKER_GPUS="$2";       shift 2 ;;
+        --docker-arg)
+                    DOCKER_EXTRA_ARGS+=("$2"); shift 2 ;;
         --model)    OVERRIDE_MODEL="$2";    shift 2 ;;
         --backends) OVERRIDE_BACKENDS="$2"; shift 2 ;;
         --suite)    SUITES+=("$2");         shift 2 ;;
@@ -276,8 +343,372 @@ fail() {
     echo -e "  ${RED}✗${NC} $1"
 }
 
+declare -a ACTIVE_DOCKER_CONTAINERS=()
+declare -a ACTIVE_LOG_FOLLOW_PIDS=()
+
 sanitize_name() {
     echo "$1" | tr '/: ' '___' | tr -cd 'A-Za-z0-9._-'
+}
+
+is_docker_mode() {
+    [[ "$SERVER_MODE" == "docker" ]]
+}
+
+docker_handle_container() {
+    local handle="$1"
+    if [[ "$handle" == docker:* ]]; then
+        local rest="${handle#docker:}"
+        echo "${rest%%:*}"
+    fi
+}
+
+docker_handle_log_pid() {
+    local handle="$1"
+    if [[ "$handle" == docker:*:* ]]; then
+        echo "${handle##*:}"
+    fi
+}
+
+pid_handle_pid() {
+    local handle="$1"
+    if [[ "$handle" == pid:* ]]; then
+        echo "${handle#pid:}"
+    else
+        echo "$handle"
+    fi
+}
+
+cleanup_active_docker_containers() {
+    local container log_pid
+    for container in "${ACTIVE_DOCKER_CONTAINERS[@]:-}"; do
+        [[ -n "$container" ]] || continue
+        docker rm -f "$container" >/dev/null 2>&1 || true
+    done
+    for log_pid in "${ACTIVE_LOG_FOLLOW_PIDS[@]:-}"; do
+        [[ -n "$log_pid" ]] || continue
+        kill "$log_pid" >/dev/null 2>&1 || true
+        wait "$log_pid" >/dev/null 2>&1 || true
+    done
+}
+
+trap cleanup_active_docker_containers EXIT INT TERM
+
+resolve_docker_network() {
+    if [[ "$DOCKER_NETWORK" != "auto" ]]; then
+        echo "$DOCKER_NETWORK"
+        return
+    fi
+
+    if [[ -f /.dockerenv ]] && docker inspect "$(hostname)" >/dev/null 2>&1; then
+        echo "container:$(hostname)"
+    else
+        echo "host"
+    fi
+}
+
+docker_supports_nvidia_gpus() {
+    docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
+}
+
+nvidia_driver_lib_path() {
+    local lib="$1"
+    local path
+    path="$(ldconfig -p 2>/dev/null | awk -v lib="$lib" '$1 == lib { print $NF; exit }')"
+    if [[ -z "$path" && -e "/usr/lib/x86_64-linux-gnu/${lib}" ]]; then
+        path="/usr/lib/x86_64-linux-gnu/${lib}"
+    fi
+    printf '%s' "$path"
+}
+
+nvidia_driver_libs_available() {
+    local lib path
+    for lib in libcuda.so.1 libnvidia-ml.so.1; do
+        path="$(nvidia_driver_lib_path "$lib")"
+        [[ -n "$path" && -e "$path" ]] || return 1
+    done
+}
+
+append_nvidia_driver_lib_mounts() {
+    local -n out_ref="$1"
+    local lib path
+    for lib in libcuda.so.1 libnvidia-ml.so.1; do
+        path="$(nvidia_driver_lib_path "$lib")"
+        [[ -n "$path" && -e "$path" ]] || return 1
+        out_ref+=(-v "${path}:/usr/lib/x86_64-linux-gnu/${lib}:ro")
+    done
+}
+
+nvidia_device_nodes_available() {
+    [[ -e /dev/nvidiactl ]] || return 1
+    local node
+    for node in /dev/nvidia[0-9]*; do
+        [[ -e "$node" ]] && return 0
+    done
+    return 1
+}
+
+append_existing_device_path() {
+    local -n out_ref="$1"
+    local path="$2"
+    [[ -e "$path" ]] || return
+    out_ref+=(--device="$path")
+}
+
+append_nvidia_device_nodes() {
+    local -n out_ref="$1"
+    local node
+    for node in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+        [[ -e "$node" ]] && out_ref+=(--device="$node")
+    done
+    for node in /dev/nvidia[0-9]* /dev/nvidia-caps/*; do
+        [[ -e "$node" ]] && out_ref+=(--device="$node")
+    done
+}
+
+append_unique_group_for_path() {
+    local -n out_ref="$1"
+    local path="$2"
+    [[ -e "$path" ]] || return
+    local gid
+    gid="$(stat -c '%g' "$path" 2>/dev/null || true)"
+    [[ -n "$gid" ]] || return
+    out_ref+=(--group-add "$gid")
+}
+
+container_model_path() {
+    local model="$1"
+    readlink -f "$model" 2>/dev/null || echo "$model"
+}
+
+parse_memory_to_mb() {
+    local value="$1"
+    python3 - "$value" <<'PY'
+import re
+import sys
+
+text = sys.argv[1].split("/", 1)[0].strip()
+match = re.match(r"([0-9]+(?:\.[0-9]+)?)\s*([A-Za-z]+)?", text)
+if not match:
+    print(-1)
+    sys.exit(0)
+
+amount = float(match.group(1))
+unit = (match.group(2) or "b").lower()
+scale = {
+    "b": 1 / 1048576,
+    "kb": 1 / 1024,
+    "kib": 1 / 1024,
+    "mb": 1,
+    "mib": 1,
+    "gb": 1024,
+    "gib": 1024,
+    "tb": 1024 * 1024,
+    "tib": 1024 * 1024,
+}.get(unit, 1)
+print(max(0, int(amount * scale)))
+PY
+}
+
+get_container_ram_mb() {
+    local container="$1"
+    local usage
+    usage="$(docker stats --no-stream --format '{{.MemUsage}}' "$container" 2>/dev/null || true)"
+    if [[ -z "$usage" ]]; then
+        echo -1
+        return
+    fi
+    parse_memory_to_mb "$usage"
+}
+
+get_container_pids() {
+    local container="$1"
+    docker top "$container" -eo pid 2>/dev/null | awk 'NR > 1 {print $1}' | xargs || true
+}
+
+signal_container_llaminar_processes() {
+    local container="$1"
+    local signal_name="${2:-TERM}"
+
+    docker exec "$container" /bin/sh -lc '
+set -eu
+signal_name="$1"
+sent=0
+fallback_pid=""
+for comm in /proc/[0-9]*/comm; do
+    [ -r "$comm" ] || continue
+    [ "$(cat "$comm" 2>/dev/null || true)" = "llaminar2" ] || continue
+    pid="${comm%/comm}"
+    pid="${pid##*/}"
+    [ -n "$fallback_pid" ] || fallback_pid="$pid"
+    if tr "\000" "\n" <"/proc/${pid}/environ" 2>/dev/null | grep -qx "OMPI_COMM_WORLD_RANK=0"; then
+        kill "-${signal_name}" "$pid" >/dev/null 2>&1 && sent=1 || true
+    fi
+done
+if [ "$sent" != 1 ] && [ -n "$fallback_pid" ]; then
+    kill "-${signal_name}" "$fallback_pid" >/dev/null 2>&1 && sent=1 || true
+fi
+[ "$sent" = 1 ]
+' _ "$signal_name" >/dev/null 2>&1
+}
+
+server_is_alive() {
+    local handle="$1"
+    if [[ "$handle" == docker:* ]]; then
+        local container
+        container="$(docker_handle_container "$handle")"
+        [[ "$(docker inspect --format '{{.State.Running}}' "$container" 2>/dev/null || echo false)" == "true" ]]
+        return
+    fi
+
+    local pid
+    pid="$(pid_handle_pid "$handle")"
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+get_server_pids() {
+    local handle="$1"
+    if [[ "$handle" == docker:* ]]; then
+        get_container_pids "$(docker_handle_container "$handle")"
+        return
+    fi
+
+    collect_process_tree_pids "$(pid_handle_pid "$handle")" | sort -n | uniq | xargs || true
+}
+
+get_server_ram_mb() {
+    local handle="$1"
+    local pids="$2"
+    if [[ "$handle" == docker:* ]]; then
+        get_container_ram_mb "$(docker_handle_container "$handle")"
+        return
+    fi
+
+    get_process_tree_ram_mb "$pids"
+}
+
+start_server_process() {
+    local tag="$1"
+    local port="$2"
+    local host_model="$3"
+    local log_path="$4"
+    local safe_tag="$5"
+    local -n env_ref="$6"
+    local -n args_ref="$7"
+
+    if ! is_docker_mode; then
+        env "${env_ref[@]}" "$BINARY" "${args_ref[@]}" >"$log_path" 2>&1 &
+        echo "pid:$!"
+        return
+    fi
+
+    local model_abs model_dir log_dir_abs network_mode container_name container_id log_pid
+    model_abs="$(container_model_path "$host_model")"
+    model_dir="$(dirname "$model_abs")"
+    log_dir_abs="$(readlink -f "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")"
+    network_mode="$(resolve_docker_network)"
+    container_name="${DOCKER_NAME_PREFIX}-${safe_tag}-port${port}-$$"
+    container_name="$(echo "$container_name" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_.-')"
+
+    docker rm -f "$container_name" >/dev/null 2>&1 || true
+
+    local -a docker_args=(
+        run -d
+        --name "$container_name"
+        --network "$network_mode"
+        --ipc=host
+        --shm-size="$DOCKER_SHM_SIZE"
+        --ulimit core=-1
+        -v "${model_dir}:${model_dir}:ro"
+        -v "${log_dir_abs}:${log_dir_abs}"
+    )
+    if [[ -n "$DOCKER_USER" ]]; then
+        docker_args+=(--user "$DOCKER_USER")
+    fi
+    local nvidia_mode="none"
+
+    if [[ "$network_mode" == "bridge" ]]; then
+        docker_args+=(-p "127.0.0.1:${port}:${port}")
+    fi
+
+    case "$DOCKER_GPUS" in
+        all)
+            if docker_supports_nvidia_gpus; then
+                docker_args+=(--gpus all)
+                nvidia_mode="runtime"
+            elif nvidia_driver_libs_available; then
+                append_nvidia_driver_lib_mounts docker_args
+                if nvidia_device_nodes_available; then
+                    append_nvidia_device_nodes docker_args
+                    nvidia_mode="manual-devices"
+                else
+                    nvidia_mode="manual-libs"
+                fi
+            fi
+            ;;
+        auto)
+            if docker_supports_nvidia_gpus; then
+                docker_args+=(--gpus all)
+                nvidia_mode="runtime"
+            elif nvidia_driver_libs_available; then
+                append_nvidia_driver_lib_mounts docker_args
+                if nvidia_device_nodes_available; then
+                    append_nvidia_device_nodes docker_args
+                    nvidia_mode="manual-devices"
+                else
+                    nvidia_mode="manual-libs"
+                fi
+            fi
+            ;;
+        none|"")
+            if nvidia_driver_libs_available; then
+                append_nvidia_driver_lib_mounts docker_args
+                nvidia_mode="manual-libs"
+            fi
+            ;;
+        *)
+            if docker_supports_nvidia_gpus; then
+                docker_args+=(--gpus "$DOCKER_GPUS")
+                nvidia_mode="runtime"
+            elif nvidia_driver_libs_available; then
+                append_nvidia_driver_lib_mounts docker_args
+                if nvidia_device_nodes_available; then
+                    append_nvidia_device_nodes docker_args
+                    nvidia_mode="manual-devices"
+                else
+                    nvidia_mode="manual-libs"
+                fi
+            fi
+            ;;
+    esac
+
+    if [[ -e /dev/kfd ]]; then
+        docker_args+=(--device=/dev/kfd)
+        append_unique_group_for_path docker_args /dev/kfd
+    fi
+    if [[ -e /dev/dri ]]; then
+        docker_args+=(--device=/dev/dri)
+        append_unique_group_for_path docker_args /dev/dri
+        for render_node in /dev/dri/render*; do
+            [[ -e "$render_node" ]] || continue
+            append_unique_group_for_path docker_args "$render_node"
+        done
+    fi
+
+    docker_args+=("${DOCKER_EXTRA_ARGS[@]}")
+    for env_pair in "${env_ref[@]}"; do
+        docker_args+=(-e "$env_pair")
+    done
+    docker_args+=("$CONTAINER_IMAGE" "${args_ref[@]}")
+
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, model=${model_abs}" >&2
+    container_id="$(docker "${docker_args[@]}")"
+    ACTIVE_DOCKER_CONTAINERS+=("$container_id")
+
+    docker logs -f "$container_id" >"$log_path" 2>&1 &
+    log_pid=$!
+    ACTIVE_LOG_FOLLOW_PIDS+=("$log_pid")
+
+    echo "docker:${container_id}:${log_pid}"
 }
 
 is_thinking_model() {
@@ -402,47 +833,109 @@ print(text)
 }
 
 cleanup_server() {
-    local pid=$1
+    local handle=$1
+    if [[ "$handle" == docker:* ]]; then
+        local container log_pid
+        container="$(docker_handle_container "$handle")"
+        log_pid="$(docker_handle_log_pid "$handle")"
+        docker rm -f "$container" >/dev/null 2>&1 || true
+        if [[ -n "$log_pid" ]]; then
+            kill "$log_pid" 2>/dev/null || true
+            wait "$log_pid" 2>/dev/null || true
+        fi
+        return
+    fi
+
+    local pid
+    pid="$(pid_handle_pid "$handle")"
     if kill -0 "$pid" 2>/dev/null; then
         kill "$pid" 2>/dev/null || true
         wait "$pid" 2>/dev/null || true
     fi
 }
 
+copy_container_artifact() {
+    local handle="$1"
+    local container_path="$2"
+    local host_path="$3"
+
+    [[ "$handle" == docker:* ]] || return
+    [[ -n "$container_path" && -n "$host_path" ]] || return
+    [[ -s "$host_path" ]] && return
+
+    local container
+    container="$(docker_handle_container "$handle")"
+    mkdir -p "$(dirname "$host_path")"
+    docker cp "${container}:${container_path}" "$host_path" >/dev/null 2>&1 || true
+}
+
 # Graceful shutdown with exit code, VRAM release, and crash validation.
 # Called at the end of each test case instead of bare cleanup_server.
 shutdown_and_validate() {
     local tag="$1"
-    local pid="$2"
+    local handle="$2"
     local gpu_before_mb="$3"
 
     # ─── Check 1: Clean SIGTERM exit ─────────────────────────────────
     local exit_code=0
-    if kill -0 "$pid" 2>/dev/null; then
-        # Kill the entire process tree (TP/PP spawns child ranks via mpirun)
-        local tree_pids
-        tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
-        kill $tree_pids 2>/dev/null || true
+    if [[ "$handle" == docker:* ]]; then
+        local container log_pid
+        container="$(docker_handle_container "$handle")"
+        log_pid="$(docker_handle_log_pid "$handle")"
 
-        # Wait with timeout — poll until root process exits or deadline
-        local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
-        while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
-            sleep 0.2
-        done
-
-        if kill -0 "$pid" 2>/dev/null; then
-            # Process didn't exit gracefully — force kill entire tree
-            fail "[${tag}] Shutdown: process did not exit within ${SHUTDOWN_TIMEOUT}s after SIGTERM, sending SIGKILL"
-            kill -9 $tree_pids 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            return
+        if server_is_alive "$handle"; then
+            signal_container_llaminar_processes "$container" TERM || true
+            local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+            while server_is_alive "$handle" && [ $SECONDS -lt $deadline ]; do
+                sleep 0.2
+            done
         fi
 
-        # Reap and get exit code (may be non-zero for SIGTERM, so suppress errexit)
-        wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
+        if server_is_alive "$handle"; then
+            if ! docker stop --time "$SHUTDOWN_TIMEOUT" "$container" >/dev/null 2>&1; then
+                fail "[${tag}] Shutdown: container did not stop within ${SHUTDOWN_TIMEOUT}s after SIGTERM, removing forcefully"
+                docker rm -f "$container" >/dev/null 2>&1 || true
+                if [[ -n "$log_pid" ]]; then
+                    kill "$log_pid" 2>/dev/null || true
+                    wait "$log_pid" 2>/dev/null || true
+                fi
+                return
+            fi
+        fi
+
+        exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$container" 2>/dev/null || echo 0)"
+        if [[ -n "$log_pid" ]]; then
+            wait "$log_pid" 2>/dev/null || true
+        fi
     else
-        # Process already exited — get its status
-        wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
+        local pid
+        pid="$(pid_handle_pid "$handle")"
+        if kill -0 "$pid" 2>/dev/null; then
+            # Kill the entire process tree (TP/PP spawns child ranks via mpirun)
+            local tree_pids
+            tree_pids=$(collect_process_tree_pids "$pid" | xargs || echo "$pid")
+            kill $tree_pids 2>/dev/null || true
+
+            # Wait with timeout — poll until root process exits or deadline
+            local deadline=$((SECONDS + SHUTDOWN_TIMEOUT))
+            while kill -0 "$pid" 2>/dev/null && [ $SECONDS -lt $deadline ]; do
+                sleep 0.2
+            done
+
+            if kill -0 "$pid" 2>/dev/null; then
+                # Process didn't exit gracefully — force kill entire tree
+                fail "[${tag}] Shutdown: process did not exit within ${SHUTDOWN_TIMEOUT}s after SIGTERM, sending SIGKILL"
+                kill -9 $tree_pids 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+                return
+            fi
+
+            # Reap and get exit code (may be non-zero for SIGTERM, so suppress errexit)
+            wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
+        else
+            # Process already exited — get its status
+            wait "$pid" 2>/dev/null && exit_code=0 || exit_code=$?
+        fi
     fi
 
     # ─── Check 2: No crash/segfault on exit ──────────────────────────
@@ -509,11 +1002,11 @@ shutdown_and_validate() {
 
 wait_for_health() {
     local port=$1
-    local pid=${2:-}
+    local handle=${2:-}
     local deadline=$((SECONDS + STARTUP_TIMEOUT))
     while [ $SECONDS -lt $deadline ]; do
-        # If we have a PID, check if the server process is still alive
-        if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+        # If we have a process/container handle, detect early exit / OOM.
+        if [ -n "$handle" ] && ! server_is_alive "$handle"; then
             return 1  # Server process already exited
         fi
         if curl -s --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
@@ -827,18 +1320,22 @@ check_memory_usage() {
     local tag="$1"
     local backend="$2"
     local model="$3"
-    local server_pid="$4"
+    local server_handle="$4"
     local gpu_before_mb="$5"
 
     local pids
-    pids=$(collect_process_tree_pids "$server_pid" | sort -n | uniq | xargs || true)
-    if [ -z "$pids" ]; then
+    pids=$(get_server_pids "$server_handle")
+    if [ -z "$pids" ] && [[ "$server_handle" != docker:* ]]; then
         fail "[${tag}] Memory: server process exited before measurement"
         return
     fi
 
     local ram_mb gpu_process_mb gpu_after_mb gpu_delta_mb abs_gpu_delta_mb model_mb rss_multiplier rss_limit_mb
-    ram_mb=$(get_process_tree_ram_mb "$pids")
+    ram_mb=$(get_server_ram_mb "$server_handle" "$pids")
+    if [ "$ram_mb" -lt 0 ]; then
+        fail "[${tag}] Memory: unable to measure server RAM"
+        return
+    fi
     gpu_process_mb=$(get_process_tree_gpu_memory_mb "$pids")
     gpu_after_mb=$(get_total_gpu_memory_mb)
     gpu_delta_mb=$((gpu_after_mb - gpu_before_mb))
@@ -886,8 +1383,8 @@ validate_perf_stats() {
     fi
 
     if [ ! -s "$perf_path" ]; then
-        if is_mtp_case "$extra_flags"; then
-            fail "[${tag}] PerfStats: missing artifact for MTP case (${perf_path})"
+        if is_mtp_case "$extra_flags" && is_gpu_backend "$backend"; then
+            fail "[${tag}] PerfStats: missing artifact for GPU MTP case (${perf_path})"
         else
             echo -e "  ${YELLOW}SKIP${NC} [${tag}] PerfStats: no records emitted (${perf_path})"
         fi
@@ -1025,16 +1522,55 @@ PY
 }
 
 # ─── Validation ───────────────────────────────────────────────────────────────
-if [ ! -x "$BINARY" ]; then
+case "$SERVER_MODE" in
+    local|docker) ;;
+    *)
+        echo -e "${RED}Error: unsupported LLAMINAR_E2E_SERVER_MODE '${SERVER_MODE}' (expected local or docker)${NC}"
+        exit 1
+        ;;
+esac
+
+if is_docker_mode; then
+    CONTAINER_IMAGE="${CONTAINER_IMAGE:-llaminar:local}"
+    if ! command -v docker >/dev/null 2>&1; then
+        echo -e "${RED}Error: Docker CLI not found for container E2E mode${NC}"
+        exit 1
+    fi
+    if ! docker_supports_nvidia_gpus && ! nvidia_driver_libs_available; then
+        echo -e "${RED}Error: container E2E mode needs NVIDIA driver libraries for the CUDA/NVML-linked release image${NC}"
+        echo "Install/configure nvidia-container-toolkit so 'docker run --gpus all ...' works, or run from a GPU-enabled environment where libcuda.so.1 and libnvidia-ml.so.1 are visible for bind-mount fallback."
+        exit 1
+    fi
+    case "$DOCKER_GPUS" in
+        auto|none|"") ;;
+        *)
+            if ! docker_supports_nvidia_gpus && ! nvidia_device_nodes_available; then
+                echo -e "${RED}Error: LLAMINAR_E2E_DOCKER_GPUS=${DOCKER_GPUS} requested NVIDIA devices, but Docker has no NVIDIA runtime and /dev/nvidia* is not visible for manual pass-through${NC}"
+                echo "Install/configure nvidia-container-toolkit so 'docker run --gpus all ...' works, or expose NVIDIA device nodes to this environment."
+                exit 1
+            fi
+            ;;
+    esac
+    if ! docker image inspect "$CONTAINER_IMAGE" >/dev/null 2>&1; then
+        echo -e "${RED}Error: Docker image not found: ${CONTAINER_IMAGE}${NC}"
+        echo "Build with: scripts/docker/build-runtime-image.sh --tag ${CONTAINER_IMAGE}"
+        exit 1
+    fi
+    BINARY_ABS="/usr/local/bin/llaminar2"
+    BINARY_DIR="${REPO_ROOT}/build_v2_release"
+else
+    if [ ! -x "$BINARY" ]; then
     echo -e "${RED}Error: Binary not found: ${BINARY}${NC}"
     echo "Build with: cmake --build build_v2_integration --parallel"
     exit 1
-fi
+    fi
 
-BINARY_ABS="$(readlink -f "$BINARY" 2>/dev/null || echo "$BINARY")"
-BINARY_DIR="$(dirname "$BINARY_ABS")"
+    BINARY_ABS="$(readlink -f "$BINARY" 2>/dev/null || echo "$BINARY")"
+    BINARY_DIR="$(dirname "$BINARY_ABS")"
+fi
 LOG_DIR="${LLAMINAR_E2E_LOG_DIR:-${BINARY_DIR}/e2e_server_logs}"
 mkdir -p "$LOG_DIR"
+LOG_DIR="$(readlink -f "$LOG_DIR" 2>/dev/null || echo "$LOG_DIR")"
 
 LAST_RESPONSE=""
 
@@ -1306,12 +1842,6 @@ run_backend_tests() {
         fi
     fi
 
-    # Build device flag — always explicit to prevent auto-detection.
-    # For TP/PP suites, backend is "tp" or "pp" and extra_flags contains device config.
-    local device_flag=""
-    if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
-        device_flag="-d ${backend}"
-    fi
     local safe_tag log_path perf_path gpu_before_mb
     safe_tag=$(sanitize_name "$tag")
     log_path="${LOG_DIR}/$(date +%Y%m%d_%H%M%S)_${safe_tag}_port${port}.log"
@@ -1321,7 +1851,6 @@ run_backend_tests() {
         echo -e "  ${BLUE}INFO${NC} [${tag}] PerfStats artifact: ${perf_path}"
     fi
 
-    # Start server
     local context_args=()
     if [ "$long_context_run" = "true" ]; then
         context_args=(-c "$CONTEXT_LENGTH")
@@ -1342,18 +1871,34 @@ run_backend_tests() {
         fi
     fi
 
-    env "${server_env[@]}" "$BINARY" serve --port "$port" \
-        "${context_args[@]}" $device_flag $extra_flags -m "$model" >"$log_path" 2>&1 &
-    local server_pid=$!
+    # Build server args — always pass the device explicitly unless this suite's
+    # extra_flags describe a TP/PP topology.
+    local server_model_path="$model"
+    if is_docker_mode; then
+        server_model_path="$(container_model_path "$model")"
+    fi
+    local -a server_args=(serve --port "$port" "${context_args[@]}")
+    if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
+        server_args+=(-d "$backend")
+    fi
+    local -a extra_arg_list=()
+    if [[ -n "$extra_flags" ]]; then
+        read -r -a extra_arg_list <<< "$extra_flags"
+        server_args+=("${extra_arg_list[@]}")
+    fi
+    server_args+=(-m "$server_model_path")
+
+    local server_handle
+    server_handle="$(start_server_process "$tag" "$port" "$model" "$log_path" "$safe_tag" server_env server_args)"
 
     # Wait for health (pass PID so we detect early exit / OOM)
-    if ! wait_for_health "$port" "$server_pid"; then
+    if ! wait_for_health "$port" "$server_handle"; then
         fail "[${tag}] Server failed to start within ${STARTUP_TIMEOUT}s"
         echo "    ── Last 80 lines of server log (${log_path}) ──"
         tail -n 80 "$log_path" 2>/dev/null | sed 's/^/    /' || echo "    (server log not available)"
         echo "    ────────────────────────────────────────────────────────────"
         scan_server_log "$tag" "$log_path"
-        cleanup_server "$server_pid"
+        cleanup_server "$server_handle"
         return
     fi
     pass "[${tag}] Server started"
@@ -1465,10 +2010,11 @@ print(d.get('error', {}).get('type', ''))
     fi
 
     # ─── Test 10: Memory and server log hygiene ───────────────────────
-    check_memory_usage "$tag" "$backend" "$model" "$server_pid" "$gpu_before_mb"
+    check_memory_usage "$tag" "$backend" "$model" "$server_handle" "$gpu_before_mb"
 
     # ─── Test 11: Graceful shutdown validation ────────────────────────
-    shutdown_and_validate "$tag" "$server_pid" "$gpu_before_mb"
+    shutdown_and_validate "$tag" "$server_handle" "$gpu_before_mb"
+    copy_container_artifact "$server_handle" "$perf_path" "$perf_path"
 
     # ─── Test 12: Server log hygiene (after shutdown) ─────────────────
     # Scan AFTER shutdown so we catch errors during teardown too.
@@ -1484,7 +2030,14 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${BLUE}  E2E Server Integration Test — Multi-Turn REST API${NC}"
 echo -e "${BLUE}════════════════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "  Binary: ${BINARY}"
+if is_docker_mode; then
+    echo -e "  Server mode: docker"
+    echo -e "  Container image: ${CONTAINER_IMAGE}"
+    echo -e "  Docker network: ${DOCKER_NETWORK}"
+else
+    echo -e "  Server mode: local"
+    echo -e "  Binary: ${BINARY}"
+fi
 echo -e "  Server logs: ${LOG_DIR}"
 echo -e "  Server log level: ${LOG_LEVEL}"
 if [ "$PERF_STATS_ENABLED" = "1" ]; then

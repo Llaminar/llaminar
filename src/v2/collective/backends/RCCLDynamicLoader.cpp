@@ -113,6 +113,8 @@ namespace llaminar2
             // RCCL is typically built locally, so we prioritize local paths
             const char *lib_paths[] = {
                 library_path, // User-specified path (may be nullptr)
+                "/usr/local/lib/librccl.so.1",
+                "/usr/local/lib/librccl.so",
                 "/workspaces/llaminar/external/rccl/build/librccl.so.1",
                 "/workspaces/llaminar/external/rccl/build/librccl.so",
                 "librccl.so.1", // Standard versioned name

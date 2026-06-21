@@ -48,6 +48,50 @@ git commit -m "Your commit message"
 **If all checks pass**: Commit proceeds normally  
 **If any check fails**: Commit is blocked with error details
 
+### Containerized E2E Mode
+
+By default, the pre-commit E2E server suite launches the local Release
+`build_v2_release/llaminar2` executable. To package the Release runtime image
+and run that same E2E suite against the containerized server instead:
+
+```bash
+LLAMINAR_PRECOMMIT_E2E_CONTAINER=1 git commit -m "Your commit message"
+```
+
+Containerized E2E exercises the same release image users run, so the Docker
+daemon must support the image's runtime contract:
+
+- NVIDIA Container Toolkit must be installed and configured so
+  `docker run --gpus all ...` works. The combined release image is CUDA/NVML
+  linked, including when a test case selects `-d cpu` or `-d rocm:0`.
+- For ROCm backends, the host must expose `/dev/kfd` and `/dev/dri` and the
+  container must be allowed into the render/video device groups. The harness
+  adds these automatically when the device nodes exist.
+
+Useful overrides:
+
+```bash
+# Choose the local image tag built by the hook
+LLAMINAR_PRECOMMIT_E2E_CONTAINER=1 \
+LLAMINAR_E2E_CONTAINER_IMAGE=llaminar:precommit \
+git commit -m "Your commit message"
+
+# Reuse an already-built image
+LLAMINAR_PRECOMMIT_E2E_CONTAINER=1 \
+LLAMINAR_PRECOMMIT_E2E_CONTAINER_BUILD=0 \
+LLAMINAR_E2E_CONTAINER_IMAGE=llaminar:local \
+git commit -m "Your commit message"
+```
+
+You can also run the E2E harness directly against a container:
+
+```bash
+scripts/docker/build-runtime-image.sh --tag llaminar:local --cuda-archs 86
+tests/v2/e2e/server/test_server_e2e.sh \
+  --container-image llaminar:local \
+  --backends "cpu,cuda:0,rocm:0"
+```
+
 ### Override
 
 If you need to commit despite failing tests (e.g., work in progress):

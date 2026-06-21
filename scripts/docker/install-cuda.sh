@@ -38,7 +38,7 @@ if [[ "${MODE}" == "full" ]]; then
 else
     # Runtime libraries only. These are the minimum a dynamically-linked
     # llaminar2 binary needs at process start: cuBLAS, cuBLASLt, cuSPARSE,
-    # cuSOLVER, cuRAND, cuFFT, NPP, NVRTC, and the NCCL runtime.
+    # cuSOLVER, cuRAND, cuFFT, NPP, NVRTC, nvJitLink, and the NCCL runtime.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
         cuda-cudart-13-0 \
@@ -48,6 +48,7 @@ else
         libcurand-13-0 \
         libcusolver-13-0 \
         libcusparse-13-0 \
+        libnvjitlink-13-0 \
         libnpp-13-0 \
         "libnccl2=*+cuda13.0"
 fi

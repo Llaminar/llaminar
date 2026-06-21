@@ -21,7 +21,8 @@
 #
 # ROCm-only host:
 #   docker run --device=/dev/kfd --device=/dev/dri \
-#       --group-add video --group-add render \
+#       --group-add "$(stat -c '%g' /dev/kfd)" \
+#       --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
 #       --ipc=host --shm-size=16G \
 #       -v /path/to/models:/models:ro \
 #       ghcr.io/llaminar/llaminar:latest -d rocm:0 -m /models/<gguf>
@@ -29,6 +30,11 @@
 ARG CUTLASS_VERSION=v4.2.1
 ARG LLAMINAR_BUILD_TYPE=Release
 ARG LLAMINAR_CUDA_ARCHS="75;80;86;89;90"
+ARG LLAMINAR_SKIP_INTEGRATION=0
+ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON
+ARG RCCL_GIT_REF=rocm-7.1.1
+ARG RCCL_GPU_TARGETS=gfx906
+ARG ROCM_RUNTIME_GPU_TARGETS=
 
 # =============================================================================
 # Stage 1: Builder
@@ -38,9 +44,12 @@ FROM ubuntu:24.04 AS builder
 ARG CUTLASS_VERSION
 ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_CUDA_ARCHS
+ARG LLAMINAR_SKIP_INTEGRATION
+ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE
+ARG RCCL_GIT_REF
+ARG RCCL_GPU_TARGETS
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    CMAKE_BUILD_PARALLEL_LEVEL=8 \
     CUDAARCHS=${LLAMINAR_CUDA_ARCHS} \
     CUDA_HOME=/usr/local/cuda \
     PATH=/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -57,7 +66,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CCACHE_NOHASHDIR=1 \
     CCACHE_BASEDIR=/src
 
-COPY scripts/docker /tmp/install-scripts
+COPY scripts/docker/install-system-deps.sh \
+     scripts/docker/install-cuda.sh \
+     scripts/docker/install-rocm.sh \
+     scripts/docker/install-cutlass.sh \
+     /tmp/install-scripts/
 RUN MODE=build  /tmp/install-scripts/install-system-deps.sh
 RUN MODE=full   /tmp/install-scripts/install-cuda.sh
 RUN MODE=full   /tmp/install-scripts/install-rocm.sh
@@ -120,6 +133,60 @@ RUN set -e; \
         \( -name '*.o' -o -name '*.d' -o -name CMakeFiles \) \
         -prune -exec rm -rf {} +
 
+# RCCL — build in a dedicated layer so the ROCm collective library is visible,
+# cacheable, and not hidden inside Llaminar's CMake configure step. The source
+# build is enabled by default for release images because Ubuntu's packaged
+# ROCm 7.1.1 RCCL has broken gfx906 binaries on MI50/MI60 systems.
+# MSCCL generated kernels are optional for standard collectives and make source
+# builds dramatically slower, so release images default them off.
+ARG RCCL_ENABLE_MSCCL_KERNEL=OFF
+ARG RCCL_ONLY_FUNCS=
+RUN --mount=type=cache,target=/root/.ccache \
+    set -e; \
+    if [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+        echo "==> [rccl] clone ${RCCL_GIT_REF}"; \
+        git clone --depth 1 --branch "${RCCL_GIT_REF}" \
+            https://github.com/ROCm/rccl.git /src/external/rccl; \
+        echo "==> [rccl] configure for GPU_TARGETS=${RCCL_GPU_TARGETS}"; \
+        if [ -n "${RCCL_ONLY_FUNCS}" ]; then \
+            echo "==> [rccl] ONLY_FUNCS=${RCCL_ONLY_FUNCS}"; \
+            cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
+                -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+                -DCMAKE_PREFIX_PATH=/opt/rocm \
+                -DROCM_PATH=/opt/rocm \
+                -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
+                -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
+                -DONLY_FUNCS="${RCCL_ONLY_FUNCS}" \
+                -DBUILD_TESTS=OFF; \
+        else \
+            cmake -B /src/external/rccl/build -S /src/external/rccl -G Ninja \
+                -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER=/opt/rocm/bin/amdclang \
+                -DCMAKE_CXX_COMPILER=/opt/rocm/bin/hipcc \
+                -DCMAKE_PREFIX_PATH=/opt/rocm \
+                -DROCM_PATH=/opt/rocm \
+                -DGPU_TARGETS="${RCCL_GPU_TARGETS}" \
+                -DENABLE_MSCCL_KERNEL="${RCCL_ENABLE_MSCCL_KERNEL}" \
+                -DBUILD_TESTS=OFF; \
+        fi; \
+        echo "==> [rccl] build (parallel)"; \
+        cmake --build /src/external/rccl/build --parallel --verbose; \
+        if [ ! -e /src/external/rccl/build/librccl.so.1.0 ]; then \
+            rccl_lib="$(find /src/external/rccl/build -maxdepth 3 -name 'librccl.so*' -type f | sort -V | tail -1)"; \
+            test -n "${rccl_lib}"; \
+            cp -P "${rccl_lib}" /src/external/rccl/build/librccl.so.1.0; \
+        fi; \
+        ln -sf librccl.so.1.0 /src/external/rccl/build/librccl.so.1; \
+        ln -sf librccl.so.1 /src/external/rccl/build/librccl.so; \
+        git -C /src/external/rccl rev-parse HEAD \
+            > /src/external/rccl/build/.llaminar-rccl-commit; \
+        echo "==> [rccl] done; library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
+    else \
+        echo "==> [rccl] source build disabled; runtime image will stage packaged RCCL"; \
+    fi
+
 # Python dependencies for the reference tests + parity gates. Pulls the
 # CPU-only PyTorch wheel (~250 MB) plus our transformers fork. Cached as a
 # separate layer keyed only on requirements.txt so source edits don't
@@ -155,45 +222,64 @@ COPY scripts/ci ./scripts/ci
 # Removing .o / .d / .gch files is safe: ctest never re-invokes the
 # compiler at test time.
 RUN --mount=type=cache,target=/root/.ccache \
-    echo "==> [integration] cmake configure" \
- && cmake -B build_v2_integration -S src/v2 -G Ninja \
-        -DCMAKE_BUILD_TYPE=Integration \
-        -DHAVE_CUDA=ON \
-        -DHAVE_ROCM=ON \
-        -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
- && echo "==> [integration] cmake build (parallel)" \
- && cmake --build build_v2_integration --parallel \
- && echo "==> [integration] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
- && find build_v2_integration \
-        \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
-        -not -path '*/CMakeFiles/*' \
-        -print0 \
-    | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true \
- && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
- && find build_v2_integration \
-        \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
-        -delete \
- && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
- && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
- && echo "==> [integration] done; final size: $(du -sh build_v2_integration | cut -f1)"
+    if [ "${LLAMINAR_SKIP_INTEGRATION}" = "1" ]; then \
+        echo "==> [integration] skipped (LLAMINAR_SKIP_INTEGRATION=1)"; \
+    else \
+        RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
+        if [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+            RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/src/external/rccl/build/librccl.so"; \
+        fi; \
+        echo "==> [integration] cmake configure" \
+     && cmake -B build_v2_integration -S src/v2 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Integration \
+            -DHAVE_CUDA=ON \
+            -DHAVE_ROCM=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
+            ${RCCL_CMAKE_ARGS} \
+     && echo "==> [integration] cmake build (parallel)" \
+     && cmake --build build_v2_integration --parallel \
+     && echo "==> [integration] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
+     && { find build_v2_integration \
+              \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
+              -not -path '*/CMakeFiles/*' \
+              -print0 \
+          | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true; } \
+     && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
+     && find build_v2_integration \
+            \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
+            -delete \
+     && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
+     && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
+     && echo "==> [integration] done; final size: $(du -sh build_v2_integration | cut -f1)"; \
+    fi
 
 # Release build — what the runtime image ships. Optimized, no assertions,
 # only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
 RUN --mount=type=cache,target=/root/.ccache \
+    RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
+    if [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+        RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/src/external/rccl/build/librccl.so"; \
+    fi; \
     echo "==> [release] cmake configure" \
  && cmake -B build_v2_release -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
         -DHAVE_CUDA=ON \
         -DHAVE_ROCM=ON \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
+        ${RCCL_CMAKE_ARGS} \
  && echo "==> [release] cmake build --target llaminar2 (parallel)" \
  && cmake --build build_v2_release --parallel --target llaminar2 \
+ && if [ ! -e external/rccl/build/librccl.so.1.0 ]; then \
+        echo "==> [release] source-built RCCL not present; staging system RCCL"; \
+        mkdir -p external/rccl/build; \
+        cp -P /opt/rocm/lib/librccl.so* external/rccl/build/; \
+    fi \
  && echo "==> [release] strip --strip-debug on executables/.a/.so (parallel, $(nproc) jobs)" \
- && find build_v2_release \
-        \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
-        -not -path '*/CMakeFiles/*' \
-        -print0 \
-    | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true \
+ && { find build_v2_release \
+          \( -type f -executable -o -name '*.a' -o -name '*.so' -o -name '*.so.*' \) \
+          -not -path '*/CMakeFiles/*' \
+          -print0 \
+      | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true; } \
  && echo "==> [release] removing intermediates (.o/.d/.gch/CMakeFiles)" \
  && find build_v2_release \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
@@ -222,6 +308,7 @@ FROM ubuntu:24.04 AS runtime
 ARG BUILD_DATE
 ARG VCS_REF
 ARG VERSION=dev
+ARG ROCM_RUNTIME_GPU_TARGETS
 
 LABEL org.opencontainers.image.title="Llaminar" \
       org.opencontainers.image.description="High-performance LLM inference engine (CUDA + ROCm)" \
@@ -237,18 +324,33 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     ROCM_HOME=/opt/rocm \
     HIP_PATH=/opt/rocm \
+    ROCM_RUNTIME_GPU_TARGETS=${ROCM_RUNTIME_GPU_TARGETS} \
     PATH=/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    LD_LIBRARY_PATH=/usr/local/cuda/lib64:/opt/rocm/lib
+    LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib
 
-COPY scripts/docker /tmp/install-scripts
+COPY scripts/docker/install-system-deps.sh \
+     scripts/docker/install-cuda.sh \
+     scripts/docker/install-rocm-runtime.sh \
+     scripts/docker/prune-runtime-image.sh \
+     /tmp/install-scripts/
 RUN MODE=runtime /tmp/install-scripts/install-system-deps.sh
 RUN MODE=runtime /tmp/install-scripts/install-cuda.sh
-RUN MODE=runtime /tmp/install-scripts/install-rocm.sh
+RUN bash /tmp/install-scripts/install-rocm-runtime.sh \
+ && bash /tmp/install-scripts/prune-runtime-image.sh
 RUN rm -rf /tmp/install-scripts
 
-# Copy just the compiled binary. Dynamic linker resolves libs from the apt
-# packages installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
+# Copy the compiled launcher, core shared library, and vendored shared
+# dependencies. The remaining dynamic libraries resolve from the apt packages
+# installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
 COPY --from=builder /src/build_v2_release/llaminar2 /usr/local/bin/llaminar2
+COPY --from=builder /src/build_v2_release/libllaminar2_core.so /usr/local/lib/
+COPY --from=builder /src/external/onednn/build/lib/libdnnl.so.3.11 /usr/local/lib/
+COPY --from=builder /src/external/rccl/build/librccl.so.1.0 /usr/local/lib/
+RUN ln -sf libdnnl.so.3.11 /usr/local/lib/libdnnl.so.3 \
+ && ln -sf libdnnl.so.3 /usr/local/lib/libdnnl.so \
+ && ln -sf librccl.so.1.0 /usr/local/lib/librccl.so.1 \
+ && ln -sf librccl.so.1 /usr/local/lib/librccl.so \
+ && ldconfig
 
 # Non-root user for the runtime. GPU devices on the host expose render/video
 # group ownership; join those so /dev/kfd + /dev/dri work for ROCm.

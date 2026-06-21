@@ -13,6 +13,13 @@
     "features": {
         "ghcr.io/devcontainers/features/git:1": {},
         "ghcr.io/devcontainers/features/github-cli:1": {},
+        "ghcr.io/devcontainers/features/azure-cli:1": {},
+        "ghcr.io/devcontainers/features/docker-outside-of-docker:1": {
+            "version": "latest",
+            "moby": true,
+            "installDockerBuildx": true,
+            "dockerDashComposeVersion": "v2"
+        },
         "ghcr.io/devcontainers/features/node:1": {
             "version": "22"
         }
@@ -27,6 +34,7 @@
                 "ms-python.python",
                 "ms-python.pylint",
                 "ms-python.debugpy",
+                "openai.chatgpt",
                 "GitHub.copilot-chat",
                 "redhat.vscode-yaml",
                 "ms-vscode.vscode-json",
