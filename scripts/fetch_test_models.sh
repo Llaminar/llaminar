@@ -2,7 +2,8 @@
 set -euo pipefail
 
 BASE_URL="https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main"
-MODEL_DIR="models"
+MODEL_DIR="${LLAMINAR_MODEL_DIR:-models}"
+EXTERNAL_MODEL_DIR="${MODELS_DIR:-/opt/llaminar-models}"
 
 # Stable variants confirmed to exist upstream (reduce noise by default)
 STABLE_MODELS=(
@@ -61,6 +62,11 @@ MODELS=("${STABLE_MODELS[@]}")
 if [[ -n "${LLAMINAR_FETCH_EXPERIMENTAL:-}" ]]; then
   MODELS+=("${EXPERIMENTAL_MODELS[@]}")
   echo "[fetch_test_models] Experimental variant probing enabled (LLAMINAR_FETCH_EXPERIMENTAL=1)" >&2
+fi
+
+if [[ ! -e "$MODEL_DIR" && ! -L "$MODEL_DIR" && -d "$EXTERNAL_MODEL_DIR" && "$MODEL_DIR" != "$EXTERNAL_MODEL_DIR" ]]; then
+  echo "[fetch_test_models] Linking '$MODEL_DIR' to existing model cache '$EXTERNAL_MODEL_DIR'"
+  ln -s "$EXTERNAL_MODEL_DIR" "$MODEL_DIR"
 fi
 
 echo "[fetch_test_models] Ensuring test models present in '$MODEL_DIR'"
