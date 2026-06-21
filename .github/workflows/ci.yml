@@ -138,6 +138,10 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Remove builder image tag
+        if: always()
+        run: docker image rm "${{ env.BUILDER_IMAGE }}" || true
+
   runtime-containers:
     name: Build, test, and publish runtime containers
     needs: build
@@ -206,8 +210,3 @@ jobs:
           path: ${{ github.workspace }}/cores/
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: Prune builder image
-        if: always()
-        run: |
-          docker image rm "${{ needs.build.outputs.builder-image }}" || true

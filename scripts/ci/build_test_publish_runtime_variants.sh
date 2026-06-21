@@ -113,6 +113,20 @@ declare -A port=(
 
 all_refs=()
 
+cleanup_images() {
+    if [[ "${LLAMINAR_KEEP_RUNTIME_IMAGES:-0}" == "1" ]]; then
+        echo "[build-test-publish] keeping runtime image tags because LLAMINAR_KEEP_RUNTIME_IMAGES=1"
+        return
+    fi
+    ((${#all_refs[@]} > 0)) || return
+    echo "[build-test-publish] removing runtime image tags; BuildKit layer cache remains available"
+    local ref
+    for ref in "${all_refs[@]}"; do
+        docker image rm "$ref" >/dev/null 2>&1 || true
+    done
+}
+trap cleanup_images EXIT
+
 run_cmd() {
     printf '[build-test-publish] '
     printf '%q ' "$@"
