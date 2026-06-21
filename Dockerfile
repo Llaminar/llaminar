@@ -113,18 +113,20 @@ RUN set -e; \
     mkdir -p /src/external; \
     ONEDNN_TARBALL_URL="https://codeload.github.com/uxlfoundation/oneDNN/tar.gz/refs/tags/${ONEDNN_GIT_REF}"; \
     echo "==> [onednn] fetch ${ONEDNN_GIT_REF} from ${ONEDNN_TARBALL_URL}"; \
-    for attempt in 1 2 3 4 5 6 7 8; do \
+    for attempt in 1 2 3 4; do \
         rm -rf /src/external/onednn; \
         mkdir -p /src/external/onednn; \
-        if curl -fL --show-error \
-            --connect-timeout 30 --max-time 600 \
-            --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 1200 \
-            -o /tmp/onednn.tar.gz "${ONEDNN_TARBALL_URL}" \
+        echo "==> [onednn] download attempt ${attempt}/4"; \
+        if timeout 600s wget --progress=dot:giga \
+            --dns-timeout=30 --connect-timeout=30 --read-timeout=60 \
+            --tries=2 --waitretry=10 --retry-connrefused \
+            -O /tmp/onednn.tar.gz "${ONEDNN_TARBALL_URL}" \
             && tar -xzf /tmp/onednn.tar.gz -C /src/external/onednn --strip-components=1; then \
             break; \
         fi; \
-        if [ "${attempt}" = "8" ]; then exit 1; fi; \
-        sleep $((attempt * 10)); \
+        if [ "${attempt}" = "4" ]; then exit 1; fi; \
+        rm -f /tmp/onednn.tar.gz; \
+        sleep $((attempt * 15)); \
     done; \
     rm -f /tmp/onednn.tar.gz; \
     printf '%s\n' "${ONEDNN_GIT_REF}" > /src/external/onednn/.llaminar-onednn-source-ref; \
@@ -160,18 +162,20 @@ RUN --mount=type=cache,target=/root/.ccache \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         RCCL_TARBALL_URL="https://codeload.github.com/ROCm/rccl/tar.gz/refs/tags/${RCCL_GIT_REF}"; \
         echo "==> [rccl] fetch ${RCCL_GIT_REF} from ${RCCL_TARBALL_URL}"; \
-        for attempt in 1 2 3 4 5 6 7 8; do \
+        for attempt in 1 2 3 4; do \
             rm -rf /src/external/rccl; \
             mkdir -p /src/external/rccl; \
-            if curl -fL --show-error \
-                --connect-timeout 30 --max-time 600 \
-                --retry 8 --retry-all-errors --retry-delay 5 --retry-max-time 1200 \
-                -o /tmp/rccl.tar.gz "${RCCL_TARBALL_URL}" \
+            echo "==> [rccl] download attempt ${attempt}/4"; \
+            if timeout 600s wget --progress=dot:giga \
+                --dns-timeout=30 --connect-timeout=30 --read-timeout=60 \
+                --tries=2 --waitretry=10 --retry-connrefused \
+                -O /tmp/rccl.tar.gz "${RCCL_TARBALL_URL}" \
                 && tar -xzf /tmp/rccl.tar.gz -C /src/external/rccl --strip-components=1; then \
                 break; \
             fi; \
-            if [ "${attempt}" = "8" ]; then exit 1; fi; \
-            sleep $((attempt * 10)); \
+            if [ "${attempt}" = "4" ]; then exit 1; fi; \
+            rm -f /tmp/rccl.tar.gz; \
+            sleep $((attempt * 15)); \
         done; \
         rm -f /tmp/rccl.tar.gz; \
         printf '%s\n' "${RCCL_GIT_REF}" > /src/external/rccl/.llaminar-rccl-source-ref; \
