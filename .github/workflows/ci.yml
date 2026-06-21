@@ -100,6 +100,7 @@ jobs:
           context: .
           file: Dockerfile
           target: builder
+          network: host
           load: true
           tags: ${{ env.BUILDER_IMAGE }}
           build-args: |

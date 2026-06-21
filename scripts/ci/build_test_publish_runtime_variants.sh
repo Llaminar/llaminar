@@ -37,6 +37,11 @@ sha="${GITHUB_SHA:-}"
 push=0
 dry_run=false
 
+# The self-hosted ARC runner invokes Docker builds from inside Kubernetes. Host
+# networking avoids TLS stalls to codeload.github.com seen from BuildKit RUN
+# layers while preserving the exact dependency versions fetched by the Dockerfile.
+export LLAMINAR_DOCKER_BUILD_NETWORK="${LLAMINAR_DOCKER_BUILD_NETWORK:-host}"
+
 while (($#)); do
     case "$1" in
         --image)

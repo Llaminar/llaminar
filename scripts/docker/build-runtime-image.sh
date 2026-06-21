@@ -59,6 +59,8 @@ Options:
       --build-arg ARG      Extra Docker build arg, KEY=VALUE. Repeatable.
       --label LABEL        Extra image label, KEY=VALUE. Repeatable.
       --platform PLATFORM  Optional docker buildx platform.
+      --build-network MODE Optional network mode for Dockerfile RUN steps.
+                           Example: host.
       --progress MODE      BuildKit progress mode. Default: auto.
       --dry-run            Print the docker command without running it.
   -h, --help               Show this help.
@@ -70,7 +72,7 @@ Environment:
   LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
   LLAMINAR_SKIP_INTEGRATION, LLAMINAR_BUILD_RCCL_FROM_SOURCE,
   RCCL_GPU_TARGETS, ROCM_RUNTIME_GPU_TARGETS, RCCL_ENABLE_MSCCL_KERNEL,
-  RCCL_ONLY_FUNCS
+  RCCL_ONLY_FUNCS, LLAMINAR_DOCKER_BUILD_NETWORK
                            Defaults for the matching options/build args.
 
 Examples:
@@ -122,6 +124,7 @@ output_mode="${LLAMINAR_IMAGE_OUTPUT:-load}"
 verify_mode="auto"
 dry_run=false
 platform=""
+build_network="${LLAMINAR_DOCKER_BUILD_NETWORK:-}"
 progress="${BUILDKIT_PROGRESS:-auto}"
 version="${VERSION:-}"
 vcs_ref="${VCS_REF:-}"
@@ -268,6 +271,11 @@ while (($#)); do
             platform="$2"
             shift 2
             ;;
+        --build-network)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            build_network="$2"
+            shift 2
+            ;;
         --progress)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             progress="$2"
@@ -412,6 +420,9 @@ if [[ -n "${rccl_only_funcs}" ]]; then
 fi
 if [[ -n "${platform}" ]]; then
     cmd+=(--platform "${platform}")
+fi
+if [[ -n "${build_network}" ]]; then
+    cmd+=(--network "${build_network}")
 fi
 if [[ -n "${progress}" ]]; then
     cmd+=(--progress "${progress}")
