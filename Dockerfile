@@ -111,8 +111,16 @@ WORKDIR /src
 ARG ONEDNN_GIT_REF=v3.11.3
 RUN set -e; \
     mkdir -p /src/external; \
-    git clone --depth 1 --branch ${ONEDNN_GIT_REF} \
-        https://github.com/uxlfoundation/oneDNN.git /src/external/onednn; \
+    for attempt in 1 2 3 4 5; do \
+        rm -rf /src/external/onednn; \
+        if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+            clone --depth 1 --branch ${ONEDNN_GIT_REF} \
+            https://github.com/uxlfoundation/oneDNN.git /src/external/onednn; then \
+            break; \
+        fi; \
+        if [ "${attempt}" = "5" ]; then exit 1; fi; \
+        sleep $((attempt * 10)); \
+    done; \
     cmake -B /src/external/onednn/build -S /src/external/onednn \
         -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
@@ -145,8 +153,16 @@ RUN --mount=type=cache,target=/root/.ccache \
     set -e; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         echo "==> [rccl] clone ${RCCL_GIT_REF}"; \
-        git clone --depth 1 --branch "${RCCL_GIT_REF}" \
-            https://github.com/ROCm/rccl.git /src/external/rccl; \
+        for attempt in 1 2 3 4 5; do \
+            rm -rf /src/external/rccl; \
+            if git -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=60 \
+                clone --depth 1 --branch "${RCCL_GIT_REF}" \
+                https://github.com/ROCm/rccl.git /src/external/rccl; then \
+                break; \
+            fi; \
+            if [ "${attempt}" = "5" ]; then exit 1; fi; \
+            sleep $((attempt * 10)); \
+        done; \
         echo "==> [rccl] configure for GPU_TARGETS=${RCCL_GPU_TARGETS}"; \
         if [ -n "${RCCL_ONLY_FUNCS}" ]; then \
             echo "==> [rccl] ONLY_FUNCS=${RCCL_ONLY_FUNCS}"; \
