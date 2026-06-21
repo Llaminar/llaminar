@@ -80,7 +80,7 @@ jobs:
             echo "cache_image=${cache_image}"
             echo "builder_cache=${cache_image}:builder"
             if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
-              echo "builder_cache_to=type=registry,ref=${cache_image}:builder,mode=max"
+              echo "builder_cache_to=type=registry,ref=${cache_image}:builder,mode=min,ignore-error=true"
             else
               echo "builder_cache_to="
             fi
