@@ -128,10 +128,26 @@ namespace
     /// @brief Read a source file relative to the repository root derived from __FILE__.
     std::string readRepoFile(const std::string &relative_path)
     {
-        const std::filesystem::path test_file(__FILE__);
-        const std::filesystem::path repo_root =
-            test_file.parent_path().parent_path().parent_path().parent_path().parent_path();
-        std::ifstream input(repo_root / relative_path);
+        std::vector<std::filesystem::path> candidates;
+        candidates.push_back(std::filesystem::path(__FILE__).parent_path());
+        candidates.push_back(std::filesystem::current_path());
+        candidates.push_back("/src");
+
+        std::ifstream input;
+        for (auto root : candidates)
+        {
+            for (int depth = 0; depth < 8 && !root.empty(); ++depth)
+            {
+                const auto path = root / relative_path;
+                input.open(path);
+                if (input)
+                    break;
+                input.clear();
+                root = root.parent_path();
+            }
+            if (input)
+                break;
+        }
         if (!input)
             return {};
         std::ostringstream buffer;

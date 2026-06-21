@@ -19,6 +19,8 @@ bitsandbytes>=0.43.0
 
 # Numerical computing (already in Dockerfile but specifying version)
 numpy>=1.24.0
+pandas>=2.2.0
+scikit-learn>=1.4.0
 
 # Testing
 pytest>=8.0.0

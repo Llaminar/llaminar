@@ -125,6 +125,7 @@ jobs:
             --cap-add SYS_NICE --cap-add SYS_PTRACE \
             --ulimit core=-1 \
             --ipc=host --shm-size=16g \
+            -v "${MODELS_DIR}:${MODELS_DIR}:ro" \
             --workdir /src \
             ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration \
