@@ -19,10 +19,6 @@ This script intentionally builds and tests variants serially on one runner to
 avoid oversubscribing GPUs. It pushes no image until every requested container
 E2E segment has passed.
 
-Environment:
-  LLAMINAR_DOCKER_CACHE_IMAGE  Registry image used for BuildKit cache manifests.
-                               Example: ghcr.io/llaminar/llaminar-build-cache
-  LLAMINAR_DOCKER_CACHE_PUSH   Set to 1 to export per-variant cache manifests.
 EOF
 }
 
@@ -41,8 +37,6 @@ branch="${GITHUB_REF_NAME:-}"
 sha="${GITHUB_SHA:-}"
 push=0
 dry_run=false
-cache_image="${LLAMINAR_DOCKER_CACHE_IMAGE:-}"
-cache_push="${LLAMINAR_DOCKER_CACHE_PUSH:-0}"
 
 # The self-hosted ARC runner invokes Docker builds from inside Kubernetes. Host
 # networking avoids TLS stalls to codeload.github.com seen from BuildKit RUN
@@ -139,15 +133,6 @@ for variant in "${variants[@]}"; do
     all_refs+=("${refs[@]}")
 
     build_args=("${repo_root}/scripts/docker/build-runtime-image.sh" --variant "$variant" --load --no-verify)
-    if [[ -n "${cache_image}" ]]; then
-        # Import the full-builder cache first to share expensive dependency
-        # layers, then the variant-specific runtime cache for packaging layers.
-        build_args+=(--cache-from "type=registry,ref=${cache_image}:builder")
-        build_args+=(--cache-from "type=registry,ref=${cache_image}:runtime-${variant}")
-        if [[ "${cache_push}" == "1" ]]; then
-            build_args+=(--cache-to "type=registry,ref=${cache_image}:runtime-${variant},mode=max")
-        fi
-    fi
     for ref in "${refs[@]}"; do
         build_args+=(--tag "$ref")
     done
