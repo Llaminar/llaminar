@@ -56,6 +56,8 @@ env:
   BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
   CUDA_VERSION: "13.0"
   ROCM_VERSION: "7.1.1"
+  RCCL_ONLY_FUNCS: >-
+    AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8
 
 jobs:
   build:
@@ -108,6 +110,7 @@ jobs:
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
             LLAMINAR_CUDA_ARCHS=86
+            RCCL_ONLY_FUNCS=${{ env.RCCL_ONLY_FUNCS }}
 
       - name: Extract ccache from BuildKit
         if: always()
