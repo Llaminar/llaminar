@@ -69,14 +69,37 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Record builder image ref
+      - name: Record Docker image refs
         id: builder-image
-        run: echo "ref=${BUILDER_IMAGE}" >> "$GITHUB_OUTPUT"
+        shell: bash
+        run: |
+          cache_image="${REGISTRY}/${IMAGE_NAME}-build-cache"
+          cache_image="${cache_image,,}"
+          {
+            echo "ref=${BUILDER_IMAGE}"
+            echo "cache_image=${cache_image}"
+            echo "builder_cache=${cache_image}:builder"
+            if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+              echo "builder_cache_to=type=registry,ref=${cache_image}:builder,mode=max"
+            else
+              echo "builder_cache_to="
+            fi
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          driver: docker
+          driver: docker-container
+          driver-opts: |
+            network=host
+
+      - name: Log in to GHCR for BuildKit cache
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Restore ccache from previous runs
         uses: actions/cache@v5
@@ -105,6 +128,9 @@ jobs:
           network: host
           load: true
           tags: ${{ env.BUILDER_IMAGE }}
+          cache-from: |
+            type=registry,ref=${{ steps.builder-image.outputs.builder_cache }}
+          cache-to: ${{ steps.builder-image.outputs.builder_cache_to }}
           build-args: |
             VERSION=${{ github.ref_name }}
             VCS_REF=${{ github.sha }}
@@ -182,7 +208,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
         with:
-          driver: docker
+          driver: docker-container
+          driver-opts: |
+            network=host
+
+      - name: Record Docker cache ref
+        id: docker-cache
+        shell: bash
+        run: |
+          cache_image="${REGISTRY}/${IMAGE_NAME}-build-cache"
+          cache_image="${cache_image,,}"
+          {
+            echo "cache_image=${cache_image}"
+            if [[ "${GITHUB_EVENT_NAME}" != "pull_request" ]]; then
+              echo "cache_push=1"
+            else
+              echo "cache_push=0"
+            fi
+          } >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
@@ -204,6 +247,9 @@ jobs:
 
       - name: Build, E2E test, and publish variants
         id: runtime
+        env:
+          LLAMINAR_DOCKER_CACHE_IMAGE: ${{ steps.docker-cache.outputs.cache_image }}
+          LLAMINAR_DOCKER_CACHE_PUSH: ${{ steps.docker-cache.outputs.cache_push }}
         run: |
           set -euo pipefail
           args=(--image "${REGISTRY}/${IMAGE_NAME}" --branch "${GITHUB_REF_NAME}" --sha "${GITHUB_SHA}")

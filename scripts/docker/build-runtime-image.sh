@@ -61,6 +61,10 @@ Options:
       --platform PLATFORM  Optional docker buildx platform.
       --build-network MODE Optional network mode for Dockerfile RUN steps.
                            Example: host.
+      --cache-from SPEC    BuildKit cache import spec. Repeatable.
+                           Example: type=registry,ref=ghcr.io/acme/llaminar-cache:runtime-full
+      --cache-to SPEC      BuildKit cache export spec. Repeatable.
+                           Example: type=registry,ref=ghcr.io/acme/llaminar-cache:runtime-full,mode=max
       --progress MODE      BuildKit progress mode. Default: auto.
       --dry-run            Print the docker command without running it.
   -h, --help               Show this help.
@@ -72,8 +76,10 @@ Environment:
   LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
   LLAMINAR_SKIP_INTEGRATION, LLAMINAR_BUILD_RCCL_FROM_SOURCE,
   RCCL_GPU_TARGETS, ROCM_RUNTIME_GPU_TARGETS, RCCL_ENABLE_MSCCL_KERNEL,
-  RCCL_ONLY_FUNCS, LLAMINAR_DOCKER_BUILD_NETWORK
+  RCCL_ONLY_FUNCS, LLAMINAR_DOCKER_BUILD_NETWORK,
+  LLAMINAR_DOCKER_CACHE_FROM, LLAMINAR_DOCKER_CACHE_TO
                            Defaults for the matching options/build args.
+                           Cache env vars are newline-separated BuildKit specs.
 
 Examples:
   scripts/docker/build-runtime-image.sh --tag llaminar:local
@@ -119,6 +125,8 @@ default_rccl_only_funcs='AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/
 
 tags=()
 labels=()
+cache_from=()
+cache_to=()
 extra_build_args=()
 output_mode="${LLAMINAR_IMAGE_OUTPUT:-load}"
 verify_mode="auto"
@@ -146,6 +154,18 @@ if [[ -n "${LLAMINAR_IMAGE_TAGS:-}" ]]; then
 fi
 if [[ -n "${LLAMINAR_IMAGE_LABELS:-}" ]]; then
     append_split_labels "${LLAMINAR_IMAGE_LABELS}"
+fi
+if [[ -n "${LLAMINAR_DOCKER_CACHE_FROM:-}" ]]; then
+    while IFS= read -r cache_spec; do
+        cache_spec="$(trim "${cache_spec}")"
+        [[ -n "${cache_spec}" ]] && cache_from+=("${cache_spec}")
+    done <<< "${LLAMINAR_DOCKER_CACHE_FROM//$'\r'/}"
+fi
+if [[ -n "${LLAMINAR_DOCKER_CACHE_TO:-}" ]]; then
+    while IFS= read -r cache_spec; do
+        cache_spec="$(trim "${cache_spec}")"
+        [[ -n "${cache_spec}" ]] && cache_to+=("${cache_spec}")
+    done <<< "${LLAMINAR_DOCKER_CACHE_TO//$'\r'/}"
 fi
 
 while (($#)); do
@@ -274,6 +294,16 @@ while (($#)); do
         --build-network)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             build_network="$2"
+            shift 2
+            ;;
+        --cache-from)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            cache_from+=("$2")
+            shift 2
+            ;;
+        --cache-to)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            cache_to+=("$2")
             shift 2
             ;;
         --progress)
@@ -432,6 +462,12 @@ for tag in "${tags[@]}"; do
 done
 for label in "${labels[@]}"; do
     cmd+=(--label "${label}")
+done
+for cache_spec in "${cache_from[@]}"; do
+    cmd+=(--cache-from "${cache_spec}")
+done
+for cache_spec in "${cache_to[@]}"; do
+    cmd+=(--cache-to "${cache_spec}")
 done
 for build_arg in "${extra_build_args[@]}"; do
     cmd+=(--build-arg "${build_arg}")
