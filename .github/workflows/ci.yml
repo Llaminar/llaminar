@@ -61,7 +61,7 @@ env:
 
 jobs:
   build:
-    name: Build builder image
+    name: Build builder image and unit tests
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 120
     outputs:
@@ -129,14 +129,6 @@ jobs:
             exit 1
           fi
 
-  unit:
-    name: Gate - Unit tests
-    needs: build
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v6
-
       - name: Preflight - clear stale MPI/IPC state
         run: bash scripts/ci/preflight_clean.sh
 
@@ -157,7 +149,7 @@ jobs:
             --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
+            ${{ env.BUILDER_IMAGE }} \
             ctest --test-dir build_v2_integration \
                   -R '^V2_Unit_' \
                   --output-on-failure \
@@ -174,7 +166,7 @@ jobs:
 
   runtime-containers:
     name: Build, test, and publish runtime containers
-    needs: [build, unit]
+    needs: build
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 360
     outputs:
