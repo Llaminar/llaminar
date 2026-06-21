@@ -11,9 +11,9 @@
 #   * .devcontainer/Dockerfile  (development image)
 #   * Dockerfile (builder stage + runtime stage)
 #
-# The nvidia/cuda and rocm base images ship without Ubuntu's `universe`
-# repository enabled, so most of these packages are invisible without the
-# explicit `add-apt-repository universe` below.
+# The nvidia/cuda and rocm base images ship without Ubuntu's `universe` and
+# `multiverse` repositories enabled, so some build packages are invisible
+# without the explicit `add-apt-repository` calls below.
 set -euo pipefail
 
 MODE="${MODE:-build}"
@@ -38,6 +38,7 @@ apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
     curl \
     wget
 add-apt-repository -y universe
+add-apt-repository -y multiverse
 apt-get "${APT_OPTS[@]}" update
 
 if [[ "${MODE}" == "build" ]]; then
