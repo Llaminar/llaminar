@@ -98,6 +98,8 @@ DOCKER_SHM_SIZE="${LLAMINAR_E2E_DOCKER_SHM_SIZE:-16g}"
 DOCKER_NAME_PREFIX="${LLAMINAR_E2E_DOCKER_NAME_PREFIX:-llaminar-e2e}"
 DOCKER_USER="${LLAMINAR_E2E_DOCKER_USER:-0:0}"
 DOCKER_NUMA_SECCOMP="${LLAMINAR_E2E_DOCKER_NUMA_SECCOMP:-1}"
+NVIDIA_DRIVER_LIB_DIR="${LLAMINAR_NVIDIA_DRIVER_LIB_DIR:-/opt/llaminar-nvidia-libs}"
+NVIDIA_CONTAINER_LIB_DIR="/usr/local/nvidia/lib64"
 declare -a DOCKER_EXTRA_ARGS=()
 if [[ -n "${LLAMINAR_E2E_DOCKER_ARGS:-}" ]]; then
     # Intentional shell-style word splitting for advanced docker run flags.
@@ -443,6 +445,10 @@ docker_args_need_cuda() {
 nvidia_driver_lib_path() {
     local lib="$1"
     local path
+    if [[ -e "${NVIDIA_DRIVER_LIB_DIR}/${lib}" ]]; then
+        printf '%s' "${NVIDIA_DRIVER_LIB_DIR}/${lib}"
+        return
+    fi
     path="$(ldconfig -p 2>/dev/null | awk -v lib="$lib" '$1 == lib { print $NF; exit }')"
     if [[ -z "$path" && -e "/usr/lib/x86_64-linux-gnu/${lib}" ]]; then
         path="/usr/lib/x86_64-linux-gnu/${lib}"
@@ -450,7 +456,15 @@ nvidia_driver_lib_path() {
     printf '%s' "$path"
 }
 
+nvidia_driver_lib_dir_available() {
+    [[ -d "$NVIDIA_DRIVER_LIB_DIR" ]] || return 1
+    [[ -e "${NVIDIA_DRIVER_LIB_DIR}/libcuda.so.1" ]] || return 1
+    [[ -e "${NVIDIA_DRIVER_LIB_DIR}/libnvidia-ml.so.1" ]] || return 1
+}
+
 nvidia_driver_libs_available() {
+    nvidia_driver_lib_dir_available && return 0
+
     local lib path
     for lib in libcuda.so.1 libnvidia-ml.so.1; do
         path="$(nvidia_driver_lib_path "$lib")"
@@ -460,6 +474,14 @@ nvidia_driver_libs_available() {
 
 append_nvidia_driver_lib_mounts() {
     local -n out_ref="$1"
+    if nvidia_driver_lib_dir_available; then
+        out_ref+=(
+            -v "${NVIDIA_DRIVER_LIB_DIR}:${NVIDIA_CONTAINER_LIB_DIR}:ro"
+            -e "LD_LIBRARY_PATH=${NVIDIA_CONTAINER_LIB_DIR}:/usr/local/lib:/usr/local/cuda/lib64:/opt/rocm/lib"
+        )
+        return
+    fi
+
     local lib path
     for lib in libcuda.so.1 libnvidia-ml.so.1; do
         path="$(nvidia_driver_lib_path "$lib")"
@@ -468,13 +490,44 @@ append_nvidia_driver_lib_mounts() {
     done
 }
 
+nvidia_device_nodes_from_docker_daemon() {
+    [[ -n "${CONTAINER_IMAGE:-}" ]] || return 1
+    docker run --rm \
+        --entrypoint /bin/sh \
+        -v /dev:/host-dev:ro \
+        "$CONTAINER_IMAGE" \
+        -lc '
+set -eu
+for path in \
+    /host-dev/nvidiactl \
+    /host-dev/nvidia-uvm \
+    /host-dev/nvidia-uvm-tools \
+    /host-dev/nvidia-modeset; do
+    [ -e "$path" ] && printf "%s\n" "${path#/host-dev}"
+done
+for path in /host-dev/nvidia[0-9]* /host-dev/nvidia-caps/*; do
+    [ -e "$path" ] && printf "%s\n" "${path#/host-dev}"
+done
+' 2>/dev/null | sort -u
+}
+
+nvidia_device_nodes() {
+    if [[ -e /dev/nvidiactl ]]; then
+        local node
+        for node in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
+            [[ -e "$node" ]] && printf '%s\n' "$node"
+        done
+        for node in /dev/nvidia[0-9]* /dev/nvidia-caps/*; do
+            [[ -e "$node" ]] && printf '%s\n' "$node"
+        done
+        return
+    fi
+
+    nvidia_device_nodes_from_docker_daemon
+}
+
 nvidia_device_nodes_available() {
-    [[ -e /dev/nvidiactl ]] || return 1
-    local node
-    for node in /dev/nvidia[0-9]*; do
-        [[ -e "$node" ]] && return 0
-    done
-    return 1
+    nvidia_device_nodes | grep -q '^/dev/nvidia'
 }
 
 append_existing_device_path() {
@@ -487,12 +540,9 @@ append_existing_device_path() {
 append_nvidia_device_nodes() {
     local -n out_ref="$1"
     local node
-    for node in /dev/nvidiactl /dev/nvidia-uvm /dev/nvidia-uvm-tools /dev/nvidia-modeset; do
-        [[ -e "$node" ]] && out_ref+=(--device="$node")
-    done
-    for node in /dev/nvidia[0-9]* /dev/nvidia-caps/*; do
-        [[ -e "$node" ]] && out_ref+=(--device="$node")
-    done
+    while IFS= read -r node; do
+        [[ -n "$node" ]] && out_ref+=(--device="$node")
+    done < <(nvidia_device_nodes)
 }
 
 append_unique_group_for_path() {

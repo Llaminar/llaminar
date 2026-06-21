@@ -115,8 +115,11 @@ jobs:
 
       - name: Run unit tests
         run: |
+          mapfile -t nvidia_args < <(scripts/ci/docker_gpu_run_args.sh \
+            --probe-image "${BUILDER_IMAGE}" \
+            --required)
           docker run --rm \
-            --gpus all \
+            "${nvidia_args[@]}" \
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
             --cap-add SYS_NICE --cap-add SYS_PTRACE \
