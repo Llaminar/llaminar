@@ -18,14 +18,17 @@ Options:
                            Default: llaminar:local
       --push               Push tags to their registry. Requires an explicit tag.
       --load               Load the image into the local Docker daemon. Default.
-      --verify             Run `llaminar2 --help` inside the image. Requires
-                           Docker with NVIDIA Container Toolkit because the
-                           release binary is CUDA/NVML-linked.
+      --verify             Run `llaminar2 --help` inside the image.
       --no-verify          Skip the local packaging smoke test.
       --version VALUE      VERSION Docker build arg. Default: git describe/local.
       --vcs-ref SHA        VCS_REF Docker build arg. Default: git HEAD/unknown.
       --build-date DATE    BUILD_DATE Docker build arg. Default: current UTC time.
       --build-type TYPE    LLAMINAR_BUILD_TYPE build arg. Default: Release.
+      --variant VARIANT    Backend/runtime variant: full, cpu, cuda, rocm.
+                           Default: full.
+      --cpu-only           Alias for --variant cpu.
+      --cuda-only          Alias for --variant cuda.
+      --rocm-only          Alias for --variant rocm.
       --cuda-archs LIST    LLAMINAR_CUDA_ARCHS build arg. Dockerfile default if unset.
       --rccl-from-source   Build/source-package RCCL for ROCm multi-GPU.
                            Default.
@@ -63,7 +66,8 @@ Options:
 Environment:
   LLAMINAR_IMAGE_TAGS      Newline- or comma-separated image tags.
   LLAMINAR_IMAGE_LABELS    Newline-separated image labels.
-  VERSION, VCS_REF, BUILD_DATE, LLAMINAR_BUILD_TYPE, LLAMINAR_CUDA_ARCHS,
+  VERSION, VCS_REF, BUILD_DATE, LLAMINAR_BUILD_TYPE, LLAMINAR_IMAGE_VARIANT,
+  LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
   LLAMINAR_SKIP_INTEGRATION, LLAMINAR_BUILD_RCCL_FROM_SOURCE,
   RCCL_GPU_TARGETS, ROCM_RUNTIME_GPU_TARGETS, RCCL_ENABLE_MSCCL_KERNEL,
   RCCL_ONLY_FUNCS
@@ -106,38 +110,6 @@ append_split_labels() {
     done <<< "${raw}"
 }
 
-docker_supports_nvidia_gpus() {
-    docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
-}
-
-nvidia_driver_lib_path() {
-    local lib="$1"
-    local path
-    path="$(ldconfig -p 2>/dev/null | awk -v lib="${lib}" '$1 == lib { print $NF; exit }')"
-    if [[ -z "${path}" && -e "/usr/lib/x86_64-linux-gnu/${lib}" ]]; then
-        path="/usr/lib/x86_64-linux-gnu/${lib}"
-    fi
-    printf '%s' "${path}"
-}
-
-nvidia_driver_libs_available() {
-    local lib path
-    for lib in libcuda.so.1 libnvidia-ml.so.1; do
-        path="$(nvidia_driver_lib_path "${lib}")"
-        [[ -n "${path}" && -e "${path}" ]] || return 1
-    done
-}
-
-append_nvidia_driver_lib_mounts() {
-    local -n args_ref="$1"
-    local lib path
-    for lib in libcuda.so.1 libnvidia-ml.so.1; do
-        path="$(nvidia_driver_lib_path "${lib}")"
-        [[ -n "${path}" && -e "${path}" ]] || return 1
-        args_ref+=(-v "${path}:/usr/lib/x86_64-linux-gnu/${lib}:ro")
-    done
-}
-
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 
@@ -155,6 +127,9 @@ version="${VERSION:-}"
 vcs_ref="${VCS_REF:-}"
 build_date="${BUILD_DATE:-}"
 build_type="${LLAMINAR_BUILD_TYPE:-Release}"
+image_variant="${LLAMINAR_IMAGE_VARIANT:-full}"
+enable_cuda="${LLAMINAR_ENABLE_CUDA:-}"
+enable_rocm="${LLAMINAR_ENABLE_ROCM:-}"
 cuda_archs="${LLAMINAR_CUDA_ARCHS:-}"
 skip_integration="${LLAMINAR_SKIP_INTEGRATION:-1}"
 build_rccl_from_source="${LLAMINAR_BUILD_RCCL_FROM_SOURCE:-ON}"
@@ -212,6 +187,23 @@ while (($#)); do
             [[ $# -ge 2 ]] || die "$1 requires a value"
             build_type="$2"
             shift 2
+            ;;
+        --variant)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            image_variant="$2"
+            shift 2
+            ;;
+        --cpu-only)
+            image_variant="cpu"
+            shift
+            ;;
+        --cuda-only)
+            image_variant="cuda"
+            shift
+            ;;
+        --rocm-only)
+            image_variant="rocm"
+            shift
             ;;
         --cuda-archs)
             [[ $# -ge 2 ]] || die "$1 requires a value"
@@ -311,6 +303,45 @@ case "${rccl_enable_msccl_kernel}" in
     ON|OFF|on|off|1|0|TRUE|FALSE|true|false) ;;
     *) die "RCCL_ENABLE_MSCCL_KERNEL must be ON or OFF" ;;
 esac
+case "${image_variant}" in
+    full|cpu|cuda|rocm) ;;
+    *) die "unsupported --variant '${image_variant}' (expected full, cpu, cuda, or rocm)" ;;
+esac
+
+normalize_bool_arg() {
+    case "${1}" in
+        ON|on|1|TRUE|true|YES|yes) printf 'ON' ;;
+        OFF|off|0|FALSE|false|NO|no) printf 'OFF' ;;
+        *) return 1 ;;
+    esac
+}
+
+case "${image_variant}" in
+    full)
+        : "${enable_cuda:=ON}"
+        : "${enable_rocm:=ON}"
+        ;;
+    cpu)
+        : "${enable_cuda:=OFF}"
+        : "${enable_rocm:=OFF}"
+        ;;
+    cuda)
+        : "${enable_cuda:=ON}"
+        : "${enable_rocm:=OFF}"
+        ;;
+    rocm)
+        : "${enable_cuda:=OFF}"
+        : "${enable_rocm:=ON}"
+        ;;
+esac
+enable_cuda="$(normalize_bool_arg "${enable_cuda}")" || die "LLAMINAR_ENABLE_CUDA must be ON or OFF"
+enable_rocm="$(normalize_bool_arg "${enable_rocm}")" || die "LLAMINAR_ENABLE_ROCM must be ON or OFF"
+if [[ "${enable_rocm}" == "OFF" ]]; then
+    build_rccl_from_source="OFF"
+    rccl_only_funcs=""
+    rccl_gpu_targets=""
+    rocm_runtime_gpu_targets=""
+fi
 
 used_default_tag=false
 if ((${#tags[@]} == 0)); then
@@ -357,6 +388,8 @@ cmd=(
     --build-arg "VCS_REF=${vcs_ref}"
     --build-arg "BUILD_DATE=${build_date}"
     --build-arg "LLAMINAR_BUILD_TYPE=${build_type}"
+    --build-arg "LLAMINAR_ENABLE_CUDA=${enable_cuda}"
+    --build-arg "LLAMINAR_ENABLE_ROCM=${enable_rocm}"
     --build-arg "LLAMINAR_SKIP_INTEGRATION=${skip_integration}"
     --build-arg "LLAMINAR_BUILD_RCCL_FROM_SOURCE=${build_rccl_from_source}"
     --build-arg "RCCL_ENABLE_MSCCL_KERNEL=${rccl_enable_msccl_kernel}"
@@ -416,36 +449,8 @@ fi
 
 if [[ "${verify}" == "true" ]]; then
     echo "[build-runtime-image] verifying ${tags[0]} can start /usr/local/bin/llaminar2"
-    if ! docker_supports_nvidia_gpus; then
-        if nvidia_driver_libs_available; then
-            echo "[build-runtime-image] NVIDIA Docker runtime not detected; bind-mounting visible driver libraries from this environment"
-            verify_args=(docker run --rm)
-            append_nvidia_driver_lib_mounts verify_args
-            "${verify_args[@]}" --entrypoint /usr/local/bin/llaminar2 "${tags[0]}" \
-                --help >/dev/null
-        else
-            if [[ "${verify_mode}" == "yes" ]]; then
-                die "--verify requires Docker with the NVIDIA Container Toolkit runtime or visible libcuda/libnvidia-ml driver libraries; install/configure nvidia-container-toolkit or use --no-verify"
-            fi
-            echo "[build-runtime-image] NVIDIA Docker runtime not detected; checking image dependencies without starting the CUDA-linked binary"
-            docker run --rm --entrypoint /bin/sh "${tags[0]}" -lc '
-                missing="$(ldd /usr/local/bin/llaminar2 /usr/local/lib/libllaminar2_core.so | awk "/not found/{print \$1}" | sort -u)"
-                unexpected="$(printf "%s\n" "${missing}" | grep -Ev "^(|libcuda\.so\.1|libnvidia-ml\.so\.1)$" || true)"
-                if [ -n "${unexpected}" ]; then
-                    echo "unexpected missing runtime libraries:"
-                    printf "%s\n" "${unexpected}"
-                    exit 1
-                fi
-                if [ -n "${missing}" ]; then
-                    echo "driver libraries expected from NVIDIA Container Toolkit:"
-                    printf "%s\n" "${missing}"
-                fi
-            '
-        fi
-    else
-        docker run --rm --gpus all --entrypoint /usr/local/bin/llaminar2 "${tags[0]}" \
-            --help >/dev/null
-    fi
+    docker run --rm --entrypoint /usr/local/bin/llaminar2 "${tags[0]}" \
+        --help >/dev/null
 fi
 
-echo "[build-runtime-image] built ${tags[*]}"
+echo "[build-runtime-image] built ${tags[*]} (variant=${image_variant}, cuda=${enable_cuda}, rocm=${enable_rocm})"

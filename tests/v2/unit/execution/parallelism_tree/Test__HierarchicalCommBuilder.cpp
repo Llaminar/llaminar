@@ -10,8 +10,8 @@
  * - CommHierarchy RAII wrapper operations
  * - Full hierarchy building for various tree topologies
  *
- * All tests are pure data-structure tests — no real MPI, no GPU, no model loading.
- * MPI types are mocked when HAVE_MPI is not defined.
+ * These tests run under MPI so CommHierarchy can exercise real communicator
+ * handles. They still do not require GPUs or model loading.
  */
 
 #include <gtest/gtest.h>

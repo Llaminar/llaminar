@@ -14,10 +14,8 @@
 #include <vector>
 #include <cstddef>
 
-#ifdef HAVE_NUMA
 #include <numa.h>
 #include <numaif.h>
-#endif
 
 namespace llaminar2
 {
@@ -200,7 +198,7 @@ namespace llaminar2
         /**
          * @brief Ensure NUMA memory binding is active for the calling thread
          *
-         * Sets numa_set_membind() so all subsequent allocations on this thread
+         * Sets a strict MPOL_BIND policy so all subsequent allocations on this thread
          * land on the NUMA node associated with this factory's MPI rank.
          *
          * Call this before allocating temporary buffers (e.g. file I/O scratch)
@@ -208,7 +206,7 @@ namespace llaminar2
          * internally, but callers who allocate their own buffers before
          * passing data to the factory should call this first.
          *
-         * No-op if NUMA is not available or the factory has no NUMA node.
+         * No-op only when the factory has no NUMA node.
          */
         void ensureNumaBinding();
 
@@ -227,7 +225,7 @@ namespace llaminar2
 
         /**
          * @brief Get NUMA node for current MPI rank
-         * @return NUMA node index, or -1 if NUMA not available
+         * @return NUMA node index, or -1 for single-node/no explicit NUMA binding
          */
         int getNumaNode() const { return numa_node_; }
 
@@ -238,8 +236,8 @@ namespace llaminar2
         int getMPIRank() const { return mpi_rank_; }
 
         /**
-         * @brief Check if NUMA support is available
-         * @return true if libnuma is available and system has multiple NUMA nodes
+         * @brief Check if this system exposes more than one NUMA node
+         * @return true if NUMA policy APIs are available and multiple nodes are configured
          */
         static bool isNumaAvailable();
 

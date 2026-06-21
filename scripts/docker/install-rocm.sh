@@ -5,8 +5,10 @@
 # container; the kernel driver is expected on the host and passed through
 # via /dev/kfd + /dev/dri + the render/video groups.
 #
-# MODE=full     (default) — rocm usecase (HIP compiler, rocBLAS dev, RCCL).
-# MODE=runtime             — rocm-hip-runtime usecase + rocBLAS + RCCL runtime.
+# MODE=full     (default) — AMD's full `rocm` usecase.
+# MODE=build              — minimal compiler/dev package set for building
+#                           Llaminar's ROCm backend and optional RCCL source.
+# MODE=runtime            — minimal runtime package set.
 #
 # gfx906 (MI50) was dropped from ROCm 7.x. We restore support by grafting the
 # gfx906 Tensile library files from Arch Linux's rocBLAS package, which
@@ -31,17 +33,47 @@ apt-get "${APT_OPTS[@]}" update
 apt-get "${APT_OPTS[@]}" install -y --allow-change-held-packages /tmp/amdgpu-install.deb
 rm /tmp/amdgpu-install.deb
 
-if [[ "${MODE}" == "full" ]]; then
-    USECASE="rocm"
-else
-    USECASE="rocm"   # ROCm doesn't ship a split runtime usecase we can rely
-                     # on; the "rocm" usecase installs both compiler and
-                     # runtime. We trim at image-flatten time, not here.
-fi
-
-# --no-dkms: the kernel driver comes from the host; don't rebuild it inside
-# the container.
-amdgpu-install --usecase="${USECASE}" --no-dkms -y
+case "${MODE}" in
+    full)
+        # --no-dkms: the kernel driver comes from the host; don't rebuild it
+        # inside the container.
+        amdgpu-install --usecase=rocm --no-dkms -y
+        ;;
+    build)
+        # Direct package closure needed by CMake:
+        # - hipcc/amdclang + HIP headers/runtime
+        # - hipBLAS/hipBLASLt headers and shared libraries
+        # - ROCm CMake/device libs for HIP and RCCL source builds
+        # - RCCL dev package for headers/system fallback when source build is off
+        apt-get "${APT_OPTS[@]}" update
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+            rocm-llvm \
+            rocm-cmake \
+            rocm-device-libs \
+            hipcc \
+            hipify-clang \
+            hip-dev \
+            hsa-rocr-dev \
+            libdrm-dev \
+            hipblas-dev \
+            hipblaslt-dev \
+            rocblas-dev \
+            rccl-dev \
+            rocminfo \
+            rocm-smi-lib
+        ;;
+    runtime)
+        apt-get "${APT_OPTS[@]}" update
+        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages \
+            hipblas \
+            rocminfo \
+            rocm-smi-lib
+        ;;
+    *)
+        echo "Unknown MODE='${MODE}' (expected full, build, or runtime)" >&2
+        exit 2
+        ;;
+esac
 
 # Restore gfx906 (MI50 / Vega 20) Tensile kernels removed in ROCm 7.x.
 apt-get "${APT_OPTS[@]}" install -y --no-install-recommends --allow-change-held-packages zstd

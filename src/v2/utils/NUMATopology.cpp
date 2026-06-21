@@ -21,7 +21,6 @@
 // When both are enabled, use extern declarations from GPUEnumeration.h instead
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
 #include <cuda_runtime.h>
-#include <nvml.h>
 #endif
 
 #if defined(HAVE_ROCM) && !defined(HAVE_CUDA)
@@ -331,23 +330,14 @@ namespace llaminar2
 // When both CUDA and ROCm are enabled, we can't include CUDA headers (conflicts with HIP)
 // Use sysfs-only detection in that case
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-        // Try NVML first (most reliable)
-        int node = NUMATopology::detectGPUViaNVML(cuda_device_id);
-        if (node >= 0)
-        {
-            info.numa_node = node;
-            info.affinity_detected = true;
-            info.detection_method = "nvml";
-            LOG_DEBUG("[NUMATopology] CUDA GPU " << cuda_device_id << " on NUMA node " << node << " (via NVML)");
-            return info;
-        }
-
-        // Try sysfs fallback
+        // Use sysfs via CUDA's PCI IDs. This avoids a load-time dependency on
+        // libnvidia-ml.so.1 so CUDA-enabled builds can still start on CPU-only
+        // hosts.
         std::string pci_bus = NUMATopology::getCUDAPCIBusID(cuda_device_id);
         if (!pci_bus.empty())
         {
             info.pci_bus_id = pci_bus;
-            node = NUMATopology::detectGPUViaSysfs(pci_bus);
+            int node = NUMATopology::detectGPUViaSysfs(pci_bus);
             if (node >= 0)
             {
                 info.numa_node = node;
@@ -391,41 +381,8 @@ namespace llaminar2
     int NUMATopology::detectGPUViaNVML(int cuda_device_id)
     {
 #if defined(HAVE_CUDA) && !defined(HAVE_ROCM)
-        // Initialize NVML
-        nvmlReturn_t result = nvmlInit();
-        if (result != NVML_SUCCESS)
-        {
-            LOG_DEBUG("[NUMATopology] NVML init failed: " << nvmlErrorString(result));
-            return -1;
-        }
-
-        nvmlDevice_t device;
-        result = nvmlDeviceGetHandleByIndex(cuda_device_id, &device);
-        if (result != NVML_SUCCESS)
-        {
-            nvmlShutdown();
-            return -1;
-        }
-
-        // Get PCIe info
-        nvmlPciInfo_t pci_info;
-        result = nvmlDeviceGetPciInfo(device, &pci_info);
-        if (result != NVML_SUCCESS)
-        {
-            nvmlShutdown();
-            return -1;
-        }
-
-        // Get NUMA node from PCIe topology
-        unsigned int numa_node;
-        result = nvmlDeviceGetNumaNodeId(device, &numa_node); // Correct function name
-        nvmlShutdown();
-
-        if (result == NVML_SUCCESS && numa_node != (unsigned int)-1) // Use -1 for unknown
-        {
-            return static_cast<int>(numa_node);
-        }
 #endif
+        (void)cuda_device_id;
         return -1;
     }
 

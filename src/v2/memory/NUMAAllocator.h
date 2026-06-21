@@ -3,14 +3,14 @@
  * @brief NUMA-aware memory allocation for cross-socket CPU tensor parallelism
  *
  * Provides NUMA-local buffer allocation with first-touch initialization,
- * aligned allocation for SIMD operations, and fallback to standard allocation
- * when NUMA is unavailable.
+ * aligned allocation for SIMD operations, and explicit failure when requested
+ * NUMA placement cannot be applied.
  *
  * Key features:
  * - Allocates memory on specific NUMA nodes
  * - First-touch initialization for proper NUMA placement
  * - Aligned allocation for SIMD operations (64-byte cache line)
- * - Fallback to standard allocation if NUMA unavailable
+ * - Fails allocation rather than silently degrading NUMA placement
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -24,6 +24,7 @@
 #include <vector>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -38,7 +39,7 @@ namespace llaminar2
      * - Allocates memory on specific NUMA nodes
      * - First-touch initialization for proper NUMA placement
      * - Aligned allocation for SIMD operations
-     * - Fallback to standard allocation if NUMA unavailable
+     * - Fails allocation rather than silently degrading NUMA placement
      */
     class NUMAAllocator
     {
@@ -102,7 +103,7 @@ namespace llaminar2
 
         /**
          * Get the NUMA node for the current thread
-         * @return NUMA node ID, or 0 if NUMA unavailable
+         * @return NUMA node ID, or 0 if the current CPU cannot be resolved
          */
         int getCurrentNUMANode() const;
 
@@ -114,7 +115,7 @@ namespace llaminar2
         int getNUMANodeForAddress(const void *ptr) const;
 
         /**
-         * Check if NUMA support is available
+         * Check if NUMA policy APIs are available at runtime
          */
         bool isNUMAAvailable() const { return numa_available_; }
 
@@ -161,10 +162,12 @@ namespace llaminar2
         // Track allocations per node for stats
         mutable std::mutex stats_mutex_;
         std::vector<size_t> allocated_per_node_;
-
-        // Fallback allocation when NUMA unavailable
-        void *fallbackAlloc(size_t bytes, size_t alignment);
-        void fallbackFree(void *ptr, size_t bytes);
+        struct AllocationRecord
+        {
+            int node = -1;
+            size_t bytes = 0;
+        };
+        std::unordered_map<void *, AllocationRecord> allocation_records_;
 
         // Internal helpers
         void initializeNUMA();

@@ -830,6 +830,10 @@ namespace llaminar2::test::parity::qwen2
                 config_.model_path = cfg().model_path;
             if (!cfg().snapshot_dir.empty())
                 config_.snapshot_dir = cfg().snapshot_dir;
+            if (!cfg().prompt.empty())
+                config_.prompt = cfg().prompt;
+            if (!cfg().token_ids.empty())
+                config_.token_ids = cfg().token_ids;
             if (cfg().decode_steps > 0)
                 config_.decode_steps = cfg().decode_steps;
         }

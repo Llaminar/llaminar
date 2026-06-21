@@ -3,7 +3,7 @@
  * @brief CUDA GPU device context with dedicated worker thread
  *
  * This class implements the IWorkerGPUContext interface for NVIDIA GPUs.
- * It owns a dedicated worker thread that holds the CUDA primary context,
+ * It owns a dedicated worker thread that initializes the CUDA runtime context,
  * ensuring all CUDA operations are executed from a single thread to avoid
  * context switching overhead and thread-safety issues.
  *
@@ -34,7 +34,7 @@ namespace llaminar2
      *
      * This class provides:
      * - Dedicated worker thread for all CUDA operations
-     * - CUDA primary context retention via driver API
+     * - CUDA runtime context initialization
      * - cuBLAS handle creation and management
      * - Stream and event creation/destruction
      * - Thread-safe work submission via submitAndWait() / submitAsync()
@@ -76,7 +76,7 @@ namespace llaminar2
          * @brief Destructor - shuts down worker thread and releases resources
          *
          * Signals the worker thread to exit, waits for it to complete, and
-         * releases all CUDA resources (stream, cuBLAS handle, context).
+         * releases CUDA resources (stream and cuBLAS handles).
          */
         ~NvidiaDeviceContext() override;
 
@@ -173,7 +173,6 @@ namespace llaminar2
          *
          * Called from workerLoop() to:
          * - Set CUDA device via cudaSetDevice()
-         * - Retain primary context via cuDevicePrimaryCtxRetain()
          * - Create default stream
          * - Create cuBLAS handle
          * - Query device name
@@ -186,7 +185,7 @@ namespace llaminar2
          * Called from workerLoop() before exit to:
          * - Destroy cuBLAS handle
          * - Destroy default stream
-         * - Release primary context (if retained)
+         * - Destroy default stream
          */
         void cleanupOnWorker();
 
@@ -205,7 +204,6 @@ namespace llaminar2
         cudaStream_t default_stream_ = nullptr;
         cublasHandle_t cublas_handle_ = nullptr;
         cublasLtHandle_t cublas_lt_handle_ = nullptr;
-        void *cuda_context_ = nullptr; // CUcontext from driver API
         void *nccl_comm_ = nullptr;
 
         // =========================================================================

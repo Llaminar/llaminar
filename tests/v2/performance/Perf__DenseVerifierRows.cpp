@@ -1325,8 +1325,8 @@ namespace
         const std::string &backend,
         const DensePrefixRestoreParityCase &test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
 
         DenseVerifierEconomyFixture fixture =
             prepareDenseVerifierEconomyFixture(

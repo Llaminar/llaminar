@@ -22,9 +22,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdlib>
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 namespace llaminar2
 {
@@ -56,9 +54,7 @@ namespace llaminar2
         if (config.n_threads > 0)
         {
             setenv("OMP_NUM_THREADS", std::to_string(config.n_threads).c_str(), 1);
-#ifdef _OPENMP
             omp_set_num_threads(config.n_threads);
-#endif
         }
 
         // Check OMP_NUM_THREADS

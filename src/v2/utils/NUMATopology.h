@@ -39,7 +39,7 @@ namespace llaminar2
         int numa_node;                  ///< NUMA node GPU is affine to (-1 if unknown)
         std::string pci_bus_id;         ///< PCIe bus ID (e.g., "0000:3b:00.0")
         bool affinity_detected = false; ///< Whether affinity was successfully detected
-        std::string detection_method;   ///< How affinity was detected ("nvml", "sysfs", "fallback")
+        std::string detection_method;   ///< How affinity was detected ("sysfs", "fallback")
     };
 
     /**
@@ -53,9 +53,8 @@ namespace llaminar2
      * Detection methods (in priority order):
      * 1. hwloc library (most reliable, optional dependency)
      * 2. /proc/self/status (Linux-specific)
-     * 3. NVML for GPUs (CUDA only)
-     * 4. /sys/bus/pci/devices/PCIBUSID/numa_node (Linux sysfs)
-     * 5. Fallback to node 0 (single-socket assumption)
+     * 3. /sys/bus/pci/devices/PCIBUSID/numa_node (Linux sysfs)
+     * 4. Fallback to node 0 (single-socket assumption)
      */
     class NUMATopology
     {
@@ -82,8 +81,8 @@ namespace llaminar2
         /**
          * @brief Detect NUMA node for CUDA GPU
          *
-         * Uses NVML (nvidia-ml library) to query GPU's PCIe NUMA affinity.
-         * Falls back to node 0 if NVML unavailable or detection fails.
+         * Uses CUDA PCI IDs plus Linux sysfs to query GPU NUMA affinity.
+         * Falls back to node 0 if detection fails.
          *
          * @param cuda_device_id CUDA device ID (0-indexed)
          * @return GPU NUMA info with detection status
@@ -161,7 +160,7 @@ namespace llaminar2
         static int getNumNodesViaSysfs();
 
         /**
-         * @brief Detect GPU NUMA node via NVML
+         * @brief Deprecated NVML detection shim; returns -1.
          *
          * @param cuda_device_id CUDA device ID
          * @return NUMA node or -1 if detection failed

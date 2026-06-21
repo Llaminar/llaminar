@@ -154,10 +154,10 @@ namespace llaminar2::test::parity::qwen36
                   << " elapsed_ms=" << ms << '\n';
     }
 
-    class ScopedMoEParityDeterministicMode
+    class ScopedMoEParityProductionMode
     {
     public:
-        explicit ScopedMoEParityDeterministicMode(bool enabled)
+        explicit ScopedMoEParityProductionMode(bool enabled)
             : enabled_(enabled)
         {
             if (!enabled_)
@@ -175,15 +175,15 @@ namespace llaminar2::test::parity::qwen36
             old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
 #endif
 
-            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
 #ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(true);
+            cudaNativeVNNIPrefill_setDeterministicMode(false);
 #endif
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
-        ~ScopedMoEParityDeterministicMode()
+        ~ScopedMoEParityProductionMode()
         {
             if (!enabled_)
             {
@@ -205,8 +205,8 @@ namespace llaminar2::test::parity::qwen36
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
-        ScopedMoEParityDeterministicMode(const ScopedMoEParityDeterministicMode &) = delete;
-        ScopedMoEParityDeterministicMode &operator=(const ScopedMoEParityDeterministicMode &) = delete;
+        ScopedMoEParityProductionMode(const ScopedMoEParityProductionMode &) = delete;
+        ScopedMoEParityProductionMode &operator=(const ScopedMoEParityProductionMode &) = delete;
 
     private:
         bool enabled_ = false;
@@ -259,19 +259,14 @@ namespace llaminar2::test::parity::qwen36
         bool old_grouped_prefill_ = false;
     };
 
-    inline bool shouldUseMoEParityDeterministicMode(
-        const MoEPrefixRestoreParityCase &test_case)
+    inline bool shouldForceMoEParityProductionMode(
+        const MoEPrefixRestoreParityCase &)
     {
         /*
-         * Real-model parity compares exact greedy token streams.  CUDA and
-         * ROCm both have tuned MoE decode kernels that may change FP reduction
-         * order outside deterministic mode; near-tie logits can then select a
-         * different, still-plausible token and make the test flaky.  Keep the
-         * parity harness deterministic on every GPU backend and reserve the
-         * faster non-deterministic paths for benchmark gates.
+         * Real-model parity is a production-path canary. Force deterministic
+         * mode off even if the surrounding shell exports LLAMINAR_DETERMINISTIC.
          */
-        return test_case.required_cuda_devices > 0 ||
-               test_case.required_rocm_devices > 0;
+        return true;
     }
 
     inline ExpertComputeDomain localTPMoEDomain(
@@ -894,8 +889,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         PrefixRestoreParityMode mode)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -998,8 +993,8 @@ namespace llaminar2::test::parity::qwen36
         bool enable_prefix_cache,
         int mtp_draft_tokens = 1)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -1109,8 +1104,8 @@ namespace llaminar2::test::parity::qwen36
         int draft_depth = 1,
         bool require_accepted_draft_after_reuse = false)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         ASSERT_EQ(test_case.topology, MoEPrefixParityTopology::SingleDevice)
             << "MoE stochastic MTP verifier parity is currently single-device only";
 
@@ -1321,8 +1316,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runMoEGreedyFreshRunnerDeterminism(
         const MoEPrefixRestoreParityCase &test_case)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -2544,8 +2539,8 @@ namespace llaminar2::test::parity::qwen36
         bool verify_device_resident_publication = false,
         bool expect_grouped_moe_verifier_prefill = false)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -3444,8 +3439,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         int verifier_row_count)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -3736,8 +3731,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         int verifier_row_count)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -4040,8 +4035,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         int decode_token_budget)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -4372,11 +4367,11 @@ namespace llaminar2::test::parity::qwen36
         int mtp_draft_tokens = 1,
         MTPDepthPolicyConfig mtp_depth_policy = {},
         bool allow_reference_prefix_only = false,
-        bool use_deterministic_mode = true)
+        bool force_production_mode = true)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            use_deterministic_mode &&
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            force_production_mode &&
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -5129,8 +5124,8 @@ namespace llaminar2::test::parity::qwen36
         int decode_token_budget,
         int repetitions = 3)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -5301,8 +5296,8 @@ namespace llaminar2::test::parity::qwen36
         const MoEPrefixRestoreParityCase &test_case,
         int decode_token_budget)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -5366,8 +5361,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runMoEIncrementalDecodeMatchesFullContext(
         const MoEPrefixRestoreParityCase &test_case)
     {
-        ScopedMoEParityDeterministicMode deterministic_mode(
-            shouldUseMoEParityDeterministicMode(test_case));
+        ScopedMoEParityProductionMode production_mode(
+            shouldForceMoEParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;

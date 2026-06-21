@@ -36,15 +36,7 @@
 #include <string>
 #include <vector>
 
-#ifdef HAVE_MPI
 #include <mpi.h>
-#else
-// Mock MPI types for unit testing without MPI
-using MPI_Comm = int;
-#define MPI_COMM_WORLD 0
-#define MPI_COMM_NULL (-1)
-#define MPI_UNDEFINED (-2)
-#endif
 
 namespace llaminar2
 {

@@ -4,7 +4,7 @@
  *
  * This file implements the NvidiaDeviceContext class, which provides:
  * - Dedicated worker thread for all CUDA operations
- * - CUDA primary context retention via driver API
+ * - CUDA runtime context initialization
  * - cuBLAS handle creation and management
  * - Stream and event creation/destruction
  *
@@ -15,7 +15,6 @@
 #include "NvidiaDeviceContext.h"
 #include "CUDAGraphCapture.h"
 #include "../../utils/Logger.h"
-#include <cuda.h> // For cuDevicePrimaryCtxRetain, cuCtxSetCurrent
 #include <sstream>
 #include <stdexcept>
 
@@ -224,43 +223,10 @@ namespace llaminar2
         // Step 1: Set CUDA device via runtime API
         CUDA_CHECK(cudaSetDevice(device_ordinal_));
 
-        // Step 2: Retain primary context via driver API for robustness
-        // This ensures the context persists even if the runtime API releases it
-        CUdevice cu_device;
-        CUresult cu_err = cuDeviceGet(&cu_device, device_ordinal_);
-        if (cu_err != CUDA_SUCCESS)
-        {
-            LOG_WARN("[NvidiaDeviceContext] cuDeviceGet failed: " << cu_err
-                                                                  << " (continuing with runtime API only)");
-        }
-        else
-        {
-            CUcontext ctx;
-            cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
-            if (cu_err != CUDA_SUCCESS)
-            {
-                LOG_WARN("[NvidiaDeviceContext] cuDevicePrimaryCtxRetain failed: " << cu_err);
-            }
-            else
-            {
-                cu_err = cuCtxSetCurrent(ctx);
-                if (cu_err != CUDA_SUCCESS)
-                {
-                    LOG_WARN("[NvidiaDeviceContext] cuCtxSetCurrent failed: " << cu_err);
-                }
-                else
-                {
-                    cuda_context_ = ctx;
-                    LOG_TRACE("[NvidiaDeviceContext] Retained CUDA primary context for device "
-                              << device_ordinal_);
-                }
-            }
-        }
-
-        // Step 3: Create default stream (non-blocking for better concurrency)
+        // Step 2: Create default stream (non-blocking for better concurrency)
         CUDA_CHECK(cudaStreamCreateWithFlags(&default_stream_, cudaStreamNonBlocking));
 
-        // Step 4: Create cuBLAS handle
+        // Step 3: Create cuBLAS handle
         cublasStatus_t cublas_status = cublasCreate(&cublas_handle_);
         if (cublas_status != CUBLAS_STATUS_SUCCESS)
         {
@@ -276,7 +242,7 @@ namespace llaminar2
             // Non-fatal - continue with default stream
         }
 
-        // Step 5: Query device name
+        // Step 4: Query device name
         cudaDeviceProp props;
         CUDA_CHECK(cudaGetDeviceProperties(&props, device_ordinal_));
         device_name_ = props.name;
@@ -286,7 +252,7 @@ namespace llaminar2
         LOG_TRACE("[NvidiaDeviceContext] - Default stream: " << default_stream_);
         LOG_TRACE("[NvidiaDeviceContext] - cuBLAS handle: " << cublas_handle_);
 
-        // Step 6: Create cuBLASLt handle (for fused GEMM operations)
+        // Step 5: Create cuBLASLt handle (for fused GEMM operations)
         cublasStatus_t cublas_lt_status = cublasLtCreate(&cublas_lt_handle_);
         if (cublas_lt_status != CUBLAS_STATUS_SUCCESS)
         {

@@ -64,6 +64,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
 option(HAVE_CUDA "Enable CUDA backend" ON)
 option(HAVE_ROCM "Enable ROCm backend" ON)
 option(HAVE_VULKAN "Enable Vulkan backend" OFF)
+option(LLAMINAR_BUILD_TESTS "Configure and build Llaminar V2 tests" ON)
 
 set(LLAMINAR_SHARED_CORE_DEFAULT OFF)
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -92,6 +93,43 @@ option(USE_ONEDNN "Enable OneDNN for INT8 GEMM acceleration" ON)
 # Attention input dumping (for debugging JIT kernel issues)
 # When enabled, dumps Q/K/V/mask inputs to disk for each JIT attention invocation
 option(DUMP_ATTENTION_INPUTS "Dump attention kernel inputs to disk for debugging" OFF)
+
+# =============================================================================
+# Required Platform Dependencies
+# =============================================================================
+find_package(MPI REQUIRED COMPONENTS CXX)
+find_package(OpenMP REQUIRED COMPONENTS CXX)
+
+if(NOT MPIEXEC_EXECUTABLE)
+    message(FATAL_ERROR "Llaminar requires OpenMPI, but CMake did not find an MPI launcher")
+endif()
+
+execute_process(
+    COMMAND "${MPIEXEC_EXECUTABLE}" --version
+    RESULT_VARIABLE LLAMINAR_MPIEXEC_VERSION_RESULT
+    OUTPUT_VARIABLE LLAMINAR_MPIEXEC_VERSION_OUTPUT
+    ERROR_VARIABLE LLAMINAR_MPIEXEC_VERSION_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_STRIP_TRAILING_WHITESPACE)
+set(LLAMINAR_MPIEXEC_VERSION_TEXT "${LLAMINAR_MPIEXEC_VERSION_OUTPUT}\n${LLAMINAR_MPIEXEC_VERSION_ERROR}")
+if(NOT LLAMINAR_MPIEXEC_VERSION_RESULT EQUAL 0 OR
+   NOT LLAMINAR_MPIEXEC_VERSION_TEXT MATCHES "Open MPI|OpenRTE")
+    message(FATAL_ERROR
+        "Llaminar requires OpenMPI. Found MPI launcher '${MPIEXEC_EXECUTABLE}', "
+        "but '${MPIEXEC_EXECUTABLE} --version' did not report Open MPI.\n"
+        "Output:\n${LLAMINAR_MPIEXEC_VERSION_TEXT}")
+endif()
+string(REGEX MATCH "^[^\n]+" LLAMINAR_OPENMPI_VERSION_LINE "${LLAMINAR_MPIEXEC_VERSION_TEXT}")
+message(STATUS "V2: ${LLAMINAR_OPENMPI_VERSION_LINE}")
+
+find_path(NUMA_INCLUDE_DIR NAMES numa.h)
+find_library(NUMA_LIBRARY NAMES numa)
+if(NOT NUMA_INCLUDE_DIR OR NOT NUMA_LIBRARY)
+    message(FATAL_ERROR
+        "Llaminar requires libnuma headers and library. Install libnuma-dev/numactl-devel.")
+endif()
+message(STATUS "V2: Found libnuma include: ${NUMA_INCLUDE_DIR}")
+message(STATUS "V2: Found libnuma library: ${NUMA_LIBRARY}")
 
 # =============================================================================
 # GPU Backend Configuration (Phase 6: Multi-GPU)
@@ -141,14 +179,35 @@ if(HAVE_CUDA)
         endif()
     endif()
     
-    # CUDA compile flags (CUDA 13.0+ dropped sm_70 Volta support)
-    # RTX 3090 = sm_86 (Ampere)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -arch=sm_75")  # Base: Turing
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_75,code=sm_75")  # Turing (RTX 20xx)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_80,code=sm_80")  # Ampere (A100)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_86,code=sm_86")  # Ampere (RTX 30xx)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_89,code=sm_89")  # Ada (RTX 40xx)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -gencode=arch=compute_90,code=sm_90")  # Hopper (H100)
+    # CUDA compile flags. NativeVNNI prefill uses Ampere+ ldmatrix/mma.sync
+    # instructions guarded by __CUDA_ARCH__ >= 800, so a CUDA build must include
+    # at least one SM80+ target. A stale pre-Ampere-only cache compiles the kernel
+    # body to no-ops and returns all-zero GEMM outputs.
+    # Honor CMAKE_CUDA_ARCHITECTURES so release images can be built for a
+    # specific fleet or a local smoke-test GPU without forcing a broad fatbin.
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
+    endif()
+    set(LLAMINAR_HAS_AMPERE_CUDA_ARCH OFF)
+    foreach(LLAMINAR_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+        string(TOLOWER "${LLAMINAR_CUDA_ARCH}" LLAMINAR_CUDA_ARCH_LOWER)
+        if(LLAMINAR_CUDA_ARCH_LOWER MATCHES "^(all|all-major|native)$")
+            set(LLAMINAR_HAS_AMPERE_CUDA_ARCH ON)
+        else()
+            string(REGEX REPLACE "-.*$" "" LLAMINAR_CUDA_ARCH_NUMBER "${LLAMINAR_CUDA_ARCH_LOWER}")
+            if(LLAMINAR_CUDA_ARCH_NUMBER MATCHES "^[0-9]+$" AND LLAMINAR_CUDA_ARCH_NUMBER GREATER_EQUAL 80)
+                set(LLAMINAR_HAS_AMPERE_CUDA_ARCH ON)
+            endif()
+        endif()
+    endforeach()
+    if(NOT LLAMINAR_HAS_AMPERE_CUDA_ARCH)
+        message(FATAL_ERROR
+            "V2: CUDA NativeVNNI requires compiling at least one SM80+ architecture. "
+            "Current CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'. "
+            "Reconfigure with -DCMAKE_CUDA_ARCHITECTURES='80;86;89;90' or a local "
+            "SM80+ value such as 86.")
+    endif()
+    message(STATUS "V2: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     
     # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
@@ -300,6 +359,7 @@ if(HAVE_CUDA)
     set_target_properties(cuda_backend PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
@@ -322,14 +382,10 @@ if(HAVE_CUDA)
     
     # Link CUDA libraries:
     # - cudart: CUDA Runtime API (for memory management, streams, etc.)
-    # - nvrtc: NVRTC runtime compiler (for JIT kernel compilation)
-    # - cuda: CUDA Driver API (for cuLaunchKernel, cuModuleLoad, etc.)
     # - cublas: cuBLAS library for dense GEMM (FP32/FP16/BF16)
     # - cublasLt: cuBLAS Light for fused GEMM+bias operations
     target_link_libraries(cuda_backend PUBLIC 
         CUDA::cudart
-        CUDA::nvrtc
-        CUDA::cuda_driver
         CUDA::cublas
         CUDA::cublasLt
     )
@@ -382,14 +438,6 @@ if(HAVE_CUDA)
         
         # CUTLASS requires C++17 minimum, we use C++23 for stacktrace
         target_compile_features(cuda_backend PUBLIC cxx_std_23)
-        
-        # Add CUTLASS NVCC flags for Tensor Cores
-        # SM 86 = RTX 3090 (Ampere), SM 80 = A100, SM 75 = Turing
-        target_compile_options(cuda_backend PRIVATE
-            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_75,code=sm_75>  # Turing
-            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_80,code=sm_80>  # Ampere A100
-            $<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_86,code=sm_86>  # Ampere RTX 3090
-        )
         
         message(STATUS "V2: CUTLASS Tensor Core support enabled (Phase 2)")
     else()
@@ -878,6 +926,7 @@ if(HAVE_CUDA)
     set_target_properties(device_benchmarks PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
         CUDA_RESOLVE_DEVICE_SYMBOLS ON
+        CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
         set_property(TARGET device_benchmarks PROPERTY JOB_POOL_LINK nvlink_pool)
@@ -892,7 +941,7 @@ target_include_directories(device_benchmarks PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(device_benchmarks PRIVATE OpenMP::OpenMP_CXX)
 
 if(HAVE_CUDA)
-    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart CUDA::cuda_driver)
+    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart)
     target_compile_definitions(device_benchmarks PRIVATE HAVE_CUDA=1)
 endif()
 
@@ -1685,24 +1734,13 @@ else()
     target_compile_definitions(llaminar2_core PUBLIC LLAMINAR_DISABLE_STACKTRACE)
 endif()
 
-# Dependencies
-find_package(MPI REQUIRED)
-find_package(OpenMP REQUIRED COMPONENTS CXX)
-message(STATUS "V2: MPI enabled (required dependency)")
-
-# Generate microkernel instantiations (auto-run Python script at configure time)
-find_library(NUMA_LIBRARY NAMES numa)
-if(NUMA_LIBRARY)
-    message(STATUS "Found libnuma: ${NUMA_LIBRARY}")
-    target_compile_definitions(llaminar2_core PUBLIC HAVE_NUMA)
-    target_link_libraries(llaminar2_core PUBLIC ${NUMA_LIBRARY})
-else()
-    message(STATUS "libnuma not found - NUMA-aware allocation disabled")
-endif()
+# Required dependencies
+target_include_directories(llaminar2_core PUBLIC ${NUMA_INCLUDE_DIR})
 
 target_link_libraries(llaminar2_core PUBLIC
     MPI::MPI_CXX
     OpenMP::OpenMP_CXX
+    ${NUMA_LIBRARY}
     ftxui::screen
     ftxui::dom
     ftxui::component
@@ -1807,9 +1845,8 @@ if(HAVE_CUDA)
         CUDA::cudart 
         CUDA::cublas
         CUDA::cublasLt  # For fused GEMM+bias operations
-        CUDA::nvml  # For GPU NUMA node detection
     )
-    message(STATUS "V2: Linked CUDA runtime, cuBLAS, cuBLASLt, and NVML")
+    message(STATUS "V2: Linked CUDA runtime, cuBLAS, and cuBLASLt")
     
     # NOTE: NCCL is linked to cuda_backend (not llaminar2_core) to isolate symbols
     # from RCCL. Both export identical symbols and would conflict if in same library.
@@ -1884,21 +1921,23 @@ if(HAVE_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../../benchmarks/v2/gemm_sw
         CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
 endif()
 
-# Enable testing for V2
-# Release builds only include performance tests; all other builds include everything.
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
-    set(V2_PERF_TESTS_ONLY ON)
-else()
-    set(V2_PERF_TESTS_ONLY OFF)
+# Enable testing for V2.
+if(LLAMINAR_BUILD_TESTS)
+    # Release builds only include performance tests; all other builds include everything.
+    if(CMAKE_BUILD_TYPE STREQUAL "Release")
+        set(V2_PERF_TESTS_ONLY ON)
+    else()
+        set(V2_PERF_TESTS_ONLY OFF)
+    endif()
+
+    enable_testing()
+
+    # V2 Tests
+    # Include test subdirectory (unit, integration, e2e, pytorch_parity, performance)
+    # Note: The source tree is at ../../tests/v2 relative to src/v2
+    # In Release mode, V2_PERF_TESTS_ONLY=ON skips non-perf targets.
+    add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
 endif()
-
-enable_testing()
-
-# V2 Tests
-# Include test subdirectory (unit, integration, e2e, pytorch_parity, performance)
-# Note: The source tree is at ../../tests/v2 relative to src/v2
-# In Release mode, V2_PERF_TESTS_ONLY=ON skips non-perf targets.
-add_subdirectory(../../tests/v2 ${CMAKE_BINARY_DIR}/tests/v2)
 
 # TODO: GPU backends (CUDA, ROCm, Vulkan) - not yet implemented
 # TODO: Intel MKL backend - not yet implemented

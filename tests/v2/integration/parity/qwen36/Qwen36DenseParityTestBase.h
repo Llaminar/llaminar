@@ -230,10 +230,10 @@ namespace llaminar2::test::parity::qwen36
             << context << " hit MTP transaction validation failures";
     }
 
-    class ScopedDenseParityDeterministicMode
+    class ScopedDenseParityProductionMode
     {
     public:
-        explicit ScopedDenseParityDeterministicMode(bool enabled)
+        explicit ScopedDenseParityProductionMode(bool enabled)
             : enabled_(enabled)
         {
             if (!enabled_)
@@ -251,15 +251,15 @@ namespace llaminar2::test::parity::qwen36
             old_cuda_prefill_deterministic_ = cudaNativeVNNIPrefill_getDeterministicMode();
 #endif
 
-            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            setenv("LLAMINAR_DETERMINISTIC", "0", 1);
             mutableDebugEnv().reload();
 #ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(true);
+            cudaNativeVNNIPrefill_setDeterministicMode(false);
 #endif
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
-        ~ScopedDenseParityDeterministicMode()
+        ~ScopedDenseParityProductionMode()
         {
             if (!enabled_)
             {
@@ -281,8 +281,8 @@ namespace llaminar2::test::parity::qwen36
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
-        ScopedDenseParityDeterministicMode(const ScopedDenseParityDeterministicMode &) = delete;
-        ScopedDenseParityDeterministicMode &operator=(const ScopedDenseParityDeterministicMode &) = delete;
+        ScopedDenseParityProductionMode(const ScopedDenseParityProductionMode &) = delete;
+        ScopedDenseParityProductionMode &operator=(const ScopedDenseParityProductionMode &) = delete;
 
     private:
         bool enabled_ = false;
@@ -293,7 +293,7 @@ namespace llaminar2::test::parity::qwen36
 #endif
     };
 
-    inline bool shouldUseDenseParityDeterministicMode(
+    inline bool isDenseGpuParityCase(
         const DensePrefixRestoreParityCase &test_case)
     {
         if (test_case.required_cuda_devices > 0)
@@ -312,6 +312,12 @@ namespace llaminar2::test::parity::qwen36
                 return device.device_type == DeviceType::CUDA ||
                        device.device_type == DeviceType::ROCm;
             });
+    }
+
+    inline bool shouldForceDenseParityProductionMode(
+        const DensePrefixRestoreParityCase &)
+    {
+        return true;
     }
 
     inline std::string firstEnvOrDefault(
@@ -2064,8 +2070,8 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case,
         PrefixRestoreParityMode mode)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -2132,8 +2138,8 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case,
         int split_tokens)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         std::string model_path;
         std::vector<int32_t> prompt_tokens;
         std::vector<int32_t> expected_tokens;
@@ -2181,8 +2187,8 @@ namespace llaminar2::test::parity::qwen36
         int mtp_draft_tokens = 1,
         MTPDepthPolicyConfig depth_policy = {})
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
 
@@ -2284,8 +2290,8 @@ namespace llaminar2::test::parity::qwen36
         DensePrefixRestoreParityCase test_case,
         int mtp_draft_tokens = 3)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_GE(mtp_draft_tokens, 1);
         ASSERT_LE(mtp_draft_tokens, 3);
 
@@ -2394,8 +2400,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseMTPFirstTransactionLeavesSequentialState(
         DensePrefixRestoreParityCase test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
 
         test_case.name += " first MTP transaction leaves sequential state";
         test_case.decode_steps = std::max(test_case.decode_steps, 8);
@@ -2492,8 +2498,8 @@ namespace llaminar2::test::parity::qwen36
         DensePrefixRestoreParityCase test_case,
         int decode_steps = 8)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_GE(decode_steps, 1);
 
         test_case.name += " Phase13.8 no-MTP continuation parity";
@@ -2612,8 +2618,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseNoMTPPhase138ThinkContinuationStageParity(
         DensePrefixRestoreParityCase test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
 
         test_case.name += " Phase13.8 no-MTP think continuation stage parity";
         test_case.decode_steps = std::max(test_case.decode_steps, 8);
@@ -2678,7 +2684,7 @@ namespace llaminar2::test::parity::qwen36
         runner->enableSnapshotCapture();
         DenseDecodeSnapshotComparisonPolicy snapshot_policy;
         snapshot_policy.layer_count = test_case.main_layers;
-        if (shouldUseDenseParityDeterministicMode(test_case))
+        if (isDenseGpuParityCase(test_case))
         {
             /*
              * This regression is about no-MTP continuation state around the
@@ -2727,8 +2733,8 @@ namespace llaminar2::test::parity::qwen36
         DensePrefixRestoreParityCase test_case,
         bool enable_prefix_cache = false)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         const int adaptive_max_depth = enable_prefix_cache ? 1 : 2;
         MTPDepthPolicyConfig depth_policy;
         depth_policy.mode = MTPDepthPolicyMode::Dynamic;
@@ -2801,8 +2807,8 @@ namespace llaminar2::test::parity::qwen36
         int decode_token_budget = 16,
         int reused_cycle_count = 2)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_GT(decode_token_budget, 0);
         ASSERT_GT(reused_cycle_count, 0);
 
@@ -3094,8 +3100,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseBenchmarkStyleDynamicMTPParity(
         DensePrefixRestoreParityCase test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         test_case.name += " benchmark-style dynamic MTP parity";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = 128;
@@ -3389,8 +3395,8 @@ namespace llaminar2::test::parity::qwen36
         MTPDepthPolicyConfig depth_policy,
         const std::string &label)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         test_case.name += " benchmark-style " + label + " MTP parity";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = qwen36BenchmarkPromptStableExactDecodeSteps(test_case);
@@ -3558,8 +3564,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseOneRowRestoreLongPrefixMatchesSequential(
         DensePrefixRestoreParityCase test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         test_case.name += " dense long-prefix one-row restore parity";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = 128;
@@ -3688,8 +3694,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseBenchmarkPromptKnownWindowPyTorchTokenParity(
         DensePrefixRestoreParityCase test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         test_case.name += " dense benchmark-prompt known-window PyTorch token parity";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = 128;
@@ -3874,8 +3880,8 @@ namespace llaminar2::test::parity::qwen36
         DensePrefixRestoreParityCase test_case,
         int decode_steps = 128)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         test_case.name += " dense MTP-enabled forward-only parity";
         test_case.prompt = qwen36DefaultBenchmarkPrompt();
         test_case.decode_steps = decode_steps;
@@ -4037,8 +4043,8 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case,
         int verifier_row_count)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_GE(verifier_row_count, 1)
             << "decode-equivalent verifier-row proof must exercise at least one row";
         ASSERT_LE(verifier_row_count, 4)
@@ -4324,8 +4330,8 @@ namespace llaminar2::test::parity::qwen36
         const DensePrefixRestoreParityCase &test_case,
         int verifier_row_count)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_GE(verifier_row_count, 1)
             << "grouped verifier-row proof must exercise at least one row";
         ASSERT_LE(verifier_row_count, 4)
@@ -4564,8 +4570,8 @@ namespace llaminar2::test::parity::qwen36
     inline void runDenseStochasticMTPVerifierParity(
         const DensePrefixRestoreParityCase &test_case)
     {
-        ScopedDenseParityDeterministicMode deterministic_mode(
-            shouldUseDenseParityDeterministicMode(test_case));
+        ScopedDenseParityProductionMode production_mode(
+            shouldForceDenseParityProductionMode(test_case));
         ASSERT_TRUE(test_case.topology == DensePrefixParityTopology::SingleDevice ||
                     test_case.topology == DensePrefixParityTopology::LocalPP)
             << "Stochastic MTP verifier parity currently requires a full-logit "

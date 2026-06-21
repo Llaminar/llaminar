@@ -27,9 +27,7 @@
 #include <string>
 #include <vector>
 
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 #define HIP_CHECK(cmd)                                                          \
     do                                                                          \
@@ -475,11 +473,7 @@ void computeCpuReferenceOpenMP(
 
 int getOpenMpThreadCount()
 {
-#ifdef _OPENMP
     return omp_get_max_threads();
-#else
-    return 1;
-#endif
 }
 
 void runOneShape(const ShapeCase &shape, const RunConfig &cfg)

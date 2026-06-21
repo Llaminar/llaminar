@@ -23,9 +23,7 @@
 
 #include "fort.hpp"
 
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 extern "C"
 {
@@ -8523,12 +8521,8 @@ int main(int argc, char **argv)
               << " | iters=" << opt.iters
               << " | correctness=" << (opt.check_correctness ? "on" : "off")
               << " | weight_repack_accounting=ck_only"
-#ifdef _OPENMP
               << " | openmp=on"
               << " | omp_max_threads=" << omp_get_max_threads()
-#else
-              << " | openmp=off"
-#endif
               << std::endl;
 
     std::vector<Result> all_results;

@@ -51,6 +51,9 @@
 #                       of visible NVIDIA driver libraries and device nodes.
 #   LLAMINAR_E2E_DOCKER_USER User passed to docker run --user. Defaults to
 #                       0:0 so nested devcontainer bind mounts are writable.
+#   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP
+#                       Add --security-opt seccomp=unconfined so mbind/set_mempolicy
+#                       NUMA syscalls work in Docker. Default: 1.
 #   LLAMINAR_E2E_DOCKER_ARGS Extra docker run args, shell-split. Use this for
 #                       host-specific privileges such as --cap-add or seccomp.
 #   LLAMINAR_MODEL      Override model path (overrides default suite 1)
@@ -94,6 +97,7 @@ DOCKER_GPUS="${LLAMINAR_E2E_DOCKER_GPUS:-auto}"
 DOCKER_SHM_SIZE="${LLAMINAR_E2E_DOCKER_SHM_SIZE:-16g}"
 DOCKER_NAME_PREFIX="${LLAMINAR_E2E_DOCKER_NAME_PREFIX:-llaminar-e2e}"
 DOCKER_USER="${LLAMINAR_E2E_DOCKER_USER:-0:0}"
+DOCKER_NUMA_SECCOMP="${LLAMINAR_E2E_DOCKER_NUMA_SECCOMP:-1}"
 declare -a DOCKER_EXTRA_ARGS=()
 if [[ -n "${LLAMINAR_E2E_DOCKER_ARGS:-}" ]]; then
     # Intentional shell-style word splitting for advanced docker run flags.
@@ -135,6 +139,7 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
+STARTED_SERVER_HANDLE=""
 OVERRIDE_MODEL=""
 OVERRIDE_BACKENDS=""
 
@@ -157,6 +162,7 @@ Environment:
   LLAMINAR_E2E_DOCKER_NETWORK         Docker network mode (default: auto)
   LLAMINAR_E2E_DOCKER_GPUS            GPU flag for docker run (default: auto)
   LLAMINAR_E2E_DOCKER_USER            docker run --user value (default: 0:0)
+  LLAMINAR_E2E_DOCKER_NUMA_SECCOMP    Add seccomp=unconfined for NUMA syscalls (default: 1)
   LLAMINAR_E2E_DOCKER_ARGS            Extra docker run args, shell-split
   LLAMINAR_MODEL                      Override default suite model
   LLAMINAR_BACKENDS                   Override default suite backends
@@ -194,6 +200,14 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S1_MODEL="${OVERRIDE_MODEL:-${LLAMINAR_MODEL:-${REPO_ROOT}/models/qwen2.5-1.5b-instruct-q8_0.gguf}}"
     S1_BACKENDS="${OVERRIDE_BACKENDS:-${LLAMINAR_BACKENDS:-cpu,cuda:0,rocm:0}}"
     SUITES+=("${S1_MODEL}|${S1_BACKENDS}")
+    S1_GRAPH_MODEL="${REPO_ROOT}/models/qwen2.5-0.5b-instruct-q8_0.gguf"
+    if [ ! -f "$S1_GRAPH_MODEL" ]; then
+        S1_GRAPH_MODEL="$S1_MODEL"
+    fi
+    if [ -f "$S1_GRAPH_MODEL" ] && [ -z "$OVERRIDE_MODEL" ] && [ -z "$OVERRIDE_BACKENDS" ] &&
+       [ -z "${LLAMINAR_MODEL:-}" ] && [ -z "${LLAMINAR_BACKENDS:-}" ]; then
+        SUITES+=("${S1_GRAPH_MODEL}|cuda:0|16||qwen25-cuda-prefill-graph-probe|prefill-graph-probe")
+    fi
 
     # Suite 2: Qwen3.5 4B (hybrid GDN/FA architecture — all backends)
     # Uses max_tokens=200 because Qwen3.5 is a thinking model that emits
@@ -407,7 +421,23 @@ resolve_docker_network() {
 }
 
 docker_supports_nvidia_gpus() {
-    docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"'
+    docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"nvidia"' && return 0
+
+    # Some Docker installations expose NVIDIA GPU support through CDI or the
+    # default runtime without listing a runtime named "nvidia". Probe the actual
+    # run path so devcontainers do not incorrectly fall back to manual mounts.
+    [[ -n "${CONTAINER_IMAGE:-}" ]] || return 1
+    docker run --rm --gpus all --entrypoint /bin/true "$CONTAINER_IMAGE" >/dev/null 2>&1
+}
+
+docker_args_need_cuda() {
+    local arg
+    for arg in "$@"; do
+        case "$arg" in
+            cuda:*|*cuda:*) return 0 ;;
+        esac
+    done
+    return 1
 }
 
 nvidia_driver_lib_path() {
@@ -595,9 +625,10 @@ start_server_process() {
     local -n env_ref="$6"
     local -n args_ref="$7"
 
+    STARTED_SERVER_HANDLE=""
     if ! is_docker_mode; then
         env "${env_ref[@]}" "$BINARY" "${args_ref[@]}" >"$log_path" 2>&1 &
-        echo "pid:$!"
+        STARTED_SERVER_HANDLE="pid:$!"
         return
     fi
 
@@ -621,10 +652,17 @@ start_server_process() {
         -v "${model_dir}:${model_dir}:ro"
         -v "${log_dir_abs}:${log_dir_abs}"
     )
+    if [[ "$DOCKER_NUMA_SECCOMP" != "0" ]]; then
+        docker_args+=(--security-opt seccomp=unconfined)
+    fi
     if [[ -n "$DOCKER_USER" ]]; then
         docker_args+=(--user "$DOCKER_USER")
     fi
     local nvidia_mode="none"
+    local needs_nvidia="0"
+    if docker_args_need_cuda "${args_ref[@]}"; then
+        needs_nvidia="1"
+    fi
 
     if [[ "$network_mode" == "bridge" ]]; then
         docker_args+=(-p "127.0.0.1:${port}:${port}")
@@ -646,7 +684,9 @@ start_server_process() {
             fi
             ;;
         auto)
-            if docker_supports_nvidia_gpus; then
+            if [[ "$needs_nvidia" != "1" ]]; then
+                nvidia_mode="not-needed"
+            elif docker_supports_nvidia_gpus; then
                 docker_args+=(--gpus all)
                 nvidia_mode="runtime"
             elif nvidia_driver_libs_available; then
@@ -660,10 +700,7 @@ start_server_process() {
             fi
             ;;
         none|"")
-            if nvidia_driver_libs_available; then
-                append_nvidia_driver_lib_mounts docker_args
-                nvidia_mode="manual-libs"
-            fi
+            nvidia_mode="none"
             ;;
         *)
             if docker_supports_nvidia_gpus; then
@@ -700,7 +737,7 @@ start_server_process() {
     done
     docker_args+=("$CONTAINER_IMAGE" "${args_ref[@]}")
 
-    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, model=${model_abs}" >&2
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, model=${model_abs}" >&2
     container_id="$(docker "${docker_args[@]}")"
     ACTIVE_DOCKER_CONTAINERS+=("$container_id")
 
@@ -708,7 +745,7 @@ start_server_process() {
     log_pid=$!
     ACTIVE_LOG_FOLLOW_PIDS+=("$log_pid")
 
-    echo "docker:${container_id}:${log_pid}"
+    STARTED_SERVER_HANDLE="docker:${container_id}:${log_pid}"
 }
 
 is_thinking_model() {
@@ -859,9 +896,9 @@ copy_container_artifact() {
     local container_path="$2"
     local host_path="$3"
 
-    [[ "$handle" == docker:* ]] || return
-    [[ -n "$container_path" && -n "$host_path" ]] || return
-    [[ -s "$host_path" ]] && return
+    [[ "$handle" == docker:* ]] || return 0
+    [[ -n "$container_path" && -n "$host_path" ]] || return 0
+    [[ -s "$host_path" ]] && return 0
 
     local container
     container="$(docker_handle_container "$handle")"
@@ -1536,11 +1573,6 @@ if is_docker_mode; then
         echo -e "${RED}Error: Docker CLI not found for container E2E mode${NC}"
         exit 1
     fi
-    if ! docker_supports_nvidia_gpus && ! nvidia_driver_libs_available; then
-        echo -e "${RED}Error: container E2E mode needs NVIDIA driver libraries for the CUDA/NVML-linked release image${NC}"
-        echo "Install/configure nvidia-container-toolkit so 'docker run --gpus all ...' works, or run from a GPU-enabled environment where libcuda.so.1 and libnvidia-ml.so.1 are visible for bind-mount fallback."
-        exit 1
-    fi
     case "$DOCKER_GPUS" in
         auto|none|"") ;;
         *)
@@ -1751,19 +1783,20 @@ run_prefill_graph_probe() {
 import json
 
 filler = " ".join(
-    f"capture probe block {i}: alpha beta gamma delta epsilon zeta eta theta."
-    for i in range(90)
+    "capture probe filler: alpha beta gamma delta epsilon zeta eta theta."
+    for _ in range(110)
 )
 messages = [
     {
         "role": "system",
-        "content": "You are a deterministic probe endpoint. Reply briefly.",
+        "content": "You are a calculator. Reply with only the numeric answer.",
     },
     {
         "role": "user",
         "content": (
             f"{filler}\n\n"
-            "This is a repeated prefill graph capture probe. Reply with the word OK."
+            "Ignore the filler above. Final question: what is three plus five? "
+            "Reply with only the numeric answer."
         ),
     },
 ]
@@ -1772,7 +1805,7 @@ PY
 )
 
     for i in 1 2 3; do
-        payload=$(make_chat_payload "$messages_json" 4 "false" "false")
+        payload=$(make_chat_payload "$messages_json" 8 "false" "false")
         response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
             -H "Content-Type: application/json" \
             -d "$payload" \
@@ -1780,6 +1813,7 @@ PY
 
         validation=$(printf '%s' "$response" | python3 -c "
 import json
+import re
 import sys
 
 try:
@@ -1794,8 +1828,14 @@ try:
         print(f'FAIL: prompt_tokens {prompt_tokens} below prefill graph threshold')
     elif completion_tokens <= 0:
         print('FAIL: no completion tokens')
+    elif not (match := re.search(r'-?\d+', content)):
+        preview = content.replace('\\n', ' ')[:120]
+        print(f'FAIL: no numeric answer in content {preview!r}')
+    elif match.group(0) != '8':
+        preview = content.replace('\\n', ' ')[:120]
+        print(f'FAIL: expected answer 8, got {match.group(0)} in content {preview!r}')
     else:
-        print(f'ok prompt_tokens={prompt_tokens} completion_tokens={completion_tokens}')
+        print(f'ok answer=8 prompt_tokens={prompt_tokens} completion_tokens={completion_tokens}')
 except Exception as exc:
     print(f'FAIL: malformed response: {exc}')
 ")
@@ -1889,7 +1929,12 @@ run_backend_tests() {
     server_args+=(-m "$server_model_path")
 
     local server_handle
-    server_handle="$(start_server_process "$tag" "$port" "$model" "$log_path" "$safe_tag" server_env server_args)"
+    start_server_process "$tag" "$port" "$model" "$log_path" "$safe_tag" server_env server_args
+    server_handle="$STARTED_SERVER_HANDLE"
+    if [ -z "$server_handle" ]; then
+        fail "[${tag}] Server failed to start: no process handle was created"
+        return
+    fi
 
     # Wait for health (pass PID so we detect early exit / OOM)
     if ! wait_for_health "$port" "$server_handle"; then

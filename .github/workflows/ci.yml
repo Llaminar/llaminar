@@ -32,14 +32,14 @@ on:
   workflow_call:
     inputs:
       image-tag:
-        description: "Tag applied to the runtime image published by this workflow"
+        description: "Deprecated; runtime image tags are derived from branch, SHA, CUDA, and ROCm versions."
         required: false
         type: string
-        default: ci
+        default: ""
     outputs:
       image-ref:
-        description: "Full image reference (registry/owner/name:tag) of the published runtime image"
-        value: ${{ jobs.publish.outputs.image-ref }}
+        description: "Published runtime image references."
+        value: ${{ jobs.runtime-containers.outputs.image-refs }}
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -53,33 +53,23 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   MODELS_DIR: /opt/llaminar-models
-  PARITY_HISTORY_DIR: /opt/llaminar-parity-history
-  BENCHMARK_HISTORY_DIR: /opt/llaminar-benchmark-history
-  # SHA-keyed builder image tag — ephemeral, never pushed to GHCR, unique per
-  # workflow run so concurrent runs don't collide on the runner's local docker.
   BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
+  CUDA_VERSION: "13.0"
+  ROCM_VERSION: "7.1.1"
 
-# =============================================================================
-# Workflow layout
-# =============================================================================
-# Sequential gate pipeline: build → unit → integration → parity → e2e/perf.
-#
-# All jobs target the `llaminar-bench` self-hosted runner. The runner persists
-# /var/lib/docker between jobs, so the builder image tagged by the `build`
-# job is visible to every downstream gate by tag — no export/import needed.
-# =============================================================================
 jobs:
-  # -------------------------------------------------------------------------
-  # build — compile the builder docker image once.
-  # -------------------------------------------------------------------------
   build:
     name: Build builder image
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 120
     outputs:
-      builder-image: ${{ env.BUILDER_IMAGE }}
+      builder-image: ${{ steps.builder-image.outputs.ref }}
     steps:
       - uses: actions/checkout@v6
+
+      - name: Record builder image ref
+        id: builder-image
+        run: echo "ref=${BUILDER_IMAGE}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -87,7 +77,6 @@ jobs:
           driver: docker
 
       - name: Restore ccache from previous runs
-        id: ccache-cache
         uses: actions/cache@v5
         with:
           path: ${{ runner.temp }}/.ccache-llaminar
@@ -135,27 +124,25 @@ jobs:
             echo "::error::Models directory ${MODELS_DIR} not found on runner."
             exit 1
           fi
-          sudo mkdir -p "${PARITY_HISTORY_DIR}" "${BENCHMARK_HISTORY_DIR}"
-          sudo chown -R "$(id -u):$(id -g)" "${PARITY_HISTORY_DIR}" "${BENCHMARK_HISTORY_DIR}" || true
 
-  # -------------------------------------------------------------------------
-  # Gate 1: unit tests.
-  # -------------------------------------------------------------------------
   unit:
-    name: Gate — Unit tests
+    name: Gate - Unit tests
     needs: build
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
-      - name: Preflight — clear stale MPI/IPC state
+
+      - name: Preflight - clear stale MPI/IPC state
         run: bash scripts/ci/preflight_clean.sh
+
       - name: Configure core-dump capture
         run: |
           sudo mkdir -p "${{ github.workspace }}/cores"
           sudo chmod 1777 "${{ github.workspace }}/cores"
           sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
           sudo sysctl -w kernel.core_uses_pid=1
+
       - name: Run unit tests
         run: |
           docker run --rm \
@@ -171,6 +158,7 @@ jobs:
                   -R '^V2_Unit_' \
                   --output-on-failure \
                   --parallel
+
       - name: Upload core dumps on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -180,207 +168,18 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # -------------------------------------------------------------------------
-  # Gate 2: integration tests (non-parity).
-  #
-  # Runs all V2_Integration_* tests except Parity and RCCL suites.
-  # RCCL tests are excluded due to known driver-level flakiness.
-  # -------------------------------------------------------------------------
-  integration:
-    name: Gate — Integration tests
+  runtime-containers:
+    name: Build, test, and publish runtime containers
     needs: [build, unit]
     runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-      - name: Preflight — clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run integration tests (excluding Parity & RCCL)
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^V2_Integration_' \
-                  -E 'Parity|RCCL' \
-                  --output-on-failure
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-integration-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # Gate 3: parity tests (all Qwen families, all backends, sequential).
-  # -------------------------------------------------------------------------
-  parity:
-    name: Gate — Parity tests
-    needs: [build, integration]
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 240
-    steps:
-      - uses: actions/checkout@v6
-      - name: Preflight — clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run parity tests
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${PARITY_HISTORY_DIR}:/src/tests/v2/integration/parity/results" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            ctest --test-dir build_v2_integration \
-                  -R '^V2_Integration_Parity_' \
-                  --output-on-failure
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-parity-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # Gate 4: E2E server tests.
-  # -------------------------------------------------------------------------
-  e2e:
-    name: Gate — E2E server tests
-    needs: [build, parity]
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v6
-      - name: Preflight — clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run E2E tests
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            tests/v2/e2e/server/test_server_e2e.sh \
-              --binary build_v2_integration/llaminar2 \
-              --backends "cpu,cuda:0,rocm:0"
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            /tmp/srv_*.log
-          if-no-files-found: ignore
-          retention-days: 14
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-e2e-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # Gate 5: performance ratchet.
-  # -------------------------------------------------------------------------
-  perf:
-    name: Gate — Performance ratchet
-    needs: [build, parity]
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-      - name: Preflight — clear stale MPI/IPC state
-        run: bash scripts/ci/preflight_clean.sh
-      - name: Configure core-dump capture
-        run: |
-          sudo mkdir -p "${{ github.workspace }}/cores"
-          sudo chmod 1777 "${{ github.workspace }}/cores"
-          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
-          sudo sysctl -w kernel.core_uses_pid=1
-      - name: Run performance ratchet
-        run: |
-          docker run --rm \
-            --gpus all \
-            --device=/dev/kfd --device=/dev/dri \
-            --group-add video --group-add render \
-            --cap-add SYS_NICE --cap-add SYS_PTRACE \
-            --ulimit core=-1 \
-            --ipc=host --shm-size=16g \
-            -v "${MODELS_DIR}:/src/models:ro" \
-            -v "${BENCHMARK_HISTORY_DIR}:/benchmark-history" \
-            -e LLAMINAR_BENCHMARK_RESULTS_DIR=/benchmark-history \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            .githooks/run_benchmark_check.sh
-      - name: Upload core dumps on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cores-perf-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ github.workspace }}/cores/
-          if-no-files-found: ignore
-          retention-days: 7
-
-  # -------------------------------------------------------------------------
-  # publish — always runs. Trend summaries run with `if: always()` so partial
-  # failures still publish charts; runtime push is gated on success of every
-  # gate via explicit `needs.X.result == 'success'` checks.
-  # -------------------------------------------------------------------------
-  publish:
-    name: Publish (summarize + runtime image)
-    needs:
-      - build
-      - unit
-      - integration
-      - parity
-      - e2e
-      - perf
-    if: always()
-    runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 60
+    timeout-minutes: 360
     outputs:
-      image-ref: ${{ steps.meta.outputs.tags }}
+      image-refs: ${{ steps.runtime.outputs.image_refs }}
+    # Serialize release-container E2E segments across workflow runs so the
+    # self-hosted GPU runner never oversubscribes NVIDIA/AMD VRAM.
+    concurrency:
+      group: llaminar-runtime-container-e2e
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v6
 
@@ -397,128 +196,46 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve runtime-image tags
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          tags: |
-            type=ref,event=pr,prefix=pr-
-            type=ref,event=branch
-            type=sha,format=short
-            type=raw,value=${{ inputs.image-tag || 'ci' }},enable=${{ inputs.image-tag != '' }}
+      - name: Preflight - clear stale MPI/IPC state
+        run: bash scripts/ci/preflight_clean.sh
 
-      # Diagnostic: list the persistent host dirs so we can see whether the
-      # parity / perf gates actually wrote anything. Useful when the upload
-      # steps below say 'No files were found'.
-      - name: Diagnostic — list persistent host result dirs
-        if: always()
+      - name: Configure core-dump capture
         run: |
-          echo "=== ${PARITY_HISTORY_DIR} ==="
-          ls -laR "${PARITY_HISTORY_DIR}" 2>&1 | head -100 || true
-          echo ""
-          echo "=== ${BENCHMARK_HISTORY_DIR} ==="
-          ls -laR "${BENCHMARK_HISTORY_DIR}" 2>&1 | head -100 || true
+          sudo mkdir -p "${{ github.workspace }}/cores"
+          sudo chmod 1777 "${{ github.workspace }}/cores"
+          sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
+          sudo sysctl -w kernel.core_uses_pid=1
 
-      - name: Summarize parity results
-        if: always()
+      - name: Build, E2E test, and publish variants
+        id: runtime
         run: |
-          python3 scripts/ci/summarize_parity_results.py \
-            --results-root "${PARITY_HISTORY_DIR}" \
-            --artifact-name parity-results-${{ github.run_id }}
-
-      - name: Generate parity trend charts
-        if: always()
-        run: |
-          mkdir -p "${{ github.workspace }}/parity-trends"
-          docker run --rm \
-            -v "${PARITY_HISTORY_DIR}:/parity-history:ro" \
-            -v "${{ github.workspace }}/parity-trends:/out" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            python3 scripts/ci/summarize_parity_trends.py \
-              --results-root /parity-history \
-              --out-dir /out \
-              --history 10 \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload parity result CSVs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: parity-results-${{ github.run_id }}
-          path: ${{ env.PARITY_HISTORY_DIR }}/
-          if-no-files-found: warn
-          retention-days: 30
-
-      - name: Upload parity trend charts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: parity-trends-${{ github.run_id }}
-          path: ${{ github.workspace }}/parity-trends/
-          if-no-files-found: ignore
-          retention-days: 30
-
-      - name: Summarize performance results
-        if: always()
-        run: |
-          python3 scripts/ci/summarize_perf_results.py \
-            --results-root "${BENCHMARK_HISTORY_DIR}"
-
-      - name: Generate performance trend charts
-        if: always()
-        run: |
-          mkdir -p "${{ github.workspace }}/perf-trends"
-          docker run --rm \
-            -v "${BENCHMARK_HISTORY_DIR}:/bench-history:ro" \
-            -v "${{ github.workspace }}/perf-trends:/out" \
-            --workdir /src \
-            ${{ needs.build.outputs.builder-image }} \
-            python3 scripts/ci/summarize_perf_trends.py \
-              --results-root /bench-history \
-              --out-dir /out \
-              --history 10 \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload benchmark result JSON
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: benchmark-results-${{ github.run_id }}
-          path: ${{ env.BENCHMARK_HISTORY_DIR }}/
-          if-no-files-found: warn
-          retention-days: 90
-
-      - name: Upload performance trend charts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: perf-trends-${{ github.run_id }}
-          path: ${{ github.workspace }}/perf-trends/
-          if-no-files-found: ignore
-          retention-days: 30
-
-      - name: Build + push runtime image
-        if: |
-          needs.build.result == 'success' &&
-          needs.unit.result == 'success' &&
-          needs.integration.result == 'success' &&
-          needs.parity.result == 'success' &&
-          needs.e2e.result == 'success' &&
-          needs.perf.result == 'success'
-        env:
-          LLAMINAR_IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
-          LLAMINAR_IMAGE_LABELS: ${{ steps.meta.outputs.labels }}
-          VERSION: ${{ github.ref_name }}
-          VCS_REF: ${{ github.sha }}
-          BUILD_DATE: ${{ github.event.repository.updated_at }}
-        run: |
+          set -euo pipefail
+          args=(--image "${REGISTRY}/${IMAGE_NAME}" --branch "${GITHUB_REF_NAME}" --sha "${GITHUB_SHA}")
           if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            scripts/docker/build-runtime-image.sh --load
+            args+=(--no-push)
           else
-            scripts/docker/build-runtime-image.sh --push
+            args+=(--push)
           fi
+          scripts/ci/build_test_publish_runtime_variants.sh "${args[@]}"
+
+      - name: Upload E2E logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            /tmp/llaminar-e2e-*-container/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Upload core dumps on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cores-runtime-containers-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ github.workspace }}/cores/
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Prune builder image
         if: always()

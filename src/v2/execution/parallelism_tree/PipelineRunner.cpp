@@ -13,9 +13,7 @@
 #include <set>
 #include <stdexcept>
 
-#ifdef HAVE_MPI
 #include <mpi.h>
-#endif
 
 namespace llaminar2
 {
@@ -341,7 +339,6 @@ namespace llaminar2
             return;
         }
 
-#ifdef HAVE_MPI
         // Get hidden state to send
         const TensorBase *hidden = getHiddenState();
         if (!hidden)
@@ -358,9 +355,6 @@ namespace llaminar2
         int count = static_cast<int>(hidden->numel());
 
         MPI_Send(data, count, MPI_FLOAT, transfer->receiver_rank, transfer->mpi_tag, MPI_COMM_WORLD);
-#else
-        LOG_DEBUG("PipelineRunner: sendHiddenState (no MPI, mock)");
-#endif
     }
 
     void PipelineRunner::recvHiddenState(int from_stage_index)
@@ -380,14 +374,13 @@ namespace llaminar2
             return;
         }
 
-#ifdef HAVE_MPI
         // Allocate buffer if needed
         // TODO: Pre-allocate based on max sequence length
         int buffer_size = hidden_dim_; // Simplified - should be seq_len * hidden_dim
 
         if (!hidden_buffer_)
         {
-            hidden_buffer_ = std::make_unique<FP32Tensor>(1, hidden_dim_);
+            hidden_buffer_ = std::make_unique<FP32Tensor>(std::vector<size_t>{1, static_cast<size_t>(hidden_dim_)});
         }
 
         LOG_DEBUG("PipelineRunner: MPI_Recv hidden state from rank " << transfer->sender_rank
@@ -397,14 +390,10 @@ namespace llaminar2
         MPI_Status status;
         MPI_Recv(data, buffer_size, MPI_FLOAT, transfer->sender_rank, transfer->mpi_tag,
                  MPI_COMM_WORLD, &status);
-#else
-        LOG_DEBUG("PipelineRunner: recvHiddenState (no MPI, mock)");
-#endif
     }
 
     void PipelineRunner::sendLogits(int to_rank)
     {
-#ifdef HAVE_MPI
         const float *data = logits();
         if (!data)
         {
@@ -417,15 +406,10 @@ namespace llaminar2
 
         LOG_DEBUG("PipelineRunner: MPI_Send logits to rank " << to_rank);
         MPI_Send(data, vocab_size_, MPI_FLOAT, to_rank, tag, MPI_COMM_WORLD);
-#else
-        (void)to_rank;
-        LOG_DEBUG("PipelineRunner: sendLogits (no MPI, mock)");
-#endif
     }
 
     void PipelineRunner::recvLogits(int from_rank)
     {
-#ifdef HAVE_MPI
         logits_buffer_.resize(vocab_size_);
 
         int tag = 10000; // Reserved tag range for logits
@@ -434,10 +418,6 @@ namespace llaminar2
         MPI_Status status;
         MPI_Recv(logits_buffer_.data(), vocab_size_, MPI_FLOAT, from_rank, tag,
                  MPI_COMM_WORLD, &status);
-#else
-        (void)from_rank;
-        LOG_DEBUG("PipelineRunner: recvLogits (no MPI, mock)");
-#endif
     }
 
     const PipelineRunner::TransferInfo *PipelineRunner::getTransfer(int from_stage, int to_stage) const

@@ -479,6 +479,13 @@ namespace llaminar2
                             mmap_prefault_policy);
                         if (!split_mmap_regions_[idx - 1])
                         {
+                            if (mmap_numa_node >= 0)
+                            {
+                                throw std::runtime_error(
+                                    "[ModelLoader] Required NUMA mmap failed for split file " +
+                                    std::to_string(idx) + " (" + model_.split_paths[idx] +
+                                    "); refusing to fall back to unbound stream loading");
+                            }
                             LOG_WARN("[ModelLoader] Failed to mmap split file " << idx
                                                                                 << ", falling back to ifstream for all files");
                             mmap_region_.reset();
@@ -490,6 +497,12 @@ namespace llaminar2
             }
             else
             {
+                if (mmap_numa_node >= 0)
+                {
+                    throw std::runtime_error(
+                        "[ModelLoader] Required NUMA mmap failed for " + file_path +
+                        "; refusing to fall back to unbound stream loading");
+                }
                 LOG_WARN("[ModelLoader] mmap failed, falling back to ifstream loading");
             }
         }

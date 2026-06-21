@@ -255,6 +255,33 @@ static const std::vector<TestConfig> kSingleDeviceConfigs = {
         .kv_cache_precision = KVCachePrecision::FP16,
     },
     {
+        .name = "CUDA_Q8_0_ChatCalc_KV_FP16",
+        .devices = {ParityDeviceType::CUDA},
+        .parallelism = Parallelism::None,
+        .collective = Collective::None,
+        .thresholds = {
+            .cosine_threshold = 0.96f,
+            .decode_cosine_threshold = 0.95f,
+            .early_layers_count = 6,
+            .min_early_layers_passed = 4,
+            .kl_threshold = 0.01f,
+            .min_top1_accuracy = 80.0f,
+            .min_top5_accuracy = 80.0f, // Short chat prompt: one shifted token out of 5 still preserves top-1/KL.
+        },
+        .model_path = "models/qwen2.5-0.5b-instruct-q8_0.gguf",
+        .snapshot_dir = "pytorch_qwen2_snapshots_q8_0_chat_calc",
+        .prompt = R"(<|im_start|>system
+You are a calculator. Reply with only the numeric answer, no explanation.<|im_end|>
+<|im_start|>user
+What is 2+2?<|im_end|>
+<|im_start|>assistant
+)",
+        .token_ids = {151644, 8948, 198, 2610, 525, 264, 29952, 13, 17841, 448, 1172, 279, 24064, 4226, 11, 902, 16148, 13, 151645, 198, 151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198},
+        .activation_precision = ActivationPrecision::FP32,
+        .kv_cache_precision = KVCachePrecision::FP16,
+        .decode_steps = 2,
+    },
+    {
         .name = "CUDA_Q8_0_KV_Q8_1",
         .devices = {ParityDeviceType::CUDA},
         .parallelism = Parallelism::None,

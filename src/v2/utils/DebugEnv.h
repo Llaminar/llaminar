@@ -112,6 +112,9 @@ namespace llaminar2
         bool layer_trace = false;             ///< Emit temporary per-layer residual trace when LLAMINAR_LAYER_TRACE is present.
         bool trace_generated_tokens = false;  ///< Trace streamed/generated token text when LLAMINAR_TRACE_GENERATED_TOKENS is truthy.
         bool moe_grouped_verifier_snapshot_diagnostic = false; ///< Emit grouped MoE verifier routing-row diagnostics.
+        bool allow_numa_bind_fallback = false; ///< Allow requested NUMA bind failures to continue when explicitly enabled.
+        bool stage_checksum_trace = false;     ///< Emit per-stage checksum traces when LLAMINAR_STAGE_CHECKSUM_TRACE is truthy.
+        std::string stage_checksum_filter;     ///< Optional substring filter for stage checksum traces.
 
         RuntimeDebugConfig()
         {
@@ -133,6 +136,9 @@ namespace llaminar2
             trace_generated_tokens = readTruthy("LLAMINAR_TRACE_GENERATED_TOKENS");
             moe_grouped_verifier_snapshot_diagnostic =
                 readTruthy("LLAMINAR_MOE_GROUPED_VERIFIER_SNAPSHOT_DIAGNOSTIC");
+            allow_numa_bind_fallback = readTruthy("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK");
+            stage_checksum_trace = readTruthy("LLAMINAR_STAGE_CHECKSUM_TRACE");
+            stage_checksum_filter = readString("LLAMINAR_STAGE_CHECKSUM_FILTER");
         }
 
     private:
@@ -167,6 +173,13 @@ namespace llaminar2
                            [](unsigned char ch)
                            { return static_cast<char>(std::tolower(ch)); });
             return flag != "0" && flag != "false" && flag != "off" && flag != "no";
+        }
+
+        /// @brief Read an optional string value, returning empty when unset.
+        static std::string readString(const char *name)
+        {
+            const char *value = std::getenv(name);
+            return value != nullptr ? std::string(value) : std::string{};
         }
     };
 

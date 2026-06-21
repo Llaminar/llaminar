@@ -87,10 +87,12 @@
 #include "kernels/KernelFactory.h"
 #include "backends/BackendManager.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "utils/DebugEnv.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/ops/CUDAEmbeddingKernelT.h"
 #include <cuda_runtime.h>
-// Deterministic mode: disables FP32 atomicAdd in split-K/stream-K GEMM
+// Parity should exercise the production CUDA prefill path unless a test opts in
+// to a deterministic-mode regression explicitly.
 extern "C" void cudaNativeVNNIPrefill_setDeterministicMode(bool enabled);
 #endif
 #ifdef HAVE_ROCM
@@ -617,6 +619,15 @@ namespace llaminar2::test::parity
         /// Snapshot directory override. If non-empty, overrides ParityConfig::snapshot_dir.
         /// Must be unique per model to avoid snapshot collisions between quant formats.
         std::string snapshot_dir;
+
+        /// Prompt override. If non-empty, overrides ParityConfig::prompt for
+        /// PyTorch snapshot generation.
+        std::string prompt;
+
+        /// Token ID override. If non-empty, overrides ParityConfig::token_ids
+        /// for Llaminar execution. This is useful for chat-template prompts
+        /// where the rendered text contains special tokens.
+        std::vector<int> token_ids;
 
         /// PP stage device sizes for hybrid PP+TP configurations
         /// Example: {2, 1} means stage 0 has 2 devices (TP domain), stage 1 has 1 device
@@ -1815,14 +1826,12 @@ namespace llaminar2::test::parity
 
         void SetUp() override
         {
-            // Enable deterministic CUDA GEMM for reproducible parity results.
-            // Stream-K is disabled, and BK64 split-K is capped to 1 because
-            // that path's FP32 accumulation-order drift compounds through the
-            // attention stack. BK256 remains enabled for FFN-down shapes where
-            // the current parity diagnostics show split_k>1 is bitwise-stable.
-            setenv("LLAMINAR_DETERMINISTIC", "1", 1);
+            // Model parity is a production-path canary. Do not let an inherited
+            // shell env or a previous test route it through deterministic GEMM.
+            setenv("LLAMINAR_DETERMINISTIC", "0", 1);
+            mutableDebugEnv().reload();
 #ifdef HAVE_CUDA
-            cudaNativeVNNIPrefill_setDeterministicMode(true);
+            cudaNativeVNNIPrefill_setDeterministicMode(false);
 #endif
 
             // Start log file capture for this test run (rank 0 only)

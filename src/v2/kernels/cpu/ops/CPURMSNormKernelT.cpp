@@ -20,9 +20,7 @@
 #include <algorithm>
 #include <array>
 
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 #include "../../../utils/OpenMPUtils.h"
 
@@ -64,7 +62,6 @@ namespace llaminar2
      */
     inline bool want_parallel(int rows, size_t cols)
     {
-#ifdef _OPENMP
         // Multiple rows: parallelize if we have enough work per thread
         if (rows >= MIN_ROWS_FOR_PARALLEL)
             return true;
@@ -72,11 +69,6 @@ namespace llaminar2
         // Single row: only parallelize for very large d_model
         size_t total_elements = static_cast<size_t>(rows) * cols;
         return total_elements >= MIN_ELEMENTS_FOR_PARALLEL;
-#else
-        (void)rows;
-        (void)cols;
-        return false;
-#endif
     }
 
     // =========================================================================

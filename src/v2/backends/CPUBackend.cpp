@@ -12,21 +12,18 @@
 #include "CPUBackend.h"
 #include "../utils/Logger.h"
 
+#include <cerrno>
 #include <cstring> // memcpy, memset
 #include <cstdlib> // aligned_alloc, free
 #include <fstream>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 
-// Optional NUMA support
-#ifdef HAVE_LIBNUMA
 #include <numa.h>
-#endif
+#include <numaif.h>
 
-// For parallel first-touch initialization
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 namespace llaminar2
 {
@@ -41,26 +38,21 @@ namespace llaminar2
         // Validate NUMA node if specified
         if (local_numa_node_ >= 0)
         {
-#ifdef HAVE_LIBNUMA
             if (numa_available() == -1)
             {
-                LOG_WARN("[CPUBackend] libnuma not available, NUMA binding disabled");
-                local_numa_node_ = -1;
+                throw std::runtime_error("[CPUBackend] libnuma reports NUMA unavailable; NUMA binding is required");
             }
             else if (local_numa_node_ >= numa_max_node() + 1)
             {
-                LOG_WARN("[CPUBackend] NUMA node " << local_numa_node_ << " exceeds max ("
-                                                   << numa_max_node() << "), using system-wide memory");
-                local_numa_node_ = -1;
+                throw std::runtime_error("[CPUBackend] NUMA node " + std::to_string(local_numa_node_) +
+                                         " exceeds max " + std::to_string(numa_max_node()));
             }
-#endif
             // Check if /sys/devices/system/node/nodeN exists
             std::string path = "/sys/devices/system/node/node" + std::to_string(local_numa_node_);
             std::ifstream test(path);
             if (!test.good())
             {
-                LOG_DEBUG("[CPUBackend] NUMA node " << local_numa_node_
-                                                    << " sysfs not found, using /proc/meminfo fallback");
+                throw std::runtime_error("[CPUBackend] NUMA node sysfs path not found: " + path);
             }
         }
 
@@ -160,22 +152,11 @@ namespace llaminar2
 
         void *ptr = nullptr;
 
-#ifdef HAVE_LIBNUMA
-        if (local_numa_node_ >= 0 && numa_available() != -1)
-        {
-            ptr = numa_alloc_onnode(bytes, local_numa_node_);
-            if (ptr)
-            {
-                LOG_TRACE("[CPUBackend] numa_alloc_onnode(" << bytes << ", " << local_numa_node_ << ") = " << ptr);
-                return ptr;
-            }
-            LOG_WARN("[CPUBackend] numa_alloc_onnode failed, falling back to aligned_alloc");
-        }
-#endif
-
-        // Fallback: aligned allocation with parallel first-touch
-        // Use 64-byte alignment for cache line / AVX-512 alignment
-        constexpr size_t alignment = 64;
+        // Use page alignment when installing NUMA memory policy; otherwise
+        // 64-byte alignment is enough for cache line / AVX-512 alignment.
+        // NUMA placement is installed with mbind() before first-touch so the
+        // pointer remains compatible with std::free().
+        const size_t alignment = local_numa_node_ >= 0 ? static_cast<size_t>(4096) : static_cast<size_t>(64);
         size_t aligned_bytes = (bytes + alignment - 1) & ~(alignment - 1);
 
         ptr = std::aligned_alloc(alignment, aligned_bytes);
@@ -185,9 +166,36 @@ namespace llaminar2
             return nullptr;
         }
 
+        if (local_numa_node_ >= 0)
+        {
+            struct bitmask *nodemask = numa_allocate_nodemask();
+            if (!nodemask)
+            {
+                LOG_ERROR("[CPUBackend] Failed to allocate NUMA nodemask");
+                std::free(ptr);
+                return nullptr;
+            }
+
+            numa_bitmask_clearall(nodemask);
+            numa_bitmask_setbit(nodemask, local_numa_node_);
+            errno = 0;
+            int rc = mbind(ptr, aligned_bytes, MPOL_BIND, nodemask->maskp, nodemask->size, 0);
+            const int bind_errno = errno;
+            numa_free_nodemask(nodemask);
+
+            if (rc != 0)
+            {
+                LOG_ERROR("[CPUBackend] mbind(" << ptr << ", " << aligned_bytes
+                                                << ", node=" << local_numa_node_
+                                                << ") failed: errno=" << bind_errno
+                                                << " (" << std::strerror(bind_errno) << ")");
+                std::free(ptr);
+                return nullptr;
+            }
+        }
+
         // NUMA first-touch: parallel initialization to bind memory to local node
         // This ensures the memory is allocated on the socket where threads touch it first
-#ifdef _OPENMP
         if (bytes >= 128 * 1024) // Only parallel init for >= 128KB
         {
             char *data = static_cast<char *>(ptr);
@@ -199,7 +207,6 @@ namespace llaminar2
             }
         }
         else
-#endif
         {
             std::memset(ptr, 0, bytes);
         }
@@ -220,16 +227,6 @@ namespace llaminar2
             LOG_ERROR("[CPUBackend] Invalid device ID " << device_id << " for free");
             return;
         }
-
-#ifdef HAVE_LIBNUMA
-        if (local_numa_node_ >= 0 && numa_available() != -1)
-        {
-            // Note: We can't distinguish numa_alloc vs aligned_alloc pointers
-            // This is a limitation - for safety, we use std::free which works for both
-            // numa_free requires the original size, which we don't track
-            LOG_TRACE("[CPUBackend] free(" << ptr << ") via std::free");
-        }
-#endif
 
         std::free(ptr);
     }

@@ -85,9 +85,14 @@ static float *getOrAllocFixupBuffer(CUDAPrefillContext_ *ctx, size_t required_by
 
 static float *getOrAllocSplitkPartials(CUDAPrefillContext_ *ctx, size_t required_bytes, cudaStream_t stream)
 {
-    (void)stream;
+    // Split-K reducers consume every partition slot. Some legal dispatches have
+    // trailing empty K partitions, so stale workspace contents must not survive
+    // from an earlier request or projection.
     if (ctx->workspace_splitk_partials && ctx->workspace_splitk_partials_size >= required_bytes)
+    {
+        cudaMemsetAsync(ctx->workspace_splitk_partials, 0, required_bytes, stream);
         return ctx->workspace_splitk_partials;
+    }
     return nullptr;
 }
 

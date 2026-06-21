@@ -519,6 +519,21 @@ protected:
     std::mt19937 rng_{42};
     std::uniform_real_distribution<float> dist_{-1.0f, 1.0f};
 
+    void SetUp() override
+    {
+        CUDATestBase::SetUp();
+#ifdef HAVE_CUDA
+        if (gpu_idx_ < 0 || !backend_)
+        {
+            return;
+        }
+        setenv("LLAMINAR_DETERMINISTIC", "0", 1);
+        mutableDebugEnv().reload();
+        cudaNativeVNNIPrefill_setDeterministicMode(false);
+        llaminar::v2::kernels::KernelFactory::clearCache();
+#endif
+    }
+
     /**
      * @brief Fill tensor with random data
      */
@@ -914,6 +929,71 @@ TEST_F(Test__CUDAGemmParity, FP32_PrefillSize_512x896x896)
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
 }
 
+TEST_F(Test__CUDAGemmParity, BlockwiseActivationQuantizationProducesExpectedBlocks)
+{
+    const int M = 2;
+    const int K = 64;
+    auto A_data = randomFP32(static_cast<size_t>(M) * K);
+
+    float *d_A = nullptr;
+    int8_t *d_A_int8 = nullptr;
+    float *d_scales = nullptr;
+
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_A, A_data.size() * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_A_int8, A_data.size() * sizeof(int8_t)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&d_scales, static_cast<size_t>(M) * (K / 32) * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(d_A, A_data.data(), A_data.size() * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+
+    ASSERT_TRUE(cudaQuantGemm_quantizeActivationsBlockwise(
+        d_A,
+        d_A_int8,
+        d_scales,
+        M,
+        K,
+        gpu_device_.ordinal,
+        nullptr));
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    std::vector<int8_t> quantized(A_data.size(), 0);
+    std::vector<float> scales(static_cast<size_t>(M) * (K / 32), 0.0f);
+    ASSERT_EQ(cudaMemcpy(quantized.data(), d_A_int8, quantized.size() * sizeof(int8_t), cudaMemcpyDeviceToHost), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(scales.data(), d_scales, scales.size() * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+
+    for (int row = 0; row < M; ++row)
+    {
+        for (int block = 0; block < K / 32; ++block)
+        {
+            const size_t block_offset = static_cast<size_t>(row) * K + block * 32;
+            float max_abs = 0.0f;
+            for (int i = 0; i < 32; ++i)
+                max_abs = std::max(max_abs, std::abs(A_data[block_offset + i]));
+
+            const float expected_scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+            const float actual_scale = scales[static_cast<size_t>(row) * (K / 32) + block];
+            EXPECT_NEAR(actual_scale, expected_scale, 1.0e-6f)
+                << "row=" << row << " block=" << block;
+
+            bool saw_nonzero = false;
+            for (int i = 0; i < 32; ++i)
+            {
+                const float qval = A_data[block_offset + i] / expected_scale;
+                const int expected_q = static_cast<int>(
+                    std::rint(std::min(127.0f, std::max(-127.0f, qval))));
+                const int actual_q = static_cast<int>(quantized[block_offset + i]);
+                EXPECT_EQ(actual_q, expected_q)
+                    << "row=" << row << " block=" << block << " i=" << i;
+                saw_nonzero = saw_nonzero || actual_q != 0;
+            }
+            EXPECT_TRUE(saw_nonzero) << "row=" << row << " block=" << block;
+        }
+    }
+
+    cudaFree(d_scales);
+    cudaFree(d_A_int8);
+    cudaFree(d_A);
+}
+
 // ============================================================================
 // IQ4_NL Parity Tests (CUDAQuantisedGemmKernel vs QuantisedGemmKernel)
 // ============================================================================
@@ -1138,6 +1218,64 @@ TEST_F(Test__CUDAGemmParity, IQ4_NL_PrefillSize_512x896x896)
 // ============================================================================
 
 DEFINE_QUANTIZED_PARITY_TEST(Q8_0_SmallMatrix, Q8_0Tensor, createQ8_0Random, 32, 101)
+
+TEST_F(Test__CUDAGemmParity, Q8_0_PrefillM35_896x896)
+{
+    ScopedCudaPrefillModes modes;
+    cudaNativeVNNIPrefill_setForceTile(-1, 0);
+    cudaNativeVNNIPrefill_setStreamKMode(0);
+
+    const int M = 35;
+    const int N = 896;
+    const int K = 896;
+
+    auto weights = TestTensorFactory::createQ8_0Random({(size_t)N, (size_t)K}, 113);
+    auto A_data = randomFP32(M * K);
+
+    std::vector<float> C_cpu(M * N, 0.0f);
+    auto cpu_kernel = llaminar::v2::kernels::KernelFactory::createGemm(
+        weights.get(), KernelDeviceType::CPU);
+    ASSERT_NE(cpu_kernel, nullptr);
+    ASSERT_TRUE(cpuMultiplyToVector(cpu_kernel.get(), A_data.data(), C_cpu.data(), M, N, K));
+    ASSERT_FALSE(hasNaNOrInf(C_cpu.data(), M * N)) << "CPU result has NaN/Inf";
+
+    ASSERT_TRUE(weights->ensureOnDevice(gpu_device_));
+    auto *cuda_kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(cuda_kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(cuda_kernel, M, N, K));
+
+    for (int repetition = 0; repetition < 2; ++repetition)
+    {
+        std::vector<float> C_cuda(M * N, 0.0f);
+        ASSERT_TRUE(cudaMultiplyViaTensor(cuda_kernel, A_data.data(), C_cuda.data(), M, N, K, gpu_device_))
+            << "production split-K prefill repetition " << repetition;
+
+        int tile_id = -99;
+        int split_k = -1;
+        int used_bk256 = 0;
+        int used_streamk = 0;
+        cudaNativeVNNIPrefill_getLastLaunchSelection(&tile_id, &split_k, &used_bk256, &used_streamk);
+        EXPECT_GT(split_k, 1)
+            << "Production regression should exercise multi-partition split-K prefill";
+        EXPECT_EQ(used_streamk, 0)
+            << "This shape should use split-K rather than Stream-K";
+
+        auto result = checkParity(C_cuda.data(), C_cpu.data(), M * N, 0.999, 0.05);
+        result.print("Q8_0 Prefill 35x896x896"
+                     " repetition=" + std::to_string(repetition) +
+                     " tile=" + std::to_string(tile_id) +
+                     " split_k=" + std::to_string(split_k));
+
+        EXPECT_FALSE(result.has_nan_inf) << "CUDA output contains NaN/Inf";
+        EXPECT_GE(result.cosine_similarity, 0.999)
+            << "Cosine similarity too low: " << result.cosine_similarity;
+        EXPECT_LE(result.relative_l2_error, 0.05)
+            << "Relative L2 error too high: " << (result.relative_l2_error * 100) << "%";
+    }
+
+    cleanupWorkspaceIfNeeded(cuda_kernel);
+    llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
 
 TEST_F(Test__CUDAGemmParity, Q8_0_DecodeSize_1x896x896)
 {
@@ -2851,7 +2989,6 @@ TEST_F(Test__CUDAGemmParity, NativeVNNISpecializedSmallM234_AllNativeFormatsMatc
     const int N = 384;
     const std::array<int, 3> verifier_rows = {2, 3, 4};
 
-    ScopedEnv deterministic("LLAMINAR_DETERMINISTIC", "1");
     ASSERT_TRUE(cudaNativeVNNIInitIQGridTables_tuned())
         << "CUDA native-VNNI IQ grid tables must be initialized for direct low-level GEMV tests";
 

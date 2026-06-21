@@ -65,8 +65,7 @@ target_link_libraries(device_benchmarks
 )
 
 if(HAVE_CUDA)
-    # Need both cudart (runtime) and cuda (driver) for DMA-BUF operations
-    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart CUDA::cuda_driver)
+    target_link_libraries(device_benchmarks PRIVATE CUDA::cudart)
     target_compile_definitions(device_benchmarks PRIVATE HAVE_CUDA=1)
 endif()
 

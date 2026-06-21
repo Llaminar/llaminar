@@ -26,6 +26,9 @@
 #include "../../../backends/IWorkerGPUContext.h"
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <optional>
 #include <print>
@@ -298,7 +301,13 @@ namespace llaminar2
     // =========================================================================
 
     // Forward declarations for static helpers used by runStage()
+    static bool stageChecksumTraceEnabled();
+    static bool stageChecksumTraceMatches(const std::string &stage_name);
     static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info);
+    static void traceStageOutputChecksums(
+        const std::string &stage_name,
+        const IComputeStage *stage,
+        const StageDumpInfo &dump_info);
     static void logWatchedPointerProducer(
         const std::string &stage_name,
         const StageDumpInfo &dump_info,
@@ -1381,6 +1390,12 @@ namespace llaminar2
             printStageOutputs(node.name, cached_dump_info);
         }
 
+        if (success && stageChecksumTraceEnabled() && stageChecksumTraceMatches(node.name))
+        {
+            node.stage->invalidateDumpInfoCache();
+            traceStageOutputChecksums(node.name, node.stage.get(), node.stage->getDumpInfo());
+        }
+
         // =====================================================================
         // Stage Dump: output snapshots
         // =====================================================================
@@ -1610,6 +1625,101 @@ namespace llaminar2
     // =========================================================================
     // Stage Output Debug Printing
     // =========================================================================
+
+    static bool stageChecksumTraceEnabled()
+    {
+        return debugEnv().runtime_debug.stage_checksum_trace;
+    }
+
+    static bool stageChecksumTraceMatches(const std::string &stage_name)
+    {
+        const auto &filter = debugEnv().runtime_debug.stage_checksum_filter;
+        return filter.empty() || stage_name.find(filter) != std::string::npos;
+    }
+
+    static uint64_t fnv1a64(const uint8_t *data, size_t size)
+    {
+        uint64_t hash = 1469598103934665603ULL;
+        for (size_t i = 0; i < size; ++i)
+        {
+            hash ^= static_cast<uint64_t>(data[i]);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    static void traceStageOutputChecksums(
+        const std::string &stage_name,
+        const IComputeStage *stage,
+        const StageDumpInfo &dump_info)
+    {
+        if (!stageChecksumTraceEnabled() || !stageChecksumTraceMatches(stage_name))
+            return;
+
+        if (dump_info.outputs.empty())
+        {
+            LOG_DEBUG("[StageChecksum] stage='" << stage_name
+                                               << "' type=" << (stage ? computeStageTypeName(stage->type()) : "(unknown)")
+                                               << " outputs=0");
+            return;
+        }
+
+        dump_info.ensureOutputsOnHost();
+        for (const auto &output : dump_info.outputs)
+        {
+            if (!output.data)
+            {
+                LOG_DEBUG("[StageChecksum] stage='" << stage_name
+                                                   << "' output='" << (output.name ? output.name : "(unnamed)")
+                                                   << "' data=null");
+                continue;
+            }
+
+            const size_t logical_elements = output.rows * output.cols;
+            const size_t byte_size = output.byte_size ? output.byte_size : logical_elements * output.element_size;
+            const auto *bytes = static_cast<const uint8_t *>(output.data);
+            const uint64_t hash = fnv1a64(bytes, byte_size);
+
+            std::ostringstream oss;
+            oss << "[StageChecksum] stage='" << stage_name
+                << "' type=" << (stage ? computeStageTypeName(stage->type()) : "(unknown)")
+                << " output='" << (output.name ? output.name : "(unnamed)")
+                << "' shape=[" << output.rows << "x" << output.cols << "]"
+                << " dtype=" << (output.dtype ? output.dtype : "(unknown)")
+                << " bytes=" << byte_size
+                << " hash=0x" << std::hex << hash << std::dec;
+
+            if (output.dtype && std::strcmp(output.dtype, "FP32") == 0 && output.element_size == sizeof(float))
+            {
+                const auto *fp = static_cast<const float *>(output.data);
+                double sum = 0.0;
+                double abs_sum = 0.0;
+                double max_abs = 0.0;
+                for (size_t i = 0; i < logical_elements; ++i)
+                {
+                    const double v = static_cast<double>(fp[i]);
+                    sum += v;
+                    const double av = std::fabs(v);
+                    abs_sum += av;
+                    max_abs = std::max(max_abs, av);
+                }
+                oss << " sum=" << std::setprecision(12) << sum
+                    << " abs_sum=" << abs_sum
+                    << " max_abs=" << max_abs;
+                const size_t sample_count = std::min<size_t>(logical_elements, 4);
+                oss << " first=[";
+                for (size_t i = 0; i < sample_count; ++i)
+                {
+                    if (i)
+                        oss << ",";
+                    oss << fp[i];
+                }
+                oss << "]";
+            }
+
+            LOG_DEBUG(oss.str());
+        }
+    }
 
     /**
      * @brief Print first N elements of stage outputs for debugging

@@ -137,7 +137,6 @@ namespace llaminar2
 
     void CommHierarchy::freeAll()
     {
-#ifdef HAVE_MPI
         if (comms_.empty())
         {
             return;
@@ -168,7 +167,6 @@ namespace llaminar2
                 MPI_Comm_free(&comm);
             }
         }
-#endif
         comms_.clear();
         root_path_.clear();
     }
@@ -212,8 +210,6 @@ namespace llaminar2
             // TP node spanning multiple ranks needs a split communicator
             int color = calculateTPColor(node, path, my_rank);
 
-#ifdef HAVE_MPI
-            // Only actually split when MPI is available
             MPI_Comm new_comm = MPI_COMM_NULL;
             int split_result = MPI_Comm_split(parent_comm, color, my_rank, &new_comm);
 
@@ -222,17 +218,6 @@ namespace llaminar2
                 hierarchy.addCommunicator(path, new_comm, depth);
                 node_comm = new_comm;
             }
-#else
-            // Without MPI, we track what would be created for testing
-            // Use color as a mock "communicator"
-            if (color >= 0)
-            {
-                // Use path hash as mock comm value
-                MPI_Comm mock_comm = pathToColor(path);
-                hierarchy.addCommunicator(path, mock_comm, depth);
-                node_comm = mock_comm;
-            }
-#endif
         }
         // PP nodes don't need their own communicator - they use P2P
 

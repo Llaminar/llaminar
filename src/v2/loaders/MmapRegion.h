@@ -16,10 +16,14 @@
  *   }
  */
 
+#include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
+#include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstddef>
+#include <cstring>
 #include <iomanip>
 #include <memory>
 #include <string>
@@ -31,14 +35,10 @@
 #include <unistd.h>
 #endif
 
-#ifdef HAVE_NUMA
 #include <numaif.h>
 #include <numa.h>
-#endif
 
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 namespace llaminar2
 {
@@ -371,28 +371,90 @@ namespace llaminar2
                 return nullptr;
             }
 
-#ifdef HAVE_NUMA
+            const bool allow_numa_bind_fallback =
+                debugEnv().runtime_debug.allow_numa_bind_fallback;
+            auto handle_requested_numa_bind_failure = [&](const std::string &reason) -> bool
+            {
+                if (allow_numa_bind_fallback)
+                {
+                    LOG_WARN("[MmapRegion] NUMA bind requested for " << file_path
+                                                                      << " on node " << numa_node
+                                                                      << " but " << reason
+                                                                      << "; continuing only because LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1");
+                    return true;
+                }
+
+                LOG_ERROR("[MmapRegion] NUMA bind requested for " << file_path
+                                                                  << " on node " << numa_node
+                                                                  << " but " << reason
+                                                                  << "; refusing to continue with unbound model pages. "
+                                                                  << "In Docker, run with --security-opt seccomp=unconfined "
+                                                                  << "so mbind/set_mempolicy/get_mempolicy are allowed. "
+                                                                  << "Set LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1 only to explicitly accept degraded CPU NUMA placement.");
+                ::munmap(base, file_size);
+                ::close(fd);
+                return false;
+            };
+
             // Bind mmap pages to the target NUMA node before pre-faulting.
             // This ensures all page-cache pages allocated for this mapping
             // land on the correct NUMA node, avoiding cross-socket bandwidth
             // penalties for memory-bandwidth-bound GEMV decode.
-            if (numa_bind && numa_available() >= 0)
+            if (numa_bind)
             {
-                unsigned long nodemask = 1UL << numa_node;
-                long rc = ::mbind(base, file_size, MPOL_BIND, &nodemask,
-                                  sizeof(nodemask) * 8, 0);
-                if (rc != 0)
+                if (numa_available() < 0)
                 {
-                    LOG_WARN("[MmapRegion] mbind to NUMA node " << numa_node
-                                                                << " failed (errno=" << errno << "), pages may be on wrong node");
+                    if (!handle_requested_numa_bind_failure("libnuma reports NUMA is unavailable"))
+                    {
+                        return nullptr;
+                    }
+                }
+                else if (numa_node > numa_max_node())
+                {
+                    if (!handle_requested_numa_bind_failure(
+                            "NUMA node " + std::to_string(numa_node) +
+                            " is outside the configured range 0-" + std::to_string(numa_max_node())))
+                    {
+                        return nullptr;
+                    }
                 }
                 else
                 {
-                    LOG_DEBUG("[MmapRegion] Bound " << (file_size / (1024 * 1024))
-                                                    << " MB to NUMA node " << numa_node);
+                    struct bitmask *nodemask = numa_allocate_nodemask();
+                    if (!nodemask)
+                    {
+                        if (!handle_requested_numa_bind_failure("failed to allocate NUMA nodemask"))
+                        {
+                            return nullptr;
+                        }
+                    }
+                    else
+                    {
+                        numa_bitmask_clearall(nodemask);
+                        numa_bitmask_setbit(nodemask, numa_node);
+                        errno = 0;
+                        long rc = ::mbind(base, file_size, MPOL_BIND, nodemask->maskp,
+                                          nodemask->size, 0);
+                        int bind_errno = errno;
+                        numa_free_nodemask(nodemask);
+
+                        if (rc != 0)
+                        {
+                            if (!handle_requested_numa_bind_failure(
+                                    "mbind failed with errno=" + std::to_string(bind_errno) +
+                                    " (" + std::strerror(bind_errno) + ")"))
+                            {
+                                return nullptr;
+                            }
+                        }
+                        else
+                        {
+                            LOG_DEBUG("[MmapRegion] Bound " << (file_size / (1024 * 1024))
+                                                            << " MB to NUMA node " << numa_node);
+                        }
+                    }
                 }
             }
-#endif
 
             if (numa_bind)
             {
@@ -404,9 +466,7 @@ namespace llaminar2
                 const size_t page_size = 4096;
                 const size_t num_pages = (file_size + page_size - 1) / page_size;
                 const volatile uint8_t *p = static_cast<const volatile uint8_t *>(base);
-#ifdef _OPENMP
 #pragma omp parallel for schedule(static)
-#endif
                 for (size_t i = 0; i < num_pages; i++)
                 {
                     (void)p[i * page_size];

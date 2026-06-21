@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # install-cuda.sh
 #
-# Install the NVIDIA CUDA 13 toolkit (full) or runtime libraries (runtime)
-# from NVIDIA's official apt repository. Matches NCCL to the CUDA 13 series.
+# Install the NVIDIA CUDA 13 build/runtime libraries from NVIDIA's official
+# apt repository. Matches NCCL to the CUDA 13 series.
 #
-# MODE=full     (default) — nvcc + libraries + NCCL dev headers. Builder stage.
+# MODE=full     (default) — minimal builder set: nvcc + CUDA runtime,
+#                            cuBLAS/NCCL headers and shared libraries.
 # MODE=runtime             — shared libraries only. Slim runtime stage.
 #
 # The host driver is injected at container run time via
@@ -29,27 +30,24 @@ rm /tmp/cuda-keyring.deb
 apt-get "${APT_OPTS[@]}" update
 
 if [[ "${MODE}" == "full" ]]; then
-    # Full toolkit + NCCL headers.
+    # Build-minimal CUDA: avoid cuda-toolkit-13-0, which also pulls Nsight,
+    # OpenJDK, GTK, profilers, docs, and other tools not needed to compile
+    # Llaminar.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
-        cuda-toolkit-13-0 \
+        cuda-nvcc-13-0 \
+        cuda-cudart-dev-13-0 \
+        libcublas-dev-13-0 \
         "libnccl2=*+cuda13.0" \
         "libnccl-dev=*+cuda13.0"
 else
     # Runtime libraries only. These are the minimum a dynamically-linked
-    # llaminar2 binary needs at process start: cuBLAS, cuBLASLt, cuSPARSE,
-    # cuSOLVER, cuRAND, cuFFT, NPP, NVRTC, nvJitLink, and the NCCL runtime.
+    # CUDA-enabled llaminar2 binary needs at process start. The host driver is
+    # injected by nvidia-container-toolkit at docker run time.
     apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
         --allow-change-held-packages \
         cuda-cudart-13-0 \
-        cuda-nvrtc-13-0 \
         libcublas-13-0 \
-        libcufft-13-0 \
-        libcurand-13-0 \
-        libcusolver-13-0 \
-        libcusparse-13-0 \
-        libnvjitlink-13-0 \
-        libnpp-13-0 \
         "libnccl2=*+cuda13.0"
 fi
 

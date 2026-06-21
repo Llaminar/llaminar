@@ -2,8 +2,8 @@
  * @file NUMAAllocator.cpp
  * @brief NUMA-aware memory allocation implementation
  *
- * Uses libnuma if available, with fallback to aligned_alloc for systems
- * without NUMA support or single-socket machines.
+ * Uses libnuma and explicit mbind() so requested NUMA placement either
+ * succeeds or allocation fails.
  *
  * @author David Sanftenberg
  * @date 2026-01-21
@@ -12,19 +12,16 @@
 #include "NUMAAllocator.h"
 #include "../utils/Logger.h"
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
 #include <thread>
 
-#ifdef HAVE_NUMA
 #include <numa.h>
 #include <numaif.h>
-#endif
 
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 namespace llaminar2
 {
@@ -76,11 +73,9 @@ namespace llaminar2
 
     void NUMAAllocator::initializeNUMA()
     {
-#ifdef HAVE_NUMA
-        // Check if NUMA is available on this system
         if (numa_available() < 0)
         {
-            LOG_DEBUG("NUMAAllocator: libnuma present but NUMA not available on this system");
+            LOG_ERROR("NUMAAllocator: libnuma is present but NUMA policy APIs are unavailable");
             numa_available_ = false;
             num_numa_nodes_ = 1;
             allocated_per_node_.resize(1, 0);
@@ -108,12 +103,6 @@ namespace llaminar2
                 LOG_DEBUG("  Node " << i << ": " << (node_size / (1024 * 1024 * 1024)) << " GB");
             }
         }
-#else
-        LOG_DEBUG("NUMAAllocator: libnuma not available, using standard allocation");
-        numa_available_ = false;
-        num_numa_nodes_ = 1;
-        allocated_per_node_.resize(1, 0);
-#endif
     }
 
     // ============================================================================
@@ -127,12 +116,18 @@ namespace llaminar2
             return getCurrentNUMANode();
         }
 
-        // Clamp to valid range
+        if (!numa_available_)
+        {
+            LOG_ERROR("NUMAAllocator: NUMA node " << numa_node
+                                                  << " requested but NUMA policy APIs are unavailable");
+            return -1;
+        }
+
         if (numa_node < 0 || numa_node >= num_numa_nodes_)
         {
-            LOG_WARN("NUMAAllocator: Invalid NUMA node " << numa_node
-                                                         << ", using node 0 (valid range: 0-" << (num_numa_nodes_ - 1) << ")");
-            return 0;
+            LOG_ERROR("NUMAAllocator: Invalid NUMA node " << numa_node
+                                                          << " (valid range: 0-" << (num_numa_nodes_ - 1) << ")");
+            return -1;
         }
 
         return numa_node;
@@ -159,61 +154,52 @@ namespace llaminar2
 
         // Resolve NUMA node (-1 means local)
         int resolved_node = resolveNUMANode(numa_node);
-
-        void *ptr = nullptr;
-
-#ifdef HAVE_NUMA
-        if (numa_available_)
+        if (resolved_node < 0)
         {
-            // Use numa_alloc_onnode for NUMA-aware allocation
-            // Note: numa_alloc_onnode returns page-aligned memory (4KB aligned)
-            // If we need larger alignment, we need to handle it ourselves
-
-            if (alignment <= PAGE_SIZE)
-            {
-                ptr = numa_alloc_onnode(bytes, resolved_node);
-            }
-            else
-            {
-                // For larger alignments, allocate extra and align manually
-                // This is rare (alignment > 4KB)
-                size_t padded_bytes = bytes + alignment;
-                void *raw = numa_alloc_onnode(padded_bytes, resolved_node);
-                if (raw)
-                {
-                    // Align the pointer
-                    uintptr_t addr = reinterpret_cast<uintptr_t>(raw);
-                    uintptr_t aligned_addr = alignUp(addr, alignment);
-                    ptr = reinterpret_cast<void *>(aligned_addr);
-
-                    // Store original pointer for freeing (in a real implementation,
-                    // we'd need a map to track this - for now, this is simplified)
-                    // TODO: Track original pointers for custom-aligned allocations
-                    LOG_WARN("NUMAAllocator: Large alignment requested (" << alignment
-                                                                          << "), using simplified allocation (may leak memory on free)");
-                }
-            }
-
-            if (ptr)
-            {
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                allocated_per_node_[resolved_node] += bytes;
-                LOG_TRACE("NUMAAllocator: Allocated " << bytes << " bytes on node " << resolved_node);
-            }
-            else
-            {
-                LOG_ERROR("NUMAAllocator: numa_alloc_onnode failed for " << bytes << " bytes on node " << resolved_node);
-                // Fall back to standard allocation
-                ptr = fallbackAlloc(bytes, alignment);
-            }
+            return nullptr;
         }
-        else
+
+        size_t allocation_alignment = std::max(alignment, PAGE_SIZE);
+        size_t aligned_bytes = alignUp(bytes, allocation_alignment);
+        void *ptr = std::aligned_alloc(allocation_alignment, aligned_bytes);
+        if (!ptr)
         {
-            ptr = fallbackAlloc(bytes, alignment);
+            LOG_ERROR("NUMAAllocator: aligned_alloc failed for " << bytes << " bytes");
+            return nullptr;
         }
-#else
-        ptr = fallbackAlloc(bytes, alignment);
-#endif
+
+        struct bitmask *nodemask = numa_allocate_nodemask();
+        if (!nodemask)
+        {
+            LOG_ERROR("NUMAAllocator: Failed to allocate NUMA nodemask for node " << resolved_node);
+            std::free(ptr);
+            return nullptr;
+        }
+
+        numa_bitmask_clearall(nodemask);
+        numa_bitmask_setbit(nodemask, resolved_node);
+
+        errno = 0;
+        int rc = mbind(ptr, aligned_bytes, MPOL_BIND, nodemask->maskp, nodemask->size, 0);
+        int bind_errno = errno;
+        numa_free_nodemask(nodemask);
+
+        if (rc != 0)
+        {
+            LOG_ERROR("NUMAAllocator: mbind failed for " << aligned_bytes
+                                                         << " bytes on node " << resolved_node
+                                                         << ": " << std::strerror(bind_errno));
+            std::free(ptr);
+            return nullptr;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            allocated_per_node_[resolved_node] += bytes;
+            allocation_records_[ptr] = AllocationRecord{resolved_node, bytes};
+        }
+
+        LOG_TRACE("NUMAAllocator: Allocated " << bytes << " bytes on node " << resolved_node);
 
         return ptr;
     }
@@ -225,43 +211,7 @@ namespace llaminar2
             return nullptr;
         }
 
-#ifdef HAVE_NUMA
-        if (numa_available_)
-        {
-            // Use numa_alloc_local which allocates on the local node
-            if (!isPowerOfTwo(alignment))
-            {
-                alignment = MIN_ALIGNMENT;
-            }
-            if (alignment < MIN_ALIGNMENT)
-            {
-                alignment = MIN_ALIGNMENT;
-            }
-
-            void *ptr = nullptr;
-            if (alignment <= PAGE_SIZE)
-            {
-                ptr = numa_alloc_local(bytes);
-            }
-            else
-            {
-                // Fallback for large alignments
-                ptr = fallbackAlloc(bytes, alignment);
-            }
-
-            if (ptr)
-            {
-                int local_node = getCurrentNUMANode();
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                allocated_per_node_[local_node] += bytes;
-                LOG_TRACE("NUMAAllocator: Allocated " << bytes << " bytes locally (node " << local_node << ")");
-            }
-
-            return ptr;
-        }
-#endif
-
-        return fallbackAlloc(bytes, alignment);
+        return allocateOnNode(bytes, getCurrentNUMANode(), alignment);
     }
 
     void *NUMAAllocator::allocateAndTouch(size_t bytes, int numa_node, uint8_t init_value)
@@ -281,9 +231,8 @@ namespace llaminar2
         // This ensures pages are faulted on the correct NUMA node
         uint8_t *data = static_cast<uint8_t *>(ptr);
 
-#ifdef _OPENMP
-// Parallel first-touch: each thread touches pages in its portion
-// This works best when threads are already bound to the target NUMA node
+        // Parallel first-touch: each thread touches pages in its portion.
+        // This works best when threads are already bound to the target NUMA node.
 #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < bytes; i += PAGE_SIZE)
         {
@@ -307,10 +256,6 @@ namespace llaminar2
             // This is faster than byte-by-byte
             std::memset(ptr, 0, bytes);
         }
-#else
-        // Single-threaded fallback
-        std::memset(ptr, init_value, bytes);
-#endif
 
         LOG_TRACE("NUMAAllocator: Allocated and touched " << bytes << " bytes on node " << numa_node);
         return ptr;
@@ -323,29 +268,27 @@ namespace llaminar2
             return;
         }
 
-#ifdef HAVE_NUMA
-        if (numa_available_)
+        int node = -1;
+        size_t recorded_bytes = bytes;
         {
-            // Get the NUMA node this memory was on (for stats tracking)
-            int node = getNUMANodeForAddress(ptr);
-
-            numa_free(ptr, bytes);
-
-            if (node >= 0 && node < num_numa_nodes_)
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            auto it = allocation_records_.find(ptr);
+            if (it != allocation_records_.end())
             {
-                std::lock_guard<std::mutex> lock(stats_mutex_);
-                if (allocated_per_node_[node] >= bytes)
+                node = it->second.node;
+                recorded_bytes = it->second.bytes;
+                if (node >= 0 && node < static_cast<int>(allocated_per_node_.size()) &&
+                    allocated_per_node_[node] >= recorded_bytes)
                 {
-                    allocated_per_node_[node] -= bytes;
+                    allocated_per_node_[node] -= recorded_bytes;
                 }
+                allocation_records_.erase(it);
             }
-
-            LOG_TRACE("NUMAAllocator: Freed " << bytes << " bytes from node " << node);
-            return;
         }
-#endif
 
-        fallbackFree(ptr, bytes);
+        std::free(ptr);
+
+        LOG_TRACE("NUMAAllocator: Freed " << recorded_bytes << " bytes from node " << node);
     }
 
     // ============================================================================
@@ -354,7 +297,6 @@ namespace llaminar2
 
     int NUMAAllocator::getCurrentNUMANode() const
     {
-#ifdef HAVE_NUMA
         if (numa_available_)
         {
             // Get the NUMA node of the current CPU
@@ -370,7 +312,6 @@ namespace llaminar2
             // Fallback: preferred node
             return numa_preferred();
         }
-#endif
         return 0;
     }
 
@@ -381,7 +322,6 @@ namespace llaminar2
             return -1;
         }
 
-#ifdef HAVE_NUMA
         if (numa_available_)
         {
             int node = -1;
@@ -400,7 +340,6 @@ namespace llaminar2
                 return node;
             }
         }
-#endif
 
         return -1; // Cannot determine
     }
@@ -412,67 +351,76 @@ namespace llaminar2
             return false;
         }
 
-#ifdef HAVE_NUMA
-        if (numa_available_)
+        if (!numa_available_)
         {
-            int resolved_node = resolveNUMANode(numa_node);
-
-            // Create a nodemask for the target node
-            struct bitmask *nodemask = numa_allocate_nodemask();
-            if (!nodemask)
-            {
-                LOG_ERROR("NUMAAllocator: Failed to allocate nodemask for migration");
-                return false;
-            }
-
-            numa_bitmask_setbit(nodemask, resolved_node);
-
-            // Migrate pages - this is expensive!
-            int result = mbind(ptr, bytes, MPOL_BIND, nodemask->maskp,
-                               nodemask->size + 1, MPOL_MF_MOVE | MPOL_MF_STRICT);
-
-            numa_free_nodemask(nodemask);
-
-            if (result != 0)
-            {
-                LOG_WARN("NUMAAllocator: Page migration to node " << resolved_node
-                                                                  << " failed: " << strerror(errno));
-                return false;
-            }
-
-            LOG_DEBUG("NUMAAllocator: Migrated " << bytes << " bytes to node " << resolved_node);
-            return true;
+            LOG_ERROR("NUMAAllocator: Cannot migrate pages because NUMA policy APIs are unavailable");
+            return false;
         }
-#endif
 
-        return false; // Migration not available
+        int resolved_node = resolveNUMANode(numa_node);
+        if (resolved_node < 0)
+        {
+            return false;
+        }
+
+        // Create a nodemask for the target node
+        struct bitmask *nodemask = numa_allocate_nodemask();
+        if (!nodemask)
+        {
+            LOG_ERROR("NUMAAllocator: Failed to allocate nodemask for migration");
+            return false;
+        }
+
+        numa_bitmask_clearall(nodemask);
+        numa_bitmask_setbit(nodemask, resolved_node);
+
+        // Migrate pages - this is expensive!
+        errno = 0;
+        int result = mbind(ptr, bytes, MPOL_BIND, nodemask->maskp,
+                           nodemask->size, MPOL_MF_MOVE | MPOL_MF_STRICT);
+        int bind_errno = errno;
+
+        numa_free_nodemask(nodemask);
+
+        if (result != 0)
+        {
+            LOG_ERROR("NUMAAllocator: Page migration to node " << resolved_node
+                                                               << " failed: " << strerror(bind_errno));
+            return false;
+        }
+
+        LOG_DEBUG("NUMAAllocator: Migrated " << bytes << " bytes to node " << resolved_node);
+        return true;
     }
 
     bool NUMAAllocator::bindThreadToNode(int numa_node)
     {
-#ifdef HAVE_NUMA
-        if (numa_available_)
+        if (!numa_available_)
         {
-            int resolved_node = resolveNUMANode(numa_node);
-
-            // Bind this thread to run only on CPUs of the target NUMA node
-            int result = numa_run_on_node(resolved_node);
-
-            if (result != 0)
-            {
-                LOG_WARN("NUMAAllocator: Failed to bind thread to node " << resolved_node);
-                return false;
-            }
-
-            // Also set memory policy for this thread
-            numa_set_preferred(resolved_node);
-
-            LOG_DEBUG("NUMAAllocator: Bound thread to NUMA node " << resolved_node);
-            return true;
+            LOG_ERROR("NUMAAllocator: Cannot bind thread because NUMA policy APIs are unavailable");
+            return false;
         }
-#endif
 
-        return false; // Binding not available
+        int resolved_node = resolveNUMANode(numa_node);
+        if (resolved_node < 0)
+        {
+            return false;
+        }
+
+        // Bind this thread to run only on CPUs of the target NUMA node
+        int result = numa_run_on_node(resolved_node);
+
+        if (result != 0)
+        {
+            LOG_ERROR("NUMAAllocator: Failed to bind thread to node " << resolved_node);
+            return false;
+        }
+
+        // Also set memory policy for this thread
+        numa_set_preferred(resolved_node);
+
+        LOG_DEBUG("NUMAAllocator: Bound thread to NUMA node " << resolved_node);
+        return true;
     }
 
     NUMAAllocator::NUMAStats NUMAAllocator::getNodeStats(int numa_node) const
@@ -480,8 +428,11 @@ namespace llaminar2
         NUMAStats stats;
 
         int resolved_node = resolveNUMANode(numa_node);
+        if (resolved_node < 0)
+        {
+            return stats;
+        }
 
-#ifdef HAVE_NUMA
         if (numa_available_)
         {
             long long free_bytes = 0;
@@ -493,7 +444,6 @@ namespace llaminar2
                 stats.free_bytes = static_cast<size_t>(free_bytes);
             }
         }
-#endif
 
         // Add our tracked allocation
         {
@@ -505,68 +455,6 @@ namespace llaminar2
         }
 
         return stats;
-    }
-
-    // ============================================================================
-    // Fallback Allocation (when NUMA unavailable)
-    // ============================================================================
-
-    void *NUMAAllocator::fallbackAlloc(size_t bytes, size_t alignment)
-    {
-        if (bytes == 0)
-        {
-            return nullptr;
-        }
-
-        // Ensure alignment is valid for aligned_alloc
-        if (!isPowerOfTwo(alignment))
-        {
-            alignment = MIN_ALIGNMENT;
-        }
-        if (alignment < sizeof(void *))
-        {
-            alignment = sizeof(void *);
-        }
-
-        // aligned_alloc requires size to be multiple of alignment
-        size_t aligned_bytes = alignUp(bytes, alignment);
-
-        void *ptr = std::aligned_alloc(alignment, aligned_bytes);
-
-        if (ptr)
-        {
-            // Track in node 0 for stats
-            std::lock_guard<std::mutex> lock(stats_mutex_);
-            allocated_per_node_[0] += bytes;
-            LOG_TRACE("NUMAAllocator: Fallback allocated " << bytes << " bytes (aligned to " << alignment << ")");
-        }
-        else
-        {
-            LOG_ERROR("NUMAAllocator: Fallback aligned_alloc failed for " << bytes << " bytes");
-        }
-
-        return ptr;
-    }
-
-    void NUMAAllocator::fallbackFree(void *ptr, size_t bytes)
-    {
-        if (!ptr)
-        {
-            return;
-        }
-
-        std::free(ptr);
-
-        // Track deallocation
-        {
-            std::lock_guard<std::mutex> lock(stats_mutex_);
-            if (allocated_per_node_[0] >= bytes)
-            {
-                allocated_per_node_[0] -= bytes;
-            }
-        }
-
-        LOG_TRACE("NUMAAllocator: Fallback freed " << bytes << " bytes");
     }
 
 } // namespace llaminar2

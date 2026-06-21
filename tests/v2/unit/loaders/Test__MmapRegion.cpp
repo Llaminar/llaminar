@@ -6,12 +6,50 @@
 #include <fstream>
 #include <string>
 
+#include <cstdlib>
 #include <unistd.h>
+
+#include <numa.h>
 
 namespace llaminar2::test
 {
     namespace
     {
+        class ScopedEnvVar
+        {
+        public:
+            ScopedEnvVar(const char *name, const char *value)
+                : name_(name)
+            {
+                const char *old = std::getenv(name);
+                if (old)
+                {
+                    had_old_ = true;
+                    old_value_ = old;
+                }
+                if (value)
+                    setenv(name, value, 1);
+                else
+                    unsetenv(name);
+            }
+
+            ~ScopedEnvVar()
+            {
+                if (had_old_)
+                    setenv(name_.c_str(), old_value_.c_str(), 1);
+                else
+                    unsetenv(name_.c_str());
+            }
+
+            ScopedEnvVar(const ScopedEnvVar &) = delete;
+            ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
+
+        private:
+            std::string name_;
+            bool had_old_ = false;
+            std::string old_value_;
+        };
+
         /**
          * @brief Creates a small temporary file that is safe to mmap in unit tests.
          *
@@ -71,5 +109,22 @@ namespace llaminar2::test
         ASSERT_NE(region, nullptr);
         EXPECT_TRUE(region->wasEagerPrefaulted())
             << "CPU/non-GPU mmap keeps the historical eager-prefault behavior";
+    }
+
+    TEST(Test__MmapRegion, RequestedNumaBindFailureFailsFastByDefault)
+    {
+        ScopedEnvVar allow_fallback("LLAMINAR_ALLOW_NUMA_BIND_FALLBACK", nullptr);
+        TemporaryMmapFile file;
+
+        int requested_node = numa_available() >= 0 ? numa_max_node() + 1 : 0;
+
+        auto region = MmapRegion::create(
+            file.path().string(),
+            requested_node,
+            /*skip_cache_eviction=*/false,
+            MmapRegion::PrefaultPolicy::Auto);
+
+        EXPECT_EQ(region, nullptr)
+            << "Requested NUMA placement must not silently fall back when binding cannot be satisfied";
     }
 } // namespace llaminar2::test

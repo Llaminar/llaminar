@@ -16,9 +16,7 @@
 #include <atomic>
 #include <type_traits>
 
-#ifdef _OPENMP
 #include <omp.h>
-#endif
 
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"

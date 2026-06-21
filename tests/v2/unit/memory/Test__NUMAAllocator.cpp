@@ -91,11 +91,8 @@ TEST(Test__NUMAAllocator, AllocateOnNodeInvalidNode)
 {
     NUMAAllocator &allocator = NUMAAllocator::instance();
 
-    // Invalid node should fall back gracefully (typically to node 0)
     void *ptr = allocator.allocateOnNode(1024, 999);
-    ASSERT_NE(ptr, nullptr) << "Invalid NUMA node should fallback, not fail";
-
-    allocator.free(ptr, 1024);
+    EXPECT_EQ(ptr, nullptr) << "Invalid NUMA node must fail instead of falling back";
 }
 
 TEST(Test__NUMAAllocator, AllocateOnNodeNegativeInvalid)
@@ -104,11 +101,7 @@ TEST(Test__NUMAAllocator, AllocateOnNodeNegativeInvalid)
 
     // -2 is invalid (only -1 is special for local)
     void *ptr = allocator.allocateOnNode(1024, -2);
-    // Should either succeed with fallback or return non-null after warning
-    // The implementation treats invalid nodes by clamping to valid range
-    ASSERT_NE(ptr, nullptr) << "Negative invalid node should fallback gracefully";
-
-    allocator.free(ptr, 1024);
+    EXPECT_EQ(ptr, nullptr) << "Negative invalid node must fail instead of falling back";
 }
 
 // ============================================================================

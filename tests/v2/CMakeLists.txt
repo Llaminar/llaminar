@@ -11035,8 +11035,10 @@ message(STATUS "V2 Tests: Added CompoundShardInfo unit tests")
 # - CommHierarchy RAII wrapper (add, get, move, toString)
 # - Hierarchy building for various topologies
 # - Edge cases (rank not in domain, PP-only, mixed local+cross-rank)
-add_executable(v2_test_hierarchical_comm_builder unit/execution/parallelism_tree/Test__HierarchicalCommBuilder.cpp)
-target_link_libraries(v2_test_hierarchical_comm_builder llaminar2_core GTest::gtest GTest::gtest_main)
+add_executable(v2_test_hierarchical_comm_builder
+    unit/execution/parallelism_tree/Test__HierarchicalCommBuilder.cpp
+    integration/mpi_gtest_main.cpp)
+target_link_libraries(v2_test_hierarchical_comm_builder llaminar2_core GTest::gtest MPI::MPI_CXX)
 add_v2_test(V2_Unit_HierarchicalCommBuilder
     COMMAND $<TARGET_FILE:v2_test_hierarchical_comm_builder>
     LABELS "V2;Unit;Topology;PipelineParallel;TensorParallel;MPI"

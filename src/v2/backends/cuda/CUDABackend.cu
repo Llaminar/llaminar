@@ -16,7 +16,6 @@
 #include "../../kernels/common/SamplingMath.h"
 #include "../../kernels/cuda/ops/CUDAVectorAddKernels.h"
 #include <cuda_runtime.h>
-#include <cuda.h> // For cuCtxSetCurrent, cuDevicePrimaryCtxRetain
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -135,7 +134,7 @@ namespace llaminar2
             return false;
         }
 
-        // Use setDevice() which handles both runtime and driver API context
+        // Use setDevice() to establish the CUDA runtime context for this thread.
         if (!setDevice(device_id))
         {
             return false;
@@ -399,45 +398,12 @@ namespace llaminar2
             return false;
         }
 
-        // First, set the runtime API device
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
         {
             return false;
         }
-
-        // Also set the driver API context for cross-thread compatibility.
-        // This is crucial when CUDA is called from a thread that primarily
-        // uses another GPU runtime (e.g., HIP/ROCm). The cudaSetDevice alone
-        // may not properly establish the context for driver API operations
-        // or for events created on other threads.
-        CUdevice cu_device;
-        CUresult cu_err = cuDeviceGet(&cu_device, device_id);
-        if (cu_err != CUDA_SUCCESS)
-        {
-            // Fall through - runtime API is set, driver API failed but may work
-            LOG_WARN("[CUDABackend::setDevice] cuDeviceGet failed for device " << device_id << " error=" << cu_err);
-            return true; // cudaSetDevice succeeded, return true
-        }
-
-        CUcontext ctx;
-        cu_err = cuDevicePrimaryCtxRetain(&ctx, cu_device);
-        if (cu_err != CUDA_SUCCESS)
-        {
-            LOG_WARN("[CUDABackend::setDevice] cuDevicePrimaryCtxRetain failed for device " << device_id << " error=" << cu_err);
-            return true; // cudaSetDevice succeeded
-        }
-
-        cu_err = cuCtxSetCurrent(ctx);
-        if (cu_err != CUDA_SUCCESS)
-        {
-            LOG_WARN("[CUDABackend::setDevice] cuCtxSetCurrent failed for device " << device_id << " error=" << cu_err);
-        }
-        else
-        {
-            LOG_DEBUG("[CUDABackend::setDevice] Successfully set context for device " << device_id);
-        }
-
+        LOG_TRACE("[CUDABackend::setDevice] Set CUDA runtime device " << device_id);
         return true;
     }
 

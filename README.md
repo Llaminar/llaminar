@@ -25,10 +25,16 @@ On the host you need:
 - NVIDIA Container Toolkit configured for Docker.
 - AMDGPU DKMS kernel driver from the ROCm 7.1.1 stack.
 
+OpenMPI and libnuma are hard Llaminar dependencies. The Docker images include
+them; source builds should install `openmpi-bin`, `libopenmpi-dev`, and
+`libnuma-dev`.
+
 You do not need to install the full CUDA Toolkit or the full ROCm user-space
-stack on the host. Those user-space libraries are in the image. The current
-combined image is CUDA/NVML-linked, so use NVIDIA Container Toolkit
-`--gpus all` even when the selected Llaminar backend is `cpu` or `rocm:0`.
+stack on the host. Those user-space libraries are in the image. Pick the image
+variant that matches the backends you want to expose: CPU-only images do not
+need GPU devices, CUDA images need NVIDIA Container Toolkit, ROCm images need
+the AMDGPU kernel driver and `/dev/kfd` plus `/dev/dri`, and the combined image
+needs both ecosystems.
 
 1. Install Docker Engine:
 
@@ -127,13 +133,24 @@ Use the semicolon-separated CUDA architecture list for the NVIDIA GPUs you plan
 to run. Common values are `80` for A100, `86` for RTX 30/A10, `89` for RTX
 40/L4/L40, and `90` for H100/H200.
 
+Build smaller backend-specific images when the target machine only needs one
+GPU ecosystem:
+
+```bash
+scripts/docker/build-runtime-image.sh --variant cpu  --tag llaminar:cpu
+scripts/docker/build-runtime-image.sh --variant cuda --tag llaminar:cuda --cuda-archs "80;86;89;90"
+scripts/docker/build-runtime-image.sh --variant rocm --tag llaminar:rocm
+```
+
 6. Verify the Llaminar image can use both GPU ecosystems:
 
 ```bash
 export AMD_KFD_GID="$(stat -c '%g' /dev/kfd)"
 export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' | head -n1)")"
 
-docker run --rm --gpus all llaminar:local --help
+docker run --rm --gpus all \
+  --security-opt seccomp=unconfined \
+  llaminar:local --help
 
 docker run --rm \
   --gpus all \
@@ -141,13 +158,19 @@ docker run --rm \
   --device /dev/dri \
   --group-add "$AMD_KFD_GID" \
   --group-add "$AMD_RENDER_GID" \
+  --security-opt seccomp=unconfined \
   --entrypoint rocminfo \
   llaminar:local
 ```
 
-These commands avoid `--privileged`, `--cap-add`, and unconfined seccomp by
-default. If your local ROCm stack rejects `rocminfo` or HIP initialization under
-Docker's default seccomp profile, add `--security-opt seccomp=unconfined`.
+Llaminar does not require `--privileged` for normal container runs. It does
+require Docker to allow Linux NUMA policy syscalls (`mbind`, `set_mempolicy`,
+and `get_mempolicy`) so CPU execution can bind model pages to the intended NUMA
+node. Docker's default seccomp profile commonly blocks those syscalls, so use
+`--security-opt seccomp=unconfined` in Llaminar containers. When CPU model-page
+NUMA binding is requested, Llaminar fails model loading by default if binding
+cannot be applied. Set `LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1` only when you
+explicitly accept degraded CPU NUMA placement.
 
 ### Running Llaminar
 
@@ -162,6 +185,7 @@ CUDA:
 ```bash
 docker run --rm -it \
   --gpus all \
+  --security-opt seccomp=unconfined \
   --ipc=host --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
@@ -182,6 +206,7 @@ docker run --rm -it \
   --device /dev/dri \
   --group-add "$AMD_KFD_GID" \
   --group-add "$AMD_RENDER_GID" \
+  --security-opt seccomp=unconfined \
   --ipc=host --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
@@ -194,7 +219,7 @@ CPU from the same release image:
 
 ```bash
 docker run --rm -it \
-  --gpus all \
+  --security-opt seccomp=unconfined \
   --ipc=host --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \

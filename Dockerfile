@@ -29,7 +29,9 @@
 
 ARG CUTLASS_VERSION=v4.2.1
 ARG LLAMINAR_BUILD_TYPE=Release
-ARG LLAMINAR_CUDA_ARCHS="75;80;86;89;90"
+ARG LLAMINAR_CUDA_ARCHS="80;86;89;90"
+ARG LLAMINAR_ENABLE_CUDA=ON
+ARG LLAMINAR_ENABLE_ROCM=ON
 ARG LLAMINAR_SKIP_INTEGRATION=0
 ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON
 ARG RCCL_GIT_REF=rocm-7.1.1
@@ -44,6 +46,8 @@ FROM ubuntu:24.04 AS builder
 ARG CUTLASS_VERSION
 ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_CUDA_ARCHS
+ARG LLAMINAR_ENABLE_CUDA
+ARG LLAMINAR_ENABLE_ROCM
 ARG LLAMINAR_SKIP_INTEGRATION
 ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE
 ARG RCCL_GIT_REF
@@ -72,26 +76,22 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/install-cutlass.sh \
      /tmp/install-scripts/
 RUN MODE=build  /tmp/install-scripts/install-system-deps.sh
-RUN MODE=full   /tmp/install-scripts/install-cuda.sh
-RUN MODE=full   /tmp/install-scripts/install-rocm.sh
-RUN CUTLASS_VERSION=${CUTLASS_VERSION} /tmp/install-scripts/install-cutlass.sh
+RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
+        MODE=full /tmp/install-scripts/install-cuda.sh; \
+    else \
+        echo "==> [cuda] disabled for this build"; \
+    fi
+RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
+        MODE=build /tmp/install-scripts/install-rocm.sh; \
+    else \
+        echo "==> [rocm] disabled for this build"; \
+    fi
+RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
+        CUTLASS_VERSION=${CUTLASS_VERSION} /tmp/install-scripts/install-cutlass.sh; \
+    else \
+        echo "==> [cutlass] skipped because CUDA is disabled"; \
+    fi
 RUN rm -rf /tmp/install-scripts
-
-# `docker build` cannot use `--gpus`, so nvidia-container-runtime never
-# injects the real /usr/lib/x86_64-linux-gnu/libcuda.so.1 driver lib.
-# Without it, any CUDA-linked binary (e.g. our parity test executables)
-# fails to start with exit 127 ("error while loading shared libraries:
-# libcuda.so.1") — which breaks the cmake POST_BUILD --gtest_list_tests
-# discovery step in tests/v2/cmake/V2ParityTestDiscovery.cmake.
-#
-# Resolve the SONAME against the CUDA toolkit's link-time stub for build
-# time only. At `docker run --gpus all` time, the real driver gets
-# injected at /usr/lib/x86_64-linux-gnu/libcuda.so.1 and wins via
-# ld.so.cache, so this stub is invisible at actual test execution time.
-RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
-           /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
-    echo "/usr/local/cuda/lib64/stubs" > /etc/ld.so.conf.d/zz-cuda-stubs.conf && \
-    ldconfig
 
 WORKDIR /src
 
@@ -143,7 +143,7 @@ ARG RCCL_ENABLE_MSCCL_KERNEL=OFF
 ARG RCCL_ONLY_FUNCS=
 RUN --mount=type=cache,target=/root/.ccache \
     set -e; \
-    if [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+    if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         echo "==> [rccl] clone ${RCCL_GIT_REF}"; \
         git clone --depth 1 --branch "${RCCL_GIT_REF}" \
             https://github.com/ROCm/rccl.git /src/external/rccl; \
@@ -183,8 +183,10 @@ RUN --mount=type=cache,target=/root/.ccache \
         git -C /src/external/rccl rev-parse HEAD \
             > /src/external/rccl/build/.llaminar-rccl-commit; \
         echo "==> [rccl] done; library: $(readlink -f /src/external/rccl/build/librccl.so.1.0)"; \
-    else \
+    elif [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         echo "==> [rccl] source build disabled; runtime image will stage packaged RCCL"; \
+    else \
+        echo "==> [rccl] skipped because ROCm is disabled"; \
     fi
 
 # Python dependencies for the reference tests + parity gates. Pulls the
@@ -226,14 +228,15 @@ RUN --mount=type=cache,target=/root/.ccache \
         echo "==> [integration] skipped (LLAMINAR_SKIP_INTEGRATION=1)"; \
     else \
         RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
-        if [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+        if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
             RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/src/external/rccl/build/librccl.so"; \
         fi; \
         echo "==> [integration] cmake configure" \
      && cmake -B build_v2_integration -S src/v2 -G Ninja \
             -DCMAKE_BUILD_TYPE=Integration \
-            -DHAVE_CUDA=ON \
-            -DHAVE_ROCM=ON \
+            -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
+            -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
+            -DLLAMINAR_SHARED_CORE=ON \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             ${RCCL_CMAKE_ARGS} \
      && echo "==> [integration] cmake build (parallel)" \
@@ -257,19 +260,21 @@ RUN --mount=type=cache,target=/root/.ccache \
 # only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
 RUN --mount=type=cache,target=/root/.ccache \
     RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
-    if [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
+    if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/src/include -DRCCL_LIBRARY=/src/external/rccl/build/librccl.so"; \
     fi; \
     echo "==> [release] cmake configure" \
  && cmake -B build_v2_release -S src/v2 -G Ninja \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
-        -DHAVE_CUDA=ON \
-        -DHAVE_ROCM=ON \
+        -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
+        -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
+        -DLLAMINAR_SHARED_CORE=ON \
+        -DLLAMINAR_BUILD_TESTS=OFF \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
         ${RCCL_CMAKE_ARGS} \
  && echo "==> [release] cmake build --target llaminar2 (parallel)" \
  && cmake --build build_v2_release --parallel --target llaminar2 \
- && if [ ! -e external/rccl/build/librccl.so.1.0 ]; then \
+ && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ ! -e external/rccl/build/librccl.so.1.0 ]; then \
         echo "==> [release] source-built RCCL not present; staging system RCCL"; \
         mkdir -p external/rccl/build; \
         cp -P /opt/rocm/lib/librccl.so* external/rccl/build/; \
@@ -285,6 +290,11 @@ RUN --mount=type=cache,target=/root/.ccache \
         \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
         -delete \
  && find build_v2_release -depth -type d -name CMakeFiles -exec rm -rf {} + \
+ && mkdir -p /src/runtime-bin /src/runtime-libs \
+ && cp build_v2_release/llaminar2 /src/runtime-bin/llaminar2 \
+ && cp build_v2_release/libllaminar2_core.so /src/runtime-libs/ \
+ && cp external/onednn/build/lib/libdnnl.so.3.11 /src/runtime-libs/ \
+ && if [ -e external/rccl/build/librccl.so.1.0 ]; then cp external/rccl/build/librccl.so.1.0 /src/runtime-libs/; fi \
  && echo "==> [release] done; final size: $(du -sh build_v2_release | cut -f1)"
 
 # CI runs `docker run --group-add render --group-add video` against this
@@ -308,6 +318,8 @@ FROM ubuntu:24.04 AS runtime
 ARG BUILD_DATE
 ARG VCS_REF
 ARG VERSION=dev
+ARG LLAMINAR_ENABLE_CUDA=ON
+ARG LLAMINAR_ENABLE_ROCM=ON
 ARG ROCM_RUNTIME_GPU_TARGETS
 
 LABEL org.opencontainers.image.title="Llaminar" \
@@ -321,6 +333,8 @@ LABEL org.opencontainers.image.title="Llaminar" \
 ENV DEBIAN_FRONTEND=noninteractive \
     OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    LLAMINAR_ENABLE_CUDA=${LLAMINAR_ENABLE_CUDA} \
+    LLAMINAR_ENABLE_ROCM=${LLAMINAR_ENABLE_ROCM} \
     CUDA_HOME=/usr/local/cuda \
     ROCM_HOME=/opt/rocm \
     HIP_PATH=/opt/rocm \
@@ -334,22 +348,30 @@ COPY scripts/docker/install-system-deps.sh \
      scripts/docker/prune-runtime-image.sh \
      /tmp/install-scripts/
 RUN MODE=runtime /tmp/install-scripts/install-system-deps.sh
-RUN MODE=runtime /tmp/install-scripts/install-cuda.sh
-RUN bash /tmp/install-scripts/install-rocm-runtime.sh \
- && bash /tmp/install-scripts/prune-runtime-image.sh
+RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
+        MODE=runtime /tmp/install-scripts/install-cuda.sh; \
+    else \
+        echo "==> [cuda] runtime disabled for this image"; \
+    fi
+RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
+        bash /tmp/install-scripts/install-rocm-runtime.sh \
+     && bash /tmp/install-scripts/prune-runtime-image.sh; \
+    else \
+        echo "==> [rocm] runtime disabled for this image"; \
+    fi
 RUN rm -rf /tmp/install-scripts
 
 # Copy the compiled launcher, core shared library, and vendored shared
 # dependencies. The remaining dynamic libraries resolve from the apt packages
 # installed above (CUDA shared libs, ROCm runtime, MPI, OpenBLAS).
-COPY --from=builder /src/build_v2_release/llaminar2 /usr/local/bin/llaminar2
-COPY --from=builder /src/build_v2_release/libllaminar2_core.so /usr/local/lib/
-COPY --from=builder /src/external/onednn/build/lib/libdnnl.so.3.11 /usr/local/lib/
-COPY --from=builder /src/external/rccl/build/librccl.so.1.0 /usr/local/lib/
+COPY --from=builder /src/runtime-bin/ /usr/local/bin/
+COPY --from=builder /src/runtime-libs/ /usr/local/lib/
 RUN ln -sf libdnnl.so.3.11 /usr/local/lib/libdnnl.so.3 \
  && ln -sf libdnnl.so.3 /usr/local/lib/libdnnl.so \
- && ln -sf librccl.so.1.0 /usr/local/lib/librccl.so.1 \
- && ln -sf librccl.so.1 /usr/local/lib/librccl.so \
+ && if [ -e /usr/local/lib/librccl.so.1.0 ]; then \
+        ln -sf librccl.so.1.0 /usr/local/lib/librccl.so.1; \
+        ln -sf librccl.so.1 /usr/local/lib/librccl.so; \
+    fi \
  && ldconfig
 
 # Non-root user for the runtime. GPU devices on the host expose render/video

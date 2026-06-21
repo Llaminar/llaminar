@@ -12,10 +12,6 @@
 #include <cstring>
 #include <cstdio>
 
-#ifdef _OPENMP
-#include <omp.h>
-#endif
-
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"
 
@@ -3379,7 +3375,6 @@ namespace llaminar2::primitives
         // This naturally scales from 1 thread (small) to many (large).
         // No hard cutoffs - the math handles it smoothly.
         // ================================================================
-#ifdef _OPENMP
         bool should_parallelize = opts.allow_parallel;
 
         if (should_parallelize)
@@ -3401,7 +3396,7 @@ namespace llaminar2::primitives
             OMP_WORKSHARE_REGION(do_work);
             return;
         }
-#endif
+
         // Sequential path
         for (size_t r = 0; r < rows; ++r)
         {
@@ -3587,7 +3582,6 @@ namespace llaminar2::primitives
             row_fn = rmsnorm_q16_1_fp32_row_scalar;
         }
 
-#ifdef _OPENMP
         bool should_parallelize = opts.allow_parallel && (rows * cols >= opts.parallel_threshold_elems);
 
         if (should_parallelize)
@@ -3608,7 +3602,6 @@ namespace llaminar2::primitives
             OMP_WORKSHARE_REGION(do_work);
             return;
         }
-#endif
 
         // Sequential path
         for (size_t r = 0; r < rows; ++r)

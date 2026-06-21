@@ -8,6 +8,7 @@
 #include "BlockStructures.h"
 #include "TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../utils/Logger.h"
+#include <cerrno>
 #include <stdexcept>
 #include <sstream>
 #include <cstring> // For std::memcpy in numaMemcpy
@@ -392,20 +393,43 @@ namespace llaminar2
 
     void TensorFactory::bindToNumaNode()
     {
-        if (numa_node_ >= 0 && numa_available() >= 0)
+        if (numa_node_ < 0)
         {
-            // Bind current thread to NUMA node
-            struct bitmask *mask = numa_allocate_nodemask();
-            numa_bitmask_clearall(mask);
-            numa_bitmask_setbit(mask, numa_node_);
+            return;
+        }
 
-            // Set memory binding policy for allocations
-            numa_set_membind(mask);
+        if (numa_available() < 0)
+        {
+            throw std::runtime_error("[TensorFactory] NUMA node " + std::to_string(numa_node_) +
+                                     " requested but NUMA policy APIs are unavailable");
+        }
+        if (numa_node_ > numa_max_node())
+        {
+            throw std::runtime_error("[TensorFactory] NUMA node " + std::to_string(numa_node_) +
+                                     " exceeds max " + std::to_string(numa_max_node()));
+        }
 
-            // Also bind CPU affinity (optional, helps with first-touch)
-            // numa_run_on_node_mask(mask);
+        struct bitmask *mask = numa_allocate_nodemask();
+        if (!mask)
+        {
+            throw std::runtime_error("[TensorFactory] Failed to allocate NUMA nodemask");
+        }
 
-            numa_free_nodemask(mask);
+        numa_bitmask_clearall(mask);
+        numa_bitmask_setbit(mask, numa_node_);
+
+        errno = 0;
+        int rc = set_mempolicy(MPOL_BIND, mask->maskp, mask->size);
+        int bind_errno = errno;
+        numa_free_nodemask(mask);
+
+        if (rc != 0)
+        {
+            std::ostringstream oss;
+            oss << "[TensorFactory] set_mempolicy(MPOL_BIND, node=" << numa_node_
+                << ") failed: errno=" << bind_errno << " (" << std::strerror(bind_errno)
+                << "). In Docker, run with --security-opt seccomp=unconfined.";
+            throw std::runtime_error(oss.str());
         }
     }
 
