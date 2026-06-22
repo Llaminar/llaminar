@@ -898,7 +898,10 @@ namespace llaminar2::cpu::native_vnni
 
             // Pass 4: Build VNNI-interleaved B buffer (4 groups) + inline comp/scales/mins
             size_t interleaved_total = (size_t)N_chunks * blocks_per_row * out.interleaved_block_stride;
-            out.native_interleaved.resize(interleaved_total, 0);
+            // The following parallel pass writes every byte. Avoid a
+            // single-threaded zero fill here because it first-touches the whole
+            // permanent weight buffer on the allocator thread's NUMA node.
+            out.native_interleaved.resize_uninitialized(interleaved_total);
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)
@@ -1042,7 +1045,10 @@ namespace llaminar2::cpu::native_vnni
         if (!out.is_nibble_lut)
         {
             size_t interleaved_total = (size_t)N_chunks * blocks_per_row * out.interleaved_block_stride;
-            out.native_interleaved.resize(interleaved_total, 0);
+            // The following parallel pass writes every byte. Avoid a
+            // single-threaded zero fill here because it first-touches the whole
+            // permanent weight buffer on the allocator thread's NUMA node.
+            out.native_interleaved.resize_uninitialized(interleaved_total);
 
 #pragma omp parallel for schedule(static) collapse(2)
             for (int chunk = 0; chunk < N_chunks; ++chunk)

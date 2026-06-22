@@ -38,16 +38,20 @@
 #ifdef __linux__
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <numa.h>
 #include <numaif.h>
 #include <sched.h>
 #endif
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <iomanip>
 #include <optional>
+#include <sstream>
 #include <vector>
 
 namespace llaminar2
@@ -82,11 +86,154 @@ namespace llaminar2
             int cpu = sched_getcpu();
             if (cpu < 0)
                 return -1;
-            unsigned char stack_byte;
-            return queryNUMANode(&stack_byte);
+            return numa_node_of_cpu(cpu);
 #else
             return -1;
 #endif
+        }
+
+        static size_t systemPageSize()
+        {
+#ifdef __linux__
+            long page_size = sysconf(_SC_PAGESIZE);
+            if (page_size > 0)
+                return static_cast<size_t>(page_size);
+#endif
+            return 4096;
+        }
+
+        static bool verifyRangeNUMANode(const void *ptr, size_t bytes, int expected_node, const char *label)
+        {
+            if (!ptr || bytes == 0)
+                return true;
+
+            const size_t page_size = systemPageSize();
+            const uintptr_t raw_start = reinterpret_cast<uintptr_t>(ptr);
+            const uintptr_t raw_end = raw_start + bytes;
+            const uintptr_t page_start = raw_start & ~(static_cast<uintptr_t>(page_size) - 1);
+            const uintptr_t last_page = (raw_end - 1) & ~(static_cast<uintptr_t>(page_size) - 1);
+            const uintptr_t mid_page = ((page_start + last_page) / 2) & ~(static_cast<uintptr_t>(page_size) - 1);
+
+            uintptr_t sample_pages[] = {page_start, mid_page, last_page};
+            for (uintptr_t page : sample_pages)
+            {
+                const int node = queryNUMANode(reinterpret_cast<const void *>(page));
+                if (node < 0)
+                {
+                    LOG_ERROR("[MoEWeightService][NUMA] Cannot verify NUMA page placement for " << label
+                                                                                                 << " at " << reinterpret_cast<const void *>(page));
+                    return false;
+                }
+                if (node != expected_node)
+                {
+                    LOG_ERROR("[MoEWeightService][NUMA] NUMA migration verification failed for " << label
+                                                                                                  << ": expected node " << expected_node
+                                                                                                  << ", found node " << node
+                                                                                                  << " at " << reinterpret_cast<const void *>(page));
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        static bool migrateRangeToNUMANode(void *ptr, size_t bytes, int target_node, const char *label)
+        {
+#ifdef __linux__
+            if (!ptr || bytes == 0)
+                return true;
+            if (target_node < 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Cannot migrate " << label
+                                                                      << ": target NUMA node is unknown");
+                return false;
+            }
+            if (numa_available() < 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Cannot migrate " << label
+                                                                      << ": libnuma policy APIs are unavailable");
+                return false;
+            }
+            if (target_node > numa_max_node())
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Cannot migrate " << label
+                                                                      << ": target NUMA node " << target_node
+                                                                      << " exceeds max node " << numa_max_node());
+                return false;
+            }
+
+            const size_t page_size = systemPageSize();
+            const uintptr_t raw_start = reinterpret_cast<uintptr_t>(ptr);
+            const uintptr_t raw_end = raw_start + bytes;
+            const uintptr_t page_start = raw_start & ~(static_cast<uintptr_t>(page_size) - 1);
+            const uintptr_t page_end = (raw_end + page_size - 1) & ~(static_cast<uintptr_t>(page_size) - 1);
+            const size_t page_bytes = static_cast<size_t>(page_end - page_start);
+
+            struct bitmask *nodemask = numa_allocate_nodemask();
+            if (!nodemask)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] Failed to allocate nodemask for " << label);
+                return false;
+            }
+
+            numa_bitmask_clearall(nodemask);
+            numa_bitmask_setbit(nodemask, target_node);
+            errno = 0;
+            const int rc = mbind(reinterpret_cast<void *>(page_start),
+                                 page_bytes,
+                                 MPOL_BIND,
+                                 nodemask->maskp,
+                                 nodemask->size,
+                                 MPOL_MF_MOVE | MPOL_MF_STRICT);
+            const int bind_errno = errno;
+            numa_free_nodemask(nodemask);
+
+            if (rc != 0)
+            {
+                LOG_ERROR("[MoEWeightService][NUMA] mbind migration failed for " << label
+                                                                                 << " (" << page_bytes
+                                                                                 << " page-rounded bytes, node="
+                                                                                 << target_node << "): errno="
+                                                                                 << bind_errno << " ("
+                                                                                 << std::strerror(bind_errno) << ")");
+                return false;
+            }
+
+            return verifyRangeNUMANode(ptr, bytes, target_node, label);
+#else
+            (void)ptr;
+            (void)bytes;
+            (void)target_node;
+            (void)label;
+            return false;
+#endif
+        }
+
+        static bool enforceExpertKernelNUMA(ITensorGemm *kernel,
+                                            int target_node,
+                                            int layer_idx,
+                                            int expert_id,
+                                            const char *role)
+        {
+            auto *vnni_kernel = dynamic_cast<cpu::native_vnni::CPUNativeVNNIGemmKernel *>(kernel);
+            if (!vnni_kernel)
+                return true;
+
+            auto &packed = const_cast<cpu::native_vnni::CPUNativeVNNIPackedWeights &>(
+                vnni_kernel->packedWeights());
+
+            std::ostringstream interleaved_label;
+            interleaved_label << "layer " << layer_idx << " expert " << expert_id
+                              << " " << role << " native_interleaved";
+            if (!migrateRangeToNUMANode(packed.native_interleaved.data(),
+                                        packed.native_interleaved.size(),
+                                        target_node,
+                                        interleaved_label.str().c_str()))
+            {
+                return false;
+            }
+
+            return true;
         }
 
         /// Audit NUMA placement of expert GEMM weights.
@@ -95,15 +242,15 @@ namespace llaminar2
             const std::vector<ITensorGemm *> &gate_gemms,
             const char *label,
             int layer_idx,
+            int expected_node,
             int max_sample = 8)
         {
             if (experts.empty())
                 return;
 
-            const int expected_node = currentCPUNode();
             if (expected_node < 0)
             {
-                LOG_DEBUG("[MoEWeightService][NUMA] Cannot determine current NUMA node, skipping audit");
+                LOG_DEBUG("[MoEWeightService][NUMA] Cannot determine expected NUMA node, skipping audit");
                 return;
             }
 
@@ -517,6 +664,12 @@ namespace llaminar2
         // Each expert has unique tensors (unique raw_data() keys), so no cache
         // key collisions.  The heavy VNNI interleave runs lock-free.
         // Phase D: prepareExpertGemmLocal returns shared_ptr without global registry.
+        const int target_numa_node = currentCPUNode();
+        if (target_numa_node < 0)
+        {
+            LOG_ERROR("[MoEWeightService][NUMA] Cannot determine target NUMA node for CPU expert packing");
+            return false;
+        }
         std::atomic<bool> error_flag{false};
 
         // Per-expert engine storage for parallel assignment (avoids push_back race)
@@ -548,6 +701,13 @@ namespace llaminar2
             if (!gate_engine || !up_engine || !down_engine)
             {
                 LOG_ERROR("[MoEWeightService] Failed to prepare GEMM weights for expert " << e);
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
+            if (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
+                !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
+                !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down"))
+            {
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
             }
@@ -672,7 +832,7 @@ namespace llaminar2
 
         // NUMA audit: verify packed weights landed on the correct NUMA node.
         auditExpertNUMA(experts_to_prep, ctx.prepared_gate_gemm,
-                        "initial_pack", ctx.layer_idx);
+                        "initial_pack", ctx.layer_idx, target_numa_node);
 
         // Mark experts as prepared in the payload provider (enables host data release)
         if (ctx.payload_provider)
@@ -907,6 +1067,12 @@ namespace llaminar2
         int transferred_count = 0;
         std::atomic<bool> error_flag{false};
         const int count = static_cast<int>(new_experts.size());
+        const int target_numa_node = currentCPUNode();
+        if (target_numa_node < 0)
+        {
+            LOG_ERROR("[MoEWeightService][NUMA] Cannot determine target NUMA node for CPU expert arrivals");
+            return false;
+        }
 
         auto cached_engine_for = [&](const std::optional<ExpertSlabRef> &slab_ref, int expert_id) -> ITensorGemm *
         {
@@ -968,6 +1134,13 @@ namespace llaminar2
                 error_flag.store(true, std::memory_order_relaxed);
                 continue;
             }
+            if (!enforceExpertKernelNUMA(gate_engine.get(), target_numa_node, ctx.layer_idx, e, "gate") ||
+                !enforceExpertKernelNUMA(up_engine.get(), target_numa_node, ctx.layer_idx, e, "up") ||
+                !enforceExpertKernelNUMA(down_engine.get(), target_numa_node, ctx.layer_idx, e, "down"))
+            {
+                error_flag.store(true, std::memory_order_relaxed);
+                continue;
+            }
 
             ctx.prepared_gate_gemm[e] = gate_engine.get();
             ctx.prepared_up_gemm[e] = up_engine.get();
@@ -996,7 +1169,7 @@ namespace llaminar2
 
         auditExpertNUMA(new_experts, ctx.prepared_gate_gemm,
                         (transferred_count > 0 ? "rebalance_transferred" : "rebalance_repacked"),
-                        ctx.layer_idx);
+                        ctx.layer_idx, target_numa_node);
 
         // Phase C: Register new arrivals in PreparedWeightStore using cached slab refs
         if (ctx.prepared_store && !new_experts.empty())
