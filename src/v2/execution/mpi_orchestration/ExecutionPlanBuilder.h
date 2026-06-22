@@ -209,6 +209,13 @@ namespace llaminar2
             const std::vector<GlobalDeviceAddress> &devices);
 
         /**
+         * @brief Select local TP backend, honoring explicit user/domain backend.
+         */
+        CollectiveBackendType selectLocalTPBackend(
+            const std::vector<GlobalDeviceAddress> &devices,
+            CollectiveBackendType requested_backend);
+
+        /**
          * @brief Select backend for cross-rank communication
          */
         CollectiveBackendType selectCrossRankBackend(

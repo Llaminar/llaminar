@@ -2,7 +2,7 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "V2: configure (debug)",
+            "label": "V2: configure debug",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -14,82 +14,16 @@
                 "Ninja",
                 "-DCMAKE_BUILD_TYPE=Debug",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                "-DHAVE_CUDA=ON",
-                "-DHAVE_ROCM=ON",
-                "-DCMAKE_CXX_FLAGS_DEBUG=-g -O0 --coverage -fprofile-abs-path",
-                "-DCMAKE_C_FLAGS_DEBUG=-g -O0 --coverage -fprofile-abs-path",
-                "-DCMAKE_EXE_LINKER_FLAGS_DEBUG=--coverage"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "problemMatcher": [],
-            "detail": "Configure V2 project with Debug settings (CUDA + ROCm enabled, assertions active)"
-        },
-        {
-            "label": "V2: configure (release)",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "-B",
-                "${workspaceFolder}/build_v2_release",
-                "-S",
-                "${workspaceFolder}/src/v2",
-                "-G",
-                "Ninja",
-                "-DCMAKE_BUILD_TYPE=Release",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DCMAKE_CUDA_ARCHITECTURES=86",
                 "-DHAVE_CUDA=ON",
                 "-DHAVE_ROCM=ON"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
             "problemMatcher": [],
-            "detail": "Configure V2 project with optimized Release settings (CUDA + ROCm enabled)"
+            "detail": "Configure the V2 Debug build. Use for debugging only."
         },
         {
-            "label": "V2: configure (e2e release)",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "-B",
-                "${workspaceFolder}/build_v2_e2e_release",
-                "-S",
-                "${workspaceFolder}/src/v2",
-                "-G",
-                "Ninja",
-                "-DCMAKE_BUILD_TYPE=E2ERelease",
-                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
-                "-DHAVE_CUDA=ON",
-                "-DHAVE_ROCM=ON"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "problemMatcher": [],
-            "detail": "Configure V2 project with E2ERelease (Release optimizations + snapshots + CUDA + ROCm)"
-        },
-        {
-            "label": "V2: configure (integration)",
+            "label": "V2: configure integration",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -101,122 +35,112 @@
                 "Ninja",
                 "-DCMAKE_BUILD_TYPE=Integration",
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DCMAKE_CUDA_ARCHITECTURES=86",
                 "-DHAVE_CUDA=ON",
                 "-DHAVE_ROCM=ON"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
             "problemMatcher": [],
-            "detail": "Configure V2 project with Integration (Release optimizations + debug symbols + snapshots + assertions)"
+            "detail": "Configure the V2 Integration build used by unit, integration, and parity tests."
         },
         {
-            "label": "Debug Build",
+            "label": "V2: configure release",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "-B",
+                "${workspaceFolder}/build_v2_release",
+                "-S",
+                "${workspaceFolder}/src/v2",
+                "-G",
+                "Ninja",
+                "-DCMAKE_BUILD_TYPE=Release",
+                "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                "-DCMAKE_CUDA_ARCHITECTURES=86",
+                "-DHAVE_CUDA=ON",
+                "-DHAVE_ROCM=ON"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Configure the V2 Release build used by performance tests and local E2E server runs."
+        },
+        {
+            "label": "V2: build debug",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
                 "${workspaceFolder}/build_v2",
-                "--config",
-                "Debug",
+                "--parallel"
+            ],
+            "group": "build",
+            "dependsOn": "V2: configure debug",
+            "problemMatcher": [],
+            "detail": "Build the V2 Debug tree with full parallelism."
+        },
+        {
+            "label": "V2: build integration",
+            "type": "shell",
+            "command": "cmake",
+            "args": [
+                "--build",
+                "${workspaceFolder}/build_v2_integration",
                 "--parallel"
             ],
             "group": {
                 "kind": "build",
                 "isDefault": true
             },
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
+            "dependsOn": "V2: configure integration",
             "problemMatcher": [],
-            "dependsOn": "V2: configure (debug)",
-            "detail": "Build V2 project in Debug mode"
+            "detail": "Build the V2 Integration tree with full parallelism."
         },
         {
-            "label": "Release Build",
+            "label": "V2: build release",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
                 "${workspaceFolder}/build_v2_release",
-                "--config",
-                "Release",
                 "--parallel"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
+            "dependsOn": "V2: configure release",
             "problemMatcher": [],
-            "dependsOn": "V2: configure (release)",
-            "detail": "Build V2 project in Release mode"
+            "detail": "Build the V2 Release tree with full parallelism."
         },
         {
-            "label": "E2E Release Build",
+            "label": "V2: build llaminar2 release",
             "type": "shell",
             "command": "cmake",
             "args": [
                 "--build",
-                "${workspaceFolder}/build_v2_e2e_release",
-                "--config",
-                "E2ERelease",
-                "--parallel"
+                "${workspaceFolder}/build_v2_release",
+                "--parallel",
+                "--target",
+                "llaminar2"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
+            "dependsOn": "V2: configure release",
             "problemMatcher": [],
-            "dependsOn": "V2: configure (e2e release)",
-            "detail": "Build V2 project in E2ERelease mode (Release optimizations + snapshots)"
+            "detail": "Build only the release llaminar2 executable and dependencies."
         },
         {
-            "label": "Integration Build",
+            "label": "V2: build all canonical",
             "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build_v2_integration",
-                "--config",
-                "Integration",
-                "--parallel"
+            "command": "true",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "V2: build debug",
+                "V2: build integration",
+                "V2: build release"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
             "problemMatcher": [],
-            "dependsOn": "V2: configure (integration)",
-            "detail": "Build V2 project in Integration mode (Release optimizations + debug symbols + snapshots)"
+            "detail": "Build Debug, Integration, and Release trees using the canonical directories."
         },
         {
-            "label": "V2: clean (debug)",
+            "label": "V2: clean debug",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -226,60 +150,11 @@
                 "clean"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Clean V2 Debug build artifacts"
+            "problemMatcher": [],
+            "detail": "Clean the V2 Debug build tree."
         },
         {
-            "label": "V2: clean (release)",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build_v2_release",
-                "--target",
-                "clean"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Clean V2 Release build artifacts"
-        },
-        {
-            "label": "V2: clean (e2e release)",
-            "type": "shell",
-            "command": "cmake",
-            "args": [
-                "--build",
-                "${workspaceFolder}/build_v2_e2e_release",
-                "--target",
-                "clean"
-            ],
-            "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Clean V2 E2ERelease build artifacts"
-        },
-        {
-            "label": "V2: clean (integration)",
+            "label": "V2: clean integration",
             "type": "shell",
             "command": "cmake",
             "args": [
@@ -289,126 +164,55 @@
                 "clean"
             ],
             "group": "build",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": false,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "detail": "Clean V2 Integration build artifacts"
+            "problemMatcher": [],
+            "detail": "Clean the V2 Integration build tree."
         },
         {
-            "label": "V2: test all",
+            "label": "V2: clean release",
             "type": "shell",
-            "command": "bash",
+            "command": "cmake",
             "args": [
-                "-c",
-                "ctest --test-dir ${workspaceFolder}/build_v2_integration --output-on-failure --parallel && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
+                "--build",
+                "${workspaceFolder}/build_v2_release",
+                "--target",
+                "clean"
             ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "Integration Build",
-            "detail": "Run all V2 tests (Integration build) + show coverage report"
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Clean the V2 Release build tree."
         },
         {
-            "label": "Run Unit Tests",
-            "type": "shell",
-            "command": "bash",
-            "args": [
-                "-c",
-                "ctest --test-dir ${workspaceFolder}/build_v2_integration --output-on-failure --parallel -R '^V2_Unit_' && ${workspaceFolder}/.vscode/show-coverage-v2.sh"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "Integration Build",
-            "detail": "Run V2 unit tests (Integration build) + show coverage report"
-        },
-        {
-            "label": "Run Integration Tests",
+            "label": "V2: test unit",
             "type": "shell",
             "command": "ctest",
             "args": [
                 "--test-dir",
                 "${workspaceFolder}/build_v2_integration",
-                "--output-on-failure",
-                "--parallel",
                 "-R",
-                "^V2_Integration_"
+                "^V2_Unit_",
+                "--output-on-failure",
+                "--parallel"
             ],
             "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "Integration Build",
-            "detail": "Run V2 integration tests (Integration build with snapshots + debug symbols)"
+            "dependsOn": "V2: build integration",
+            "problemMatcher": [],
+            "detail": "Run V2 unit tests from the Integration build."
         },
         {
-            "label": "Run E2E Tests",
+            "label": "V2: test integration",
             "type": "shell",
             "command": "ctest",
             "args": [
                 "--test-dir",
-                "${workspaceFolder}/build_v2_e2e_release",
-                "--output-on-failure",
+                "${workspaceFolder}/build_v2_integration",
                 "-R",
-                "^V2_E2E_"
+                "^V2_Integration_",
+                "--output-on-failure"
             ],
             "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "E2E Release Build",
-            "detail": "Run V2 end-to-end parity tests (E2ERelease build with snapshots)"
-        },
-        {
-            "label": "V2: test performance",
-            "type": "shell",
-            "command": "ctest",
-            "args": [
-                "--test-dir",
-                "${workspaceFolder}/build_v2_release",
-                "--output-on-failure",
-                "--verbose",
-                "-R",
-                "^V2_Perf_"
-            ],
-            "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
-            },
-            "dependsOn": "Release Build",
-            "detail": "Run V2 performance benchmarks (tests/v2/performance/) - requires Release build"
+            "dependsOn": "V2: build integration",
+            "problemMatcher": [],
+            "detail": "Run V2 integration tests from the Integration build."
         },
         {
             "label": "V2: test parity",
@@ -417,22 +221,211 @@
             "args": [
                 "--test-dir",
                 "${workspaceFolder}/build_v2_integration",
-                "--output-on-failure",
-                "--verbose",
                 "-R",
-                "^V2_Parity_"
+                "^V2_Integration_Parity_",
+                "--output-on-failure"
             ],
             "group": "test",
-            "presentation": {
-                "echo": true,
-                "reveal": "always",
-                "focus": true,
-                "panel": "shared",
-                "showReuseMessage": true,
-                "clear": false
+            "dependsOn": "V2: build integration",
+            "problemMatcher": [],
+            "detail": "Run V2 parity tests from the Integration build."
+        },
+        {
+            "label": "V2: test performance",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build_v2_release",
+                "-R",
+                "^V2_Perf_",
+                "--verbose"
+            ],
+            "group": "test",
+            "dependsOn": "V2: build release",
+            "problemMatcher": [],
+            "detail": "Run V2 performance tests from the Release build."
+        },
+        {
+            "label": "V2: test integration tree",
+            "type": "shell",
+            "command": "ctest",
+            "args": [
+                "--test-dir",
+                "${workspaceFolder}/build_v2_integration",
+                "--output-on-failure",
+                "--parallel"
+            ],
+            "group": "test",
+            "dependsOn": "V2: build integration",
+            "problemMatcher": [],
+            "detail": "Run every registered test in the Integration build tree."
+        },
+        {
+            "label": "V2: parity baseline",
+            "type": "shell",
+            "command": "${workspaceFolder}/.githooks/run_parity_baseline.sh",
+            "args": [
+                "${workspaceFolder}/build_v2_integration"
+            ],
+            "group": "test",
+            "dependsOn": "V2: build integration",
+            "problemMatcher": [],
+            "detail": "Run the focused pre-commit parity baseline against build_v2_integration."
+        },
+        {
+            "label": "V2: e2e server local",
+            "type": "shell",
+            "command": "${workspaceFolder}/tests/v2/e2e/server/test_server_e2e.sh",
+            "args": [
+                "--binary",
+                "${workspaceFolder}/build_v2_release/llaminar2",
+                "--backends",
+                "cpu,cuda:0,rocm:0"
+            ],
+            "options": {
+                "env": {
+                    "LLAMINAR_E2E_LONG_CONTEXT": "0"
+                }
             },
-            "dependsOn": "Integration Build",
-            "detail": "Run V2 parity tests (Integration build)"
+            "group": "test",
+            "dependsOn": "V2: build llaminar2 release",
+            "problemMatcher": [],
+            "detail": "Run the serialized local server E2E harness with the Release binary."
+        },
+        {
+            "label": "V2: e2e server local pre-commit",
+            "type": "shell",
+            "command": "${workspaceFolder}/tests/v2/e2e/server/test_server_e2e.sh",
+            "args": [
+                "--binary",
+                "${workspaceFolder}/build_v2_release/llaminar2",
+                "--backends",
+                "cpu,cuda:0,rocm:0"
+            ],
+            "options": {
+                "env": {
+                    "LLAMINAR_E2E_LONG_CONTEXT": "1",
+                    "LLAMINAR_E2E_LONG_CONTEXT_TIER": "lite",
+                    "LLAMINAR_E2E_CONTEXT_LENGTH": "4096",
+                    "LLAMINAR_E2E_LONG_MAX_TOKENS": "512",
+                    "LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS": "900",
+                    "LLAMINAR_E2E_LONG_REQUEST_TIMEOUT": "1800",
+                    "LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B": "4"
+                }
+            },
+            "group": "test",
+            "dependsOn": "V2: build llaminar2 release",
+            "problemMatcher": [],
+            "detail": "Run the serialized local server E2E harness with pre-commit long-context settings."
+        },
+        {
+            "label": "V2: e2e release container cpu",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/ci/run_release_container_e2e.sh",
+            "args": [
+                "--variant",
+                "cpu",
+                "--image",
+                "ghcr.io/llaminar/llaminar:develop-cpu-latest"
+            ],
+            "options": {
+                "env": {
+                    "LLAMINAR_E2E_DOCKER_NETWORK": "bridge"
+                }
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the serialized CPU release-container E2E subset against the public develop image."
+        },
+        {
+            "label": "V2: e2e release container cuda",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/ci/run_release_container_e2e.sh",
+            "args": [
+                "--variant",
+                "cuda",
+                "--image",
+                "ghcr.io/llaminar/llaminar:develop-cuda13.0-latest"
+            ],
+            "options": {
+                "env": {
+                    "LLAMINAR_E2E_DOCKER_NETWORK": "bridge"
+                }
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the serialized CUDA release-container E2E subset against the public develop image."
+        },
+        {
+            "label": "V2: e2e release container rocm",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/ci/run_release_container_e2e.sh",
+            "args": [
+                "--variant",
+                "rocm",
+                "--image",
+                "ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest"
+            ],
+            "options": {
+                "env": {
+                    "LLAMINAR_E2E_DOCKER_NETWORK": "bridge"
+                }
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the serialized ROCm release-container E2E subset against the public develop image."
+        },
+        {
+            "label": "V2: e2e release container hybrid",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/ci/run_release_container_e2e.sh",
+            "args": [
+                "--variant",
+                "hybrid",
+                "--image",
+                "ghcr.io/llaminar/llaminar:develop-latest"
+            ],
+            "options": {
+                "env": {
+                    "LLAMINAR_E2E_DOCKER_NETWORK": "bridge"
+                }
+            },
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the serialized hybrid CUDA+ROCm release-container E2E subset against the public develop image."
+        },
+        {
+            "label": "V2: e2e release container public matrix",
+            "type": "shell",
+            "command": "true",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "V2: e2e release container cpu",
+                "V2: e2e release container cuda",
+                "V2: e2e release container rocm",
+                "V2: e2e release container hybrid"
+            ],
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run all public release-container E2E subsets sequentially to avoid GPU oversubscription."
+        },
+        {
+            "label": "V2: benchmark regression check",
+            "type": "shell",
+            "command": "${workspaceFolder}/.githooks/run_benchmark_check.sh",
+            "group": "test",
+            "dependsOn": "V2: build release",
+            "problemMatcher": [],
+            "detail": "Run the pre-commit performance regression benchmark check."
+        },
+        {
+            "label": "Git: pre-commit suite",
+            "type": "shell",
+            "command": "${workspaceFolder}/.githooks/pre-commit",
+            "group": "test",
+            "problemMatcher": [],
+            "detail": "Run the repository pre-commit suite exactly as installed."
         }
     ]
 }

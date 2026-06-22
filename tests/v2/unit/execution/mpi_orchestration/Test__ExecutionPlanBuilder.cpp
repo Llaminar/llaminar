@@ -193,6 +193,29 @@ TEST_F(Test__ExecutionPlanBuilder, BuildPlan_LocalTP_MixedGPUs_UsesPCIeBAR)
     EXPECT_TRUE(errors.empty()) << "Errors: " << (errors.empty() ? "" : errors[0]);
 }
 
+TEST_F(Test__ExecutionPlanBuilder, BuildPlan_LocalTP_HonorsExplicitBackend)
+{
+    auto cluster = ClusterInventoryBuilder()
+                       .addRank(0, "localhost", 0, {{DeviceType::CUDA, 0}, {DeviceType::ROCm, 0}})
+                       .build();
+
+    config.tp_degree = 2;
+    config.tp_scope = TPScope::LOCAL;
+    config.default_backend = CollectiveBackendType::HOST;
+
+    auto plans = builder->buildAllPlans(config, model, cluster);
+
+    ASSERT_EQ(plans.size(), 1);
+    const auto &plan = plans[0];
+
+    EXPECT_EQ(plan.local_tp_devices.size(), 2);
+    EXPECT_TRUE(plan.usesLocalTP());
+    EXPECT_EQ(plan.local_tp_backend, CollectiveBackendType::HOST);
+
+    auto errors = plan.validate();
+    EXPECT_TRUE(errors.empty()) << "Errors: " << (errors.empty() ? "" : errors[0]);
+}
+
 // ============================================================================
 // Global TP Tests (Multiple Ranks)
 // ============================================================================

@@ -2,12 +2,19 @@
     "cmake.configureOnOpen": false,
     "cmake.buildBeforeRun": true,
     "cmake.clearOutputBeforeBuild": true,
-    "cmake.generator": "Unix Makefiles",
+    "cmake.sourceDirectory": "${workspaceFolder}/src/v2",
+    "cmake.generator": "Ninja",
     "cmake.preferredGenerators": [
-        "Unix Makefiles",
         "Ninja"
     ],
-    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.buildDirectory": "${workspaceFolder}/build_v2_integration",
+    "cmake.configureSettings": {
+        "CMAKE_BUILD_TYPE": "Integration",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_CUDA_ARCHITECTURES": "86",
+        "HAVE_CUDA": "ON",
+        "HAVE_ROCM": "ON"
+    },
     "cmake.installPrefix": "${workspaceFolder}/install",
     "cmake.debugConfig": {
         "MIMode": "gdb",

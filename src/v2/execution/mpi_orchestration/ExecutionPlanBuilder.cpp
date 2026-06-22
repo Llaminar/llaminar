@@ -700,7 +700,9 @@ namespace llaminar2
                 }
             }
 
-            plan.local_tp_backend = selectBackend(plan.local_tp_devices);
+            plan.local_tp_backend = selectLocalTPBackend(
+                plan.local_tp_devices,
+                primary_domain->backend);
         }
 
         // Set primary device
@@ -1029,7 +1031,9 @@ namespace llaminar2
         plan.weight_shard.work_fraction = 1.0f / total_shards;
 
         // Local TP backend
-        plan.local_tp_backend = selectBackend(plan.local_tp_devices);
+        plan.local_tp_backend = selectLocalTPBackend(
+            plan.local_tp_devices,
+            config.default_backend);
 
         // Cross-rank backend
         plan.cross_rank_backend = selectCrossRankBackend(cluster_inventory);
@@ -1132,6 +1136,17 @@ namespace llaminar2
         }
 
         return CollectiveBackendType::AUTO;
+    }
+
+    CollectiveBackendType ExecutionPlanBuilder::selectLocalTPBackend(
+        const std::vector<GlobalDeviceAddress> &devices,
+        CollectiveBackendType requested_backend)
+    {
+        if (requested_backend != CollectiveBackendType::AUTO)
+        {
+            return requested_backend;
+        }
+        return selectBackend(devices);
     }
 
     CollectiveBackendType ExecutionPlanBuilder::selectCrossRankBackend(
