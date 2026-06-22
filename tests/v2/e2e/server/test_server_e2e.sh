@@ -545,6 +545,54 @@ append_nvidia_device_nodes() {
     done < <(nvidia_device_nodes)
 }
 
+rocm_device_nodes_from_docker_daemon() {
+    [[ -n "${CONTAINER_IMAGE:-}" ]] || return 1
+    docker run --rm \
+        --entrypoint /bin/sh \
+        -v /dev:/host-dev:ro \
+        "$CONTAINER_IMAGE" \
+        -lc '
+set -eu
+for path in /host-dev/kfd /host-dev/dri; do
+    [ -e "$path" ] && printf "/dev%s\n" "${path#/host-dev}"
+done
+' 2>/dev/null | sort -u
+}
+
+rocm_device_nodes() {
+    if [[ -e /dev/kfd || -e /dev/dri ]]; then
+        [[ -e /dev/kfd ]] && printf '%s\n' /dev/kfd
+        [[ -e /dev/dri ]] && printf '%s\n' /dev/dri
+        return
+    fi
+
+    rocm_device_nodes_from_docker_daemon
+}
+
+append_rocm_device_nodes() {
+    local out_var="$1"
+    local -n out_ref="$out_var"
+    local node
+    local added=0
+    while IFS= read -r node; do
+        [[ -n "$node" ]] || continue
+        out_ref+=(--device="$node")
+        if [[ -e "$node" ]]; then
+            append_unique_group_for_path "$out_var" "$node"
+            if [[ "$node" == /dev/dri ]]; then
+                local render_node
+                for render_node in /dev/dri/render*; do
+                    [[ -e "$render_node" ]] || continue
+                    append_unique_group_for_path "$out_var" "$render_node"
+                done
+            fi
+        fi
+        added=1
+    done < <(rocm_device_nodes)
+
+    [[ "$added" -eq 1 ]]
+}
+
 append_unique_group_for_path() {
     local -n out_ref="$1"
     local path="$2"
@@ -768,17 +816,9 @@ start_server_process() {
             ;;
     esac
 
-    if [[ -e /dev/kfd ]]; then
-        docker_args+=(--device=/dev/kfd)
-        append_unique_group_for_path docker_args /dev/kfd
-    fi
-    if [[ -e /dev/dri ]]; then
-        docker_args+=(--device=/dev/dri)
-        append_unique_group_for_path docker_args /dev/dri
-        for render_node in /dev/dri/render*; do
-            [[ -e "$render_node" ]] || continue
-            append_unique_group_for_path docker_args "$render_node"
-        done
+    local rocm_mode="none"
+    if append_rocm_device_nodes docker_args; then
+        rocm_mode="devices"
     fi
 
     docker_args+=("${DOCKER_EXTRA_ARGS[@]}")
@@ -787,7 +827,7 @@ start_server_process() {
     done
     docker_args+=("$CONTAINER_IMAGE" "${args_ref[@]}")
 
-    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, model=${model_abs}" >&2
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, rocm=${rocm_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, model=${model_abs}" >&2
     container_id="$(docker "${docker_args[@]}")"
     ACTIVE_DOCKER_CONTAINERS+=("$container_id")
 
