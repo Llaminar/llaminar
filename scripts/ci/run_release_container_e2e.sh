@@ -120,7 +120,8 @@ cmd=(
     --port "$base_port"
 )
 e2e_env=(
-    "LLAMINAR_E2E_LONG_CONTEXT=0"
+    "LLAMINAR_E2E_LONG_CONTEXT=1"
+    "LLAMINAR_E2E_LONG_CONTEXT_TIER=full"
     "LLAMINAR_E2E_LOG_DIR=${log_dir}"
 )
 
