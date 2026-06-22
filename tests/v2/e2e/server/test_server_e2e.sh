@@ -615,7 +615,10 @@ rocm_device_nodes_from_docker_daemon() {
         "$CONTAINER_IMAGE" \
         -lc '
 set -eu
-for path in /host-dev/kfd /host-dev/dri; do
+for path in \
+    /host-dev/kfd \
+    /host-dev/dri/card* \
+    /host-dev/dri/renderD*; do
     [ -e "$path" ] && printf "/dev%s\n" "${path#/host-dev}"
 done
 ' 2>/dev/null | sort -u
@@ -624,7 +627,10 @@ done
 rocm_device_nodes() {
     if [[ -e /dev/kfd || -e /dev/dri ]]; then
         [[ -e /dev/kfd ]] && printf '%s\n' /dev/kfd
-        [[ -e /dev/dri ]] && printf '%s\n' /dev/dri
+        local node
+        for node in /dev/dri/card* /dev/dri/renderD*; do
+            [[ -e "$node" ]] && printf '%s\n' "$node"
+        done
         return
     fi
 
@@ -641,13 +647,6 @@ append_rocm_device_nodes() {
         out_ref+=(--device="$node")
         if [[ -e "$node" ]]; then
             append_unique_group_for_path "$out_var" "$node"
-            if [[ "$node" == /dev/dri ]]; then
-                local render_node
-                for render_node in /dev/dri/render*; do
-                    [[ -e "$render_node" ]] || continue
-                    append_unique_group_for_path "$out_var" "$render_node"
-                done
-            fi
         fi
         added=1
     done < <(rocm_device_nodes)

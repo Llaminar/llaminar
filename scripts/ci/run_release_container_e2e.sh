@@ -119,6 +119,18 @@ cmd=(
     --container-image "$image"
     --port "$base_port"
 )
+e2e_env=(
+    "LLAMINAR_E2E_LONG_CONTEXT=0"
+    "LLAMINAR_E2E_LOG_DIR=${log_dir}"
+)
+
+case "$variant" in
+    rocm)
+        rocm_debug_docker_args="${LLAMINAR_E2E_DOCKER_ARGS:-}"
+        rocm_debug_docker_args="${rocm_debug_docker_args:+${rocm_debug_docker_args} }-e NCCL_DEBUG=INFO -e RCCL_LOG_LEVEL=INFO"
+        e2e_env+=("LLAMINAR_E2E_DOCKER_ARGS=${rocm_debug_docker_args}")
+        ;;
+esac
 
 case "$variant" in
     cpu)
@@ -189,13 +201,11 @@ case "$variant" in
 esac
 
 printf '[run-release-container-e2e] '
-printf '%q ' env LLAMINAR_E2E_LONG_CONTEXT=0 "LLAMINAR_E2E_LOG_DIR=${log_dir}" "${cmd[@]}"
+printf '%q ' env "${e2e_env[@]}" "${cmd[@]}"
 printf '\n'
 
 if [[ "$dry_run" == "true" ]]; then
     exit 0
 fi
 
-env LLAMINAR_E2E_LONG_CONTEXT=0 \
-    "LLAMINAR_E2E_LOG_DIR=${log_dir}" \
-    "${cmd[@]}"
+env "${e2e_env[@]}" "${cmd[@]}"
