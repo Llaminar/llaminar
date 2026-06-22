@@ -107,10 +107,6 @@ docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 "$L
 
 #### CUDA+ROCm Host-staged Tensor Parallel tp=2
 
-This uses the E2E model files and the validated host-staged cross-vendor TP
-shape. The release-container server E2E matrix does not currently include this
-exact Quickstart header as a full server case.
-
 ```bash
 docker run "${COMMON_RUN[@]}" "${CUDA_RUN[@]}" "${ROCM_RUN[@]}" -p 8080:8080 "$LLAMINAR_FULL_IMAGE" serve --host 0.0.0.0 --port 8080 --tp-devices cuda:0,rocm:0 --backend host "${MOE_PREFIX_FLAGS[@]}" -m "$MODEL_MOE"
 ```
