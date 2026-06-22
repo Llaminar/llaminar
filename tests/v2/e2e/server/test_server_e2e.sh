@@ -962,6 +962,8 @@ shutdown_and_validate() {
     local tag="$1"
     local handle="$2"
     local gpu_before_mb="$3"
+    local backend="${4:-}"
+    local extra_flags="${5:-}"
 
     # ─── Check 1: Clean SIGTERM exit ─────────────────────────────────
     local exit_code=0
@@ -1064,6 +1066,11 @@ shutdown_and_validate() {
     local gpu_after_mb gpu_leaked_mb release_deadline
 
     # ─── Check 3: GPU VRAM fully released ────────────────────────────
+    if is_gpu_backend "$backend" && ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
+        echo -e "  ${YELLOW}SKIP${NC} [${tag}] Shutdown: GPU VRAM release check skipped; host GPU memory telemetry unavailable for backend ${backend}"
+        return
+    fi
+
     # Driver teardown can lag process exit, especially on ROCm after large
     # models.  Poll for the same strict threshold instead of sampling once and
     # reporting a false leak while the driver is still releasing allocations.
@@ -1243,6 +1250,20 @@ get_nvidia_total_gpu_mb() {
         awk '{gsub(/[^0-9]/, "", $1); if ($1 != "") sum += $1} END {print sum + 0}'
 }
 
+nvidia_memory_telemetry_available() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+    nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null |
+        awk '
+            {
+                gsub(/[^0-9]/, "", $1)
+                if ($1 != "") {
+                    found = 1
+                    exit
+                }
+            }
+            END {exit found ? 0 : 1}'
+}
+
 get_amd_total_gpu_mb() {
     if command -v amd-smi >/dev/null 2>&1; then
         { amd-smi metric --mem-usage --csv 2>/dev/null || true; } |
@@ -1257,6 +1278,56 @@ get_amd_total_gpu_mb() {
     fi
 
     echo 0
+}
+
+amd_memory_telemetry_available() {
+    if command -v amd-smi >/dev/null 2>&1; then
+        amd-smi metric --mem-usage --csv 2>/dev/null |
+            awk -F',' 'NR > 1 && $3 ~ /^[0-9]+$/ {found = 1; exit} END {exit found ? 0 : 1}' &&
+            return 0
+    fi
+
+    if command -v rocm-smi >/dev/null 2>&1; then
+        rocm-smi --showmeminfo vram 2>/dev/null |
+            awk -F': ' '/VRAM Total Used Memory/ {found = 1; exit} END {exit found ? 0 : 1}' &&
+            return 0
+    fi
+
+    return 1
+}
+
+backend_expects_cuda_memory() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    [[ "$backend" == cuda:* || " ${extra_flags} " == *"cuda:"* ]]
+}
+
+backend_expects_rocm_memory() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    [[ "$backend" == rocm:* || " ${extra_flags} " == *"rocm:"* ]]
+}
+
+gpu_memory_telemetry_available_for_backend() {
+    local backend="$1"
+    local extra_flags="${2:-}"
+    local expects_cuda=0
+    local expects_rocm=0
+
+    backend_expects_cuda_memory "$backend" "$extra_flags" && expects_cuda=1
+    backend_expects_rocm_memory "$backend" "$extra_flags" && expects_rocm=1
+
+    if [ "$expects_cuda" -eq 1 ] || [ "$expects_rocm" -eq 1 ]; then
+        if [ "$expects_cuda" -eq 1 ] && nvidia_memory_telemetry_available; then
+            return 0
+        fi
+        if [ "$expects_rocm" -eq 1 ] && amd_memory_telemetry_available; then
+            return 0
+        fi
+        return 1
+    fi
+
+    nvidia_memory_telemetry_available || amd_memory_telemetry_available
 }
 
 get_total_gpu_memory_mb() {
@@ -1409,6 +1480,7 @@ check_memory_usage() {
     local model="$3"
     local server_handle="$4"
     local gpu_before_mb="$5"
+    local extra_flags="${6:-}"
 
     local pids
     pids=$(get_server_pids "$server_handle")
@@ -1443,7 +1515,9 @@ check_memory_usage() {
     fi
 
     if is_gpu_backend "$backend"; then
-        if [ "$gpu_process_mb" -ge "$GPU_ACTIVE_MIN_MB" ] || [ "$abs_gpu_delta_mb" -ge "$GPU_ACTIVE_MIN_MB" ]; then
+        if ! gpu_memory_telemetry_available_for_backend "$backend" "$extra_flags"; then
+            echo -e "  ${YELLOW}SKIP${NC} [${tag}] GPU memory: host telemetry unavailable for backend ${backend}; relying on GPU PerfStats/server-log validation"
+        elif [ "$gpu_process_mb" -ge "$GPU_ACTIVE_MIN_MB" ] || [ "$abs_gpu_delta_mb" -ge "$GPU_ACTIVE_MIN_MB" ]; then
             pass "[${tag}] GPU memory: process ${gpu_process_mb} MiB, global delta ${gpu_delta_mb} MiB"
         else
             fail "[${tag}] GPU memory: expected active GPU usage, process ${gpu_process_mb} MiB, global delta ${gpu_delta_mb} MiB"
@@ -2105,10 +2179,10 @@ print(d.get('error', {}).get('type', ''))
     fi
 
     # ─── Test 10: Memory and server log hygiene ───────────────────────
-    check_memory_usage "$tag" "$backend" "$model" "$server_handle" "$gpu_before_mb"
+    check_memory_usage "$tag" "$backend" "$model" "$server_handle" "$gpu_before_mb" "$extra_flags"
 
     # ─── Test 11: Graceful shutdown validation ────────────────────────
-    shutdown_and_validate "$tag" "$server_handle" "$gpu_before_mb"
+    shutdown_and_validate "$tag" "$server_handle" "$gpu_before_mb" "$backend" "$extra_flags"
     copy_container_artifact "$server_handle" "$perf_path" "$perf_path"
 
     # ─── Test 12: Server log hygiene (after shutdown) ─────────────────
