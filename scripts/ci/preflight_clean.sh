@@ -6,11 +6,9 @@
 # every gate job. Best-effort: every command tolerates failure and the script
 # always exits 0. Never touches GPUs.
 #
-# Why sudo: most leaked state on the host is created by the test container
-# running as root (Open MPI / NCCL / RCCL inside `docker run --ipc=host`),
-# so the resulting files in /dev/shm and SysV IPC arrays are root-owned on
-# the host. The runner user typically can't unlink them without sudo. We
-# fall back to direct invocation when sudo is unavailable.
+# Why sudo: leaked state from test containers may be root-owned. The runner
+# user typically can't unlink those files or IPC arrays without sudo. We fall
+# back to direct invocation when sudo is unavailable.
 #
 # NOTE on process kill: when MPI ranks run inside a container, their host
 # PIDs live in the container's PID namespace and are reaped at container

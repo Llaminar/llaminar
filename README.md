@@ -170,6 +170,9 @@ docker run --rm \
 Llaminar does not require `--privileged` for normal container runs. It does
 require a few targeted Docker permissions:
 
+- `--shm-size=16g` gives OpenMPI, NCCL, and RCCL enough `/dev/shm` for
+  tensor-parallel collectives. Avoid `--ipc=host` unless the host `/dev/shm`
+  is known to be large enough; Docker's `--shm-size` does not resize host IPC.
 - `--security-opt seccomp=unconfined` allows Linux NUMA policy syscalls
   (`mbind`, `set_mempolicy`, `get_mempolicy`, and `move_pages`) so CPU
   execution can bind and verify model pages on the intended NUMA node.
@@ -198,7 +201,7 @@ docker run --rm -it \
   --security-opt seccomp=unconfined \
   --cap-add SYS_NICE \
   --cap-add SYS_PTRACE \
-  --ipc=host --shm-size=16g \
+  --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
   llaminar:local \
@@ -221,7 +224,7 @@ docker run --rm -it \
   --security-opt seccomp=unconfined \
   --cap-add SYS_NICE \
   --cap-add SYS_PTRACE \
-  --ipc=host --shm-size=16g \
+  --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
   llaminar:local \
@@ -235,7 +238,7 @@ CPU from the same release image:
 docker run --rm -it \
   --security-opt seccomp=unconfined \
   --cap-add SYS_NICE \
-  --ipc=host --shm-size=16g \
+  --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
   llaminar:local \

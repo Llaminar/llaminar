@@ -49,6 +49,14 @@
 #                       Uses NVIDIA Container Toolkit when available. In a
 #                       GPU-enabled devcontainer, falls back to pass-through
 #                       of visible NVIDIA driver libraries and device nodes.
+#   LLAMINAR_E2E_DOCKER_SHM_SIZE
+#                       Docker /dev/shm size for container-local IPC.
+#                       Default: 16g. RCCL/NCCL tensor-parallel runs require
+#                       more than Docker's 64MiB default.
+#   LLAMINAR_E2E_DOCKER_IPC
+#                       Optional docker --ipc mode. Default: Docker private IPC
+#                       namespace with LLAMINAR_E2E_DOCKER_SHM_SIZE applied.
+#                       Set to host only when host /dev/shm is known large.
 #   LLAMINAR_E2E_DOCKER_USER User passed to docker run --user. Defaults to
 #                       0:0 so nested devcontainer bind mounts are writable.
 #   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP
@@ -108,6 +116,7 @@ fi
 DOCKER_NETWORK="${LLAMINAR_E2E_DOCKER_NETWORK:-auto}"
 DOCKER_GPUS="${LLAMINAR_E2E_DOCKER_GPUS:-auto}"
 DOCKER_SHM_SIZE="${LLAMINAR_E2E_DOCKER_SHM_SIZE:-16g}"
+DOCKER_IPC="${LLAMINAR_E2E_DOCKER_IPC:-}"
 DOCKER_NAME_PREFIX="${LLAMINAR_E2E_DOCKER_NAME_PREFIX:-llaminar-e2e}"
 DOCKER_USER="${LLAMINAR_E2E_DOCKER_USER:-0:0}"
 DOCKER_NUMA_SECCOMP="${LLAMINAR_E2E_DOCKER_NUMA_SECCOMP:-1}"
@@ -183,6 +192,8 @@ Environment:
   LLAMINAR_E2E_CONTAINER_IMAGE        Docker image to run instead of the local binary
   LLAMINAR_E2E_DOCKER_NETWORK         Docker network mode (default: auto)
   LLAMINAR_E2E_DOCKER_GPUS            GPU flag for docker run (default: auto)
+  LLAMINAR_E2E_DOCKER_SHM_SIZE        Container /dev/shm size (default: 16g)
+  LLAMINAR_E2E_DOCKER_IPC             Optional docker --ipc mode (default: private)
   LLAMINAR_E2E_DOCKER_USER            docker run --user value (default: 0:0)
   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP    Add seccomp=unconfined for NUMA syscalls (default: 1)
   LLAMINAR_E2E_DOCKER_CAPS            Capabilities to add (default: SYS_NICE SYS_PTRACE)
@@ -805,12 +816,16 @@ start_server_process() {
         run -d
         --name "$container_name"
         --network "$network_mode"
-        --ipc=host
-        --shm-size="$DOCKER_SHM_SIZE"
         --ulimit core=-1
         -v "${model_dir}:${model_dir}:ro"
         -v "${log_dir_abs}:${log_dir_abs}"
     )
+    if [[ -n "$DOCKER_IPC" && "${DOCKER_IPC,,}" != "none" ]]; then
+        docker_args+=(--ipc "$DOCKER_IPC")
+    fi
+    if [[ "${DOCKER_IPC,,}" != "host" ]]; then
+        docker_args+=(--shm-size="$DOCKER_SHM_SIZE")
+    fi
     if [[ "$DOCKER_NUMA_SECCOMP" != "0" ]]; then
         docker_args+=(--security-opt seccomp=unconfined)
     fi
@@ -892,7 +907,11 @@ start_server_process() {
     done
     docker_args+=("$CONTAINER_IMAGE" "${args_ref[@]}")
 
-    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, rocm=${rocm_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, caps=${DOCKER_CAPS:-none}, model=${model_abs}" >&2
+    local shm_mode="$DOCKER_SHM_SIZE"
+    if [[ "${DOCKER_IPC,,}" == "host" ]]; then
+        shm_mode="host"
+    fi
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, ipc=${DOCKER_IPC:-private}, shm=${shm_mode}, nvidia=${nvidia_mode}, rocm=${rocm_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, caps=${DOCKER_CAPS:-none}, model=${model_abs}" >&2
     container_id="$(docker "${docker_args[@]}")"
     ACTIVE_DOCKER_CONTAINERS+=("$container_id")
 
