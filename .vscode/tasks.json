@@ -126,6 +126,87 @@
             "detail": "Build only the release llaminar2 executable and dependencies."
         },
         {
+            "label": "V2: docker build runtime cpu",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/docker/build-runtime-image.sh",
+            "args": [
+                "--variant",
+                "cpu",
+                "--tag",
+                "llaminar:local-cpu",
+                "--load",
+                "--verify"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Build and load the local CPU-only Llaminar runtime image."
+        },
+        {
+            "label": "V2: docker build runtime cuda",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/docker/build-runtime-image.sh",
+            "args": [
+                "--variant",
+                "cuda",
+                "--tag",
+                "llaminar:local-cuda",
+                "--load",
+                "--verify"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Build and load the local CPU+CUDA Llaminar runtime image."
+        },
+        {
+            "label": "V2: docker build runtime rocm",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/docker/build-runtime-image.sh",
+            "args": [
+                "--variant",
+                "rocm",
+                "--tag",
+                "llaminar:local-rocm",
+                "--load",
+                "--verify"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Build and load the local CPU+ROCm Llaminar runtime image."
+        },
+        {
+            "label": "V2: docker build runtime full",
+            "type": "shell",
+            "command": "${workspaceFolder}/scripts/docker/build-runtime-image.sh",
+            "args": [
+                "--variant",
+                "full",
+                "--tag",
+                "llaminar:local",
+                "--tag",
+                "llaminar:local-full",
+                "--load",
+                "--verify"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Build and load the local CPU+CUDA+ROCm Llaminar runtime image."
+        },
+        {
+            "label": "V2: docker build runtime matrix",
+            "type": "shell",
+            "command": "true",
+            "dependsOrder": "sequence",
+            "dependsOn": [
+                "V2: docker build runtime cpu",
+                "V2: docker build runtime cuda",
+                "V2: docker build runtime rocm",
+                "V2: docker build runtime full"
+            ],
+            "group": "build",
+            "problemMatcher": [],
+            "detail": "Build every local Llaminar runtime image variant sequentially."
+        },
+        {
             "label": "V2: build all canonical",
             "type": "shell",
             "command": "true",
