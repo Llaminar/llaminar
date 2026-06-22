@@ -38,6 +38,8 @@ Open vscode in the devcontainer, and run the Build Integration / Build Release v
 
 ### Running Llaminar
 
+**Important**: Ensure your installed ROCm and CUDA drivers are compatible with Llaminar's CUDA and ROCm versions.
+
 Set these once before running the one-liners below:
 
 ```bash
