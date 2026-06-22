@@ -835,6 +835,6 @@ cat results.stats.csv | column -t -s,
 | [ROCmQuantisedGemmKernel.hip](ROCmQuantisedGemmKernel.hip) | All V1–V7 kernel templates, dispatch functions, and CK stubs |
 | [ROCmQuantisedGemmKernel.cpp](ROCmQuantisedGemmKernel.cpp) | Dispatch wiring (env var → kernel selection) |
 | [../../utils/DebugEnv.h](../../utils/DebugEnv.h) | Environment variable definitions |
-| [../../../../tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp](../../../../tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp) | Benchmark test |
-| [../../../../changelog/2025-07-24-ck-vs-v1-isa-analysis.md](../../../../changelog/2025-07-24-ck-vs-v1-isa-analysis.md) | CK vs V1 ISA deep dive |
-| [../../../../changelog/2025-07-25-v5-kernel-occupancy-experiment.md](../../../../changelog/2025-07-25-v5-kernel-occupancy-experiment.md) | V5 design and occupancy results |
+| [../../../../tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp](../../../../../tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp) | Benchmark test |
+| [../../../../changelog/2025-07-24-ck-vs-v1-isa-analysis.md](../../../../../changelog/2025-07-24-ck-vs-v1-isa-analysis.md) | CK vs V1 ISA deep dive |
+| [../../../../changelog/2025-07-25-v5-kernel-occupancy-experiment.md](../../../../../changelog/2025-07-25-v5-kernel-occupancy-experiment.md) | V5 design and occupancy results |

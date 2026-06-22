@@ -41,7 +41,7 @@
  * **Total GPU VRAM**: 4× 80GB = 320 GB
  * **Interconnect**: 200 Gbps HDR InfiniBand (inter-node), 600 GB/s NVLink (intra-node)
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 5)
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 5)
  * @author Copilot
  * @date January 2026
  */

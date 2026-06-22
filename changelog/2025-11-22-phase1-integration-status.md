@@ -109,7 +109,7 @@ To fully integrate FusedRMSNormQuantize, we need to:
    - Enables Phase 2 fusion detection
 
 5. **Documentation**
-   - Migration plan: `docs/v2/FUSION_FRAMEWORK_MIGRATION.md`
+   - Migration plan: `docs/v2/projects/2025-11/FUSION_FRAMEWORK_MIGRATION.md`
    - Session summary: `changelog/2025-01-30-fusion-framework-phase1-complete.md`
 
 ### 🔄 Deferred to Phase 2
@@ -215,7 +215,7 @@ src/v2/kernels/cpu/CPUSwiGLUKernelT.h         # Added get_contract()
 src/v2/CMakeLists.txt                         # Added fused kernel to build
 tests/v2/unit/Test__FusedRMSNormQuantize.cpp  # Unit tests
 tests/v2/CMakeLists.txt                       # Test target registration
-docs/v2/FUSION_FRAMEWORK_MIGRATION.md         # Migration plan
+docs/v2/projects/2025-11/FUSION_FRAMEWORK_MIGRATION.md         # Migration plan
 changelog/2025-01-30-fusion-framework-phase1-complete.md  # Session summary
 changelog/2025-11-22-phase1-integration-status.md  # This file
 ```

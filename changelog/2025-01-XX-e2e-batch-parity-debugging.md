@@ -132,4 +132,4 @@ LLAMINAR_LOG_LEVEL=ERROR mpirun -np 2 ... (same as above)
 - Attention mask types: causal vs padding-only
 - Batch layout: `[batch_size, seq_len, ...]` vs `[total_tokens, ...]` 
 - V2 architecture: `.github/instructions/llaminar-architecture-v2.instructions.md`
-- Snapshot framework: `docs/v2/SNAPSHOT_FRAMEWORK_DESIGN.md`
+- Snapshot framework: `docs/v2/projects/2025-10/SNAPSHOT_FRAMEWORK_DESIGN.md`

@@ -140,4 +140,4 @@ placement_map->applyPlan(plan);
 
 ## Documentation Updated
 
-- `docs/v2/DISTRIBUTED_ARCHITECTURE_IMPLEMENTATION.md`: Updated Phase G0 status and API examples
+- `docs/v2/projects/2025-12/DISTRIBUTED_ARCHITECTURE_IMPLEMENTATION.md`: Updated Phase G0 status and API examples

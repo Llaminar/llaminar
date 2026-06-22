@@ -11,7 +11,7 @@
  * Uses MockLocalPPContext for functional testing without real multi-GPU hardware.
  * Tests with real model weights but minimal sequence length for efficiency.
  *
- * @see docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
+ * @see docs/v2/projects/2026-02/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
  * @author David Sanftenberg
  * @date February 2026
  */

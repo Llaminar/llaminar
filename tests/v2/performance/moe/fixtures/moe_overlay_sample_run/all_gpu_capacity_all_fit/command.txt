@@ -1,1 +1,0 @@
-LLAMINAR_PROFILING=1 LLAMINAR_MOE_EP_PROFILE_CSV=benchmark_results/moe_overlay/sample/all_gpu_capacity_all_fit/moe_overlay_profile.csv build_v2_release/llaminar2 benchmark --config configs/moe_overlay/all_gpu_capacity_all_fit.yaml --mpi-procs 2 -m /synthetic/model.gguf

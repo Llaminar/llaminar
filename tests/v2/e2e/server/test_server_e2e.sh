@@ -85,9 +85,9 @@
 #   LLAMINAR_E2E_LONG_CONTEXT Enable optional long-context checks (default: 0)
 #   LLAMINAR_E2E_LONG_CONTEXT_TIER lite|full long-context tier (default: full)
 #   LLAMINAR_E2E_CONTEXT_LENGTH Context length passed with -c for eligible models (default: 4096)
-#   LLAMINAR_E2E_LONG_MAX_TOKENS Long-generation max_tokens (default: 1024)
+#   LLAMINAR_E2E_LONG_MAX_TOKENS Long-generation max_tokens (default: 2048)
 #   LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS Minimum helper prompt tokens (default: 900)
-#   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: REQUEST_TIMEOUT)
+#   LLAMINAR_E2E_LONG_REQUEST_TIMEOUT Long helper request timeout (default: 420)
 #   LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B Minimum parsed model size in billions (default: 4)
 #   LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS Seconds to poll for GPU VRAM release
 #                       after server shutdown before declaring a leak (default: 30)
@@ -362,9 +362,9 @@ REQUEST_TIMEOUT=180   # seconds per curl request
 LONG_CONTEXT_ENABLED="${LLAMINAR_E2E_LONG_CONTEXT:-0}"
 LONG_CONTEXT_TIER="${LLAMINAR_E2E_LONG_CONTEXT_TIER:-full}"
 CONTEXT_LENGTH="${LLAMINAR_E2E_CONTEXT_LENGTH:-4096}"
-LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-1024}"
+LONG_MAX_TOKENS="${LLAMINAR_E2E_LONG_MAX_TOKENS:-2048}"
 LONG_MIN_PROMPT_TOKENS="${LLAMINAR_E2E_LONG_MIN_PROMPT_TOKENS:-900}"
-LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-$REQUEST_TIMEOUT}"
+LONG_REQUEST_TIMEOUT="${LLAMINAR_E2E_LONG_REQUEST_TIMEOUT:-420}"
 LONG_MIN_MODEL_SIZE_B="${LLAMINAR_E2E_LONG_MIN_MODEL_SIZE_B:-4}"
 
 # Colors

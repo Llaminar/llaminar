@@ -32,7 +32,7 @@
  *
  * @see ROCmQuantisedGemmKernel_INT8_VNNI.hip for INT8 VNNI GEMM (V3/V7)
  * @see ROCmGemvKernel_native_VNNI.hip for native-VNNI GEMV (M=1 decode)
- * @see docs/v2/NATIVE_VNNI_GEMM_DESIGN.md for architecture design document
+ * @see docs/v2/projects/2026-03/NATIVE_VNNI_GEMM_DESIGN.md for architecture design document
  */
 
 #include <hip/hip_runtime.h>

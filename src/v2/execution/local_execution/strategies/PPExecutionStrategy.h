@@ -5,7 +5,7 @@
  * Part of the Unified Multi-Device Orchestration Architecture (Phase 3).
  * Implements sequential forward execution with activation transfer between stages.
  *
- * @see docs/v2/UNIFIED_MULTI_DEVICE_ORCHESTRATION_DESIGN.md
+ * @see docs/v2/projects/2026-02/UNIFIED_MULTI_DEVICE_ORCHESTRATION_DESIGN.md
  * @see IExecutionStrategy.h
  *
  * @author David Sanftenberg

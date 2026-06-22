@@ -20,7 +20,7 @@
  * - transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE) correctly invalidates host
  * - releaseDeviceMemory() properly syncs before freeing
  *
- * @see docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md
+ * @see docs/v2/projects/2026-01/TENSOR_MEMORY_COHERENCE_DESIGN.md
  *
  * @author David Sanftenberg
  * @date January 2026

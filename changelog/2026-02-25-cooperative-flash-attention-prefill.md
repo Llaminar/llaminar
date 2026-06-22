@@ -53,7 +53,7 @@ inner loops. This enables the compiler to register-promote the arrays. Final ISA
 | File | Changes |
 |------|---------|
 | `src/v2/kernels/rocm/attention/ROCmFlashAttentionKernels.hip` | New template cooperative kernel + launch dispatch |
-| `docs/v2/flash-attention-cooperative-redesign.project.md` | Updated with actual results |
+| `docs/v2/projects/2026-02/flash-attention-cooperative-redesign.project.md` | Updated with actual results |
 
 ## ISA Resources (template <8, 2>)
 

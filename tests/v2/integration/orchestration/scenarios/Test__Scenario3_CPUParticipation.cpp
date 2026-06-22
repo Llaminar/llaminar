@@ -27,7 +27,7 @@
  * **Total GPU VRAM**: 40 GB (A100 only)
  * **Total CPU Memory**: ~1 TB (2× 512GB DDR5)
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 3)
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 3)
  * @author David Sanftenberg
  * @date January 2026
  */

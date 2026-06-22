@@ -28,7 +28,7 @@
  *
  * **Tested Models**: 7B, 72B, 120B
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md
  */
 
 #include <gtest/gtest.h>

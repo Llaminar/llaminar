@@ -12,7 +12,7 @@
  *
  * This is the key validation test for the Hybrid Orchestration Plan.
  *
- * @see docs/v2/HYBRID_ORCHESTRATION_INTEGRATION_PLAN_v2.md
+ * @see docs/v2/projects/2026-01/HYBRID_ORCHESTRATION_INTEGRATION_PLAN_v2.md
  * @author David Sanftenberg
  * @date January 2026
  */

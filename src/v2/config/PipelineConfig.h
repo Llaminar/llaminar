@@ -6,7 +6,7 @@
  * Combines TP domains and PP stages into a unified pipeline specification.
  * Enables complex compositions like PP(TP(cuda:0,cuda:1) + TP(rocm:0,rocm:1) + TP(cpu:0,cpu:1)).
  *
- * @see docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
+ * @see docs/v2/projects/2026-02/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
  *
  * @author David Sanftenberg
  * @date February 2026

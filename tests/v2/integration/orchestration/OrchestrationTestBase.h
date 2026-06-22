@@ -20,7 +20,7 @@
  *   };
  *   INSTANTIATE_ORCHESTRATION_TESTS(Test__ScenarioFoo);
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md
  * @author David Sanftenberg
  * @date January 2026
  */

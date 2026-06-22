@@ -1,7 +1,7 @@
 # Fusion Framework Phase 1 Implementation - Session Summary
 
-**Date**: 2025-01-30  
-**Component**: Operator Fusion Framework - FusedRMSNormQuantize Kernel  
+**Date**: 2025-01-30
+**Component**: Operator Fusion Framework - FusedRMSNormQuantize Kernel
 **Status**: ✅ Complete - All tests passing
 
 ---
@@ -21,7 +21,7 @@ Implemented **Phase 1** of the operator fusion framework for Llaminar V2, creati
 
 ### Core Infrastructure (CPUKernelBase Extension)
 
-**File**: `src/v2/kernels/cpu/CPUKernelBase.h`  
+**File**: `src/v2/kernels/cpu/CPUKernelBase.h`
 **Changes**: Added kernel contract system for fusion detection
 - `TensorFormat` enum: All supported formats (FP32, BF16, FP16, INT8, Q4_0-Q8_K, IQ1_M-IQ4_XS)
 - `KernelContract` struct: Declares input/output formats, fusion capabilities
@@ -41,11 +41,11 @@ struct KernelContract {
     TensorFormat output_format;
     bool supports_inplace;
     bool is_fusable;
-    
+
     bool can_fuse_with(const KernelContract& next) const {
-        return is_fusable && 
-               std::find(next.accepted_input_formats.begin(), 
-                        next.accepted_input_formats.end(), 
+        return is_fusable &&
+               std::find(next.accepted_input_formats.begin(),
+                        next.accepted_input_formats.end(),
                         output_format) != next.accepted_input_formats.end();
     }
 };
@@ -53,16 +53,16 @@ struct KernelContract {
 
 ### Fused Kernel Implementation
 
-**Directory**: `src/v2/kernels/cpu/fused/`  
+**Directory**: `src/v2/kernels/cpu/fused/`
 **Purpose**: Home for all fused kernels (operator fusion framework)
 
-**File**: `src/v2/kernels/cpu/fused/FusedRMSNormQuantize.h` (191 lines)  
+**File**: `src/v2/kernels/cpu/fused/FusedRMSNormQuantize.h` (191 lines)
 **Purpose**: Header with ITensorRMSNorm interface and kernel contract
 - Implements `ITensorRMSNorm` for pipeline compatibility
 - Declares kernel contract: `FP32 → INT8` fusion
 - Public API: `execute(input, gamma, int8_output, scales, seq_len, d_model, epsilon)`
 
-**File**: `src/v2/kernels/cpu/fused/FusedRMSNormQuantize.cpp` (387 lines)  
+**File**: `src/v2/kernels/cpu/fused/FusedRMSNormQuantize.cpp` (387 lines)
 **Purpose**: SIMD-optimized implementation (AVX512/AVX2/scalar)
 - **Algorithm**: 3-pass fused operation
   1. **Pass 1**: Compute RMS (root mean square)
@@ -74,14 +74,14 @@ struct KernelContract {
   - Scalar: Portable fallback (no SIMD dependencies)
 - **Quantization**: Symmetric INT8 [-127, 127] with per-row scales
 
-**Build Integration**: `src/v2/CMakeLists.txt`  
+**Build Integration**: `src/v2/CMakeLists.txt`
 **Changes**: Added `kernels/cpu/fused/FusedRMSNormQuantize.cpp` to `llaminar2_core` sources
 
 ---
 
 ## Testing Infrastructure
 
-**File**: `tests/v2/unit/Test__FusedRMSNormQuantize.cpp` (489 lines)  
+**File**: `tests/v2/unit/Test__FusedRMSNormQuantize.cpp` (489 lines)
 **Test Coverage**:
 1. ✅ `SingleToken_SmallModel` - seq_len=1, d_model=896 (Qwen 0.5B)
 2. ✅ `SmallBatch_LargeModel` - seq_len=8, d_model=4864 (Qwen 7B)
@@ -107,14 +107,14 @@ struct KernelContract {
 [       OK ] Test__FusedRMSNormQuantize.SIMD_Parity (12 ms)
 ```
 
-**CMake Integration**: `tests/v2/CMakeLists.txt`  
+**CMake Integration**: `tests/v2/CMakeLists.txt`
 **Test Labels**: `V2;Unit;Kernels;FusedKernels;RMSNorm;Quantization;INT8;OperatorFusion;AVX512;AVX2;CPU`
 
 ---
 
 ## Documentation
 
-**File**: `docs/v2/FUSION_FRAMEWORK_MIGRATION.md` (647 lines)  
+**File**: `docs/v2/projects/2025-11/FUSION_FRAMEWORK_MIGRATION.md` (647 lines)
 **Content**: Comprehensive 12-week migration plan with 4 phases
 - **Phase 1** (2 weeks): Foundation - kernel contracts, FusedRMSNormQuantize ← **COMPLETE**
 - **Phase 2** (3 weeks): Multi-input fusions (gate/up, Q/K/V shared quantization)
@@ -160,8 +160,8 @@ void process_row_fused(...) {
 
 ### Memory Layout
 
-**Input**: FP32 buffer (seq_len × d_model)  
-**Output**: INT8 buffer (seq_len × d_model) + FP32 scales (seq_len)  
+**Input**: FP32 buffer (seq_len × d_model)
+**Output**: INT8 buffer (seq_len × d_model) + FP32 scales (seq_len)
 **Intermediate**: None (fused computation eliminates temporary buffers)
 
 ---
@@ -184,7 +184,7 @@ void process_row_fused(...) {
 
 ### 2. Integrate FusedRMSNormQuantize into Qwen2Pipeline
 
-**File**: `src/v2/pipelines/qwen/Qwen2Pipeline.cpp`  
+**File**: `src/v2/pipelines/qwen/Qwen2Pipeline.cpp`
 **Locations**:
 - `attention_block()` lines 445-682: Pre-attention RMSNorm
 - `ffn_block()` lines 684-817: Pre-FFN RMSNorm
@@ -238,7 +238,7 @@ cd build_v2 && ./tests/v2/v2_test_fused_rmsnorm_quantize \
 
 ### 4. Validate E2E Parity
 
-**File**: `tests/v2/e2e/Test__Qwen2FP32Parity.cpp`  
+**File**: `tests/v2/e2e/Test__Qwen2FP32Parity.cpp`
 **Concern**: Fused quantization may introduce small numerical differences
 - Dequantized outputs should still match PyTorch reference within 6% tolerance
 - If divergence increases, may need to adjust quantization precision or tolerance
@@ -317,8 +317,8 @@ cd build_v2 && ctest -R Qwen2FP32Parity --verbose
 
 ### 1. Compile-Time vs Runtime ISA Selection
 
-**Initial Approach**: Runtime CPU feature detection (`CPUFeatures`)  
-**Issue**: No `CPUFeatures` class exists in V2, adds complexity  
+**Initial Approach**: Runtime CPU feature detection (`CPUFeatures`)
+**Issue**: No `CPUFeatures` class exists in V2, adds complexity
 **Solution**: Use compile-time `#if defined(__AVX512F__)` (matches existing patterns)
 
 **Benefits**:
@@ -379,7 +379,7 @@ cd build_v2 && ctest -R Qwen2FP32Parity --verbose
 ## References
 
 - **Architecture**: `.github/instructions/llaminar-architecture-v2.instructions.md`
-- **Migration Plan**: `docs/v2/FUSION_FRAMEWORK_MIGRATION.md`
+- **Migration Plan**: `docs/v2/projects/2025-11/FUSION_FRAMEWORK_MIGRATION.md`
 - **Copilot Guidelines**: `.github/copilot-instructions.md`
 - **Original Issue**: E2E parity test failures due to quantization round trips
 
@@ -424,8 +424,8 @@ cd build_v2 && ./tests/v2/v2_test_fused_rmsnorm_quantize \
 
 ## Contacts and Context
 
-**Session Date**: 2025-01-30  
-**Agent**: GitHub Copilot (Claude Sonnet 4.5)  
+**Session Date**: 2025-01-30
+**Agent**: GitHub Copilot (Claude Sonnet 4.5)
 **User Intent**: Fix E2E parity tests → Diagnosed quantization overhead → Designed fusion framework → Implemented Phase 1
 
 **Previous Sessions**:

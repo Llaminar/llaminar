@@ -30,7 +30,7 @@ The optimization itself is pending, but the dispatch framework is in place.
 
 ### Design Document
 
-- Added `docs/v2/PREFILL_KV_CACHE_REUSE_DESIGN.md`
+- Added `docs/v2/projects/2025-12/PREFILL_KV_CACHE_REUSE_DESIGN.md`
 - Documents loop reordering strategy (Q→H→KV vs H→KV→Q)
 - Memory bandwidth analysis
 - Stack layout for per-query state
@@ -62,7 +62,7 @@ With K/V cache reuse, prefill should improve by ~2-3x:
 - `src/v2/kernels/cpu/jit/q8_1/JitFusedAttentionWo.h`
 - `src/v2/kernels/cpu/jit/q8_1/JitVWeightedAccum.h`
 - `tests/v2/performance/kernels/cpu/attention/Perf__FusedAttentionWo.cpp`
-- `docs/v2/PREFILL_KV_CACHE_REUSE_DESIGN.md` (new)
+- `docs/v2/projects/2025-12/PREFILL_KV_CACHE_REUSE_DESIGN.md` (new)
 
 ## Next Steps
 

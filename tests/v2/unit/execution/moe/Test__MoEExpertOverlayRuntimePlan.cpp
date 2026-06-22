@@ -616,7 +616,7 @@ namespace llaminar2::test
     TEST(Test__MoEExpertOverlayRuntimePlan, LayoutARank1RegressionIsOrchestrationGapNotGraphMathGap)
     {
         // Regression guard for the production limitation documented in
-        // docs/v2/MOE_EXPERT_OVERLAY_ORCHESTRATION_REFACTOR_PLAN.md: rank 1 is an
+        // docs/v2/projects/2026-06/MOE_EXPERT_OVERLAY_ORCHESTRATION_REFACTOR_PLAN.md: rank 1 is an
         // auxiliary CPU fallback participant. The failure is orchestration trying
         // to build a continuation-root runner on rank 1, not overlay graph math.
         const std::string strict_message = thrownMessageFor(

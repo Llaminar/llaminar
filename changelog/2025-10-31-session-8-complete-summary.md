@@ -347,11 +347,11 @@ Session 8 successfully **completed Phases 1-2** of the V2 GPU readiness roadmap 
 15. `2025-10-31-batched-attention-test-partial-fix.md` - Test infrastructure fixes
 
 ### Design Documents (5 files)
-- `docs/v2/SNAPSHOT_INDEX.md` - Documentation index
-- `docs/v2/SNAPSHOT_ARCHITECTURE.md` - System architecture
-- `docs/v2/SNAPSHOT_FRAMEWORK_DESIGN.md` - Framework design
-- `docs/v2/SNAPSHOT_IMPLEMENTATION_ROADMAP.md` - Implementation roadmap
-- `docs/v2/SNAPSHOT_QUICK_START.md` - Quick start guide
+- `docs/v2/projects/2025-10/SNAPSHOT_INDEX.md` - Documentation index
+- `docs/v2/projects/2025-10/SNAPSHOT_ARCHITECTURE.md` - System architecture
+- `docs/v2/projects/2025-10/SNAPSHOT_FRAMEWORK_DESIGN.md` - Framework design
+- `docs/v2/projects/2025-10/SNAPSHOT_IMPLEMENTATION_ROADMAP.md` - Implementation roadmap
+- `docs/v2/projects/2025-10/SNAPSHOT_QUICK_START.md` - Quick start guide
 
 ### Git Commits
 - **Phase 1**: `45117ad` - NUMA-aware device enumeration

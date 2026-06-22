@@ -29,7 +29,7 @@ existed with an N≥2048 threshold that excluded TP-sharded shapes from the best
 - Updated `classifyGemvDispatch()` to reflect unified dispatch: removed tiny-KV, QWO,
   grid-kpar, scatter classifications → single "LDS-kred" for all N≥128 vec4 shapes.
 
-### `docs/v2/ROCM_GEMV_TP_TUNING_PLAN.md`
+### `docs/v2/projects/2026-03/ROCM_GEMV_TP_TUNING_PLAN.md`
 
 - Created project plan for the full 4-phase TP tuning effort.
 - Updated Phase 1 status to complete with measured results.

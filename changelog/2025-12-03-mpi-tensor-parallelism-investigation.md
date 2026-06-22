@@ -56,7 +56,7 @@ These provide the API for future optimizations but are not yet integrated.
 
 ### 5. Added comprehensive documentation
 
-**File:** `docs/v2/TENSOR_PARALLELISM_STATUS.md`
+**File:** `docs/v2/projects/2025-12/TENSOR_PARALLELISM_STATUS.md`
 
 Documents current status, what works, what doesn't, and the implementation plan.
 
@@ -100,7 +100,7 @@ src/v2/pipelines/qwen/Qwen2Pipeline.cpp            # Use project_row_parallel fo
 src/v2/kernels/cpu/gemm_v4/TPGemm.h               # New: TP GEMM wrapper
 src/v2/kernels/cpu/gemm_v4/TPFusedGEMM.h          # New: TP fused GEMM
 src/v2/kernels/cpu/gemm_v4/QuantisedGemmKernel.h  # Added getPackedWeights() accessor
-docs/v2/TENSOR_PARALLELISM_STATUS.md              # New: Detailed status document
+docs/v2/projects/2025-12/TENSOR_PARALLELISM_STATUS.md              # New: Detailed status document
 ```
 
 ## Key Insight

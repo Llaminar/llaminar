@@ -20,7 +20,7 @@
  * **Total GPU VRAM**: 56 GB (24 + 16 + 16)
  * **Total GPU Bandwidth**: ~2.4 TB/s
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 1)
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 1)
  */
 
 #include <gtest/gtest.h>

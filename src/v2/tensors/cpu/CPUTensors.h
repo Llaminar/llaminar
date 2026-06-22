@@ -1304,7 +1304,7 @@ namespace llaminar2
         //   SYNCED:               host_valid_=true,  device_valid_=true
         //   INVALID:              host_valid_=false, device_valid_=false (ERROR STATE)
         //
-        // See docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md for full design.
+        // See docs/v2/projects/2026-01/TENSOR_MEMORY_COHERENCE_DESIGN.md for full design.
 
         void *gpu_data_ptr_ = nullptr;            // GPU buffer pointer (nullptr = not on GPU)
         bool host_valid_ = true;                  // Host data is current (starts true - data created on host)
@@ -3795,7 +3795,7 @@ namespace llaminar2
          * Formula: int16 = clip(round(fp32 * 32767 / kv_cache_scale), ±MAX_SAFE_INT16)
          *
          * See: kernels/cpu/attention/q16_1/VNNISafetyConstants.h for limits
-         * See: docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
+         * See: docs/v2/projects/2025-12/PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
          *
          * @param src_data Source FP32 data
          * @param kv_cache_scale The fixed scale factor (e.g., 8.0 for ±8.0 FP32 range)

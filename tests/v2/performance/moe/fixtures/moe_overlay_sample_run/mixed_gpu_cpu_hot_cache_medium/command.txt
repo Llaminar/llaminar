@@ -1,1 +1,0 @@
-LLAMINAR_PROFILING=1 LLAMINAR_MOE_EP_PROFILE_CSV=benchmark_results/moe_overlay/sample/mixed_gpu_cpu_hot_cache_medium/moe_overlay_profile.csv build_v2_release/llaminar2 benchmark --config configs/moe_overlay/mixed_gpu_cpu_hot_cache_medium.yaml --mpi-procs 3 -m /synthetic/model.gguf

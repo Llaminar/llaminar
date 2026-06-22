@@ -8,7 +8,7 @@ This is the single handoff reference for running **live-path** ROCm perf benchma
 cmake --build build_v2_release --target v2_perf_rocm_prefill_dispatch_comparison --parallel
 ```
 
-Benchmark source: [tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp](tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp)
+Benchmark source: [tests/v2/performance/kernels/rocm/Perf__ROCmPrefillDispatchComparison.cpp](Perf__ROCmPrefillDispatchComparison.cpp)
 
 Benchmark binary:
 
@@ -157,7 +157,7 @@ else
 
 ### C) Env parsing for `KERNEL_BODY` (0..2)
 
-Location: [src/v2/utils/DebugEnv.h](src/v2/utils/DebugEnv.h)
+Location: [src/v2/utils/DebugEnv.h](../../../../../src/v2/utils/DebugEnv.h)
 
 Search for:
 - `LLAMINAR_ROCM_VNNI_PREFILL_FFN_OVERRIDE_KERNEL_BODY`

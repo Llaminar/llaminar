@@ -39,7 +39,7 @@ namespace llaminar2
      * Set kv_cache_scale and head_dim to enable proper clipping limits.
      *
      * See: kernels/cpu/attention/q16_1/VNNISafetyConstants.h for clipping limits
-     * See: docs/v2/PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
+     * See: docs/v2/projects/2025-12/PROJECT_Q16_INTEGER_ATTENTION_V2.md "VNNI OVERFLOW PREVENTION CONTRACT"
      */
     class KVCacheAppendStage : public IComputeStage
     {

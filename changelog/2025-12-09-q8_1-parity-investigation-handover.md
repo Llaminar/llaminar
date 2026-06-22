@@ -199,4 +199,4 @@ struct Q8_1Block {
 
 - `.github/copilot-instructions.md` - Project development guidelines
 - `.github/instructions/llaminar-architecture-v2.instructions.md` - V2 architecture overview
-- `docs/v2/SNAPSHOT_FRAMEWORK_DESIGN.md` - Snapshot system for debugging
+- `docs/v2/projects/2025-10/SNAPSHOT_FRAMEWORK_DESIGN.md` - Snapshot system for debugging

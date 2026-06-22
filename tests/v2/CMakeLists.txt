@@ -4463,7 +4463,7 @@ add_v2_test(V2_Integration_CUDABasicPipeline
 # Test: Tensor Host/Device Memory Coherence (comprehensive state machine validation)
 # Tests the two-flag coherence model (host_valid_, device_valid_) with full state
 # transition coverage, edge cases, and efficiency verification.
-# See: docs/v2/TENSOR_MEMORY_COHERENCE_DESIGN.md
+# See: docs/v2/projects/2026-01/TENSOR_MEMORY_COHERENCE_DESIGN.md
 add_executable(v2_integration_tensor_coherence integration/execution/coherence/Test__TensorCoherence.cpp)
 target_link_libraries(v2_integration_tensor_coherence llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_TensorCoherence
@@ -4488,7 +4488,7 @@ add_v2_test(V2_Integration_HostReleaseAfterGpuUpload
 # Test: GPU-Resident Data Flow (Phase 1: verifies no unnecessary D2H transfers)
 # Tests StageCoherence functions with MockBackend transfer tracking
 # Verifies: cohereInputs, cohereOutputs, markOutputsDirty behavior
-# See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+# See: docs/v2/projects/2026-01/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
 add_executable(v2_integration_gpu_resident_data_flow integration/execution/Test__GpuResidentDataFlow.cpp)
 target_link_libraries(v2_integration_gpu_resident_data_flow llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Integration_GpuResidentDataFlow
@@ -4501,7 +4501,7 @@ add_v2_test(V2_Integration_GpuResidentDataFlow
 # Tests FP32Tensor::createMapped() behavior for GPU↔CPU shared memory
 # Verifies: gpu_data_ptr valid after creation, ensureOnHost is no-op, 
 #           kernel writes visible on host, both valid flags stay true
-# See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+# See: docs/v2/projects/2026-01/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
 add_executable(v2_integration_mapped_memory_coherence integration/execution/coherence/Test__MappedMemoryCoherence.cpp)
 target_include_directories(v2_integration_mapped_memory_coherence PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -4534,7 +4534,7 @@ add_v2_test(V2_Integration_StreamCoherence
 # - allocateOnDevice (optimized, no H2D upload)
 # - mapped memory (zero-copy)
 # Validates GPU-resident execution optimization
-# See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+# See: docs/v2/projects/2026-01/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
 add_executable(v2_perf_coherence_transfer_overhead performance/Test__CoherenceTransferOverhead.cpp)
 target_include_directories(v2_perf_coherence_transfer_overhead PRIVATE 
     ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
@@ -4561,24 +4561,6 @@ target_link_libraries(v2_perf_prefix_cache_mtp_benchmark
 add_v2_test(V2_Perf_PrefixCacheMTP
     COMMAND $<TARGET_FILE:v2_perf_prefix_cache_mtp_benchmark>
     LABELS "V2;Performance;Benchmark;PrefixCache;MTP;JSON;Smoke"
-    MPI_PROCS 1
-)
-
-# MoE graph-native overlay benchmark harness smoke.
-# Validates curated overlay configs and the analyzer script without requiring
-# large model files in the performance suite.
-add_executable(v2_perf_moe_graph_native_overlay
-    performance/moe/Perf__MoEGraphNativeOverlayHarness.cpp
-    performance/moe/Perf__MoEGraphNativeOverlayAnalysis.cpp
-)
-target_link_libraries(v2_perf_moe_graph_native_overlay
-    llaminar2_core
-    GTest::gtest
-    GTest::gtest_main
-)
-add_v2_test(V2_Perf_MoEGraphNativeOverlay
-    COMMAND $<TARGET_FILE:v2_perf_moe_graph_native_overlay>
-    LABELS "V2;Performance;Benchmark;MoE;Overlay;ExpertParallel;GraphNative;Smoke"
     MPI_PROCS 1
 )
 
@@ -5349,7 +5331,7 @@ if(ZLIB_FOUND)
     # NOTE: LocalPP Multi-Stage Parity and Unified PP vs Orchestrator tests removed
     # as part of Phase 6 (LocalPPOrchestrator sunset). LocalPP tests now use unified
     # graph approach via Qwen2ParityTestBase::setupLocalPPPipeline().
-    # See: docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
+    # See: docs/v2/projects/2026-02/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
 
     message(STATUS "V2: Qwen2 parity tests enabled (SingleDevice, LocalTP, LocalPP, HybridPPTP)")
     message(STATUS "V2: LocalPP layer-partitioned weights test enabled")

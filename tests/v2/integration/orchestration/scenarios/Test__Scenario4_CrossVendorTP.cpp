@@ -33,7 +33,7 @@
  * **Total GPU VRAM**: 56 GB (24 + 32)
  * **Total GPU Compute**: ~128.7 TFLOPS (82.58 + 46.1)
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 4)
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 4)
  * @author Llaminar V2 Team
  * @date January 2026
  */

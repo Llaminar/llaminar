@@ -17,7 +17,7 @@
  *
  * **Tested Models**: 7B, 72B, 235B, 571B, 1142B
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 2)
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md (Scenario 2)
  */
 
 #include <gtest/gtest.h>

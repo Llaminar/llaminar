@@ -30,7 +30,7 @@
  * **Total GPU VRAM**: 104 GB (24 + 80)
  * **Total GPU Bandwidth**: ~3.3 TB/s (1008 + 2039 GB/s)
  *
- * @see docs/v2/ARCHITECTURE_EXECUTION_SCENARIOS.md
+ * @see docs/v2/projects/2026-01/ARCHITECTURE_EXECUTION_SCENARIOS.md
  * @author David Sanftenberg
  * @date January 2026
  */

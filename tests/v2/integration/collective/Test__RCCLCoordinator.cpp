@@ -14,7 +14,7 @@
  * Tests will be skipped if no ROCm devices are available.
  *
  * @see RCCLCoordinator for the implementation
- * @see docs/v2/sketches/CollectiveCoordinators.md for design documentation
+ * @see docs/v2/projects/2026-02/CollectiveCoordinators.md for design documentation
  */
 
 #include <gtest/gtest.h>

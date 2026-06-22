@@ -5,7 +5,7 @@
  * Tests the PPStageConfig structure which defines pipeline parallel stages
  * for the unified PP graph architecture.
  *
- * @see docs/v2/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
+ * @see docs/v2/projects/2026-02/UNIFIED_PP_GRAPH_ARCHITECTURE_PLAN.md
  *
  * @author David Sanftenberg
  * @date February 2026

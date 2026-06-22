@@ -5,7 +5,7 @@
  * Part of the Unified Multi-Device Orchestration Architecture (Phase 3).
  * Describes which layers, embedding, and LM head a specific device handles.
  *
- * @see docs/v2/UNIFIED_MULTI_DEVICE_ORCHESTRATION_DESIGN.md
+ * @see docs/v2/projects/2026-02/UNIFIED_MULTI_DEVICE_ORCHESTRATION_DESIGN.md
  *
  * @author David Sanftenberg
  * @date February 2026

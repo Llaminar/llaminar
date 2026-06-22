@@ -25,7 +25,7 @@
  * @endcode
  *
  * @see ICollectiveCoordinator for the base interface
- * @see docs/v2/sketches/CollectiveCoordinators.md for design documentation
+ * @see docs/v2/projects/2026-02/CollectiveCoordinators.md for design documentation
  */
 
 #pragma once

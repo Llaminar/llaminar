@@ -10,7 +10,7 @@
  * - Output buffers get valid GPU pointers after cohereOutputs()
  *
  * This is part of Phase 1 of the GPU-Resident Execution optimization plan.
- * See: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+ * See: docs/v2/projects/2026-01/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
  *
  * **Test Strategy**:
  * Uses MockBackend with transfer tracking to verify H2D/D2H counts

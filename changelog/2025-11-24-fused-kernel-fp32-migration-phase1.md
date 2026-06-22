@@ -73,7 +73,7 @@ The migration from INT32 to FP32 output is driven by:
 3. **Cleaner Pipeline**: Q8_1GemmKernel handles quantization internally (no separate step)
 4. **Weight Efficiency**: Q8_1 weights stay quantized (no repeated dequantization)
 
-See `docs/v2/FUSION_FRAMEWORK_MIGRATION.md` for complete architecture rationale.
+See `docs/v2/projects/2025-11/FUSION_FRAMEWORK_MIGRATION.md` for complete architecture rationale.
 
 ## Next Steps (Phase 2-3)
 

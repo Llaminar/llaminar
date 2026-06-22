@@ -13,7 +13,7 @@
  * behavior without requiring actual GPU hardware.
  *
  * **Phase**: GPU-Resident Execution Optimization Phase 3
- * **See**: docs/v2/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
+ * **See**: docs/v2/projects/2026-01/GPU_RESIDENT_EXECUTION_PROJECT_PLAN.md
  *
  * @author GitHub Copilot
  * @date January 2026

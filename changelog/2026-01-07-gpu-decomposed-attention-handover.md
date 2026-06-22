@@ -19,7 +19,7 @@ GPU prefill works, but **GPU decode is blocked** because `AttentionComputeStage`
 
 ### Root Cause
 
-All stage implementations use `requireTensorBase()` from [ComputeStageUtils.h](src/v2/execution/compute_stages/ComputeStageUtils.h):
+All stage implementations use `requireTensorBase()` from [ComputeStageUtils.h](../src/v2/execution/compute_stages/ComputeStageUtils.h):
 
 ```cpp
 // This blocks GPU tensors
@@ -55,9 +55,9 @@ GTEST_SKIP() << "GPU decode not yet supported - FusedAttentionWoStage requires T
 
 ### Files to Modify
 
-1. **[AttentionComputeStage.cpp](src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp)** - Add GPU tensor dispatch
-2. **[KernelFactory.h](src/v2/kernels/KernelFactory.h)** - Add `ITensor*` overload for `createAttention()`
-3. **[KernelFactory.cpp](src/v2/kernels/KernelFactory.cpp)** - Implement `ITensor*` dispatch
+1. **[AttentionComputeStage.cpp](../src/v2/execution/compute_stages/stages/AttentionComputeStage.cpp)** - Add GPU tensor dispatch
+2. **[KernelFactory.h](../src/v2/kernels/KernelFactory.h)** - Add `ITensor*` overload for `createAttention()`
+3. **[KernelFactory.cpp](../src/v2/kernels/KernelFactory.cpp)** - Implement `ITensor*` dispatch
 4. **[Test__CUDAFullModelInference.cpp](tests/v2/integration/Test__CUDAFullModelInference.cpp)** - Remove GTEST_SKIP
 
 ### Optional: Configure Qwen2Graph for GPU
@@ -382,9 +382,9 @@ The kernel automatically selects:
 
 ## Related Documentation
 
-- [CUDA_KERNELS_PROJECT_PLAN.md](docs/v2/CUDA_KERNELS_PROJECT_PLAN.md) - Full project plan with Phase 4 blockers
-- [copilot-instructions.md](.github/copilot-instructions.md) - Build and test instructions
-- [CUDAFlashAttentionKernelT.h](src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.h) - CUDA attention kernel interface
+- [CUDA_KERNELS_PROJECT_PLAN.md](../docs/v2/projects/2026-01/CUDA_KERNELS_PROJECT_PLAN.md) - Full project plan with Phase 4 blockers
+- [copilot-instructions.md](../.github/copilot-instructions.md) - Build and test instructions
+- [CUDAFlashAttentionKernelT.h](../src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.h) - CUDA attention kernel interface
 
 ---
 

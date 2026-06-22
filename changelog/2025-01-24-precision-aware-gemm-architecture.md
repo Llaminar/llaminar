@@ -243,7 +243,7 @@ bool multiply_activations_strided_typed(...)
 - Implemented `multiply_activations_strided_typed<ActT, WeightT>()`
 
 ✅ **Documentation**:
-- Created `docs/v2/PRECISION_ARCHITECTURE.md` (comprehensive guide)
+- Created `docs/v2/projects/2025-11/PRECISION_ARCHITECTURE.md` (comprehensive guide)
 - Created `changelog/2025-01-24-precision-aware-gemm-architecture.md` (this file)
 
 ### Pending (Next Steps)
@@ -439,7 +439,7 @@ gemm->multiply_activations_typed<ElementType, ElementType>(
 - **OneDNN GEMM Primitives**: `src/v2/kernels/cpu/gemm_v4/OneDNNGemmKernel.h`
 - **CpuAttentionKernelT**: `src/v2/kernels/cpu/CpuAttentionKernelT.h`
 - **ActivationTraits**: `src/v2/kernels/cpu/primitives/ActivationTraits.h`
-- **Precision Architecture**: `docs/v2/PRECISION_ARCHITECTURE.md`
+- **Precision Architecture**: `docs/v2/projects/2025-11/PRECISION_ARCHITECTURE.md`
 
 ---
 
