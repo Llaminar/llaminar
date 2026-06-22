@@ -14,6 +14,9 @@
 #
 # Runtime usage (both CUDA + ROCm available; pick per invocation with -d):
 #   docker run --gpus all --rm -it \
+#       --security-opt seccomp=unconfined \
+#       --cap-add SYS_NICE --cap-add SYS_PTRACE \
+#       --ipc=host --shm-size=16G \
 #       -v /path/to/models:/models:ro \
 #       -p 8080:8080 \
 #       ghcr.io/llaminar/llaminar:latest \
@@ -23,6 +26,8 @@
 #   docker run --device=/dev/kfd --device=/dev/dri \
 #       --group-add "$(stat -c '%g' /dev/kfd)" \
 #       --group-add "$(stat -c '%g' /dev/dri/renderD128)" \
+#       --security-opt seccomp=unconfined \
+#       --cap-add SYS_NICE --cap-add SYS_PTRACE \
 #       --ipc=host --shm-size=16G \
 #       -v /path/to/models:/models:ro \
 #       ghcr.io/llaminar/llaminar:latest -d rocm:0 -m /models/<gguf>

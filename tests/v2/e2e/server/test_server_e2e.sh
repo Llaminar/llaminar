@@ -54,6 +54,12 @@
 #   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP
 #                       Add --security-opt seccomp=unconfined so NUMA policy
 #                       syscalls work in Docker. Default: 1.
+#   LLAMINAR_E2E_DOCKER_CAPS
+#                       Space-separated capabilities to add to docker run.
+#                       Default: SYS_NICE SYS_PTRACE. Set to empty or none to
+#                       disable. ROCm containers need SYS_PTRACE on common
+#                       hosts; SYS_NICE keeps MPI/NUMA placement from being
+#                       denied by container capability defaults.
 #   LLAMINAR_E2E_DOCKER_BRIDGE_HOST_BIND
 #                       Host bind address for Docker bridge publishes. Default:
 #                       auto; uses 0.0.0.0 from containerized harnesses and
@@ -105,10 +111,15 @@ DOCKER_SHM_SIZE="${LLAMINAR_E2E_DOCKER_SHM_SIZE:-16g}"
 DOCKER_NAME_PREFIX="${LLAMINAR_E2E_DOCKER_NAME_PREFIX:-llaminar-e2e}"
 DOCKER_USER="${LLAMINAR_E2E_DOCKER_USER:-0:0}"
 DOCKER_NUMA_SECCOMP="${LLAMINAR_E2E_DOCKER_NUMA_SECCOMP:-1}"
+DOCKER_CAPS="${LLAMINAR_E2E_DOCKER_CAPS:-SYS_NICE SYS_PTRACE}"
 DOCKER_BRIDGE_HOST_BIND="${LLAMINAR_E2E_DOCKER_BRIDGE_HOST_BIND:-auto}"
 SERVER_CLIENT_HOST="${LLAMINAR_E2E_SERVER_CLIENT_HOST:-auto}"
 NVIDIA_DRIVER_LIB_DIR="${LLAMINAR_NVIDIA_DRIVER_LIB_DIR:-/opt/llaminar-nvidia-libs}"
 NVIDIA_CONTAINER_LIB_DIR="/usr/local/nvidia/lib64"
+declare -a DOCKER_CAP_ARGS=()
+if [[ -n "$DOCKER_CAPS" && "${DOCKER_CAPS,,}" != "none" ]]; then
+    read -r -a DOCKER_CAP_ARGS <<< "$DOCKER_CAPS"
+fi
 declare -a DOCKER_EXTRA_ARGS=()
 if [[ -n "${LLAMINAR_E2E_DOCKER_ARGS:-}" ]]; then
     # Intentional shell-style word splitting for advanced docker run flags.
@@ -174,6 +185,7 @@ Environment:
   LLAMINAR_E2E_DOCKER_GPUS            GPU flag for docker run (default: auto)
   LLAMINAR_E2E_DOCKER_USER            docker run --user value (default: 0:0)
   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP    Add seccomp=unconfined for NUMA syscalls (default: 1)
+  LLAMINAR_E2E_DOCKER_CAPS            Capabilities to add (default: SYS_NICE SYS_PTRACE)
   LLAMINAR_E2E_DOCKER_BRIDGE_HOST_BIND Bridge publish host bind (default: auto)
   LLAMINAR_E2E_SERVER_CLIENT_HOST      Host/IP for curl requests (default: auto)
   LLAMINAR_E2E_DOCKER_ARGS            Extra docker run args, shell-split
@@ -803,6 +815,10 @@ start_server_process() {
     if [[ "$DOCKER_NUMA_SECCOMP" != "0" ]]; then
         docker_args+=(--security-opt seccomp=unconfined)
     fi
+    local cap
+    for cap in "${DOCKER_CAP_ARGS[@]}"; do
+        [[ -n "$cap" ]] && docker_args+=(--cap-add "$cap")
+    done
     if [[ -n "$DOCKER_USER" ]]; then
         docker_args+=(--user "$DOCKER_USER")
     fi
@@ -877,7 +893,7 @@ start_server_process() {
     done
     docker_args+=("$CONTAINER_IMAGE" "${args_ref[@]}")
 
-    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, rocm=${rocm_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, model=${model_abs}" >&2
+    echo -e "  ${BLUE}INFO${NC} [${tag}] Docker: image=${CONTAINER_IMAGE}, network=${network_mode}, nvidia=${nvidia_mode}, rocm=${rocm_mode}, numa_seccomp=${DOCKER_NUMA_SECCOMP}, caps=${DOCKER_CAPS:-none}, model=${model_abs}" >&2
     container_id="$(docker "${docker_args[@]}")"
     ACTIVE_DOCKER_CONTAINERS+=("$container_id")
 

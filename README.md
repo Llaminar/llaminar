@@ -150,6 +150,8 @@ export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'render
 
 docker run --rm --gpus all \
   --security-opt seccomp=unconfined \
+  --cap-add SYS_NICE \
+  --cap-add SYS_PTRACE \
   llaminar:local --help
 
 docker run --rm \
@@ -159,19 +161,26 @@ docker run --rm \
   --group-add "$AMD_KFD_GID" \
   --group-add "$AMD_RENDER_GID" \
   --security-opt seccomp=unconfined \
+  --cap-add SYS_NICE \
+  --cap-add SYS_PTRACE \
   --entrypoint rocminfo \
   llaminar:local
 ```
 
 Llaminar does not require `--privileged` for normal container runs. It does
-require Docker to allow Linux NUMA policy syscalls (`mbind`, `set_mempolicy`,
-`get_mempolicy`, and `move_pages`) so CPU execution can bind and verify model
-pages on the intended NUMA node. Docker's default seccomp profile commonly
-blocks those syscalls, so use `--security-opt seccomp=unconfined` in Llaminar
-containers. When CPU model-page NUMA binding is requested, Llaminar fails model
-loading by default if binding cannot be applied. Set
-`LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1` only when you explicitly accept degraded
-CPU NUMA placement.
+require a few targeted Docker permissions:
+
+- `--security-opt seccomp=unconfined` allows Linux NUMA policy syscalls
+  (`mbind`, `set_mempolicy`, `get_mempolicy`, and `move_pages`) so CPU
+  execution can bind and verify model pages on the intended NUMA node.
+- `--cap-add SYS_NICE` allows the MPI/NUMA runtime to apply placement and
+  scheduling policy without Docker capability denials.
+- `--cap-add SYS_PTRACE` is required on common ROCm Docker hosts for AMD GPU
+  runtime/debug interfaces used through `/dev/kfd`.
+
+When CPU model-page NUMA binding is requested, Llaminar fails model loading by
+default if binding cannot be applied. Set `LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1`
+only when you explicitly accept degraded CPU NUMA placement.
 
 ### Running Llaminar
 
@@ -187,6 +196,8 @@ CUDA:
 docker run --rm -it \
   --gpus all \
   --security-opt seccomp=unconfined \
+  --cap-add SYS_NICE \
+  --cap-add SYS_PTRACE \
   --ipc=host --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
@@ -208,6 +219,8 @@ docker run --rm -it \
   --group-add "$AMD_KFD_GID" \
   --group-add "$AMD_RENDER_GID" \
   --security-opt seccomp=unconfined \
+  --cap-add SYS_NICE \
+  --cap-add SYS_PTRACE \
   --ipc=host --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
@@ -221,6 +234,7 @@ CPU from the same release image:
 ```bash
 docker run --rm -it \
   --security-opt seccomp=unconfined \
+  --cap-add SYS_NICE \
   --ipc=host --shm-size=16g \
   -v "$MODEL_DIR":/models:ro \
   -p 8080:8080 \
