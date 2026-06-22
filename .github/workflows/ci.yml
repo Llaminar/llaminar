@@ -56,6 +56,7 @@ env:
   BUILDER_IMAGE: llaminar-builder:${{ github.sha }}
   CUDA_VERSION: "13.0"
   ROCM_VERSION: "7.1.1"
+  LLAMINAR_DOCKER_BUILD_CACHE_MAX_SIZE: "256GB"
   RCCL_ONLY_FUNCS: >-
     AllReduce RING/TREE LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Reduce RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|ReduceScatter RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|AllGather RING/PAT LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|Broadcast RING LL/LL128/SIMPLE Sum i8/i32/f16/f32/bf16|SendRecv RING SIMPLE Sum i8
 
@@ -123,6 +124,7 @@ jobs:
             --device=/dev/kfd --device=/dev/dri \
             --group-add video --group-add render \
             --cap-add SYS_NICE --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined \
             --ulimit core=-1 \
             --ipc=host --shm-size=16g \
             -e MODELS_DIR="${MODELS_DIR}" \
@@ -147,6 +149,10 @@ jobs:
       - name: Remove builder image tag
         if: always()
         run: docker image rm "${{ env.BUILDER_IMAGE }}" || true
+
+      - name: Bound Docker build cache
+        if: always()
+        run: bash scripts/ci/prune_docker_build_cache.sh
 
   runtime-containers:
     name: Build, test, and publish runtime containers
@@ -216,3 +222,7 @@ jobs:
           path: ${{ github.workspace }}/cores/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Bound Docker build cache
+        if: always()
+        run: bash scripts/ci/prune_docker_build_cache.sh

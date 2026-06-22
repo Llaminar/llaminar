@@ -165,12 +165,13 @@ docker run --rm \
 
 Llaminar does not require `--privileged` for normal container runs. It does
 require Docker to allow Linux NUMA policy syscalls (`mbind`, `set_mempolicy`,
-and `get_mempolicy`) so CPU execution can bind model pages to the intended NUMA
-node. Docker's default seccomp profile commonly blocks those syscalls, so use
-`--security-opt seccomp=unconfined` in Llaminar containers. When CPU model-page
-NUMA binding is requested, Llaminar fails model loading by default if binding
-cannot be applied. Set `LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1` only when you
-explicitly accept degraded CPU NUMA placement.
+`get_mempolicy`, and `move_pages`) so CPU execution can bind and verify model
+pages on the intended NUMA node. Docker's default seccomp profile commonly
+blocks those syscalls, so use `--security-opt seccomp=unconfined` in Llaminar
+containers. When CPU model-page NUMA binding is requested, Llaminar fails model
+loading by default if binding cannot be applied. Set
+`LLAMINAR_ALLOW_NUMA_BIND_FALLBACK=1` only when you explicitly accept degraded
+CPU NUMA placement.
 
 ### Running Llaminar
 

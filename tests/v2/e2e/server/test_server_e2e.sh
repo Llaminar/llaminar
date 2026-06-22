@@ -52,8 +52,8 @@
 #   LLAMINAR_E2E_DOCKER_USER User passed to docker run --user. Defaults to
 #                       0:0 so nested devcontainer bind mounts are writable.
 #   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP
-#                       Add --security-opt seccomp=unconfined so mbind/set_mempolicy
-#                       NUMA syscalls work in Docker. Default: 1.
+#                       Add --security-opt seccomp=unconfined so NUMA policy
+#                       syscalls work in Docker. Default: 1.
 #   LLAMINAR_E2E_DOCKER_ARGS Extra docker run args, shell-split. Use this for
 #                       host-specific privileges such as --cap-add or seccomp.
 #   LLAMINAR_MODEL      Override model path (overrides default suite 1)
