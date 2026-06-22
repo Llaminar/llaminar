@@ -6,7 +6,12 @@ echo "Setting up Python environment for Llaminar"
 echo "=========================================="
 
 # Define paths
-WORKSPACE_DIR="/workspaces/llaminar"
+if [[ "$GITHUB_ACTIONS" == "true" ]]; then
+  WORKSPACE_DIR="."
+else
+  WORKSPACE_DIR="/workspaces/llaminar"
+fi
+
 VENV_DIR="$WORKSPACE_DIR/.venv"
 REQUIREMENTS_FILE="$WORKSPACE_DIR/requirements.txt"
 FETCH_MODELS_SCRIPT="$WORKSPACE_DIR/scripts/fetch_test_models.sh"
