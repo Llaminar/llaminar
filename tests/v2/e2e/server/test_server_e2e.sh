@@ -54,6 +54,13 @@
 #   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP
 #                       Add --security-opt seccomp=unconfined so NUMA policy
 #                       syscalls work in Docker. Default: 1.
+#   LLAMINAR_E2E_DOCKER_BRIDGE_HOST_BIND
+#                       Host bind address for Docker bridge publishes. Default:
+#                       auto; uses 0.0.0.0 from containerized harnesses and
+#                       127.0.0.1 from host shells.
+#   LLAMINAR_E2E_SERVER_CLIENT_HOST
+#                       Hostname/IP the harness curls. Default: auto; uses the
+#                       Docker-host gateway for bridge mode from containers.
 #   LLAMINAR_E2E_DOCKER_ARGS Extra docker run args, shell-split. Use this for
 #                       host-specific privileges such as --cap-add or seccomp.
 #   LLAMINAR_MODEL      Override model path (overrides default suite 1)
@@ -98,6 +105,8 @@ DOCKER_SHM_SIZE="${LLAMINAR_E2E_DOCKER_SHM_SIZE:-16g}"
 DOCKER_NAME_PREFIX="${LLAMINAR_E2E_DOCKER_NAME_PREFIX:-llaminar-e2e}"
 DOCKER_USER="${LLAMINAR_E2E_DOCKER_USER:-0:0}"
 DOCKER_NUMA_SECCOMP="${LLAMINAR_E2E_DOCKER_NUMA_SECCOMP:-1}"
+DOCKER_BRIDGE_HOST_BIND="${LLAMINAR_E2E_DOCKER_BRIDGE_HOST_BIND:-auto}"
+SERVER_CLIENT_HOST="${LLAMINAR_E2E_SERVER_CLIENT_HOST:-auto}"
 NVIDIA_DRIVER_LIB_DIR="${LLAMINAR_NVIDIA_DRIVER_LIB_DIR:-/opt/llaminar-nvidia-libs}"
 NVIDIA_CONTAINER_LIB_DIR="/usr/local/nvidia/lib64"
 declare -a DOCKER_EXTRA_ARGS=()
@@ -165,6 +174,8 @@ Environment:
   LLAMINAR_E2E_DOCKER_GPUS            GPU flag for docker run (default: auto)
   LLAMINAR_E2E_DOCKER_USER            docker run --user value (default: 0:0)
   LLAMINAR_E2E_DOCKER_NUMA_SECCOMP    Add seccomp=unconfined for NUMA syscalls (default: 1)
+  LLAMINAR_E2E_DOCKER_BRIDGE_HOST_BIND Bridge publish host bind (default: auto)
+  LLAMINAR_E2E_SERVER_CLIENT_HOST      Host/IP for curl requests (default: auto)
   LLAMINAR_E2E_DOCKER_ARGS            Extra docker run args, shell-split
   LLAMINAR_MODEL                      Override default suite model
   LLAMINAR_BACKENDS                   Override default suite backends
@@ -408,6 +419,45 @@ cleanup_active_docker_containers() {
 }
 
 trap cleanup_active_docker_containers EXIT INT TERM
+
+running_inside_docker() {
+    [[ -f /.dockerenv ]] && return 0
+    grep -qaE '/docker/|/kubepods/|/containerd/' /proc/1/cgroup 2>/dev/null
+}
+
+docker_host_gateway() {
+    awk '$2 == "00000000" { print $3; exit }' /proc/net/route 2>/dev/null |
+        python3 -c 'import socket, struct, sys
+raw = sys.stdin.read().strip()
+print(socket.inet_ntoa(struct.pack("<L", int(raw, 16))) if raw else "")'
+}
+
+docker_bridge_host_bind() {
+    if [[ "$DOCKER_BRIDGE_HOST_BIND" != "auto" ]]; then
+        echo "$DOCKER_BRIDGE_HOST_BIND"
+    elif running_inside_docker; then
+        echo "0.0.0.0"
+    else
+        echo "127.0.0.1"
+    fi
+}
+
+server_client_host() {
+    if [[ "$SERVER_CLIENT_HOST" != "auto" ]]; then
+        echo "$SERVER_CLIENT_HOST"
+    elif is_docker_mode && [[ "$DOCKER_NETWORK" == "bridge" ]] && running_inside_docker; then
+        local gateway
+        gateway="$(docker_host_gateway)"
+        echo "${gateway:-127.0.0.1}"
+    else
+        echo "127.0.0.1"
+    fi
+}
+
+server_base_url() {
+    local port="$1"
+    echo "http://$(server_client_host):${port}"
+}
 
 resolve_docker_network() {
     if [[ "$DOCKER_NETWORK" != "auto" ]]; then
@@ -763,7 +813,7 @@ start_server_process() {
     fi
 
     if [[ "$network_mode" == "bridge" ]]; then
-        docker_args+=(-p "127.0.0.1:${port}:${port}")
+        docker_args+=(-p "$(docker_bridge_host_bind):${port}:${port}")
     fi
 
     case "$DOCKER_GPUS" in
@@ -927,7 +977,7 @@ run_long_context_checks() {
 
     if LLAMINAR_E2E_LONG_CONTEXT_ARTIFACT_DIR="$LOG_DIR" \
         python3 "$SCRIPT_DIR/long_context_checks.py" \
-        --base-url "http://127.0.0.1:${port}" \
+        --base-url "$(server_base_url "$port")" \
         --tag "$tag" \
         --tier "$LONG_CONTEXT_TIER" \
         --min-prompt-tokens "$LONG_MIN_PROMPT_TOKENS" \
@@ -1143,7 +1193,7 @@ wait_for_health() {
         if [ -n "$handle" ] && ! server_is_alive "$handle"; then
             return 1  # Server process already exited
         fi
-        if curl -s --max-time 2 "http://127.0.0.1:${port}/health" >/dev/null 2>&1; then
+        if curl -s --max-time 2 "$(server_base_url "$port")/health" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5
@@ -1792,7 +1842,7 @@ run_chat_answer_check() {
         response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
         LAST_RESPONSE="$response"
 
         content=$(printf '%s' "$response" | extract_content 2>/dev/null || echo "PARSE_ERROR")
@@ -1846,7 +1896,7 @@ run_streaming_checks() {
         stream_raw=$(curl -s --max-time "$REQUEST_TIMEOUT" -N \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo "CURL_FAILED")
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo "CURL_FAILED")
 
         stream_ok=$(printf '%s' "$stream_raw" | python3 -c "
 import sys
@@ -1973,7 +2023,7 @@ PY
         response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
             -H "Content-Type: application/json" \
             -d "$payload" \
-            "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
 
         validation=$(printf '%s' "$response" | python3 -c "
 import json
@@ -2082,6 +2132,11 @@ run_backend_tests() {
         server_model_path="$(container_model_path "$model")"
     fi
     local -a server_args=(serve --port "$port" "${context_args[@]}")
+    if is_docker_mode && [[ "$DOCKER_NETWORK" == "bridge" ]]; then
+        # Docker bridge port publishing targets the container's bridge address,
+        # so a loopback-only server inside the container is not reachable.
+        server_args+=(--host 0.0.0.0)
+    fi
     if [[ "$backend" != "tp" && "$backend" != "pp" ]]; then
         server_args+=(-d "$backend")
     fi
@@ -2114,7 +2169,7 @@ run_backend_tests() {
 
     # ─── Test 1: Health endpoint ──────────────────────────────────────
     local health_response
-    health_response=$(curl -s --max-time 5 "http://127.0.0.1:${port}/health" 2>/dev/null || echo "CURL_FAILED")
+    health_response=$(curl -s --max-time 5 "$(server_base_url "$port")/health" 2>/dev/null || echo "CURL_FAILED")
     if echo "$health_response" | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['status']=='ok'" 2>/dev/null; then
         pass "[${tag}] GET /health returns ok"
     else
@@ -2170,7 +2225,7 @@ run_backend_tests() {
     error_response=$(curl -s --max-time 5 -X POST \
         -H "Content-Type: application/json" \
         -d 'not valid json' \
-        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{}')
+        "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{}')
 
     error_msg=$(echo "$error_response" | python3 -c "
 import json, sys
@@ -2188,7 +2243,7 @@ print(d.get('error', {}).get('type', ''))
     error_response=$(curl -s --max-time 5 -X POST \
         -H "Content-Type: application/json" \
         -d '{"max_tokens": 10}' \
-        "http://127.0.0.1:${port}/v1/chat/completions" 2>/dev/null || echo '{}')
+        "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{}')
 
     error_msg=$(echo "$error_response" | python3 -c "
 import json, sys
@@ -2243,6 +2298,10 @@ if is_docker_mode; then
     echo -e "  Server mode: docker"
     echo -e "  Container image: ${CONTAINER_IMAGE}"
     echo -e "  Docker network: ${DOCKER_NETWORK}"
+    if [[ "$DOCKER_NETWORK" == "bridge" ]]; then
+        echo -e "  Docker bridge host bind: $(docker_bridge_host_bind)"
+        echo -e "  Server client host: $(server_client_host)"
+    fi
 else
     echo -e "  Server mode: local"
     echo -e "  Binary: ${BINARY}"

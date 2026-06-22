@@ -152,7 +152,8 @@ for variant in "${variants[@]}"; do
     done
     run_cmd "${build_args[@]}"
 
-    run_cmd "${repo_root}/scripts/ci/run_release_container_e2e.sh" \
+    run_cmd env LLAMINAR_E2E_DOCKER_NETWORK=bridge \
+        "${repo_root}/scripts/ci/run_release_container_e2e.sh" \
         --variant "${e2e_variant[$variant]}" \
         --image "${refs[0]}" \
         --port "${port[$variant]}" \
