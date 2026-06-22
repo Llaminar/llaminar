@@ -39,7 +39,7 @@ on:
     outputs:
       image-ref:
         description: "Published runtime image references."
-        value: ${{ jobs.runtime-containers.outputs.image-refs }}
+        value: ${{ jobs.runtime-image-refs.outputs.image-refs }}
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -155,17 +155,39 @@ jobs:
         run: bash scripts/ci/prune_docker_build_cache.sh
 
   runtime-containers:
-    name: Build, test, and publish runtime containers
+    name: Runtime ${{ matrix.variant }} image
     needs: build
     runs-on: [self-hosted, linux, x64, llaminar-bench]
-    timeout-minutes: 360
-    outputs:
-      image-refs: ${{ steps.runtime.outputs.image_refs }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      # Keep the DAG split for visibility while still protecting the shared
+      # self-hosted runner from concurrent GPU-heavy E2E segments.
+      max-parallel: 1
+      matrix:
+        include:
+          - variant: cpu
+            e2e_variant: cpu
+            port: 20100
+          - variant: cuda
+            e2e_variant: cuda
+            port: 20200
+          - variant: rocm
+            e2e_variant: rocm
+            port: 20300
+          - variant: full
+            e2e_variant: hybrid
+            port: 20400
     # Serialize release-container E2E segments across workflow runs so the
     # self-hosted GPU runner never oversubscribes NVIDIA/AMD VRAM.
     concurrency:
       group: llaminar-runtime-container-e2e
       cancel-in-progress: false
+    env:
+      # The self-hosted ARC runner invokes Docker builds from inside
+      # Kubernetes. Host networking avoids TLS stalls to codeload.github.com
+      # seen from BuildKit RUN layers while preserving exact dependency refs.
+      LLAMINAR_DOCKER_BUILD_NETWORK: host
     steps:
       - uses: actions/checkout@v6
 
@@ -192,25 +214,71 @@ jobs:
           sudo sysctl -w "kernel.core_pattern=${{ github.workspace }}/cores/core.%e.%p.%t"
           sudo sysctl -w kernel.core_uses_pid=1
 
-      - name: Build, E2E test, and publish variants
-        id: runtime
+      - name: Resolve runtime image tags
+        id: runtime-tags
+        shell: bash
         run: |
           set -euo pipefail
-          args=(--image "${REGISTRY}/${IMAGE_NAME}" --branch "${GITHUB_REF_NAME}" --sha "${GITHUB_SHA}")
-          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
-            args+=(--no-push)
-          else
-            args+=(--push)
-          fi
-          scripts/ci/build_test_publish_runtime_variants.sh "${args[@]}"
+          image="${REGISTRY}/${IMAGE_NAME}"
+          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+            --variant "${{ matrix.variant }}" \
+            --image "$image" \
+            --branch "${GITHUB_REF_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --format refs)
+          ((${#refs[@]} > 0))
+          {
+            echo "primary_ref=${refs[0]}"
+            echo "refs<<EOF"
+            printf '%s\n' "${refs[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Runtime ${{ matrix.variant }} image tags"
+            echo ""
+            for ref in "${refs[@]}"; do
+              echo "- \`${ref}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build runtime image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+            --variant "${{ matrix.variant }}" \
+            --image "$image" \
+            --branch "${GITHUB_REF_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --format refs)
+          build_args=(scripts/docker/build-runtime-image.sh --variant "${{ matrix.variant }}" --load --no-verify)
+          for ref in "${refs[@]}"; do
+            build_args+=(--tag "$ref")
+          done
+          "${build_args[@]}"
+
+      - name: E2E test runtime image
+        env:
+          LLAMINAR_E2E_DOCKER_NETWORK: bridge
+        run: |
+          scripts/ci/run_release_container_e2e.sh \
+            --variant "${{ matrix.e2e_variant }}" \
+            --image "${{ steps.runtime-tags.outputs.primary_ref }}" \
+            --port "${{ matrix.port }}" \
+            --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-container"
+
+      - name: Push tested SHA image
+        if: github.event_name != 'pull_request'
+        run: docker push "${{ steps.runtime-tags.outputs.primary_ref }}"
 
       - name: Upload E2E logs on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: runtime-e2e-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          name: runtime-e2e-logs-${{ matrix.e2e_variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            /tmp/llaminar-e2e-*-container/
+            /tmp/llaminar-e2e-${{ matrix.e2e_variant }}-container/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -218,11 +286,109 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cores-runtime-containers-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cores-runtime-containers-${{ matrix.e2e_variant }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/cores/
           if-no-files-found: ignore
           retention-days: 7
 
+      - name: Remove runtime image tags
+        if: always()
+        shell: bash
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}"
+          mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+            --variant "${{ matrix.variant }}" \
+            --image "$image" \
+            --branch "${GITHUB_REF_NAME}" \
+            --sha "${GITHUB_SHA}" \
+            --format refs)
+          for ref in "${refs[@]}"; do
+            [[ -n "$ref" ]] && docker image rm "$ref" >/dev/null 2>&1 || true
+          done
+
       - name: Bound Docker build cache
         if: always()
         run: bash scripts/ci/prune_docker_build_cache.sh
+
+  publish-runtime-aliases:
+    name: Publish runtime latest aliases
+    needs: runtime-containers
+    if: github.event_name != 'pull_request'
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish latest aliases from tested SHA images
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          variants=(cpu cuda rocm full)
+          for variant in "${variants[@]}"; do
+            mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+              --variant "$variant" \
+              --image "$image" \
+              --branch "${GITHUB_REF_NAME}" \
+              --sha "${GITHUB_SHA}" \
+              --format refs)
+            ((${#refs[@]} > 0))
+            primary="${refs[0]}"
+            docker pull "$primary"
+            for ref in "${refs[@]:1}"; do
+              docker tag "$primary" "$ref"
+              docker push "$ref"
+            done
+            docker image rm "${refs[@]}" >/dev/null 2>&1 || true
+          done
+
+      - name: Bound Docker build cache
+        if: always()
+        run: bash scripts/ci/prune_docker_build_cache.sh
+
+  runtime-image-refs:
+    name: Runtime image refs
+    needs: [runtime-containers, publish-runtime-aliases]
+    if: always()
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
+    outputs:
+      image-refs: ${{ steps.refs.outputs.image_refs }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve published runtime image refs
+        id: refs
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${IMAGE_NAME}"
+          variants=(cpu cuda rocm full)
+          all_refs=()
+          for variant in "${variants[@]}"; do
+            mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+              --variant "$variant" \
+              --image "$image" \
+              --branch "${GITHUB_REF_NAME}" \
+              --sha "${GITHUB_SHA}" \
+              --format refs)
+            all_refs+=("${refs[@]}")
+          done
+          {
+            echo "image_refs<<EOF"
+            printf '%s\n' "${all_refs[@]}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "## Runtime image refs"
+            echo ""
+            for ref in "${all_refs[@]}"; do
+              echo "- \`${ref}\`"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
