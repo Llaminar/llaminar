@@ -64,7 +64,7 @@ env:
 jobs:
   build:
     name: Build builder image and unit tests
-    runs-on: llaminar-xeon
+    runs-on: [self-hosted, Linux, X64, llaminar-bench]
     timeout-minutes: 120
     outputs:
       builder-image: ${{ steps.builder-image.outputs.ref }}
@@ -158,7 +158,7 @@ jobs:
   runtime-containers:
     name: Runtime ${{ matrix.variant }} ${{ matrix.cpu_isa }} image
     needs: build
-    runs-on: llaminar-xeon
+    runs-on: [self-hosted, Linux, X64, llaminar-bench]
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -349,7 +349,7 @@ jobs:
     name: Publish runtime latest aliases
     needs: runtime-containers
     if: github.event_name != 'pull_request'
-    runs-on: llaminar-xeon
+    runs-on: [self-hosted, Linux, X64, llaminar-bench]
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
@@ -396,7 +396,7 @@ jobs:
     name: Runtime image refs
     needs: [runtime-containers, publish-runtime-aliases]
     if: always()
-    runs-on: llaminar-xeon
+    runs-on: [self-hosted, Linux, X64, llaminar-bench]
     outputs:
       image-refs: ${{ steps.refs.outputs.image_refs }}
     steps:
