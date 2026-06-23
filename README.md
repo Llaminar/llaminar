@@ -28,6 +28,12 @@ Llaminar supports the following model architectures initially:
 * Qwen 3 (dense)
 * Qwen 3.5/3.6 (dense and MoE)
 
+## Benchmarks
+
+Latest benchmarks can be found here: 
+
+https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/e126900d/benchmark_results.csv
+
 ## Quickstart
 
 ### Building Llaminar
