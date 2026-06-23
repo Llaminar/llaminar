@@ -8708,6 +8708,19 @@ set_property(TEST V2_Perf_CPUNativeVNNI_VerifierRows
     "LLAMINAR_CPU_NVNNI_VERIFIER_ITERS=10"
 )
 
+add_v2_test(V2_Perf_CPUNativeVNNI_MoEGateUpFusion
+    COMMAND $<TARGET_FILE:v2_perf_cpu_native_vnni_gemv>
+            --gtest_filter=*MoE_SingleTokenGateUp_FusedProjectionSpeedup
+    LABELS "V2;Performance;GEMV;NativeVNNI;CPU;MoE;Decode;Qwen;Tuning"
+    MPI_PROCS 1
+    TIMEOUT 120
+)
+set_property(TEST V2_Perf_CPUNativeVNNI_MoEGateUpFusion
+    APPEND PROPERTY ENVIRONMENT
+    "LLAMINAR_CPU_NVNNI_MOE_GATEUP_WARMUP=2"
+    "LLAMINAR_CPU_NVNNI_MOE_GATEUP_ITERS=5"
+)
+
 # Performance Test: CPU Flash Attention Sweep (all models, TP degrees, decode + prefill)
 add_executable(v2_perf_cpu_flash_attention_sweep performance/kernels/cpu/attention/Perf__CpuFlashAttentionSweep.cpp)
 target_link_libraries(v2_perf_cpu_flash_attention_sweep

@@ -1574,6 +1574,193 @@ namespace
                   << table.to_string() << std::endl;
     }
 
+    TEST_F(CPUNativeVNNIGemvTest, MoE_SingleTokenGateUp_FusedProjectionSpeedup)
+    {
+        /*
+         * MoE decode does many M=1 expert gate/up projections for the same hidden
+         * row. The production path should quantize that row once and run all
+         * active expert projections inside one OpenMP region. This microbench
+         * catches AVX2-only builds regressing to per-projection GEMV scheduling.
+         *
+         * Useful knobs:
+         * - LLAMINAR_CPU_NVNNI_MOE_GATEUP_FORMATS=Q4_K,Q8_0
+         * - LLAMINAR_CPU_NVNNI_MOE_GATEUP_K=5120
+         * - LLAMINAR_CPU_NVNNI_MOE_GATEUP_N=1536
+         * - LLAMINAR_CPU_NVNNI_MOE_GATEUP_EXPERTS=8
+         * - LLAMINAR_CPU_NVNNI_MOE_GATEUP_MIN_SPEEDUP=1.10
+         */
+        const std::set<std::string> format_filters =
+            getEnvCsvSet("LLAMINAR_CPU_NVNNI_MOE_GATEUP_FORMATS");
+        const int K =
+            std::max(32, getEnvInt("LLAMINAR_CPU_NVNNI_MOE_GATEUP_K").value_or(5120));
+        const int expert_N =
+            std::max(64, getEnvInt("LLAMINAR_CPU_NVNNI_MOE_GATEUP_N").value_or(1536));
+        const int active_experts =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_MOE_GATEUP_EXPERTS").value_or(8));
+        const int warmup =
+            std::max(0, getEnvInt("LLAMINAR_CPU_NVNNI_MOE_GATEUP_WARMUP").value_or(2));
+        const int iterations =
+            std::max(1, getEnvInt("LLAMINAR_CPU_NVNNI_MOE_GATEUP_ITERS").value_or(5));
+        const double min_required_speedup =
+            getEnvDouble("LLAMINAR_CPU_NVNNI_MOE_GATEUP_MIN_SPEEDUP").value_or(1.10);
+
+        ASSERT_EQ(K % 32, 0)
+            << "MoE gate/up fused projection perf expects K to be block-aligned";
+
+        fort::utf8_table table;
+        table.set_border_style(FT_DOUBLE2_STYLE);
+        table << fort::header << "Format" << "Experts" << "Proj" << "N" << "K"
+              << "Fused us" << "Serial us" << "Speedup" << "RelL2" << fort::endr;
+        table.column(0).set_cell_text_align(fort::text_align::left);
+        for (int c = 1; c <= 8; ++c)
+            table.column(c).set_cell_text_align(fort::text_align::right);
+
+        int executed_cases = 0;
+        for (const auto &fmt : MTP_SMALL_M_FORMATS)
+        {
+            if (format_filters.empty())
+            {
+                if (fmt.name != "Q4_K")
+                    continue;
+            }
+            else if (!shouldRunName(format_filters, fmt.name))
+            {
+                continue;
+            }
+
+            const int projection_count = active_experts * 2;
+            std::vector<std::unique_ptr<TensorBase>> weights;
+            std::vector<std::unique_ptr<CPUNativeVNNIGemmKernel>> kernels;
+            std::vector<std::unique_ptr<FP32Tensor>> fused_outputs;
+            std::vector<std::unique_ptr<FP32Tensor>> serial_outputs;
+            std::vector<ITensorGemm::TensorProjectionDesc> projections;
+            weights.reserve(static_cast<size_t>(projection_count));
+            kernels.reserve(static_cast<size_t>(projection_count));
+            fused_outputs.reserve(static_cast<size_t>(projection_count));
+            serial_outputs.reserve(static_cast<size_t>(projection_count));
+            projections.reserve(static_cast<size_t>(projection_count));
+
+            for (int p = 0; p < projection_count; ++p)
+            {
+                auto weights_for_projection =
+                    createWeightsForFormat(fmt.name, static_cast<size_t>(expert_N), static_cast<size_t>(K));
+                ASSERT_NE(weights_for_projection, nullptr) << fmt.name;
+
+                auto kernel =
+                    std::make_unique<CPUNativeVNNIGemmKernel>(weights_for_projection.get());
+                ASSERT_TRUE(kernel->isValid()) << fmt.name << " projection=" << p;
+
+                auto fused_output =
+                    std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{1, static_cast<size_t>(expert_N)});
+                auto serial_output =
+                    std::make_unique<FP32Tensor>(
+                        std::vector<size_t>{1, static_cast<size_t>(expert_N)});
+
+                const char *projection_name = (p % 2 == 0) ? "moe_gate" : "moe_up";
+                projections.push_back(
+                    {kernel.get(), fused_output.get(), expert_N, nullptr, projection_name});
+                weights.push_back(std::move(weights_for_projection));
+                kernels.push_back(std::move(kernel));
+                fused_outputs.push_back(std::move(fused_output));
+                serial_outputs.push_back(std::move(serial_output));
+            }
+
+            auto input = TestTensorFactory::createFP32Random(
+                {1, static_cast<size_t>(K)},
+                -1.0f,
+                1.0f,
+                static_cast<uint32_t>(23000 + K + expert_N + active_experts + fmt.name.size()));
+
+            auto run_fused = [&]()
+            {
+                const bool ok =
+                    kernels.front()->multiply_fused_tensor(input.get(), projections, 1, K);
+                if (!ok)
+                    ADD_FAILURE() << "Fused MoE gate/up projection failed for " << fmt.name;
+            };
+            auto run_serial = [&]()
+            {
+                for (int p = 0; p < projection_count; ++p)
+                {
+                    const bool ok =
+                        kernels[static_cast<size_t>(p)]->multiply_tensor(
+                            input.get(),
+                            serial_outputs[static_cast<size_t>(p)].get(),
+                            1,
+                            expert_N,
+                            K);
+                    if (!ok)
+                        ADD_FAILURE() << "Serial MoE gate/up projection failed for "
+                                      << fmt.name << " projection=" << p;
+                }
+            };
+
+            run_fused();
+            run_serial();
+
+            std::vector<float> fused_flat;
+            std::vector<float> serial_flat;
+            fused_flat.reserve(static_cast<size_t>(projection_count) * static_cast<size_t>(expert_N));
+            serial_flat.reserve(static_cast<size_t>(projection_count) * static_cast<size_t>(expert_N));
+            for (int p = 0; p < projection_count; ++p)
+            {
+                const float *fused_data =
+                    fused_outputs[static_cast<size_t>(p)]->data();
+                const float *serial_data =
+                    serial_outputs[static_cast<size_t>(p)]->data();
+                fused_flat.insert(fused_flat.end(), fused_data, fused_data + expert_N);
+                serial_flat.insert(serial_flat.end(), serial_data, serial_data + expert_N);
+            }
+
+            const VectorMetrics metrics =
+                computeVectorMetrics(fused_flat.data(), serial_flat.data(), fused_flat.size());
+            const std::string label =
+                fmt.name + " MoE gate/up fused projection";
+            assertVerifierMetricsStrict(metrics, label);
+
+            const TimingSummary fused_timing =
+                timeMicrobench(warmup, iterations, run_fused);
+            const TimingSummary serial_timing =
+                timeMicrobench(warmup, iterations, run_serial);
+            const double speedup =
+                fused_timing.min_us > 0.0 ? serial_timing.min_us / fused_timing.min_us : 0.0;
+
+            char fused_us[32], serial_us[32], speed[32], rel_l2[32];
+            std::snprintf(fused_us, sizeof(fused_us), "%.1f", fused_timing.min_us);
+            std::snprintf(serial_us, sizeof(serial_us), "%.1f", serial_timing.min_us);
+            std::snprintf(speed, sizeof(speed), "%.2fx", speedup);
+            std::snprintf(rel_l2, sizeof(rel_l2), "%.3e", metrics.relative_l2);
+            table << fmt.name << active_experts << projection_count << expert_N << K
+                  << fused_us << serial_us << speed << rel_l2 << fort::endr;
+
+            std::fprintf(
+                stderr,
+                "[CPUNativeVNNI][MOE_GATEUP] format=%s experts=%d projections=%d N=%d K=%d "
+                "fused_us=%.3f serial_us=%.3f speedup=%.3f rel_l2=%.9e\n",
+                fmt.name.c_str(),
+                active_experts,
+                projection_count,
+                expert_N,
+                K,
+                fused_timing.min_us,
+                serial_timing.min_us,
+                speedup,
+                metrics.relative_l2);
+
+            EXPECT_GT(speedup, min_required_speedup)
+                << label << " did not preserve fused MoE decode economy.";
+            ++executed_cases;
+        }
+
+        EXPECT_GT(executed_cases, 0)
+            << "No CPU NativeVNNI MoE gate/up fused projection cases selected.";
+
+        std::cout << "\n=== MoE Single-Token Gate/Up Fused Projection Perf ===\n"
+                  << "M=1, two projections per active expert, fused batch vs serial per-projection GEMV.\n\n"
+                  << table.to_string() << std::endl;
+    }
+
     TEST_F(CPUNativeVNNIGemvTest, MTP_SmallM_TrainerCsv_AllFormats)
     {
         /**

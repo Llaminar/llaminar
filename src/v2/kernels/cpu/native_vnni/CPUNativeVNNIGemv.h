@@ -3881,23 +3881,72 @@ namespace llaminar2::cpu::native_vnni
 
 #else // !defined(__AVX512F__)
 
+    /*
+     * AVX2-only builds still need the same decode economics as AVX512:
+     * MoE single-token gate/up fusion depends on one quantization pass and one
+     * OpenMP region spanning all active expert projections. Keep the row dot
+     * vectorized here too so Q8_0 raw expert weights do not fall back to scalar.
+     */
     static inline float gemv_dot_row_q8_0_vnni(
         const Q8_0Block *__restrict row,
         const Q8_1Block *__restrict a_q8,
         int bpr)
     {
-        float acc = 0.0f;
-        for (int kb = 0; kb < bpr; ++kb)
+        __m256 acc0 = _mm256_setzero_ps();
+        __m256 acc1 = _mm256_setzero_ps();
+        __m256 acc2 = _mm256_setzero_ps();
+        __m256 acc3 = _mm256_setzero_ps();
+
+        int kb = 0;
+        for (; kb + 3 < bpr; kb += 4)
         {
-            int32_t sumi = 0;
-            for (int i = 0; i < Q8_0Block::BLOCK_SIZE; ++i)
-                sumi += static_cast<int32_t>(row[kb].qs[i]) *
-                        static_cast<int32_t>(a_q8[kb].qs[i]);
-            const float sp = simd::fp16_to_fp32(row[kb].d) *
-                             simd::fp16_to_fp32(a_q8[kb].d);
-            acc += sp * static_cast<float>(sumi);
+            {
+                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb].qs));
+                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb].qs));
+                const __m256i sumi = isa::avx2_dpbusd_epi32(
+                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
+                const float sp = simd::fp16_to_fp32(row[kb].d) * simd::fp16_to_fp32(a_q8[kb].d);
+                acc0 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc0);
+            }
+            {
+                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 1].qs));
+                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 1].qs));
+                const __m256i sumi = isa::avx2_dpbusd_epi32(
+                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
+                const float sp = simd::fp16_to_fp32(row[kb + 1].d) * simd::fp16_to_fp32(a_q8[kb + 1].d);
+                acc1 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc1);
+            }
+            {
+                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 2].qs));
+                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 2].qs));
+                const __m256i sumi = isa::avx2_dpbusd_epi32(
+                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
+                const float sp = simd::fp16_to_fp32(row[kb + 2].d) * simd::fp16_to_fp32(a_q8[kb + 2].d);
+                acc2 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc2);
+            }
+            {
+                const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb + 3].qs));
+                const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb + 3].qs));
+                const __m256i sumi = isa::avx2_dpbusd_epi32(
+                    _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
+                const float sp = simd::fp16_to_fp32(row[kb + 3].d) * simd::fp16_to_fp32(a_q8[kb + 3].d);
+                acc3 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc3);
+            }
         }
-        return acc;
+
+        for (; kb < bpr; ++kb)
+        {
+            const __m256i w = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(row[kb].qs));
+            const __m256i a = _mm256_loadu_si256(reinterpret_cast<const __m256i *>(a_q8[kb].qs));
+            const __m256i sumi = isa::avx2_dpbusd_epi32(
+                _mm256_setzero_si256(), _mm256_abs_epi8(w), _mm256_sign_epi8(a, w));
+            const float sp = simd::fp16_to_fp32(row[kb].d) * simd::fp16_to_fp32(a_q8[kb].d);
+            acc0 = _mm256_fmadd_ps(_mm256_set1_ps(sp), _mm256_cvtepi32_ps(sumi), acc0);
+        }
+
+        const __m256 sum01 = _mm256_add_ps(acc0, acc1);
+        const __m256 sum23 = _mm256_add_ps(acc2, acc3);
+        return isa::hsum_ps_avx2(_mm256_add_ps(sum01, sum23));
     }
 
     inline void q8_0_native_gemv(
@@ -3947,36 +3996,58 @@ namespace llaminar2::cpu::native_vnni
         const FusedGemvDesc *descs,
         int num_descs)
     {
-        for (int p = 0; p < num_descs; ++p)
+        auto do_fused = [&]()
         {
-            const auto &d = descs[p];
-            if (d.q8_0_raw)
+            for (int p = 0; p < num_descs; ++p)
             {
-                auto do_rows = [&]()
+                const auto &d = descs[p];
+
+                if (d.q8_0_raw)
                 {
-#pragma omp for schedule(static)
-                    for (int n = 0; n < d.N; ++n)
+                    const int proj_N = d.N;
+                    const int proj_bpr = d.bpr;
+                    const Q8_0Block *__restrict blocks = d.q8_0_raw;
+
+#pragma omp for schedule(static) nowait
+                    for (int n = 0; n < proj_N; ++n)
                     {
                         const Q8_0Block *__restrict row =
-                            d.q8_0_raw + static_cast<size_t>(n) * d.bpr;
-                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, d.bpr);
+                            blocks + static_cast<size_t>(n) * proj_bpr;
+                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, proj_bpr);
                         if (d.bias)
                             val += d.bias[n];
                         d.output[n] = val;
                     }
-                };
-                OMP_WORKSHARE_REGION(do_rows);
-            }
-            else
-            {
-                gemv_native_vnni_preq(*d.packed, A_q8, d.output);
-                if (d.bias)
+                }
+                else
                 {
-                    for (int n = 0; n < d.N; ++n)
-                        d.output[n] += d.bias[n];
+                    const auto &packed = *d.packed;
+                    const int N = packed.N;
+                    const int N_chunks = (N + 63) / 64;
+                    const int K_blocks = packed.blocks_per_row;
+                    const __m256i decode_lut = packed.is_nibble_lut
+                                                   ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
+                                                   : _mm256_setzero_si256();
+
+#pragma omp for schedule(static) nowait
+                    for (int chunk = 0; chunk < N_chunks; ++chunk)
+                    {
+                        gemv_avx2_block(packed, A_q8, d.output, chunk, 1, K_blocks, N, decode_lut);
+                    }
+
+                    if (d.bias)
+                    {
+#pragma omp barrier
+#pragma omp for schedule(static) nowait
+                        for (int n = 0; n < d.N; ++n)
+                            d.output[n] += d.bias[n];
+                    }
                 }
             }
-        }
+
+#pragma omp barrier
+        };
+        OMP_WORKSHARE_REGION(do_fused);
     }
 
 #endif // __AVX512F__
