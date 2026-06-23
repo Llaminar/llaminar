@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+LocalPP_HETEROGENEOUS_CUDA_ROCm_4B,0,0.976122,0.0709335,1,0.8,198,198,true,true,true,true
+LocalPP_HETEROGENEOUS_CUDA_ROCm_4B,1,0.994601,0.0551211,1,1,760,760,true,true,true,true
+LocalPP_HETEROGENEOUS_CUDA_ROCm_4B,2,0.991364,0.128923,1,0.4,3841,3841,true,true,true,true
+LocalPP_HETEROGENEOUS_CUDA_ROCm_4B,3,0.99404,0.00844479,1,1,13477,13477,true,true,true,true
+LocalPP_HETEROGENEOUS_CUDA_ROCm_4B,4,0.997538,0.00264134,1,0.8,37550,37550,true,true,true,true

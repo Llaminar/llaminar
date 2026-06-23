@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+Qwen35_08B_CPU_KV_FP16,0,0.997181,0.00788311,1,1,198,198,true,true,true,true
+Qwen35_08B_CPU_KV_FP16,1,0.994281,0.0512515,1,0.6,760,760,true,true,true,true
+Qwen35_08B_CPU_KV_FP16,2,0.995715,0.355207,1,0.6,3841,3841,true,true,true,true
+Qwen35_08B_CPU_KV_FP16,3,0.985078,0.00756854,1,1,13477,13477,true,true,true,true
+Qwen35_08B_CPU_KV_FP16,4,0.993796,0.0265191,1,0.8,37550,37550,true,true,true,true

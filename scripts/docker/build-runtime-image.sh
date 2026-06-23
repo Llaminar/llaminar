@@ -26,6 +26,8 @@ Options:
       --build-type TYPE    LLAMINAR_BUILD_TYPE build arg. Default: Release.
       --variant VARIANT    Backend/runtime variant: full, cpu, cuda, rocm.
                            Default: full.
+      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512 or AVX2.
+                           Dockerfile default if unset.
       --cpu-only           Alias for --variant cpu.
       --cuda-only          Alias for --variant cuda.
       --rocm-only          Alias for --variant rocm.
@@ -73,7 +75,7 @@ Environment:
   LLAMINAR_IMAGE_TAGS      Newline- or comma-separated image tags.
   LLAMINAR_IMAGE_LABELS    Newline-separated image labels.
   VERSION, VCS_REF, BUILD_DATE, LLAMINAR_BUILD_TYPE, LLAMINAR_IMAGE_VARIANT,
-  LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
+  LLAMINAR_CPU_ISA, LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
   LLAMINAR_SKIP_INTEGRATION, LLAMINAR_BUILD_RCCL_FROM_SOURCE,
   RCCL_GPU_TARGETS, ROCM_RUNTIME_GPU_TARGETS, RCCL_ENABLE_MSCCL_KERNEL,
   RCCL_ONLY_FUNCS, LLAMINAR_DOCKER_BUILD_NETWORK,
@@ -138,6 +140,7 @@ version="${VERSION:-}"
 vcs_ref="${VCS_REF:-}"
 build_date="${BUILD_DATE:-}"
 build_type="${LLAMINAR_BUILD_TYPE:-Release}"
+cpu_isa="${LLAMINAR_CPU_ISA:-}"
 image_variant="${LLAMINAR_IMAGE_VARIANT:-full}"
 enable_cuda="${LLAMINAR_ENABLE_CUDA:-}"
 enable_rocm="${LLAMINAR_ENABLE_ROCM:-}"
@@ -214,6 +217,11 @@ while (($#)); do
         --variant)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             image_variant="$2"
+            shift 2
+            ;;
+        --cpu-isa)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            cpu_isa="$2"
             shift 2
             ;;
         --cpu-only)
@@ -345,6 +353,13 @@ case "${image_variant}" in
     full|cpu|cuda|rocm) ;;
     *) die "unsupported --variant '${image_variant}' (expected full, cpu, cuda, or rocm)" ;;
 esac
+if [[ -n "${cpu_isa}" ]]; then
+    cpu_isa="${cpu_isa^^}"
+    case "${cpu_isa}" in
+        AVX512|AVX2) ;;
+        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512 or AVX2)" ;;
+    esac
+fi
 
 normalize_bool_arg() {
     case "${1}" in
@@ -433,6 +448,9 @@ cmd=(
     --build-arg "RCCL_ENABLE_MSCCL_KERNEL=${rccl_enable_msccl_kernel}"
 )
 
+if [[ -n "${cpu_isa}" ]]; then
+    cmd+=(--build-arg "LLAMINAR_CPU_ISA=${cpu_isa}")
+fi
 if [[ -n "${cuda_archs}" ]]; then
     cmd+=(--build-arg "LLAMINAR_CUDA_ARCHS=${cuda_archs}")
 fi
@@ -500,4 +518,4 @@ if [[ "${verify}" == "true" ]]; then
         --help >/dev/null
 fi
 
-echo "[build-runtime-image] built ${tags[*]} (variant=${image_variant}, cuda=${enable_cuda}, rocm=${enable_rocm})"
+echo "[build-runtime-image] built ${tags[*]} (variant=${image_variant}, cpu_isa=${cpu_isa:-Dockerfile default}, cuda=${enable_cuda}, rocm=${enable_rocm})"

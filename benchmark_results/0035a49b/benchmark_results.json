@@ -1,0 +1,133 @@
+{
+  "commit": "0035a49b",
+  "timestamp": "2026-05-29T14:03:53Z",
+  "models": [
+    {
+      "name": "Qwen 2.5 7B Instruct Q8_0",
+      "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
+      "devices": [
+        {
+          "device": "cpu",
+          "prefill_tok_s": 329.36,
+          "decode_tok_s": 18.48,
+          "baseline_prefill_tok_s": 337.99,
+          "baseline_decode_tok_s": 19.78
+        },
+        {
+          "device": "cuda:0",
+          "prefill_tok_s": 4844.92,
+          "decode_tok_s": 94.02,
+          "baseline_prefill_tok_s": 4894.57,
+          "baseline_decode_tok_s": 95.16
+        },
+        {
+          "device": "rocm:0",
+          "prefill_tok_s": 1184.88,
+          "decode_tok_s": 77.18,
+          "baseline_prefill_tok_s": 1214.71,
+          "baseline_decode_tok_s": 78.94
+        }
+      ]
+    },
+    {
+      "name": "Qwen 3.5 4B Q8_0",
+      "model": "models/Qwen3.5-4B-Q8_0.gguf",
+      "devices": [
+        {
+          "device": "cpu",
+          "prefill_tok_s": 387.40,
+          "decode_tok_s": 25.47,
+          "baseline_prefill_tok_s": 453.80,
+          "baseline_decode_tok_s": 28.41
+        },
+        {
+          "device": "cuda:0",
+          "prefill_tok_s": 5939.07,
+          "decode_tok_s": 144.80,
+          "baseline_prefill_tok_s": 0,
+          "baseline_decode_tok_s": 0
+        },
+        {
+          "device": "rocm:0",
+          "prefill_tok_s": 1668.54,
+          "decode_tok_s": 101.83,
+          "baseline_prefill_tok_s": 0,
+          "baseline_decode_tok_s": 0
+        }
+      ]
+    },
+    {
+      "name": "Qwen 3.5 35B MoE Q4_K_XL",
+      "model": "models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",
+      "devices": [
+        {
+          "device": "cpu",
+          "prefill_tok_s": 191.22,
+          "decode_tok_s": 25.71,
+          "baseline_prefill_tok_s": 234.49,
+          "baseline_decode_tok_s": 27.92
+        },
+        {
+          "device": "cpu:0",
+          "prefill_tok_s": 132.18,
+          "decode_tok_s": 17.93,
+          "baseline_prefill_tok_s": 158.47,
+          "baseline_decode_tok_s": 19.48
+        },
+        {
+          "device": "rocm:0",
+          "prefill_tok_s": 1304.26,
+          "decode_tok_s": 80.54,
+          "baseline_prefill_tok_s": 1281.57,
+          "baseline_decode_tok_s": 79.38
+        }
+      ]
+    },
+    {
+      "name": "Qwen 3.5 27B Dense Q4_K_M",
+      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+      "devices": [
+        {
+          "device": "cpu",
+          "prefill_tok_s": 76.73,
+          "decode_tok_s": 6.86,
+          "baseline_prefill_tok_s": 0,
+          "baseline_decode_tok_s": 0
+        },
+        {
+          "device": "rocm:0",
+          "prefill_tok_s": 229.27,
+          "decode_tok_s": 28.09,
+          "baseline_prefill_tok_s": 0,
+          "baseline_decode_tok_s": 0
+        }
+      ]
+    },
+    {
+      "name": "Qwen 3.5 27B Dense Q4_K_M TP2 ROCm",
+      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+      "devices": [
+        {
+          "device": "tp",
+          "prefill_tok_s": 351.89,
+          "decode_tok_s": 27.53,
+          "baseline_prefill_tok_s": 0,
+          "baseline_decode_tok_s": 0
+        }
+      ]
+    },
+    {
+      "name": "Qwen 3.5 27B Dense Q4_K_M PP2 CUDA+ROCm",
+      "model": "models/Qwen3.5-27B-Q4_K_M.gguf",
+      "devices": [
+        {
+          "device": "pp",
+          "prefill_tok_s": 274.54,
+          "decode_tok_s": 11.44,
+          "baseline_prefill_tok_s": 0,
+          "baseline_decode_tok_s": 0
+        }
+      ]
+    }
+  ]
+}

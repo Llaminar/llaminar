@@ -874,6 +874,7 @@ namespace llaminar2
                         // Fast path: K is multiple of 32, no partial blocks
                         // Process blocks in pairs for 2-way ILP on AVX-512
                         int k_blk = 0;
+#if defined(__AVX512F__)
                         if (activeISALevel() >= ISALevel::AVX512)
                         {
                             for (; k_blk + 1 < k_blocks; k_blk += 2)
@@ -883,6 +884,7 @@ namespace llaminar2
                                                                  row_blocks[k_blk + 1]);
                             }
                         }
+#endif
                         // Handle remaining odd block (if any)
                         for (; k_blk < k_blocks; ++k_blk)
                         {

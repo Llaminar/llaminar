@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+ROCm_Q8_0_KV_FP16,0,0.99769,0.0120328,1,1,323,323,true,true,true,true
+ROCm_Q8_0_KV_FP16,1,0.997857,0.0111893,1,1,279,279,true,true,true,true
+ROCm_Q8_0_KV_FP16,2,0.996934,0.0181659,1,0.8,5562,5562,true,true,true,true
+ROCm_Q8_0_KV_FP16,3,0.995425,0.0187583,1,1,374,374,true,true,true,true
+ROCm_Q8_0_KV_FP16,4,0.998315,0.0142767,1,1,264,264,true,true,true,true

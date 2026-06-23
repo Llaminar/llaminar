@@ -670,6 +670,69 @@ namespace
         EXPECT_FALSE(failed.load(std::memory_order_acquire));
     }
 
+    TEST_F(CPUNativeVNNIGemvTest, Q4_K_FusedExpertDownMatchesSerialDecodeChunks)
+    {
+        constexpr int experts = 3;
+        const int N = 512;
+        const int K = 512;
+
+        std::array<std::unique_ptr<TensorBase>, experts> weights;
+        std::array<std::unique_ptr<CPUNativeVNNIGemmKernel>, experts> kernels;
+        std::array<std::unique_ptr<FP32Tensor>, experts> inputs;
+        std::array<std::vector<float>, experts> fused_outputs;
+        std::array<std::vector<float>, experts> serial_outputs;
+        std::array<ITensorGemm::FusedExpertDownDesc, experts> descs;
+
+        for (int expert = 0; expert < experts; ++expert)
+        {
+            weights[expert] = TestTensorFactory::createQ4_KRandom(
+                {static_cast<size_t>(N), static_cast<size_t>(K)});
+            ASSERT_NE(weights[expert], nullptr);
+
+            kernels[expert] = std::make_unique<CPUNativeVNNIGemmKernel>(weights[expert].get());
+            ASSERT_TRUE(kernels[expert]->isValid());
+
+            inputs[expert] = TestTensorFactory::createFP32Random(
+                {1, static_cast<size_t>(K)}, -0.75f, 0.75f,
+                static_cast<uint32_t>(3300 + expert));
+            ASSERT_NE(inputs[expert], nullptr);
+
+            fused_outputs[expert].assign(N, 0.0f);
+            serial_outputs[expert].assign(N, 0.0f);
+            ASSERT_TRUE(multiplyViaTensor(
+                *kernels[expert],
+                inputs[expert]->data(),
+                serial_outputs[expert].data(),
+                1,
+                N,
+                K));
+
+            descs[expert] = {
+                kernels[expert].get(),
+                inputs[expert]->data(),
+                fused_outputs[expert].data(),
+                N};
+        }
+
+        ASSERT_TRUE(kernels[0]->multiply_fused_expert_down(descs.data(), experts, 1, K));
+
+        for (int expert = 0; expert < experts; ++expert)
+        {
+            const float cos = cosineSimilarity(
+                fused_outputs[expert].data(),
+                serial_outputs[expert].data(),
+                static_cast<size_t>(N));
+            const float max_err = maxAbsError(
+                fused_outputs[expert].data(),
+                serial_outputs[expert].data(),
+                static_cast<size_t>(N));
+            EXPECT_GE(cos, 0.999999f)
+                << "expert " << expert << " fused expert-down differs from serial decode";
+            EXPECT_LE(max_err, 1e-5f)
+                << "expert " << expert << " fused expert-down max error differs from serial decode";
+        }
+    }
+
     // =========================================================================
     // All-format support: factory dispatch + threshold table
     // =========================================================================

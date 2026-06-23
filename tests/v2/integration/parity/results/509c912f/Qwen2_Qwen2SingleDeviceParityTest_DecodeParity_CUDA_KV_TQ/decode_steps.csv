@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+CUDA_KV_TQ,0,0.994476,0.0143606,1,1,323,323,true,true,true,true
+CUDA_KV_TQ,1,0.996894,0.00904795,1,1,279,279,true,true,true,true
+CUDA_KV_TQ,2,0.996262,0.0587939,0,0.8,5562,3974,false,true,true,true
+CUDA_KV_TQ,3,0.99595,0.00331176,1,0.8,13876,13876,true,true,true,true
+CUDA_KV_TQ,4,0.985843,0.00834141,1,0.8,38835,38835,true,true,true,true

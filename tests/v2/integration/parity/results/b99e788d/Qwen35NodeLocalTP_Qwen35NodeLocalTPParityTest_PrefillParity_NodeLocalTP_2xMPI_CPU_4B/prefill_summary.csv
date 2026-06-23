@@ -1,0 +1,2 @@
+backend,lm_head_cosine,lm_head_kl,lm_head_top1,lm_head_top5,lm_head_pytorch_top1_in_topk,early_layers_passed,total_layers_passed,overall_passed
+NodeLocalTP_2xMPI_CPU_4B,0.913959,0.176952,1,0.6,true,7,24,false

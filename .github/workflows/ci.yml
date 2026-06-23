@@ -155,7 +155,7 @@ jobs:
         run: bash scripts/ci/prune_docker_build_cache.sh
 
   runtime-containers:
-    name: Runtime ${{ matrix.variant }} image
+    name: Runtime ${{ matrix.variant }} ${{ matrix.cpu_isa }} image
     needs: build
     runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 180
@@ -168,16 +168,44 @@ jobs:
         include:
           - variant: cpu
             e2e_variant: cpu
+            port: 21100
+            cpu_isa: AVX2
+            tag_suffix: -avx2
+          - variant: cuda
+            e2e_variant: cuda
+            port: 21200
+            cpu_isa: AVX2
+            tag_suffix: -avx2
+          - variant: rocm
+            e2e_variant: rocm
+            port: 21300
+            cpu_isa: AVX2
+            tag_suffix: -avx2
+          - variant: full
+            e2e_variant: hybrid
+            port: 21400
+            cpu_isa: AVX2
+            tag_suffix: -avx2
+          - variant: cpu
+            e2e_variant: cpu
             port: 20100
+            cpu_isa: AVX512
+            tag_suffix: ""
           - variant: cuda
             e2e_variant: cuda
             port: 20200
+            cpu_isa: AVX512
+            tag_suffix: ""
           - variant: rocm
             e2e_variant: rocm
             port: 20300
+            cpu_isa: AVX512
+            tag_suffix: ""
           - variant: full
             e2e_variant: hybrid
             port: 20400
+            cpu_isa: AVX512
+            tag_suffix: ""
     # Serialize release-container E2E segments across workflow runs so the
     # self-hosted GPU runner never oversubscribes NVIDIA/AMD VRAM.
     concurrency:
@@ -225,6 +253,7 @@ jobs:
             --image "$image" \
             --branch "${GITHUB_REF_NAME}" \
             --sha "${GITHUB_SHA}" \
+            --tag-suffix "${{ matrix.tag_suffix }}" \
             --format refs)
           ((${#refs[@]} > 0))
           {
@@ -234,7 +263,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
           {
-            echo "## Runtime ${{ matrix.variant }} image tags"
+            echo "## Runtime ${{ matrix.variant }} ${{ matrix.cpu_isa }} image tags"
             echo ""
             for ref in "${refs[@]}"; do
               echo "- \`${ref}\`"
@@ -251,8 +280,9 @@ jobs:
             --image "$image" \
             --branch "${GITHUB_REF_NAME}" \
             --sha "${GITHUB_SHA}" \
+            --tag-suffix "${{ matrix.tag_suffix }}" \
             --format refs)
-          build_args=(scripts/docker/build-runtime-image.sh --variant "${{ matrix.variant }}" --load --no-verify)
+          build_args=(scripts/docker/build-runtime-image.sh --variant "${{ matrix.variant }}" --cpu-isa "${{ matrix.cpu_isa }}" --load --no-verify)
           for ref in "${refs[@]}"; do
             build_args+=(--tag "$ref")
           done
@@ -269,7 +299,7 @@ jobs:
             --variant "${{ matrix.e2e_variant }}" \
             --image "${{ steps.runtime-tags.outputs.primary_ref }}" \
             --port "${{ matrix.port }}" \
-            --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-container"
+            --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-container"
 
       - name: Push tested SHA image
         if: github.event_name != 'pull_request'
@@ -279,9 +309,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: runtime-e2e-logs-${{ matrix.e2e_variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: runtime-e2e-logs-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            /tmp/llaminar-e2e-${{ matrix.e2e_variant }}-container/
+            /tmp/llaminar-e2e-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-container/
           if-no-files-found: ignore
           retention-days: 14
 
@@ -289,7 +319,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: cores-runtime-containers-${{ matrix.e2e_variant }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: cores-runtime-containers-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ github.workspace }}/cores/
           if-no-files-found: ignore
           retention-days: 7
@@ -304,6 +334,7 @@ jobs:
             --image "$image" \
             --branch "${GITHUB_REF_NAME}" \
             --sha "${GITHUB_SHA}" \
+            --tag-suffix "${{ matrix.tag_suffix }}" \
             --format refs)
           for ref in "${refs[@]}"; do
             [[ -n "$ref" ]] && docker image rm "$ref" >/dev/null 2>&1 || true
@@ -335,21 +366,25 @@ jobs:
           set -euo pipefail
           image="${REGISTRY}/${IMAGE_NAME}"
           variants=(cpu cuda rocm full)
-          for variant in "${variants[@]}"; do
-            mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-              --variant "$variant" \
-              --image "$image" \
-              --branch "${GITHUB_REF_NAME}" \
-              --sha "${GITHUB_SHA}" \
-              --format refs)
-            ((${#refs[@]} > 0))
-            primary="${refs[0]}"
-            docker pull "$primary"
-            for ref in "${refs[@]:1}"; do
-              docker tag "$primary" "$ref"
-              docker push "$ref"
+          tag_suffixes=("" "-avx2")
+          for tag_suffix in "${tag_suffixes[@]}"; do
+            for variant in "${variants[@]}"; do
+              mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+                --variant "$variant" \
+                --image "$image" \
+                --branch "${GITHUB_REF_NAME}" \
+                --sha "${GITHUB_SHA}" \
+                --tag-suffix "$tag_suffix" \
+                --format refs)
+              ((${#refs[@]} > 0))
+              primary="${refs[0]}"
+              docker pull "$primary"
+              for ref in "${refs[@]:1}"; do
+                docker tag "$primary" "$ref"
+                docker push "$ref"
+              done
+              docker image rm "${refs[@]}" >/dev/null 2>&1 || true
             done
-            docker image rm "${refs[@]}" >/dev/null 2>&1 || true
           done
 
       - name: Bound Docker build cache
@@ -373,15 +408,19 @@ jobs:
           set -euo pipefail
           image="${REGISTRY}/${IMAGE_NAME}"
           variants=(cpu cuda rocm full)
+          tag_suffixes=("" "-avx2")
           all_refs=()
-          for variant in "${variants[@]}"; do
-            mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
-              --variant "$variant" \
-              --image "$image" \
-              --branch "${GITHUB_REF_NAME}" \
-              --sha "${GITHUB_SHA}" \
-              --format refs)
-            all_refs+=("${refs[@]}")
+          for tag_suffix in "${tag_suffixes[@]}"; do
+            for variant in "${variants[@]}"; do
+              mapfile -t refs < <(scripts/ci/runtime_image_tags.sh \
+                --variant "$variant" \
+                --image "$image" \
+                --branch "${GITHUB_REF_NAME}" \
+                --sha "${GITHUB_SHA}" \
+                --tag-suffix "$tag_suffix" \
+                --format refs)
+              all_refs+=("${refs[@]}")
+            done
           done
           {
             echo "image_refs<<EOF"

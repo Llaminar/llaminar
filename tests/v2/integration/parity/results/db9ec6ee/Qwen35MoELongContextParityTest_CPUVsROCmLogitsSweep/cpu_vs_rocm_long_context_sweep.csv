@@ -1,0 +1,7 @@
+length,phase,decode_step,driver_token,logits_cosine,logits_kl,cpu_top1,rocm_top1,top5_overlap,cpu_top1_in_rocm_top5,worst_selected_stage,passed
+1,prefill,-1,-1,0.999699712,0.0022696401,30350,30350,0.800000012,1,LM_HEAD/logits,1
+1,decode,0,30350,0.999719679,0.000745512953,148461,148461,1,1,worst=LM_HEAD mode=full cosine=0.99972 rel_l2=0.0241006,1
+1,decode,1,148461,0.999400258,0.00292743254,66459,66459,1,1,worst=LM_HEAD mode=full cosine=0.9994 rel_l2=0.0361874,1
+2,prefill,-1,-1,0.999854863,0.000856950646,271,271,1,1,LM_HEAD/logits,1
+2,decode,0,271,0.999670506,0.0020868883,760,760,1,1,worst=LM_HEAD mode=full cosine=0.999671 rel_l2=0.0268768,1
+2,decode,1,760,0.999807715,0.00233011064,271,271,1,1,worst=LM_HEAD mode=full cosine=0.999808 rel_l2=0.0196111,1

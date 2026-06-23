@@ -1,0 +1,46 @@
+{
+  "commit": "c51d5583",
+  "timestamp": "2026-04-22T10:29:04Z",
+  "models": [
+    {
+      "name": "Qwen 2.5 7B Instruct Q8_0",
+      "model": "models/Qwen2.5-7B-Instruct-Q8_0.gguf",
+      "devices": [
+        {
+          "device": "cpu",
+          "prefill_tok_s": 325.29,
+          "decode_tok_s": 19.40,
+          "baseline_prefill_tok_s": 337.99,
+          "baseline_decode_tok_s": 19.63
+        },
+        {
+          "device": "cuda:0",
+          "prefill_tok_s": 4831.53,
+          "decode_tok_s": 94.69,
+          "baseline_prefill_tok_s": 4879.29,
+          "baseline_decode_tok_s": 95.16
+        },
+        {
+          "device": "rocm:0",
+          "prefill_tok_s": 1204.24,
+          "decode_tok_s": 78.72,
+          "baseline_prefill_tok_s": 1214.71,
+          "baseline_decode_tok_s": 78.41
+        }
+      ]
+    },
+    {
+      "name": "Qwen 3.5 4B Q8_0",
+      "model": "models/Qwen3.5-4B-Q8_0.gguf",
+      "devices": [
+        {
+          "device": "cpu",
+          "prefill_tok_s": 436.83,
+          "decode_tok_s": 25.73,
+          "baseline_prefill_tok_s": 440.03,
+          "baseline_decode_tok_s": 27.70
+        }
+      ]
+    }
+  ]
+}
