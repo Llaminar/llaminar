@@ -122,12 +122,12 @@ namespace
         const size_t size_C = static_cast<size_t>(M) * N * sizeof(float);
 
         float *d_A = nullptr, *d_W = nullptr, *d_C = nullptr;
-        hipMalloc(&d_A, size_A);
-        hipMalloc(&d_W, size_W);
-        hipMalloc(&d_C, size_C);
+        (void)hipMalloc(&d_A, size_A);
+        (void)hipMalloc(&d_W, size_W);
+        (void)hipMalloc(&d_C, size_C);
 
-        hipMemcpy(d_A, A_host, size_A, hipMemcpyHostToDevice);
-        hipMemcpy(d_W, W_host, size_W, hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_A, A_host, size_A, hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_W, W_host, size_W, hipMemcpyHostToDevice);
 
         const float alpha = 1.0f, beta = 0.0f;
         hipblasStatus_t status = hipblasSgemm(
@@ -142,8 +142,8 @@ namespace
             d_C, N          // ldc = N (C' is [N,M] col-major)
         );
 
-        hipDeviceSynchronize();
-        hipMemcpy(C_host, d_C, size_C, hipMemcpyDeviceToHost);
+        (void)hipDeviceSynchronize();
+        (void)hipMemcpy(C_host, d_C, size_C, hipMemcpyDeviceToHost);
 
         (void)hipFree(d_A);
         (void)hipFree(d_W);

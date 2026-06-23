@@ -126,7 +126,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkDeviceMemory()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_bytes = config_.memory_test_bytes;
         size_t num_elements = num_bytes / sizeof(float);
@@ -181,7 +181,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkH2DPinned()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_bytes = config_.memory_test_bytes;
 
@@ -226,7 +226,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkH2DPageable()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_bytes = config_.memory_test_bytes;
 
@@ -267,7 +267,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkD2HPinned()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_bytes = config_.memory_test_bytes;
 
@@ -312,7 +312,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkD2HPageable()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_bytes = config_.memory_test_bytes;
 
@@ -355,7 +355,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkComputeFP32()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_elements = 1024 * 1024; // 4MB
         float *d_buffer = nullptr;
@@ -404,7 +404,7 @@ namespace llaminar2
 
     double ROCmBenchmark::benchmarkComputeFP16()
     {
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         size_t num_elements = 1024 * 1024; // 2MB of half
         __half *d_buffer = nullptr;
@@ -471,7 +471,7 @@ namespace llaminar2
         }
 
         // Enable P2P
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
         err = hipDeviceEnablePeerAccess(peer_ordinal, 0);
         if (err != hipSuccess && err != hipErrorPeerAccessAlreadyEnabled)
         {
@@ -484,14 +484,14 @@ namespace llaminar2
         void *d_src = nullptr;
         void *d_dst = nullptr;
 
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
         HIP_CHECK(hipMalloc(&d_src, num_bytes));
         HIP_CHECK(hipMemset(d_src, 1, num_bytes));
 
-        hipSetDevice(peer_ordinal);
+        (void)hipSetDevice(peer_ordinal);
         HIP_CHECK(hipMalloc(&d_dst, num_bytes));
 
-        hipSetDevice(device_ordinal_);
+        (void)hipSetDevice(device_ordinal_);
 
         hipEvent_t start, stop;
         HIP_CHECK(hipEventCreate(&start));
@@ -520,10 +520,10 @@ namespace llaminar2
         HIP_CHECK(hipEventDestroy(start));
         HIP_CHECK(hipEventDestroy(stop));
 
-        hipSetDevice(peer_ordinal);
-        hipFree(d_dst);
-        hipSetDevice(device_ordinal_);
-        hipFree(d_src);
+        (void)hipSetDevice(peer_ordinal);
+        (void)hipFree(d_dst);
+        (void)hipSetDevice(device_ordinal_);
+        (void)hipFree(d_src);
 
         return gbps;
     }
@@ -542,7 +542,7 @@ namespace llaminar2
         }
 
         hipDeviceProp_t props;
-        hipGetDeviceProperties(&props, device_ordinal_);
+        (void)hipGetDeviceProperties(&props, device_ordinal_);
         LOG_DEBUG("Starting ROCm benchmark for GPU " << device_ordinal_ << ": " << props.name);
 
         double start_time = getTimeMs();
@@ -571,7 +571,7 @@ namespace llaminar2
 
         // P2P transfers to all other GPUs
         int num_gpus = 0;
-        hipGetDeviceCount(&num_gpus);
+        (void)hipGetDeviceCount(&num_gpus);
         for (int peer = 0; peer < num_gpus; ++peer)
         {
             if (peer != device_ordinal_)
@@ -622,7 +622,7 @@ namespace llaminar2
 
     double ROCmBenchmark::copyHostToDevice(int device_ordinal, const void *h_src, size_t num_bytes)
     {
-        hipSetDevice(device_ordinal);
+        (void)hipSetDevice(device_ordinal);
 
         void *d_dst = nullptr;
         hipError_t err = hipMalloc(&d_dst, num_bytes);
@@ -633,25 +633,25 @@ namespace llaminar2
         }
 
         // Warm up
-        hipMemcpy(d_dst, h_src, num_bytes, hipMemcpyHostToDevice);
-        hipDeviceSynchronize();
+        (void)hipMemcpy(d_dst, h_src, num_bytes, hipMemcpyHostToDevice);
+        (void)hipDeviceSynchronize();
 
         // Timed copy
         hipEvent_t start, stop;
-        hipEventCreate(&start);
-        hipEventCreate(&stop);
+        (void)hipEventCreate(&start);
+        (void)hipEventCreate(&stop);
 
-        hipEventRecord(start);
-        hipMemcpy(d_dst, h_src, num_bytes, hipMemcpyHostToDevice);
-        hipEventRecord(stop);
-        hipEventSynchronize(stop);
+        (void)hipEventRecord(start);
+        (void)hipMemcpy(d_dst, h_src, num_bytes, hipMemcpyHostToDevice);
+        (void)hipEventRecord(stop);
+        (void)hipEventSynchronize(stop);
 
         float ms = 0;
-        hipEventElapsedTime(&ms, start, stop);
+        (void)hipEventElapsedTime(&ms, start, stop);
 
-        hipEventDestroy(start);
-        hipEventDestroy(stop);
-        hipFree(d_dst);
+        (void)hipEventDestroy(start);
+        (void)hipEventDestroy(stop);
+        (void)hipFree(d_dst);
 
         double seconds = ms / 1000.0;
         return (num_bytes / (1024.0 * 1024.0 * 1024.0)) / seconds;
@@ -659,7 +659,7 @@ namespace llaminar2
 
     double ROCmBenchmark::copyDeviceToHost(int device_ordinal, void *h_dst, size_t num_bytes)
     {
-        hipSetDevice(device_ordinal);
+        (void)hipSetDevice(device_ordinal);
 
         void *d_src = nullptr;
         hipError_t err = hipMalloc(&d_src, num_bytes);
@@ -670,29 +670,29 @@ namespace llaminar2
         }
 
         // Initialize device memory with pattern
-        hipMemset(d_src, 0xAB, num_bytes);
-        hipDeviceSynchronize();
+        (void)hipMemset(d_src, 0xAB, num_bytes);
+        (void)hipDeviceSynchronize();
 
         // Warm up
-        hipMemcpy(h_dst, d_src, num_bytes, hipMemcpyDeviceToHost);
-        hipDeviceSynchronize();
+        (void)hipMemcpy(h_dst, d_src, num_bytes, hipMemcpyDeviceToHost);
+        (void)hipDeviceSynchronize();
 
         // Timed copy
         hipEvent_t start, stop;
-        hipEventCreate(&start);
-        hipEventCreate(&stop);
+        (void)hipEventCreate(&start);
+        (void)hipEventCreate(&stop);
 
-        hipEventRecord(start);
-        hipMemcpy(h_dst, d_src, num_bytes, hipMemcpyDeviceToHost);
-        hipEventRecord(stop);
-        hipEventSynchronize(stop);
+        (void)hipEventRecord(start);
+        (void)hipMemcpy(h_dst, d_src, num_bytes, hipMemcpyDeviceToHost);
+        (void)hipEventRecord(stop);
+        (void)hipEventSynchronize(stop);
 
         float ms = 0;
-        hipEventElapsedTime(&ms, start, stop);
+        (void)hipEventElapsedTime(&ms, start, stop);
 
-        hipEventDestroy(start);
-        hipEventDestroy(stop);
-        hipFree(d_src);
+        (void)hipEventDestroy(start);
+        (void)hipEventDestroy(stop);
+        (void)hipFree(d_src);
 
         double seconds = ms / 1000.0;
         return (num_bytes / (1024.0 * 1024.0 * 1024.0)) / seconds;

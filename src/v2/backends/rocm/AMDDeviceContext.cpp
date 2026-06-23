@@ -670,7 +670,7 @@ namespace llaminar2
         if (err != hipSuccess)
         {
             LOG_ERROR("[AMDDeviceContext] hipEventRecord failed: " << hipGetErrorString(err));
-            hipEventDestroy(event);
+            (void)hipEventDestroy(event);
             return;
         }
 
@@ -680,7 +680,7 @@ namespace llaminar2
             LOG_ERROR("[AMDDeviceContext] hipStreamWaitEvent failed: " << hipGetErrorString(err));
         }
 
-        hipEventDestroy(event);
+        (void)hipEventDestroy(event);
     }
 
     std::unique_ptr<IGPUGraphCapture> AMDDeviceContext::createGraphCapture()

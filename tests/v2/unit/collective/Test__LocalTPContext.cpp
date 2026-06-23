@@ -970,7 +970,7 @@ TEST_F(Test__LocalTPContext, AllreduceOutOfPlaceNullOutputFails)
     auto ctx = createLocalTPContext({cpu0_}, {}, CollectiveBackendType::HOST);
 
     auto input = TestTensorFactory::createFP32({2, 4});
-    EXPECT_FALSE(ctx->allreduce(input.get(), nullptr));
+    EXPECT_FALSE(ctx->allreduce(input.get(), static_cast<TensorBase *>(nullptr)));
 }
 
 /**

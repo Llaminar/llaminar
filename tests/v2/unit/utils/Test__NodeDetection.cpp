@@ -5,8 +5,11 @@
 
 #include <gtest/gtest.h>
 #include "utils/NodeDetection.h"
+#include <array>
 #include <fstream>
 #include <cstdio>
+#include <stdexcept>
+#include <unistd.h>
 
 using namespace llaminar2;
 
@@ -135,7 +138,15 @@ namespace
     public:
         explicit TempHostfile(const std::string &content)
         {
-            path_ = std::tmpnam(nullptr);
+            std::array<char, 64> path_template{};
+            std::snprintf(path_template.data(), path_template.size(), "/tmp/llaminar-hostfile-XXXXXX");
+
+            int fd = ::mkstemp(path_template.data());
+            if (fd == -1)
+                throw std::runtime_error("mkstemp failed for TempHostfile");
+            ::close(fd);
+
+            path_ = path_template.data();
             std::ofstream ofs(path_);
             ofs << content;
         }

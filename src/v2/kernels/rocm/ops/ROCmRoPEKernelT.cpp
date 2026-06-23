@@ -282,7 +282,7 @@ namespace llaminar2
         {
             if (h_device_params_)
             {
-                hipHostFree(h_device_params_);
+                (void)hipHostFree(h_device_params_);
                 h_device_params_ = nullptr;
             }
         }
@@ -291,7 +291,7 @@ namespace llaminar2
         {
             if (!h_device_params_)
             {
-                hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+                (void)hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
             }
             if (h_device_params_)
             {
@@ -661,7 +661,7 @@ namespace llaminar2
         {
             if (h_device_params_)
             {
-                hipHostFree(h_device_params_);
+                (void)hipHostFree(h_device_params_);
                 h_device_params_ = nullptr;
             }
         }
@@ -670,7 +670,7 @@ namespace llaminar2
         {
             if (!h_device_params_)
             {
-                hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+                (void)hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
             }
             if (h_device_params_)
             {
@@ -1028,7 +1028,7 @@ namespace llaminar2
         {
             if (h_device_params_)
             {
-                hipHostFree(h_device_params_);
+                (void)hipHostFree(h_device_params_);
                 h_device_params_ = nullptr;
             }
         }
@@ -1037,7 +1037,7 @@ namespace llaminar2
         {
             if (!h_device_params_)
             {
-                hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
+                (void)hipHostMalloc(&h_device_params_, sizeof(rope::RoPEDeviceParams), hipHostMallocDefault);
             }
             if (h_device_params_)
             {

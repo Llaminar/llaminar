@@ -3098,6 +3098,8 @@ namespace llaminar2
     StageBufferContract MoEExpertComputeStage::bufferContract() const
     {
         auto contract = StageBufferContract::build();
+        contract.inputs.reserve(3);
+        contract.outputs.reserve(1);
 
         contract.addInput(params_.input_buffer_id);
         contract.addInput(params_.routing_indices_buffer_id);

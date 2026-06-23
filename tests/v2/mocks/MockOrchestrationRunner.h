@@ -64,6 +64,7 @@ namespace llaminar2::test
 
         // Lifecycle
         MOCK_METHOD(bool, initialize, (), (override));
+        MOCK_METHOD(bool, initializeForDryRun, (), (override));
         MOCK_METHOD(void, shutdown, (), (override));
 
         // Inference

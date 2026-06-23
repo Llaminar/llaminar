@@ -64,7 +64,7 @@ protected:
             for (int i = 0; i < rocm_device_count_; ++i)
             {
                 hipDeviceProp_t prop;
-                hipGetDeviceProperties(&prop, i);
+                (void)hipGetDeviceProperties(&prop, i);
                 std::cout << "  ROCm GPU " << i << ": " << prop.name << std::endl;
             }
         }
@@ -75,8 +75,8 @@ protected:
         // Synchronize all devices
         for (int i = 0; i < rocm_device_count_; ++i)
         {
-            hipSetDevice(i);
-            hipDeviceSynchronize();
+            (void)hipSetDevice(i);
+            (void)hipDeviceSynchronize();
         }
     }
 
@@ -85,7 +85,7 @@ protected:
      */
     void *allocateDeviceBuffer(int device_id, size_t bytes)
     {
-        hipSetDevice(device_id);
+        (void)hipSetDevice(device_id);
         void *ptr = nullptr;
         hipError_t err = hipMalloc(&ptr, bytes);
         if (err != hipSuccess)
@@ -100,8 +100,8 @@ protected:
      */
     void freeDeviceBuffer(int device_id, void *ptr)
     {
-        hipSetDevice(device_id);
-        hipFree(ptr);
+        (void)hipSetDevice(device_id);
+        (void)hipFree(ptr);
     }
 
     /**
@@ -109,9 +109,9 @@ protected:
      */
     void copyHostToDevice(int device_id, void *dst, const void *src, size_t bytes)
     {
-        hipSetDevice(device_id);
-        hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
-        hipDeviceSynchronize();
+        (void)hipSetDevice(device_id);
+        (void)hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
+        (void)hipDeviceSynchronize();
     }
 
     /**
@@ -119,9 +119,9 @@ protected:
      */
     void copyDeviceToHost(int device_id, void *dst, const void *src, size_t bytes)
     {
-        hipSetDevice(device_id);
-        hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
-        hipDeviceSynchronize();
+        (void)hipSetDevice(device_id);
+        (void)hipMemcpy(dst, src, bytes, hipMemcpyDeviceToHost);
+        (void)hipDeviceSynchronize();
     }
 
     /**
@@ -341,10 +341,10 @@ TEST_F(Test__RCCLCoordinator, AllgatherMultiGPU)
     fillDeviceBuffer(1, d_send_1, SEND_COUNT, 2.0f);
 
     // Zero recv buffers
-    hipSetDevice(0);
-    hipMemset(d_recv_0, 0, RECV_COUNT * sizeof(float));
-    hipSetDevice(1);
-    hipMemset(d_recv_1, 0, RECV_COUNT * sizeof(float));
+    (void)hipSetDevice(0);
+    (void)hipMemset(d_recv_0, 0, RECV_COUNT * sizeof(float));
+    (void)hipSetDevice(1);
+    (void)hipMemset(d_recv_1, 0, RECV_COUNT * sizeof(float));
 
     // Allgather
     std::vector<const void *> send_buffers = {d_send_0, d_send_1};
@@ -401,8 +401,8 @@ TEST_F(Test__RCCLCoordinator, BroadcastMultiGPU)
 
     // Fill root (GPU 0) with 42.0, GPU 1 with zeros
     fillDeviceBuffer(0, d_buffer_0, COUNT, 42.0f);
-    hipSetDevice(1);
-    hipMemset(d_buffer_1, 0, COUNT * sizeof(float));
+    (void)hipSetDevice(1);
+    (void)hipMemset(d_buffer_1, 0, COUNT * sizeof(float));
 
     // Broadcast from root=0
     std::vector<void *> buffers = {d_buffer_0, d_buffer_1};

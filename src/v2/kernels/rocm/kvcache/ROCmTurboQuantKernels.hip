@@ -41,15 +41,15 @@ namespace llaminar2
         if (s_hip_codebooks_uploaded.load(std::memory_order_acquire))
             return;
 
-        hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ8_CENTROIDS_HIP), TQ8_CENTROIDS.data(),
+        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ8_CENTROIDS_HIP), TQ8_CENTROIDS.data(),
                                256 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ8_THRESHOLDS_HIP), TQ8_THRESHOLDS.data(),
+        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ8_THRESHOLDS_HIP), TQ8_THRESHOLDS.data(),
                                255 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ4_CENTROIDS_HIP), TQ4_CENTROIDS.data(),
+        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ4_CENTROIDS_HIP), TQ4_CENTROIDS.data(),
                                16 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ4_THRESHOLDS_HIP), TQ4_THRESHOLDS.data(),
+        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_TQ4_THRESHOLDS_HIP), TQ4_THRESHOLDS.data(),
                                15 * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        hipStreamSynchronize(stream);
+        (void)hipStreamSynchronize(stream);
 
         if (hipGetLastError() == hipSuccess)
             s_hip_codebooks_uploaded.store(true, std::memory_order_release);
@@ -65,9 +65,9 @@ namespace llaminar2
         for (int i = 0; i < half_dim; ++i)
             freqs[i] = 1.0f / powf(rope_theta, static_cast<float>(2 * i) / static_cast<float>(head_dim));
 
-        hipMemcpyToSymbolAsync(HIP_SYMBOL(d_HIP_ROPE_FREQS), freqs.data(),
+        (void)hipMemcpyToSymbolAsync(HIP_SYMBOL(d_HIP_ROPE_FREQS), freqs.data(),
                                half_dim * sizeof(float), 0, hipMemcpyHostToDevice, stream);
-        hipStreamSynchronize(stream);
+        (void)hipStreamSynchronize(stream);
 
         if (hipGetLastError() == hipSuccess)
             s_hip_rope_freqs_head_dim.store(head_dim, std::memory_order_release);
@@ -82,7 +82,7 @@ namespace llaminar2
         uint64_t rotation_seed, int device_id,
         hipStream_t stream)
     {
-        hipSetDevice(device_id);
+        (void)hipSetDevice(device_id);
 
         ROCmTurboQuantRotations result;
         result.n_layers = n_layers;
@@ -93,8 +93,8 @@ namespace llaminar2
         const size_t total_mats = static_cast<size_t>(n_layers) * n_kv_heads;
         const size_t total_floats = total_mats * mat_size;
 
-        hipMalloc(&result.d_rotations, total_floats * sizeof(float));
-        hipMalloc(&result.d_rotations_t, total_floats * sizeof(float));
+        (void)hipMalloc(&result.d_rotations, total_floats * sizeof(float));
+        (void)hipMalloc(&result.d_rotations_t, total_floats * sizeof(float));
 
         TurboQuantContext base_ctx(head_dim, rotation_seed == 0 ? 31ULL : rotation_seed);
 
@@ -119,9 +119,9 @@ namespace llaminar2
             }
         }
 
-        hipMemcpyAsync(result.d_rotations, host_rot.data(),
+        (void)hipMemcpyAsync(result.d_rotations, host_rot.data(),
                        total_floats * sizeof(float), hipMemcpyHostToDevice, stream);
-        hipMemcpyAsync(result.d_rotations_t, host_rot_t.data(),
+        (void)hipMemcpyAsync(result.d_rotations_t, host_rot_t.data(),
                        total_floats * sizeof(float), hipMemcpyHostToDevice, stream);
 
         return result;
@@ -131,12 +131,12 @@ namespace llaminar2
     {
         if (rotations.d_rotations)
         {
-            hipFree(rotations.d_rotations);
+            (void)hipFree(rotations.d_rotations);
             rotations.d_rotations = nullptr;
         }
         if (rotations.d_rotations_t)
         {
-            hipFree(rotations.d_rotations_t);
+            (void)hipFree(rotations.d_rotations_t);
             rotations.d_rotations_t = nullptr;
         }
     }
@@ -1126,8 +1126,8 @@ namespace llaminar2
 
         void *d_k_temp = nullptr;
         void *d_v_temp = nullptr;
-        hipMalloc(&d_k_temp, k_temp_bytes);
-        hipMalloc(&d_v_temp, v_temp_bytes);
+        (void)hipMalloc(&d_k_temp, k_temp_bytes);
+        (void)hipMalloc(&d_v_temp, v_temp_bytes);
 
         bool ok = hip_tq8_quantize(d_K_new, d_K_rotations, d_k_temp,
                                     num_tokens, n_kv_heads, head_dim, stream);
@@ -1142,20 +1142,20 @@ namespace llaminar2
                 int dst_pos = (head + t) % max_seq_len;
                 size_t k_dst_offset = static_cast<size_t>(dst_pos) * n_kv_heads * k_block_size;
                 size_t k_src_offset = static_cast<size_t>(t) * n_kv_heads * k_block_size;
-                hipMemcpyAsync(static_cast<uint8_t *>(d_K_cache) + k_dst_offset,
+                (void)hipMemcpyAsync(static_cast<uint8_t *>(d_K_cache) + k_dst_offset,
                                static_cast<uint8_t *>(d_k_temp) + k_src_offset,
                                n_kv_heads * k_block_size, hipMemcpyDeviceToDevice, stream);
 
                 size_t v_dst_offset = static_cast<size_t>(dst_pos) * n_kv_heads * v_block_size;
                 size_t v_src_offset = static_cast<size_t>(t) * n_kv_heads * v_block_size;
-                hipMemcpyAsync(static_cast<uint8_t *>(d_V_cache) + v_dst_offset,
+                (void)hipMemcpyAsync(static_cast<uint8_t *>(d_V_cache) + v_dst_offset,
                                static_cast<uint8_t *>(d_v_temp) + v_src_offset,
                                n_kv_heads * v_block_size, hipMemcpyDeviceToDevice, stream);
             }
         }
 
-        hipFree(d_k_temp);
-        hipFree(d_v_temp);
+        (void)hipFree(d_k_temp);
+        (void)hipFree(d_v_temp);
 
         return ok;
     }

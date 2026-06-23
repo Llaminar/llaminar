@@ -107,7 +107,7 @@ namespace llaminar2
         /**
          * @brief Set a log file path to tee all log output to a file
          *
-         * When set, every log message is written to both stdout and the file.
+         * When set, every log message is written to both stderr and the file.
          * Before opening, any existing log file at @p path is rotated through
          * a sliding window of up to 10 previous runs (logrotate-style):
          *
@@ -235,7 +235,7 @@ namespace llaminar2
                     recent_.pop_front();
             }
 
-            std::cout << full_line << std::endl;
+            std::cerr << full_line << std::endl;
 
             // Tee to log file if open
             if (log_file_.is_open())

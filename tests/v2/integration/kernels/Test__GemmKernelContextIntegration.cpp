@@ -27,7 +27,6 @@
 // we prefer CUDA tests and skip ROCm tests.
 
 #if defined(HAVE_CUDA) && defined(HAVE_ROCM)
-#warning "Both HAVE_CUDA and HAVE_ROCM are defined. Only CUDA tests will be built due to header conflicts."
 #undef HAVE_ROCM
 #endif
 

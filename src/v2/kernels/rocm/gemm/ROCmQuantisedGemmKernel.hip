@@ -599,7 +599,6 @@ void quantizeActivationsQ8_blockwise_v3_kernel(
         if (aligned && (k_end - k_start) == QUANT_BLOCK)
         {
             // Fast path: full aligned block
-            #pragma unroll
             for (int k4 = k_start; k4 < vec_end; k4 += 4)
             {
                 const float4 v = *reinterpret_cast<const float4 *>(row_in + k4);
@@ -1047,7 +1046,7 @@ extern "C"
         err = hipMalloc(d_scales_B, scale_bytes);
         if (err != hipSuccess)
         {
-            hipFree(*d_weights_int8);
+            (void)hipFree(*d_weights_int8);
             *d_weights_int8 = nullptr;
             fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMalloc scales failed: %s\n",
                     hipGetErrorString(err));
@@ -1058,8 +1057,8 @@ extern "C"
         err = hipMemcpy(*d_weights_int8, h_weights_int8, weight_bytes, hipMemcpyHostToDevice);
         if (err != hipSuccess)
         {
-            hipFree(*d_weights_int8);
-            hipFree(*d_scales_B);
+            (void)hipFree(*d_weights_int8);
+            (void)hipFree(*d_scales_B);
             *d_weights_int8 = nullptr;
             *d_scales_B = nullptr;
             fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy weights failed: %s "
@@ -1073,8 +1072,8 @@ extern "C"
         err = hipMemcpy(*d_scales_B, h_scales_B, scale_bytes, hipMemcpyHostToDevice);
         if (err != hipSuccess)
         {
-            hipFree(*d_weights_int8);
-            hipFree(*d_scales_B);
+            (void)hipFree(*d_weights_int8);
+            (void)hipFree(*d_scales_B);
             *d_weights_int8 = nullptr;
             *d_scales_B = nullptr;
             fprintf(stderr, "[rocmQuantGemm_uploadWeights] hipMemcpy scales failed: %s\n",
@@ -1108,13 +1107,13 @@ extern "C"
 
         // Free existing buffers
         if (*d_A_int8) {
-            hipFree(*d_A_int8);
+            (void)hipFree(*d_A_int8);
         }
         if (*d_scales_A) {
-            hipFree(*d_scales_A);
+            (void)hipFree(*d_scales_A);
         }
         if (*d_C_int32) {
-            hipFree(*d_C_int32);
+            (void)hipFree(*d_C_int32);
         }
 
         *d_A_int8 = nullptr;
@@ -1132,7 +1131,7 @@ extern "C"
         err = hipMalloc(d_scales_A, static_cast<size_t>(M) * sizeof(float));
         if (err != hipSuccess)
         {
-            hipFree(*d_A_int8);
+            (void)hipFree(*d_A_int8);
             *d_A_int8 = nullptr;
             fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc scales_A failed: %s\n", hipGetErrorString(err));
             return false;
@@ -1141,8 +1140,8 @@ extern "C"
         err = hipMalloc(d_C_int32, static_cast<size_t>(M) * N * sizeof(int32_t));
         if (err != hipSuccess)
         {
-            hipFree(*d_A_int8);
-            hipFree(*d_scales_A);
+            (void)hipFree(*d_A_int8);
+            (void)hipFree(*d_scales_A);
             *d_A_int8 = nullptr;
             *d_scales_A = nullptr;
             fprintf(stderr, "[rocmQuantGemm_ensureWorkBuffers] hipMalloc C_int32 failed: %s\n", hipGetErrorString(err));

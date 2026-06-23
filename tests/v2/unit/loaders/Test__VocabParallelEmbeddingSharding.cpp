@@ -114,7 +114,7 @@ protected:
         return ModelDimensions{
             .n_heads = n_heads,
             .n_kv_heads = n_kv,
-            .head_dim = static_cast<size_t>(hd)};
+            .head_dim = hd};
     }
 
     static constexpr ModelContextId kModelId{7001};

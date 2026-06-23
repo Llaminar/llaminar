@@ -7,6 +7,7 @@
 #include "mocks/MockMPIContext.h"
 #include "mocks/MockOrchestrationRunner.h"
 #include "mocks/MockTokenizer.h"
+#include "utils/Logger.h"
 
 #include <mpi.h>
 #include <memory>
@@ -16,7 +17,9 @@ using namespace llaminar2;
 using namespace llaminar2::test;
 using ::testing::_;
 using ::testing::ElementsAre;
+using ::testing::HasSubstr;
 using ::testing::NiceMock;
+using ::testing::Not;
 using ::testing::Return;
 using ::testing::Throw;
 
@@ -65,6 +68,27 @@ namespace
         NiceMock<MockOrchestrationRunner> *runner = nullptr;
         std::shared_ptr<MockMPIContext> mpi;
         std::shared_ptr<NiceMock<MockTokenizer>> tokenizer;
+    };
+
+    class ScopedLogLevel
+    {
+    public:
+        explicit ScopedLogLevel(LogLevel level)
+            : previous_level_(Logger::getInstance().getLogLevel())
+        {
+            Logger::getInstance().setLogLevel(level);
+        }
+
+        ~ScopedLogLevel()
+        {
+            Logger::getInstance().setLogLevel(previous_level_);
+        }
+
+        ScopedLogLevel(const ScopedLogLevel &) = delete;
+        ScopedLogLevel &operator=(const ScopedLogLevel &) = delete;
+
+    private:
+        LogLevel previous_level_;
     };
 }
 
@@ -232,6 +256,41 @@ TEST(Test__CompletionMode, EmitsAllTokensReturnedByMultiTokenDecodeStep)
     EXPECT_EQ(mode.execute(h.ctx), 0);
 }
 
+TEST(Test__CompletionMode, UserTextStaysOnStdoutAndInfoLogsUseStderr)
+{
+    ScopedLogLevel log_level(LogLevel::INFO);
+    ModeHarness h(/*rank=*/0, /*world_size=*/1);
+    h.ctx.config.prompt = "Explain laminar flow";
+    h.ctx.config.n_predict = 2;
+
+    EXPECT_CALL(*h.tokenizer, encode("Explain laminar flow", false, false))
+        .WillOnce(Return(std::vector<int>{1}));
+    EXPECT_CALL(*h.runner, prefill(ElementsAre(1))).WillOnce(Return(true));
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult({10, 11})));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(10)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(11)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, decode_token(10)).WillOnce(Return(" smooth"));
+    EXPECT_CALL(*h.tokenizer, decode_token(11)).WillOnce(Return(" flow"));
+    EXPECT_CALL(*h.runner, flushStageTimeline()).Times(1);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    CompletionMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+    const std::string stderr_text = testing::internal::GetCapturedStderr();
+    const std::string stdout_text = testing::internal::GetCapturedStdout();
+
+    EXPECT_THAT(stdout_text, HasSubstr("Prompt:\nExplain laminar flow\n\nResponse:\n smooth flow"));
+    EXPECT_THAT(stdout_text, Not(HasSubstr("[INFO")));
+    EXPECT_THAT(stdout_text, Not(HasSubstr("Running prefill")));
+    EXPECT_THAT(stderr_text, HasSubstr("[INFO"));
+    EXPECT_THAT(stderr_text, HasSubstr("Running prefill (1 tokens)"));
+}
+
 TEST(Test__SingleShotChatMode, NonRootRankEntersWorkerLoopWithoutTokenizerUse)
 {
     ModeHarness h(/*rank=*/1, /*world_size=*/2);
@@ -374,6 +433,42 @@ TEST(Test__SingleShotChatMode, EmitsAllTokensReturnedByMultiTokenDecodeStep)
 
     SingleShotChatMode mode;
     EXPECT_EQ(mode.execute(h.ctx), 0);
+}
+
+TEST(Test__SingleShotChatMode, UserTextStaysOnStdoutAndInfoLogsUseStderr)
+{
+    ScopedLogLevel log_level(LogLevel::INFO);
+    ModeHarness h(/*rank=*/0, /*world_size=*/1);
+    h.ctx.config.single_shot_chat = true;
+    h.ctx.config.prompt = "Tell me a tiny story";
+    h.ctx.config.n_predict = 2;
+
+    EXPECT_CALL(*h.tokenizer, hasChatTemplate()).WillOnce(Return(true));
+    EXPECT_CALL(*h.tokenizer, encodeChat(_, true, "")).WillOnce(Return(std::vector<int>{7}));
+    EXPECT_CALL(*h.runner, prefill(ElementsAre(7))).WillOnce(Return(true));
+    EXPECT_CALL(*h.runner, setSamplingParams(_)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(2)).Times(1);
+    EXPECT_CALL(*h.runner, setDecodeStepTokenBudget(0)).Times(1);
+    EXPECT_CALL(*h.runner, decodeStep()).WillOnce(Return(tokenResult({20, 21})));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(20)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, is_stop_token(21)).WillOnce(Return(false));
+    EXPECT_CALL(*h.tokenizer, decode_token(20)).WillOnce(Return(" Once"));
+    EXPECT_CALL(*h.tokenizer, decode_token(21)).WillOnce(Return(" there"));
+    EXPECT_CALL(*h.runner, flushStageTimeline()).Times(1);
+    EXPECT_CALL(*h.runner, shutdown()).Times(1);
+
+    testing::internal::CaptureStdout();
+    testing::internal::CaptureStderr();
+    SingleShotChatMode mode;
+    EXPECT_EQ(mode.execute(h.ctx), 0);
+    const std::string stderr_text = testing::internal::GetCapturedStderr();
+    const std::string stdout_text = testing::internal::GetCapturedStdout();
+
+    EXPECT_THAT(stdout_text, HasSubstr("Prompt:\nTell me a tiny story\n\nResponse:\n Once there"));
+    EXPECT_THAT(stdout_text, Not(HasSubstr("[INFO")));
+    EXPECT_THAT(stdout_text, Not(HasSubstr("Generating response")));
+    EXPECT_THAT(stderr_text, HasSubstr("[INFO"));
+    EXPECT_THAT(stderr_text, HasSubstr("Generating response (max 2 tokens)"));
 }
 
 int main(int argc, char **argv)

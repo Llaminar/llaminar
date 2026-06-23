@@ -288,21 +288,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_Small)
     rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
 
     float *d_input, *d_gamma, *d_output;
-    hipMalloc(&d_input, total * sizeof(float));
-    hipMalloc(&d_gamma, cols * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(float));
+    (void)hipMalloc(&d_input, total * sizeof(float));
+    (void)hipMalloc(&d_gamma, cols * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(float));
 
-    hipMemcpy(d_input, input_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_input, input_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gamma);
-    hipFree(d_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gamma);
+    (void)hipFree(d_output);
 
     // Validate
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), total)) << "ROCm output contains NaN/Inf";
@@ -340,21 +340,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_Large)
     rocm::ROCmRMSNormKernelT<ActivationPrecision::FP32> rocm_kernel;
 
     float *d_input, *d_gamma, *d_output;
-    hipMalloc(&d_input, total * sizeof(float));
-    hipMalloc(&d_gamma, cols * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(float));
+    (void)hipMalloc(&d_input, total * sizeof(float));
+    (void)hipMalloc(&d_gamma, cols * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(float));
 
-    hipMemcpy(d_input, input_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_input, input_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gamma);
-    hipFree(d_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gamma);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), total)) << "ROCm output contains NaN/Inf";
 
@@ -401,21 +401,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_BF16_Small)
 
     uint16_t *d_input, *d_output;
     float *d_gamma;
-    hipMalloc(&d_input, total * sizeof(uint16_t));
-    hipMalloc(&d_gamma, cols * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_input, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gamma, cols * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_input, input_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_input, input_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gamma);
-    hipFree(d_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gamma);
+    (void)hipFree(d_output);
 
     // Convert to FP32 for comparison
     std::vector<float> cpu_output_fp32(total);
@@ -461,21 +461,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_BF16_Large)
 
     uint16_t *d_input, *d_output;
     float *d_gamma;
-    hipMalloc(&d_input, total * sizeof(uint16_t));
-    hipMalloc(&d_gamma, cols * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_input, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gamma, cols * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_input, input_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_input, input_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gamma);
-    hipFree(d_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gamma);
+    (void)hipFree(d_output);
 
     std::vector<float> cpu_output_fp32(total);
     std::vector<float> rocm_output_fp32(total);
@@ -526,21 +526,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP16_Small)
 
     uint16_t *d_input, *d_output;
     float *d_gamma;
-    hipMalloc(&d_input, total * sizeof(uint16_t));
-    hipMalloc(&d_gamma, cols * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_input, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gamma, cols * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_input, input_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_input, input_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gamma);
-    hipFree(d_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gamma);
+    (void)hipFree(d_output);
 
     // Convert to FP32 for comparison
     std::vector<float> cpu_output_fp32(total);
@@ -586,21 +586,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP16_Large)
 
     uint16_t *d_input, *d_output;
     float *d_gamma;
-    hipMalloc(&d_input, total * sizeof(uint16_t));
-    hipMalloc(&d_gamma, cols * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_input, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gamma, cols * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_input, input_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_input, input_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gamma, gamma_data.data(), cols * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_input, d_gamma, d_output, rows, cols, epsilon, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gamma);
-    hipFree(d_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gamma);
+    (void)hipFree(d_output);
 
     std::vector<float> cpu_output_fp32(total);
     std::vector<float> rocm_output_fp32(total);
@@ -659,7 +659,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_ApplyTensor)
         input.get(), gamma.get(), rocm_output.get(),
         rows, cols, epsilon, nullptr, 0));
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
@@ -712,19 +712,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer21InputParity)
     TensorBase *hidden = prefix_runner->getHiddenState();
     ASSERT_NE(hidden, nullptr);
 
-    const int rows = static_cast<int>(hidden->rows());
-    const int cols = static_cast<int>(hidden->cols());
+    const size_t rows_size = hidden->rows();
+    const size_t cols_size = hidden->cols();
+    const int rows = static_cast<int>(rows_size);
+    const int cols = static_cast<int>(cols_size);
     const size_t total = hidden->numel();
     constexpr float epsilon = 1e-6f;
 
-    auto input = TestTensorFactory::createFP32({rows, cols});
+    auto input = TestTensorFactory::createFP32({rows_size, cols_size});
     std::memcpy(input->mutable_data(), hidden->data(), total * sizeof(float));
 
     auto gamma = full_ctx->getWeightForDevice("blk.21.attn_norm.weight", DeviceId::cpu());
     ASSERT_NE(gamma, nullptr) << "Missing blk.21.attn_norm.weight";
 
-    auto cpu_output = TestTensorFactory::createFP32({rows, cols});
-    auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+    auto cpu_output = TestTensorFactory::createFP32({rows_size, cols_size});
+    auto rocm_output = TestTensorFactory::createFP32({rows_size, cols_size});
 
     CPURMSNormKernelT<ActivationPrecision::FP32> cpu_kernel;
     cpu_kernel.apply(
@@ -741,7 +743,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer21InputParity)
         input.get(), gamma.get(), rocm_output.get(),
         rows, cols, epsilon, nullptr, 0));
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 
@@ -796,19 +798,21 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer3InputParity)
     TensorBase *hidden = prefix_runner->getHiddenState();
     ASSERT_NE(hidden, nullptr);
 
-    const int rows = static_cast<int>(hidden->rows());
-    const int cols = static_cast<int>(hidden->cols());
+    const size_t rows_size = hidden->rows();
+    const size_t cols_size = hidden->cols();
+    const int rows = static_cast<int>(rows_size);
+    const int cols = static_cast<int>(cols_size);
     const size_t total = hidden->numel();
     constexpr float epsilon = 1e-6f;
 
-    auto input = TestTensorFactory::createFP32({rows, cols});
+    auto input = TestTensorFactory::createFP32({rows_size, cols_size});
     std::memcpy(input->mutable_data(), hidden->data(), total * sizeof(float));
 
     auto gamma = full_ctx->getWeightForDevice("blk.3.attn_norm.weight", DeviceId::cpu());
     ASSERT_NE(gamma, nullptr) << "Missing blk.3.attn_norm.weight";
 
-    auto cpu_output = TestTensorFactory::createFP32({rows, cols});
-    auto rocm_output = TestTensorFactory::createFP32({rows, cols});
+    auto cpu_output = TestTensorFactory::createFP32({rows_size, cols_size});
+    auto rocm_output = TestTensorFactory::createFP32({rows_size, cols_size});
 
     CPURMSNormKernelT<ActivationPrecision::FP32> cpu_kernel;
     cpu_kernel.apply(
@@ -825,7 +829,7 @@ TEST_F(Test__ROCmRMSNormParity, RMSNorm_FP32_RealQwen2Layer3InputParity)
         input.get(), gamma.get(), rocm_output.get(),
         rows, cols, epsilon, nullptr, 0));
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 

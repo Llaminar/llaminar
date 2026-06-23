@@ -126,41 +126,41 @@ namespace
         float *allocGpuFloat(size_t count)
         {
             float *d_ptr = nullptr;
-            hipMalloc(&d_ptr, count * sizeof(float));
+            (void)hipMalloc(&d_ptr, count * sizeof(float));
             return d_ptr;
         }
 
         uint16_t *allocGpuU16(size_t count)
         {
             uint16_t *d_ptr = nullptr;
-            hipMalloc(&d_ptr, count * sizeof(uint16_t));
+            (void)hipMalloc(&d_ptr, count * sizeof(uint16_t));
             return d_ptr;
         }
 
         void copyToGpu(float *d_dst, const float *h_src, size_t count)
         {
-            hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_dst, h_src, count * sizeof(float), hipMemcpyHostToDevice);
         }
 
         void copyToGpu(uint16_t *d_dst, const uint16_t *h_src, size_t count)
         {
-            hipMemcpy(d_dst, h_src, count * sizeof(uint16_t), hipMemcpyHostToDevice);
+            (void)hipMemcpy(d_dst, h_src, count * sizeof(uint16_t), hipMemcpyHostToDevice);
         }
 
         void copyFromGpu(float *h_dst, const float *d_src, size_t count)
         {
-            hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(h_dst, d_src, count * sizeof(float), hipMemcpyDeviceToHost);
         }
 
         void copyFromGpu(uint16_t *h_dst, const uint16_t *d_src, size_t count)
         {
-            hipMemcpy(h_dst, d_src, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
+            (void)hipMemcpy(h_dst, d_src, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
         }
 
         void freeGpu(void *d_ptr)
         {
             if (d_ptr)
-                hipFree(d_ptr);
+                (void)hipFree(d_ptr);
         }
 #endif
     };
@@ -200,7 +200,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output->mutable_data(), d_output, num_elements);
 
         // Validate
@@ -248,7 +248,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP32> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output->mutable_data(), d_output, num_elements);
 
         EXPECT_FALSE(hasNanOrInf(rocm_output->data(), num_elements)) << "ROCm output contains NaN/Inf";
@@ -300,7 +300,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::BF16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         // Dequantize for comparison
@@ -354,7 +354,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::BF16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -411,7 +411,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -464,7 +464,7 @@ namespace
         llaminar2::rocm::ROCmResidualAddKernelT<ActivationPrecision::FP16> rocm_kernel;
         ASSERT_TRUE(rocm_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         copyFromGpu(rocm_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -529,7 +529,7 @@ namespace
             input.get(), residual.get(), rocm_output.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
 
         // Mark output dirty and sync back to host
         rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
@@ -573,7 +573,7 @@ namespace
             input.get(), residual.get(), rocm_output.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = rocm_output->data();
 
@@ -616,7 +616,7 @@ namespace
             input.get(), residual.get(), residual.get(),
             num_elements, nullptr, 0));
 
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         residual->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
         const float *result = residual->data();
         ASSERT_NE(result, nullptr);

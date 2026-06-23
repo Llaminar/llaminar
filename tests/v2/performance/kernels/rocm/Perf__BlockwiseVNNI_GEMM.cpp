@@ -211,7 +211,7 @@ namespace
             {
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, 0);
+                (void)hipGetDeviceProperties(&props, 0);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
             }
 #else

@@ -467,7 +467,7 @@ namespace llaminar2
                 // Bulk DMA from HBM redirect buffer to mapped output
                 if (success && d_mapped_output)
                 {
-                    hipMemcpyAsync(d_mapped_output, d_C,
+                    (void)hipMemcpyAsync(d_mapped_output, d_C,
                                    static_cast<size_t>(m) * n * sizeof(float),
                                    hipMemcpyDeviceToDevice,
                                    static_cast<hipStream_t>(gpu_stream_));
@@ -487,7 +487,7 @@ namespace llaminar2
                 // Bulk DMA from HBM redirect buffer to mapped output
                 if (success && d_mapped_output)
                 {
-                    hipMemcpyAsync(d_mapped_output, d_C,
+                    (void)hipMemcpyAsync(d_mapped_output, d_C,
                                    static_cast<size_t>(m) * n * sizeof(float),
                                    hipMemcpyDeviceToDevice,
                                    static_cast<hipStream_t>(gpu_stream_));

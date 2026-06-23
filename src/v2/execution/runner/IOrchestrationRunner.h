@@ -121,6 +121,21 @@ namespace llaminar2
         virtual bool initialize() = 0;
 
         /**
+         * @brief Initialize far enough to validate and print the execution plan.
+         *
+         * Default implementations may conservatively fall back to full
+         * initialize(). Runners that can separate preflight from graph/materialized
+         * weight setup should override this and stop before inference resources are
+         * built.
+         *
+         * @return true on success, false on failure (check lastError())
+         */
+        virtual bool initializeForDryRun()
+        {
+            return initialize();
+        }
+
+        /**
          * @brief Clean shutdown
          *
          * Releases all resources:

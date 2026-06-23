@@ -20,6 +20,28 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        void configureLauncherEnvironment()
+        {
+            if (debugEnv().mpi_bootstrap.get("HWLOC_COMPONENTS").has_value())
+            {
+                return;
+            }
+
+            // OpenMPI initializes hwloc in the launcher before ranks start. The
+            // hwloc GL discovery plugin can block on stale or inaccessible X
+            // sockets, so disable only that component by default.
+            if (setenv("HWLOC_COMPONENTS", "-gl", 0) != 0)
+            {
+                LOG_WARN("[MPIBootstrap] Failed to set HWLOC_COMPONENTS=-gl: " << strerror(errno));
+            }
+            else
+            {
+                LOG_DEBUG("[MPIBootstrap] Set HWLOC_COMPONENTS=-gl for mpirun launcher");
+            }
+        }
+    }
 
     // ========================================================================
     // Environment Variable Helpers
@@ -671,6 +693,7 @@ namespace llaminar2
     {
         // Configure OpenMP environment before exec (inherited by child processes)
         configureOpenMPEnvironment(topology, config);
+        configureLauncherEnvironment();
 
         // Build command
         auto cmd = buildMPIRunCommand(argc, argv, config, topology);

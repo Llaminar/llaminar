@@ -505,7 +505,8 @@ namespace llaminar2
                 return false;
 
             // Check XCR0 for AMX tile state (bits 17=XTILECFG, 18=XTILEDATA)
-            uint32_t xcr0_lo, xcr0_hi;
+            uint32_t xcr0_lo;
+            [[maybe_unused]] uint32_t xcr0_hi;
 #if defined(_MSC_VER)
             uint64_t xcr0_full = _xgetbv(0);
             xcr0_lo = static_cast<uint32_t>(xcr0_full);
@@ -515,7 +516,6 @@ namespace llaminar2
 #else
             return false;
 #endif
-            (void)xcr0_hi; // upper 32 bits not needed for AMX checks
             // AMX requires bits 17 (XTILECFG) and 18 (XTILEDATA)
             constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
             if ((xcr0_lo & AMX_MASK) != AMX_MASK)
@@ -545,7 +545,8 @@ namespace llaminar2
                 return false;
 
             // Check XCR0 for AMX tile state (bits 17=XTILECFG, 18=XTILEDATA)
-            uint32_t xcr0_lo, xcr0_hi;
+            uint32_t xcr0_lo;
+            [[maybe_unused]] uint32_t xcr0_hi;
 #if defined(_MSC_VER)
             uint64_t xcr0_full = _xgetbv(0);
             xcr0_lo = static_cast<uint32_t>(xcr0_full);
@@ -555,7 +556,6 @@ namespace llaminar2
 #else
             return false;
 #endif
-            (void)xcr0_hi; // upper 32 bits not needed for AMX checks
             constexpr uint32_t AMX_MASK = (1u << 17) | (1u << 18);
             if ((xcr0_lo & AMX_MASK) != AMX_MASK)
                 return false;

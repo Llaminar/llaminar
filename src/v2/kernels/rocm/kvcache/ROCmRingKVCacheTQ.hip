@@ -26,7 +26,7 @@ namespace llaminar2
         : ROCmRingKVCacheBase(n_layers, batch_size, max_seq_len,
                                n_kv_heads, head_dim, n_kv_heads * head_dim, device_id)
     {
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
 
         if (head_dim_ == 64)
         {
@@ -61,8 +61,8 @@ namespace llaminar2
 
             for (int s = 0; s < batch_size_; ++s)
             {
-                hipMalloc(&entries_[l][s].d_K, k_entry_bytes);
-                hipMalloc(&entries_[l][s].d_V, v_entry_bytes);
+                (void)hipMalloc(&entries_[l][s].d_K, k_entry_bytes);
+                (void)hipMalloc(&entries_[l][s].d_V, v_entry_bytes);
                 entries_[l][s].head = 0;
                 entries_[l][s].count = 0;
             }
@@ -74,8 +74,8 @@ namespace llaminar2
             layer_scratch_.resize(n_layers_);
             for (int l = 0; l < n_layers_; ++l)
             {
-                hipMalloc(&layer_scratch_[l].d_K, scratch_bytes);
-                hipMalloc(&layer_scratch_[l].d_V, scratch_bytes);
+                (void)hipMalloc(&layer_scratch_[l].d_K, scratch_bytes);
+                (void)hipMalloc(&layer_scratch_[l].d_V, scratch_bytes);
                 layer_scratch_[l].invalidate();
             }
             LOG_DEBUG("ROCmRingKVCacheTQ: per-layer FP16 scratch: "
@@ -86,16 +86,16 @@ namespace llaminar2
         {
             const size_t k_temp_bytes = static_cast<size_t>(max_seq_len) * n_kv_heads * tq8_block_size_;
             const size_t v_temp_bytes = static_cast<size_t>(max_seq_len) * n_kv_heads * tq4_block_size_;
-            hipMalloc(&d_quantize_k_temp_, k_temp_bytes);
-            hipMalloc(&d_quantize_v_temp_, v_temp_bytes);
+            (void)hipMalloc(&d_quantize_k_temp_, k_temp_bytes);
+            (void)hipMalloc(&d_quantize_v_temp_, v_temp_bytes);
             LOG_DEBUG("ROCmRingKVCacheTQ: pre-allocated quantize temp buffers: K="
                      << (k_temp_bytes / 1024) << "KB, V=" << (v_temp_bytes / 1024) << "KB");
         }
 
         // Allocate graph capture dynamic params (per-layer)
         {
-            hipMalloc(&d_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams));
-            hipHostMalloc(&h_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams),
+            (void)hipMalloc(&d_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams));
+            (void)hipHostMalloc(&h_dequant_params_, n_layers_ * sizeof(HIPTQDequantDynamicParams),
                           hipHostMallocDefault);
             memset(h_dequant_params_, 0, n_layers_ * sizeof(HIPTQDequantDynamicParams));
             dequant_params_device_valid_.assign(static_cast<size_t>(n_layers_), 0);
@@ -110,13 +110,13 @@ namespace llaminar2
 
     ROCmRingKVCacheTQ::~ROCmRingKVCacheTQ()
     {
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
 
         for (auto &layer : entries_)
             for (auto &entry : layer)
             {
-                if (entry.d_K) hipFree(entry.d_K);
-                if (entry.d_V) hipFree(entry.d_V);
+                if (entry.d_K) (void)hipFree(entry.d_K);
+                if (entry.d_V) (void)hipFree(entry.d_V);
             }
 
         // Free per-layer scratch
@@ -124,17 +124,17 @@ namespace llaminar2
         {
             scratch.k_view.reset();
             scratch.v_view.reset();
-            if (scratch.d_K) hipFree(scratch.d_K);
-            if (scratch.d_V) hipFree(scratch.d_V);
+            if (scratch.d_K) (void)hipFree(scratch.d_K);
+            if (scratch.d_V) (void)hipFree(scratch.d_V);
         }
 
         // Free pre-allocated quantize temp buffers
-        if (d_quantize_k_temp_) hipFree(d_quantize_k_temp_);
-        if (d_quantize_v_temp_) hipFree(d_quantize_v_temp_);
+        if (d_quantize_k_temp_) (void)hipFree(d_quantize_k_temp_);
+        if (d_quantize_v_temp_) (void)hipFree(d_quantize_v_temp_);
 
         // Free graph capture params
-        if (d_dequant_params_) hipFree(d_dequant_params_);
-        if (h_dequant_params_) hipHostFree(h_dequant_params_);
+        if (d_dequant_params_) (void)hipFree(d_dequant_params_);
+        if (h_dequant_params_) (void)hipHostFree(h_dequant_params_);
 
         hip_tq_free_rotations(rotations_);
     }
@@ -170,7 +170,7 @@ namespace llaminar2
             return false;
         }
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         const auto hip_stream = static_cast<hipStream_t>(stream);
         cached_stream_ = hip_stream;
         auto &entry = entries_[layer][seq_idx];
@@ -206,11 +206,11 @@ namespace llaminar2
                 const size_t k_src_offset = static_cast<size_t>(t) * k_row_bytes;
                 const size_t v_src_offset = static_cast<size_t>(t) * v_row_bytes;
 
-                hipMemcpyAsync(
+                (void)hipMemcpyAsync(
                     static_cast<uint8_t *>(entry.d_K) + k_dst_offset,
                     h_K_blocks + k_src_offset,
                     k_row_bytes, hipMemcpyHostToDevice, hip_stream);
-                hipMemcpyAsync(
+                (void)hipMemcpyAsync(
                     static_cast<uint8_t *>(entry.d_V) + v_dst_offset,
                     h_V_blocks + v_src_offset,
                     v_row_bytes, hipMemcpyHostToDevice, hip_stream);
@@ -245,8 +245,8 @@ namespace llaminar2
         else
         {
             const size_t bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
-            hipMalloc(&d_k_uploaded, bytes);
-            hipMemcpyAsync(d_k_uploaded, k->data(), bytes, hipMemcpyHostToDevice, hip_stream);
+            (void)hipMalloc(&d_k_uploaded, bytes);
+            (void)hipMemcpyAsync(d_k_uploaded, k->data(), bytes, hipMemcpyHostToDevice, hip_stream);
             d_k_input = static_cast<const float *>(d_k_uploaded);
         }
 
@@ -257,8 +257,8 @@ namespace llaminar2
         else
         {
             const size_t bytes = static_cast<size_t>(num_tokens) * kv_dim_ * sizeof(float);
-            hipMalloc(&d_v_uploaded, bytes);
-            hipMemcpyAsync(d_v_uploaded, v->data(), bytes, hipMemcpyHostToDevice, hip_stream);
+            (void)hipMalloc(&d_v_uploaded, bytes);
+            (void)hipMemcpyAsync(d_v_uploaded, v->data(), bytes, hipMemcpyHostToDevice, hip_stream);
             d_v_input = static_cast<const float *>(d_v_uploaded);
         }
 
@@ -282,11 +282,11 @@ namespace llaminar2
             for (int t = 0; t < num_tokens; ++t)
             {
                 int dst_pos = (entry.head + t) % max_seq_len_;
-                hipMemcpyAsync(
+                (void)hipMemcpyAsync(
                     static_cast<uint8_t *>(entry.d_K) + static_cast<size_t>(dst_pos) * k_pos_bytes,
                     static_cast<uint8_t *>(d_quantize_k_temp_) + static_cast<size_t>(t) * k_pos_bytes,
                     k_pos_bytes, hipMemcpyDeviceToDevice, hip_stream);
-                hipMemcpyAsync(
+                (void)hipMemcpyAsync(
                     static_cast<uint8_t *>(entry.d_V) + static_cast<size_t>(dst_pos) * v_pos_bytes,
                     static_cast<uint8_t *>(d_quantize_v_temp_) + static_cast<size_t>(t) * v_pos_bytes,
                     v_pos_bytes, hipMemcpyDeviceToDevice, hip_stream);
@@ -304,8 +304,8 @@ namespace llaminar2
             // triggers a full linearize dequant — correct behavior.
         }
 
-        if (d_k_uploaded) hipFree(d_k_uploaded);
-        if (d_v_uploaded) hipFree(d_v_uploaded);
+        if (d_k_uploaded) (void)hipFree(d_k_uploaded);
+        if (d_v_uploaded) (void)hipFree(d_v_uploaded);
 
         return ok;
     }
@@ -403,7 +403,7 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return;
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         hipStream_t stream = clearStream();
         clearEntryStorage(layer, seq_idx, stream);
         clearScratchStorage(layer, stream);
@@ -422,7 +422,7 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_)
             return;
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         hipStream_t stream = clearStream();
         for (int seq = 0; seq < batch_size_; ++seq)
         {
@@ -445,7 +445,7 @@ namespace llaminar2
         if (seq_idx < 0 || seq_idx >= batch_size_)
             return;
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         hipStream_t stream = clearStream();
         for (int layer = 0; layer < n_layers_; ++layer)
         {
@@ -465,7 +465,7 @@ namespace llaminar2
 
     void ROCmRingKVCacheTQ::clear()
     {
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         hipStream_t stream = clearStream();
 
         for (int layer = 0; layer < n_layers_; ++layer)
@@ -638,7 +638,7 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return nullptr;
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
         auto &scratch = layer_scratch_[layer];
 
@@ -661,7 +661,7 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return nullptr;
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         dequant_to_scratch(layer, seq_idx, 0.0f, 0, clearStream());
         auto &scratch = layer_scratch_[layer];
 
@@ -723,7 +723,7 @@ namespace llaminar2
         if (layer < 0 || layer >= n_layers_ || seq_idx < 0 || seq_idx >= batch_size_)
             return false;
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         const auto &entry = entries_[layer][seq_idx];
 
         if (entry.count == 0)

@@ -147,7 +147,7 @@ namespace llaminar2
             for (int i = 0; i < device_count_; ++i)
             {
                 hipDeviceProp_t prop;
-                hipGetDeviceProperties(&prop, i);
+                (void)hipGetDeviceProperties(&prop, i);
                 std::cout << "  GPU " << i << ": " << prop.name << std::endl;
             }
             std::cout << std::endl;
@@ -177,9 +177,9 @@ namespace llaminar2
             // Synchronize all devices to ensure operations are complete
             for (int i = 0; i < device_count_; ++i)
             {
-                hipSetDevice(i);
-                hipDeviceSynchronize();
-                hipGetLastError();
+                (void)hipSetDevice(i);
+                (void)hipDeviceSynchronize();
+                (void)hipGetLastError();
             }
         }
 
@@ -251,7 +251,7 @@ namespace llaminar2
                 threads.emplace_back([&, i]()
                                      {
                 // Set device context for this thread
-                hipSetDevice(i);
+                (void)hipSetDevice(i);
 
                 // Signal ready
                 threads_ready.fetch_add(1);

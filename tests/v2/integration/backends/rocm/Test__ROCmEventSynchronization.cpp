@@ -64,7 +64,7 @@ protected:
         }
 
         device_id_ = 0;
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
     }
 
     void TearDown() override
@@ -178,14 +178,14 @@ TEST_F(Test__ROCmEventSynchronization, EventSyncIsEventSpecific_NotStreamWide)
     }
 
     // Step 1: Launch quick operation and record event
-    hipMemsetAsync(d_small, 0, small_bytes, 0);
+    (void)hipMemsetAsync(d_small, 0, small_bytes, 0);
     backend_->recordEvent(event_quick, device_id_);
 
     // Step 2: Launch slow operation (will still be running when we wait on quick event)
     // Use multiple iterations to ensure it takes time
     for (int i = 0; i < 10; ++i)
     {
-        hipMemsetAsync(d_large, i, large_bytes, 0);
+        (void)hipMemsetAsync(d_large, i, large_bytes, 0);
     }
     backend_->recordEvent(event_slow, device_id_);
 
@@ -253,7 +253,7 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
     {
         for (int i = 0; i < 10; ++i)
         {
-            hipMemsetAsync(d_slow, i, slow_bytes, 0);
+            (void)hipMemsetAsync(d_slow, i, slow_bytes, 0);
         }
     }
 
@@ -267,7 +267,7 @@ TEST_F(Test__ROCmEventSynchronization, MappedTensorCoherenceUsesEvents)
     // Clean up slow work buffer
     if (d_slow)
     {
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
         backend_->free(d_slow, device_id_);
     }
 
@@ -317,7 +317,7 @@ TEST_F(Test__ROCmEventSynchronization, MultipleEventsIndependentSync)
         }
 
         // Launch work and record event
-        hipMemsetAsync(buffers[i], i, bytes_per_op, 0);
+        (void)hipMemsetAsync(buffers[i], i, bytes_per_op, 0);
         backend_->recordEvent(events[i], device_id_);
     }
 

@@ -1,7 +1,8 @@
 #!/bin/bash
-# Focused parity baseline — 40 tests covering all model families.
+# Focused parity baseline — 48 tests covering all model families.
 #
-# Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
+# Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.6 (dense),
+#         Qwen3.5 27B LocalPP (dense Q4_K_M),
 #         Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
 #         HybridPPTP (pipeline+tensor parallel),
 #         and ExpertOverlay (tiered same-layer expert residency).
@@ -46,6 +47,16 @@ TESTS=(
   "Qwen35SingleDeviceParityTest_DecodeParity_Qwen35_4B_CUDA_KV_FP16$"
   "Qwen35SingleDeviceParityTest_PrefillParity_Qwen35_4B_ROCm_KV_FP16$"
   "Qwen35SingleDeviceParityTest_DecodeParity_Qwen35_4B_ROCm_KV_FP16$"
+  # Qwen3.6 Dense SingleDevice 27B (6)
+  "V2_Integration_Parity_Qwen36_SingleDevice_Math_PrefillParity_CPU$"
+  "V2_Integration_Parity_Qwen36_SingleDevice_Math_DecodeParity_CPU$"
+  "V2_Integration_Parity_Qwen36_SingleDevice_Math_PrefillParity_CUDA$"
+  "V2_Integration_Parity_Qwen36_SingleDevice_Math_DecodeParity_CUDA$"
+  "V2_Integration_Parity_Qwen36_SingleDevice_Math_PrefillParity_ROCm$"
+  "V2_Integration_Parity_Qwen36_SingleDevice_Math_DecodeParity_ROCm$"
+  # Qwen3.6 Dense SingleDevice MTP graph-stream stress (2)
+  "V2_Integration_Parity_Qwen36_CUDA_SingleDevice_MTPGreedyDepth3GraphStreamStress$"
+  "V2_Integration_Parity_Qwen36_ROCm_SingleDevice_MTPGreedyDepth3GraphStreamStress$"
   # Qwen3.5 LocalPP 27B Q4_K_M CUDA/ROCm (6)
   "Qwen35LocalPPParityTest_PrefillParity_LocalPP_NCCL_2xCUDA_27B$"
   "Qwen35LocalPPParityTest_DecodeParity_LocalPP_NCCL_2xCUDA_27B$"

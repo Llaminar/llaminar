@@ -206,7 +206,7 @@ namespace llaminar2
             // Free cached workspace
             if (lt_workspace_)
             {
-                hipFree(lt_workspace_);
+                (void)hipFree(lt_workspace_);
                 lt_workspace_ = nullptr;
                 lt_workspace_size_ = 0;
             }
@@ -252,7 +252,7 @@ namespace llaminar2
                 // Destroy our resources if we own them
                 if (lt_workspace_)
                 {
-                    hipFree(lt_workspace_);
+                    (void)hipFree(lt_workspace_);
                 }
                 if (owns_lt_handle_ && lt_handle_)
                 {
@@ -511,7 +511,7 @@ namespace llaminar2
             if (!lt_workspace_ || lt_workspace_size_ < workspaceSize)
             {
                 if (lt_workspace_)
-                    hipFree(lt_workspace_);
+                    (void)hipFree(lt_workspace_);
                 HIP_CHECK(hipMalloc(&lt_workspace_, workspaceSize));
                 lt_workspace_size_ = workspaceSize;
             }

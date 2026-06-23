@@ -143,7 +143,7 @@ namespace llaminar2
             {
                 int current_device = 0;
 #ifdef HAVE_ROCM
-                hipGetDevice(&current_device);
+                (void)hipGetDevice(&current_device);
 #endif
 
                 if (!ensureIQGridTablesInitialized(current_device))
@@ -391,7 +391,7 @@ namespace llaminar2
             err = hipMemcpy(*d_ptr, host_data, bytes, hipMemcpyHostToDevice);
             if (err != hipSuccess)
             {
-                hipFree(*d_ptr);
+                (void)hipFree(*d_ptr);
                 *d_ptr = nullptr;
                 return false;
             }
@@ -409,10 +409,10 @@ namespace llaminar2
             !uploadBuffer(all_native_emins.empty() ? nullptr : all_native_emins.data(),
                           all_native_emins.size() * sizeof(uint32_t), &d_emins))
         {
-            if (d_vnni) hipFree(d_vnni);
-            if (d_scales) hipFree(d_scales);
-            if (d_mins) hipFree(d_mins);
-            if (d_emins) hipFree(d_emins);
+            if (d_vnni) (void)hipFree(d_vnni);
+            if (d_scales) (void)hipFree(d_scales);
+            if (d_mins) (void)hipFree(d_mins);
+            if (d_emins) (void)hipFree(d_emins);
             return false;
         }
 

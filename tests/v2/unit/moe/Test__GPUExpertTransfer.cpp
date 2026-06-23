@@ -40,7 +40,7 @@ int getROCmDeviceCount()
 template<typename T>
 T* allocOnDevice(int device_ordinal, size_t count)
 {
-    hipSetDevice(device_ordinal);
+    (void)hipSetDevice(device_ordinal);
     T* ptr = nullptr;
     hipError_t err = hipMalloc(&ptr, count * sizeof(T));
     return (err == hipSuccess) ? ptr : nullptr;
@@ -50,7 +50,7 @@ T* allocOnDevice(int device_ordinal, size_t count)
 template<typename T>
 bool uploadToDevice(T* d_ptr, const T* h_ptr, size_t count, int device_ordinal)
 {
-    hipSetDevice(device_ordinal);
+    (void)hipSetDevice(device_ordinal);
     hipError_t err = hipMemcpy(d_ptr, h_ptr, count * sizeof(T), hipMemcpyHostToDevice);
     return (err == hipSuccess);
 }
@@ -59,15 +59,15 @@ bool uploadToDevice(T* d_ptr, const T* h_ptr, size_t count, int device_ordinal)
 template<typename T>
 bool downloadFromDevice(T* h_ptr, const T* d_ptr, size_t count, int device_ordinal)
 {
-    hipSetDevice(device_ordinal);
+    (void)hipSetDevice(device_ordinal);
     hipError_t err = hipMemcpy(h_ptr, d_ptr, count * sizeof(T), hipMemcpyDeviceToHost);
     return (err == hipSuccess);
 }
 
 void freeOnDevice(void* ptr, int device_ordinal)
 {
-    hipSetDevice(device_ordinal);
-    hipFree(ptr);
+    (void)hipSetDevice(device_ordinal);
+    (void)hipFree(ptr);
 }
 
 #endif // HAVE_ROCM
@@ -115,7 +115,7 @@ TEST(Test__GPUExpertTransfer, EnablePeerAccess)
     // Test that the call doesn't crash and handles the unavailable case gracefully.
     bool peer_available = GPUExpertTransfer::canAccessPeer(0, 1);
 
-    hipSetDevice(0);
+    (void)hipSetDevice(0);
     bool ok1 = GPUExpertTransfer::enablePeerAccess(1);
     bool ok2 = GPUExpertTransfer::enablePeerAccess(1);  // idempotent
 
@@ -189,8 +189,8 @@ TEST(Test__GPUExpertTransfer, D2D_Transfer)
     ASSERT_TRUE(ok);
 
     // Sync destination device
-    hipSetDevice(dst_dev);
-    hipDeviceSynchronize();
+    (void)hipSetDevice(dst_dev);
+    (void)hipDeviceSynchronize();
 
     // Download and verify
     std::vector<uint8_t> h_result_vnni(vnni_bytes);
@@ -288,8 +288,8 @@ TEST(Test__GPUExpertTransfer, D2D_Transfer_AllArrays)
         nullptr);
     ASSERT_TRUE(ok);
 
-    hipSetDevice(dst_dev);
-    hipDeviceSynchronize();
+    (void)hipSetDevice(dst_dev);
+    (void)hipDeviceSynchronize();
 
     // Download and verify all arrays
     std::vector<uint8_t> r_vnni(vnni_bytes);
@@ -381,8 +381,8 @@ TEST(Test__GPUExpertTransfer, D2D_Transfer_ZeroSizeOptional)
         nullptr);
     ASSERT_TRUE(ok);
 
-    hipSetDevice(dst_dev);
-    hipDeviceSynchronize();
+    (void)hipSetDevice(dst_dev);
+    (void)hipDeviceSynchronize();
 
     std::vector<uint8_t> r_vnni(vnni_bytes);
     std::vector<uint16_t> r_scales(scales_count);

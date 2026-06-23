@@ -511,6 +511,12 @@ function(discover_v2_parity_tests TARGET)
 
     # Paths for generated artifacts
     set(_ctest_file "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_discovered_tests.cmake")
+    set(_discovery_script "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityTestDiscovery.cmake")
+
+    # The generated CTest include is produced by a POST_BUILD command attached
+    # to the test binary. Make the binary relink when the discovery helper
+    # changes so stale "Discovery failed" files do not survive script fixes.
+    set_property(TARGET ${TARGET} APPEND PROPERTY LINK_DEPENDS "${_discovery_script}")
 
     # Working directory: project root (CMAKE_SOURCE_DIR is src/v2, go up two levels)
     get_filename_component(_working_dir "${CMAKE_SOURCE_DIR}/../.." ABSOLUTE)
@@ -528,7 +534,7 @@ function(discover_v2_parity_tests TARGET)
             -D "CORES_PER_SOCKET=${V2_TEST_CORES_PER_SOCKET}"
             -D "WORKING_DIR=${_working_dir}"
             -D "TIMEOUT=${ARG_TIMEOUT}"
-            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/V2ParityTestDiscovery.cmake"
+            -P "${_discovery_script}"
         BYPRODUCTS "${_ctest_file}"
         COMMENT "Discovering parity tests in ${TARGET}..."
         VERBATIM
@@ -7443,6 +7449,23 @@ target_link_libraries(v2_test_commands llaminar2_core GTest::gtest GTest::gtest_
 add_v2_test(V2_Unit_Commands
     COMMAND $<TARGET_FILE:v2_test_commands>
     LABELS "V2;Unit;CLI;Commands;DescribeCommand;PlanCommand"
+    MPI_PROCS 1
+)
+
+# RuntimeInitPhase: dry-run preflight lifecycle and reporting
+add_executable(v2_test_runtime_init_phase unit/app/Test__RuntimeInitPhase.cpp)
+target_include_directories(v2_test_runtime_init_phase PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}  # For tests/v2/mocks/ include path
+)
+target_link_libraries(v2_test_runtime_init_phase
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+    GTest::gmock
+)
+add_v2_test(V2_Unit_RuntimeInitPhase
+    COMMAND $<TARGET_FILE:v2_test_runtime_init_phase>
+    LABELS "V2;Unit;App;RuntimeInitPhase;DryRun"
     MPI_PROCS 1
 )
 

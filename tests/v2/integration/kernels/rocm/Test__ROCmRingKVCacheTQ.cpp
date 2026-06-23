@@ -72,7 +72,7 @@ namespace
         ~ScopedHipStream()
         {
             if (stream_)
-                hipStreamDestroy(stream_);
+                (void)hipStreamDestroy(stream_);
         }
 
         void *opaque() const { return static_cast<void *>(stream_); }
@@ -136,8 +136,8 @@ namespace
     {
         float *d_ptr = nullptr;
         size_t bytes = host_data.size() * sizeof(float);
-        hipMalloc(&d_ptr, bytes);
-        hipMemcpy(d_ptr, host_data.data(), bytes, hipMemcpyHostToDevice);
+        (void)hipMalloc(&d_ptr, bytes);
+        (void)hipMemcpy(d_ptr, host_data.data(), bytes, hipMemcpyHostToDevice);
         return d_ptr;
     }
 
@@ -145,7 +145,7 @@ namespace
     std::vector<float> downloadFP16ToFP32(const void *d_ptr, size_t count)
     {
         std::vector<uint16_t> h_fp16(count);
-        hipMemcpy(h_fp16.data(), d_ptr, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
+        (void)hipMemcpy(h_fp16.data(), d_ptr, count * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
         std::vector<float> result(count);
         for (size_t i = 0; i < count; ++i)
@@ -268,8 +268,8 @@ TEST(Test__ROCmRingKVCacheTQ, BasicAppendRetrieve_SplitTQ)
     LOG_INFO("[Test] ROCm Split TQ roundtrip: K cos=" << avg_cos_k << "/" << min_cos_k
                                                       << ", V cos=" << avg_cos_v << "/" << min_cos_v);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -319,8 +319,8 @@ TEST(Test__ROCmRingKVCacheTQ, WrapAround_PreservesNewest)
     ASSERT_NE(out_k, nullptr);
     EXPECT_EQ(out_k->shape()[0], static_cast<size_t>(max_seq_len));
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -363,8 +363,8 @@ TEST(Test__ROCmRingKVCacheTQ, IncrementalAppend_DecodeLike)
         stream.synchronize();
         EXPECT_EQ(cache->get_cached_tokens(0, 0), step + 1);
 
-        hipFree(d_K);
-        hipFree(d_V);
+        (void)hipFree(d_K);
+        (void)hipFree(d_V);
     }
 
     const ITensor *out_k = cache->get_k(0, 0);
@@ -420,8 +420,8 @@ TEST(Test__ROCmRingKVCacheTQ, MultiLayer_IndependentData)
         stream.synchronize();
         EXPECT_EQ(cache->get_cached_tokens(layer, 0), num_tokens);
 
-        hipFree(d_K);
-        hipFree(d_V);
+        (void)hipFree(d_K);
+        (void)hipFree(d_V);
     }
 
     // Verify layers are different
@@ -489,8 +489,8 @@ TEST(Test__ROCmRingKVCacheTQ, Clear_ResetsAllLayers)
     for (int l = 0; l < n_layers; ++l)
         EXPECT_EQ(cache->get_cached_tokens(l, 0), 0);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 TEST(Test__ROCmRingKVCacheTQ, AppendRequiresExplicitNonNullStream)
@@ -525,8 +525,8 @@ TEST(Test__ROCmRingKVCacheTQ, AppendRequiresExplicitNonNullStream)
     stream.synchronize();
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 TEST(Test__ROCmRingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch)
@@ -557,8 +557,8 @@ TEST(Test__ROCmRingKVCacheTQ, ClearSequenceLayerAndAllInvalidateConvertedScratch
         auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
         ASSERT_TRUE(appendWithTestStream(*cache, layer, seq_idx, k_view.get(), v_view.get(), num_tokens, stream));
         stream.synchronize();
-        hipFree(d_K);
-        hipFree(d_V);
+        (void)hipFree(d_K);
+        (void)hipFree(d_V);
     };
 
     append_seeded(0, 0, 10);
@@ -614,8 +614,8 @@ TEST(Test__ROCmRingKVCacheTQ, ClearThenReappendConvertedScratchUsesNewRows)
         auto v_view = std::make_unique<GpuTensorView>(d_V, num_tokens, kv_dim, TensorType::FP32, 0);
         ASSERT_TRUE(appendWithTestStream(*cache, 0, 0, k_view.get(), v_view.get(), num_tokens, stream));
         stream.synchronize();
-        hipFree(d_K);
-        hipFree(d_V);
+        (void)hipFree(d_K);
+        (void)hipFree(d_V);
     };
 
     auto h_K_a = generateRandomFP32(num_tokens * kv_dim, 900);
@@ -695,8 +695,8 @@ TEST(Test__ROCmRingKVCacheTQ, QuantizationError_WithinBounds)
 
     LOG_INFO("[Test] ROCm Quantization MSE: K=" << mse_k << " V=" << mse_v);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -738,7 +738,7 @@ TEST(Test__ROCmRingKVCacheTQ, KQuality_StrictlyBetterThan_V)
     EXPECT_GT(cos_k, cos_v) << "TQ8 K should be higher quality than TQ4 V";
     LOG_INFO("[Test] ROCm Same-data quality: K cos=" << cos_k << " V cos=" << cos_v);
 
-    hipFree(d_data);
+    (void)hipFree(d_data);
 }
 
 // =============================================================================
@@ -811,8 +811,8 @@ TEST(Test__ROCmRingKVCacheTQ, GetKVConverted_WithRoPE)
         v_diff += std::abs(v_noRoPE[i] - v_withRoPE[i]);
     EXPECT_LT(v_diff, 0.01f) << "RoPE should NOT modify V values";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -862,8 +862,8 @@ TEST(Test__ROCmRingKVCacheTQ, GetKVConverted_DequantOnly)
     for (size_t i = 0; i < result_K.size(); ++i)
         EXPECT_NEAR(result_K[i], direct_K[i], 1e-6f) << "Mismatch at index " << i;
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -907,8 +907,8 @@ TEST(Test__ROCmRingKVCacheTQ, Eviction_ReducesCount)
     cache->evict_oldest(0, 0, num_tokens);
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 0);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -963,10 +963,10 @@ TEST(Test__ROCmRingKVCacheTQ, ShadowInvalidation_AfterAppend)
     ASSERT_NE(k2, nullptr);
     EXPECT_EQ(k2->shape()[0], 8u); // 5 + 3
 
-    hipFree(d_K1);
-    hipFree(d_V1);
-    hipFree(d_K2);
-    hipFree(d_V2);
+    (void)hipFree(d_K1);
+    (void)hipFree(d_V1);
+    (void)hipFree(d_K2);
+    (void)hipFree(d_V2);
 }
 
 // =============================================================================
@@ -1016,8 +1016,8 @@ TEST(Test__ROCmRingKVCacheTQ, HeadDim128_BasicRoundtrip)
 
     LOG_INFO("[Test] ROCm HeadDim128 avg K cosine: " << avg_cos);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================
@@ -1082,8 +1082,8 @@ TEST(Test__ROCmRingKVCacheTQ, RoPE_PositionCorrectness)
         diff += std::abs(result_pos0[i] - result_pos10[i]);
     EXPECT_GT(diff, 0.01f) << "Different position offsets should produce different K values";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 }
 
 // =============================================================================

@@ -1109,47 +1109,47 @@ bool rocmGDN_gpu_malloc(float **ptr, size_t count)
 
 void rocmGDN_gpu_free(float *ptr)
 {
-    if (ptr) hipFree(ptr);
+    if (ptr) (void)hipFree(ptr);
 }
 
 void rocmGDN_gpu_memset_zero(float *ptr, size_t count)
 {
-    if (ptr && count > 0) hipMemset(ptr, 0, count * sizeof(float));
+    if (ptr && count > 0) (void)hipMemset(ptr, 0, count * sizeof(float));
 }
 
 void rocmGDN_gpu_memset_zero_async(float *ptr, size_t count, void *stream)
 {
-    if (ptr && count > 0) hipMemsetAsync(ptr, 0, count * sizeof(float), (hipStream_t)stream);
+    if (ptr && count > 0) (void)hipMemsetAsync(ptr, 0, count * sizeof(float), (hipStream_t)stream);
 }
 
 void rocmGDN_gpu_set_device(int ordinal)
 {
-    hipSetDevice(ordinal);
+    (void)hipSetDevice(ordinal);
 }
 
 void rocmGDN_gpu_memcpy(float *dst, const float *src, size_t count)
 {
-    hipMemcpy(dst, src, count * sizeof(float), hipMemcpyDefault);
+    (void)hipMemcpy(dst, src, count * sizeof(float), hipMemcpyDefault);
 }
 
 void rocmGDN_gpu_memcpy_async(float *dst, const float *src, size_t count, void *stream)
 {
-    hipMemcpyAsync(dst, src, count * sizeof(float), hipMemcpyDefault, (hipStream_t)stream);
+    (void)hipMemcpyAsync(dst, src, count * sizeof(float), hipMemcpyDefault, (hipStream_t)stream);
 }
 
 void rocmGDN_gpu_memcpy_d2h(float *host_dst, const float *device_src, size_t count)
 {
-    hipMemcpy(host_dst, device_src, count * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_dst, device_src, count * sizeof(float), hipMemcpyDeviceToHost);
 }
 
 void rocmGDN_gpu_memcpy_d2h_async(float *host_dst, const float *device_src, size_t count, void *stream)
 {
-    hipMemcpyAsync(host_dst, device_src, count * sizeof(float), hipMemcpyDeviceToHost, (hipStream_t)stream);
+    (void)hipMemcpyAsync(host_dst, device_src, count * sizeof(float), hipMemcpyDeviceToHost, (hipStream_t)stream);
 }
 
 void rocmGDN_stream_synchronize(void *stream)
 {
-    hipStreamSynchronize((hipStream_t)stream);
+    (void)hipStreamSynchronize((hipStream_t)stream);
 }
 
 bool rocmGDN_gpu_copy_capture_row_from_device_index(

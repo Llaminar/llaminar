@@ -88,17 +88,17 @@ protected:
         }
 
         rocm_device_id_ = 0;
-        hipSetDevice(rocm_device_id_);
+        (void)hipSetDevice(rocm_device_id_);
 
         // Get device properties
         hipDeviceProp_t props;
-        hipGetDeviceProperties(&props, rocm_device_id_);
+        (void)hipGetDeviceProperties(&props, rocm_device_id_);
         LOG_INFO("[Test] Using ROCm device: " << props.name << " (gfx" << props.gcnArchName << ")");
     }
 
     void TearDown() override
     {
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
     }
 
     // Reference CPU GEMM for validation: C = A @ B^T (row-major)
@@ -125,14 +125,14 @@ protected:
     float *allocate_and_copy_to_gpu(const std::vector<float> &host_data)
     {
         float *d_ptr = nullptr;
-        hipMalloc(&d_ptr, host_data.size() * sizeof(float));
-        hipMemcpy(d_ptr, host_data.data(), host_data.size() * sizeof(float), hipMemcpyHostToDevice);
+        (void)hipMalloc(&d_ptr, host_data.size() * sizeof(float));
+        (void)hipMemcpy(d_ptr, host_data.data(), host_data.size() * sizeof(float), hipMemcpyHostToDevice);
         return d_ptr;
     }
 
     void copy_from_gpu(float *d_ptr, std::vector<float> &host_data)
     {
-        hipMemcpy(host_data.data(), d_ptr, host_data.size() * sizeof(float), hipMemcpyDeviceToHost);
+        (void)hipMemcpy(host_data.data(), d_ptr, host_data.size() * sizeof(float), hipMemcpyDeviceToHost);
     }
 
     // Compute relative error
@@ -205,9 +205,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_SmallMatrix)
     EXPECT_LT(max_rel_err, 1e-5f);
     EXPECT_GT(cosine_sim, 0.9999f); // Expect near-perfect alignment
 
-    hipFree(d_A);
-    hipFree(d_B);
-    hipFree(d_C);
+    (void)hipFree(d_A);
+    (void)hipFree(d_B);
+    (void)hipFree(d_C);
 }
 
 TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen05B_Sizes)
@@ -245,9 +245,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen05B_Sizes)
     EXPECT_LT(max_rel_err, 0.1f);
     EXPECT_GT(cosine_sim, 0.999f); // Expect high alignment for GEMM
 
-    hipFree(d_A);
-    hipFree(d_B);
-    hipFree(d_C);
+    (void)hipFree(d_A);
+    (void)hipFree(d_B);
+    (void)hipFree(d_C);
 }
 
 TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen14B_Sizes)
@@ -285,9 +285,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Qwen14B_Sizes)
     EXPECT_LT(max_rel_err, 0.1f);
     EXPECT_GT(cosine_sim, 0.999f); // Expect high alignment for GEMM
 
-    hipFree(d_A);
-    hipFree(d_B);
-    hipFree(d_C);
+    (void)hipFree(d_A);
+    (void)hipFree(d_B);
+    (void)hipFree(d_C);
 }
 
 TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
@@ -314,7 +314,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
 
     // Warmup
     kernel.execute(d_A, d_B, d_C, M, N, K, false, true);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     // Benchmark
     const int num_iters = 10;
@@ -324,7 +324,7 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
     {
         kernel.execute(d_A, d_B, d_C, M, N, K, false, true);
     }
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     auto end = std::chrono::high_resolution_clock::now();
     double elapsed_ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -343,9 +343,9 @@ TEST_F(Test__ROCmFloatingPointGemmKernel, HipBLASGemmKernel_Performance)
     // Note: No performance assertion - GFLOPS varies significantly when
     // running in parallel with other GPU tests due to resource contention
 
-    hipFree(d_A);
-    hipFree(d_B);
-    hipFree(d_C);
+    (void)hipFree(d_A);
+    (void)hipFree(d_B);
+    (void)hipFree(d_C);
 }
 
 // ============================================================================

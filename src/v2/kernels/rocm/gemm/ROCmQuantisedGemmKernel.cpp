@@ -791,7 +791,7 @@ namespace llaminar2
                     {
                         if (ptr)
                         {
-                            hipHostFree(ptr);
+                            (void)hipHostFree(ptr);
                             ptr = nullptr;
                         }
                     };
@@ -957,12 +957,12 @@ namespace llaminar2
                         rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, device_id);
 #ifdef HAVE_ROCM
                     if (upload.d_native_vnni_scales)
-                        hipFree(upload.d_native_vnni_scales);
+                        (void)hipFree(upload.d_native_vnni_scales);
                     if (upload.d_native_vnni_mins)
-                        hipFree(upload.d_native_vnni_mins);
+                        (void)hipFree(upload.d_native_vnni_mins);
                     freeStartupPinnedStaging(upload);
                     if (upload.startup_h2d_stream)
-                        hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
+                        (void)hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
 #endif
                 }
             }
@@ -1010,13 +1010,13 @@ namespace llaminar2
                     return;
                 device_id = dev_id;
                 count = std::min(num_streams, MAX_STREAMS);
-                hipSetDevice(dev_id);
+                (void)hipSetDevice(dev_id);
                 for (int i = 0; i < count; ++i)
                 {
-                    hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
-                    hipEventCreateWithFlags(&completion[i], hipEventDisableTiming);
+                    (void)hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking);
+                    (void)hipEventCreateWithFlags(&completion[i], hipEventDisableTiming);
                 }
-                hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
+                (void)hipEventCreateWithFlags(&quant_ready, hipEventDisableTiming);
                 initialized = true;
                 LOG_DEBUG("[ConcurrentPrefillPool] Initialized " << count
                                                                  << " streams on device " << dev_id);
@@ -1033,13 +1033,13 @@ namespace llaminar2
                 // Free old
                 if (scratch[idx])
                 {
-                    hipSetDevice(device_id);
-                    hipFree(scratch[idx]);
+                    (void)hipSetDevice(device_id);
+                    (void)hipFree(scratch[idx]);
                     scratch[idx] = nullptr;
                     scratch_capacity[idx] = 0;
                 }
 
-                hipSetDevice(device_id);
+                (void)hipSetDevice(device_id);
                 hipError_t err = hipMalloc(&scratch[idx], elements * sizeof(int32_t));
                 if (err != hipSuccess)
                 {
@@ -1064,13 +1064,13 @@ namespace llaminar2
 
                 if (scatter_partial[idx])
                 {
-                    hipSetDevice(device_id);
-                    hipFree(scatter_partial[idx]);
+                    (void)hipSetDevice(device_id);
+                    (void)hipFree(scatter_partial[idx]);
                     scatter_partial[idx] = nullptr;
                     scatter_partial_capacity[idx] = 0;
                 }
 
-                hipSetDevice(device_id);
+                (void)hipSetDevice(device_id);
                 hipError_t err = hipMalloc(&scatter_partial[idx], elements * sizeof(float));
                 if (err != hipSuccess)
                 {
@@ -1089,35 +1089,35 @@ namespace llaminar2
             {
                 if (!initialized)
                     return;
-                hipSetDevice(device_id);
+                (void)hipSetDevice(device_id);
                 for (int i = 0; i < count; ++i)
                 {
                     if (streams[i])
                     {
-                        hipStreamDestroy(streams[i]);
+                        (void)hipStreamDestroy(streams[i]);
                         streams[i] = nullptr;
                     }
                     if (completion[i])
                     {
-                        hipEventDestroy(completion[i]);
+                        (void)hipEventDestroy(completion[i]);
                         completion[i] = nullptr;
                     }
                     if (scratch[i])
                     {
-                        hipFree(scratch[i]);
+                        (void)hipFree(scratch[i]);
                         scratch[i] = nullptr;
                         scratch_capacity[i] = 0;
                     }
                     if (scatter_partial[i])
                     {
-                        hipFree(scatter_partial[i]);
+                        (void)hipFree(scatter_partial[i]);
                         scatter_partial[i] = nullptr;
                         scatter_partial_capacity[i] = 0;
                     }
                 }
                 if (quant_ready)
                 {
-                    hipEventDestroy(quant_ready);
+                    (void)hipEventDestroy(quant_ready);
                     quant_ready = nullptr;
                 }
                 initialized = false;
@@ -2968,7 +2968,7 @@ namespace llaminar2
                         // Bulk DMA from HBM workspace to output
                         if (gemv_output_needs_copyout)
                         {
-                            hipMemcpyAsync(d_output, impl_->d_C_fp32,
+                            (void)hipMemcpyAsync(d_output, impl_->d_C_fp32,
                                            static_cast<size_t>(n) * sizeof(float),
                                            hipMemcpyDeviceToDevice,
                                            static_cast<hipStream_t>(gpu_stream_));
@@ -3013,7 +3013,7 @@ namespace llaminar2
                         // Bulk DMA from HBM workspace to output
                         if (gemv_output_needs_copyout)
                         {
-                            hipMemcpyAsync(d_output, impl_->d_C_fp32,
+                            (void)hipMemcpyAsync(d_output, impl_->d_C_fp32,
                                            static_cast<size_t>(n) * sizeof(float),
                                            hipMemcpyDeviceToDevice,
                                            static_cast<hipStream_t>(gpu_stream_));
@@ -3263,24 +3263,24 @@ namespace llaminar2
                                 if (!use_gpu_path)
                                 {
                                     float *host_dst = C_fp32->mutable_data();
-                                    hipMemcpyAsync(host_dst, d_prefill_output,
+                                    (void)hipMemcpyAsync(host_dst, d_prefill_output,
                                                    nvnni_c_size * sizeof(float),
                                                    hipMemcpyDeviceToHost,
                                                    static_cast<hipStream_t>(gpu_stream_));
-                                    hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                                    (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
                                 }
                                 else if (output_is_mapped)
                                 {
                                     float *host_dst = C_fp32->mutable_data();
-                                    hipMemcpyAsync(host_dst, d_prefill_output,
+                                    (void)hipMemcpyAsync(host_dst, d_prefill_output,
                                                    nvnni_c_size * sizeof(float),
                                                    hipMemcpyDeviceToHost,
                                                    static_cast<hipStream_t>(gpu_stream_));
-                                    hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                                    (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
                                 }
                                 else
                                 {
-                                    hipMemcpyAsync(d_output, d_prefill_output,
+                                    (void)hipMemcpyAsync(d_output, d_prefill_output,
                                                    nvnni_c_size * sizeof(float),
                                                    hipMemcpyDeviceToDevice,
                                                    static_cast<hipStream_t>(gpu_stream_));
@@ -3319,7 +3319,7 @@ namespace llaminar2
                             float *host_dst = C_fp32->mutable_data();
                             const size_t copy_bytes = prefill_c_size * sizeof(float);
 
-                            hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                            (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
 
                             auto copy_start = std::chrono::high_resolution_clock::now();
                             hipError_t err = hipMemcpy(
@@ -3633,7 +3633,7 @@ namespace llaminar2
                     auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
 
                     // Record event after quantization completes on main stream
-                    hipEventRecord(pool.quant_ready,
+                    (void)hipEventRecord(pool.quant_ready,
                                    static_cast<hipStream_t>(gpu_stream_));
 
                     for (int pi = 0; pi < num_proj; ++pi)
@@ -3705,12 +3705,12 @@ namespace llaminar2
                         }
 
                         // This stream waits for quantization to complete
-                        hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
+                        (void)hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
 
                         // If projections > streams, wait for previous projection on this stream
                         if (pi >= pool.count)
                         {
-                            hipStreamWaitEvent(pool.streams[stream_idx],
+                            (void)hipStreamWaitEvent(pool.streams[stream_idx],
                                                pool.completion[stream_idx], 0);
                         }
 
@@ -3743,14 +3743,14 @@ namespace llaminar2
                         }
 
                         // Record completion event for this stream
-                        hipEventRecord(pool.completion[stream_idx],
+                        (void)hipEventRecord(pool.completion[stream_idx],
                                        pool.streams[stream_idx]);
                     }
 
                     // All projections dispatched — main stream waits for completion
                     for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                     {
-                        hipStreamWaitEvent(
+                        (void)hipStreamWaitEvent(
                             static_cast<hipStream_t>(gpu_stream_),
                             pool.completion[si], 0);
                     }
@@ -3830,7 +3830,7 @@ namespace llaminar2
                     auto &pool = getSharedPrefillPool(rocm_device_id_, num_proj);
 
                     // Record event after quantization completes on main stream
-                    hipEventRecord(pool.quant_ready,
+                    (void)hipEventRecord(pool.quant_ready,
                                    static_cast<hipStream_t>(gpu_stream_));
 
                     for (int pi = 0; pi < num_proj; ++pi)
@@ -3863,12 +3863,12 @@ namespace llaminar2
                         int stream_idx = pi % pool.count;
 
                         // This stream waits for quantization
-                        hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
+                        (void)hipStreamWaitEvent(pool.streams[stream_idx], pool.quant_ready, 0);
 
                         // If reusing a stream, wait for its previous work
                         if (pi >= pool.count)
                         {
-                            hipStreamWaitEvent(pool.streams[stream_idx],
+                            (void)hipStreamWaitEvent(pool.streams[stream_idx],
                                                pool.completion[stream_idx], 0);
                         }
 
@@ -3940,14 +3940,14 @@ namespace llaminar2
                             }
                         }
 
-                        hipEventRecord(pool.completion[stream_idx],
+                        (void)hipEventRecord(pool.completion[stream_idx],
                                        pool.streams[stream_idx]);
                     }
 
                     // All projections dispatched — main stream waits for completion
                     for (int si = 0; si < std::min(num_proj, pool.count); ++si)
                     {
-                        hipStreamWaitEvent(
+                        (void)hipStreamWaitEvent(
                             static_cast<hipStream_t>(gpu_stream_),
                             pool.completion[si], 0);
                     }
@@ -4657,15 +4657,15 @@ namespace llaminar2
                             if (output_is_mapped)
                             {
                                 float *host_dst = fp32_output->mutable_data();
-                                hipMemcpyAsync(host_dst, d_native_output,
+                                (void)hipMemcpyAsync(host_dst, d_native_output,
                                                output_bytes,
                                                hipMemcpyDeviceToHost,
                                                static_cast<hipStream_t>(gpu_stream_));
-                                hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                                (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
                             }
                             else
                             {
-                                hipMemcpyAsync(d_output, d_native_output,
+                                (void)hipMemcpyAsync(d_output, d_native_output,
                                                output_bytes,
                                                hipMemcpyDeviceToDevice,
                                                static_cast<hipStream_t>(gpu_stream_));
@@ -4815,15 +4815,15 @@ namespace llaminar2
                         if (output_is_mapped)
                         {
                             float *host_dst = fp32_output->mutable_data();
-                            hipMemcpyAsync(host_dst, d_prefill_output,
+                            (void)hipMemcpyAsync(host_dst, d_prefill_output,
                                            output_bytes,
                                            hipMemcpyDeviceToHost,
                                            static_cast<hipStream_t>(gpu_stream_));
-                            hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                            (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
                         }
                         else
                         {
-                            hipMemcpyAsync(d_output, d_prefill_output,
+                            (void)hipMemcpyAsync(d_output, d_prefill_output,
                                            output_bytes,
                                            hipMemcpyDeviceToDevice,
                                            static_cast<hipStream_t>(gpu_stream_));
@@ -4884,15 +4884,15 @@ namespace llaminar2
                         if (output_is_mapped)
                         {
                             float *host_dst = fp32_output->mutable_data();
-                            hipMemcpyAsync(host_dst, d_prefill_output,
+                            (void)hipMemcpyAsync(host_dst, d_prefill_output,
                                            output_bytes,
                                            hipMemcpyDeviceToHost,
                                            static_cast<hipStream_t>(gpu_stream_));
-                            hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
+                            (void)hipStreamSynchronize(static_cast<hipStream_t>(gpu_stream_));
                         }
                         else
                         {
-                            hipMemcpyAsync(d_output, d_prefill_output,
+                            (void)hipMemcpyAsync(d_output, d_prefill_output,
                                            output_bytes,
                                            hipMemcpyDeviceToDevice,
                                            static_cast<hipStream_t>(gpu_stream_));
@@ -5228,7 +5228,7 @@ namespace llaminar2
                         freeStartupPinnedStaging(upload);
                         if (upload.startup_h2d_stream)
                         {
-                            hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
+                            (void)hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
                         }
                         upload.startup_h2d_stream = nullptr;
                         h2d_upload_stream = nullptr;
@@ -5379,7 +5379,7 @@ namespace llaminar2
                                     if (err != hipSuccess)
                                     {
 #ifdef HAVE_ROCM
-                                        hipFree(d_scales_tmp);
+                                        (void)hipFree(d_scales_tmp);
 #endif
                                         upload.d_native_vnni_scales = nullptr;
                                         LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
@@ -5424,7 +5424,7 @@ namespace llaminar2
                                     if (err != hipSuccess)
                                     {
 #ifdef HAVE_ROCM
-                                        hipFree(d_mins_tmp);
+                                        (void)hipFree(d_mins_tmp);
 #endif
                                         upload.d_native_vnni_mins = nullptr;
                                         LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
@@ -5467,7 +5467,7 @@ namespace llaminar2
                                     if (err != hipSuccess)
                                     {
 #ifdef HAVE_ROCM
-                                        hipFree(d_emins_tmp);
+                                        (void)hipFree(d_emins_tmp);
 #endif
                                         upload.d_native_vnni_emins = nullptr;
                                         LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
@@ -5494,8 +5494,8 @@ namespace llaminar2
 #ifdef HAVE_ROCM
                         if (h2d_upload_stream)
                         {
-                            hipStreamSynchronize(h2d_upload_stream);
-                            hipStreamDestroy(h2d_upload_stream);
+                            (void)hipStreamSynchronize(h2d_upload_stream);
+                            (void)hipStreamDestroy(h2d_upload_stream);
                             h2d_upload_stream = nullptr;
                             upload.startup_h2d_stream = nullptr;
                         }

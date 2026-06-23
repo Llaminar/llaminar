@@ -368,11 +368,11 @@ TEST_F(Test__ROCmRingKVCache_Sharding, ShardedCache_AppendAndRetrieve)
     }
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * local_kv_dim * sizeof(float));
-    hipMalloc(&d_V, num_tokens * local_kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K.data(), num_tokens * local_kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(h_V.data(), h_V.data(), num_tokens * local_kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), num_tokens * local_kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * local_kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, num_tokens * local_kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K.data(), num_tokens * local_kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(h_V.data(), h_V.data(), num_tokens * local_kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), num_tokens * local_kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
@@ -384,8 +384,8 @@ TEST_F(Test__ROCmRingKVCache_Sharding, ShardedCache_AppendAndRetrieve)
 
     std::vector<float> h_K_out(num_tokens * local_kv_dim);
     std::vector<float> h_V_out(num_tokens * local_kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, num_tokens * local_kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, num_tokens * local_kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, num_tokens * local_kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, num_tokens * local_kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     for (size_t i = 0; i < h_K.size(); ++i)
     {
@@ -393,8 +393,8 @@ TEST_F(Test__ROCmRingKVCache_Sharding, ShardedCache_AppendAndRetrieve)
         EXPECT_FLOAT_EQ(h_V_out[i], h_V[i]);
     }
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[ShardedCache_AppendAndRetrieve] PASSED");
 }

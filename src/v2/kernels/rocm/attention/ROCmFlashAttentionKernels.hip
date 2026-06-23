@@ -550,7 +550,7 @@ namespace
         if (!cfg.initialized)
         {
             hipDeviceProp_t prop;
-            hipGetDeviceProperties(&prop, device);
+            (void)hipGetDeviceProperties(&prop, device);
 
             // Parse gcnArchName string (e.g., "gfx906") to extract arch number
             // gcnArchName format: "gfx" + arch_number
@@ -1698,7 +1698,7 @@ static int launch_decode(
     float softmax_scale = 1.0f / sqrtf(static_cast<float>(head_dim));
 
     int current_device = 0;
-    hipGetDevice(&current_device);
+    (void)hipGetDevice(&current_device);
     const int num_cus = getDeviceConfig(current_device).num_cus;
 
     const DecodeAutotuneSelection tuned = chooseDecodeLaunchConfig(kv_len, head_dim, num_splits, n_heads, num_cus);
@@ -1710,7 +1710,7 @@ static int launch_decode(
     // will invalidate the capture graph.
     hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
     if (hip_stream)
-        hipStreamIsCapturing(hip_stream, &capture_status);
+        (void)hipStreamIsCapturing(hip_stream, &capture_status);
     const bool is_capturing = (capture_status == hipStreamCaptureStatusActive);
 
     hipEvent_t tune_start = nullptr;
@@ -1720,14 +1720,14 @@ static int launch_decode(
     {
         if (hipEventCreate(&tune_start) == hipSuccess && hipEventCreate(&tune_stop) == hipSuccess)
         {
-            hipEventRecord(tune_start, hip_stream);
+            (void)hipEventRecord(tune_start, hip_stream);
         }
         else
         {
             if (tune_start)
-                hipEventDestroy(tune_start);
+                (void)hipEventDestroy(tune_start);
             if (tune_stop)
-                hipEventDestroy(tune_stop);
+                (void)hipEventDestroy(tune_stop);
             tune_start = nullptr;
             tune_stop = nullptr;
         }
@@ -1765,7 +1765,7 @@ static int launch_decode(
 
     if (tune_start && tune_stop)
     {
-        hipEventRecord(tune_stop, hip_stream);
+        (void)hipEventRecord(tune_stop, hip_stream);
         if (hipEventSynchronize(tune_stop) == hipSuccess)
         {
             float elapsed_ms = 0.0f;
@@ -1774,8 +1774,8 @@ static int launch_decode(
                 recordDecodeAutotuneResult(tuned.key, tuned.candidate_index, elapsed_ms);
             }
         }
-        hipEventDestroy(tune_start);
-        hipEventDestroy(tune_stop);
+        (void)hipEventDestroy(tune_start);
+        (void)hipEventDestroy(tune_stop);
     }
 
     (void)hipGetLastError();  // Clear stale errors
@@ -1979,25 +1979,25 @@ static PrefillPoolState& get_stream_pool(int device_id) {
     if (it != s_stream_pools.end()) return it->second;
 
     // Ensure streams/handles are created on the correct device for multi-GPU TP
-    hipSetDevice(device_id);
+    (void)hipSetDevice(device_id);
 
     auto& state = s_stream_pools[device_id];
     for (int i = 0; i < NUM_PREFILL_STREAMS; i++) {
-        hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
+        (void)hipStreamCreateWithFlags(&state.streams[i].stream, hipStreamNonBlocking);
         hipblasCreate(&state.streams[i].handle);
         hipblasSetStream(state.streams[i].handle, state.streams[i].stream);
         // Disable atomic reductions inside rocBLAS/Tensile GEMM kernels for
         // deterministic output (see get_cached_rocblas_handle for rationale).
         hipblasSetAtomicsMode(state.streams[i].handle, HIPBLAS_ATOMICS_NOT_ALLOWED);
-        hipEventCreateWithFlags(&state.streams[i].completion_event, hipEventDisableTiming);
+        (void)hipEventCreateWithFlags(&state.streams[i].completion_event, hipEventDisableTiming);
     }
-    hipEventCreateWithFlags(&state.input_ready, hipEventDisableTiming);
+    (void)hipEventCreateWithFlags(&state.input_ready, hipEventDisableTiming);
     return state;
 }
 
 static float* ensure_scores_buffer(PrefillStreamCtx& ctx, size_t required_bytes) {
     if (required_bytes > ctx.scores_cap) {
-        if (ctx.scores_buf) hipFree(ctx.scores_buf);
+        if (ctx.scores_buf) (void)hipFree(ctx.scores_buf);
         hipError_t err = hipMalloc(&ctx.scores_buf, required_bytes);
         if (err != hipSuccess) {
             ctx.scores_buf = nullptr;
@@ -2035,7 +2035,7 @@ static int rocblas_prefill_impl(
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
-    hipGetDevice(&device_id);
+    (void)hipGetDevice(&device_id);
 
     auto& pool_state = get_stream_pool(device_id);
     auto& pool = pool_state.streams;
@@ -2045,9 +2045,9 @@ static int rocblas_prefill_impl(
     // on hip_stream. Pool streams use hipStreamNonBlocking, which does NOT
     // implicitly sync with the caller's stream. Without this fence, pool
     // streams can read stale Q/K/V data from prior pipeline iterations.
-    hipEventRecord(pool_state.input_ready, hip_stream);
+    (void)hipEventRecord(pool_state.input_ready, hip_stream);
     for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-        hipStreamWaitEvent(pool[s].stream, pool_state.input_ready, 0);
+        (void)hipStreamWaitEvent(pool[s].stream, pool_state.input_ready, 0);
     }
 
     const int gqa_ratio = n_heads / n_kv_heads;
@@ -2172,8 +2172,8 @@ static int rocblas_prefill_impl(
         // No CPU-side sync needed — all downstream stages operate on hip_stream
         // which will wait for the events before proceeding.
         for (int s = 0; s < NUM_PREFILL_STREAMS; s++) {
-            hipEventRecord(pool[s].completion_event, pool[s].stream);
-            hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
+            (void)hipEventRecord(pool[s].completion_event, pool[s].stream);
+            (void)hipStreamWaitEvent(hip_stream, pool[s].completion_event, 0);
         }
     }
 
@@ -2265,8 +2265,8 @@ static float* get_dequant_buffer(int device_id, size_t required_bytes) {
     auto& buf = s_dequant_bufs[device_id];
     if (required_bytes > buf.cap) {
         // Ensure allocation targets the correct device for multi-GPU TP
-        hipSetDevice(device_id);
-        if (buf.ptr) hipFree(buf.ptr);
+        (void)hipSetDevice(device_id);
+        if (buf.ptr) (void)hipFree(buf.ptr);
         hipError_t err = hipMalloc(&buf.ptr, required_bytes);
         if (err != hipSuccess) {
             printf("[rocblas_prefill] hipMalloc failed for dequant buffer (%zu bytes)\n", required_bytes);
@@ -2297,7 +2297,7 @@ static int rocblas_prefill_fp16_impl(
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
-    hipGetDevice(&device_id);
+    (void)hipGetDevice(&device_id);
 
     // Dequant buffer: space for both K and V as FP32
     const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
@@ -2347,7 +2347,7 @@ static int rocblas_prefill_q8_1_impl(
     int head_start = 0, int gqa_n_rep = 0)
 {
     int device_id = 0;
-    hipGetDevice(&device_id);
+    (void)hipGetDevice(&device_id);
 
     const size_t kv_elements = static_cast<size_t>(kv_len) * n_kv_heads * head_dim;
     const size_t dequant_bytes = 2 * kv_elements * sizeof(float);
@@ -2752,13 +2752,13 @@ extern "C"
             return -1;
         if (hipMalloc(partial_m, m_size) != hipSuccess)
         {
-            hipFree(*partial_output);
+            (void)hipFree(*partial_output);
             return -1;
         }
         if (hipMalloc(partial_l, l_size) != hipSuccess)
         {
-            hipFree(*partial_output);
-            hipFree(*partial_m);
+            (void)hipFree(*partial_output);
+            (void)hipFree(*partial_m);
             return -1;
         }
 
@@ -2771,11 +2771,11 @@ extern "C"
     void hipFlashAttn_freeWorkspace(void *partial_output, void *partial_m, void *partial_l)
     {
         if (partial_output)
-            hipFree(partial_output);
+            (void)hipFree(partial_output);
         if (partial_m)
-            hipFree(partial_m);
+            (void)hipFree(partial_m);
         if (partial_l)
-            hipFree(partial_l);
+            (void)hipFree(partial_l);
     }
 
     /**

@@ -30,10 +30,10 @@ protected:
         GTEST_SKIP() << "No ROCm support compiled";
 #else
         int device_count = 0;
-        hipGetDeviceCount(&device_count);
+        (void)hipGetDeviceCount(&device_count);
         if (device_count <= 0)
             GTEST_SKIP() << "No ROCm device available";
-        hipSetDevice(0);
+        (void)hipSetDevice(0);
 #endif
     }
 };
@@ -185,11 +185,11 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_ChunkForward_FailsDuringCapture_NoSt
 
     // Allocate dummy device buffers for the call
     float *d_buf = nullptr;
-    hipMalloc(&d_buf, static_cast<size_t>(seq_len * n_heads * d_k) * sizeof(float));
-    hipMemset(d_buf, 0, static_cast<size_t>(seq_len * n_heads * d_k) * sizeof(float));
+    (void)hipMalloc(&d_buf, static_cast<size_t>(seq_len * n_heads * d_k) * sizeof(float));
+    (void)hipMemset(d_buf, 0, static_cast<size_t>(seq_len * n_heads * d_k) * sizeof(float));
 
     float *d_output = nullptr;
-    hipMalloc(&d_output, static_cast<size_t>(seq_len * n_heads * d_v) * sizeof(float));
+    (void)hipMalloc(&d_output, static_cast<size_t>(seq_len * n_heads * d_v) * sizeof(float));
 
     // State not allocated — under capture, chunk_forward should fail
     {
@@ -216,8 +216,8 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_ChunkForward_FailsDuringCapture_NoSt
         EXPECT_TRUE(result);
     }
 
-    hipFree(d_buf);
-    hipFree(d_output);
+    (void)hipFree(d_buf);
+    (void)hipFree(d_output);
 #endif
 }
 
@@ -236,11 +236,11 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_RecurrentStep_FailsDuringCapture_NoS
     const int state_size = n_heads * d_k * d_v;
 
     float *d_buf = nullptr;
-    hipMalloc(&d_buf, static_cast<size_t>(n_heads * d_k) * sizeof(float));
-    hipMemset(d_buf, 0, static_cast<size_t>(n_heads * d_k) * sizeof(float));
+    (void)hipMalloc(&d_buf, static_cast<size_t>(n_heads * d_k) * sizeof(float));
+    (void)hipMemset(d_buf, 0, static_cast<size_t>(n_heads * d_k) * sizeof(float));
 
     float *d_output = nullptr;
-    hipMalloc(&d_output, static_cast<size_t>(n_heads * d_v) * sizeof(float));
+    (void)hipMalloc(&d_output, static_cast<size_t>(n_heads * d_v) * sizeof(float));
 
     // No state — should fail under capture
     {
@@ -262,8 +262,8 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_RecurrentStep_FailsDuringCapture_NoS
         EXPECT_TRUE(result);
     }
 
-    hipFree(d_buf);
-    hipFree(d_output);
+    (void)hipFree(d_buf);
+    (void)hipFree(d_output);
 #endif
 }
 
@@ -299,8 +299,8 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
     size_t small_total = static_cast<size_t>(small_seq) * n_v_heads * d_k * 2 +
                          static_cast<size_t>(small_seq) * n_v_heads * d_v;
     float *d_merged = nullptr;
-    hipMalloc(&d_merged, small_total * sizeof(float));
-    hipMemset(d_merged, 0, small_total * sizeof(float));
+    (void)hipMalloc(&d_merged, small_total * sizeof(float));
+    (void)hipMemset(d_merged, 0, small_total * sizeof(float));
 
     float *d_q = nullptr, *d_k_out = nullptr, *d_v_out = nullptr;
     EXPECT_FALSE(gdn.deinterleave_qkv_device(
@@ -320,8 +320,8 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
     size_t big_total = static_cast<size_t>(big_seq) * n_v_heads * d_k * 2 +
                        static_cast<size_t>(big_seq) * n_v_heads * d_v;
     float *d_merged_big = nullptr;
-    hipMalloc(&d_merged_big, big_total * sizeof(float));
-    hipMemset(d_merged_big, 0, big_total * sizeof(float));
+    (void)hipMalloc(&d_merged_big, big_total * sizeof(float));
+    (void)hipMemset(d_merged_big, 0, big_total * sizeof(float));
 
     {
         GraphCaptureGuard guard;
@@ -347,7 +347,7 @@ TEST_F(Test__PrefillGraphCaptureGuards, GDN_DeinterleaveQKV_RequiresBoundWorkspa
             big_seq, n_k_heads, n_v_heads, d_k, d_v, 0));
     }
 
-    hipFree(d_merged);
-    hipFree(d_merged_big);
+    (void)hipFree(d_merged);
+    (void)hipFree(d_merged_big);
 #endif
 }

@@ -39,6 +39,7 @@
 #include <memory>
 #include <mutex>
 #include <atomic>
+#include <cstdio>
 #include <optional>
 #include <utility>
 
@@ -151,6 +152,7 @@ namespace llaminar2
         // =====================================================================
 
         bool initialize() override;
+        bool initializeForDryRun() override;
         void shutdown() override;
 
         // =====================================================================
@@ -359,7 +361,7 @@ namespace llaminar2
         /**
          * @brief Load model weights (partial for PP, sharded for TP)
          */
-        bool loadWeights();
+        bool loadWeights(bool prepopulate_page_cache = true);
 
         bool freezeMoEExpertOverlayPlanForLoadedModel();
 
@@ -441,7 +443,7 @@ namespace llaminar2
          * Called after all validation passes, before buildComputeGraph().
          * Consolidates topology, config, model, and preflight info.
          */
-        void printStartupBanner();
+        void printStartupBanner(FILE *stream = stderr);
 
         bool shouldUseMTPDecode() const;
         std::string mtpDecodeHardFailureReason() const;
