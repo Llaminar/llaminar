@@ -67,7 +67,7 @@ jobs:
     name: Publish release artefacts
     if: needs.release-please.outputs.release_created == 'true'
     needs: [release-please, ci]
-    runs-on: llaminar-xeon
+    runs-on: [self-hosted, linux, x64, llaminar-bench]
     timeout-minutes: 30
     steps:
       - name: Log in to GHCR
