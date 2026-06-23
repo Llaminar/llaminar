@@ -29,6 +29,7 @@ on:
       - '.editorconfig'
       - '**/*.md'
       - '**/.gitkeep'
+  workflow_dispatch:
   workflow_call:
     inputs:
       image-tag:
