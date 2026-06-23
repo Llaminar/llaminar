@@ -187,9 +187,9 @@ namespace
             has_device_ = (err == hipSuccess && count > 0);
             if (has_device_)
             {
-                hipSetDevice(device_id_);
+                (void)hipSetDevice(device_id_);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, device_id_);
+                (void)hipGetDeviceProperties(&props, device_id_);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
                 num_cus_ = props.multiProcessorCount;
             }
@@ -240,10 +240,10 @@ namespace
             float *d_Q = nullptr, *d_O = nullptr;
             void *d_K = nullptr, *d_V = nullptr;
 
-            hipMalloc(&d_Q, q_size * sizeof(float));
-            hipMalloc(&d_K, k_bytes);
-            hipMalloc(&d_V, v_bytes);
-            hipMalloc(&d_O, out_size * sizeof(float));
+            (void)hipMalloc(&d_Q, q_size * sizeof(float));
+            (void)hipMalloc(&d_K, k_bytes);
+            (void)hipMalloc(&d_V, v_bytes);
+            (void)hipMalloc(&d_O, out_size * sizeof(float));
 
             // Initialize Q with random data
             {
@@ -252,7 +252,7 @@ namespace
                 std::normal_distribution<float> dist(0.0f, 0.1f);
                 for (auto &v : h_Q)
                     v = dist(rng);
-                hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_Q, h_Q.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
             }
 
             // Initialize KV with random data (appropriate format)
@@ -263,10 +263,10 @@ namespace
                 std::normal_distribution<float> dist(0.0f, 0.1f);
                 for (auto &v : h_KV)
                     v = dist(rng);
-                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
                 for (auto &v : h_KV)
                     v = dist(rng);
-                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
             else if (kv_type == KVType::FP16)
             {
@@ -282,7 +282,7 @@ namespace
                     int mantissa = rng() & 0x3FF;
                     v = static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
                 }
-                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
                 for (auto &v : h_KV)
                 {
                     int sign = rng() & 1;
@@ -290,7 +290,7 @@ namespace
                     int mantissa = rng() & 0x3FF;
                     v = static_cast<uint16_t>((sign << 15) | (exp << 10) | mantissa);
                 }
-                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
             else
             {
@@ -299,13 +299,13 @@ namespace
                 std::mt19937 rng(123);
                 for (auto &v : h_KV)
                     v = static_cast<uint8_t>(rng() & 0xFF);
-                hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_K, h_KV.data(), k_bytes, hipMemcpyHostToDevice);
                 h_KV.resize(v_bytes);
                 for (auto &v : h_KV)
                     v = static_cast<uint8_t>(rng() & 0xFF);
-                hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
+                (void)hipMemcpy(d_V, h_KV.data(), v_bytes, hipMemcpyHostToDevice);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Lambda to dispatch based on KV type
             auto launch = [&]() -> int
@@ -347,21 +347,21 @@ namespace
                     goto cleanup;
                 }
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
 
             // Benchmark with HIP events
             {
                 hipEvent_t ev_start, ev_stop;
-                hipEventCreate(&ev_start);
-                hipEventCreate(&ev_stop);
+                (void)hipEventCreate(&ev_start);
+                (void)hipEventCreate(&ev_stop);
 
                 std::vector<double> times_us;
                 times_us.reserve(BENCH_ITERS);
 
                 for (int i = 0; i < BENCH_ITERS; ++i)
                 {
-                    hipDeviceSynchronize();
-                    hipEventRecord(ev_start, nullptr);
+                    (void)hipDeviceSynchronize();
+                    (void)hipEventRecord(ev_start, nullptr);
 
                     int rc = launch();
                     if (rc != 0)
@@ -372,16 +372,16 @@ namespace
                         goto cleanup;
                     }
 
-                    hipEventRecord(ev_stop, nullptr);
-                    hipEventSynchronize(ev_stop);
+                    (void)hipEventRecord(ev_stop, nullptr);
+                    (void)hipEventSynchronize(ev_stop);
 
                     float ms = 0.0f;
-                    hipEventElapsedTime(&ms, ev_start, ev_stop);
+                    (void)hipEventElapsedTime(&ms, ev_start, ev_stop);
                     times_us.push_back(static_cast<double>(ms) * 1000.0);
                 }
 
-                hipEventDestroy(ev_start);
-                hipEventDestroy(ev_stop);
+                (void)hipEventDestroy(ev_start);
+                (void)hipEventDestroy(ev_stop);
 
                 std::sort(times_us.begin(), times_us.end());
                 result.min_us = times_us.front();

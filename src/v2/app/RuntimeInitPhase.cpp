@@ -27,6 +27,32 @@
 namespace llaminar2
 {
 
+    bool RuntimeInitPhase::runDryRunPreflight(OrchestrationConfig &config,
+                                              IOrchestrationRunner &runner,
+                                              int mpi_rank,
+                                              std::ostream &out)
+    {
+        if (!runner.initializeForDryRun())
+        {
+            if (mpi_rank == 0)
+            {
+                LOG_ERROR("--dry-run preflight failed: " << runner.lastError());
+            }
+            config.dry_run = false;
+            runner.shutdown();
+            return false;
+        }
+
+        if (mpi_rank == 0)
+        {
+            out << "\n=== Resolved Orchestration Plan ===\n"
+                << runner.config().toString() << std::endl;
+        }
+
+        runner.shutdown();
+        return true;
+    }
+
     std::optional<AppContext> RuntimeInitPhase::execute(OrchestrationConfig &config,
                                                         int &argc, char **&argv)
     {
@@ -267,17 +293,6 @@ namespace llaminar2
             }
         }
 
-        // Dry-run check (post-MPI)
-        if (config.dry_run)
-        {
-            if (mpi_ctx->rank() == 0)
-            {
-                LOG_INFO("[Main] --dry-run requested: configuration validated, skipping model load/inference");
-            }
-            mpiShutdown();
-            return std::nullopt;
-        }
-
         // Validate model path
         if (config.model_path.empty())
         {
@@ -286,6 +301,8 @@ namespace llaminar2
                 LOG_ERROR("Error: Model path required (-m)\n\n");
                 std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
             }
+            if (config.dry_run)
+                config.dry_run = false;
             mpiShutdown();
             return std::nullopt;
         }
@@ -300,6 +317,15 @@ namespace llaminar2
             {
                 LOG_ERROR("Error: Failed to create orchestration runner");
             }
+            if (config.dry_run)
+                config.dry_run = false;
+            mpiShutdown();
+            return std::nullopt;
+        }
+
+        if (config.dry_run)
+        {
+            runDryRunPreflight(config, *runner, mpi_ctx->rank(), std::cout);
             mpiShutdown();
             return std::nullopt;
         }

@@ -19,7 +19,10 @@
 
 # --- Run the binary to discover tests (no mpirun needed) --------------------
 execute_process(
-    COMMAND "${TEST_EXECUTABLE}" --gtest_list_tests
+    COMMAND "${CMAKE_COMMAND}" -E env
+        "HWLOC_COMPONENTS=-gl,-opencl"
+        "OMPI_MCA_btl_vader_single_copy_mechanism=none"
+        "${TEST_EXECUTABLE}" --gtest_list_tests
     OUTPUT_VARIABLE _test_list_output
     ERROR_QUIET
     RESULT_VARIABLE _result
@@ -27,7 +30,7 @@ execute_process(
 )
 
 if(NOT _result EQUAL 0)
-    message(WARNING "V2ParityTestDiscovery: Failed to list tests from ${TEST_EXECUTABLE} (exit ${_result})")
+    message(STATUS "V2ParityTestDiscovery: Failed to list tests from ${TEST_EXECUTABLE} (exit ${_result})")
     file(WRITE "${CTEST_FILE}" "# Discovery failed for ${TEST_EXECUTABLE}\n")
     return()
 endif()
@@ -74,7 +77,7 @@ endforeach()
 
 list(LENGTH _all_tests _test_count)
 if(_test_count EQUAL 0)
-    message(WARNING "V2ParityTestDiscovery: No tests discovered from ${TEST_EXECUTABLE}")
+    message(STATUS "V2ParityTestDiscovery: No tests discovered from ${TEST_EXECUTABLE}")
     file(WRITE "${CTEST_FILE}" "# No tests discovered from ${TEST_EXECUTABLE}\n")
     return()
 endif()

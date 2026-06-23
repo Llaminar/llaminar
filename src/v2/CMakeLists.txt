@@ -171,10 +171,10 @@ if(HAVE_CUDA)
             
             add_compile_definitions(HAVE_ONNX_RUNTIME)
         else()
-            message(WARNING "V2: ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
-            message(WARNING "V2: Neural network heuristic disabled")
-            message(WARNING "V2: Download from: https://github.com/microsoft/onnxruntime/releases")
-            message(WARNING "V2: Extract to: /opt/onnxruntime")
+            message(STATUS "V2: ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
+            message(STATUS "V2: Neural network heuristic disabled")
+            message(STATUS "V2: Download from: https://github.com/microsoft/onnxruntime/releases")
+            message(STATUS "V2: Extract to: /opt/onnxruntime")
             set(USE_ONNX_HEURISTIC OFF)
         endif()
     endif()
@@ -1217,6 +1217,12 @@ set(FORT_ENABLE_TESTING OFF CACHE BOOL "Disable libfort tests" FORCE)
 FetchContent_MakeAvailable(libfort)
 # Reset policy version
 unset(CMAKE_POLICY_VERSION_MINIMUM)
+if(TARGET fort)
+    target_compile_options(fort PRIVATE
+        $<$<COMPILE_LANG_AND_ID:C,GNU>:-Wno-unused-parameter>
+        $<$<COMPILE_LANG_AND_ID:C,Clang>:-Wno-unused-parameter>
+    )
+endif()
 message(STATUS "V2: libfort v0.4.2 configured for formatted table output")
 
 # Link fort to GPU backends (for CUDAKernelProfiler.h and ROCmKernelProfiler.h table output)

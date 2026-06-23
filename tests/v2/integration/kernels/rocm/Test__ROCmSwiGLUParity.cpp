@@ -270,21 +270,21 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_Small)
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::FP32> rocm_kernel;
 
     float *d_gate, *d_up, *d_output;
-    hipMalloc(&d_gate, total * sizeof(float));
-    hipMalloc(&d_up, total * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(float));
+    (void)hipMalloc(&d_gate, total * sizeof(float));
+    (void)hipMalloc(&d_up, total * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(float));
 
-    hipMemcpy(d_gate, gate_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
-    hipFree(d_output);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), total));
 
@@ -317,21 +317,21 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_Large)
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::FP32> rocm_kernel;
 
     float *d_gate, *d_up, *d_output;
-    hipMalloc(&d_gate, total * sizeof(float));
-    hipMalloc(&d_up, total * sizeof(float));
-    hipMalloc(&d_output, total * sizeof(float));
+    (void)hipMalloc(&d_gate, total * sizeof(float));
+    (void)hipMalloc(&d_up, total * sizeof(float));
+    (void)hipMalloc(&d_output, total * sizeof(float));
 
-    hipMemcpy(d_gate, gate_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up_data.data(), total * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, total * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
-    hipFree(d_output);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), total));
 
@@ -375,22 +375,22 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_BF16_Small)
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::BF16> rocm_kernel;
 
     uint16_t *d_gate, *d_up, *d_output;
-    hipMalloc(&d_gate, total * sizeof(uint16_t));
-    hipMalloc(&d_up, total * sizeof(uint16_t));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gate, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_up, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_gate, gate_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<uint16_t> rocm_output_bf16(total);
-    hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
-    hipFree(d_output);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
+    (void)hipFree(d_output);
 
     // Convert outputs to FP32 for comparison
     std::vector<float> cpu_output_fp32(total);
@@ -433,22 +433,22 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_BF16_Large)
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::BF16> rocm_kernel;
 
     uint16_t *d_gate, *d_up, *d_output;
-    hipMalloc(&d_gate, total * sizeof(uint16_t));
-    hipMalloc(&d_up, total * sizeof(uint16_t));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gate, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_up, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_gate, gate_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up_bf16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<uint16_t> rocm_output_bf16(total);
-    hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_bf16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
-    hipFree(d_output);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
+    (void)hipFree(d_output);
 
     std::vector<float> cpu_output_fp32(total);
     std::vector<float> rocm_output_fp32(total);
@@ -497,22 +497,22 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP16_Small)
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::FP16> rocm_kernel;
 
     uint16_t *d_gate, *d_up, *d_output;
-    hipMalloc(&d_gate, total * sizeof(uint16_t));
-    hipMalloc(&d_up, total * sizeof(uint16_t));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gate, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_up, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_gate, gate_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<uint16_t> rocm_output_fp16(total);
-    hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
-    hipFree(d_output);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
+    (void)hipFree(d_output);
 
     // Convert outputs to FP32 for comparison
     std::vector<float> cpu_output_fp32(total);
@@ -555,22 +555,22 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP16_Large)
     llaminar2::rocm::ROCmSwiGLUKernelT<ActivationPrecision::FP16> rocm_kernel;
 
     uint16_t *d_gate, *d_up, *d_output;
-    hipMalloc(&d_gate, total * sizeof(uint16_t));
-    hipMalloc(&d_up, total * sizeof(uint16_t));
-    hipMalloc(&d_output, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_gate, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_up, total * sizeof(uint16_t));
+    (void)hipMalloc(&d_output, total * sizeof(uint16_t));
 
-    hipMemcpy(d_gate, gate_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up_fp16.data(), total * sizeof(uint16_t), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(rocm_kernel.apply_typed(d_gate, d_up, d_output, total, 0));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<uint16_t> rocm_output_fp16(total);
-    hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output_fp16.data(), d_output, total * sizeof(uint16_t), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
-    hipFree(d_output);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
+    (void)hipFree(d_output);
 
     std::vector<float> cpu_output_fp32(total);
     std::vector<float> rocm_output_fp32(total);
@@ -629,7 +629,7 @@ TEST_F(Test__ROCmSwiGLUParity, SwiGLU_FP32_ApplyTensor)
         gate.get(), up.get(), rocm_output.get(),
         rows, cols, false, nullptr, 0));
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     rocm_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     const float *result = rocm_output->data();
 

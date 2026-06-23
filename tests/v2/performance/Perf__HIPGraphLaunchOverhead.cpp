@@ -169,12 +169,12 @@ protected:
     {
         if (stream_)
         {
-            hipStreamDestroy(stream_);
+            (void)hipStreamDestroy(stream_);
             stream_ = nullptr;
         }
-        hipFree(d_A);
-        hipFree(d_B);
-        hipFree(d_C);
+        (void)hipFree(d_A);
+        (void)hipFree(d_B);
+        (void)hipFree(d_C);
     }
 
     // -----------------------------------------------------------------------
@@ -191,7 +191,7 @@ protected:
             {
                 vector_add_kernel<<<grid, BLOCK_SIZE, 0, stream_>>>(d_C, d_A, d_B, VECTOR_N);
             }
-            hipStreamSynchronize(stream_);
+            (void)hipStreamSynchronize(stream_);
         }
 
         // Benchmark
@@ -204,7 +204,7 @@ protected:
             {
                 vector_add_kernel<<<grid, BLOCK_SIZE, 0, stream_>>>(d_C, d_A, d_B, VECTOR_N);
             }
-            hipStreamSynchronize(stream_);
+            (void)hipStreamSynchronize(stream_);
             auto end = std::chrono::high_resolution_clock::now();
             samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
         }
@@ -232,15 +232,15 @@ protected:
 
         // Query node count
         size_t node_count = 0;
-        hipGraphGetNodes(graph, nullptr, &node_count);
+        (void)hipGraphGetNodes(graph, nullptr, &node_count);
 
         HIP_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
 
         // Warmup launches
         for (int w = 0; w < WARMUP_ITERS; w++)
         {
-            hipGraphLaunch(exec, stream_);
-            hipStreamSynchronize(stream_);
+            (void)hipGraphLaunch(exec, stream_);
+            (void)hipStreamSynchronize(stream_);
         }
 
         // Benchmark
@@ -249,8 +249,8 @@ protected:
         for (int i = 0; i < BENCH_ITERS; i++)
         {
             auto start = std::chrono::high_resolution_clock::now();
-            hipGraphLaunch(exec, stream_);
-            hipStreamSynchronize(stream_);
+            (void)hipGraphLaunch(exec, stream_);
+            (void)hipStreamSynchronize(stream_);
             auto end = std::chrono::high_resolution_clock::now();
             samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
         }
@@ -258,8 +258,8 @@ protected:
         auto result = computeStats(samples, num_kernels);
 
         // Cleanup
-        hipGraphExecDestroy(exec);
-        hipGraphDestroy(graph);
+        (void)hipGraphExecDestroy(exec);
+        (void)hipGraphDestroy(graph);
 
         return result;
     }
@@ -285,8 +285,8 @@ protected:
         // Warmup
         for (int w = 0; w < WARMUP_ITERS; w++)
         {
-            hipGraphLaunch(exec, stream_);
-            hipStreamSynchronize(stream_);
+            (void)hipGraphLaunch(exec, stream_);
+            (void)hipStreamSynchronize(stream_);
         }
 
         // Benchmark
@@ -295,16 +295,16 @@ protected:
         for (int i = 0; i < BENCH_ITERS; i++)
         {
             auto start = std::chrono::high_resolution_clock::now();
-            hipGraphLaunch(exec, stream_);
-            hipStreamSynchronize(stream_);
+            (void)hipGraphLaunch(exec, stream_);
+            (void)hipStreamSynchronize(stream_);
             auto end = std::chrono::high_resolution_clock::now();
             samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
         }
 
         auto result = computeStats(samples, num_kernels);
 
-        hipGraphExecDestroy(exec);
-        hipGraphDestroy(graph);
+        (void)hipGraphExecDestroy(exec);
+        (void)hipGraphDestroy(graph);
         return result;
     }
 
@@ -320,7 +320,7 @@ protected:
             {
                 nop_kernel<<<1, 1, 0, stream_>>>();
             }
-            hipStreamSynchronize(stream_);
+            (void)hipStreamSynchronize(stream_);
         }
 
         // Benchmark
@@ -333,7 +333,7 @@ protected:
             {
                 nop_kernel<<<1, 1, 0, stream_>>>();
             }
-            hipStreamSynchronize(stream_);
+            (void)hipStreamSynchronize(stream_);
             auto end = std::chrono::high_resolution_clock::now();
             samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
         }
@@ -354,7 +354,7 @@ protected:
             {
                 vector_add_kernel<<<grid, BLOCK_SIZE, 0, stream_>>>(d_C, d_A, d_B, VECTOR_N);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
         }
 
         // Benchmark
@@ -367,7 +367,7 @@ protected:
             {
                 vector_add_kernel<<<grid, BLOCK_SIZE, 0, stream_>>>(d_C, d_A, d_B, VECTOR_N);
             }
-            hipDeviceSynchronize();
+            (void)hipDeviceSynchronize();
             auto end = std::chrono::high_resolution_clock::now();
             samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
         }
@@ -395,8 +395,8 @@ protected:
         // Warmup
         for (int w = 0; w < WARMUP_ITERS; w++)
         {
-            hipGraphLaunch(exec, stream_);
-            hipDeviceSynchronize();
+            (void)hipGraphLaunch(exec, stream_);
+            (void)hipDeviceSynchronize();
         }
 
         // Benchmark
@@ -405,15 +405,15 @@ protected:
         for (int i = 0; i < BENCH_ITERS; i++)
         {
             auto start = std::chrono::high_resolution_clock::now();
-            hipGraphLaunch(exec, stream_);
-            hipDeviceSynchronize();
+            (void)hipGraphLaunch(exec, stream_);
+            (void)hipDeviceSynchronize();
             auto end = std::chrono::high_resolution_clock::now();
             samples.push_back(std::chrono::duration<double, std::micro>(end - start).count());
         }
 
         auto result = computeStats(samples, num_kernels);
-        hipGraphExecDestroy(exec);
-        hipGraphDestroy(graph);
+        (void)hipGraphExecDestroy(exec);
+        (void)hipGraphDestroy(graph);
         return result;
     }
 

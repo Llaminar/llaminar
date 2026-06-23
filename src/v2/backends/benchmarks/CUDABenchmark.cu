@@ -48,7 +48,6 @@ namespace llaminar2
         __global__ void computeKernelFP32(float *data, size_t n)
         {
             size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-            size_t stride = blockDim.x * gridDim.x;
 
             float a = 1.0001f;
             float b = 0.9999f;

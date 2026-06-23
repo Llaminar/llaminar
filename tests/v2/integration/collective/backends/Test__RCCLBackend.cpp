@@ -58,7 +58,7 @@ namespace llaminar2
     T *allocGPU(size_t count, int device = 0)
     {
         T *ptr = nullptr;
-        hipSetDevice(device);
+        (void)hipSetDevice(device);
         hipError_t err = hipMalloc(&ptr, count * sizeof(T));
         if (err != hipSuccess)
         {
@@ -78,7 +78,7 @@ namespace llaminar2
     template <typename T>
     void copyToGPU(T *d_ptr, const T *h_ptr, size_t count)
     {
-        hipMemcpy(d_ptr, h_ptr, count * sizeof(T), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_ptr, h_ptr, count * sizeof(T), hipMemcpyHostToDevice);
     }
 
     /**
@@ -91,7 +91,7 @@ namespace llaminar2
     template <typename T>
     void copyFromGPU(T *h_ptr, const T *d_ptr, size_t count)
     {
-        hipMemcpy(h_ptr, d_ptr, count * sizeof(T), hipMemcpyDeviceToHost);
+        (void)hipMemcpy(h_ptr, d_ptr, count * sizeof(T), hipMemcpyDeviceToHost);
     }
 
     /**
@@ -104,7 +104,7 @@ namespace llaminar2
     {
         if (ptr)
         {
-            hipFree(ptr);
+            (void)hipFree(ptr);
         }
     }
 
@@ -131,7 +131,7 @@ namespace llaminar2
             for (int i = 0; i < device_count_; ++i)
             {
                 hipDeviceProp_t prop;
-                hipGetDeviceProperties(&prop, i);
+                (void)hipGetDeviceProperties(&prop, i);
                 std::cout << "  GPU " << i << ": " << prop.name
                           << " (gfx" << prop.gcnArchName << ")"
                           << std::endl;
@@ -143,9 +143,9 @@ namespace llaminar2
             // Synchronize and clear any HIP errors
             for (int i = 0; i < device_count_; ++i)
             {
-                hipSetDevice(i);
-                hipDeviceSynchronize();
-                hipGetLastError();
+                (void)hipSetDevice(i);
+                (void)hipDeviceSynchronize();
+                (void)hipGetLastError();
             }
         }
 
@@ -520,7 +520,7 @@ namespace llaminar2
         ASSERT_NE(d_recv, nullptr);
 
         copyToGPU(d_send, h_send.data(), send_count);
-        hipMemset(d_recv, 0, recv_count * sizeof(float));
+        (void)hipMemset(d_recv, 0, recv_count * sizeof(float));
 
         bool success = backend.allgather(d_send, d_recv, send_count, CollectiveDataType::FLOAT32);
         EXPECT_TRUE(success) << "AllGather failed: " << backend.lastError();
@@ -779,7 +779,7 @@ namespace llaminar2
             d_buffers[i] = allocGPU<float>(count, i);
             ASSERT_NE(d_buffers[i], nullptr) << "Failed to allocate on GPU " << i;
 
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             copyToGPU(d_buffers[i], h_data[i].data(), count);
         }
 
@@ -801,7 +801,7 @@ namespace llaminar2
         for (int i = 0; i < num_gpus; ++i)
         {
             std::vector<float> h_result(count);
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             copyFromGPU(h_result.data(), d_buffers[i], count);
 
             for (size_t j = 0; j < count; ++j)
@@ -815,7 +815,7 @@ namespace llaminar2
         // Cleanup
         for (int i = 0; i < num_gpus; ++i)
         {
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             freeGPU(d_buffers[i]);
         }
 
@@ -851,14 +851,14 @@ namespace llaminar2
             // Each GPU sends data filled with its rank + 0.5
             h_send[i].resize(send_count, static_cast<float>(i) + 0.5f);
 
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             d_send[i] = allocGPU<float>(send_count, i);
             d_recv[i] = allocGPU<float>(recv_count, i);
             ASSERT_NE(d_send[i], nullptr) << "Failed to allocate send on GPU " << i;
             ASSERT_NE(d_recv[i], nullptr) << "Failed to allocate recv on GPU " << i;
 
             copyToGPU(d_send[i], h_send[i].data(), send_count);
-            hipMemset(d_recv[i], 0, recv_count * sizeof(float));
+            (void)hipMemset(d_recv[i], 0, recv_count * sizeof(float));
         }
 
         // Create buffer vectors for the API
@@ -881,7 +881,7 @@ namespace llaminar2
         for (int i = 0; i < num_gpus; ++i)
         {
             std::vector<float> h_result(recv_count);
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             copyFromGPU(h_result.data(), d_recv[i], recv_count);
 
             // Each chunk of send_count elements should contain data from the corresponding GPU
@@ -901,7 +901,7 @@ namespace llaminar2
         // Cleanup
         for (int i = 0; i < num_gpus; ++i)
         {
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             freeGPU(d_send[i]);
             freeGPU(d_recv[i]);
         }
@@ -934,7 +934,7 @@ namespace llaminar2
 
         for (int i = 0; i < num_gpus; ++i)
         {
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             d_buffers[i] = allocGPU<float>(count, i);
             ASSERT_NE(d_buffers[i], nullptr) << "Failed to allocate on GPU " << i;
 
@@ -970,7 +970,7 @@ namespace llaminar2
         for (int i = 0; i < num_gpus; ++i)
         {
             std::vector<float> h_result(count);
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             copyFromGPU(h_result.data(), d_buffers[i], count);
 
             for (size_t j = 0; j < count; ++j)
@@ -984,7 +984,7 @@ namespace llaminar2
         // Cleanup
         for (int i = 0; i < num_gpus; ++i)
         {
-            hipSetDevice(i);
+            (void)hipSetDevice(i);
             freeGPU(d_buffers[i]);
         }
 
@@ -1016,7 +1016,7 @@ namespace llaminar2
         constexpr size_t count = 64;
         float *d_data = allocGPU<float>(count, 0);
         ASSERT_NE(d_data, nullptr);
-        hipMemset(d_data, 0, count * sizeof(float));
+        (void)hipMemset(d_data, 0, count * sizeof(float));
 
         backend.allreduce(d_data, count, CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM);
 

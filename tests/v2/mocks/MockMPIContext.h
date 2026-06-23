@@ -23,6 +23,12 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(__GNUC__) && !defined(__clang__)
+#define LLAMINAR_TEST_NOINLINE __attribute__((noinline))
+#else
+#define LLAMINAR_TEST_NOINLINE
+#endif
+
 namespace llaminar2::test
 {
 
@@ -285,7 +291,7 @@ namespace llaminar2::test
             }
         }
 
-        void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const override
+        LLAMINAR_TEST_NOINLINE void allgather_bytes(const void *send_data, void *recv_data, size_t byte_count) const override
         {
             if (config_.track_calls)
             {
@@ -764,3 +770,5 @@ namespace llaminar2::test
     };
 
 } // namespace llaminar2::test
+
+#undef LLAMINAR_TEST_NOINLINE

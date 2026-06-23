@@ -117,7 +117,7 @@ extern "C"
      */
     void rocmFP16ScratchFree(void *buf, int ordinal)
     {
-        hipSetDevice(ordinal);
-        hipFree(buf);
+        (void)hipSetDevice(ordinal);
+        (void)hipFree(buf);
     }
 }

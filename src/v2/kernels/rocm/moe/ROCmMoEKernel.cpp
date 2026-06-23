@@ -1027,172 +1027,172 @@ namespace llaminar2
             clearWorkspaceScratchBindings();
         if (d_histogram_)
         {
-            hipFree(d_histogram_);
+            (void)hipFree(d_histogram_);
             d_histogram_ = nullptr;
         }
         if (d_expert_mask_)
         {
-            hipFree(d_expert_mask_);
+            (void)hipFree(d_expert_mask_);
             d_expert_mask_ = nullptr;
         }
         if (d_write_heads_)
         {
-            hipFree(d_write_heads_);
+            (void)hipFree(d_write_heads_);
             d_write_heads_ = nullptr;
         }
         if (d_staging_indices_)
         {
-            hipFree(d_staging_indices_);
+            (void)hipFree(d_staging_indices_);
             d_staging_indices_ = nullptr;
         }
         if (d_staging_weights_)
         {
-            hipFree(d_staging_weights_);
+            (void)hipFree(d_staging_weights_);
             d_staging_weights_ = nullptr;
         }
         if (d_grouped_gate_ptrs_)
         {
-            hipFree(d_grouped_gate_ptrs_);
+            (void)hipFree(d_grouped_gate_ptrs_);
             d_grouped_gate_ptrs_ = nullptr;
         }
         if (d_grouped_up_ptrs_)
         {
-            hipFree(d_grouped_up_ptrs_);
+            (void)hipFree(d_grouped_up_ptrs_);
             d_grouped_up_ptrs_ = nullptr;
         }
         if (d_grouped_expert_ids_)
         {
-            hipFree(d_grouped_expert_ids_);
+            (void)hipFree(d_grouped_expert_ids_);
             d_grouped_expert_ids_ = nullptr;
         }
         if (d_grouped_decode_weights_)
         {
-            hipFree(d_grouped_decode_weights_);
+            (void)hipFree(d_grouped_decode_weights_);
             d_grouped_decode_weights_ = nullptr;
         }
         if (d_grouped_down_descs_)
         {
-            hipFree(d_grouped_down_descs_);
+            (void)hipFree(d_grouped_down_descs_);
             d_grouped_down_descs_ = nullptr;
         }
         if (d_grouped_swiglu_int8_)
         {
-            hipFree(d_grouped_swiglu_int8_);
+            (void)hipFree(d_grouped_swiglu_int8_);
             d_grouped_swiglu_int8_ = nullptr;
         }
         if (d_grouped_swiglu_scales_)
         {
-            hipFree(d_grouped_swiglu_scales_);
+            (void)hipFree(d_grouped_swiglu_scales_);
             d_grouped_swiglu_scales_ = nullptr;
         }
         if (d_grouped_gate_output_ptrs_)
         {
-            hipFree(d_grouped_gate_output_ptrs_);
+            (void)hipFree(d_grouped_gate_output_ptrs_);
             d_grouped_gate_output_ptrs_ = nullptr;
         }
         if (d_grouped_up_output_ptrs_)
         {
-            hipFree(d_grouped_up_output_ptrs_);
+            (void)hipFree(d_grouped_up_output_ptrs_);
             d_grouped_up_output_ptrs_ = nullptr;
         }
         if (d_grouped_gateup_expert_ids_)
         {
-            hipFree(d_grouped_gateup_expert_ids_);
+            (void)hipFree(d_grouped_gateup_expert_ids_);
             d_grouped_gateup_expert_ids_ = nullptr;
         }
         if (d_grouped_hidden_int8_)
         {
-            hipFree(d_grouped_hidden_int8_);
+            (void)hipFree(d_grouped_hidden_int8_);
             d_grouped_hidden_int8_ = nullptr;
         }
         if (d_grouped_hidden_scales_)
         {
-            hipFree(d_grouped_hidden_scales_);
+            (void)hipFree(d_grouped_hidden_scales_);
             d_grouped_hidden_scales_ = nullptr;
         }
         if (d_grouped_gateup_gate_partials_)
         {
-            hipFree(d_grouped_gateup_gate_partials_);
+            (void)hipFree(d_grouped_gateup_gate_partials_);
             d_grouped_gateup_gate_partials_ = nullptr;
         }
         if (d_grouped_gateup_up_partials_)
         {
-            hipFree(d_grouped_gateup_up_partials_);
+            (void)hipFree(d_grouped_gateup_up_partials_);
             d_grouped_gateup_up_partials_ = nullptr;
         }
         if (d_shared_gate_scratch_)
         {
-            hipFree(d_shared_gate_scratch_);
+            (void)hipFree(d_shared_gate_scratch_);
             d_shared_gate_scratch_ = nullptr;
         }
         if (d_route_logits_)
         {
-            hipFree(d_route_logits_);
+            (void)hipFree(d_route_logits_);
             d_route_logits_ = nullptr;
         }
         if (d_route_logits_partials_)
         {
-            hipFree(d_route_logits_partials_);
+            (void)hipFree(d_route_logits_partials_);
             d_route_logits_partials_ = nullptr;
         }
         if (d_router_q8_hidden_)
         {
-            hipFree(d_router_q8_hidden_);
+            (void)hipFree(d_router_q8_hidden_);
             d_router_q8_hidden_ = nullptr;
         }
         if (d_router_q8_hidden_scales_)
         {
-            hipFree(d_router_q8_hidden_scales_);
+            (void)hipFree(d_router_q8_hidden_scales_);
             d_router_q8_hidden_scales_ = nullptr;
         }
         if (d_route_indices_)
         {
-            hipFree(d_route_indices_);
+            (void)hipFree(d_route_indices_);
             d_route_indices_ = nullptr;
         }
         if (d_route_weights_)
         {
-            hipFree(d_route_weights_);
+            (void)hipFree(d_route_weights_);
             d_route_weights_ = nullptr;
         }
         if (d_group_int_indices_)
         {
-            hipFree(d_group_int_indices_);
+            (void)hipFree(d_group_int_indices_);
             d_group_int_indices_ = nullptr;
         }
         if (d_group_offsets_)
         {
-            hipFree(d_group_offsets_);
+            (void)hipFree(d_group_offsets_);
             d_group_offsets_ = nullptr;
         }
         if (d_group_counts_)
         {
-            hipFree(d_group_counts_);
+            (void)hipFree(d_group_counts_);
             d_group_counts_ = nullptr;
         }
         if (d_group_max_tokens_)
         {
-            hipFree(d_group_max_tokens_);
+            (void)hipFree(d_group_max_tokens_);
             d_group_max_tokens_ = nullptr;
         }
         if (d_group_token_indices_)
         {
-            hipFree(d_group_token_indices_);
+            (void)hipFree(d_group_token_indices_);
             d_group_token_indices_ = nullptr;
         }
         if (d_group_original_to_grouped_)
         {
-            hipFree(d_group_original_to_grouped_);
+            (void)hipFree(d_group_original_to_grouped_);
             d_group_original_to_grouped_ = nullptr;
         }
         if (d_group_weights_)
         {
-            hipFree(d_group_weights_);
+            (void)hipFree(d_group_weights_);
             d_group_weights_ = nullptr;
         }
         if (d_group_active_expert_ids_)
         {
-            hipFree(d_group_active_expert_ids_);
+            (void)hipFree(d_group_active_expert_ids_);
             d_group_active_expert_ids_ = nullptr;
         }
         for (auto &entry : router_fp16_gate_cache_)
@@ -1222,7 +1222,7 @@ namespace llaminar2
         {
             if (table.device_descs)
             {
-                hipFree(table.device_descs);
+                (void)hipFree(table.device_descs);
                 table.device_descs = nullptr;
             }
         }
@@ -1230,12 +1230,12 @@ namespace llaminar2
         {
             if (table.device_gate_descs)
             {
-                hipFree(table.device_gate_descs);
+                (void)hipFree(table.device_gate_descs);
                 table.device_gate_descs = nullptr;
             }
             if (table.device_up_descs)
             {
-                hipFree(table.device_up_descs);
+                (void)hipFree(table.device_up_descs);
                 table.device_up_descs = nullptr;
             }
         }
@@ -1243,32 +1243,32 @@ namespace llaminar2
         // Phase 5: grouped prefill scratch
         if (d_prefill_A_int8_)
         {
-            hipFree(d_prefill_A_int8_);
+            (void)hipFree(d_prefill_A_int8_);
             d_prefill_A_int8_ = nullptr;
         }
         if (d_prefill_A_scales_)
         {
-            hipFree(d_prefill_A_scales_);
+            (void)hipFree(d_prefill_A_scales_);
             d_prefill_A_scales_ = nullptr;
         }
         if (d_prefill_swiglu_int8_)
         {
-            hipFree(d_prefill_swiglu_int8_);
+            (void)hipFree(d_prefill_swiglu_int8_);
             d_prefill_swiglu_int8_ = nullptr;
         }
         if (d_prefill_swiglu_scales_)
         {
-            hipFree(d_prefill_swiglu_scales_);
+            (void)hipFree(d_prefill_swiglu_scales_);
             d_prefill_swiglu_scales_ = nullptr;
         }
         if (d_prefill_gate_)
         {
-            hipFree(d_prefill_gate_);
+            (void)hipFree(d_prefill_gate_);
             d_prefill_gate_ = nullptr;
         }
         if (d_prefill_up_)
         {
-            hipFree(d_prefill_up_);
+            (void)hipFree(d_prefill_up_);
             d_prefill_up_ = nullptr;
         }
     }
@@ -1832,7 +1832,7 @@ namespace llaminar2
             return false;
         }
 
-        hipStreamSynchronize(stream);
+        (void)hipStreamSynchronize(stream);
         return true;
     }
 
@@ -1985,7 +1985,7 @@ namespace llaminar2
         // Free old if dimensions grew
         if (d_histogram_)
         {
-            hipFree(d_histogram_);
+            (void)hipFree(d_histogram_);
             d_histogram_ = nullptr;
         }
 
@@ -2075,7 +2075,7 @@ namespace llaminar2
             return;
         }
 
-        hipStreamSynchronize(stream);
+        (void)hipStreamSynchronize(stream);
     }
 
     void ROCmMoEKernel::resetHistogramDevice(int layer_idx, int num_experts)
@@ -2119,7 +2119,7 @@ namespace llaminar2
         if (!d_expert_mask_ || num_experts > max_experts_)
         {
             if (d_expert_mask_)
-                hipFree(d_expert_mask_);
+                (void)hipFree(d_expert_mask_);
 
             hipError_t err = hipMalloc(&d_expert_mask_, num_experts * sizeof(bool));
             if (err != hipSuccess)

@@ -687,9 +687,9 @@ namespace llaminar2
             for (auto &shadow : layer_shadows)
             {
                 if (shadow.d_K)
-                    hipFree(shadow.d_K);
+                    (void)hipFree(shadow.d_K);
                 if (shadow.d_V)
-                    hipFree(shadow.d_V);
+                    (void)hipFree(shadow.d_V);
             }
         }
         rope_shadows_.clear();
@@ -752,8 +752,8 @@ namespace llaminar2
         // Zero-initialize the entire pool
         hipStream_t init_stream = static_cast<hipStream_t>(
             GPUDeviceContextPool::instance().getAMDContext(device_id_).defaultStream());
-        hipMemsetAsync(pool_base_, 0, pool_size_, init_stream);
-        hipStreamSynchronize(init_stream);
+        (void)hipMemsetAsync(pool_base_, 0, pool_size_, init_stream);
+        (void)hipStreamSynchronize(init_stream);
 
         LOG_DEBUG("[ROCmRingKVCache] Pooled KV cache: 1 hipMalloc for "
                   << total_entries << " entries × 2 buffers = "
@@ -835,8 +835,8 @@ namespace llaminar2
         size_t buffer_size = static_cast<size_t>(max_seq_len_) * static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
 
         // Main K/V buffers
-        hipMalloc(&entry.d_K, buffer_size);
-        hipMalloc(&entry.d_V, buffer_size);
+        (void)hipMalloc(&entry.d_K, buffer_size);
+        (void)hipMalloc(&entry.d_V, buffer_size);
 
         // Initialize state
         entry.head = 0;
@@ -1551,7 +1551,7 @@ namespace llaminar2
             return false;
         }
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         hipStream_t stream = desc.stream ? static_cast<hipStream_t>(desc.stream)
                                          : getEffectiveStream(nullptr);
         const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
@@ -1639,7 +1639,7 @@ namespace llaminar2
             return false;
         }
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         const size_t row_bytes = static_cast<size_t>(kv_storage_dim_) * sizeof(DataT);
         const size_t bytes = static_cast<size_t>(desc.token_count) * row_bytes;
         const size_t dst_offset = static_cast<size_t>(desc.logical_token_start) *
@@ -1844,13 +1844,13 @@ namespace llaminar2
         }
 
         // Copy to device
-        hipMemcpyAsync(d_k_caches, h_k_caches.data(), num_seqs * sizeof(DataT *),
+        (void)hipMemcpyAsync(d_k_caches, h_k_caches.data(), num_seqs * sizeof(DataT *),
                        hipMemcpyHostToDevice, stream);
-        hipMemcpyAsync(d_v_caches, h_v_caches.data(), num_seqs * sizeof(DataT *),
+        (void)hipMemcpyAsync(d_v_caches, h_v_caches.data(), num_seqs * sizeof(DataT *),
                        hipMemcpyHostToDevice, stream);
-        hipMemcpyAsync(d_tails, h_tails.data(), num_seqs * sizeof(int),
+        (void)hipMemcpyAsync(d_tails, h_tails.data(), num_seqs * sizeof(int),
                        hipMemcpyHostToDevice, stream);
-        hipMemcpyAsync(d_counts, h_counts.data(), num_seqs * sizeof(int),
+        (void)hipMemcpyAsync(d_counts, h_counts.data(), num_seqs * sizeof(int),
                        hipMemcpyHostToDevice, stream);
 
         // Launch kernel (via extern "C" wrapper)
@@ -1958,12 +1958,12 @@ namespace llaminar2
             {
                 if (shadow.d_K)
                 {
-                    hipFree(shadow.d_K);
+                    (void)hipFree(shadow.d_K);
                     shadow.d_K = nullptr;
                 }
                 if (shadow.d_V)
                 {
-                    hipFree(shadow.d_V);
+                    (void)hipFree(shadow.d_V);
                     shadow.d_V = nullptr;
                 }
                 shadow.converted_count = 0;
@@ -2002,9 +2002,9 @@ namespace llaminar2
                 for (auto &entry : layer_entries)
                 {
                     if (entry.d_K)
-                        hipMemsetAsync(entry.d_K, 0, buffer_size, clear_stream);
+                        (void)hipMemsetAsync(entry.d_K, 0, buffer_size, clear_stream);
                     if (entry.d_V)
-                        hipMemsetAsync(entry.d_V, 0, buffer_size, clear_stream);
+                        (void)hipMemsetAsync(entry.d_V, 0, buffer_size, clear_stream);
                 }
             }
         }
@@ -2390,9 +2390,9 @@ namespace llaminar2
         if (!shadow.d_K)
         {
             const size_t buf_bytes = static_cast<size_t>(max_seq_len_) * kv_dim_ * sizeof(_Float16);
-            hipSetDevice(device_id_);
-            hipMalloc(&shadow.d_K, buf_bytes);
-            hipMalloc(&shadow.d_V, buf_bytes);
+            (void)hipSetDevice(device_id_);
+            (void)hipMalloc(&shadow.d_K, buf_bytes);
+            (void)hipMalloc(&shadow.d_V, buf_bytes);
             shadow.converted_count = 0;
             shadow.last_head = -1;
             shadow.rope_applied = false;
@@ -2455,7 +2455,7 @@ namespace llaminar2
             return ROCmRingKVCache::get_kv(layer, seq_idx, out_k, out_v, out_kv_len);
         }
 
-        hipSetDevice(device_id_);
+        (void)hipSetDevice(device_id_);
         const hipStream_t stream = getEffectiveStream(
             rope ? static_cast<hipStream_t>(rope->gpu_stream) : nullptr);
 

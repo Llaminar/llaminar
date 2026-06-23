@@ -6,6 +6,7 @@
 #include "app/modes/CompletionMode.h"
 #include "app/AppContext.h"
 #include "app/MPIShutdown.h"
+#include "app/modes/ConsoleOutput.h"
 #include "utils/Logger.h"
 #include "utils/Sampler.h"
 #include <iostream>
@@ -165,6 +166,11 @@ namespace llaminar2
         // Configure GPU-side sampling
         runner->setSamplingParams(sampling_params);
 
+        if (mpi_ctx->rank() == 0)
+        {
+            console_output::printPromptAndResponseHeader(config.prompt);
+        }
+
         // Generate tokens autoregressively. decodeStep() may return more than
         // one token when MTP accepts a draft, so count output tokens rather
         // than decode calls.
@@ -227,13 +233,18 @@ namespace llaminar2
             }
         }
 
+        if (mpi_ctx->rank() == 0)
+        {
+            std::cout << "\n"
+                      << std::flush;
+        }
+
         // Flush accumulated GPU stage timeline for decode phase
         runner->flushStageTimeline();
 
         if (mpi_ctx->rank() == 0)
         {
-            std::cout << "\n"
-                      << std::endl;
+            std::cout << std::endl;
             LOG_DEBUG("Generation complete.");
         }
 

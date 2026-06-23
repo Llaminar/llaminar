@@ -6,6 +6,7 @@
 #include "app/modes/SingleShotChatMode.h"
 #include "app/AppContext.h"
 #include "app/MPIShutdown.h"
+#include "app/modes/ConsoleOutput.h"
 #include "utils/Logger.h"
 #include "utils/ChatTemplate.h"
 #include "utils/Sampler.h"
@@ -155,7 +156,7 @@ namespace llaminar2
 
         if (mpi_ctx->rank() == 0)
         {
-            LOG_INFO("Generating response (max " << max_tokens << " tokens)...\n");
+            LOG_INFO("Generating response (max " << max_tokens << " tokens)...");
         }
 
         // Configure sampling params from CLI config
@@ -165,6 +166,11 @@ namespace llaminar2
         sampling_params.top_p = config.top_p;
         sampling_params.seed = config.seed;
         runner->setSamplingParams(sampling_params);
+
+        if (mpi_ctx->rank() == 0)
+        {
+            console_output::printPromptAndResponseHeader(config.prompt);
+        }
 
         // Decode loop. MTP can return multiple accepted tokens in one step, so
         // keep the loop bounded by emitted tokens rather than decode calls.
@@ -215,6 +221,12 @@ namespace llaminar2
                     break;
                 }
             }
+        }
+
+        if (mpi_ctx->rank() == 0)
+        {
+            std::cout << "\n"
+                      << std::flush;
         }
 
         // Flush accumulated GPU stage timeline for decode phase

@@ -2489,6 +2489,7 @@ namespace llaminar2
         std::string mpi_localrankid;
         std::string ompi_comm_world_local_rank;
         std::string ompi_mca_btl_vader_single_copy_mechanism;
+        std::string hwloc_components;
 
         MPIBootstrapEnvConfig()
         {
@@ -2516,6 +2517,7 @@ namespace llaminar2
             mpi_localrankid = read_env("MPI_LOCALRANKID");
             ompi_comm_world_local_rank = read_env("OMPI_COMM_WORLD_LOCAL_RANK");
             ompi_mca_btl_vader_single_copy_mechanism = read_env("OMPI_MCA_btl_vader_single_copy_mechanism");
+            hwloc_components = read_env("HWLOC_COMPONENTS");
         }
 
         std::optional<std::string> get(const char *name) const
@@ -2549,6 +2551,8 @@ namespace llaminar2
                 return ompi_comm_world_local_rank;
             if (std::strcmp(name, "OMPI_MCA_btl_vader_single_copy_mechanism") == 0)
                 return ompi_mca_btl_vader_single_copy_mechanism;
+            if (std::strcmp(name, "HWLOC_COMPONENTS") == 0)
+                return hwloc_components;
             static const std::string empty;
             return empty;
         }

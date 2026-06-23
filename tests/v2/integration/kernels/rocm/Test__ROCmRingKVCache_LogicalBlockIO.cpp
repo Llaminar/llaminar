@@ -138,11 +138,11 @@ TEST(Test__ROCmRingKVCache_LogicalBlockIO, FP32WrappedExportImportAndTruncateWit
     expectRows(truncated_k, 2, KV_DIM, {120.0f, 130.0f});
     expectRows(truncated_v, 2, KV_DIM, {220.0f, 230.0f});
 
-    hipFree(d_k0);
-    hipFree(d_v0);
-    hipFree(d_k1);
-    hipFree(d_v1);
-    hipStreamDestroy(stream);
+    (void)hipFree(d_k0);
+    (void)hipFree(d_v0);
+    (void)hipFree(d_k1);
+    (void)hipFree(d_v1);
+    (void)hipStreamDestroy(stream);
 }
 
 TEST(Test__ROCmRingKVCache_LogicalBlockIO, Q8ShardedLayoutReportsDeviceResidentBytes)

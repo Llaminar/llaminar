@@ -741,7 +741,7 @@ namespace llaminar2
             // for the current device. The device should already be set by the caller
             // (ensureOnDevice → backend->allocate → hipSetDevice), but we set it
             // explicitly for safety in case ensureHostPinned is called from another path.
-            hipSetDevice(gpu_device_->gpu_ordinal());
+            (void)hipSetDevice(gpu_device_->gpu_ordinal());
             success = host_backend_detail::hipHostRegisterBuffer(host_ptr, bytes);
             if (success)
             {

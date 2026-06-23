@@ -397,16 +397,16 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Small)
 
     // Allocate device memory
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
     // Copy inputs to device
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     // Execute ROCm kernel
     bool rocm_success = rocm_kernel.compute(
@@ -422,18 +422,18 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Small)
         &mpi_ctx_,
         0 // device_idx
     );
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success) << "ROCm attention failed";
 
     // Copy output back
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     // Validate
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size)) << "ROCm output contains NaN/Inf";
@@ -486,30 +486,30 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Medium_GQA)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -562,30 +562,30 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -636,30 +636,30 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_LargerSeq)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -710,30 +710,30 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_LargeHeadDim_GQA)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -818,10 +818,10 @@ TEST_F(Test__ROCmFlashAttentionParity, RocblasPrefillHonorsExternalMask)
 
     ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     for (int d = 0; d < head_dim; ++d)
     {
@@ -873,15 +873,15 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_SmallKVLen)
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     // Use compute_decode for single-query path
     bool rocm_success = rocm_kernel.compute_decode(
@@ -889,19 +889,19 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_SmallKVLen)
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false, // Non-causal
         0);    // position_offset
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success) << "ROCm decode attention failed";
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -956,34 +956,34 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_LargeKVLen_GQA)
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false, // Non-causal
         0);    // position_offset
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -1103,10 +1103,10 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_GraphReplayUsesUpdatedKV
     EXPECT_LE(l2_error, 1e-4);
     EXPECT_LE(max_error, 1e-4);
 
-    hipGraphExecDestroy(graph_exec);
-    hipGraphDestroy(graph);
+    (void)hipGraphExecDestroy(graph_exec);
+    (void)hipGraphDestroy(graph);
     cleanupWorkspace(rocm_kernel);
-    hipStreamDestroy(stream);
+    (void)hipStreamDestroy(stream);
 }
 
 TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_NativeFP16KV_Qwen35LongKVLen)
@@ -1641,7 +1641,7 @@ void runQwen36DeviceDerivedRowsMatchSerialDecode(
     }
 
     rocm_kernel.unbindWorkspace();
-    hipFree(d_cached_tokens);
+    (void)hipFree(d_cached_tokens);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 }
 
@@ -2195,31 +2195,31 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_Parity)
     float *d_K = nullptr;
     float *d_V = nullptr;
     float *d_out = nullptr;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_out, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_out, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_out, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_out, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_out,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false,
         0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_q81_output.data(), d_out, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q81_output.data(), d_out, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     cleanupWorkspace(rocm_kernel);
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_out);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_out);
 
     ASSERT_FALSE(hasNaNOrInf(cpu_q81_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(rocm_q81_output.data(), out_size));
@@ -2313,31 +2313,31 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_Q81KVCacheConsumption_NonCaus
     float *d_K = nullptr;
     float *d_V = nullptr;
     float *d_out = nullptr;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_out, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_out, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_out, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_from_q81, kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_out, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_out,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false,
         0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_q81_output.data(), d_out, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_q81_output.data(), d_out, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     cleanupWorkspace(rocm_kernel);
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_out);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_out);
 
     const double q81_rocm_cpu_cos = cosineSimilarity(rocm_q81_output.data(), cpu_q81_output.data(), out_size);
     const double q81_rocm_cpu_l2 = relativeL2Error(rocm_q81_output.data(), cpu_q81_output.data(), out_size);
@@ -2394,31 +2394,31 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_NonCausal)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         false, // NON-causal
         -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
     ASSERT_FALSE(hasNaNOrInf(cpu_output.data(), out_size));
@@ -2471,30 +2471,30 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Large)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 
@@ -2557,10 +2557,10 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_FP32_Qwen35LongPrefillSampledR
     ASSERT_TRUE(rocm_success);
     ASSERT_EQ(hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost), hipSuccess);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 
@@ -3198,34 +3198,34 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_VeryLong_Parity)
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false, // causal (see note above — production also uses false for seq_len=1)
         0);    // position_offset
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 
@@ -3277,33 +3277,33 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_MHA_Parity)
     // Setup workspace for FlashDecode (required for multi-block reduction)
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false, // causal (see VeryLong test for explanation)
         0);    // position_offset
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 
@@ -3355,33 +3355,33 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_HeadDim128_Parity)
     // Setup workspace for FlashDecode (required for multi-block reduction)
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false, // causal (see VeryLong test for explanation)
         0);    // position_offset
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 
@@ -3432,33 +3432,33 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_FP32_NonCausal_Parity)
     // Setup workspace for FlashDecode (required for multi-block reduction)
     ASSERT_TRUE(setupWorkspace(rocm_kernel, seq_len, n_heads, head_dim));
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute_decode(
         d_Q, d_K, d_V, d_output,
         seq_len, kv_len, n_heads, n_kv_heads, head_dim,
         false, // non-causal
         0);    // position_offset
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 
@@ -3509,23 +3509,23 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_BatchDecoding)
 
     // Allocate device memory for largest batch element
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_per_batch * sizeof(float));
-    hipMalloc(&d_K, kv_per_batch * sizeof(float));
-    hipMalloc(&d_V, kv_per_batch * sizeof(float));
-    hipMalloc(&d_output, out_per_batch * sizeof(float));
+    (void)hipMalloc(&d_Q, q_per_batch * sizeof(float));
+    (void)hipMalloc(&d_K, kv_per_batch * sizeof(float));
+    (void)hipMalloc(&d_V, kv_per_batch * sizeof(float));
+    (void)hipMalloc(&d_output, out_per_batch * sizeof(float));
 
     bool all_success = true;
 
     // Process each batch element
     for (int b = 0; b < batch_size; b++)
     {
-        hipMemcpy(d_Q, Q_data.data() + b * q_per_batch,
+        (void)hipMemcpy(d_Q, Q_data.data() + b * q_per_batch,
                   q_per_batch * sizeof(float), hipMemcpyHostToDevice);
-        hipMemcpy(d_K, K_data.data() + b * kv_per_batch,
+        (void)hipMemcpy(d_K, K_data.data() + b * kv_per_batch,
                   kv_per_batch * sizeof(float), hipMemcpyHostToDevice);
-        hipMemcpy(d_V, V_data.data() + b * kv_per_batch,
+        (void)hipMemcpy(d_V, V_data.data() + b * kv_per_batch,
                   kv_per_batch * sizeof(float), hipMemcpyHostToDevice);
-        hipMemset(d_output, 0, out_per_batch * sizeof(float));
+        (void)hipMemset(d_output, 0, out_per_batch * sizeof(float));
 
         // Use compute_decode for single-token decode
         bool success = rocm_kernel.compute_decode(
@@ -3535,7 +3535,7 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_BatchDecoding)
             n_heads, n_kv_heads, head_dim,
             true, // causal
             0);   // position_offset
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
 
         if (!success)
         {
@@ -3544,17 +3544,17 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashDecode_BatchDecoding)
             continue;
         }
 
-        hipMemcpy(rocm_output.data() + b * out_per_batch, d_output,
+        (void)hipMemcpy(rocm_output.data() + b * out_per_batch, d_output,
                   out_per_batch * sizeof(float), hipMemcpyDeviceToHost);
     }
 
     // Cleanup workspace before freeing GPU memory
     cleanupWorkspace(rocm_kernel);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_TRUE(all_success) << "All batch decode operations should succeed";
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), batch_size * out_per_batch));
@@ -3671,31 +3671,31 @@ TEST_F(Test__ROCmFlashAttentionParity, FlashAttn2_CausalMasking)
     llaminar2::rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32> rocm_kernel(0);
 
     float *d_Q, *d_K, *d_V, *d_output;
-    hipMalloc(&d_Q, q_size * sizeof(float));
-    hipMalloc(&d_K, kv_size * sizeof(float));
-    hipMalloc(&d_V, kv_size * sizeof(float));
-    hipMalloc(&d_output, out_size * sizeof(float));
+    (void)hipMalloc(&d_Q, q_size * sizeof(float));
+    (void)hipMalloc(&d_K, kv_size * sizeof(float));
+    (void)hipMalloc(&d_V, kv_size * sizeof(float));
+    (void)hipMalloc(&d_output, out_size * sizeof(float));
 
-    hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
-    hipMemset(d_output, 0, out_size * sizeof(float));
+    (void)hipMemcpy(d_Q, Q_data.data(), q_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_K, K_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, V_data.data(), kv_size * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemset(d_output, 0, out_size * sizeof(float));
 
     bool rocm_success = rocm_kernel.compute(
         d_Q, d_K, d_V, d_output,
         seq_len, n_heads, n_kv_heads, head_dim,
         true, // causal
         -1, nullptr, nullptr, nullptr, nullptr, false, &mpi_ctx_, 0);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     ASSERT_TRUE(rocm_success);
 
-    hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(rocm_output.data(), d_output, out_size * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_Q);
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_output);
+    (void)hipFree(d_Q);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_output);
 
     ASSERT_FALSE(hasNaNOrInf(rocm_output.data(), out_size));
 

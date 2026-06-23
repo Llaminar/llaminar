@@ -72,7 +72,7 @@ bool GPUExpertTransfer::transferExpert(
 
     // Save caller's active device to restore on exit
     int original_device = -1;
-    hipGetDevice(&original_device);
+    (void)hipGetDevice(&original_device);
 
     const int src_ord = src_device.rocm_ordinal();
     const int dst_ord = dst_device.rocm_ordinal();
@@ -112,7 +112,7 @@ bool GPUExpertTransfer::transferExpert(
 
     // Restore caller's original device context
     if (original_device >= 0) {
-        hipSetDevice(original_device);
+        (void)hipSetDevice(original_device);
     }
 
     if (success) {

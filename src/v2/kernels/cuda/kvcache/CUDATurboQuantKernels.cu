@@ -387,7 +387,6 @@ namespace llaminar2
 
         // Write TQ4Block: [norm(4B), residual_norm(4B), mse_indices[D*3/8], high_bits[D/8]]
         constexpr size_t MSE_BYTES = D * 3 / 8;
-        constexpr size_t HIGH_BIT_BYTES = D / 8;
         const size_t block_size = sizeof(TQ4Block<D>);
         uint8_t *block_ptr = d_output_bytes + (static_cast<size_t>(token) * n_kv_heads + head) * block_size;
 
@@ -450,7 +449,6 @@ namespace llaminar2
         if (tid >= D)
             return;
 
-        const int kv_dim = n_kv_heads * D;
         const float x = (phase == 0)
                             ? d_K_input[head * D + tid]
                             : d_V_input[head * D + tid];
@@ -935,7 +933,6 @@ namespace llaminar2
         const auto &p = params[layer];
         const size_t block_size = sizeof(TQ8Block<D>);
         const float inv_scale = 1.0f / sqrtf(static_cast<float>(D));
-        const int kv_dim = n_kv_heads * D;
 
         // Load centroid for the single new position
         const uint8_t *block_ptr = p.cache +
@@ -991,7 +988,6 @@ namespace llaminar2
         const auto &p = params[layer];
         const size_t block_size = sizeof(TQ4Block<D>);
         const float inv_scale = 1.0f / sqrtf(static_cast<float>(D));
-        const int kv_dim = n_kv_heads * D;
 
         // Load TQ4 centroid for the single new position
         const uint8_t *block_ptr = p.cache +

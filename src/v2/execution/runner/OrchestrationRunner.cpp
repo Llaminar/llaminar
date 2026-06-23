@@ -61,6 +61,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -918,6 +919,125 @@ namespace llaminar2
         catch (const std::exception &e)
         {
             return setError(std::string("Initialization failed: ") + e.what());
+        }
+    }
+
+    bool OrchestrationRunner::initializeForDryRun()
+    {
+        if (initialized_)
+        {
+            return true;
+        }
+
+        auto syncInitStep = [&](bool local_ok, const char *step_name) -> bool
+        {
+            if (!mpi_ctx_ || mpi_ctx_->world_size() <= 1)
+            {
+                return local_ok;
+            }
+
+            int ok = local_ok ? 1 : 0;
+            int global_ok = 0;
+            MPI_Allreduce(&ok, &global_ok, 1, MPI_INT, MPI_MIN, mpi_ctx_->communicator());
+            if (global_ok == 0)
+            {
+                if (local_ok)
+                {
+                    setError(std::string("Dry-run preflight failed on another rank at step: ") + step_name);
+                }
+                return false;
+            }
+            return true;
+        };
+
+        try
+        {
+            if (!initializeMPI())
+                return false;
+            if (!syncInitStep(true, "initializeMPI"))
+                return false;
+
+            if (!buildExecutionPlan())
+            {
+                syncInitStep(false, "buildExecutionPlan");
+                return false;
+            }
+            if (!syncInitStep(true, "buildExecutionPlan"))
+                return false;
+
+            if (!setupLocalTPContext())
+            {
+                syncInitStep(false, "setupLocalTPContext");
+                return false;
+            }
+            if (!syncInitStep(true, "setupLocalTPContext"))
+                return false;
+
+            if (!setupLocalPPContext())
+            {
+                syncInitStep(false, "setupLocalPPContext");
+                return false;
+            }
+            if (!syncInitStep(true, "setupLocalPPContext"))
+                return false;
+
+            if (!loadWeights(/*prepopulate_page_cache=*/false))
+            {
+                syncInitStep(false, "loadWeights");
+                return false;
+            }
+            if (!syncInitStep(true, "loadWeights"))
+                return false;
+
+            if (!freezeMoEExpertOverlayPlanForLoadedModel())
+            {
+                syncInitStep(false, "freezeMoEExpertOverlayPlanForLoadedModel");
+                return false;
+            }
+            if (!syncInitStep(true, "freezeMoEExpertOverlayPlanForLoadedModel"))
+                return false;
+
+            if (!validateTPPPConfiguration())
+            {
+                syncInitStep(false, "validateTPPPConfiguration");
+                return false;
+            }
+            if (!syncInitStep(true, "validateTPPPConfiguration"))
+                return false;
+
+            if (!validateContextLength())
+            {
+                syncInitStep(false, "validateContextLength");
+                return false;
+            }
+            if (!syncInitStep(true, "validateContextLength"))
+                return false;
+
+            if (!validateMemoryPlan())
+            {
+                syncInitStep(false, "validateMemoryPlan");
+                return false;
+            }
+            if (!syncInitStep(true, "validateMemoryPlan"))
+                return false;
+
+            printStartupBanner(stdout);
+
+            if (!syncInitStep(true, "dryRunComplete"))
+                return false;
+
+            initialized_ = true;
+
+            if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
+            {
+                LOG_INFO("[Main] --dry-run complete: preflight validation passed; no compute graph was built and no inference was started");
+            }
+
+            return true;
+        }
+        catch (const std::exception &e)
+        {
+            return setError(std::string("Dry-run preflight failed: ") + e.what());
         }
     }
 
@@ -12032,7 +12152,7 @@ namespace llaminar2
         return true;
     }
 
-    bool OrchestrationRunner::loadWeights()
+    bool OrchestrationRunner::loadWeights(bool prepopulate_page_cache_enabled)
     {
         // Get model path from config
         std::string model_path = config_.model_path;
@@ -12119,7 +12239,7 @@ namespace llaminar2
             return ok;
         };
 
-        if (!is_multi_rank && config_.use_mmap)
+        if (prepopulate_page_cache_enabled && !is_multi_rank && config_.use_mmap)
         {
             // Single-rank loads need the same protection as multi-rank loads.
             //
@@ -12136,7 +12256,7 @@ namespace llaminar2
                                        : "Single-rank CPU");
             weight_config.skip_mmap_cache_eviction = true;
         }
-        else if (is_multi_rank && config_.use_mmap)
+        else if (prepopulate_page_cache_enabled && is_multi_rank && config_.use_mmap)
         {
             const auto *topo = mpi_ctx_->topology();
             if (topo)
@@ -12467,7 +12587,7 @@ namespace llaminar2
         return true;
     }
 
-    void OrchestrationRunner::printStartupBanner()
+    void OrchestrationRunner::printStartupBanner(FILE *stream)
     {
         // Only rank 0 prints the banner
         if (mpi_ctx_ && mpi_ctx_->rank() != 0)
@@ -12665,11 +12785,11 @@ namespace llaminar2
         bool use_color = StartupBanner::shouldUseColor();
         std::string banner = StartupBanner::render(data, use_color);
 
-        // Print directly to stderr (bypassing LOG_INFO) to preserve ANSI colors.
+        // Print directly (bypassing LOG_INFO) to preserve ANSI colors.
         // LOG_INFO strips escape codes via its formatting pipeline.
         if (!banner.empty())
         {
-            std::print(stderr, "{}\n", banner);
+            std::print(stream ? stream : stderr, "{}\n", banner);
         }
     }
 

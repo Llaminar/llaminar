@@ -440,10 +440,10 @@ namespace
         GTEST_SKIP() << "No ROCm support compiled";
 #else
         int device_count = 0;
-        hipGetDeviceCount(&device_count);
+        (void)hipGetDeviceCount(&device_count);
         if (device_count <= 0)
             GTEST_SKIP() << "No ROCm device available";
-        hipSetDevice(0);
+        (void)hipSetDevice(0);
 
         auto embed_table = createEmbeddingTable();
         auto output = std::make_unique<FP32Tensor>(
@@ -514,10 +514,10 @@ namespace
         GTEST_SKIP() << "No ROCm support compiled";
 #else
         int device_count = 0;
-        hipGetDeviceCount(&device_count);
+        (void)hipGetDeviceCount(&device_count);
         if (device_count <= 0)
             GTEST_SKIP() << "No ROCm device available";
-        hipSetDevice(0);
+        (void)hipSetDevice(0);
 
         // Prefill with multiple tokens (seq_len > 1)
         const int seq_len = 8;
@@ -566,10 +566,10 @@ namespace
         GTEST_SKIP() << "No ROCm support compiled";
 #else
         int device_count = 0;
-        hipGetDeviceCount(&device_count);
+        (void)hipGetDeviceCount(&device_count);
         if (device_count <= 0)
             GTEST_SKIP() << "No ROCm device available";
-        hipSetDevice(0);
+        (void)hipSetDevice(0);
 
         const int seq_len = 4;
         auto embed_table = createEmbeddingTable();

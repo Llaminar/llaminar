@@ -50,7 +50,7 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to create stop event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
+                (void)hipEventDestroy(start_event_);
                 enabled_ = false;
                 return;
             }
@@ -61,8 +61,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to record start event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(start_event_);
+                (void)hipEventDestroy(stop_event_);
                 enabled_ = false;
             }
         }
@@ -78,8 +78,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to record stop event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(start_event_);
+                (void)hipEventDestroy(stop_event_);
                 return;
             }
 
@@ -89,8 +89,8 @@ namespace llaminar2
             {
                 fprintf(stderr, "[ROCmKernelProfiler] Failed to synchronize stop event: %s\n",
                         hipGetErrorString(err));
-                hipEventDestroy(start_event_);
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(start_event_);
+                (void)hipEventDestroy(stop_event_);
                 return;
             }
 
@@ -109,8 +109,8 @@ namespace llaminar2
             }
 
             // Clean up events
-            hipEventDestroy(start_event_);
-            hipEventDestroy(stop_event_);
+            (void)hipEventDestroy(start_event_);
+            (void)hipEventDestroy(stop_event_);
         }
     }
 
@@ -135,7 +135,7 @@ namespace llaminar2
             err = hipEventCreate(&stop_event_);
             if (err != hipSuccess)
             {
-                hipEventDestroy(start_event_);
+                (void)hipEventDestroy(start_event_);
                 enabled_ = false;
                 return;
             }
@@ -147,9 +147,9 @@ namespace llaminar2
         if (enabled_)
         {
             if (start_event_)
-                hipEventDestroy(start_event_);
+                (void)hipEventDestroy(start_event_);
             if (stop_event_)
-                hipEventDestroy(stop_event_);
+                (void)hipEventDestroy(stop_event_);
         }
     }
 

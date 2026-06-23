@@ -775,7 +775,7 @@ namespace
                 NUM_GPUS = std::min(device_count, 3); // Use up to 3 GPUs
                 (void)hipSetDevice(0);
                 hipDeviceProp_t props;
-                hipGetDeviceProperties(&props, 0);
+                (void)hipGetDeviceProperties(&props, 0);
                 device_name_ = std::string(props.name) + " (" + props.gcnArchName + ")";
             }
 #else

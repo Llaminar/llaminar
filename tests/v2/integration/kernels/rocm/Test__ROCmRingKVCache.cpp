@@ -143,10 +143,10 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
 
     // Allocate device memory
     float *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Append to cache (layer 0)
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
@@ -162,8 +162,8 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     // Copy back and verify
     std::vector<float> h_K_out(num_tokens * kv_dim);
     std::vector<float> h_V_out(num_tokens * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, num_tokens * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, num_tokens * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, num_tokens * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, num_tokens * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     float max_err_K = computeMaxError(h_K, h_K_out);
     float max_err_V = computeMaxError(h_V, h_V_out);
@@ -174,8 +174,8 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP32)
     EXPECT_EQ(max_err_V, 0.0f);
 
     // Cleanup
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[BasicAppendRetrieve_FP32] PASSED");
 }
@@ -309,11 +309,11 @@ TEST(Test__ROCmRingKVCache, DeviceResidentSequenceStatePublicationKeepsHostMirro
     EXPECT_EQ(cache->get_cached_tokens(0, 0), target_cached_tokens);
     EXPECT_EQ(cache->ring_head(0, 0), expected_device_head);
 
-    hipFree(d_ok);
-    hipFree(d_accepted);
-    hipFree(d_target);
-    hipFree(d_V);
-    hipFree(d_K);
+    (void)hipFree(d_ok);
+    (void)hipFree(d_accepted);
+    (void)hipFree(d_target);
+    (void)hipFree(d_V);
+    (void)hipFree(d_K);
 }
 
 // =============================================================================
@@ -346,10 +346,10 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
 
     // Allocate device memory
     float *d_K, *d_V;
-    hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Append all 12 tokens - should wrap and auto-evict oldest 4
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
@@ -367,8 +367,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     // Copy back
     std::vector<float> h_K_out(max_seq_len * kv_dim);
     std::vector<float> h_V_out(max_seq_len * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     // Verify: output should match tokens [4..11] of original
     const float *expected_K = h_K_all.data() + 4 * kv_dim;
@@ -386,8 +386,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_FP32)
     EXPECT_EQ(cache->get_total_evicted(), 4);
 
     // Cleanup
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[WrapAround_FP32] PASSED");
 }
@@ -422,10 +422,10 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
     auto h_V_all = generateRandomFP32(total_tokens * kv_dim, 222);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
@@ -439,8 +439,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
 
     std::vector<float> h_K_out(max_seq_len * kv_dim);
     std::vector<float> h_V_out(max_seq_len * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     // Should have tokens 8-15 (the last 8)
     const float *expected_K = h_K_all.data() + 8 * kv_dim;
@@ -455,8 +455,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_ExactlyDouble_FP32)
     EXPECT_EQ(max_err_V, 0.0f) << "V values should exactly match tokens 8-15";
     EXPECT_EQ(cache->get_total_evicted(), 8) << "Should have evicted exactly 8 tokens";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[WrapAround_ExactlyDouble_FP32] PASSED");
 }
@@ -488,10 +488,10 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
     auto h_V_all = generateRandomFP32(total_tokens * kv_dim, 444);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
@@ -505,8 +505,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
 
     std::vector<float> h_K_out(max_seq_len * kv_dim);
     std::vector<float> h_V_out(max_seq_len * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     // Should have tokens 1-8 (the last 8, with token 0 evicted)
     const float *expected_K = h_K_all.data() + 1 * kv_dim;
@@ -521,8 +521,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_BarelyOver_FP32)
     EXPECT_EQ(max_err_V, 0.0f) << "V values should exactly match tokens 1-8";
     EXPECT_EQ(cache->get_total_evicted(), 1) << "Should have evicted exactly 1 token";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[WrapAround_BarelyOver_FP32] PASSED");
 }
@@ -553,10 +553,10 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
     auto h_V_all = generateRandomFP32(total_tokens * kv_dim, 666);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, total_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, total_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V_all.data(), total_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
 
@@ -570,8 +570,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
 
     std::vector<float> h_K_out(max_seq_len * kv_dim);
     std::vector<float> h_V_out(max_seq_len * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, max_seq_len * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     // Should have tokens 16-23 (the last 8)
     const float *expected_K = h_K_all.data() + 16 * kv_dim;
@@ -586,8 +586,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_TripleBuffer_FP32)
     EXPECT_EQ(max_err_V, 0.0f) << "V values should exactly match tokens 16-23";
     EXPECT_EQ(cache->get_total_evicted(), 16) << "Should have evicted exactly 16 tokens";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[WrapAround_TripleBuffer_FP32] PASSED");
 }
@@ -620,10 +620,10 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 222);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), 10);
@@ -642,8 +642,8 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     // Copy back
     std::vector<float> h_K_out(7 * kv_dim);
     std::vector<float> h_V_out(7 * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, 7 * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, 7 * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, 7 * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, 7 * kv_dim * sizeof(float), hipMemcpyDeviceToHost);
 
     // Verify: output should match tokens [3..9] of original
     const float *expected_K = h_K.data() + 3 * kv_dim;
@@ -658,8 +658,8 @@ TEST(Test__ROCmRingKVCache, Eviction_FP32)
     EXPECT_EQ(max_err_V, 0.0f);
 
     // Cleanup
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[Eviction_FP32] PASSED");
 }
@@ -692,10 +692,10 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 444);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     // Fill all caches
     for (int layer = 0; layer < n_layers; ++layer)
@@ -731,8 +731,8 @@ TEST(Test__ROCmRingKVCache, Clear_FP32)
     }
 
     // Cleanup
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[Clear_FP32] PASSED");
 }
@@ -965,10 +965,10 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
 
     // Allocate device memory
     _Float16 *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * kv_dim * sizeof(_Float16));
-    hipMalloc(&d_V, num_tokens * kv_dim * sizeof(_Float16));
-    hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(_Float16), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(_Float16), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * kv_dim * sizeof(_Float16));
+    (void)hipMalloc(&d_V, num_tokens * kv_dim * sizeof(_Float16));
+    (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(_Float16), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(_Float16), hipMemcpyHostToDevice);
 
     // Append
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
@@ -983,8 +983,8 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
     // Copy back
     std::vector<_Float16> h_K_out(num_tokens * kv_dim);
     std::vector<_Float16> h_V_out(num_tokens * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, num_tokens * kv_dim * sizeof(_Float16), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, num_tokens * kv_dim * sizeof(_Float16), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, num_tokens * kv_dim * sizeof(_Float16), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, num_tokens * kv_dim * sizeof(_Float16), hipMemcpyDeviceToHost);
 
     // Verify (FP16 should be exact bitwise match)
     for (size_t i = 0; i < h_K.size(); ++i)
@@ -996,8 +996,8 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_FP16)
     }
 
     // Cleanup
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[BasicAppendRetrieve_FP16] PASSED");
 }
@@ -1104,8 +1104,8 @@ TEST(Test__ROCmRingKVCache, FP16RoPEOnRead_Qwen35LongPartialRotary)
         max_v_error = std::max(max_v_error, std::abs(static_cast<float>(actual_V[i]) - expected_V[i]));
     }
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     EXPECT_LE(max_k_error, 0.01f) << "RoPE-on-read K mismatch";
     EXPECT_LE(max_v_error, 0.0f) << "RoPE-on-read should not alter V";
@@ -1143,10 +1143,10 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
     auto h_V = generateRandomFP32(num_tokens * kv_dim, 888);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
-    hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, num_tokens * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), num_tokens * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_TRUE(cache->is_wrapped(0, 0));
@@ -1170,8 +1170,8 @@ TEST(Test__ROCmRingKVCache, LinearizationStatistics_FP32)
     EXPECT_EQ(cache->get_total_evicted(), 0);
 
     // Cleanup
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[LinearizationStatistics_FP32] PASSED");
 }
@@ -1200,8 +1200,8 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
     ASSERT_NE(cache, nullptr);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, kv_dim * sizeof(float));
-    hipMalloc(&d_V, kv_dim * sizeof(float));
+    (void)hipMalloc(&d_K, kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, kv_dim * sizeof(float));
 
     // Simulate 100 decode steps
     for (int step = 0; step < 100; ++step)
@@ -1209,8 +1209,8 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
         auto h_K = generateRandomFP32(kv_dim, step);
         auto h_V = generateRandomFP32(kv_dim, step + 1000);
 
-        hipMemcpy(d_K, h_K.data(), kv_dim * sizeof(float), hipMemcpyHostToDevice);
-        hipMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_K, h_K.data(), kv_dim * sizeof(float), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_V, h_V.data(), kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
         // Append 1 token
         ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 1, 0));
@@ -1225,8 +1225,8 @@ TEST(Test__ROCmRingKVCache, SlidingWindow)
     // 100 appends with window=32 means 68 evicted
     EXPECT_EQ(cache->get_total_evicted(), 68);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[SlidingWindow] PASSED - evicted=" << cache->get_total_evicted());
 }
@@ -1259,16 +1259,16 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     std::vector<std::vector<float>> h_Vs(batch_size);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, 30 * kv_dim * sizeof(float));
-    hipMalloc(&d_V, 30 * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_K, 30 * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, 30 * kv_dim * sizeof(float));
 
     for (int seq = 0; seq < batch_size; ++seq)
     {
         h_Ks[seq] = generateRandomFP32(seq_lens[seq] * kv_dim, seq * 100);
         h_Vs[seq] = generateRandomFP32(seq_lens[seq] * kv_dim, seq * 100 + 1000);
 
-        hipMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-        hipMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_K, h_Ks[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_V, h_Vs[seq].data(), seq_lens[seq] * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
         ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq], 0));
     }
@@ -1288,8 +1288,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     // Gather all sequences
     int max_kv_len = 25; // Max sequence length
     float *d_K_gathered, *d_V_gathered;
-    hipMalloc(&d_K_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
-    hipMalloc(&d_V_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_K_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V_gathered, batch_size * max_kv_len * kv_dim * sizeof(float));
 
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
@@ -1306,7 +1306,7 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
 
     // Verify content for sequence 0
     std::vector<float> h_K_gathered(batch_size * max_kv_len * kv_dim);
-    hipMemcpy(h_K_gathered.data(), d_K_gathered,
+    (void)hipMemcpy(h_K_gathered.data(), d_K_gathered,
               batch_size * max_kv_len * kv_dim * sizeof(float),
               hipMemcpyDeviceToHost);
 
@@ -1324,10 +1324,10 @@ TEST(Test__ROCmRingKVCache, BatchedGather)
     // Unbind workspace before cleanup
     cache->unbindWorkspace();
 
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_K_gathered);
-    hipFree(d_V_gathered);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_K_gathered);
+    (void)hipFree(d_V_gathered);
 
     LOG_INFO("[BatchedGather] PASSED");
 }
@@ -1359,8 +1359,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
 
     Q8_1Block *d_K = nullptr;
     Q8_1Block *d_V = nullptr;
-    hipMalloc(&d_K, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
-    hipMalloc(&d_V, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
+    (void)hipMalloc(&d_K, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
+    (void)hipMalloc(&d_V, static_cast<size_t>(max_seq_len) * kv_blocks * sizeof(Q8_1Block));
 
     for (int seq = 0; seq < batch_size; ++seq)
     {
@@ -1381,8 +1381,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
             }
         }
 
-        hipMemcpy(d_K, h_K[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
-        hipMemcpy(d_V, h_V[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_K, h_K[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+        (void)hipMemcpy(d_V, h_V[seq].data(), blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
         ASSERT_TRUE(cache->append(0, seq, d_K, d_V, seq_lens[seq], 0));
     }
 
@@ -1394,8 +1394,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
     const int max_kv_len = 8;
     Q8_1Block *d_K_gathered = nullptr;
     Q8_1Block *d_V_gathered = nullptr;
-    hipMalloc(&d_K_gathered, static_cast<size_t>(batch_size) * max_kv_len * kv_blocks * sizeof(Q8_1Block));
-    hipMalloc(&d_V_gathered, static_cast<size_t>(batch_size) * max_kv_len * kv_blocks * sizeof(Q8_1Block));
+    (void)hipMalloc(&d_K_gathered, static_cast<size_t>(batch_size) * max_kv_len * kv_blocks * sizeof(Q8_1Block));
+    (void)hipMalloc(&d_V_gathered, static_cast<size_t>(batch_size) * max_kv_len * kv_blocks * sizeof(Q8_1Block));
 
     std::vector<int> kv_lens(batch_size);
     int actual_max = cache->gather_kv_batched(0, batch_size,
@@ -1410,8 +1410,8 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
 
     std::vector<Q8_1Block> h_K_gathered(static_cast<size_t>(batch_size) * max_kv_len * kv_blocks);
     std::vector<Q8_1Block> h_V_gathered(static_cast<size_t>(batch_size) * max_kv_len * kv_blocks);
-    hipMemcpy(h_K_gathered.data(), d_K_gathered, h_K_gathered.size() * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_gathered.data(), d_V_gathered, h_V_gathered.size() * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_gathered.data(), d_K_gathered, h_K_gathered.size() * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_gathered.data(), d_V_gathered, h_V_gathered.size() * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
 
     for (int seq = 0; seq < batch_size; ++seq)
     {
@@ -1425,10 +1425,10 @@ TEST(Test__ROCmRingKVCache, BatchedGather_Q81)
     }
 
     cache->unbindWorkspace();
-    hipFree(d_K);
-    hipFree(d_V);
-    hipFree(d_K_gathered);
-    hipFree(d_V_gathered);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
+    (void)hipFree(d_K_gathered);
+    (void)hipFree(d_V_gathered);
 
     LOG_INFO("[BatchedGather_Q81] PASSED");
 }
@@ -1460,10 +1460,10 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     auto h_V = generateRandomFP32(30 * kv_dim);
 
     float *d_K, *d_V;
-    hipMalloc(&d_K, 30 * kv_dim * sizeof(float));
-    hipMalloc(&d_V, 30 * kv_dim * sizeof(float));
-    hipMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, 30 * kv_dim * sizeof(float));
+    (void)hipMalloc(&d_V, 30 * kv_dim * sizeof(float));
+    (void)hipMemcpy(d_K, h_K.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), 30 * kv_dim * sizeof(float), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, 30, 0));
 
@@ -1485,8 +1485,8 @@ TEST(Test__ROCmRingKVCache, ContiguousOptimization)
     }
     EXPECT_EQ(cache->get_linearization_count(), 0);
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[ContiguousOptimization] PASSED - linearizations=0");
 }
@@ -1529,10 +1529,10 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
     }
 
     hip_bfloat16 *d_K, *d_V;
-    hipMalloc(&d_K, num_tokens * kv_dim * sizeof(hip_bfloat16));
-    hipMalloc(&d_V, num_tokens * kv_dim * sizeof(hip_bfloat16));
-    hipMemcpy(d_K, h_K_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, num_tokens * kv_dim * sizeof(hip_bfloat16));
+    (void)hipMalloc(&d_V, num_tokens * kv_dim * sizeof(hip_bfloat16));
+    (void)hipMemcpy(d_K, h_K_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V_bf16.data(), num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
@@ -1544,7 +1544,7 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
 
     // Verify content - convert hip_bfloat16 to float via union
     std::vector<hip_bfloat16> h_K_out(num_tokens * kv_dim);
-    hipMemcpy(h_K_out.data(), d_K_out, num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, num_tokens * kv_dim * sizeof(hip_bfloat16), hipMemcpyDeviceToHost);
 
     // Helper lambda for bf16 to float conversion
     auto bf16_to_float = [](hip_bfloat16 val) -> float
@@ -1565,8 +1565,8 @@ TEST(Test__ROCmRingKVCache, MultiPrecision_BF16)
         EXPECT_FLOAT_EQ(actual, expected) << "BF16 mismatch at " << i;
     }
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[MultiPrecision_BF16] PASSED");
 }
@@ -1616,10 +1616,10 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_Q81)
 
     Q8_1Block *d_K = nullptr;
     Q8_1Block *d_V = nullptr;
-    hipMalloc(&d_K, block_count * sizeof(Q8_1Block));
-    hipMalloc(&d_V, block_count * sizeof(Q8_1Block));
-    hipMemcpy(d_K, h_K.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, block_count * sizeof(Q8_1Block));
+    (void)hipMalloc(&d_V, block_count * sizeof(Q8_1Block));
+    (void)hipMemcpy(d_K, h_K.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V.data(), block_count * sizeof(Q8_1Block), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, num_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), num_tokens);
@@ -1632,16 +1632,16 @@ TEST(Test__ROCmRingKVCache, BasicAppendRetrieve_Q81)
 
     std::vector<Q8_1Block> h_K_out(block_count);
     std::vector<Q8_1Block> h_V_out(block_count);
-    hipMemcpy(h_K_out.data(), d_K_out, block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, block_count * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
 
     EXPECT_EQ(std::memcmp(h_K_out.data(), h_K.data(), block_count * sizeof(Q8_1Block)), 0)
         << "Q8_1 K blocks mismatch";
     EXPECT_EQ(std::memcmp(h_V_out.data(), h_V.data(), block_count * sizeof(Q8_1Block)), 0)
         << "Q8_1 V blocks mismatch";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[BasicAppendRetrieve_Q81] PASSED");
 }
@@ -1686,10 +1686,10 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
 
     Q8_1Block *d_K = nullptr;
     Q8_1Block *d_V = nullptr;
-    hipMalloc(&d_K, total_blocks * sizeof(Q8_1Block));
-    hipMalloc(&d_V, total_blocks * sizeof(Q8_1Block));
-    hipMemcpy(d_K, h_K_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
-    hipMemcpy(d_V, h_V_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_K, total_blocks * sizeof(Q8_1Block));
+    (void)hipMalloc(&d_V, total_blocks * sizeof(Q8_1Block));
+    (void)hipMemcpy(d_K, h_K_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_V, h_V_all.data(), total_blocks * sizeof(Q8_1Block), hipMemcpyHostToDevice);
 
     ASSERT_TRUE(cache->append(0, 0, d_K, d_V, total_tokens, 0));
     EXPECT_EQ(cache->get_cached_tokens(0, 0), max_seq_len);
@@ -1705,8 +1705,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     const size_t kept_blocks = static_cast<size_t>(max_seq_len) * static_cast<size_t>(kv_blocks);
     std::vector<Q8_1Block> h_K_out(kept_blocks);
     std::vector<Q8_1Block> h_V_out(kept_blocks);
-    hipMemcpy(h_K_out.data(), d_K_out, kept_blocks * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
-    hipMemcpy(h_V_out.data(), d_V_out, kept_blocks * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_K_out.data(), d_K_out, kept_blocks * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(h_V_out.data(), d_V_out, kept_blocks * sizeof(Q8_1Block), hipMemcpyDeviceToHost);
 
     const size_t skipped_blocks = static_cast<size_t>(total_tokens - max_seq_len) * static_cast<size_t>(kv_blocks);
     EXPECT_EQ(std::memcmp(h_K_out.data(), h_K_all.data() + skipped_blocks, kept_blocks * sizeof(Q8_1Block)), 0)
@@ -1714,8 +1714,8 @@ TEST(Test__ROCmRingKVCache, WrapAround_Q81)
     EXPECT_EQ(std::memcmp(h_V_out.data(), h_V_all.data() + skipped_blocks, kept_blocks * sizeof(Q8_1Block)), 0)
         << "Q8_1 wrapped V blocks mismatch";
 
-    hipFree(d_K);
-    hipFree(d_V);
+    (void)hipFree(d_K);
+    (void)hipFree(d_V);
 
     LOG_INFO("[WrapAround_Q81] PASSED");
 }

@@ -4122,7 +4122,7 @@ TEST(Test__GDNKernels, ROCmPaddedGDNRealLengthStateMatchesUnpaddedDecodeAcrossRe
         EXPECT_LT(rel_l2, 1e-4) << "real_len=" << real_len;
     }
 
-    hipFree(d_effective_len);
+    (void)hipFree(d_effective_len);
 }
 
 TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAcrossReplayLengths)
@@ -4210,7 +4210,7 @@ TEST(Test__GDNKernels, ROCmPaddedShortConvRealLengthStateMatchesUnpaddedDecodeAc
         }
     }
 
-    hipFree(d_effective_len);
+    (void)hipFree(d_effective_len);
 }
 
 TEST(Test__GDNKernels, ROCmShortConvChunkForwardFromNonZeroStateMatchesSequentialDecode)

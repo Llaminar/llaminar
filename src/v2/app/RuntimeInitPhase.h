@@ -7,6 +7,7 @@
 
 #include "app/AppContext.h"
 #include "config/OrchestrationConfig.h"
+#include <iosfwd>
 #include <optional>
 
 namespace llaminar2
@@ -26,6 +27,20 @@ namespace llaminar2
     class RuntimeInitPhase
     {
     public:
+        /**
+         * @brief Run dry-run preflight on an already-created runner.
+         *
+         * This helper owns the dry-run-specific lifecycle after MPI/device setup:
+         * initialize the runner in validation-only mode, print the resolved plan
+         * on rank 0, and shut the runner back down.
+         *
+         * @return true when dry-run validation succeeds; false when it fails
+         */
+        static bool runDryRunPreflight(OrchestrationConfig &config,
+                                       IOrchestrationRunner &runner,
+                                       int mpi_rank,
+                                       std::ostream &out);
+
         /**
          * @brief Execute the runtime init phase
          *

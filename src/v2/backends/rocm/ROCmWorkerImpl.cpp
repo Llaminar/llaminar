@@ -69,7 +69,7 @@ namespace llaminar2
 
             if (stream)
             {
-                hipStreamDestroy(static_cast<hipStream_t>(stream));
+                (void)hipStreamDestroy(static_cast<hipStream_t>(stream));
             }
 
             LOG_DEBUG("[rocm_worker] Cleaned up context for ROCm device " << ordinal);

@@ -202,7 +202,7 @@ namespace llaminar2
             freeWorkspace();
             if (h_attn_params_)
             {
-                hipHostFree(h_attn_params_);
+                (void)hipHostFree(h_attn_params_);
                 h_attn_params_ = nullptr;
                 h_attn_params_capacity_ = 0;
             }
@@ -254,7 +254,7 @@ namespace llaminar2
                 freeWorkspace();
                 if (h_attn_params_)
                 {
-                    hipHostFree(h_attn_params_);
+                    (void)hipHostFree(h_attn_params_);
                     h_attn_params_ = nullptr;
                     h_attn_params_capacity_ = 0;
                 }
@@ -305,7 +305,7 @@ namespace llaminar2
 
             hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
             if (stream_)
-                hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
+                (void)hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
             if (cap_status == hipStreamCaptureStatusActive)
             {
                 LOG_ERROR("[ROCmFlashAttentionKernelT<FP32>] "
@@ -315,7 +315,7 @@ namespace llaminar2
 
             if (h_attn_params_)
             {
-                hipHostFree(h_attn_params_);
+                (void)hipHostFree(h_attn_params_);
                 h_attn_params_ = nullptr;
                 h_attn_params_capacity_ = 0;
             }
@@ -599,7 +599,7 @@ namespace llaminar2
             {
                 hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
                 if (stream_)
-                    hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
+                    (void)hipStreamIsCapturing(static_cast<hipStream_t>(stream_), &cap_status);
                 if (cap_status != hipStreamCaptureStatusActive)
                 {
                     if (hipFlashAttn_setDevice(device_idx) != 0)

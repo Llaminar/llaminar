@@ -22,6 +22,11 @@
 #include <iostream>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <iomanip>
+#include <memory>
+#include <optional>
+#include <sstream>
 #ifdef __linux__
 #include <malloc.h>
 #include <fstream>
@@ -30,6 +35,7 @@
 #include <exception>
 #include <filesystem>
 #include <string>
+#include <unordered_map>
 
 using json = nlohmann::json;
 
@@ -37,6 +43,258 @@ namespace llaminar2
 {
     namespace
     {
+        using SteadyClock = std::chrono::steady_clock;
+
+        struct RequestLogContext
+        {
+            SteadyClock::time_point started_at{};
+            std::shared_ptr<std::string> streamed_response_body;
+        };
+
+        class RequestLogState
+        {
+        public:
+            void start(const httplib::Request &req)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                contexts_[&req].started_at = SteadyClock::now();
+            }
+
+            void attachStreamedResponseBody(const httplib::Request &req,
+                                            std::shared_ptr<std::string> body)
+            {
+                if (!body)
+                    return;
+
+                std::lock_guard<std::mutex> lock(mutex_);
+                contexts_[&req].streamed_response_body = std::move(body);
+            }
+
+            RequestLogContext finish(const httplib::Request &req)
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto it = contexts_.find(&req);
+                if (it == contexts_.end())
+                    return {};
+
+                RequestLogContext context = std::move(it->second);
+                contexts_.erase(it);
+                return context;
+            }
+
+        private:
+            std::mutex mutex_;
+            std::unordered_map<const httplib::Request *, RequestLogContext> contexts_;
+        };
+
+        bool traceAccessLoggingEnabled()
+        {
+#if defined(NDEBUG)
+            return false;
+#else
+            return Logger::getInstance().shouldLog(LogLevel::TRACE);
+#endif
+        }
+
+        std::string escapeAccessField(const std::string &value)
+        {
+            if (value.empty())
+                return "-";
+
+            std::string escaped;
+            escaped.reserve(value.size());
+            for (char c : value)
+            {
+                switch (c)
+                {
+                case '\\':
+                    escaped += "\\\\";
+                    break;
+                case '"':
+                    escaped += "\\\"";
+                    break;
+                case '\n':
+                    escaped += "\\n";
+                    break;
+                case '\r':
+                    escaped += "\\r";
+                    break;
+                case '\t':
+                    escaped += "\\t";
+                    break;
+                default:
+                    escaped += c;
+                    break;
+                }
+            }
+            return escaped;
+        }
+
+        std::string requestTarget(const httplib::Request &req)
+        {
+            if (!req.target.empty())
+                return req.target;
+            if (!req.path.empty())
+                return req.path;
+            return "-";
+        }
+
+        std::string remoteAddress(const httplib::Request &req)
+        {
+            if (req.remote_addr.empty())
+                return "-";
+            if (req.remote_port < 0)
+                return req.remote_addr;
+            return req.remote_addr + ":" + std::to_string(req.remote_port);
+        }
+
+        std::optional<double> elapsedMs(const RequestLogContext &context)
+        {
+            if (context.started_at == SteadyClock::time_point{})
+                return std::nullopt;
+
+            return std::chrono::duration<double, std::milli>(
+                       SteadyClock::now() - context.started_at)
+                .count();
+        }
+
+        std::optional<size_t> responseBodyBytes(const httplib::Response &res,
+                                                const RequestLogContext &context)
+        {
+            if (context.streamed_response_body)
+                return context.streamed_response_body->size();
+            if (!res.body.empty())
+                return res.body.size();
+            if (res.has_header("Content-Length"))
+                return static_cast<size_t>(res.get_header_value_u64("Content-Length"));
+            if (res.status == 204 || res.status == 304)
+                return static_cast<size_t>(0);
+            return std::nullopt;
+        }
+
+        std::string formatDuration(const std::optional<double> &duration_ms)
+        {
+            if (!duration_ms)
+                return "-";
+
+            std::ostringstream out;
+            out << std::fixed << std::setprecision(1) << *duration_ms << "ms";
+            return out.str();
+        }
+
+        std::string formatBytes(const std::optional<size_t> &bytes)
+        {
+            if (!bytes)
+                return "-";
+            return std::to_string(*bytes) + "B";
+        }
+
+        std::string formatAccessLogLine(const httplib::Request &req,
+                                        const httplib::Response &res,
+                                        const RequestLogContext &context)
+        {
+            const std::string version = req.version.empty() ? "HTTP/?" : req.version;
+            const std::string referer = req.get_header_value("Referer");
+            const std::string user_agent = req.get_header_value("User-Agent");
+
+            std::ostringstream out;
+            out << "[Access] "
+                << remoteAddress(req)
+                << " - - \""
+                << escapeAccessField(req.method.empty() ? "-" : req.method) << ' '
+                << escapeAccessField(requestTarget(req)) << ' '
+                << escapeAccessField(version) << "\" "
+                << res.status << ' '
+                << formatBytes(responseBodyBytes(res, context)) << ' '
+                << formatDuration(elapsedMs(context)) << " \""
+                << escapeAccessField(referer) << "\" \""
+                << escapeAccessField(user_agent) << "\"";
+            return out.str();
+        }
+
+        size_t headerCount(const httplib::Headers &headers)
+        {
+            return headers.size();
+        }
+
+        std::string contentType(const httplib::Response &res)
+        {
+            return res.get_header_value("Content-Type");
+        }
+
+        std::string formatDebugLogLine(const httplib::Request &req,
+                                       const httplib::Response &res,
+                                       const RequestLogContext &context)
+        {
+            std::ostringstream out;
+            out << "[HTTP] "
+                << (req.method.empty() ? "-" : req.method) << ' '
+                << requestTarget(req)
+                << " from=" << remoteAddress(req)
+                << " request_headers=" << headerCount(req.headers)
+                << " request_body=" << req.body.size() << "B"
+                << " status=" << res.status
+                << " response_headers=" << headerCount(res.headers)
+                << " response_body=" << formatBytes(responseBodyBytes(res, context))
+                << " content_type=\"" << escapeAccessField(contentType(res)) << "\""
+                << " duration=" << formatDuration(elapsedMs(context));
+            return out.str();
+        }
+
+        void appendHeaders(std::ostringstream &out, const httplib::Headers &headers)
+        {
+            for (const auto &[name, value] : headers)
+            {
+                out << name << ": " << value << '\n';
+            }
+        }
+
+        std::string responseBodyForTrace(const httplib::Response &res,
+                                         const RequestLogContext &context)
+        {
+            if (context.streamed_response_body)
+                return *context.streamed_response_body;
+            return res.body;
+        }
+
+        std::string formatRequestTrace(const httplib::Request &req)
+        {
+            std::ostringstream out;
+            out << (req.method.empty() ? "-" : req.method) << ' '
+                << requestTarget(req) << ' '
+                << (req.version.empty() ? "HTTP/?" : req.version) << '\n';
+            appendHeaders(out, req.headers);
+            out << '\n'
+                << req.body;
+            return out.str();
+        }
+
+        std::string formatResponseTrace(const httplib::Response &res,
+                                        const RequestLogContext &context)
+        {
+            std::ostringstream out;
+            out << "HTTP/1.1 " << res.status;
+            if (const char *reason = httplib::status_message(res.status))
+                out << ' ' << reason;
+            out << '\n';
+            appendHeaders(out, res.headers);
+            out << '\n'
+                << responseBodyForTrace(res, context);
+            return out.str();
+        }
+
+        void logServedRequest(const httplib::Request &req,
+                              const httplib::Response &res,
+                              RequestLogState &log_state)
+        {
+            RequestLogContext context = log_state.finish(req);
+
+            LOG_INFO(formatAccessLogLine(req, res, context));
+            LOG_DEBUG(formatDebugLogLine(req, res, context));
+            LOG_TRACE("[HTTP] request\n" << formatRequestTrace(req));
+            LOG_TRACE("[HTTP] response\n" << formatResponseTrace(res, context));
+        }
+
         int finalizeAfterUnhandledException(AppContext &ctx, const std::string &detail)
         {
             const bool has_mpi = ctx.mpi_ctx != nullptr;
@@ -119,6 +377,7 @@ namespace llaminar2
 
         httplib::Server svr;
         g_server_ptr = &svr;
+        RequestLogState request_log_state;
 
         // Inference is serialized on a single model instance. Keep HTTP handling
         // on one stable worker so OpenMP does not initialize per-request teams
@@ -129,6 +388,17 @@ namespace llaminar2
         // Install signal handlers for graceful shutdown
         std::signal(SIGINT, signal_handler);
         std::signal(SIGTERM, signal_handler);
+
+        svr.set_pre_routing_handler(
+            [&request_log_state](const httplib::Request &req, httplib::Response &) {
+                request_log_state.start(req);
+                return httplib::Server::HandlerResponse::Unhandled;
+            });
+
+        svr.set_logger(
+            [&request_log_state](const httplib::Request &req, const httplib::Response &res) {
+                logServedRequest(req, res, request_log_state);
+            });
 
         // Mutex to serialize inference requests (single model instance)
         std::mutex inference_mutex;
@@ -172,13 +442,22 @@ namespace llaminar2
 
                      if (parsed_request->stream)
                      {
+                         auto streamed_response_body = traceAccessLoggingEnabled()
+                                                           ? std::make_shared<std::string>()
+                                                           : nullptr;
+                         request_log_state.attachStreamedResponseBody(req, streamed_response_body);
+
                          // SSE streaming response
                          res.set_chunked_content_provider(
                              "text/event-stream",
-                             [&handler, request = std::move(*parsed_request)](size_t /*offset*/, httplib::DataSink &sink) -> bool
+                             [&handler,
+                              request = std::move(*parsed_request),
+                              streamed_response_body](size_t /*offset*/, httplib::DataSink &sink) -> bool
                              {
-                                 auto chunk_cb = [&sink](const std::string &sse_line) -> bool
+                                 auto chunk_cb = [&sink, streamed_response_body](const std::string &sse_line) -> bool
                                  {
+                                     if (streamed_response_body)
+                                         streamed_response_body->append(sse_line);
                                      return sink.write(sse_line.c_str(), sse_line.size());
                                  };
 
@@ -188,6 +467,8 @@ namespace llaminar2
                                  {
                                      // Error before streaming started — emit error as SSE
                                      std::string error_sse = "data: " + response.json_body + "\n\ndata: [DONE]\n\n";
+                                     if (streamed_response_body)
+                                         streamed_response_body->append(error_sse);
                                      sink.write(error_sse.c_str(), error_sse.size());
                                  }
 
@@ -204,8 +485,26 @@ namespace llaminar2
                      }
                  });
 
-        // Start listening
-        LOG_INFO("Llaminar server starting on " << config.serve_host << ":" << config.serve_port);
+        // Bind the socket before announcing readiness. cpp-httplib combines
+        // bind(2) and listen(2) in bind_to_port(), then listen_after_bind()
+        // enters the blocking accept loop.
+        const std::string serve_endpoint = config.serve_host + ":" + std::to_string(config.serve_port);
+        LOG_INFO("Llaminar server starting on " << serve_endpoint);
+
+        if (!svr.bind_to_port(config.serve_host, config.serve_port))
+        {
+            if (!g_shutdown_requested.load())
+            {
+                LOG_ERROR("Failed to start server on " << serve_endpoint);
+            }
+            if (mpi_ctx->world_size() > 1)
+                runner->shutdownMPIWorkers();
+            runner->shutdown();
+            mpiShutdown();
+            return 1;
+        }
+
+        LOG_INFO("Llaminar is ready and serving on " << serve_endpoint);
 
         // Report RSS at server-ready point (after arena + KV cache init)
 #ifdef __linux__
@@ -224,11 +523,11 @@ namespace llaminar2
         }
 #endif
 
-        if (!svr.listen(config.serve_host, config.serve_port))
+        if (!svr.listen_after_bind())
         {
             if (!g_shutdown_requested.load())
             {
-                LOG_ERROR("Failed to start server on " << config.serve_host << ":" << config.serve_port);
+                LOG_ERROR("Server stopped unexpectedly while serving on " << serve_endpoint);
                 if (mpi_ctx->world_size() > 1)
                     runner->shutdownMPIWorkers();
                 runner->shutdown();

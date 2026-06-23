@@ -9,7 +9,7 @@
 # Feature branches run a 6-step suite:
 #   1. Integration build
 #   2. Unit tests (parallel)
-#   3. Focused parity baseline (40 tests, all model families, sequential)
+#   3. Focused parity baseline (48 tests, all model families, sequential)
 #   4. E2E release build
 #   5. E2E server integration tests
 #   6. Performance regression benchmarks
@@ -122,14 +122,14 @@ if $FULL_SUITE; then
     echo ""
 fi
 
-# Step 3/4: Run Focused Parity Baseline (40 tests, all model families, sequential)
+# Step 3/4: Run Focused Parity Baseline (48 tests, all model families, sequential)
 # Covers Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.5 27B LocalPP (dense Q4_K_M),
 # Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
 # HybridPPTP (pipeline+tensor parallel),
 # and ExpertOverlay (tiered same-layer expert residency).
 # Runs on ALL branches to catch accuracy regressions early.
 if $FULL_SUITE; then PARITY_STEP=4; else PARITY_STEP=3; fi
-echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (40 tests, all model families)...${NC}"
+echo -e "${YELLOW}[${PARITY_STEP}/${TOTAL_STEPS}] Running focused parity baseline (48 tests, all model families)...${NC}"
 echo ""
 
 set +e
@@ -261,7 +261,7 @@ echo -e "${GREEN}  • Unit tests: OK${NC}"
 if $FULL_SUITE; then
 echo -e "${GREEN}  • Integration tests: OK${NC}"
 fi
-echo -e "${GREEN}  • Parity baseline (40 tests): OK${NC}"
+echo -e "${GREEN}  • Parity baseline (48 tests): OK${NC}"
 echo -e "${GREEN}  • E2E server tests: OK${NC}"
 echo -e "${GREEN}  • Performance benchmarks: OK${NC}"
 echo ""

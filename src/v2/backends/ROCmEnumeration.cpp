@@ -49,7 +49,7 @@ namespace llaminar2
 
             // Save the current device so we can restore it after enumeration
             int saved_device = 0;
-            hipGetDevice(&saved_device);
+            (void)hipGetDevice(&saved_device);
 
             // Track which devices already had an active primary context before
             // we touch them.  We will release contexts we created so that
@@ -162,7 +162,7 @@ namespace llaminar2
             }
 
             // Restore the original device to avoid side effects on callers
-            hipSetDevice(saved_device);
+            (void)hipSetDevice(saved_device);
 
             // Release primary contexts that we created during enumeration.
             // hipSetDevice() implicitly retains the primary context; if we

@@ -773,18 +773,18 @@ TEST(Test__ROCmMoEKernel, Route_DecodeSmall)
 
     // Upload data to device
     float *d_hidden = nullptr, *d_gate_weights = nullptr;
-    hipMalloc(&d_hidden, hidden.size() * sizeof(float));
-    hipMalloc(&d_gate_weights, gate_weights.size() * sizeof(float));
-    hipMemcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_gate_weights, gate_weights.data(), gate_weights.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_hidden, hidden.size() * sizeof(float));
+    (void)hipMalloc(&d_gate_weights, gate_weights.size() * sizeof(float));
+    (void)hipMemcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate_weights, gate_weights.data(), gate_weights.size() * sizeof(float), hipMemcpyHostToDevice);
 
     MoERoutingResult gpu_result;
     ASSERT_TRUE(gpu_kernel.route(d_hidden, d_gate_weights,
                                  seq_len, d_model, num_experts, top_k,
                                  true, gpu_result));
 
-    hipFree(d_hidden);
-    hipFree(d_gate_weights);
+    (void)hipFree(d_hidden);
+    (void)hipFree(d_gate_weights);
 
     // Verify router logits parity
     ASSERT_EQ(gpu_result.router_logits.size(), cpu_result.router_logits.size());
@@ -1923,18 +1923,18 @@ TEST(Test__ROCmMoEKernel, Route_PrefillLarge)
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_hidden = nullptr, *d_gate = nullptr;
-    hipMalloc(&d_hidden, hidden.size() * sizeof(float));
-    hipMalloc(&d_gate, gate_weights.size() * sizeof(float));
-    hipMemcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_gate, gate_weights.data(), gate_weights.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_hidden, hidden.size() * sizeof(float));
+    (void)hipMalloc(&d_gate, gate_weights.size() * sizeof(float));
+    (void)hipMemcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate, gate_weights.data(), gate_weights.size() * sizeof(float), hipMemcpyHostToDevice);
 
     MoERoutingResult gpu_result;
     ASSERT_TRUE(gpu_kernel.route(d_hidden, d_gate,
                                  seq_len, d_model, num_experts, top_k,
                                  true, gpu_result));
 
-    hipFree(d_hidden);
-    hipFree(d_gate);
+    (void)hipFree(d_hidden);
+    (void)hipFree(d_gate);
 
     // Verify per-token
     ASSERT_FALSE(hasNaNOrInf(gpu_result.router_logits.data(), gpu_result.router_logits.size()));
@@ -1993,21 +1993,21 @@ TEST(Test__ROCmMoEKernel, GatherTokenBatch)
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_hidden = nullptr, *d_batch = nullptr;
     int *d_indices = nullptr;
-    hipMalloc(&d_hidden, hidden.size() * sizeof(float));
-    hipMalloc(&d_batch, num_tokens * d_model * sizeof(float));
-    hipMalloc(&d_indices, num_tokens * sizeof(int));
-    hipMemcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_indices, token_indices.data(), num_tokens * sizeof(int), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_hidden, hidden.size() * sizeof(float));
+    (void)hipMalloc(&d_batch, num_tokens * d_model * sizeof(float));
+    (void)hipMalloc(&d_indices, num_tokens * sizeof(int));
+    (void)hipMemcpy(d_hidden, hidden.data(), hidden.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_indices, token_indices.data(), num_tokens * sizeof(int), hipMemcpyHostToDevice);
 
     gpu_kernel.gatherTokenBatch(d_hidden, d_batch, d_indices, num_tokens, d_model);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<float> gpu_batch(num_tokens * d_model);
-    hipMemcpy(gpu_batch.data(), d_batch, gpu_batch.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(gpu_batch.data(), d_batch, gpu_batch.size() * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_hidden);
-    hipFree(d_batch);
-    hipFree(d_indices);
+    (void)hipFree(d_hidden);
+    (void)hipFree(d_batch);
+    (void)hipFree(d_indices);
 
     // Exact match expected for gather (just copying)
     ASSERT_FALSE(hasNaNOrInf(gpu_batch.data(), gpu_batch.size()));
@@ -2058,25 +2058,25 @@ TEST(Test__ROCmMoEKernel, ScatterAddWeighted)
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_output = nullptr, *d_expert = nullptr, *d_weights = nullptr;
     int *d_indices = nullptr;
-    hipMalloc(&d_output, seq_len * d_model * sizeof(float));
-    hipMalloc(&d_expert, expert_output.size() * sizeof(float));
-    hipMalloc(&d_weights, weights.size() * sizeof(float));
-    hipMalloc(&d_indices, token_indices.size() * sizeof(int));
-    hipMemset(d_output, 0, seq_len * d_model * sizeof(float));
-    hipMemcpy(d_expert, expert_output.data(), expert_output.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_weights, weights.data(), weights.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_indices, token_indices.data(), token_indices.size() * sizeof(int), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_output, seq_len * d_model * sizeof(float));
+    (void)hipMalloc(&d_expert, expert_output.size() * sizeof(float));
+    (void)hipMalloc(&d_weights, weights.size() * sizeof(float));
+    (void)hipMalloc(&d_indices, token_indices.size() * sizeof(int));
+    (void)hipMemset(d_output, 0, seq_len * d_model * sizeof(float));
+    (void)hipMemcpy(d_expert, expert_output.data(), expert_output.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_weights, weights.data(), weights.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_indices, token_indices.data(), token_indices.size() * sizeof(int), hipMemcpyHostToDevice);
 
     gpu_kernel.scatterAddWeighted(d_output, d_expert, d_indices, d_weights, num_tokens, d_model);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<float> gpu_output(seq_len * d_model);
-    hipMemcpy(gpu_output.data(), d_output, gpu_output.size() * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(gpu_output.data(), d_output, gpu_output.size() * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_output);
-    hipFree(d_expert);
-    hipFree(d_weights);
-    hipFree(d_indices);
+    (void)hipFree(d_output);
+    (void)hipFree(d_expert);
+    (void)hipFree(d_weights);
+    (void)hipFree(d_indices);
 
     // Verify
     ASSERT_FALSE(hasNaNOrInf(gpu_output.data(), gpu_output.size()));
@@ -2123,23 +2123,23 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_Decode)
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_input = nullptr, *d_gate_inp = nullptr, *d_shared_output = nullptr;
-    hipMalloc(&d_input, input.size() * sizeof(float));
-    hipMalloc(&d_gate_inp, gate_inp.size() * sizeof(float));
-    hipMalloc(&d_shared_output, gpu_shared_output_host.size() * sizeof(float));
-    hipMemcpy(d_input, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_gate_inp, gate_inp.data(), gate_inp.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_shared_output, gpu_shared_output_host.data(),
+    (void)hipMalloc(&d_input, input.size() * sizeof(float));
+    (void)hipMalloc(&d_gate_inp, gate_inp.size() * sizeof(float));
+    (void)hipMalloc(&d_shared_output, gpu_shared_output_host.size() * sizeof(float));
+    (void)hipMemcpy(d_input, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate_inp, gate_inp.data(), gate_inp.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_shared_output, gpu_shared_output_host.data(),
               gpu_shared_output_host.size() * sizeof(float), hipMemcpyHostToDevice);
 
     gpu_kernel.sharedExpertGate(d_input, d_gate_inp, d_shared_output, seq_len, d_model);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(gpu_shared_output_host.data(), d_shared_output,
+    (void)hipMemcpy(gpu_shared_output_host.data(), d_shared_output,
               gpu_shared_output_host.size() * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gate_inp);
-    hipFree(d_shared_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gate_inp);
+    (void)hipFree(d_shared_output);
 
     // Verify
     ASSERT_FALSE(hasNaNOrInf(gpu_shared_output_host.data(), gpu_shared_output_host.size()));
@@ -2306,23 +2306,23 @@ TEST(Test__ROCmMoEKernel, SharedExpertGate_Prefill)
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_input = nullptr, *d_gate_inp = nullptr, *d_shared_output = nullptr;
-    hipMalloc(&d_input, input.size() * sizeof(float));
-    hipMalloc(&d_gate_inp, gate_inp.size() * sizeof(float));
-    hipMalloc(&d_shared_output, gpu_shared_output_host.size() * sizeof(float));
-    hipMemcpy(d_input, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_gate_inp, gate_inp.data(), gate_inp.size() * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_shared_output, gpu_shared_output_host.data(),
+    (void)hipMalloc(&d_input, input.size() * sizeof(float));
+    (void)hipMalloc(&d_gate_inp, gate_inp.size() * sizeof(float));
+    (void)hipMalloc(&d_shared_output, gpu_shared_output_host.size() * sizeof(float));
+    (void)hipMemcpy(d_input, input.data(), input.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_gate_inp, gate_inp.data(), gate_inp.size() * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_shared_output, gpu_shared_output_host.data(),
               gpu_shared_output_host.size() * sizeof(float), hipMemcpyHostToDevice);
 
     gpu_kernel.sharedExpertGate(d_input, d_gate_inp, d_shared_output, seq_len, d_model);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(gpu_shared_output_host.data(), d_shared_output,
+    (void)hipMemcpy(gpu_shared_output_host.data(), d_shared_output,
               gpu_shared_output_host.size() * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_input);
-    hipFree(d_gate_inp);
-    hipFree(d_shared_output);
+    (void)hipFree(d_input);
+    (void)hipFree(d_gate_inp);
+    (void)hipFree(d_shared_output);
 
     ASSERT_FALSE(hasNaNOrInf(gpu_shared_output_host.data(), gpu_shared_output_host.size()));
     double cosine = cosineSimilarity(gpu_shared_output_host.data(), cpu_shared_output.data(),
@@ -2363,18 +2363,18 @@ TEST(Test__ROCmMoEKernel, SwiGLU)
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     float *d_gate = nullptr, *d_up = nullptr;
-    hipMalloc(&d_gate, count * sizeof(float));
-    hipMalloc(&d_up, count * sizeof(float));
-    hipMemcpy(d_gate, gpu_gate_host.data(), count * sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(d_up, up.data(), count * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_gate, count * sizeof(float));
+    (void)hipMalloc(&d_up, count * sizeof(float));
+    (void)hipMemcpy(d_gate, gpu_gate_host.data(), count * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_up, up.data(), count * sizeof(float), hipMemcpyHostToDevice);
 
     gpu_kernel.swiGLU(d_gate, d_up, count);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
-    hipMemcpy(gpu_gate_host.data(), d_gate, count * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(gpu_gate_host.data(), d_gate, count * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_gate);
-    hipFree(d_up);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_up);
 
     // Verify
     ASSERT_FALSE(hasNaNOrInf(gpu_gate_host.data(), gpu_gate_host.size()));
@@ -2494,7 +2494,7 @@ TEST(Test__ROCmMoEKernel, GroupedExpertDownDecode_Q4_0MatchesSequential)
     ASSERT_TRUE(moe_kernel.groupedExpertDownDecode(
         gate_ptrs, up_ptrs, expert_ids, route_weights, descs,
         num_active, grouped_output.get(), d_model, intermediate));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     sequential_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     grouped_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
@@ -2667,7 +2667,7 @@ void runGroupedExpertDownDecodeFormatMatch(const char *label, WeightFactory crea
             gate_ptrs, up_ptrs, device_runtime, table_id,
             num_active, parallel_runtime_output.get(), d_model, intermediate));
     }
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     ASSERT_EQ(hipFree(device_runtime), hipSuccess);
 
     sequential_output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
@@ -2898,7 +2898,7 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
 
     ASSERT_TRUE(gate_kernels[expert_ids[0]]->multiply_fused_tensor(
         input.get(), projections, 1, d_model));
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(num_experts);
     std::vector<DeviceNativeVNNIMatrixDesc> up_descs(num_experts);
@@ -2975,7 +2975,7 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
             device_runtime, input.get(), table_id, num_active,
             kpart_gate_ptrs, kpart_up_ptrs, d_model, intermediate))
             << label << " K-partition runtime gate/up failed for kparts=" << kparts;
-        hipDeviceSynchronize();
+        (void)hipDeviceSynchronize();
 
         for (int i = 0; i < num_active; ++i)
         {
@@ -3010,7 +3010,7 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
                 << label << " kpart up max abs diff too high for active slot " << i << " kparts=" << kparts;
         }
     }
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
     ASSERT_EQ(hipFree(device_runtime), hipSuccess);
 
     for (int i = 0; i < num_active; ++i)
@@ -4383,8 +4383,8 @@ TEST(Test__ROCmMoEKernel, Histogram_RecordAndSync)
 
     // Upload routing indices to device
     int *d_indices = nullptr;
-    hipMalloc(&d_indices, routing_indices.size() * sizeof(int));
-    hipMemcpy(d_indices, routing_indices.data(),
+    (void)hipMalloc(&d_indices, routing_indices.size() * sizeof(int));
+    (void)hipMemcpy(d_indices, routing_indices.data(),
               routing_indices.size() * sizeof(int), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
@@ -4395,7 +4395,7 @@ TEST(Test__ROCmMoEKernel, Histogram_RecordAndSync)
     std::vector<uint64_t> host_counts(num_experts, 0);
     gpu_kernel.syncHistogramToHost(host_counts.data(), layer_idx, num_experts);
 
-    hipFree(d_indices);
+    (void)hipFree(d_indices);
 
     // Verify counts
     uint64_t total_count = 0;
@@ -4431,8 +4431,8 @@ TEST(Test__ROCmMoEKernel, Histogram_Reset)
     // Record some histogram data
     std::vector<int> routing_indices = {0, 1, 2, 3, 4, 5, 6, 7};
     int *d_indices = nullptr;
-    hipMalloc(&d_indices, routing_indices.size() * sizeof(int));
-    hipMemcpy(d_indices, routing_indices.data(),
+    (void)hipMalloc(&d_indices, routing_indices.size() * sizeof(int));
+    (void)hipMemcpy(d_indices, routing_indices.data(),
               routing_indices.size() * sizeof(int), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
@@ -4460,7 +4460,7 @@ TEST(Test__ROCmMoEKernel, Histogram_Reset)
             << "Expert " << e << " should be 0 after reset, got " << counts_after[e];
     }
 
-    hipFree(d_indices);
+    (void)hipFree(d_indices);
 
     std::cout << "[Histogram_Reset] sum_before=" << sum_before
               << " sum_after=0 (all zeroed)" << std::endl;
@@ -4502,10 +4502,10 @@ TEST(Test__ROCmMoEKernel, ExpertMask_ApplyZerosWeights)
     // Upload to device
     int *d_indices = nullptr;
     float *d_weights = nullptr;
-    hipMalloc(&d_indices, total_slots * sizeof(int));
-    hipMalloc(&d_weights, total_slots * sizeof(float));
-    hipMemcpy(d_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
-    hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_indices, total_slots * sizeof(int));
+    (void)hipMalloc(&d_weights, total_slots * sizeof(float));
+    (void)hipMemcpy(d_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
@@ -4515,14 +4515,14 @@ TEST(Test__ROCmMoEKernel, ExpertMask_ApplyZerosWeights)
         mask_bytes[i] = mask[i] ? 1 : 0;
     gpu_kernel.updateExpertMaskDevice(reinterpret_cast<const bool *>(mask_bytes.data()), num_experts);
     gpu_kernel.applyExpertMaskDevice(d_weights, d_indices, seq_len, top_k);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     // Read back weights
     std::vector<float> result_weights(total_slots);
-    hipMemcpy(result_weights.data(), d_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(result_weights.data(), d_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_indices);
-    hipFree(d_weights);
+    (void)hipFree(d_indices);
+    (void)hipFree(d_weights);
 
     // Verify
     int zeroed_count = 0;
@@ -4585,23 +4585,23 @@ TEST(Test__ROCmMoEKernel, ExpertMask_AllActiveNoChange)
     // Upload to device
     int *d_indices = nullptr;
     float *d_weights = nullptr;
-    hipMalloc(&d_indices, total_slots * sizeof(int));
-    hipMalloc(&d_weights, total_slots * sizeof(float));
-    hipMemcpy(d_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
-    hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_indices, total_slots * sizeof(int));
+    (void)hipMalloc(&d_weights, total_slots * sizeof(float));
+    (void)hipMemcpy(d_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
 
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
     gpu_kernel.updateExpertMaskDevice(reinterpret_cast<const bool *>(mask_bytes.data()), num_experts);
     gpu_kernel.applyExpertMaskDevice(d_weights, d_indices, seq_len, top_k);
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     // Read back
     std::vector<float> result_weights(total_slots);
-    hipMemcpy(result_weights.data(), d_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(result_weights.data(), d_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_indices);
-    hipFree(d_weights);
+    (void)hipFree(d_indices);
+    (void)hipFree(d_weights);
 
     // Verify all weights unchanged
     int mismatches = 0;
@@ -4688,19 +4688,19 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_Basic)
     // Upload to device
     int *d_routing_indices = nullptr;
     float *d_routing_weights = nullptr;
-    hipMalloc(&d_routing_indices, total_slots * sizeof(int));
-    hipMalloc(&d_routing_weights, total_slots * sizeof(float));
-    hipMemcpy(d_routing_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
-    hipMemcpy(d_routing_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_routing_indices, total_slots * sizeof(int));
+    (void)hipMalloc(&d_routing_weights, total_slots * sizeof(float));
+    (void)hipMemcpy(d_routing_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_routing_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
 
     // Allocate output buffers
     int *d_expert_offsets = nullptr, *d_expert_counts = nullptr;
     int *d_grouped_indices = nullptr;
     float *d_grouped_weights = nullptr;
-    hipMalloc(&d_expert_offsets, num_experts * sizeof(int));
-    hipMalloc(&d_expert_counts, num_experts * sizeof(int));
-    hipMalloc(&d_grouped_indices, total_slots * sizeof(int));
-    hipMalloc(&d_grouped_weights, total_slots * sizeof(float));
+    (void)hipMalloc(&d_expert_offsets, num_experts * sizeof(int));
+    (void)hipMalloc(&d_expert_counts, num_experts * sizeof(int));
+    (void)hipMalloc(&d_grouped_indices, total_slots * sizeof(int));
+    (void)hipMalloc(&d_grouped_weights, total_slots * sizeof(float));
 
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
@@ -4711,24 +4711,24 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_Basic)
         d_grouped_indices, d_grouped_weights);
     ASSERT_TRUE(ok) << "groupTokensByExpertDevice failed";
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     // D2H copy results
     std::vector<int> host_offsets(num_experts);
     std::vector<int> host_counts(num_experts);
     std::vector<int> host_grouped_indices(total_slots);
     std::vector<float> host_grouped_weights(total_slots);
-    hipMemcpy(host_offsets.data(), d_expert_offsets, num_experts * sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_counts.data(), d_expert_counts, num_experts * sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_grouped_indices.data(), d_grouped_indices, total_slots * sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_grouped_weights.data(), d_grouped_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_offsets.data(), d_expert_offsets, num_experts * sizeof(int), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_counts.data(), d_expert_counts, num_experts * sizeof(int), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_grouped_indices.data(), d_grouped_indices, total_slots * sizeof(int), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_grouped_weights.data(), d_grouped_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_routing_indices);
-    hipFree(d_routing_weights);
-    hipFree(d_expert_offsets);
-    hipFree(d_expert_counts);
-    hipFree(d_grouped_indices);
-    hipFree(d_grouped_weights);
+    (void)hipFree(d_routing_indices);
+    (void)hipFree(d_routing_weights);
+    (void)hipFree(d_expert_offsets);
+    (void)hipFree(d_expert_counts);
+    (void)hipFree(d_grouped_indices);
+    (void)hipFree(d_grouped_weights);
 
     // Verify expert counts
     for (int e = 0; e < num_experts; ++e)
@@ -4997,9 +4997,9 @@ TEST(Test__ROCmMoEKernel, SmallMGateLogits_RejectsNullStream)
         /*device_idx=*/0,
         /*stream=*/nullptr));
 
-    hipFree(d_hidden);
-    hipFree(d_gate);
-    hipFree(d_logits);
+    (void)hipFree(d_hidden);
+    (void)hipFree(d_gate);
+    (void)hipFree(d_logits);
 }
 
 TEST(Test__ROCmMoEKernel, SmallMGateLogits_ModelShapeMatchesSingleTokenLaunches)
@@ -6422,19 +6422,19 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_PrefillScale)
     // Upload to device
     int *d_routing_indices = nullptr;
     float *d_routing_weights = nullptr;
-    hipMalloc(&d_routing_indices, total_slots * sizeof(int));
-    hipMalloc(&d_routing_weights, total_slots * sizeof(float));
-    hipMemcpy(d_routing_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
-    hipMemcpy(d_routing_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
+    (void)hipMalloc(&d_routing_indices, total_slots * sizeof(int));
+    (void)hipMalloc(&d_routing_weights, total_slots * sizeof(float));
+    (void)hipMemcpy(d_routing_indices, routing_indices.data(), total_slots * sizeof(int), hipMemcpyHostToDevice);
+    (void)hipMemcpy(d_routing_weights, routing_weights.data(), total_slots * sizeof(float), hipMemcpyHostToDevice);
 
     // Allocate output buffers
     int *d_expert_offsets = nullptr, *d_expert_counts = nullptr;
     int *d_grouped_indices = nullptr;
     float *d_grouped_weights = nullptr;
-    hipMalloc(&d_expert_offsets, num_experts * sizeof(int));
-    hipMalloc(&d_expert_counts, num_experts * sizeof(int));
-    hipMalloc(&d_grouped_indices, total_slots * sizeof(int));
-    hipMalloc(&d_grouped_weights, total_slots * sizeof(float));
+    (void)hipMalloc(&d_expert_offsets, num_experts * sizeof(int));
+    (void)hipMalloc(&d_expert_counts, num_experts * sizeof(int));
+    (void)hipMalloc(&d_grouped_indices, total_slots * sizeof(int));
+    (void)hipMalloc(&d_grouped_weights, total_slots * sizeof(float));
 
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(gpu_kernel);
@@ -6445,24 +6445,24 @@ TEST(Test__ROCmMoEKernel, GroupTokensByExpert_PrefillScale)
         d_grouped_indices, d_grouped_weights);
     ASSERT_TRUE(ok) << "groupTokensByExpertDevice failed";
 
-    hipDeviceSynchronize();
+    (void)hipDeviceSynchronize();
 
     // D2H copy results
     std::vector<int> host_offsets(num_experts);
     std::vector<int> host_counts(num_experts);
     std::vector<int> host_grouped_indices(total_slots);
     std::vector<float> host_grouped_weights(total_slots);
-    hipMemcpy(host_offsets.data(), d_expert_offsets, num_experts * sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_counts.data(), d_expert_counts, num_experts * sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_grouped_indices.data(), d_grouped_indices, total_slots * sizeof(int), hipMemcpyDeviceToHost);
-    hipMemcpy(host_grouped_weights.data(), d_grouped_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_offsets.data(), d_expert_offsets, num_experts * sizeof(int), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_counts.data(), d_expert_counts, num_experts * sizeof(int), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_grouped_indices.data(), d_grouped_indices, total_slots * sizeof(int), hipMemcpyDeviceToHost);
+    (void)hipMemcpy(host_grouped_weights.data(), d_grouped_weights, total_slots * sizeof(float), hipMemcpyDeviceToHost);
 
-    hipFree(d_routing_indices);
-    hipFree(d_routing_weights);
-    hipFree(d_expert_offsets);
-    hipFree(d_expert_counts);
-    hipFree(d_grouped_indices);
-    hipFree(d_grouped_weights);
+    (void)hipFree(d_routing_indices);
+    (void)hipFree(d_routing_weights);
+    (void)hipFree(d_expert_offsets);
+    (void)hipFree(d_expert_counts);
+    (void)hipFree(d_grouped_indices);
+    (void)hipFree(d_grouped_weights);
 
     // Verify: sum of all expert_counts == total_slots
     int sum_counts = 0;
