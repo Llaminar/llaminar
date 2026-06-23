@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+Qwen36MoE_35B_ROCm_KV_FP16,0,0.999806,0.00165281,1,1,271,271,true,true,true,true
+Qwen36MoE_35B_ROCm_KV_FP16,1,0.998771,0.00371732,1,1,71093,71093,true,true,true,true
+Qwen36MoE_35B_ROCm_KV_FP16,2,0.999501,0.00247437,1,1,12305,12305,true,true,true,true
+Qwen36MoE_35B_ROCm_KV_FP16,3,0.999426,3.37391e-05,1,1,198,198,true,true,true,true
+Qwen36MoE_35B_ROCm_KV_FP16,4,0.999088,0.00127891,1,1,464,464,true,true,true,true

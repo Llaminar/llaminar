@@ -676,7 +676,7 @@ namespace llaminar2
             // Halves KV bandwidth (int16 values are 2 bytes vs 4 bytes FP32)
             // and leverages VPDPWSSD for compute-free QK scoring.
             // ---------------------------------------------------------------
-#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+#if (defined(__AVX512F__) && defined(__AVX512VNNI__)) || defined(__AVX2__)
             if (K->native_type() == TensorType::Q16_1 &&
                 V->native_type() == TensorType::Q16_1 &&
                 batch_size == 1)
@@ -1086,8 +1086,10 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 return dot_fp32_avx512(a, b, n);
+#endif
             case ISALevel::AVX2:
                 return dot_fp32_avx2(a, b, n);
             default:
@@ -1499,9 +1501,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 dot_fp32_avx512_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
+#endif
             case ISALevel::AVX2:
                 dot_fp32_avx2_4row(q, k0, k1, k2, k3, head_dim, s0, s1, s2, s3);
                 break;
@@ -1567,9 +1571,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 batch_exp_4_avx512(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
+#endif
             case ISALevel::AVX2:
                 batch_exp_4_avx2(s0, s1, s2, s3, max_val, p0, p1, p2, p3);
                 break;
@@ -1681,9 +1687,11 @@ namespace llaminar2
             (void)use_avx512;
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 accum_weighted_v_avx512(out, v, weight, head_dim);
                 break;
+#endif
             case ISALevel::AVX2:
                 accum_weighted_v_avx2(out, v, weight, head_dim);
                 break;
@@ -1813,9 +1821,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 accum_weighted_v_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
+#endif
             case ISALevel::AVX2:
                 accum_weighted_v_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
@@ -1884,9 +1894,11 @@ namespace llaminar2
             (void)use_avx512;
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 scale_vec_avx512(out, alpha, head_dim);
                 break;
+#endif
             case ISALevel::AVX2:
                 scale_vec_avx2(out, alpha, head_dim);
                 break;
@@ -2009,13 +2021,11 @@ namespace llaminar2
                 const __m256 v = _mm256_loadu_ps(src + i);
                 __m256i i32 = _mm256_cvtps_epi32(_mm256_mul_ps(v, v_inv));
                 i32 = _mm256_max_epi32(v_lo, _mm256_min_epi32(v_hi, i32));
-                // Pack 8 × i32 → 8 × i16 via _mm256_packs_epi32
-                // packs_epi32 interleaves lanes: [0-3,4-7]→[0-3,0-3,4-7,4-7]
-                // So we pack with itself and use permute to fix lane order
-                __m256i packed = _mm256_packs_epi32(i32, i32);
-                packed = _mm256_permute4x64_epi64(packed, 0b11011000); // fix cross-lane
+                const __m128i packed = _mm_packs_epi32(
+                    _mm256_castsi256_si128(i32),
+                    _mm256_extracti128_si256(i32, 1));
                 _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + i),
-                                 _mm256_castsi256_si128(packed));
+                                 packed);
             }
             for (; i < n; ++i)
             {
@@ -2078,8 +2088,10 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512BW__)
             case ISALevel::AVX512:
                 return quantize_row_i16_i12_avx512(src, dst, n, qmax);
+#endif
             case ISALevel::AVX2:
                 return quantize_row_i16_i12_avx2(src, dst, n, qmax);
             default:
@@ -2239,8 +2251,10 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             case ISALevel::AVX512:
                 return dot_i16_i16_i32_vnni(a, b, n);
+#endif
             case ISALevel::AVX2:
                 return dot_i16_i16_i32_avx2(a, b, n);
             default:
@@ -2411,9 +2425,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             case ISALevel::AVX512:
                 dot_i16_i16_i32_vnni_2row_avx512(q, k0, k1, n, out0, out1);
                 break;
+#endif
             case ISALevel::AVX2:
                 dot_i16_i16_i32_vnni_2row_avx2(q, k0, k1, n, out0, out1);
                 break;
@@ -2538,9 +2554,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             case ISALevel::AVX512:
                 dot_2row_packedpair_avx512(q, k_pair, n, out0, out1);
                 break;
+#endif
             case ISALevel::AVX2:
                 dot_2row_packedpair_avx2(q, k_pair, n, out0, out1);
                 break;
@@ -2693,9 +2711,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             case ISALevel::AVX512:
                 dot_4row_packedpair_avx512(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
                 break;
+#endif
             case ISALevel::AVX2:
                 dot_4row_packedpair_avx2(q, k_pair0, k_pair1, n, out0, out1, out2, out3);
                 break;
@@ -2793,8 +2813,10 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             case ISALevel::AVX512:
                 return dot_single_from_packedpair_avx512(q, k_pair, n, row_sel);
+#endif
             case ISALevel::AVX2:
                 return dot_single_from_packedpair_avx2(q, k_pair, n, row_sel);
             default:
@@ -2932,9 +2954,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             case ISALevel::AVX512:
                 dot_4row_separate_avx512(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
+#endif
             case ISALevel::AVX2:
                 dot_4row_separate_avx2(q, k0, k1, k2, k3, n, out0, out1, out2, out3);
                 break;
@@ -3028,9 +3052,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 accum_weighted_v_q16_avx512(out, v_qs, combined, head_dim);
                 break;
+#endif
             case ISALevel::AVX2:
                 accum_weighted_v_q16_avx2(out, v_qs, combined, head_dim);
                 break;
@@ -3187,9 +3213,11 @@ namespace llaminar2
         {
             switch (activeISALevel())
             {
+#if defined(__AVX512F__)
             case ISALevel::AVX512:
                 accum_weighted_v_q16_4row_avx512(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
+#endif
             case ISALevel::AVX2:
                 accum_weighted_v_q16_4row_avx2(out, v0, w0, v1, w1, v2, w2, v3, w3, head_dim);
                 break;
@@ -4156,23 +4184,14 @@ namespace llaminar2
                                                      _MM_HINT_T0);
                                     }
 
-                                    const __m128 scores4 = _mm_set_ps(
-                                        block_scores[static_cast<size_t>(k - k0 + 3)],
-                                        block_scores[static_cast<size_t>(k - k0 + 2)],
-                                        block_scores[static_cast<size_t>(k - k0 + 1)],
-                                        block_scores[static_cast<size_t>(k - k0 + 0)]);
-                                    const __m128 nm4 = _mm_set1_ps(new_m);
-#if defined(__AVX512F__)
-                                    const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
-                                    const __m512 exp_out = fast_exp_avx512(exp_in);
-                                    const __m128 probs = _mm512_castps512_ps128(exp_out);
-#else
-                                    const __m256 exp_in = _mm256_castps128_ps256(_mm_sub_ps(scores4, nm4));
-                                    const __m256 exp_out = llaminar2::avx2::fast_exp(exp_in);
-                                    const __m128 probs = _mm256_castps256_ps128(exp_out);
-#endif
                                     alignas(16) float pp[4];
-                                    _mm_store_ps(pp, probs);
+                                    batch_exp_4(
+                                        block_scores[static_cast<size_t>(k - k0 + 0)],
+                                        block_scores[static_cast<size_t>(k - k0 + 1)],
+                                        block_scores[static_cast<size_t>(k - k0 + 2)],
+                                        block_scores[static_cast<size_t>(k - k0 + 3)],
+                                        new_m,
+                                        pp[0], pp[1], pp[2], pp[3]);
                                     new_l += pp[0] + pp[1] + pp[2] + pp[3];
 
                                     const uint8_t *vb0 = v_raw + static_cast<size_t>(k + 0) * row_stride_bytes + blk_off_bytes;
@@ -4649,34 +4668,14 @@ namespace llaminar2
                                                  _MM_HINT_T0);
                                 }
 
-                                // Vectorized exp: compute 4 softmax weights in one shot
-#if defined(__AVX512F__)
-                                const __m128 scores4 = _mm_set_ps(
-                                    block_scores[static_cast<size_t>(k - k0 + 3)],
-                                    block_scores[static_cast<size_t>(k - k0 + 2)],
-                                    block_scores[static_cast<size_t>(k - k0 + 1)],
-                                    block_scores[static_cast<size_t>(k - k0 + 0)]);
-                                const __m128 nm4 = _mm_set1_ps(new_m);
-                                // Broadcast 4 scores to __m512, compute exp, extract lower 4
-                                const __m512 exp_in = _mm512_castps128_ps512(_mm_sub_ps(scores4, nm4));
-                                const __m512 exp_out = fast_exp_avx512(exp_in);
-                                const __m128 probs = _mm512_castps512_ps128(exp_out);
                                 alignas(16) float pp[4];
-                                _mm_store_ps(pp, probs);
-#else
-                                // AVX2: pad 4 scores to __m256, compute exp, extract lower 4
-                                const __m128 scores4 = _mm_set_ps(
-                                    block_scores[static_cast<size_t>(k - k0 + 3)],
-                                    block_scores[static_cast<size_t>(k - k0 + 2)],
+                                batch_exp_4(
+                                    block_scores[static_cast<size_t>(k - k0 + 0)],
                                     block_scores[static_cast<size_t>(k - k0 + 1)],
-                                    block_scores[static_cast<size_t>(k - k0 + 0)]);
-                                const __m128 nm4 = _mm_set1_ps(new_m);
-                                const __m256 exp_in = _mm256_castps128_ps256(_mm_sub_ps(scores4, nm4));
-                                const __m256 exp_out = llaminar2::avx2::fast_exp(exp_in);
-                                const __m128 probs = _mm256_castps256_ps128(exp_out);
-                                alignas(16) float pp[4];
-                                _mm_store_ps(pp, probs);
-#endif
+                                    block_scores[static_cast<size_t>(k - k0 + 2)],
+                                    block_scores[static_cast<size_t>(k - k0 + 3)],
+                                    new_m,
+                                    pp[0], pp[1], pp[2], pp[3]);
                                 const float p0 = pp[0], p1 = pp[1], p2 = pp[2], p3 = pp[3];
                                 new_l += p0 + p1 + p2 + p3;
 
@@ -5132,14 +5131,7 @@ namespace llaminar2
                         const float alpha = std::isfinite(running_m)
                                                 ? std::exp(running_m - new_m)
                                                 : 0.0f;
-                        {
-                            const __m512 va = _mm512_set1_ps(alpha);
-                            int sd = 0;
-                            for (; sd + 15 < head_dim; sd += 16)
-                                _mm512_storeu_ps(out + sd, _mm512_mul_ps(va, _mm512_loadu_ps(out + sd)));
-                            for (; sd < head_dim; ++sd)
-                                out[sd] *= alpha;
-                        }
+                        scale_vec(out, alpha, head_dim, cpu_supports_avx512());
                         float new_l = running_l * alpha;
 
                         // --- V Phase: inline int8→float dequant + weighted accumulation ---
@@ -5188,12 +5180,7 @@ namespace llaminar2
                     if (running_l > 0.0f)
                     {
                         const float inv_l = 1.0f / running_l;
-                        const __m512 vi = _mm512_set1_ps(inv_l);
-                        int sd = 0;
-                        for (; sd + 15 < head_dim; sd += 16)
-                            _mm512_storeu_ps(out + sd, _mm512_mul_ps(vi, _mm512_loadu_ps(out + sd)));
-                        for (; sd < head_dim; ++sd)
-                            out[sd] *= inv_l;
+                        scale_vec(out, inv_l, head_dim, cpu_supports_avx512());
                     }
                 } // end head loop
             };

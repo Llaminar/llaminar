@@ -54,8 +54,34 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     endif()
 endif()
 
-# Enable native CPU optimizations (AVX512/AVX2/FMA)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=native -mtune=native")
+# CPU ISA selection. Keep this explicit so the binary can be built for either
+# AVX512-capable hosts or an AVX2-only baseline without inheriting the builder's
+# full native ISA by accident.
+set(LLAMINAR_CPU_ISA "AVX512" CACHE STRING "Maximum x86 SIMD ISA to compile for: AVX512 or AVX2")
+set_property(CACHE LLAMINAR_CPU_ISA PROPERTY STRINGS AVX512 AVX2)
+string(TOUPPER "${LLAMINAR_CPU_ISA}" LLAMINAR_CPU_ISA_UPPER)
+
+set(LLAMINAR_CPU_AVX2_FLAGS "-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt")
+set(LLAMINAR_CPU_AVX512_FLAGS
+    "${LLAMINAR_CPU_AVX2_FLAGS} -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni")
+
+if(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX512")
+    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX512_FLAGS}")
+    add_compile_definitions(
+        LLAMINAR_COMPILED_WITH_AVX2=1
+        LLAMINAR_COMPILED_WITH_AVX512=1)
+elseif(LLAMINAR_CPU_ISA_UPPER STREQUAL "AVX2")
+    set(LLAMINAR_CPU_COMPILE_FLAGS "${LLAMINAR_CPU_AVX2_FLAGS}")
+    add_compile_definitions(
+        LLAMINAR_COMPILED_WITH_AVX2=1
+        LLAMINAR_COMPILED_WITH_AVX512=0)
+else()
+    message(FATAL_ERROR "Unsupported LLAMINAR_CPU_ISA='${LLAMINAR_CPU_ISA}'. Use AVX512 or AVX2.")
+endif()
+
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${LLAMINAR_CPU_COMPILE_FLAGS}")
+message(STATUS "V2: CPU ISA target: ${LLAMINAR_CPU_ISA_UPPER} (${LLAMINAR_CPU_COMPILE_FLAGS})")
 
 # Backend options (Phase 6: Heterogeneous Multi-GPU)
 # CUDA and ROCm CAN coexist - compiled in separate translation units
@@ -149,6 +175,14 @@ endif()
 # CUDA Backend Configuration
 # =============================================================================
 if(HAVE_CUDA)
+    # CMake initializes CMAKE_CUDA_ARCHITECTURES during enable_language(CUDA)
+    # from CUDAARCHS or the compiler default. Seed our project default first so
+    # a fresh configure targets sm_86 instead of nvcc's older fallback.
+    if((NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+       AND NOT DEFINED ENV{CUDAARCHS})
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures" FORCE)
+    endif()
+
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
     
@@ -186,7 +220,7 @@ if(HAVE_CUDA)
     # Honor CMAKE_CUDA_ARCHITECTURES so release images can be built for a
     # specific fleet or a local smoke-test GPU without forcing a broad fatbin.
     if(NOT CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES 80 86 89 90)
+        set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures" FORCE)
     endif()
     set(LLAMINAR_HAS_AMPERE_CUDA_ARCH OFF)
     foreach(LLAMINAR_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
@@ -204,8 +238,8 @@ if(HAVE_CUDA)
         message(FATAL_ERROR
             "V2: CUDA NativeVNNI requires compiling at least one SM80+ architecture. "
             "Current CMAKE_CUDA_ARCHITECTURES='${CMAKE_CUDA_ARCHITECTURES}'. "
-            "Reconfigure with -DCMAKE_CUDA_ARCHITECTURES='80;86;89;90' or a local "
-            "SM80+ value such as 86.")
+            "Reconfigure with a local SM80+ value such as "
+            "-DCMAKE_CUDA_ARCHITECTURES=86.")
     endif()
     message(STATUS "V2: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     
@@ -1062,9 +1096,10 @@ if(USE_ONEDNN)
         message(STATUS "V2: OneDNN source is not a git checkout and has no ref marker; using ${ONEDNN_COMMIT} for cache validation")
     endif()
 
-    # Now check if OneDNN is built for the requested commit
+    # Now check if OneDNN is built for the requested commit and CPU ISA.
     set(ONEDNN_BUILD_DIR "${ONEDNN_EXTERNAL_DIR}/build")
     set(ONEDNN_VERSION_FILE "${ONEDNN_BUILD_DIR}/.llaminar-onednn-commit")
+    set(ONEDNN_CACHE_KEY "${ONEDNN_COMMIT};isa=${LLAMINAR_CPU_ISA_UPPER}")
 
     set(ONEDNN_BUILD_COMMIT "missing")
     if(EXISTS "${ONEDNN_VERSION_FILE}")
@@ -1072,9 +1107,9 @@ if(USE_ONEDNN)
         string(STRIP "${ONEDNN_BUILD_COMMIT_RAW}" ONEDNN_BUILD_COMMIT)
     endif()
 
-    if(EXISTS "${ONEDNN_BUILD_DIR}" AND NOT ONEDNN_BUILD_COMMIT STREQUAL ONEDNN_COMMIT)
+    if(EXISTS "${ONEDNN_BUILD_DIR}" AND NOT ONEDNN_BUILD_COMMIT STREQUAL ONEDNN_CACHE_KEY)
         message(STATUS
-            "V2: OneDNN build cache (${ONEDNN_BUILD_COMMIT}) is stale vs ${ONEDNN_COMMIT}, rebuilding...")
+            "V2: OneDNN build cache (${ONEDNN_BUILD_COMMIT}) is stale vs ${ONEDNN_CACHE_KEY}, rebuilding...")
         file(REMOVE_RECURSE "${ONEDNN_BUILD_DIR}")
     endif()
 
@@ -1090,8 +1125,8 @@ if(USE_ONEDNN)
                     -DDNNL_BUILD_TESTS=OFF
                     -DDNNL_BUILD_EXAMPLES=OFF
                     -DDNNL_EXPERIMENTAL_UKERNEL=ON
-                    -DCMAKE_CXX_FLAGS=-march=native
-                    -DCMAKE_C_FLAGS=-march=native
+                    "-DCMAKE_CXX_FLAGS=${LLAMINAR_CPU_COMPILE_FLAGS}"
+                    "-DCMAKE_C_FLAGS=${LLAMINAR_CPU_COMPILE_FLAGS}"
             RESULT_VARIABLE ONEDNN_CONFIG_RESULT
             OUTPUT_VARIABLE ONEDNN_CONFIG_OUTPUT
             ERROR_VARIABLE ONEDNN_CONFIG_ERROR
@@ -1113,7 +1148,7 @@ if(USE_ONEDNN)
             message(FATAL_ERROR "V2: Failed to build OneDNN: ${ONEDNN_BUILD_ERROR}")
         endif()
 
-        file(WRITE "${ONEDNN_VERSION_FILE}" "${ONEDNN_COMMIT}\n")
+        file(WRITE "${ONEDNN_VERSION_FILE}" "${ONEDNN_CACHE_KEY}\n")
 
         message(STATUS "V2: OneDNN built and installed to ${ONEDNN_BUILD_DIR}")
     else()

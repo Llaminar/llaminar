@@ -729,13 +729,16 @@ TEST_F(AVX2Q16DotParityTest, Dot2RowPackedPair)
         }
         pack_pair(k0, k1, pair_buf, n);
 
-        int32_t s0, s1, a2_0, a2_1, a5_0, a5_1;
+        int32_t s0, s1, a2_0, a2_1;
         FlashKernel::dot_2row_packedpair_scalar(q, pair_buf, n, s0, s1);
         FlashKernel::dot_2row_packedpair_avx2(q, pair_buf, n, a2_0, a2_1);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        int32_t a5_0, a5_1;
         FlashKernel::dot_2row_packedpair_avx512(q, pair_buf, n, a5_0, a5_1);
 
         EXPECT_EQ(a5_0, s0) << "AVX512 vs scalar row0, n=" << n;
         EXPECT_EQ(a5_1, s1) << "AVX512 vs scalar row1, n=" << n;
+#endif
         EXPECT_EQ(a2_0, s0) << "AVX2 vs scalar row0, n=" << n;
         EXPECT_EQ(a2_1, s1) << "AVX2 vs scalar row1, n=" << n;
     }
@@ -761,15 +764,18 @@ TEST_F(AVX2Q16DotParityTest, Dot4RowPackedPair)
         pack_pair(k0, k1, pair0, n);
         pack_pair(k2, k3, pair1, n);
 
-        int32_t s0, s1, s2, s3, a2_0, a2_1, a2_2, a2_3, a5_0, a5_1, a5_2, a5_3;
+        int32_t s0, s1, s2, s3, a2_0, a2_1, a2_2, a2_3;
         FlashKernel::dot_4row_packedpair_scalar(q, pair0, pair1, n, s0, s1, s2, s3);
         FlashKernel::dot_4row_packedpair_avx2(q, pair0, pair1, n, a2_0, a2_1, a2_2, a2_3);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        int32_t a5_0, a5_1, a5_2, a5_3;
         FlashKernel::dot_4row_packedpair_avx512(q, pair0, pair1, n, a5_0, a5_1, a5_2, a5_3);
 
         EXPECT_EQ(a5_0, s0) << "n=" << n;
         EXPECT_EQ(a5_1, s1) << "n=" << n;
         EXPECT_EQ(a5_2, s2) << "n=" << n;
         EXPECT_EQ(a5_3, s3) << "n=" << n;
+#endif
         EXPECT_EQ(a2_0, s0) << "n=" << n;
         EXPECT_EQ(a2_1, s1) << "n=" << n;
         EXPECT_EQ(a2_2, s2) << "n=" << n;
@@ -798,9 +804,11 @@ TEST_F(AVX2Q16DotParityTest, DotSingleFromPackedPair)
         {
             int32_t s = FlashKernel::dot_single_from_packedpair_scalar(q, pair_buf, n, row_sel);
             int32_t a2 = FlashKernel::dot_single_from_packedpair_avx2(q, pair_buf, n, row_sel);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
             int32_t a5 = FlashKernel::dot_single_from_packedpair_avx512(q, pair_buf, n, row_sel);
 
             EXPECT_EQ(a5, s) << "AVX512 vs scalar, n=" << n << " row=" << row_sel;
+#endif
             EXPECT_EQ(a2, s) << "AVX2 vs scalar, n=" << n << " row=" << row_sel;
         }
     }
@@ -823,15 +831,18 @@ TEST_F(AVX2Q16DotParityTest, Dot4RowSeparate)
             k3[i] = dist(rng);
         }
 
-        int32_t s0, s1, s2, s3, a2_0, a2_1, a2_2, a2_3, a5_0, a5_1, a5_2, a5_3;
+        int32_t s0, s1, s2, s3, a2_0, a2_1, a2_2, a2_3;
         FlashKernel::dot_4row_separate_scalar(q, k0, k1, k2, k3, n, s0, s1, s2, s3);
         FlashKernel::dot_4row_separate_avx2(q, k0, k1, k2, k3, n, a2_0, a2_1, a2_2, a2_3);
+#if defined(__AVX512F__) && defined(__AVX512VNNI__)
+        int32_t a5_0, a5_1, a5_2, a5_3;
         FlashKernel::dot_4row_separate_avx512(q, k0, k1, k2, k3, n, a5_0, a5_1, a5_2, a5_3);
 
         EXPECT_EQ(a5_0, s0) << "n=" << n;
         EXPECT_EQ(a5_1, s1) << "n=" << n;
         EXPECT_EQ(a5_2, s2) << "n=" << n;
         EXPECT_EQ(a5_3, s3) << "n=" << n;
+#endif
         EXPECT_EQ(a2_0, s0) << "n=" << n;
         EXPECT_EQ(a2_1, s1) << "n=" << n;
         EXPECT_EQ(a2_2, s2) << "n=" << n;

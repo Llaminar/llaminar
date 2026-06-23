@@ -28,6 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 BASELINE_FILE="$SCRIPT_DIR/benchmark_baseline.json"
 RELEASE_BIN="$ROOT_DIR/build_v2_release/llaminar2"
+RELEASE_CACHE="$ROOT_DIR/build_v2_release/CMakeCache.txt"
 
 # Colors
 RED='\033[0;31m'
@@ -69,6 +70,16 @@ if [[ ! -x "$RELEASE_BIN" ]]; then
     exit 1
 fi
 echo -e "${GREEN}✓ Release build complete${NC}"
+
+CPU_ISA_TARGET="AVX512"
+if [[ -f "$RELEASE_CACHE" ]]; then
+    CPU_ISA_TARGET=$(grep -E '^LLAMINAR_CPU_ISA:' "$RELEASE_CACHE" | tail -1 | sed 's/.*=//' || true)
+    CPU_ISA_TARGET="${CPU_ISA_TARGET:-AVX512}"
+    CPU_ISA_TARGET="${CPU_ISA_TARGET^^}"
+fi
+if [[ "$CPU_ISA_TARGET" == "AVX2" ]]; then
+    echo -e "${YELLOW}Release build targets AVX2; CPU benchmark regressions will be reported as warnings.${NC}"
+fi
 
 # ---------------------------------------------------------------------------
 # Read global settings
@@ -125,7 +136,13 @@ declare -A RESULTS_PREFILL
 declare -A RESULTS_DECODE
 OVERALL_PASS=true
 FAILED_CHECKS=""
+AVX2_CPU_BENCHMARK_WARNINGS=false
 RECHECK_MARGIN_PCT="${LLAMINAR_BENCHMARK_RECHECK_MARGIN_PCT:-1}"
+
+is_direct_cpu_device() {
+    local device="$1"
+    [[ "$device" == "cpu" || "$device" == cpu:* ]]
+}
 
 # ---------------------------------------------------------------------------
 # Run benchmarks for all models × devices
@@ -424,9 +441,14 @@ check_regression() {
 
     local status="${GREEN}✓ OK${NC}"
     if (( $(echo "$delta < -${effective_threshold}" | bc -l) )); then
-        status="${RED}✗ REGRESSED${NC}"
-        OVERALL_PASS=false
-        FAILED_CHECKS+="  [${model_name}] ${device} ${phase}: ${baseline} → ${current} tok/s (${delta}%, threshold ${effective_threshold}%)\n"
+        if [[ "$CPU_ISA_TARGET" == "AVX2" ]] && is_direct_cpu_device "$device"; then
+            status="${YELLOW}~ AVX2 slower${NC}"
+            AVX2_CPU_BENCHMARK_WARNINGS=true
+        else
+            status="${RED}✗ REGRESSED${NC}"
+            OVERALL_PASS=false
+            FAILED_CHECKS+="  [${model_name}] ${device} ${phase}: ${baseline} → ${current} tok/s (${delta}%, threshold ${effective_threshold}%)\n"
+        fi
     elif (( $(echo "$delta < 0" | bc -l) )); then
         status="${YELLOW}~ slower${NC}"
     elif (( $(echo "$delta > 0" | bc -l) )); then
@@ -467,6 +489,9 @@ done
 
 if $OVERALL_PASS; then
     echo -e "${GREEN}✓ No performance regressions detected${NC}"
+    if $AVX2_CPU_BENCHMARK_WARNINGS; then
+        echo -e "${YELLOW}CPU throughput regressions were allowed because this Release build targets AVX2 instead of AVX512.${NC}"
+    fi
     echo -e "${BLUE}Baseline file unchanged. Use --update-baseline after explicit approval to rewrite baseline values.${NC}"
 
     exit 0

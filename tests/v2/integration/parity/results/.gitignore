@@ -1,3 +1,6 @@
-# Parity test CSV results are machine-generated and not committed
+# Track parity CSV summaries by commit hash; keep other generated artifacts out.
 *
 !.gitignore
+![0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+![0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**/
+![0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**/*.csv

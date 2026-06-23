@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+LocalPP_RCCL_2xROCm,0,0.998987,0.00349715,1,1,323,323,true,true,true,true
+LocalPP_RCCL_2xROCm,1,0.999235,0.00271292,1,1,279,279,true,true,true,true
+LocalPP_RCCL_2xROCm,2,0.999544,0.0103515,1,0.6,3974,3974,true,true,true,true
+LocalPP_RCCL_2xROCm,3,0.999546,0.00257993,1,0.8,13876,13876,true,true,true,true
+LocalPP_RCCL_2xROCm,4,0.999667,0.000245343,1,1,38835,38835,true,true,true,true

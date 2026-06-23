@@ -70,6 +70,10 @@ pytorch_qwen*/
 *.npz
 *.out
 *benchmark_result*/
+!benchmark_results/
+benchmark_results/*
+!benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+!benchmark_results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**
 *output.txt
 **/wget-log*
 **/*.data
@@ -79,6 +83,10 @@ flash_rebar/
 **/*.db
 artifacts/**/*
 **/results.*
+!tests/v2/integration/parity/results/
+!tests/v2/integration/parity/results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/
+!tests/v2/integration/parity/results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**/
+!tests/v2/integration/parity/results/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/**/*.csv
 
 # Python, C++, and Markdown files created in the root (for debugging/testing)
 /*.py

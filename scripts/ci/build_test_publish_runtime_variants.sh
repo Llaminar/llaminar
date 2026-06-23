@@ -98,6 +98,7 @@ fi
 [[ -n "$sha" ]] || die "sha could not be resolved"
 
 variants=(cpu cuda rocm full)
+cpu_isas=(AVX2 AVX512)
 declare -A e2e_variant=(
     [cpu]=cpu
     [cuda]=cuda
@@ -109,6 +110,10 @@ declare -A port=(
     [cuda]=20200
     [rocm]=20300
     [full]=20400
+)
+declare -A tag_suffix=(
+    [AVX512]=""
+    [AVX2]="-avx2"
 )
 
 all_refs=()
@@ -136,28 +141,41 @@ run_cmd() {
     fi
 }
 
-for variant in "${variants[@]}"; do
-    mapfile -t refs < <("${script_dir}/runtime_image_tags.sh" \
-        --variant "$variant" \
-        --image "$image" \
-        --branch "$branch" \
-        --sha "$sha" \
-        --format refs)
-    ((${#refs[@]} > 0)) || die "no tags generated for variant ${variant}"
-    all_refs+=("${refs[@]}")
+for cpu_isa in "${cpu_isas[@]}"; do
+    for variant in "${variants[@]}"; do
+        mapfile -t refs < <("${script_dir}/runtime_image_tags.sh" \
+            --variant "$variant" \
+            --image "$image" \
+            --branch "$branch" \
+            --sha "$sha" \
+            --tag-suffix "${tag_suffix[$cpu_isa]}" \
+            --format refs)
+        ((${#refs[@]} > 0)) || die "no tags generated for variant ${variant} ${cpu_isa}"
+        all_refs+=("${refs[@]}")
 
-    build_args=("${repo_root}/scripts/docker/build-runtime-image.sh" --variant "$variant" --load --no-verify)
-    for ref in "${refs[@]}"; do
-        build_args+=(--tag "$ref")
+        build_args=(
+            "${repo_root}/scripts/docker/build-runtime-image.sh"
+            --variant "$variant"
+            --cpu-isa "$cpu_isa"
+            --load
+            --no-verify
+        )
+        for ref in "${refs[@]}"; do
+            build_args+=(--tag "$ref")
+        done
+        run_cmd "${build_args[@]}"
+
+        e2e_port="${port[$variant]}"
+        if [[ "$cpu_isa" == "AVX2" ]]; then
+            e2e_port="$((e2e_port + 1000))"
+        fi
+        run_cmd env LLAMINAR_E2E_DOCKER_NETWORK=bridge \
+            "${repo_root}/scripts/ci/run_release_container_e2e.sh" \
+            --variant "${e2e_variant[$variant]}" \
+            --image "${refs[0]}" \
+            --port "${e2e_port}" \
+            --log-dir "/tmp/llaminar-e2e-${e2e_variant[$variant]}-${cpu_isa}-container"
     done
-    run_cmd "${build_args[@]}"
-
-    run_cmd env LLAMINAR_E2E_DOCKER_NETWORK=bridge \
-        "${repo_root}/scripts/ci/run_release_container_e2e.sh" \
-        --variant "${e2e_variant[$variant]}" \
-        --image "${refs[0]}" \
-        --port "${port[$variant]}" \
-        --log-dir "/tmp/llaminar-e2e-${e2e_variant[$variant]}-container"
 done
 
 {

@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+GraphNative_RocmHot_CpuCold,0,0.983393,0.0613521,1,0.8,198,198,true,true,true,true
+GraphNative_RocmHot_CpuCold,1,0.995679,0.0399805,1,1,760,760,true,true,true,true
+GraphNative_RocmHot_CpuCold,2,0.991839,0.0494533,1,0.8,3841,3841,true,true,true,true
+GraphNative_RocmHot_CpuCold,3,0.990157,0.00181277,1,0.8,13477,13477,true,true,true,true
+GraphNative_RocmHot_CpuCold,4,0.995722,0.00409681,1,0.8,37550,37550,true,true,true,true

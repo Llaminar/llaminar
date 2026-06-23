@@ -1,0 +1,137 @@
+=== Llaminar MPI Configuration ===
+System: 2 socket(s), 28 cores/socket, 2 NUMA node(s)
+Topology: 56 physical cores, 112 logical cores
+Hyperthreading: Yes (2 threads/core)
+MPI: 1 process(es)
+OpenMP: 28 threads/rank, places=cores, bind=close
+CPU Set: 28-55
+Status: Not running under MPI (will self-launch)
+
++-----------------------------------------------------+
+|               INFERENCE CONFIGURATION               |
++----------------+------------------------------------+
+| Device         | CUDA:0                             |
+| Parallelism    | TP=1 | PP=1                        |
+| Precision      | Activations: FP32 | KV Cache: FP16 |
+| Context Length | 4096 / 262144 (model max)          |
+| Backend        | CUDA (GPU 0)                       |
++----------------+------------------------------------+
+
++----------------------------------------------------------+
+|                          MODEL                           |
++--------------+-------------------------------------------+
+| File         | Qwen3.5-35B-A3B-Q3_K_S.gguf (14.2 GB)     |
+| Architecture | qwen35moe (40 layers, 256 experts, top-8) |
+| Vocab        | 248,320 tokens                            |
+| Thinking     | Enabled (<think>...</think>)              |
++--------------+-------------------------------------------+
+
++-----------------------------------------------------------------------+
+|                           PREFLIGHT CHECKS                            |
++---------------------------------------+--------+----------------------+
+| Check                                 | Status | Detail               |
++---------------------------------------+--------+----------------------+
+| Host RAM (weight staging)             | OK     | 14.2 GB required     |
+| Device memory (weights + KV + activ.) | OK     | fits                 |
+| Weight schema validation              | OK     | 733 tensors in model |
++---------------------------------------+--------+----------------------+
+
+[00:11:32.015] [INFO ] [0] [NvidiaContextFactory.cu:77] [NvidiaContextFactory] Registered CUDA factory with 1 devices
+[00:11:32.018] [INFO ] [0] [NvidiaDeviceContext.cu:114] [NvidiaDeviceContext] Created context for CUDA device 0 (NVIDIA GeForce RTX 3090)
+
+Loading model weights...
+  CUDA:0         [                                        ]   0%   0.0 GB/s[K
+[1A  CUDA:0         [#                                       ]   2%   3.8 GB/s[K
+[1A  CUDA:0         [#                                       ]   2%   2.0 GB/s[K
+[1A  CUDA:0         [#                                       ]   3%   2.2 GB/s[K
+[1A  CUDA:0         [#                                       ]   4%   2.3 GB/s[K
+[1A  CUDA:0         [##                                      ]   6%   2.4 GB/s[K
+[1A  CUDA:0         [##                                      ]   7%   2.5 GB/s[K
+[1A  CUDA:0         [###                                     ]   8%   2.6 GB/s[K
+[1A  CUDA:0         [###                                     ]   9%   2.7 GB/s[K
+[1A  CUDA:0         [####                                    ]  11%   2.7 GB/s[K
+[1A  CUDA:0         [####                                    ]  12%   2.8 GB/s[K
+[1A  CUDA:0         [#####                                   ]  13%   2.9 GB/s[K
+[1A  CUDA:0         [######                                  ]  15%   3.0 GB/s[K
+[1A  CUDA:0         [#######                                 ]  17%   3.2 GB/s[K
+[1A  CUDA:0         [#######                                 ]  19%   3.3 GB/s[K
+[1A  CUDA:0         [########                                ]  21%   3.4 GB/s[K
+[1A  CUDA:0         [#########                               ]  23%   3.5 GB/s[K
+[1A  CUDA:0         [#########                               ]  24%   3.5 GB/s[K
+[1A  CUDA:0         [##########                              ]  26%   3.6 GB/s[K
+[1A  CUDA:0         [###########                             ]  28%   3.7 GB/s[K
+[1A  CUDA:0         [############                            ]  30%   3.7 GB/s[K
+[1A  CUDA:0         [############                            ]  32%   3.8 GB/s[K
+[1A  CUDA:0         [#############                           ]  33%   3.8 GB/s[K
+[1A  CUDA:0         [##############                          ]  35%   3.9 GB/s[K
+[1A  CUDA:0         [###############                         ]  37%   3.9 GB/s[K
+[1A  CUDA:0         [###############                         ]  39%   4.0 GB/s[K
+[1A  CUDA:0         [################                        ]  41%   4.0 GB/s[K
+[1A  CUDA:0         [#################                       ]  42%   4.0 GB/s[K
+[1A  CUDA:0         [#################                       ]  44%   4.1 GB/s[K
+[1A  CUDA:0         [##################                      ]  46%   4.1 GB/s[K
+[1A  CUDA:0         [###################                     ]  48%   4.1 GB/s[K
+[1A  CUDA:0         [####################                    ]  50%   4.1 GB/s[K
+[1A  CUDA:0         [####################                    ]  52%   4.2 GB/s[K
+[1A  CUDA:0         [#####################                   ]  53%   4.2 GB/s[K
+[1A  CUDA:0         [######################                  ]  55%   4.2 GB/s[K
+[1A  CUDA:0         [#######################                 ]  57%   4.2 GB/s[K
+[1A  CUDA:0         [#######################                 ]  59%   4.3 GB/s[K
+[1A  CUDA:0         [########################                ]  61%   4.3 GB/s[K
+[1A  CUDA:0         [#########################               ]  63%   4.3 GB/s[K
+[1A  CUDA:0         [#########################               ]  64%   4.3 GB/s[K
+[1A  CUDA:0         [##########################              ]  66%   4.3 GB/s[K
+[1A  CUDA:0         [###########################             ]  68%   4.3 GB/s[K
+[1A  CUDA:0         [############################            ]  70%   4.4 GB/s[K
+[1A  CUDA:0         [############################            ]  72%   4.4 GB/s[K
+[1A  CUDA:0         [#############################           ]  74%   4.4 GB/s[K
+[1A  CUDA:0         [##############################          ]  75%   4.4 GB/s[K
+[1A  CUDA:0         [###############################         ]  77%   4.4 GB/s[K
+[1A  CUDA:0         [###############################         ]  79%   4.4 GB/s[K
+[1A  CUDA:0         [################################        ]  81%   4.4 GB/s[K
+[1A  CUDA:0         [#################################       ]  83%   4.5 GB/s[K
+[1A  CUDA:0         [#################################       ]  84%   4.5 GB/s[K
+[1A  CUDA:0         [##################################      ]  86%   4.5 GB/s[K
+[1A  CUDA:0         [###################################     ]  88%   4.5 GB/s[K
+[1A  CUDA:0         [####################################    ]  90%   4.5 GB/s[K
+[1A  CUDA:0         [####################################    ]  92%   4.5 GB/s[K
+[1A  CUDA:0         [#####################################   ]  94%   4.5 GB/s[K
+[1A  CUDA:0         [######################################  ]  95%   4.5 GB/s[K
+[1A  CUDA:0         [####################################### ]  97%   4.5 GB/s[K
+[1A  CUDA:0         [####################################### ]  99%   4.5 GB/s[K
+[1A  CUDA:0         [########################################] 100%   4.5 GB/s  done[K
+
+  CUDA:0         loaded 13.7 GB in 3.0s (4.5 GB/s)
+
+[00:11:37.018] [INFO ] [0] [BenchmarkMode.cpp:119] [Benchmark] Prefill graph buckets enabled; bucket_sizes=64,128,256,384,512,544,576,600,608,640,672,704,736,768,1024,1280,1536,2048,2560,3072,4096 (production default); mode=benchmark default; gpu_graphs=enabled
+[00:11:37.022] [INFO ] [0] [BenchmarkRunner.cpp:389] Running warmup...
+[00:11:41.401] [INFO ] [0] [BenchmarkRunner.cpp:413] Preparing prefill graph capture for steady-state benchmark...
+[00:11:44.359] [INFO ] [0] [BenchmarkRunner.cpp:467] Warmup complete.
+[00:11:44.359] [INFO ] [0] [BenchmarkRunner.cpp:496] Running 3 benchmark iterations...
+[00:11:55.689] [INFO ] [0] [BenchmarkRunner.cpp:626] Benchmark complete.
+
+╔════════════════════════════════════════════════════╗
+║ BENCHMARK RESULTS (average of 3 runs after warmup) ║
+╚════════════════════════════════════════════════════╝
+╔═════════╤════════════╤════════════════════╗
+║ Phase   │ Metric     │              Value ║
+╠═════════╪════════════╪════════════════════╣
+║ PREFILL │ Tokens     │         595 tokens ║
+╟─────────┼────────────┼────────────────────╢
+║         │ Time       │         1423.28 ms ║
+╟─────────┼────────────┼────────────────────╢
+║         │ Throughput │       418.05 tok/s ║
+╠═════════╪════════════╪════════════════════╣
+║ DECODE  │ Tokens     │         128 tokens ║
+╟─────────┼────────────┼────────────────────╢
+║         │ Time       │         2294.38 ms ║
+╟─────────┼────────────┼────────────────────╢
+║         │ Throughput │        55.79 tok/s ║
+╠═════════╪════════════╪════════════════════╣
+║ TOTAL   │ Time       │         3717.66 ms ║
+╟─────────┼────────────┼────────────────────╢
+║         │ Overall    │ 194.48 tok/s (avg) ║
+╚═════════╧════════════╧════════════════════╝
+
+✓ Benchmark completed successfully.
+

@@ -17,6 +17,22 @@
 namespace llaminar2
 {
 
+#ifndef LLAMINAR_COMPILED_WITH_AVX2
+#if defined(__AVX2__)
+#define LLAMINAR_COMPILED_WITH_AVX2 1
+#else
+#define LLAMINAR_COMPILED_WITH_AVX2 0
+#endif
+#endif
+
+#ifndef LLAMINAR_COMPILED_WITH_AVX512
+#if defined(__AVX512F__)
+#define LLAMINAR_COMPILED_WITH_AVX512 1
+#else
+#define LLAMINAR_COMPILED_WITH_AVX512 0
+#endif
+#endif
+
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 
     /**
@@ -282,8 +298,12 @@ namespace llaminar2
      */
     inline bool cpu_supports_avx512()
     {
+#if LLAMINAR_COMPILED_WITH_AVX512
         static const bool result = detail::detect_avx512();
         return result;
+#else
+        return false;
+#endif
     }
 
     // =========================================================================
@@ -336,9 +356,13 @@ namespace llaminar2
                 if (eq(env, "scalar"))
                     return ISALevel::Scalar;
                 if (eq(env, "avx2"))
-                    return ISALevel::AVX2;
+                    return cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
                 if (eq(env, "avx512"))
-                    return ISALevel::AVX512;
+                {
+                    if (cpu_supports_avx512())
+                        return ISALevel::AVX512;
+                    return cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
+                }
             }
             if (cpu_supports_avx512())
                 return ISALevel::AVX512;
@@ -357,10 +381,12 @@ namespace llaminar2
 //   float result; ISA_DISPATCH_RET(result, activation_row_max_abs, row, len);
 //   double val = ISA_DISPATCH_RETVAL(compute_sumsq, data, count);
 //
-// The _avx2 and _avx512 variants MUST be compiled (possibly as unreachable
-// stubs) regardless of the host ISA so the switch is always complete.
+// The compiled binary controls the maximum ISA that may be referenced. AVX2
+// builds intentionally avoid naming _avx512 variants so those translation units
+// can omit AVX512 stubs entirely.
 // ---------------------------------------------------------------------------
 
+#if LLAMINAR_COMPILED_WITH_AVX512
 /// Dispatch a void-returning function: name##_scalar / _avx2 / _avx512
 #define ISA_DISPATCH_VOID(name, ...)           \
     do                                         \
@@ -411,14 +437,63 @@ namespace llaminar2
             return name##_scalar(__VA_ARGS__);                   \
         } }()
 
+#else
+
+/// Dispatch a void-returning function: name##_scalar / _avx2
+#define ISA_DISPATCH_VOID(name, ...)           \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX2:      \
+            name##_avx2(__VA_ARGS__);          \
+            break;                             \
+        default:                               \
+            name##_scalar(__VA_ARGS__);        \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and assign: lhs = name##_{scalar|avx2}(...)
+#define ISA_DISPATCH_RET(lhs, name, ...)       \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX2:      \
+            lhs = name##_avx2(__VA_ARGS__);    \
+            break;                             \
+        default:                               \
+            lhs = name##_scalar(__VA_ARGS__);  \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and return the value directly for AVX2-only builds.
+#define ISA_DISPATCH_RETVAL(name, ...) \
+    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
+        switch (::llaminar2::activeISALevel())                   \
+        {                                                        \
+        case ::llaminar2::ISALevel::AVX2:                        \
+            return name##_avx2(__VA_ARGS__);                     \
+        default:                                                 \
+            return name##_scalar(__VA_ARGS__);                   \
+        } }()
+
+#endif
+
     /**
      * @brief Check if CPU supports AVX2
      * @note Result is cached on first call - no cpuid overhead on subsequent calls
      */
     inline bool cpu_supports_avx2()
     {
+#if LLAMINAR_COMPILED_WITH_AVX2
         static const bool result = detail::detect_avx2();
         return result;
+#else
+        return false;
+#endif
     }
 
     /**

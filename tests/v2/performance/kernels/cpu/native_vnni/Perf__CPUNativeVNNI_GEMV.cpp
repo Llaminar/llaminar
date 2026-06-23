@@ -825,7 +825,11 @@ namespace
     {
         char *p = const_cast<char *>(static_cast<const char *>(ptr));
         for (size_t off = 0; off < bytes; off += 64)
+#if defined(__CLFLUSHOPT__)
             _mm_clflushopt(p + off);
+#else
+            _mm_clflush(p + off);
+#endif
         _mm_mfence();
     }
 

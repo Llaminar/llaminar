@@ -976,16 +976,14 @@ namespace llaminar2::cpu::native_vnni
         const float *A_fp32,
         float *C)
     {
-#if defined(__AVX512F__)
         // Q8_0 fast path: workspace contains raw Q8_0 blocks (no interleave).
-        // Use dedicated FP32-dequant GEMV which avoids the Q8_1 quantize step.
+        // Use dedicated raw-block GEMV for both AVX512 and AVX2 builds.
         if (packed.codebook_id == 19 && packed.workspace_data_)
         {
             auto *blocks = reinterpret_cast<const Q8_0Block *>(packed.workspace_data_);
             q8_0_native_gemv(blocks, A_fp32, C, packed.N, packed.K, packed.blocks_per_row);
             return;
         }
-#endif
 
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
@@ -3851,12 +3849,13 @@ namespace llaminar2::cpu::native_vnni
                                                       chunk, 1, K_blocks, N, decode_lut);
                     }
 #else
+                    const __m256i decode_lut = packed.is_nibble_lut
+                                                   ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
+                                                   : _mm256_setzero_si256();
 #pragma omp for schedule(static) nowait
                     for (int chunk = 0; chunk < N_chunks; ++chunk)
                     {
-                        int n_start = chunk * 64;
-                        int n_cols = std::min(64, N - n_start);
-                        gemv_native_vnni_scalar(packed, A_q8, d.output + n_start, n_cols, K_blocks);
+                        gemv_avx2_block(packed, A_q8, d.output, chunk, 1, K_blocks, N, decode_lut);
                     }
 #endif
                     // Barrier: all GEMV chunks must complete before bias pass
@@ -3878,6 +3877,106 @@ namespace llaminar2::cpu::native_vnni
 #pragma omp barrier
         };
         OMP_WORKSHARE_REGION(do_fused);
+    }
+
+#else // !defined(__AVX512F__)
+
+    static inline float gemv_dot_row_q8_0_vnni(
+        const Q8_0Block *__restrict row,
+        const Q8_1Block *__restrict a_q8,
+        int bpr)
+    {
+        float acc = 0.0f;
+        for (int kb = 0; kb < bpr; ++kb)
+        {
+            int32_t sumi = 0;
+            for (int i = 0; i < Q8_0Block::BLOCK_SIZE; ++i)
+                sumi += static_cast<int32_t>(row[kb].qs[i]) *
+                        static_cast<int32_t>(a_q8[kb].qs[i]);
+            const float sp = simd::fp16_to_fp32(row[kb].d) *
+                             simd::fp16_to_fp32(a_q8[kb].d);
+            acc += sp * static_cast<float>(sumi);
+        }
+        return acc;
+    }
+
+    inline void q8_0_native_gemv(
+        const Q8_0Block *__restrict blocks,
+        const float *__restrict A,
+        float *__restrict C,
+        int N,
+        int K,
+        int bpr)
+    {
+        static thread_local std::vector<Q8_1Block> a_q8_tls;
+        if (static_cast<int>(a_q8_tls.size()) < bpr)
+            a_q8_tls.resize(bpr);
+        Q8_1Block *A_q8 = a_q8_tls.data();
+
+        for (int kb = 0; kb < bpr; ++kb)
+        {
+            const int block_start = kb * 32;
+            const int block_len = std::min(32, K - block_start);
+            simd::quantize_single_block(A + block_start, A_q8[kb], block_len);
+        }
+
+        auto do_gemv = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int n = 0; n < N; ++n)
+            {
+                const Q8_0Block *__restrict row = blocks + static_cast<size_t>(n) * bpr;
+                C[n] = gemv_dot_row_q8_0_vnni(row, A_q8, bpr);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_gemv);
+    }
+
+    struct FusedGemvDesc
+    {
+        const CPUNativeVNNIPackedWeights *packed;
+        const Q8_0Block *q8_0_raw;
+        float *output;
+        const float *bias;
+        int N;
+        int bpr;
+    };
+
+    inline void gemv_native_vnni_fused_preq(
+        const Q8_1Block *__restrict A_q8,
+        const FusedGemvDesc *descs,
+        int num_descs)
+    {
+        for (int p = 0; p < num_descs; ++p)
+        {
+            const auto &d = descs[p];
+            if (d.q8_0_raw)
+            {
+                auto do_rows = [&]()
+                {
+#pragma omp for schedule(static)
+                    for (int n = 0; n < d.N; ++n)
+                    {
+                        const Q8_0Block *__restrict row =
+                            d.q8_0_raw + static_cast<size_t>(n) * d.bpr;
+                        float val = gemv_dot_row_q8_0_vnni(row, A_q8, d.bpr);
+                        if (d.bias)
+                            val += d.bias[n];
+                        d.output[n] = val;
+                    }
+                };
+                OMP_WORKSHARE_REGION(do_rows);
+            }
+            else
+            {
+                gemv_native_vnni_preq(*d.packed, A_q8, d.output);
+                if (d.bias)
+                {
+                    for (int n = 0; n < d.N; ++n)
+                        d.output[n] += d.bias[n];
+                }
+            }
+        }
     }
 
 #endif // __AVX512F__
@@ -3955,12 +4054,13 @@ namespace llaminar2::cpu::native_vnni
                                                       chunk, 1, K_blocks, N, decode_lut);
                     }
 #else
+                    const __m256i decode_lut = packed.is_nibble_lut
+                                                   ? build_decode_lut_avx2_for_codebook(packed.codebook_id)
+                                                   : _mm256_setzero_si256();
 #pragma omp for schedule(static) nowait
                     for (int chunk = 0; chunk < N_chunks; ++chunk)
                     {
-                        int n_start = chunk * 64;
-                        int n_cols = std::min(64, N - n_start);
-                        gemv_native_vnni_scalar(packed, A_q8, d.output + n_start, n_cols, K_blocks);
+                        gemv_avx2_block(packed, A_q8, d.output, chunk, 1, K_blocks, N, decode_lut);
                     }
 #endif
                 }

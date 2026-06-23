@@ -1,0 +1,8 @@
+commit,timestamp,model_name,model_path,device,prefill_tok_s,decode_tok_s,baseline_prefill_tok_s,baseline_decode_tok_s
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cpu,330.87,18.24,337.99,19.78
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",cuda:0,7096.74,92.75,4894.57,95.16
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 2.5 7B Instruct Q8_0","models/Qwen2.5-7B-Instruct-Q8_0.gguf",rocm:0,1760.29,77.53,1214.71,78.94
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 3.5 4B Q8_0","models/Qwen3.5-4B-Q8_0.gguf",cpu,394.48,26.34,453.80,28.41
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",cpu,191.49,25.02,234.49,27.92
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",cpu:0,135.01,18.53,158.47,19.48
+ac6a32c5,2026-05-20T15:19:08Z,"Qwen 3.5 35B MoE Q4_K_XL","models/Qwen3.5-35B-A3B-UD-Q4_K_XL.gguf",rocm:0,2015.09,75.86,1979.00,74.90

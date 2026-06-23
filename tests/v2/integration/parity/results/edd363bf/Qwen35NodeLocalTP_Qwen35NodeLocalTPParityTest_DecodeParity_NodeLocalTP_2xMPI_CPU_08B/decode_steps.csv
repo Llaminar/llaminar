@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+NodeLocalTP_2xMPI_CPU_08B,0,0.996316,0.00757148,1,1,198,198,true,true,true,true
+NodeLocalTP_2xMPI_CPU_08B,1,0.992361,0.0248131,1,0.8,760,760,true,true,true,true
+NodeLocalTP_2xMPI_CPU_08B,2,0.995558,0.0741444,1,1,3841,3841,true,true,true,true
+NodeLocalTP_2xMPI_CPU_08B,3,0.990586,0.030736,1,0.8,13477,13477,true,true,true,true
+NodeLocalTP_2xMPI_CPU_08B,4,0.993881,0.018234,1,0.4,37550,37550,true,true,true,true

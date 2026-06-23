@@ -34,6 +34,7 @@
 
 ARG CUTLASS_VERSION=v4.2.1
 ARG LLAMINAR_BUILD_TYPE=Release
+ARG LLAMINAR_CPU_ISA=AVX512
 ARG LLAMINAR_CUDA_ARCHS="80;86;89;90"
 ARG LLAMINAR_ENABLE_CUDA=ON
 ARG LLAMINAR_ENABLE_ROCM=ON
@@ -50,6 +51,7 @@ FROM ubuntu:24.04 AS builder
 
 ARG CUTLASS_VERSION
 ARG LLAMINAR_BUILD_TYPE
+ARG LLAMINAR_CPU_ISA
 ARG LLAMINAR_CUDA_ARCHS
 ARG LLAMINAR_ENABLE_CUDA
 ARG LLAMINAR_ENABLE_ROCM
@@ -115,6 +117,11 @@ WORKDIR /src
 # ---------------------------------------------------------------------------
 ARG ONEDNN_GIT_REF=v3.11.3
 RUN set -e; \
+    case "${LLAMINAR_CPU_ISA}" in \
+        AVX512) ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni" ;; \
+        AVX2) ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt" ;; \
+        *) echo "Unsupported LLAMINAR_CPU_ISA='${LLAMINAR_CPU_ISA}'. Use AVX512 or AVX2." >&2; exit 1 ;; \
+    esac; \
     mkdir -p /src/external; \
     ONEDNN_TARBALL_URL="https://codeload.github.com/uxlfoundation/oneDNN/tar.gz/refs/tags/${ONEDNN_GIT_REF}"; \
     echo "==> [onednn] fetch ${ONEDNN_GIT_REF} from ${ONEDNN_TARBALL_URL}"; \
@@ -143,10 +150,10 @@ RUN set -e; \
         -DDNNL_BUILD_TESTS=OFF \
         -DDNNL_BUILD_EXAMPLES=OFF \
         -DDNNL_EXPERIMENTAL_UKERNEL=ON \
-        -DCMAKE_CXX_FLAGS=-march=native \
-        -DCMAKE_C_FLAGS=-march=native; \
+        -DCMAKE_CXX_FLAGS="${ONEDNN_CPU_FLAGS}" \
+        -DCMAKE_C_FLAGS="${ONEDNN_CPU_FLAGS}"; \
     cmake --build /src/external/onednn/build --parallel --target install; \
-    printf '%s\n' "${ONEDNN_GIT_REF}" \
+    printf '%s\n' "${ONEDNN_GIT_REF};isa=${LLAMINAR_CPU_ISA}" \
         > /src/external/onednn/build/.llaminar-onednn-commit; \
     # Drop OneDNN's intermediate .o / .d files but keep the installed lib +
     # headers + source ref marker used by CMake cache validation.
@@ -275,6 +282,7 @@ RUN --mount=type=cache,target=/root/.ccache \
             -DCMAKE_BUILD_TYPE=Integration \
             -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
             -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
+            -DLLAMINAR_CPU_ISA="${LLAMINAR_CPU_ISA}" \
             -DLLAMINAR_SHARED_CORE=ON \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             ${RCCL_CMAKE_ARGS} \
@@ -307,6 +315,7 @@ RUN --mount=type=cache,target=/root/.ccache \
         -DCMAKE_BUILD_TYPE=${LLAMINAR_BUILD_TYPE} \
         -DHAVE_CUDA="${LLAMINAR_ENABLE_CUDA}" \
         -DHAVE_ROCM="${LLAMINAR_ENABLE_ROCM}" \
+        -DLLAMINAR_CPU_ISA="${LLAMINAR_CPU_ISA}" \
         -DLLAMINAR_SHARED_CORE=ON \
         -DLLAMINAR_BUILD_TESTS=OFF \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \

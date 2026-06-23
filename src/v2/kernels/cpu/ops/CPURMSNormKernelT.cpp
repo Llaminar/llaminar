@@ -13,6 +13,7 @@
 #include "../primitives/RMSNormPrimitives.h"
 #include "../../../tensors/SIMDHelpers.h"
 #include "../../../tensors/BlockStructures.h"
+#include "../../../utils/CPUFeatures.h"
 #include "../../../utils/Logger.h"
 
 #include <vector>
@@ -69,6 +70,30 @@ namespace llaminar2
         // Single row: only parallelize for very large d_model
         size_t total_elements = static_cast<size_t>(rows) * cols;
         return total_elements >= MIN_ELEMENTS_FOR_PARALLEL;
+    }
+
+    inline void rmsnorm_fused_row_best(
+        const float *input,
+        const float *gamma,
+        float *output,
+        size_t cols,
+        float epsilon)
+    {
+#if defined(__AVX512F__)
+        if (cpu_supports_avx512())
+        {
+            primitives::rmsnorm_fused_row_avx512(input, gamma, output, cols, epsilon);
+            return;
+        }
+#endif
+#if defined(__AVX2__)
+        if (cpu_supports_avx2())
+        {
+            primitives::rmsnorm_fused_row_avx2(input, gamma, output, cols, epsilon);
+            return;
+        }
+#endif
+        primitives::rmsnorm_fused_row_scalar(input, gamma, output, cols, epsilon);
     }
 
     // =========================================================================
@@ -135,7 +160,7 @@ namespace llaminar2
             }
 
             // RMSNorm on single row (scratch → out_row)
-            primitives::rmsnorm_fused_row_avx512(scratch, gamma, out_row, ucols, epsilon);
+            rmsnorm_fused_row_best(scratch, gamma, out_row, ucols, epsilon);
         };
 
         if (use_parallel)
@@ -209,7 +234,7 @@ namespace llaminar2
             simd::convert_bf16_to_fp32(in_row, fp32_in, ucols);
 
             // 2. RMSNorm in FP32 (one row)
-            primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
+            rmsnorm_fused_row_best(fp32_in, gamma, fp32_out, ucols, epsilon);
 
             // 3. Quantize FP32 → BF16 (one row)
             simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
@@ -290,7 +315,7 @@ namespace llaminar2
             simd::fused_bf16_residual_add(res_row, in_row, fused, ucols);
 
             // 2. RMSNorm in FP32 (one row)
-            primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
+            rmsnorm_fused_row_best(fused, gamma, fp32_out, ucols, epsilon);
 
             // 3. Quantize FP32 → BF16 (one row)
             simd::convert_fp32_to_bf16(fp32_out, out_row, ucols);
@@ -373,7 +398,7 @@ namespace llaminar2
             simd::convert_fp16_to_fp32(in_row, fp32_in, ucols);
 
             // 2. RMSNorm in FP32 (one row)
-            primitives::rmsnorm_fused_row_avx512(fp32_in, gamma, fp32_out, ucols, epsilon);
+            rmsnorm_fused_row_best(fp32_in, gamma, fp32_out, ucols, epsilon);
 
             // 3. Quantize FP32 → FP16 (one row)
             simd::convert_fp32_to_fp16(fp32_out, out_row, ucols);
@@ -454,7 +479,7 @@ namespace llaminar2
             simd::fused_fp16_residual_add(res_row, in_row, fused, ucols);
 
             // 2. RMSNorm in FP32 (one row)
-            primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
+            rmsnorm_fused_row_best(fused, gamma, fp32_out, ucols, epsilon);
 
             // 3. Quantize FP32 → FP16 (one row)
             simd::convert_fp32_to_fp16(fp32_out, out_row, ucols);
@@ -534,7 +559,7 @@ namespace llaminar2
         const size_t ucols = static_cast<size_t>(cols);
         const size_t blocks_per_row = ucols / 32;
 
-        // Use the optimized pure-integer primitive with dynamic threading
+#if defined(__AVX512F__)
         primitives::RMSNormExecOptions opts;
         opts.allow_parallel = want_parallel(rows, ucols);
 
@@ -544,6 +569,61 @@ namespace llaminar2
             epsilon, opts);
 
         return true;
+#else
+        const bool use_parallel = want_parallel(rows, ucols);
+
+        auto process_row = [&](int row, float *fp32_in, float *fp32_out)
+        {
+            const Q8_1Block *in_row = input + row * blocks_per_row;
+            Q8_1Block *out_row = output + row * blocks_per_row;
+
+            simd::dequantize_q8_1_to_fp32(in_row, fp32_in, ucols);
+            rmsnorm_fused_row_best(fp32_in, gamma, fp32_out, ucols, epsilon);
+            simd::quantize_fp32_to_q8_1_blocks(fp32_out, out_row, ucols);
+        };
+
+        if (use_parallel)
+        {
+            auto do_work = [&]()
+            {
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+                std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+                std::vector<float> heap_fp32_in, heap_fp32_out;
+                float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
+                                     ? stack_fp32_in.data()
+                                     : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
+                float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                      ? stack_fp32_out.data()
+                                      : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
+#pragma omp for schedule(static)
+                for (int row = 0; row < rows; ++row)
+                {
+                    process_row(row, fp32_in, fp32_out);
+                }
+            };
+            OMP_WORKSHARE_REGION(do_work);
+        }
+        else
+        {
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_in;
+            std::array<float, MAX_STACK_ROW_SIZE> stack_fp32_out;
+            std::vector<float> heap_fp32_in, heap_fp32_out;
+            float *fp32_in = (ucols <= MAX_STACK_ROW_SIZE)
+                                 ? stack_fp32_in.data()
+                                 : (heap_fp32_in.resize(ucols), heap_fp32_in.data());
+            float *fp32_out = (ucols <= MAX_STACK_ROW_SIZE)
+                                  ? stack_fp32_out.data()
+                                  : (heap_fp32_out.resize(ucols), heap_fp32_out.data());
+
+            for (int row = 0; row < rows; ++row)
+            {
+                process_row(row, fp32_in, fp32_out);
+            }
+        }
+
+        return true;
+#endif
     }
 
     bool CPURMSNormKernelT<ActivationPrecision::Q8_1>::apply_with_residual_add(
@@ -585,7 +665,7 @@ namespace llaminar2
             simd::fused_q8_1_residual_add(res_row, in_row, fused, ucols);
 
             // 2. RMSNorm in FP32 (one row)
-            primitives::rmsnorm_fused_row_avx512(fused, gamma, fp32_out, ucols, epsilon);
+            rmsnorm_fused_row_best(fused, gamma, fp32_out, ucols, epsilon);
 
             // 3. Quantize FP32 → Q8_1 (one row)
             simd::quantize_fp32_to_q8_1_blocks(fp32_out, out_row, ucols);

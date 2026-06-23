@@ -13,6 +13,7 @@ Options:
   --sha SHA              Commit SHA. Default: GITHUB_SHA or git HEAD.
   --cuda-version VALUE   CUDA version for tag segment. Default: CUDA_VERSION or 13.0.
   --rocm-version VALUE   ROCm version for tag segment. Default: ROCM_VERSION or 7.1.1.
+  --tag-suffix SUFFIX    Append a suffix to every emitted tag, for example -avx2.
   --format refs|tags     Output full refs or tag names only. Default: refs.
   -h, --help             Show this help.
 
@@ -40,6 +41,7 @@ branch="${GITHUB_REF_NAME:-}"
 sha="${GITHUB_SHA:-}"
 cuda_version="${CUDA_VERSION:-13.0}"
 rocm_version="${ROCM_VERSION:-7.1.1}"
+tag_suffix="${LLAMINAR_IMAGE_TAG_SUFFIX:-}"
 format="refs"
 
 while (($#)); do
@@ -72,6 +74,11 @@ while (($#)); do
         --rocm-version)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             rocm_version="$2"
+            shift 2
+            ;;
+        --tag-suffix)
+            [[ $# -ge 2 ]] || die "$1 requires a value"
+            tag_suffix="$2"
             shift 2
             ;;
         --format)
@@ -114,6 +121,12 @@ branch="$(sanitize_tag_part "$branch")"
 short_sha="$(sanitize_tag_part "${sha:0:7}")"
 cuda_part="$(sanitize_tag_part "$cuda_version")"
 rocm_part="$(sanitize_tag_part "$rocm_version")"
+tag_suffix_part=""
+if [[ -n "$tag_suffix" ]]; then
+    tag_suffix_part="$(sanitize_tag_part "$tag_suffix")"
+    [[ -n "$tag_suffix_part" && "$tag_suffix_part" != "unknown" ]] \
+        || die "--tag-suffix resolved to an empty tag segment"
+fi
 
 case "$format" in
     refs|tags) ;;
@@ -151,6 +164,12 @@ tags=(
 )
 if [[ "$variant" == "full" ]]; then
     tags+=("${branch}-latest")
+fi
+
+if [[ -n "$tag_suffix_part" ]]; then
+    for idx in "${!tags[@]}"; do
+        tags[$idx]="${tags[$idx]}-${tag_suffix_part}"
+    done
 fi
 
 for tag in "${tags[@]}"; do

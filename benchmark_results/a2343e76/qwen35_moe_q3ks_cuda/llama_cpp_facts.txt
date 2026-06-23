@@ -1,0 +1,5 @@
+llama_cpp_repo=/workspaces/llama.cpp-mainline
+llama_cpp_remote=https://github.com/ggml-org/llama.cpp.git
+llama_cpp_commit=d4204b0
+llama_cpp_commit_full=d4204b03a592a90cb62feaaa14276c9407e36cbd
+command=CUDA_VISIBLE_DEVICES=0 build-cuda/bin/llama-bench -m /opt/llaminar-models/Qwen3.5-35B-A3B-Q3_K_S.gguf -p 595 -n 128 -r 3 -ngl 99 -ctk f16 -ctv f16 -dev CUDA0 -o md

@@ -6652,7 +6652,15 @@ namespace llaminar2
                 }
             }
 #else
-            unpack_iq2_xxs_superblock_to_int8(block, output, scales, mins);
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq2xxs_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
 #endif
         }
 
@@ -7139,7 +7147,15 @@ namespace llaminar2
                 }
             }
 #else
-            unpack_iq2_xs_superblock_to_int8(block, output, scales, mins);
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq2xs_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
 #endif
         }
 
@@ -8180,7 +8196,15 @@ namespace llaminar2
                 }
             }
 #else
-            unpack_iq2_s_superblock_to_int8(block, output, scales, mins);
+            for (int i = 0; i < 8; ++i)
+            {
+                uint16_t scale_fp16;
+                decode_iq2s_to_q8_0(block, i, output + i * 32, &scale_fp16);
+                if (scales)
+                    scales[i] = fp16_to_fp32(scale_fp16);
+                if (mins)
+                    mins[i] = 0.0f;
+            }
 #endif
         }
 
