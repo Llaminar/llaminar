@@ -40,21 +40,28 @@ Open vscode in the devcontainer, and run the Build Integration / Build Release v
 
 **Important**: Ensure your installed ROCm and CUDA drivers are compatible with Llaminar's CUDA and ROCm versions.
 
+Serve an OpenAI-compatible HTTP API endpoint from a supported GGUF model.
+
 Set these once before running the one-liners below:
 
 ```bash
+# Choose a model folder and download some GGUFs:
 export MODEL_DIR=/opt/llaminar-models
 export MODEL_DENSE="$MODEL_DIR/Qwen3.6-27B-Q4_K_S.gguf"
 export MODEL_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
+
+# Path to Llaminar images:
 export LLAMINAR_CPU_IMAGE=ghcr.io/llaminar/llaminar:develop-cpu-latest
 export LLAMINAR_CUDA_IMAGE=ghcr.io/llaminar/llaminar:develop-cuda13.0-latest
 export LLAMINAR_ROCM_IMAGE=ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest
 export LLAMINAR_FULL_IMAGE=ghcr.io/llaminar/llaminar:develop-latest
-# docker run pulls these public GHCR images automatically when needed.
+
+# Group permissions for AMD GPUs in Docker
 export AMD_KFD_GID="$(stat -c '%g' /dev/kfd 2>/dev/null || true)"
 export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' 2>/dev/null | head -n1)" 2>/dev/null || true)"
 
+# Common runtime params:
 COMMON_RUN=(--rm -it --network bridge --ulimit core=-1 --user 0:0 --security-opt seccomp=unconfined --cap-add SYS_NICE --cap-add SYS_PTRACE --shm-size=16g -v "$MODEL_DIR:$MODEL_DIR:ro")
 CUDA_RUN=(--gpus all)
 ROCM_RUN=(--device /dev/kfd --device /dev/dri --group-add "$AMD_KFD_GID" --group-add "$AMD_RENDER_GID")
