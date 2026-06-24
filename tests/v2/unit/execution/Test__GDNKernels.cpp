@@ -474,6 +474,79 @@ TEST(GDNROCmConfig, SharedExpertGroupedDecodeFlagDefaultsOffAndParsesEnv)
     EXPECT_FALSE(debugEnv().rocm.shared_expert_grouped_decode);
 }
 
+TEST(GDNROCmConfig, MoERouterQ8DefaultsOnAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_MOE_ROUTER_Q8");
+
+    flag.clear();
+    EXPECT_TRUE(debugEnv().rocm.moe_router_q8);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.moe_router_q8);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.moe_router_q8);
+}
+
+TEST(GDNROCmConfig, MoEGroupedDecodeRouterDefaultsOnAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_MOE_GROUPED_DECODE_ROUTER");
+
+    flag.clear();
+    EXPECT_TRUE(debugEnv().rocm.moe_grouped_decode_router);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.moe_grouped_decode_router);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.moe_grouped_decode_router);
+}
+
+TEST(GDNROCmConfig, MoEReuseRouterQ8HiddenDefaultsOnAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_MOE_REUSE_ROUTER_Q8_HIDDEN");
+
+    flag.clear();
+    EXPECT_TRUE(debugEnv().rocm.moe_reuse_router_q8_hidden);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.moe_reuse_router_q8_hidden);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.moe_reuse_router_q8_hidden);
+}
+
+TEST(GDNROCmConfig, MoEGateUpKPartsDefaultsToFourAndParsesSupportedValues)
+{
+    ScopedEnvVar kparts("LLAMINAR_ROCM_MOE_GATEUP_KPARTS");
+
+    kparts.clear();
+    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 4);
+
+    kparts.set("8");
+    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 8);
+
+    kparts.set("16");
+    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 16);
+
+    kparts.set("32");
+    EXPECT_EQ(debugEnv().rocm.moe_gateup_kparts, 4);
+}
+
+TEST(GDNROCmConfig, MoEGateUpSwiGLUQuantFusedDefaultsOnAndParsesEnv)
+{
+    ScopedEnvVar flag("LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED");
+
+    flag.clear();
+    EXPECT_TRUE(debugEnv().rocm.moe_gateup_swiglu_quant_fused);
+
+    flag.set("0");
+    EXPECT_FALSE(debugEnv().rocm.moe_gateup_swiglu_quant_fused);
+
+    flag.set("1");
+    EXPECT_TRUE(debugEnv().rocm.moe_gateup_swiglu_quant_fused);
+}
+
 TEST(Test__GDNKernels, ShortConv_WorkspaceRequirementUsesActiveSeqLen)
 {
     ShortConv1dStage::Params p;

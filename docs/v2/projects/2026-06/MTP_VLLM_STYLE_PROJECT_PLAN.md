@@ -223,6 +223,9 @@ Done:
   plus standalone shared GEMV-many verifier counters.
 - CUDA and ROCm dense/MoE stochastic verifier parity now pass on the same
   all-position state-publication path.
+- ROCm Qwen3.6 MoE main all-position verifier rows now force
+  decode-equivalent replay for grouped MTP, keeping M1-M4 grouped and rowwise
+  verifier parity green while the ROCm MoE decode tuning defaults stay enabled.
 - vLLM-style stochastic verification is wired into the GPU SingleDevice runner
   path using processed target logits plus device-resident sampled draft tokens.
   Draft proposals follow the vLLM default greedy draft branch, so the verifier

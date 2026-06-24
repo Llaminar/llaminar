@@ -663,6 +663,7 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
         int num_active,
         int N,
         int K,
@@ -679,8 +680,29 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
         float *d_gate_partials,
         float *d_up_partials,
+        int num_active,
+        int N,
+        int K,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream);
+
+    bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
+        const float *d_hidden,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
+        const llaminar2::DeviceNativeVNNIMatrixDesc *d_up_desc_table,
+        const int *d_expert_ids,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
         int num_active,
         int N,
         int K,
@@ -697,6 +719,7 @@ extern "C"
         const float *d_weights,
         int8_t *d_swiglu_int8,
         float *d_swiglu_scales,
+        bool swiglu_prequantized,
         float *d_output,
         int num_active,
         int N,
@@ -974,6 +997,8 @@ namespace llaminar2
         d_route_logits_partials_ = nullptr;
         d_router_q8_hidden_ = nullptr;
         d_router_q8_hidden_scales_ = nullptr;
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
         d_route_indices_ = nullptr;
         d_route_weights_ = nullptr;
         d_group_int_indices_ = nullptr;
@@ -1006,6 +1031,8 @@ namespace llaminar2
         route_logits_partials_capacity_ = 0;
         router_q8_hidden_d_model_cap_ = 0;
         router_q8_hidden_blocks_cap_ = 0;
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
         group_active_expert_slots_ = 0;
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
@@ -2417,7 +2444,7 @@ namespace llaminar2
     bool ROCmMoEKernel::ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate)
     {
         if (num_active <= 0 || intermediate <= 0 ||
-            !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8))
+            !(k_partitions == 2 || k_partitions == 4 || k_partitions == 8 || k_partitions == 16))
         {
             return false;
         }
@@ -3022,6 +3049,8 @@ namespace llaminar2
         bool runtime_ready = false;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
         if (gate_is_fp32 && rocm_env.moe_router_q8)
         {
             if ((d_model % 32) == 0 && ensureRouterQ8HiddenScratchCapacity(d_model))
@@ -3037,6 +3066,11 @@ namespace llaminar2
                     if (!logits_ready)
                     {
                         LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] Q8 router logits kernel failed; falling back to K-part/FP16/default router");
+                    }
+                    else
+                    {
+                        router_q8_hidden_source_ = h;
+                        router_q8_hidden_valid_ = true;
                     }
                 }
                 else
@@ -3822,6 +3856,7 @@ namespace llaminar2
             d_up_output_ptrs,
             d_grouped_hidden_int8_,
             d_grouped_hidden_scales_,
+            false,
             num_active,
             intermediate,
             d_model,
@@ -3949,6 +3984,7 @@ namespace llaminar2
             d_grouped_up_output_ptrs_,
             d_grouped_hidden_int8_,
             d_grouped_hidden_scales_,
+            false,
             top_k,
             intermediate,
             d_model,
@@ -4046,6 +4082,16 @@ namespace llaminar2
             top_k > 0 &&
             groupedDecodeSupportsCodebook(table.codebook_id) &&
             ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate);
+        const bool reuse_router_q8_hidden =
+            debugEnv().rocm.moe_reuse_router_q8_hidden &&
+            router_q8_hidden_valid_ &&
+            router_q8_hidden_source_ == d_hidden &&
+            router_q8_hidden_d_model_cap_ >= d_model &&
+            router_q8_hidden_blocks_cap_ >= ((d_model + 31) / 32) &&
+            d_router_q8_hidden_ &&
+            d_router_q8_hidden_scales_;
+        int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
+        float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
 
         bool ok = false;
         if (use_kpart_gateup)
@@ -4057,8 +4103,9 @@ namespace llaminar2
                 d_expert_ids,
                 d_gate_output_ptrs,
                 d_up_output_ptrs,
-                d_grouped_hidden_int8_,
-                d_grouped_hidden_scales_,
+                gateup_hidden_int8,
+                gateup_hidden_scales,
+                reuse_router_q8_hidden,
                 d_grouped_gateup_gate_partials_,
                 d_grouped_gateup_up_partials_,
                 top_k,
@@ -4083,8 +4130,9 @@ namespace llaminar2
                 d_expert_ids,
                 d_gate_output_ptrs,
                 d_up_output_ptrs,
-                d_grouped_hidden_int8_,
-                d_grouped_hidden_scales_,
+                gateup_hidden_int8,
+                gateup_hidden_scales,
+                reuse_router_q8_hidden,
                 top_k,
                 intermediate,
                 d_model,
@@ -4221,9 +4269,59 @@ namespace llaminar2
             debugEnv().rocm.moe_gateup_kpart_decode &&
             groupedDecodeSupportsCodebook(gateup_table.codebook_id) &&
             ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate);
+        const bool reuse_router_q8_hidden =
+            debugEnv().rocm.moe_reuse_router_q8_hidden &&
+            router_q8_hidden_valid_ &&
+            router_q8_hidden_source_ == d_hidden &&
+            router_q8_hidden_d_model_cap_ >= d_model &&
+            router_q8_hidden_blocks_cap_ >= ((d_model + 31) / 32) &&
+            d_router_q8_hidden_ &&
+            d_router_q8_hidden_scales_;
+        int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
+        float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
+        const bool use_parallel_down =
+            debugEnv().rocm.moe_parallel_down_decode &&
+            top_k > 1 &&
+            groupedDecodeSupportsCodebook(down_table.codebook_id);
+        const bool use_gateup_swiglu_quant_fused =
+            use_gateup_kpart &&
+            debugEnv().rocm.moe_gateup_swiglu_quant_fused &&
+            use_parallel_down &&
+            d_grouped_swiglu_int8_ &&
+            d_grouped_swiglu_scales_;
 
         bool gateup_ok = false;
-        if (use_gateup_kpart)
+        bool swiglu_prequantized = false;
+        if (use_gateup_swiglu_quant_fused)
+        {
+            gateup_ok = rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
+                d_hidden,
+                gateup_table.device_gate_descs,
+                gateup_table.device_up_descs,
+                d_expert_ids,
+                gateup_hidden_int8,
+                gateup_hidden_scales,
+                reuse_router_q8_hidden,
+                d_grouped_gateup_gate_partials_,
+                d_grouped_gateup_up_partials_,
+                d_grouped_swiglu_int8_,
+                d_grouped_swiglu_scales_,
+                top_k,
+                intermediate,
+                d_model,
+                gateup_table.codebook_id,
+                gateup_k_partitions,
+                device_ordinal_,
+                stream);
+            swiglu_prequantized = gateup_ok;
+            if (!gateup_ok)
+            {
+                LOG_DEBUG("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "K-partition fused gate/up SwiGLU quant path failed; falling back");
+            }
+        }
+
+        if (!gateup_ok && use_gateup_kpart)
         {
             gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
                 d_hidden,
@@ -4232,8 +4330,9 @@ namespace llaminar2
                 d_expert_ids,
                 d_gate_ptrs,
                 d_up_ptrs,
-                d_grouped_hidden_int8_,
-                d_grouped_hidden_scales_,
+                gateup_hidden_int8,
+                gateup_hidden_scales,
+                reuse_router_q8_hidden,
                 d_grouped_gateup_gate_partials_,
                 d_grouped_gateup_up_partials_,
                 top_k,
@@ -4259,8 +4358,9 @@ namespace llaminar2
                 d_expert_ids,
                 d_gate_ptrs,
                 d_up_ptrs,
-                d_grouped_hidden_int8_,
-                d_grouped_hidden_scales_,
+                gateup_hidden_int8,
+                gateup_hidden_scales,
+                reuse_router_q8_hidden,
                 top_k,
                 intermediate,
                 d_model,
@@ -4281,11 +4381,6 @@ namespace llaminar2
             return false;
         }
 
-        const bool use_parallel_down =
-            debugEnv().rocm.moe_parallel_down_decode &&
-            top_k > 1 &&
-            groupedDecodeSupportsCodebook(down_table.codebook_id);
-
         const bool down_ok = use_parallel_down
                                  ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
                                        d_down_gate_ptrs,
@@ -4295,6 +4390,7 @@ namespace llaminar2
                                        d_weights,
                                        d_grouped_swiglu_int8_,
                                        d_grouped_swiglu_scales_,
+                                       swiglu_prequantized,
                                        d_output,
                                        top_k,
                                        d_model,
@@ -4635,6 +4731,7 @@ namespace llaminar2
                                   d_weights,
                                   d_grouped_swiglu_int8_,
                                   d_grouped_swiglu_scales_,
+                                  false,
                                   d_output,
                                   top_k,
                                   d_model,

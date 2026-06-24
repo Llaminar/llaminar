@@ -81,6 +81,8 @@ Latest MoE stage blockers:
   `0.1035 ms` graph vs `9.8135 ms` row replay.
 - ROCm verifier handoff reruns M4 after workspace rebind/reset.
 - CUDA/ROCm shared direct and `SharedExpertFFNStage` M=2/3/4 gates pass.
+- 2026-06-23 ROCm Qwen3.6 MoE verifier rows M1-M4 grouped/rowwise pass after
+  forcing main all-position ROCm rows onto decode-equivalent replay.
 - CUDA long-prompt MoE greedy parity and CUDA/ROCm stochastic verifier runs are
   green after pruning the broken combined owner.
 - Replay preservation gates pass:

@@ -616,6 +616,8 @@ namespace llaminar2
         float *d_route_logits_partials_ = nullptr;   ///< [route_logits_partials_capacity_] floats on device
         int8_t *d_router_q8_hidden_ = nullptr;       ///< [router_q8_hidden_d_model_cap_] int8 values on device
         float *d_router_q8_hidden_scales_ = nullptr; ///< [router_q8_hidden_blocks_cap_] floats on device
+        const float *router_q8_hidden_source_ = nullptr; ///< Input row that produced d_router_q8_hidden_ for the current layer
+        bool router_q8_hidden_valid_ = false;
         size_t route_logits_capacity_ = 0;
         size_t route_topk_capacity_ = 0;
         size_t route_logits_partials_capacity_ = 0;

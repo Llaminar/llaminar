@@ -945,7 +945,8 @@ namespace llaminar2
                    total_tokens <= 4 &&
                    config_.compute_all_position_logits &&
                    !mtp_sidecar_context &&
-                   !forceGpuSmallMMainVerifierPrefill(candidate);
+                   (!forceGpuSmallMMainVerifierPrefill(candidate) ||
+                    candidate.is_rocm());
         };
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 

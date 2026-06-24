@@ -98,7 +98,8 @@ extern "C" bool hipMoE_softmax_topk(
     int *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
-    int device_idx, void *stream);
+    int device_idx, void *stream,
+    const int *device_effective_seq_len);
 #endif
 
 using namespace llaminar2;
@@ -2965,7 +2966,7 @@ void runGroupedExpertGateUpDecodeFormatMatch(const char *label, WeightFactory cr
             runtime_gate_ptrs, runtime_up_ptrs, d_model, intermediate));
     }
 
-    constexpr const char *kKPartCounts[] = {"2", "4", "8"};
+    constexpr const char *kKPartCounts[] = {"2", "4", "8", "16"};
     for (const char *kparts : kKPartCounts)
     {
         ScopedROCmEnvOverride deterministic_off("LLAMINAR_DETERMINISTIC", "0");
@@ -5240,7 +5241,8 @@ TEST(Test__ROCmMoEKernel, SoftmaxTopKParallelSelectionPreservesTieOrder)
         top_k,
         /*normalize_weights=*/true,
         /*device_idx=*/0,
-        stream));
+        stream,
+        nullptr));
     indices->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
     weights->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
     ASSERT_TRUE(indices->ensureOnHost(stream));
@@ -5391,6 +5393,8 @@ TEST(Test__ROCmMoEKernel, SmallMRouteWithTensorsUsesDecodeEquivalentRouterAndMat
 TEST(Test__ROCmMoEKernel, SmallMRouteWithTensorsMatchesSerialDecodeRouterForVerifierRows)
 {
     SKIP_IF_NO_ROCM();
+
+    ScopedROCmEnvOverride q8_env("LLAMINAR_ROCM_MOE_ROUTER_Q8", "0");
 
     const DeviceId device = DeviceId::rocm(0);
     constexpr int d_model = 2048;

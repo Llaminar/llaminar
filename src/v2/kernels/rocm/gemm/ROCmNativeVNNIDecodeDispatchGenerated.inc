@@ -2016,6 +2016,12 @@ inline bool selectROCmNativeVNNIDecodeGenerated(
     uint8_t codebook_id, int m, int n, int k, ROCmNativeVNNIDecodeDispatchConfig &out)
 {
     const uint64_t key = packROCmNativeVNNIDecodeDispatchKey(m, n, k);
+    // BEGIN ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY
+    if (codebook_id == 5 && key == 0x0100008000000200ULL) { out = ROCmNativeVNNIDecodeDispatchConfig{16, 8}; return true; } // CB=5 (Q4_1) M=1 512x2048 KB16/TW8 35BMoE_Expert_GateUp 21.440us
+    if (codebook_id == 5 && key == 0x0100002000000800ULL) { out = ROCmNativeVNNIDecodeDispatchConfig{8, 4}; return true; } // CB=5 (Q4_1) M=1 2048x512 KB8/TW4 35BMoE_Expert_Down 18.720us
+    if (codebook_id == 5 && key == 0x0100008000001000ULL) { out = ROCmNativeVNNIDecodeDispatchConfig{8, 24}; return true; } // CB=5 (Q4_1) M=1 4096x2048 KB8/TW24 Qwen36MoE_GDN_ZProjection 27.040us
+    if (codebook_id == 5 && key == 0x0100008000002000ULL) { out = ROCmNativeVNNIDecodeDispatchConfig{8, 8}; return true; } // CB=5 (Q4_1) M=1 8192x2048 KB8/TW8 Qwen36MoE_GDN_QKVProjection 32.960us
+    // END ROCM_NATIVE_VNNI_KNOWN_SHAPE_OVERLAY
     if (codebook_id == 0) { // CB=0 (Q4_0)
         static constexpr ROCmNativeVNNIDecodeTuningEntry kTable[] = {
             {0x0100014000000400ULL, {8, 8}}, // CB=0 (Q4_0) M=1 1024x5120 KB8/TW8 Qwen36_GDN_TimeProjection 28.159us

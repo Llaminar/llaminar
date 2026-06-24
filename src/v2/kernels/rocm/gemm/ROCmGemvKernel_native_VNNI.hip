@@ -2383,7 +2383,7 @@ __global__ void moe_grouped_native_vnni_gate_up_kernel_t(
         up_desc, n, A_int8, scales_A_blockwise, N, K);
 }
 
-template <NativeVNNIFormat FMT>
+template <NativeVNNIFormat FMT, int FIXED_K_PARTITIONS = 0>
 __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
@@ -2399,16 +2399,22 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
 {
     static_assert(NVNNIGroupedMoESupported<FMT>::value,
                   "Grouped MoE K-partition gate/up requires a supported native-VNNI descriptor");
+    static_assert(FIXED_K_PARTITIONS == 0 || FIXED_K_PARTITIONS == 2 ||
+                      FIXED_K_PARTITIONS == 4 || FIXED_K_PARTITIONS == 8 ||
+                      FIXED_K_PARTITIONS == 16,
+                  "unsupported fixed grouped MoE K-partition count");
 
     constexpr int TILE_N = 64;
+    const int effective_k_partitions =
+        (FIXED_K_PARTITIONS != 0) ? FIXED_K_PARTITIONS : k_partitions;
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int k_part = blockIdx.y;
     const int slot = blockIdx.z;
-    if (slot >= num_active || k_part >= k_partitions || n >= N) return;
+    if (slot >= num_active || k_part >= effective_k_partitions || n >= N) return;
 
     const int expert_id = expert_ids[slot];
     const size_t partial_index =
-        (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) + static_cast<size_t>(k_part)) *
+        (static_cast<size_t>(slot) * static_cast<size_t>(effective_k_partitions) + static_cast<size_t>(k_part)) *
             static_cast<size_t>(N) +
         static_cast<size_t>(n);
 
@@ -2420,7 +2426,7 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
     }
 
     const int blocks_per_row = K / 32;
-    const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+    const int blocks_per_part = (blocks_per_row + effective_k_partitions - 1) / effective_k_partitions;
     const int b_start = k_part * blocks_per_part;
     int b_end = b_start + blocks_per_part;
     if (b_end > blocks_per_row) b_end = blocks_per_row;
@@ -2467,6 +2473,71 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_kernel(
 
     gate_outputs[slot][n] = gate_sum;
     up_outputs[slot][n] = up_sum;
+}
+
+template <int K_PARTITIONS>
+__global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel(
+    const float* __restrict__ gate_partials,
+    const float* __restrict__ up_partials,
+    int8_t* __restrict__ swiglu_int8,
+    float* __restrict__ swiglu_scales,
+    int num_active,
+    int N)
+{
+    static_assert(K_PARTITIONS == 2 || K_PARTITIONS == 4 ||
+                      K_PARTITIONS == 8 || K_PARTITIONS == 16,
+                  "unsupported grouped MoE K-partition count");
+
+    const int slot = blockIdx.y;
+    if (slot >= num_active) return;
+
+    constexpr int BLOCK_SIZE = 32;
+    const int blocks_per_row = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    const int lane = threadIdx.x & 31;
+    const int half_wave = threadIdx.x >> 5;
+    const int block_idx = blockIdx.x * 2 + half_wave;
+    if (block_idx >= blocks_per_row) return;
+
+    int8_t* row_int8 = swiglu_int8 + static_cast<size_t>(slot) * static_cast<size_t>(N);
+    float* row_scales = swiglu_scales + static_cast<size_t>(slot) * static_cast<size_t>(blocks_per_row);
+    const size_t slot_base = static_cast<size_t>(slot) * static_cast<size_t>(K_PARTITIONS) * static_cast<size_t>(N);
+
+    const int n = block_idx * BLOCK_SIZE + lane;
+    float val = 0.0f;
+    if (n < N)
+    {
+        float gate_sum = 0.0f;
+        float up_sum = 0.0f;
+        #pragma unroll
+        for (int k_part = 0; k_part < K_PARTITIONS; ++k_part)
+        {
+            const size_t idx =
+                slot_base +
+                static_cast<size_t>(k_part) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            gate_sum += gate_partials[idx];
+            up_sum += up_partials[idx];
+        }
+        val = (gate_sum / (1.0f + expf(-gate_sum))) * up_sum;
+    }
+
+    float abs_val = fabsf(val);
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1)
+        abs_val = fmaxf(abs_val, __shfl_xor(abs_val, mask));
+
+    const float scale = (abs_val > 0.0f) ? (abs_val / 127.0f) : 1.0f;
+    const float inv_scale = 1.0f / scale;
+
+    if (lane == 0)
+        row_scales[block_idx] = scale;
+
+    if (n < N)
+    {
+        const float qval = val * inv_scale;
+        row_int8[n] = static_cast<int8_t>(
+            rintf(fminf(127.0f, fmaxf(-127.0f, qval))));
+    }
 }
 
 
@@ -3485,6 +3556,7 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
     float* const* d_up_outputs,
     int8_t* d_hidden_int8,
     float* d_hidden_scales,
+    bool hidden_prequantized,
     int num_active,
     int N,
     int K,
@@ -3494,7 +3566,7 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+    if ((!hidden_prequantized && !d_hidden) || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
         !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
         num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
     {
@@ -3503,17 +3575,21 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table(
     }
 
     (void)hipGetLastError();
-    const int blocks_per_row = K / 32;
-    hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
-        dim3(blocks_per_row), dim3(32), 0, static_cast<hipStream_t>(stream),
-        d_hidden, d_hidden_int8, d_hidden_scales, K);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    hipError_t err = hipSuccess;
+    if (!hidden_prequantized)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] hidden quantize launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        const int blocks_per_row = K / 32;
+        hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
+            dim3(blocks_per_row), dim3(32), 0, static_cast<hipStream_t>(stream),
+            d_hidden, d_hidden_int8, d_hidden_scales, K);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table] hidden quantize launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
 
     constexpr int TN = 64;
@@ -3572,6 +3648,7 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
     float* const* d_up_outputs,
     int8_t* d_hidden_int8,
     float* d_hidden_scales,
+    bool hidden_prequantized,
     float* d_gate_partials,
     float* d_up_partials,
     int num_active,
@@ -3584,8 +3661,9 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 || k_partitions == 8);
-    if (!d_hidden || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+    const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 ||
+                                     k_partitions == 8 || k_partitions == 16);
+    if ((!hidden_prequantized && !d_hidden) || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
         !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
         !d_gate_partials || !d_up_partials ||
         num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0 || !valid_k_partitions)
@@ -3596,17 +3674,21 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError();
-    const int blocks_per_row = K / 32;
-    hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
-        dim3(blocks_per_row), dim3(32), 0, hip_stream,
-        d_hidden, d_hidden_int8, d_hidden_scales, K);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    hipError_t err = hipSuccess;
+    if (!hidden_prequantized)
     {
-        fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] hidden quantize launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        const int blocks_per_row = K / 32;
+        hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
+            dim3(blocks_per_row), dim3(32), 0, hip_stream,
+            d_hidden, d_hidden_int8, d_hidden_scales, K);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] hidden quantize launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
 
     constexpr int TN = 64;
@@ -3664,6 +3746,153 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
     if (err != hipSuccess)
     {
         fprintf(stderr, "[rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart] reduce launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
+    const float* d_hidden,
+    const DeviceNativeVNNIMatrixDesc* d_gate_desc_table,
+    const DeviceNativeVNNIMatrixDesc* d_up_desc_table,
+    const int* d_expert_ids,
+    int8_t* d_hidden_int8,
+    float* d_hidden_scales,
+    bool hidden_prequantized,
+    float* d_gate_partials,
+    float* d_up_partials,
+    int8_t* d_swiglu_int8,
+    float* d_swiglu_scales,
+    int num_active,
+    int N,
+    int K,
+    uint8_t codebook_id,
+    int k_partitions,
+    int device_id,
+    void* stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_id);
+
+    const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 ||
+                                     k_partitions == 8 || k_partitions == 16);
+    if ((!hidden_prequantized && !d_hidden) || !d_gate_desc_table || !d_up_desc_table || !d_expert_ids ||
+        !d_hidden_int8 || !d_hidden_scales || !d_gate_partials || !d_up_partials ||
+        !d_swiglu_int8 || !d_swiglu_scales ||
+        num_active <= 0 || N <= 0 || K <= 0 || (N % 32) != 0 || (K % 32) != 0 || !valid_k_partitions)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] invalid arguments\n");
+        return false;
+    }
+
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    (void)hipGetLastError();
+    hipError_t err = hipSuccess;
+    if (!hidden_prequantized)
+    {
+        const int blocks_per_row = K / 32;
+        hipLaunchKernelGGL(moe_grouped_hidden_quantize_blockwise_kernel,
+            dim3(blocks_per_row), dim3(32), 0, hip_stream,
+            d_hidden, d_hidden_int8, d_hidden_scales, K);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] hidden quantize launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
+    }
+
+    constexpr int TN = 64;
+    dim3 partial_grid((N + TN - 1) / TN, k_partitions, num_active);
+    dim3 partial_block(TN);
+
+    #define LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(FMT_TAG, FIXED_KPARTS_TAG)             \
+        hipLaunchKernelGGL(                                                                    \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_kernel_t<FMT_TAG, FIXED_KPARTS_TAG>), \
+            partial_grid, partial_block, 0, hip_stream,                                        \
+            d_hidden_int8, d_hidden_scales, d_gate_desc_table, d_up_desc_table,                \
+            d_expert_ids, d_gate_partials, d_up_partials, num_active, N, K, k_partitions)
+
+    #define DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(FIXED_KPARTS_TAG)                    \
+        do                                                                                    \
+        {                                                                                     \
+            switch (static_cast<NativeVNNIFormat>(codebook_id))                               \
+            {                                                                                 \
+            case NVNNI_Q4_0:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q4_0, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_IQ4_NL:   LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ4_NL, FIXED_KPARTS_TAG);   break; \
+            case NVNNI_Q4_1:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q4_1, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_Q5_0:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q5_0, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_Q5_1:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q5_1, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_Q6_K:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q6_K, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_Q3_K:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q3_K, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_Q2_K:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q2_K, FIXED_KPARTS_TAG);     break; \
+            case NVNNI_IQ3_S:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ3_S, FIXED_KPARTS_TAG);    break; \
+            case NVNNI_IQ3_XXS:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ3_XXS, FIXED_KPARTS_TAG);  break; \
+            case NVNNI_IQ2_S:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ2_S, FIXED_KPARTS_TAG);    break; \
+            case NVNNI_IQ2_XS:   LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ2_XS, FIXED_KPARTS_TAG);   break; \
+            case NVNNI_IQ2_XXS:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ2_XXS, FIXED_KPARTS_TAG);  break; \
+            case NVNNI_IQ1_S:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ1_S, FIXED_KPARTS_TAG);    break; \
+            case NVNNI_IQ1_M:    LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_IQ1_M, FIXED_KPARTS_TAG);    break; \
+            case NVNNI_Q8_0:     LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(NVNNI_Q8_0, FIXED_KPARTS_TAG);     break; \
+            default:                                                                          \
+                fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n", \
+                        static_cast<unsigned>(codebook_id));                                  \
+                return false;                                                                 \
+            }                                                                                 \
+        } while (0)
+
+    if (k_partitions == 4)
+    {
+        DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(4);
+    }
+    else
+    {
+        DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART(0);
+    }
+
+    #undef DISPATCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART
+    #undef LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_KPART
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] partial gate/up launch failed: %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+
+    constexpr int QUANT_THREADS = 64;
+    const int swiglu_blocks_per_row = N / 32;
+    const dim3 quant_grid((swiglu_blocks_per_row + 1) / 2, num_active);
+    const dim3 quant_block(QUANT_THREADS);
+
+    #define LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(KPARTS_TAG)                              \
+        hipLaunchKernelGGL(                                                                      \
+            HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel<KPARTS_TAG>), \
+            quant_grid, quant_block, 0, hip_stream,                                              \
+            d_gate_partials, d_up_partials, d_swiglu_int8, d_swiglu_scales,                     \
+            num_active, N)
+
+    switch (k_partitions)
+    {
+    case 2:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(2);  break;
+    case 4:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(4);  break;
+    case 8:  LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(8);  break;
+    case 16: LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE(16); break;
+    default:
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] unsupported reduce K-partitions=%d\n",
+                k_partitions);
+        return false;
+    }
+
+    #undef LAUNCH_GROUPED_GATE_UP_SWIGLU_QUANT_REDUCE
+
+    err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "[rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart] reduce/quant launch failed: %s\n",
                 hipGetErrorString(err));
         return false;
     }
@@ -3853,6 +4082,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
     const float* d_weights,
     int8_t* d_swiglu_int8,
     float* d_swiglu_scales,
+    bool swiglu_prequantized,
     float* d_output,
     int num_active,
     int N,
@@ -3863,7 +4093,8 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
-    if (!d_gate_ptrs || !d_up_ptrs || !d_desc_table || !d_expert_ids || !d_weights ||
+    if ((!swiglu_prequantized && (!d_gate_ptrs || !d_up_ptrs)) ||
+        !d_desc_table || !d_expert_ids || !d_weights ||
         !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
         num_active <= 0 || N <= 0 || K <= 0 || (K % 32) != 0)
     {
@@ -3873,18 +4104,22 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     (void)hipGetLastError();
-    constexpr int QUANT_THREADS = 256;
-    hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
-        dim3(num_active), dim3(QUANT_THREADS), 0, hip_stream,
-        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
-        num_active, K);
-
-    hipError_t err = hipGetLastError();
-    if (err != hipSuccess)
+    hipError_t err = hipSuccess;
+    if (!swiglu_prequantized)
     {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] quantize launch failed: %s\n",
-                hipGetErrorString(err));
-        return false;
+        constexpr int QUANT_THREADS = 256;
+        hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
+            dim3(num_active), dim3(QUANT_THREADS), 0, hip_stream,
+            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
+            num_active, K);
+
+        err = hipGetLastError();
+        if (err != hipSuccess)
+        {
+            fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel] quantize launch failed: %s\n",
+                    hipGetErrorString(err));
+            return false;
+        }
     }
 
     err = hipMemsetAsync(d_output, 0, static_cast<size_t>(N) * sizeof(float), hip_stream);

@@ -147,6 +147,126 @@ namespace
                (candidate_value == best_value && candidate_id < best_id);
     }
 
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx906__)
+#define LLAMINAR_ROCM_MOE_GFX906_DPP 1
+#endif
+
+#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
+#define LLAMINAR_ROCM_MOE_DPP_F32(name, barrier, dpp_ctrl, vop_instr)       \
+    __device__ __forceinline__ float name(float x)                          \
+    {                                                                       \
+        float r;                                                            \
+        asm volatile(                                                       \
+            barrier                                                         \
+            vop_instr " %0, %1, %1 " dpp_ctrl " row_mask:0xf bank_mask:0xf" \
+            : "=v"(r)                                                       \
+            : "v"(x)                                                        \
+            : "memory");                                                    \
+        return r;                                                           \
+    }
+
+    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_add_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_add_f32_dpp")
+    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_add_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_add_f32_dpp")
+    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_add_xor8_f32, "s_nop 1\n", "row_ror:8", "v_add_f32_dpp")
+    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_max_xor1_f32, "s_nop 4\n", "quad_perm:[1,0,3,2]", "v_max_f32_dpp")
+    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_max_xor2_f32, "s_nop 1\n", "quad_perm:[2,3,0,1]", "v_max_f32_dpp")
+    LLAMINAR_ROCM_MOE_DPP_F32(rocm_moe_dpp_max_xor8_f32, "s_nop 1\n", "row_ror:8", "v_max_f32_dpp")
+
+#undef LLAMINAR_ROCM_MOE_DPP_F32
+
+    template <int off>
+    __device__ __forceinline__ int rocm_moe_dpp_xfer_xor_i32(int x)
+    {
+        int d;
+        if constexpr (off == 1)
+        {
+            asm volatile("s_nop 4\n"
+                         "v_mov_b32_dpp %0, %1 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf"
+                         : "=v"(d)
+                         : "v"(x)
+                         : "memory");
+        }
+        else if constexpr (off == 2)
+        {
+            asm volatile("s_nop 4\n"
+                         "v_mov_b32_dpp %0, %1 quad_perm:[2,3,0,1] row_mask:0xf bank_mask:0xf"
+                         : "=v"(d)
+                         : "v"(x)
+                         : "memory");
+        }
+        else if constexpr (off == 4)
+        {
+            asm volatile("v_mov_b32 %0, %1\n"
+                         "s_nop 1\n"
+                         "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
+                         "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
+                         : "=v"(d)
+                         : "v"(x)
+                         : "memory");
+        }
+        else if constexpr (off == 8)
+        {
+            asm volatile("s_nop 4\n"
+                         "v_mov_b32_dpp %0, %1 row_ror:8 row_mask:0xf bank_mask:0xf"
+                         : "=v"(d)
+                         : "v"(x)
+                         : "memory");
+        }
+        else
+        {
+            static_assert(off == 16, "unsupported xor offset");
+            asm volatile("ds_swizzle_b32 %0, %1 offset:swizzle(SWAP,16)\n"
+                         "s_waitcnt lgkmcnt(0)\n"
+                         : "=v"(d)
+                         : "v"(x)
+                         : "memory");
+        }
+        return d;
+    }
+
+    __device__ __forceinline__ float rocm_moe_dpp_xfer_xor4_f32(float x)
+    {
+        return __int_as_float(rocm_moe_dpp_xfer_xor_i32<4>(__float_as_int(x)));
+    }
+
+    __device__ __forceinline__ float rocm_moe_dpp_xfer_xor16_f32(float x)
+    {
+        return __int_as_float(rocm_moe_dpp_xfer_xor_i32<16>(__float_as_int(x)));
+    }
+#endif
+
+    __device__ __forceinline__ float rocm_moe_wave_reduce_sum_f32(float x)
+    {
+#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
+        x = rocm_moe_dpp_add_xor1_f32(x);
+        x = rocm_moe_dpp_add_xor2_f32(x);
+        x += rocm_moe_dpp_xfer_xor4_f32(x);
+        x = rocm_moe_dpp_add_xor8_f32(x);
+        x += rocm_moe_dpp_xfer_xor16_f32(x);
+        x += __shfl_xor(x, 32);
+#else
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            x += __shfl_down(x, offset);
+#endif
+        return x;
+    }
+
+    __device__ __forceinline__ float rocm_moe_wave_reduce_max_f32(float x)
+    {
+#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
+        x = rocm_moe_dpp_max_xor1_f32(x);
+        x = rocm_moe_dpp_max_xor2_f32(x);
+        x = fmaxf(x, rocm_moe_dpp_xfer_xor4_f32(x));
+        x = rocm_moe_dpp_max_xor8_f32(x);
+        x = fmaxf(x, rocm_moe_dpp_xfer_xor16_f32(x));
+        x = fmaxf(x, __shfl_xor(x, 32));
+#else
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            x = fmaxf(x, __shfl_down(x, offset));
+#endif
+        return x;
+    }
+
     __device__ void moe_select_topk_probabilities_block(
         float *__restrict__ expert_probs,
         int num_experts,
@@ -261,8 +381,7 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
         }
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -274,8 +393,7 @@ __global__ void rocm_moe_gate_logits_single_token_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) logits[expert] = sum;
     }
 }
@@ -341,8 +459,7 @@ __global__ void rocm_moe_gate_logits_small_m_kernel(
             sum += hidden_shared[i] * w[i];
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     if (lane == 0)
         logits[static_cast<size_t>(row) * num_experts + expert] = sum;
@@ -380,8 +497,7 @@ __global__ void rocm_moe_gate_logits_small_m_mixed_weights_kernel(
     for (int i = lane; i < d_model; i += warpSize)
         sum += hidden_shared[i] * route_weight_to_float(w[i]);
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     if (lane == 0)
         logits[static_cast<size_t>(row) * num_experts + expert] = sum;
@@ -431,8 +547,7 @@ __global__ void rocm_moe_gate_logits_single_token_kpart_kernel(
         }
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -444,8 +559,7 @@ __global__ void rocm_moe_gate_logits_single_token_kpart_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) partials[expert * k_partitions + partition] = sum;
     }
 }
@@ -465,8 +579,7 @@ __global__ void rocm_moe_gate_logits_kpart_reduce_kernel(
         sum += expert_partials[partition];
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -478,8 +591,7 @@ __global__ void rocm_moe_gate_logits_kpart_reduce_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) logits[expert] = sum;
     }
 }
@@ -589,8 +701,7 @@ __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
         sum += static_cast<float>(block_acc) * hidden_scales[block_idx] * gate_scales[scale_idx];
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -602,8 +713,7 @@ __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) logits[expert] = sum;
     }
 }
@@ -639,8 +749,7 @@ __global__ void rocm_moe_gate_logits_single_token_fp16_weights_kernel(
         }
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -652,8 +761,7 @@ __global__ void rocm_moe_gate_logits_single_token_fp16_weights_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) logits[expert] = sum;
     }
 }
@@ -675,8 +783,7 @@ __global__ void rocm_moe_gate_logits_single_token_bf16_weights_kernel(
         sum += hidden[i] * static_cast<float>(w[i]);
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -688,8 +795,7 @@ __global__ void rocm_moe_gate_logits_single_token_bf16_weights_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) logits[expert] = sum;
     }
 }
@@ -762,8 +868,7 @@ __global__ void rocm_moe_gate_logits_single_token_grouped_kernel(
         }
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     if (lane == 0)
         logits[expert] = sum;
@@ -829,10 +934,7 @@ __global__ void rocm_moe_softmax_topk_kernel(
         local_max = fmaxf(local_max, row[e]);
     }
     // Warp reduction for max
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
-    }
+    local_max = rocm_moe_wave_reduce_max_f32(local_max);
 
     __shared__ float shared_max[8];
     const int lane = threadIdx.x % warpSize;
@@ -844,8 +946,7 @@ __global__ void rocm_moe_softmax_topk_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         local_max = (lane < nw) ? shared_max[lane] : -FLT_MAX;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            local_max = fmaxf(local_max, __shfl_down(local_max, offset));
+        local_max = rocm_moe_wave_reduce_max_f32(local_max);
         if (lane == 0) shared_max[0] = local_max;
     }
     __syncthreads();
@@ -860,8 +961,7 @@ __global__ void rocm_moe_softmax_topk_kernel(
         local_sum += val;
     }
     // Warp reduction for sum
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        local_sum += __shfl_down(local_sum, offset);
+    local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
 
     __shared__ float shared_sum[8];
     if (lane == 0) shared_sum[warp_id] = local_sum;
@@ -870,8 +970,7 @@ __global__ void rocm_moe_softmax_topk_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         local_sum = (lane < nw) ? shared_sum[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            local_sum += __shfl_down(local_sum, offset);
+        local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
         if (lane == 0) shared_sum[0] = local_sum;
     }
     __syncthreads();
@@ -988,10 +1087,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
     {
         local_max = fmaxf(local_max, logits[expert]);
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
-    }
+    local_max = rocm_moe_wave_reduce_max_f32(local_max);
 
     __shared__ float shared_max[8];
     const int lane = threadIdx.x % warpSize;
@@ -1003,10 +1099,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         local_max = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        {
-            local_max = fmaxf(local_max, __shfl_down(local_max, offset));
-        }
+        local_max = rocm_moe_wave_reduce_max_f32(local_max);
         if (lane == 0) shared_max[0] = local_max;
     }
     __syncthreads();
@@ -1019,10 +1112,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
         logits[expert] = value;
         local_sum += value;
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        local_sum += __shfl_down(local_sum, offset);
-    }
+    local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
 
     __shared__ float shared_sum[8];
     if (lane == 0) shared_sum[warp_id] = local_sum;
@@ -1031,10 +1121,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         local_sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        {
-            local_sum += __shfl_down(local_sum, offset);
-        }
+        local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
         if (lane == 0) shared_sum[0] = local_sum;
     }
     __syncthreads();
@@ -1160,10 +1247,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     {
         max_val = fmaxf(max_val, logits[expert]);
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        max_val = fmaxf(max_val, __shfl_down(max_val, offset));
-    }
+    max_val = rocm_moe_wave_reduce_max_f32(max_val);
     if (lane == 0) shared_max[warp_id] = max_val;
     __syncthreads();
 
@@ -1171,10 +1255,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         max_val = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        {
-            max_val = fmaxf(max_val, __shfl_down(max_val, offset));
-        }
+        max_val = rocm_moe_wave_reduce_max_f32(max_val);
         if (lane == 0) shared_max[0] = max_val;
     }
     __syncthreads();
@@ -1187,10 +1268,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
         expert_probs[expert] = value;
         sum += value;
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        sum += __shfl_down(sum, offset);
-    }
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
     if (lane == 0) shared_sum[warp_id] = sum;
     __syncthreads();
 
@@ -1198,10 +1276,7 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        {
-            sum += __shfl_down(sum, offset);
-        }
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0) shared_sum[0] = sum;
     }
     __syncthreads();
@@ -1299,10 +1374,7 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
 
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        local_max = fmaxf(local_max, __shfl_down(local_max, offset));
-    }
+    local_max = rocm_moe_wave_reduce_max_f32(local_max);
 
     __shared__ float shared_max[8];
     if (lane == 0) shared_max[warp_id] = local_max;
@@ -1312,10 +1384,7 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         local_max = (lane < num_warps) ? shared_max[lane] : -FLT_MAX;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        {
-            local_max = fmaxf(local_max, __shfl_down(local_max, offset));
-        }
+        local_max = rocm_moe_wave_reduce_max_f32(local_max);
         if (lane == 0) shared_max[0] = local_max;
     }
     __syncthreads();
@@ -1328,10 +1397,7 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
         expert_probs[expert] = value;
         local_sum += value;
     }
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-    {
-        local_sum += __shfl_down(local_sum, offset);
-    }
+    local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
 
     __shared__ float shared_sum[8];
     if (lane == 0) shared_sum[warp_id] = local_sum;
@@ -1340,10 +1406,7 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         local_sum = (lane < num_warps) ? shared_sum[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        {
-            local_sum += __shfl_down(local_sum, offset);
-        }
+        local_sum = rocm_moe_wave_reduce_sum_f32(local_sum);
         if (lane == 0) shared_sum[0] = local_sum;
     }
     __syncthreads();
@@ -1606,9 +1669,8 @@ __global__ void rocm_moe_shared_expert_gate_dot_kernel(
         sum += x[i] * gate_inp[i];
     }
 
-    // Warp reduction
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    // Wave reduction
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[8];
     const int lane = threadIdx.x % warpSize;
@@ -1620,8 +1682,7 @@ __global__ void rocm_moe_shared_expert_gate_dot_kernel(
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
         sum = (lane < nw) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            sum += __shfl_down(sum, offset);
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
         if (lane == 0)
         {
             // Apply sigmoid
@@ -1668,13 +1729,27 @@ __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
     int d_model)
 {
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    if ((d_model & 3) == 0)
     {
-        sum += input[i] * gate_inp[i];
+        const int d4 = d_model >> 2;
+        const float4 *__restrict__ input4 = reinterpret_cast<const float4 *>(input);
+        const float4 *__restrict__ gate4 = reinterpret_cast<const float4 *>(gate_inp);
+        for (int i = threadIdx.x; i < d4; i += blockDim.x)
+        {
+            const float4 x = input4[i];
+            const float4 g = gate4[i];
+            sum += x.x * g.x + x.y * g.y + x.z * g.z + x.w * g.w;
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            sum += input[i] * gate_inp[i];
+        }
     }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[16];
     const int lane = threadIdx.x % warpSize;
@@ -1686,17 +1761,29 @@ __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         float block_sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            block_sum += __shfl_down(block_sum, offset);
+        block_sum = rocm_moe_wave_reduce_sum_f32(block_sum);
         if (lane == 0)
             warp_sums[0] = 1.0f / (1.0f + expf(-block_sum));
     }
     __syncthreads();
 
     const float gate = warp_sums[0];
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    if ((d_model & 3) == 0)
     {
-        shared_output[i] *= gate;
+        const int d4 = d_model >> 2;
+        float4 *__restrict__ shared4 = reinterpret_cast<float4 *>(shared_output);
+        for (int i = threadIdx.x; i < d4; i += blockDim.x)
+        {
+            const float4 s = shared4[i];
+            shared4[i] = make_float4(gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            shared_output[i] *= gate;
+        }
     }
 }
 
@@ -1717,21 +1804,52 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
         rocm_moe_clamp_effective_seq_len(seq_len, device_effective_seq_len);
     if (token >= effective_seq_len)
     {
-        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        if ((d_model & 3) == 0)
         {
-            shared_output[row_offset + i] = 0.0f;
-            combined_output[row_offset + i] = 0.0f;
+            const int d4 = d_model >> 2;
+            float4 *__restrict__ shared4 =
+                reinterpret_cast<float4 *>(shared_output + row_offset);
+            float4 *__restrict__ combined4 =
+                reinterpret_cast<float4 *>(combined_output + row_offset);
+            const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            for (int i = threadIdx.x; i < d4; i += blockDim.x)
+            {
+                shared4[i] = zero;
+                combined4[i] = zero;
+            }
+        }
+        else
+        {
+            for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            {
+                shared_output[row_offset + i] = 0.0f;
+                combined_output[row_offset + i] = 0.0f;
+            }
         }
         return;
     }
     const float *x = input + row_offset;
 
     float sum = 0.0f;
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-        sum += x[i] * gate_inp[i];
+    if ((d_model & 3) == 0)
+    {
+        const int d4 = d_model >> 2;
+        const float4 *__restrict__ x4 = reinterpret_cast<const float4 *>(x);
+        const float4 *__restrict__ gate4 = reinterpret_cast<const float4 *>(gate_inp);
+        for (int i = threadIdx.x; i < d4; i += blockDim.x)
+        {
+            const float4 xv = x4[i];
+            const float4 gv = gate4[i];
+            sum += xv.x * gv.x + xv.y * gv.y + xv.z * gv.z + xv.w * gv.w;
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            sum += x[i] * gate_inp[i];
+    }
 
-    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-        sum += __shfl_down(sum, offset);
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
 
     __shared__ float warp_sums[16];
     const int lane = threadIdx.x % warpSize;
@@ -1743,19 +1861,41 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
     {
         const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
         float block_sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
-        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
-            block_sum += __shfl_down(block_sum, offset);
+        block_sum = rocm_moe_wave_reduce_sum_f32(block_sum);
         if (lane == 0)
             warp_sums[0] = 1.0f / (1.0f + expf(-block_sum));
     }
     __syncthreads();
 
     const float gate = warp_sums[0];
-    for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+    if ((d_model & 3) == 0)
     {
-        const float gated_shared = gate * shared_output[row_offset + i];
-        shared_output[row_offset + i] = gated_shared;
-        combined_output[row_offset + i] = routed_residual[row_offset + i] + gated_shared;
+        const int d4 = d_model >> 2;
+        float4 *__restrict__ shared4 =
+            reinterpret_cast<float4 *>(shared_output + row_offset);
+        const float4 *__restrict__ routed4 =
+            reinterpret_cast<const float4 *>(routed_residual + row_offset);
+        float4 *__restrict__ combined4 =
+            reinterpret_cast<float4 *>(combined_output + row_offset);
+        for (int i = threadIdx.x; i < d4; i += blockDim.x)
+        {
+            const float4 s = shared4[i];
+            const float4 r = routed4[i];
+            const float4 gated = make_float4(
+                gate * s.x, gate * s.y, gate * s.z, gate * s.w);
+            shared4[i] = gated;
+            combined4[i] = make_float4(
+                r.x + gated.x, r.y + gated.y, r.z + gated.z, r.w + gated.w);
+        }
+    }
+    else
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        {
+            const float gated_shared = gate * shared_output[row_offset + i];
+            shared_output[row_offset + i] = gated_shared;
+            combined_output[row_offset + i] = routed_residual[row_offset + i] + gated_shared;
+        }
     }
 }
 
