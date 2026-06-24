@@ -130,10 +130,6 @@ if ! command -v jq &>/dev/null; then
     echo -e "${RED}Error: jq is required but not installed. Install with: apt install jq${NC}" >&2
     exit 1
 fi
-if ! command -v bc &>/dev/null; then
-    echo -e "${RED}Error: bc is required but not installed. Install with: apt install bc${NC}" >&2
-    exit 1
-fi
 
 if [[ ! -f "$BASELINE_FILE" ]]; then
     echo -e "${RED}Error: Baseline file not found: $BASELINE_FILE${NC}" >&2
@@ -257,7 +253,23 @@ baseline_metric() {
 
 metric_delta_pct() {
     local baseline="$1" current="$2"
-    echo "scale=4; ($current - $baseline) / $baseline * 100" | bc -l
+    awk -v baseline="$baseline" -v current="$current" \
+        'BEGIN { printf "%.4f", (current - baseline) / baseline * 100.0 }'
+}
+
+float_lt() {
+    local lhs="$1" rhs="$2"
+    awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN { exit(lhs < rhs ? 0 : 1) }'
+}
+
+float_gt() {
+    local lhs="$1" rhs="$2"
+    awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN { exit(lhs > rhs ? 0 : 1) }'
+}
+
+float_ge() {
+    local lhs="$1" rhs="$2"
+    awk -v lhs="$lhs" -v rhs="$rhs" 'BEGIN { exit(lhs >= rhs ? 0 : 1) }'
 }
 
 is_borderline_regression() {
@@ -268,8 +280,9 @@ is_borderline_regression() {
 
     local delta lower_bound
     delta=$(metric_delta_pct "$baseline" "$current")
-    lower_bound=$(echo "-(${threshold} + ${RECHECK_MARGIN_PCT})" | bc -l)
-    if (( $(echo "$delta < -${threshold} && $delta >= $lower_bound" | bc -l) )); then
+    lower_bound=$(awk -v threshold="$threshold" -v margin="$RECHECK_MARGIN_PCT" \
+        'BEGIN { printf "%.4f", -(threshold + margin) }')
+    if float_lt "$delta" "-${threshold}" && float_ge "$delta" "$lower_bound"; then
         return 0
     fi
     return 1
@@ -502,10 +515,10 @@ for (( mi=0; mi<NUM_MODELS; mi++ )); do
             continue
         fi
 
-        if (( $(echo "$PREFILL > ${RESULTS_PREFILL[$KEY]}" | bc -l) )); then
+        if float_gt "$PREFILL" "${RESULTS_PREFILL[$KEY]}"; then
             RESULTS_PREFILL[$KEY]=$PREFILL
         fi
-        if (( $(echo "$DECODE > ${RESULTS_DECODE[$KEY]}" | bc -l) )); then
+        if float_gt "$DECODE" "${RESULTS_DECODE[$KEY]}"; then
             RESULTS_DECODE[$KEY]=$DECODE
         fi
 
@@ -678,13 +691,13 @@ check_regression() {
     delta=$(printf "%.1f" "$delta")
 
     local status="${GREEN}✓ OK${NC}"
-    if (( $(echo "$delta < -${effective_threshold}" | bc -l) )); then
+    if float_lt "$delta" "-${effective_threshold}"; then
         status="${RED}✗ REGRESSED${NC}"
         OVERALL_PASS=false
         FAILED_CHECKS+="  [${model_name}] $(display_device "$device") ${phase}: ${baseline} → ${current} tok/s (${delta}%, threshold ${effective_threshold}%)\n"
-    elif (( $(echo "$delta < 0" | bc -l) )); then
+    elif float_lt "$delta" "0"; then
         status="${YELLOW}~ slower${NC}"
-    elif (( $(echo "$delta > 0" | bc -l) )); then
+    elif float_gt "$delta" "0"; then
         status="${GREEN}▲ faster${NC}"
     fi
 
