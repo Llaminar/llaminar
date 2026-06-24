@@ -302,6 +302,26 @@ jobs:
             --port "${{ matrix.port }}" \
             --log-dir "/tmp/llaminar-e2e-${{ matrix.e2e_variant }}-${{ matrix.cpu_isa }}-container"
 
+      - name: Benchmark full runtime image
+        if: matrix.variant == 'full'
+        env:
+          LLAMINAR_BENCHMARK_RESULTS_DIR: ${{ github.workspace }}/benchmark-results-${{ matrix.cpu_isa }}
+        run: |
+          .githooks/run_benchmark_check.sh \
+            --container-image "${{ steps.runtime-tags.outputs.primary_ref }}" \
+            --cpu-isa "${{ matrix.cpu_isa }}" \
+            --host-models-dir "${MODELS_DIR}" \
+            --container-models-dir "${MODELS_DIR}"
+
+      - name: Upload benchmark results
+        if: matrix.variant == 'full'
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-${{ matrix.cpu_isa }}
+          path: ${{ github.workspace }}/benchmark-results-${{ matrix.cpu_isa }}/
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Push tested SHA image
         if: github.event_name != 'pull_request'
         run: docker push "${{ steps.runtime-tags.outputs.primary_ref }}"
@@ -391,6 +411,74 @@ jobs:
       - name: Bound Docker build cache
         if: always()
         run: bash scripts/ci/prune_docker_build_cache.sh
+
+  benchmark-results:
+    name: Merge benchmark results
+    needs: [runtime-containers, publish-runtime-aliases]
+    if: >-
+      always() &&
+      needs.runtime-containers.result == 'success' &&
+      (github.event_name == 'pull_request' ||
+       needs.publish-runtime-aliases.result == 'success' ||
+       needs.publish-runtime-aliases.result == 'skipped')
+    runs-on: [llaminar-bench]
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Prepare branch for result commit
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: git checkout -B "${GITHUB_REF_NAME}" "${GITHUB_SHA}"
+
+      - name: Resolve benchmark result path
+        id: benchmark-path
+        run: |
+          short_sha="${GITHUB_SHA::8}"
+          echo "short_sha=${short_sha}" >> "$GITHUB_OUTPUT"
+          echo "dir=benchmark_results/${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Download benchmark artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: benchmark-results-*
+          path: benchmark-artifacts
+
+      - name: Merge ISA benchmark artifacts
+        run: |
+          set -euo pipefail
+          python3 scripts/ci/merge_benchmark_results.py \
+            --input benchmark-artifacts \
+            --output-dir "${{ steps.benchmark-path.outputs.dir }}" \
+            --commit "${{ steps.benchmark-path.outputs.short_sha }}"
+
+      - name: Summarize benchmark results
+        run: python3 scripts/ci/summarize_perf_results.py --results-root benchmark_results
+
+      - name: Upload merged benchmark results
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-results-merged
+          path: ${{ steps.benchmark-path.outputs.dir }}/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Commit benchmark results
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${{ steps.benchmark-path.outputs.dir }}/benchmark_results.json" \
+                  "${{ steps.benchmark-path.outputs.dir }}/benchmark_results.csv"
+          if git diff --cached --quiet; then
+            echo "No benchmark result changes to commit."
+            exit 0
+          fi
+          git commit -m "ci: add benchmark results for ${{ steps.benchmark-path.outputs.short_sha }} [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
 
   runtime-image-refs:
     name: Runtime image refs

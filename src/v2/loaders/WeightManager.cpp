@@ -120,6 +120,42 @@ namespace llaminar2
             return unpackable && unpackable->vnniFormatInfo() != nullptr;
         }
 
+        bool endsWith(const std::string &value, const std::string &suffix)
+        {
+            return value.size() >= suffix.size() &&
+                   value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+        }
+
+        bool isGdnTinySsmProjectionOverride(
+            const std::string &name,
+            const TensorBase *tensor)
+        {
+            if (!tensor)
+                return false;
+            if (tensor->native_type() != TensorType::Q8_0 || tensor->shape().size() != 2)
+                return false;
+            return endsWith(name, "ssm_alpha.weight") ||
+                   endsWith(name, "ssm_beta.weight");
+        }
+
+        std::shared_ptr<TensorBase> createGdnTinySsmProjectionFp32Override(
+            const std::string &name,
+            const TensorBase *source,
+            DeviceId target_device)
+        {
+            if (!isGdnTinySsmProjectionOverride(name, source))
+                return nullptr;
+
+            auto fp32 = std::make_shared<FP32Tensor>(source->shape(), DeviceId::cpu());
+            source->to_fp32(fp32->mutable_data());
+            fp32->setDebugName(name + "@fp32-ssm-projection");
+            LOG_DEBUG("[WeightManager] Dequantized " << name
+                                                      << " from Q8_0 to FP32 for "
+                                                      << target_device.to_string()
+                                                      << " GDN projection path");
+            return fp32;
+        }
+
     }
 
     const char *WeightManager::weightPrepStateName(WeightPrepState state)
@@ -1642,6 +1678,16 @@ namespace llaminar2
                 requirement.slice.expert_count != 0)
             {
                 binding.slice = requirement.slice;
+            }
+
+            if (auto fp32_override = createGdnTinySsmProjectionFp32Override(
+                    requirement.canonical_name,
+                    tensor.get(),
+                    requirement.target_device))
+            {
+                tensor = fp32_override;
+                binding.tensor_owner = fp32_override;
+                binding.tensor = fp32_override.get();
             }
 
             if (binding.slice.source_rows == 0 && tensor)
@@ -4399,6 +4445,31 @@ namespace llaminar2
             }
         }
 
+        for (auto &dense_job : gemm_weights)
+        {
+            auto fp32_override = createGdnTinySsmProjectionFp32Override(
+                dense_job.name,
+                dense_job.tensor,
+                target_device);
+            if (!fp32_override)
+                continue;
+
+            dense_job.owner = fp32_override;
+            dense_job.tensor = fp32_override.get();
+            if (dense_job.binding.has_value())
+            {
+                dense_job.binding->tensor_owner = fp32_override;
+                dense_job.binding->tensor = fp32_override.get();
+                if (dense_job.binding->slice.source_rows == 0 &&
+                    dense_job.binding->slice.source_cols == 0 &&
+                    dense_job.binding->slice.row_count == 0 &&
+                    dense_job.binding->slice.col_count == 0)
+                {
+                    dense_job.binding->slice = fullSliceSpec(*fp32_override);
+                }
+            }
+        }
+
         if (frozen_weights)
         {
             std::vector<DenseGemmJob> pending_gemm_weights;
@@ -4906,6 +4977,8 @@ namespace llaminar2
                 binding.identity = makeSourceWeightIdentity(name, {}, binding.binding_id);
             }
             binding.tensor = tensor;
+            if (dense_job.owner)
+                binding.tensor_owner = dense_job.owner;
             if (binding.slice.source_rows == 0 && binding.slice.source_cols == 0 &&
                 binding.slice.row_count == 0 && binding.slice.col_count == 0)
             {

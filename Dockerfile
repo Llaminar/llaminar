@@ -366,6 +366,7 @@ FROM ubuntu:24.04 AS runtime
 ARG BUILD_DATE
 ARG VCS_REF
 ARG VERSION=dev
+ARG LLAMINAR_CPU_ISA=AVX512
 ARG LLAMINAR_ENABLE_CUDA=ON
 ARG LLAMINAR_ENABLE_ROCM=ON
 ARG ROCM_RUNTIME_GPU_TARGETS
@@ -376,11 +377,13 @@ LABEL org.opencontainers.image.title="Llaminar" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
-      org.opencontainers.image.created="${BUILD_DATE}"
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}"
 
 ENV DEBIAN_FRONTEND=noninteractive \
     OMPI_ALLOW_RUN_AS_ROOT=1 \
     OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1 \
+    LLAMINAR_CPU_ISA=${LLAMINAR_CPU_ISA} \
     LLAMINAR_ENABLE_CUDA=${LLAMINAR_ENABLE_CUDA} \
     LLAMINAR_ENABLE_ROCM=${LLAMINAR_ENABLE_ROCM} \
     CUDA_HOME=/usr/local/cuda \

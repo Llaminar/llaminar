@@ -4,8 +4,8 @@ Render benchmark JSON files as Markdown tables for the GitHub Actions summary.
 
 Looks for benchmark_results.json files under --results-root (which contains
 <git-hash>/benchmark_results.json subdirs). Picks the most recent run and
-renders one table per model: device | prefill (tok/s) | decode (tok/s) |
-prefill Δ vs baseline | decode Δ vs baseline.
+renders one table per model: device | CPU ISA | prefill (tok/s) |
+decode (tok/s) | prefill Δ vs baseline | decode Δ vs baseline.
 """
 from __future__ import annotations
 
@@ -38,15 +38,39 @@ def fmt_delta(cur, base) -> str:
     return f"{arrow} {delta_pct:+.1f}%"
 
 
+def fmt_text(v) -> str:
+    if v is None or v == "":
+        return "—"
+    return str(v)
+
+
+def render_runs(data: dict) -> list[str]:
+    runs = data.get("runs")
+    if not isinstance(runs, list) or not runs:
+        return []
+
+    out = ["_Benchmark runs:_"]
+    for run in runs:
+        source = fmt_text(run.get("source"))
+        cpu_isa = fmt_text(run.get("cpu_isa") or run.get("container_cpu_isa"))
+        image = run.get("image")
+        image_part = f" · `{image}`" if image else ""
+        out.append(f"- `{source}` · CPU ISA `{cpu_isa}`{image_part}")
+    out.append("")
+    return out
+
+
 def render_table(model: dict) -> list[str]:
     out = [f"### {model.get('name', '?')}", ""]
     out.append(f"_Model file: `{model.get('model', '?')}`_")
     out.append("")
-    out.append("| Device | Prefill (tok/s) | Decode (tok/s) | Prefill Δ | Decode Δ |")
-    out.append("|--------|----------------:|---------------:|----------:|---------:|")
+    out.append("| Device | CPU ISA | Prefill (tok/s) | Decode (tok/s) | Prefill Δ | Decode Δ |")
+    out.append("|--------|---------|----------------:|---------------:|----------:|---------:|")
     for d in model.get("devices", []):
+        cpu_isa = d.get("cpu_isa")
         out.append(
             f"| `{d.get('device', '?')}` "
+            f"| {fmt_text(cpu_isa)} "
             f"| {fmt_tok(d.get('prefill_tok_s'))} "
             f"| {fmt_tok(d.get('decode_tok_s'))} "
             f"| {fmt_delta(d.get('prefill_tok_s'), d.get('baseline_prefill_tok_s'))} "
@@ -104,6 +128,7 @@ def main() -> int:
         f"_Commit: `{data.get('commit', '?')}` · {data.get('timestamp', '')}_",
         "",
     ]
+    out.extend(render_runs(data))
     for model in data.get("models", []):
         out.extend(render_table(model))
 

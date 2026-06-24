@@ -1,0 +1,6 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+Qwen36Dense_27B_CUDA_KV_FP16,0,0.999943,0.000238877,1,1,271,271,true,true,true,true
+Qwen36Dense_27B_CUDA_KV_FP16,1,0.999948,0.000242844,1,1,248068,248068,true,true,true,true
+Qwen36Dense_27B_CUDA_KV_FP16,2,0.99828,2.03237e-05,1,0.8,198,198,true,true,true,true
+Qwen36Dense_27B_CUDA_KV_FP16,3,0.99902,2.35187e-05,1,1,8160,8160,true,true,true,true
+Qwen36Dense_27B_CUDA_KV_FP16,4,0.99945,1.09632e-07,1,0.8,579,579,true,true,true,true

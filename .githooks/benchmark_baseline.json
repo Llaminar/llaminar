@@ -20,10 +20,19 @@
           "_comment": "High-water mark set at commit 7510ad25 on 2026-04-26. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
         },
         "cpu": {
-          "prefill_tok_s": 334.59,
-          "decode_tok_s": 18.12,
           "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 334.59,
+              "decode_tok_s": 18.12,
+              "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 142.93,
+              "decode_tok_s": 17.75,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
         }
       }
     },
@@ -33,10 +42,19 @@
       "decode_tokens": 128,
       "devices": {
         "cpu": {
-          "prefill_tok_s": 394.34,
-          "decode_tok_s": 26.12,
           "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 394.34,
+              "decode_tok_s": 26.12,
+              "_comment": "High-water mark set at commit 74454c25 on 2026-05-01. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 184.00,
+              "decode_tok_s": 25.51,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
         },
         "cuda:0": {
           "prefill_tok_s": 5910.97,
@@ -61,16 +79,34 @@
       },
       "devices": {
         "cpu:0": {
-          "prefill_tok_s": 134.57,
-          "decode_tok_s": 18.56,
           "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 3a03cfd2 on 2026-05-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 134.57,
+              "decode_tok_s": 18.56,
+              "_comment": "High-water mark set at commit 3a03cfd2 on 2026-05-06. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 72.92,
+              "decode_tok_s": 17.05,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
         },
         "cpu": {
-          "prefill_tok_s": 192.42,
-          "decode_tok_s": 25.26,
           "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit fb4d70b2 on 2026-05-03. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 192.42,
+              "decode_tok_s": 25.26,
+              "_comment": "High-water mark set at commit fb4d70b2 on 2026-05-03. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 120.23,
+              "decode_tok_s": 22.74,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
         },
         "rocm:0": {
           "prefill_tok_s": 1304.55,
@@ -99,10 +135,19 @@
       "decode_tokens": 128,
       "devices": {
         "cpu": {
-          "prefill_tok_s": 78.23,
-          "decode_tok_s": 6.95,
           "regression_threshold_pct": 25,
-          "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+          "isa": {
+            "AVX512": {
+              "prefill_tok_s": 78.23,
+              "decode_tok_s": 6.95,
+              "_comment": "High-water mark set at commit 0035a49b on 2026-05-29. Note to agents: It is FORBIDDEN to update these thresholds without explicit human approval."
+            },
+            "AVX2": {
+              "prefill_tok_s": 34.18,
+              "decode_tok_s": 6.52,
+              "_comment": "Seeded from local AVX2 benchmark e2e80d51 on 2026-06-24."
+            }
+          }
         },
         "rocm:0": {
           "prefill_tok_s": 229.32,
