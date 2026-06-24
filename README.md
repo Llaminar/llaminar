@@ -1,5 +1,5 @@
 # 🚿 Llaminar
-An LLM inferencing engine in C++, with custom quantised kernels for CPU AVX512-VNNI, CUDA `sm86`, and ROCm `gfx906`.
+An LLM inferencing engine in C++, with custom quantised kernels for CPU AVX512-VNNI / AVX2, CUDA `sm86`, and ROCm `gfx906`.
 
 Llaminar tries to solve a variety of problems encountered in other projects:
 
@@ -14,7 +14,7 @@ Llaminar is **experimental** and very much in an **alpha** stage of development.
 
 Llaminar supports:
 
-* CPU inferencing (AVX512-VNNI is **required**, AVX2 coming soon)
+* CPU inferencing (AVX512-VNNI and AVX2 runtime images)
 * CUDA inferencing (RTX-3090 / `sm86` initial support for now)
 * ROCm inferencing (`gfx906` only for now)
 * All of the above simultaneously
@@ -38,7 +38,7 @@ https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/e126900d/ben
 
 ### Building Llaminar
 
-Llaminar uses a predefined devcontainer and the recommended development environment is vscode on a Linux machine with AVX512-VNNI, and access to gfx906 / sm86 hardware.
+Llaminar uses a predefined devcontainer and the recommended development environment is vscode on a Linux machine with AVX512-VNNI or AVX2, and access to gfx906 / sm86 hardware.
 
 Open vscode in the devcontainer, and run the Build Integration / Build Release vscode tasks with `CTRL + Shift + P`.
 
@@ -51,10 +51,20 @@ export MODEL_DIR=/opt/llaminar-models
 export MODEL_DENSE="$MODEL_DIR/Qwen3.6-27B-Q4_K_S.gguf"
 export MODEL_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 export MODEL_PP_DENSE="$MODEL_DIR/Qwen3.5-27B-Q4_K_M.gguf"
-export LLAMINAR_CPU_IMAGE=ghcr.io/llaminar/llaminar:develop-cpu-latest
-export LLAMINAR_CUDA_IMAGE=ghcr.io/llaminar/llaminar:develop-cuda13.0-latest
-export LLAMINAR_ROCM_IMAGE=ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest
-export LLAMINAR_FULL_IMAGE=ghcr.io/llaminar/llaminar:develop-latest
+
+# Choose the runtime image ISA for this host.
+# AVX512 uses the current unsuffixed tags; AVX2 uses tags ending in -avx2.
+export LLAMINAR_CPU_ISA=AVX512  # or AVX2
+case "$LLAMINAR_CPU_ISA" in
+  AVX512) LLAMINAR_IMAGE_TAG_SUFFIX="" ;;
+  AVX2)   LLAMINAR_IMAGE_TAG_SUFFIX="-avx2" ;;
+  *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
+esac
+
+export LLAMINAR_CPU_IMAGE="ghcr.io/llaminar/llaminar:develop-cpu-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_CUDA_IMAGE="ghcr.io/llaminar/llaminar:develop-cuda13.0-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_ROCM_IMAGE="ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:develop-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
 # docker run pulls these public GHCR images automatically when needed.
 export AMD_KFD_GID="$(stat -c '%g' /dev/kfd 2>/dev/null || true)"
 export AMD_RENDER_GID="$(stat -c '%g' "$(find /dev/dri -maxdepth 1 -name 'renderD*' 2>/dev/null | head -n1)" 2>/dev/null || true)"
@@ -237,7 +247,8 @@ It does not ship kernel drivers.
 
 On the host you need:
 
-- AVX512-VNNI support (AVX2 support is coming soon)
+- An x86_64 CPU with AVX512-VNNI or AVX2. Use runtime image tags that match
+  the CPU ISA on the host.
 - Ubuntu 24.04 on x86_64.
 - Docker Engine with the Buildx plugin.
 - NVIDIA Linux driver `580.95.05` or newer for CUDA 13.0 Update 2.
@@ -345,10 +356,17 @@ ls -l /dev/kfd /dev/dri/render*
 5. Pull the public GHCR runtime images:
 
 ```bash
-export LLAMINAR_CPU_IMAGE=ghcr.io/llaminar/llaminar:develop-cpu-latest
-export LLAMINAR_CUDA_IMAGE=ghcr.io/llaminar/llaminar:develop-cuda13.0-latest
-export LLAMINAR_ROCM_IMAGE=ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest
-export LLAMINAR_FULL_IMAGE=ghcr.io/llaminar/llaminar:develop-latest
+export LLAMINAR_CPU_ISA=AVX512  # or AVX2
+case "$LLAMINAR_CPU_ISA" in
+  AVX512) LLAMINAR_IMAGE_TAG_SUFFIX="" ;;
+  AVX2)   LLAMINAR_IMAGE_TAG_SUFFIX="-avx2" ;;
+  *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
+esac
+
+export LLAMINAR_CPU_IMAGE="ghcr.io/llaminar/llaminar:develop-cpu-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_CUDA_IMAGE="ghcr.io/llaminar/llaminar:develop-cuda13.0-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_ROCM_IMAGE="ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:develop-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
 
 docker pull "$LLAMINAR_CPU_IMAGE"
 docker pull "$LLAMINAR_CUDA_IMAGE"
@@ -358,25 +376,27 @@ docker pull "$LLAMINAR_FULL_IMAGE"
 
 Docker also pulls these public images automatically on first `docker run`. Use
 the CPU, CUDA, or ROCm image when the target machine only needs one backend; use
-the full image for mixed CUDA+ROCm runs.
+the full image for mixed CUDA+ROCm runs. The unsuffixed aliases are AVX512
+builds; append `-avx2` for the AVX2 builds.
 
 To build images locally instead of pulling GHCR, use the release image build
 script:
 
 ```bash
-scripts/docker/build-runtime-image.sh --tag llaminar:local --cuda-archs "80;86;89;90"
+scripts/docker/build-runtime-image.sh --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:local --cuda-archs "80;86;89;90"
 ```
 
 Use the semicolon-separated CUDA architecture list for the NVIDIA GPUs in your
 local build. Common values are `80` for A100, `86` for RTX 30/A10, `89` for RTX
-40/L4/L40, and `90` for H100/H200.
+40/L4/L40, and `90` for H100/H200. `--cpu-isa AVX512` is the default; pass
+`--cpu-isa AVX2` for an AVX2-compatible local image.
 
 Backend-specific local builds are also available:
 
 ```bash
-scripts/docker/build-runtime-image.sh --variant cpu  --tag llaminar:cpu
-scripts/docker/build-runtime-image.sh --variant cuda --tag llaminar:cuda --cuda-archs "80;86;89;90"
-scripts/docker/build-runtime-image.sh --variant rocm --tag llaminar:rocm
+scripts/docker/build-runtime-image.sh --variant cpu  --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:cpu
+scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:cuda --cuda-archs "80;86;89;90"
+scripts/docker/build-runtime-image.sh --variant rocm --cpu-isa "$LLAMINAR_CPU_ISA" --tag llaminar:rocm
 ```
 
 6. Verify the Llaminar image can use both GPU ecosystems:
@@ -451,10 +471,17 @@ export MODEL_TP_MOE="$MODEL_DIR/Qwen3.6-35B-A3B-UD-IQ3_S.gguf"
 Use the public GHCR develop release aliases:
 
 ```bash
-export LLAMINAR_CPU_IMAGE=ghcr.io/llaminar/llaminar:develop-cpu-latest
-export LLAMINAR_CUDA_IMAGE=ghcr.io/llaminar/llaminar:develop-cuda13.0-latest
-export LLAMINAR_ROCM_IMAGE=ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest
-export LLAMINAR_FULL_IMAGE=ghcr.io/llaminar/llaminar:develop-latest
+export LLAMINAR_CPU_ISA=AVX512  # or AVX2
+case "$LLAMINAR_CPU_ISA" in
+  AVX512) LLAMINAR_IMAGE_TAG_SUFFIX="" ;;
+  AVX2)   LLAMINAR_IMAGE_TAG_SUFFIX="-avx2" ;;
+  *) echo "LLAMINAR_CPU_ISA must be AVX512 or AVX2" >&2; exit 1 ;;
+esac
+
+export LLAMINAR_CPU_IMAGE="ghcr.io/llaminar/llaminar:develop-cpu-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_CUDA_IMAGE="ghcr.io/llaminar/llaminar:develop-cuda13.0-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_ROCM_IMAGE="ghcr.io/llaminar/llaminar:develop-rocm7.1.1-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
+export LLAMINAR_FULL_IMAGE="ghcr.io/llaminar/llaminar:develop-latest${LLAMINAR_IMAGE_TAG_SUFFIX}"
 ```
 
 For local builds, override these variables with tags such as `llaminar:cpu`,
