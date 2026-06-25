@@ -269,6 +269,11 @@ namespace llaminar2
         sampler_ = Sampler();
     }
 
+    DeviceId GlobalOrchestratorRunner::primaryDeviceId() const
+    {
+        return global_orch_ ? global_orch_->primaryDeviceId() : DeviceId::cpu();
+    }
+
     // =========================================================================
     // Advanced
     // =========================================================================

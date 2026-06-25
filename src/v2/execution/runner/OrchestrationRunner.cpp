@@ -11913,6 +11913,11 @@ namespace llaminar2
         return snapshot;
     }
 
+    DeviceId OrchestrationRunner::primaryDeviceId() const
+    {
+        return runner_ ? runner_->primaryDeviceId() : DeviceId::cpu();
+    }
+
     // =========================================================================
     // Advanced
     // =========================================================================
@@ -11923,6 +11928,13 @@ namespace llaminar2
         {
             return nullptr;
         }
+        PerfStatsCollector::addCounter(
+            "sampling",
+            "host_logits_access",
+            1.0,
+            {},
+            runner_->primaryDeviceId().toString(),
+            {{"source", "orchestration_runner_last_logits"}});
         return runner_->logits();
     }
 

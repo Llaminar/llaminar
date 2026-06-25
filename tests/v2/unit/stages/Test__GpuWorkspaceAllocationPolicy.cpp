@@ -981,6 +981,31 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPSidecarRestampsDeferredTargetTokenFo
         << "Draft sample slots are still single-consumer for chained sidecars.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, GPUDecodeSamplingCannotFallbackToFullLogitsDownload)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto sampler_body = removeAsciiWhitespace(stripCommentsAndStringLiterals(sliceBetween(
+        source,
+        "GreedyLogitCandidate sampleGreedyCandidateFromTensor(",
+        "int coordinateGreedyCandidate(")));
+
+    const size_t gpu_guard = sampler_body.find("if(gpu_resident_logits)");
+    const size_t host_download =
+        sampler_body.find("TransferEngine::instance().download(tensor)");
+
+    ASSERT_NE(gpu_guard, std::string::npos)
+        << "GPU-resident logits must be guarded before host fallback sampling.";
+    ASSERT_NE(host_download, std::string::npos)
+        << "CPU sampling fallback may still download CPU/host-only tensors.";
+    EXPECT_LT(gpu_guard, host_download)
+        << "GPU logits sampling failures must return before full logits D2H fallback.";
+    EXPECT_NE(sampler_body.find("gpu_ptr_for_guard!=nullptr"),
+              std::string::npos)
+        << "The guard must trigger for tensors with a GPU pointer even if the "
+           "coherence device metadata is stale.";
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, DeferredSampleReadinessPreservesVerifierOwnedSlots)
 {
     const auto header =

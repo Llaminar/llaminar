@@ -572,6 +572,30 @@ public:
         return apply_penalties_to_all_position_row_ok_;
     }
 
+    void setSkipLogitsGatherDecode(bool skip) override
+    {
+        ++set_skip_decode_calls_;
+        skip_logits_gather_decode_ = skip;
+    }
+
+    void setSkipLogitsGatherPrefill(bool skip) override
+    {
+        ++set_skip_prefill_calls_;
+        skip_logits_gather_prefill_ = skip;
+    }
+
+    void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override
+    {
+        ++set_all_position_sync_deferral_calls_;
+        all_position_sync_deferral_enabled_ = enabled;
+    }
+
+    void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override
+    {
+        ++set_main_decode_sync_deferral_calls_;
+        main_decode_sync_deferral_enabled_ = enabled;
+    }
+
     bool verifyGreedyAllPositionBatchOutcomeOnDevice(
         const int32_t *draft_tokens,
         int draft_token_count,
@@ -1089,6 +1113,14 @@ public:
     bool compute_row_indexed_all_position_logits() const { return compute_row_indexed_all_position_logits_; }
     int row_indexed_all_position_logit_rows() const { return row_indexed_all_position_logit_rows_; }
     size_t apply_penalties_to_all_position_row_call_count() const { return apply_penalties_to_all_position_row_calls_; }
+    size_t set_skip_decode_call_count() const { return set_skip_decode_calls_; }
+    size_t set_skip_prefill_call_count() const { return set_skip_prefill_calls_; }
+    bool skip_logits_gather_decode() const { return skip_logits_gather_decode_; }
+    bool skip_logits_gather_prefill() const { return skip_logits_gather_prefill_; }
+    size_t set_all_position_sync_deferral_call_count() const { return set_all_position_sync_deferral_calls_; }
+    size_t set_main_decode_sync_deferral_call_count() const { return set_main_decode_sync_deferral_calls_; }
+    bool all_position_sync_deferral_enabled() const { return all_position_sync_deferral_enabled_; }
+    bool main_decode_sync_deferral_enabled() const { return main_decode_sync_deferral_enabled_; }
     size_t build_stochastic_processed_rows_call_count() const { return build_stochastic_processed_rows_calls_; }
     size_t sample_stochastic_draft_proposal_call_count() const { return sample_stochastic_draft_proposal_calls_; }
     size_t sample_stochastic_distribution_call_count() const { return sample_stochastic_distribution_calls_; }
@@ -1145,6 +1177,10 @@ public:
         prefix_live_capture_calls_.store(0, std::memory_order_relaxed);
         prefix_live_restore_calls_.store(0, std::memory_order_relaxed);
         prefix_live_truncate_calls_.store(0, std::memory_order_relaxed);
+        set_skip_decode_calls_ = 0;
+        set_skip_prefill_calls_ = 0;
+        set_all_position_sync_deferral_calls_ = 0;
+        set_main_decode_sync_deferral_calls_ = 0;
         prepare_mtp_verifier_input_tokens_calls_ = 0;
         prepare_mtp_verifier_input_tokens_from_device_calls_ = 0;
         stage_stochastic_draft_tokens_calls_ = 0;
@@ -1196,6 +1232,10 @@ private:
     bool apply_penalties_to_all_position_row_ok_ = true;
     bool verify_greedy_all_position_batch_outcome_ok_ = true;
     bool stochastic_device_ops_ok_ = true;
+    bool skip_logits_gather_decode_ = false;
+    bool skip_logits_gather_prefill_ = false;
+    bool all_position_sync_deferral_enabled_ = false;
+    bool main_decode_sync_deferral_enabled_ = false;
     int stochastic_sample_token_ = 17;
     bool prefix_live_capture_ok_ = true;
     bool prefix_live_restore_ok_ = true;
@@ -1224,6 +1264,10 @@ private:
     size_t build_stochastic_processed_rows_calls_ = 0;
     size_t sample_stochastic_draft_proposal_calls_ = 0;
     size_t sample_stochastic_distribution_calls_ = 0;
+    size_t set_skip_decode_calls_ = 0;
+    size_t set_skip_prefill_calls_ = 0;
+    size_t set_all_position_sync_deferral_calls_ = 0;
+    size_t set_main_decode_sync_deferral_calls_ = 0;
     size_t prepare_mtp_verifier_input_tokens_calls_ = 0;
     size_t prepare_mtp_verifier_input_tokens_from_device_calls_ = 0;
     size_t stage_stochastic_draft_tokens_calls_ = 0;
@@ -3530,6 +3574,89 @@ TEST_F(Test__RankOrchestrator, AllPositionLogitToggleRunsOnEveryLocalTPChild)
     EXPECT_FALSE(runner1_ptr->compute_all_position_logits());
     EXPECT_EQ(runner0_ptr->set_all_position_logits_call_count(), 2u);
     EXPECT_EQ(runner1_ptr->set_all_position_logits_call_count(), 2u);
+}
+
+TEST_F(Test__RankOrchestrator, LogitsGatherSkipPolicyPropagatesToEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    runner0_ptr->reset_call_counts();
+    runner1_ptr->reset_call_counts();
+
+    orchestrator->setSkipLogitsGatherDecode(true);
+    EXPECT_TRUE(runner0_ptr->skip_logits_gather_decode());
+    EXPECT_TRUE(runner1_ptr->skip_logits_gather_decode());
+    EXPECT_GT(runner0_ptr->set_skip_decode_call_count(), 0u);
+    EXPECT_GT(runner1_ptr->set_skip_decode_call_count(), 0u);
+
+    orchestrator->setSkipLogitsGatherPrefill(true);
+    EXPECT_TRUE(runner0_ptr->skip_logits_gather_prefill());
+    EXPECT_TRUE(runner1_ptr->skip_logits_gather_prefill());
+    EXPECT_GT(runner0_ptr->set_skip_prefill_call_count(), 0u);
+    EXPECT_GT(runner1_ptr->set_skip_prefill_call_count(), 0u);
+
+    const size_t runner0_decode_calls = runner0_ptr->set_skip_decode_call_count();
+    const size_t runner1_decode_calls = runner1_ptr->set_skip_decode_call_count();
+
+    orchestrator->setSkipLogitsGatherDecode(false);
+    EXPECT_FALSE(runner0_ptr->skip_logits_gather_decode());
+    EXPECT_FALSE(runner1_ptr->skip_logits_gather_decode());
+    EXPECT_GT(runner0_ptr->set_skip_decode_call_count(), runner0_decode_calls);
+    EXPECT_GT(runner1_ptr->set_skip_decode_call_count(), runner1_decode_calls);
+}
+
+TEST_F(Test__RankOrchestrator, DecodeSyncDeferralPolicyPropagatesToEveryLocalTPChild)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    runner0_ptr->reset_call_counts();
+    runner1_ptr->reset_call_counts();
+
+    orchestrator->setMTPMainDecodeSyncDeferralEnabled(true);
+    EXPECT_TRUE(runner0_ptr->main_decode_sync_deferral_enabled());
+    EXPECT_TRUE(runner1_ptr->main_decode_sync_deferral_enabled());
+    EXPECT_EQ(runner0_ptr->set_main_decode_sync_deferral_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->set_main_decode_sync_deferral_call_count(), 1u);
+
+    orchestrator->setMTPAllPositionVerifierSyncDeferralEnabled(true);
+    EXPECT_TRUE(runner0_ptr->all_position_sync_deferral_enabled());
+    EXPECT_TRUE(runner1_ptr->all_position_sync_deferral_enabled());
+    EXPECT_EQ(runner0_ptr->set_all_position_sync_deferral_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->set_all_position_sync_deferral_call_count(), 1u);
+
+    orchestrator->setMTPMainDecodeSyncDeferralEnabled(false);
+    EXPECT_FALSE(runner0_ptr->main_decode_sync_deferral_enabled());
+    EXPECT_FALSE(runner1_ptr->main_decode_sync_deferral_enabled());
+    EXPECT_EQ(runner0_ptr->set_main_decode_sync_deferral_call_count(), 2u);
+    EXPECT_EQ(runner1_ptr->set_main_decode_sync_deferral_call_count(), 2u);
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildMTPDecodePropagatesChildTopologyBypass)

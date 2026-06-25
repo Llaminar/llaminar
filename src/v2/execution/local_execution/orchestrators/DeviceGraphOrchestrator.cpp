@@ -722,6 +722,10 @@ namespace llaminar2
             int max_idx = -1;
 
             auto device_opt = tensor->current_device();
+            void *gpu_ptr_for_guard = tensor->gpu_data_ptr();
+            const bool gpu_resident_logits =
+                gpu_ptr_for_guard != nullptr ||
+                (device_opt.has_value() && device_opt->is_gpu());
             if (device_opt.has_value() && device_opt->is_gpu() && tensor->deviceValid())
             {
                 if (!stream)
@@ -730,7 +734,7 @@ namespace llaminar2
                     return candidate;
                 }
                 IBackend *backend = getBackendFor(*device_opt);
-                const void *gpu_ptr = tensor->gpu_data_ptr();
+                const void *gpu_ptr = gpu_ptr_for_guard;
                 if (backend && gpu_ptr)
                 {
                     const auto *base = static_cast<const float *>(gpu_ptr);
@@ -782,6 +786,21 @@ namespace llaminar2
                     auto &pool = GPUDeviceContextPool::instance();
                     pool.getContext(*device_opt).synchronizeStream(stream);
                 }
+            }
+
+            if (gpu_resident_logits)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] GPU greedy sampling failed for "
+                          << (source ? source : "unknown")
+                          << " row=" << row
+                          << " device="
+                          << (device_opt.has_value() ? device_opt->toString() : "none")
+                          << " device_valid=" << (tensor->deviceValid() ? "true" : "false")
+                          << " gpu_ptr=" << gpu_ptr_for_guard
+                          << " stream=" << stream
+                          << " argmax_capacity=" << argmax_partial_capacity
+                          << "; CPU logits fallback is disabled");
+                return candidate;
             }
 
             if (!tensor->hostValid())
@@ -7324,6 +7343,20 @@ namespace llaminar2
         if (!state_.logits)
         {
             return nullptr;
+        }
+        if (state_.device_id.is_gpu())
+        {
+            PerfStatsCollector::addCounter(
+                "sampling",
+                "host_logits_access",
+                1.0,
+                perfPhaseName(),
+                state_.device_id.toString(),
+                {{"source", "device_graph_logits"},
+                 {"device_valid", state_.logits->deviceValid() ? "true" : "false"},
+                 {"host_valid", state_.logits->hostValid() ? "true" : "false"},
+                 {"rows", std::to_string(state_.logits->rows())},
+                 {"cols", std::to_string(state_.logits->cols())}});
         }
         return state_.logits->fp32_data();
     }

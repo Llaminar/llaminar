@@ -74,6 +74,11 @@ namespace llaminar2
         return position_;
     }
 
+    DeviceId InferenceRunnerAdapter::primaryDeviceId() const
+    {
+        return orch_runner_ ? orch_runner_->primaryDeviceId() : DeviceId::cpu();
+    }
+
     ExecutionPath InferenceRunnerAdapter::executionPath() const
     {
         return ExecutionPath::GRAPH;

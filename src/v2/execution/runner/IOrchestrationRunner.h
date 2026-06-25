@@ -21,6 +21,7 @@
 
 #pragma once
 
+#include "../../backends/DeviceId.h"
 #include "../../config/OrchestrationConfig.h"
 #include "../prefix_cache/PrefixCacheStateProbe.h"
 #include "../mpi_orchestration/RankExecutionPlan.h"
@@ -364,6 +365,16 @@ namespace llaminar2
          * @brief Read-only runtime state probe for prefix-cache/MTP development.
          */
         virtual PrefixRuntimeStateSnapshot prefixStateProbe() const { return {}; }
+
+        /**
+         * @brief Get the primary compute device backing this orchestration runner.
+         *
+         * Adapters that expose IOrchestrationRunner through IInferenceRunner use
+         * this to preserve GPU-vs-CPU policy decisions such as decode logits
+         * gather suppression. Composite runners should report the underlying
+         * runner's primary device.
+         */
+        virtual DeviceId primaryDeviceId() const { return DeviceId::cpu(); }
 
         // =====================================================================
         // Advanced

@@ -110,6 +110,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        DeviceId primaryDeviceId() const override;
 
         // =================================================================
         // IOrchestrationRunner: Advanced

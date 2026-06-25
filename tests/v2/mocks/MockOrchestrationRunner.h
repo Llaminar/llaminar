@@ -45,6 +45,7 @@ namespace llaminar2::test
             ON_CALL(*this, lastError()).WillByDefault(testing::ReturnRef(empty_error_));
             ON_CALL(*this, executionPlan()).WillByDefault(testing::ReturnRef(default_plan_));
             ON_CALL(*this, config()).WillByDefault(testing::ReturnRef(default_config_));
+            ON_CALL(*this, primaryDeviceId()).WillByDefault(testing::Return(DeviceId::cpu()));
             ON_CALL(*this, supportsPrefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, prefillBatch(testing::_)).WillByDefault(testing::Return(false));
             ON_CALL(*this, supportsDecodeStepBatch(testing::_)).WillByDefault(testing::Return(false));
@@ -94,6 +95,7 @@ namespace llaminar2::test
         MOCK_METHOD(int, vocabSize, (), (const, override));
         MOCK_METHOD(int, currentPosition, (), (const, override));
         MOCK_METHOD(void, clearCache, (), (override));
+        MOCK_METHOD(DeviceId, primaryDeviceId, (), (const, override));
 
         // Advanced
         MOCK_METHOD(const float *, lastLogits, (), (const, override));

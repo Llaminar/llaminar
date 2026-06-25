@@ -504,6 +504,11 @@ namespace llaminar2
         return inner_ ? inner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
     }
 
+    DeviceId NamedDomainGlobalRunner::primaryDeviceId() const
+    {
+        return inner_ ? inner_->primaryDeviceId() : DeviceId::cpu();
+    }
+
     const float *NamedDomainGlobalRunner::lastLogits() const
     {
         return inner_ ? inner_->lastLogits() : nullptr;

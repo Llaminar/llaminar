@@ -694,6 +694,8 @@ namespace llaminar2
             uint64_t inverse_sample_seed = 0,
             int inverse_sample_first_logical_position = 0,
             bool use_vllm_probability_rejection = false) override;
+        void setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled) override;
+        void setMTPMainDecodeSyncDeferralEnabled(bool enabled) override;
 
         /**
          * @brief GPU-side greedy sampling for decode
@@ -1107,6 +1109,17 @@ namespace llaminar2
          */
         void aggregateStats() const;
 
+        /**
+         * @brief Replay rank-level logits gather policy into gatherers/children.
+         *
+         * The skip flags are part of the rank runner contract: callers that use
+         * GPU-side sampling expect every nested runner to avoid publishing
+         * full logits to host during decode.  Keep this centralized so late
+         * gatherer construction and nested TP/PP runners inherit the same
+         * policy.
+         */
+        void applyLogitsGatherSkipFlags();
+
         // =====================================================================
         // Member Variables
         // =====================================================================
@@ -1146,6 +1159,8 @@ namespace llaminar2
         std::unique_ptr<LogitsGatherer> logits_gatherer_;
         mutable std::unique_ptr<LogitsGatherer> mtp_logits_gatherer_;
         mutable std::unique_ptr<LogitsGatherer> all_position_logits_gatherer_;
+        bool skip_logits_gather_decode_ = false;
+        bool skip_logits_gather_prefill_ = false;
 
         /// Aggregated executor stats (mutable for lazy computation)
         mutable std::unique_ptr<GraphExecutorStats> aggregated_stats_;

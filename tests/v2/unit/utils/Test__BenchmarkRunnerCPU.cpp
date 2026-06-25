@@ -970,6 +970,11 @@ TEST(Test__BenchmarkRunnerCPU, AdapterForwardsRequestBatchedDecodeContract)
     MockOrchestrationRunner orch;
     InferenceRunnerAdapter adapter(&orch);
 
+    EXPECT_CALL(orch, primaryDeviceId())
+        .WillOnce(::testing::Return(DeviceId::cuda(1)));
+    EXPECT_EQ(adapter.primaryDeviceId(), DeviceId::cuda(1))
+        << "BenchmarkRunner relies on the adapter preserving GPU identity to skip full logits gathers";
+
     EXPECT_CALL(orch, supportsDecodeStepBatch(3))
         .WillOnce(::testing::Return(true));
     EXPECT_TRUE(adapter.supportsDecodeStepBatchForBenchmark(3));

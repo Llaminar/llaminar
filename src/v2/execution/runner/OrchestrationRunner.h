@@ -191,6 +191,7 @@ namespace llaminar2
         int currentPosition() const override;
         void clearCache() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
+        DeviceId primaryDeviceId() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Advanced

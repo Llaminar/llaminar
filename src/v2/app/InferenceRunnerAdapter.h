@@ -35,6 +35,7 @@ namespace llaminar2
         int vocab_size() const override;
         void clear_cache() override;
         int get_position() const override;
+        DeviceId primaryDeviceId() const override;
         ExecutionPath executionPath() const override;
         const char *architecture() const override;
 

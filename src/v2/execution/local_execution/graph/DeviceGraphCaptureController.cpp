@@ -2311,9 +2311,15 @@ namespace llaminar2
                 return result;
             }
             auto sync_capture_t1 = std::chrono::high_resolution_clock::now();
-            if (!gpu_ctx->synchronizeStreamChecked(gpu_ctx->defaultStream()))
+            void *context_default_stream = gpu_ctx->defaultStream();
+            if (context_default_stream == nullptr)
             {
-                LOG_ERROR("[DeviceGraphCaptureController] Final replay default-stream sync failed");
+                LOG_ERROR("[DeviceGraphCaptureController] Final replay context-default stream unavailable; refusing to synchronize the legacy null stream");
+                return result;
+            }
+            if (!gpu_ctx->synchronizeStreamChecked(context_default_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Final replay context-default stream sync failed");
                 return result;
             }
             auto sync_t1 = std::chrono::high_resolution_clock::now();
@@ -2327,7 +2333,7 @@ namespace llaminar2
                 auto capture_tags = replayCacheTags(segment_cache);
                 capture_tags.emplace("stream", "capture");
                 auto default_tags = replayCacheTags(segment_cache);
-                default_tags.emplace("stream", "default");
+                default_tags.emplace("stream", "context_default");
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
                     "segmented_replay_stream_sync",

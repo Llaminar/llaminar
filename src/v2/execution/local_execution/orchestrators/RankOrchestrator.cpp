@@ -677,6 +677,7 @@ namespace llaminar2
                         logits_gatherer_->pinForDevice(primary_dev);
                     }
                 }
+                applyLogitsGatherSkipFlags();
             }
         }
     }
@@ -1150,6 +1151,7 @@ namespace llaminar2
                         logits_gatherer_->pinForDevice(primary_dev);
                     }
                 }
+                applyLogitsGatherSkipFlags();
             }
         }
 
@@ -2203,7 +2205,10 @@ namespace llaminar2
             if (last_stage >= 0 && static_cast<size_t>(last_stage) < pp_stage_runners_.size() && pp_stage_runners_[last_stage])
             {
                 if (!logits_gatherer_)
+                {
                     logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0);
+                    applyLogitsGatherSkipFlags();
+                }
                 logits_gatherer_->copyFromStage(*pp_stage_runners_[last_stage],
                                                 0, config_.batch_size, config_.max_seq_len);
             }
@@ -2309,6 +2314,19 @@ namespace llaminar2
 
     const float *RankOrchestrator::logits() const
     {
+        PerfStatsCollector::addCounter(
+            "sampling",
+            "host_logits_access",
+            1.0,
+            {},
+            primaryDeviceId().toString(),
+            {{"source", "rank_orchestrator_logits"},
+             {"mode", std::to_string(static_cast<int>(mode_))},
+             {"tp_children", std::to_string(device_runners_.size())},
+             {"pp_children", std::to_string(pp_stage_runners_.size())},
+             {"gatherer_allocated",
+              (logits_gatherer_ && logits_gatherer_->isAllocated()) ? "true" : "false"}});
+
         // For PP mode: return combined logits (copied from final stage)
         if (mode_ == ParallelismMode::PP || mode_ == ParallelismMode::TP_PP)
         {
@@ -5443,14 +5461,67 @@ namespace llaminar2
 
     void RankOrchestrator::setSkipLogitsGatherDecode(bool skip)
     {
-        if (logits_gatherer_)
-            logits_gatherer_->setSkipDecode(skip);
+        skip_logits_gather_decode_ = skip;
+        applyLogitsGatherSkipFlags();
     }
 
     void RankOrchestrator::setSkipLogitsGatherPrefill(bool skip)
     {
+        skip_logits_gather_prefill_ = skip;
+        applyLogitsGatherSkipFlags();
+    }
+
+    void RankOrchestrator::setMTPAllPositionVerifierSyncDeferralEnabled(bool enabled)
+    {
+        for (auto &runner : device_runners_)
+        {
+            if (runner)
+                runner->setMTPAllPositionVerifierSyncDeferralEnabled(enabled);
+        }
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+                runner->setMTPAllPositionVerifierSyncDeferralEnabled(enabled);
+        }
+    }
+
+    void RankOrchestrator::setMTPMainDecodeSyncDeferralEnabled(bool enabled)
+    {
+        for (auto &runner : device_runners_)
+        {
+            if (runner)
+                runner->setMTPMainDecodeSyncDeferralEnabled(enabled);
+        }
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+                runner->setMTPMainDecodeSyncDeferralEnabled(enabled);
+        }
+    }
+
+    void RankOrchestrator::applyLogitsGatherSkipFlags()
+    {
         if (logits_gatherer_)
-            logits_gatherer_->setSkipPrefill(skip);
+        {
+            logits_gatherer_->setSkipDecode(skip_logits_gather_decode_);
+            logits_gatherer_->setSkipPrefill(skip_logits_gather_prefill_);
+        }
+
+        for (auto &runner : device_runners_)
+        {
+            if (!runner)
+                continue;
+            runner->setSkipLogitsGatherDecode(skip_logits_gather_decode_);
+            runner->setSkipLogitsGatherPrefill(skip_logits_gather_prefill_);
+        }
+
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (!runner)
+                continue;
+            runner->setSkipLogitsGatherDecode(skip_logits_gather_decode_);
+            runner->setSkipLogitsGatherPrefill(skip_logits_gather_prefill_);
+        }
     }
 
     bool RankOrchestrator::forward_batch(const std::vector<std::vector<int>> &token_batches)
@@ -5855,7 +5926,10 @@ namespace llaminar2
         if (!pp_stage_runners_.empty() && pp_stage_runners_.back())
         {
             if (!logits_gatherer_)
+            {
                 logits_gatherer_ = std::make_unique<LogitsGatherer>(0, 0);
+                applyLogitsGatherSkipFlags();
+            }
             logits_gatherer_->copyFromStage(*pp_stage_runners_.back(),
                                             static_cast<size_t>(vocab_size()),
                                             config_.batch_size,
