@@ -33,6 +33,66 @@ namespace llaminar2
         return "unknown";
     }
 
+    MoERebalanceController *selectActiveMoERebalanceController(
+        const std::vector<MoERebalanceController *> &controllers)
+    {
+        auto first_valid = std::find_if(
+            controllers.begin(),
+            controllers.end(),
+            [](const MoERebalanceController *controller)
+            {
+                return controller != nullptr;
+            });
+        if (first_valid == controllers.end())
+            return nullptr;
+
+        auto routed_multi_participant = std::find_if(
+            controllers.begin(),
+            controllers.end(),
+            [](const MoERebalanceController *controller)
+            {
+                return controller &&
+                       controller->domainId() != "single" &&
+                       controller->participantCount() > 1;
+            });
+        if (routed_multi_participant != controllers.end())
+            return *routed_multi_participant;
+
+        auto any_multi_participant = std::find_if(
+            controllers.begin(),
+            controllers.end(),
+            [](const MoERebalanceController *controller)
+            {
+                return controller && controller->participantCount() > 1;
+            });
+        if (any_multi_participant != controllers.end())
+            return *any_multi_participant;
+
+        auto routed_hot_cache = std::find_if(
+            controllers.begin(),
+            controllers.end(),
+            [](const MoERebalanceController *controller)
+            {
+                return controller &&
+                       controller->domainId() != "single" &&
+                       controller->maxReplicasPerSocket() > 0;
+            });
+        if (routed_hot_cache != controllers.end())
+            return *routed_hot_cache;
+
+        return *first_valid;
+    }
+
+    MoERebalanceController *selectActiveMoERebalanceController(
+        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers)
+    {
+        std::vector<MoERebalanceController *> pointers;
+        pointers.reserve(controllers.size());
+        for (const auto &controller : controllers)
+            pointers.push_back(controller.get());
+        return selectActiveMoERebalanceController(pointers);
+    }
+
     // =========================================================================
     // ExpertReplicaSet — deterministic per-token dispatch
     // =========================================================================
@@ -616,7 +676,20 @@ namespace llaminar2
                 total_counts[e] += layer_counts[e];
         }
 
+        const uint64_t total_activations =
+            std::accumulate(total_counts.begin(), total_counts.end(), uint64_t{0});
+        if (total_activations == 0 && current_replicas_.num_replicated > 0)
+        {
+            LOG_DEBUG("[MoERebalanceController] No activation signal; preserving "
+                      << current_replicas_.num_replicated << " existing expert replicas");
+            return current_replicas_;
+        }
+
         // For each socket, find the hottest experts on OTHER sockets to replicate locally.
+        // Keep still-warm existing replicas before filling new slots so short
+        // decode windows do not churn PCIe/NVLink transfers on tiny rank-order
+        // changes. A previous replica must stay within 50% of the current top
+        // candidate for that target.
         for (int target_socket = 0; target_socket < num_sockets; ++target_socket)
         {
             // Collect experts NOT owned by this socket, sorted by count descending
@@ -631,8 +704,42 @@ namespace llaminar2
                       [&](int a, int b)
                       { return total_counts[a] > total_counts[b]; });
 
-            // Mark the top-K as replicated
+            const uint64_t top_count = candidates.empty() ? 0 : total_counts[candidates.front()];
+
+            // First preserve existing replicas that are still competitive.
             int replicated = 0;
+            auto is_previous_replica_for_target = [&](int e)
+            {
+                return e >= 0 &&
+                       e < static_cast<int>(current_replicas_.is_replicated.size()) &&
+                       e < static_cast<int>(current_replicas_.owner_socket.size()) &&
+                       current_replicas_.is_replicated[e] &&
+                       current_replicas_.owner_socket[e] == current_placement_[e] &&
+                       current_placement_[e] != target_socket;
+            };
+
+            auto keep_previous = [&](int e)
+            {
+                if (result.is_replicated[e])
+                    return false;
+                result.is_replicated[e] = true;
+                result.num_replicated++;
+                replicated++;
+                return true;
+            };
+
+            for (int e : candidates)
+            {
+                if (replicated >= max_replicas_per_socket)
+                    break;
+                if (!is_previous_replica_for_target(e))
+                    continue;
+                if (top_count > 0 && total_counts[e] * 2 < top_count)
+                    continue;
+                keep_previous(e);
+            }
+
+            // Fill remaining capacity with the hottest new candidates.
             for (int e : candidates)
             {
                 if (replicated >= max_replicas_per_socket)

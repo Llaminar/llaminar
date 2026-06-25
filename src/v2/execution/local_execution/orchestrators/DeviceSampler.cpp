@@ -20,6 +20,13 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        size_t logitsRowStride(const LogitsLocalInfo &info)
+        {
+            return info.row_stride > 0 ? info.row_stride : info.vocab_local;
+        }
+    } // namespace
 
     int DeviceSampler::sampleGreedy(
         const std::vector<std::unique_ptr<IInferenceRunner>> &runners)
@@ -101,11 +108,12 @@ namespace llaminar2
                 const auto &shape = info.tensor->shape();
                 const size_t rows = shape.size() >= 2 ? shape[0] : 1;
                 const size_t cols = info.vocab_local;
-                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                const size_t row_stride = logitsRowStride(info);
+                if (cols == 0 || row_stride < cols || static_cast<size_t>(row) >= rows)
                     return -1;
 
                 const auto *row_ptr =
-                    static_cast<const float *>(info.gpu_ptr) + static_cast<size_t>(row) * cols;
+                    static_cast<const float *>(info.gpu_ptr) + static_cast<size_t>(row) * row_stride;
 
                 // Drive the multi-block argmax with the runner's arena-owned scratch
                 // (null/zero capacity -> argmaxF32 fails, and we degrade to host-side
@@ -128,14 +136,15 @@ namespace llaminar2
                 const auto &shape = info.tensor->shape();
                 const size_t rows = shape.size() >= 2 ? shape[0] : 1;
                 const size_t cols = info.vocab_local;
-                if (cols == 0 || static_cast<size_t>(row) >= rows)
+                const size_t row_stride = logitsRowStride(info);
+                if (cols == 0 || row_stride < cols || static_cast<size_t>(row) >= rows)
                     return -1;
 
                 const float *data = info.tensor->fp32_data();
                 if (!data)
                     return -1;
 
-                const float *row_data = data + static_cast<size_t>(row) * cols;
+                const float *row_data = data + static_cast<size_t>(row) * row_stride;
                 max_idx = 0;
                 max_val = row_data[0];
                 for (size_t i = 1; i < cols; ++i)

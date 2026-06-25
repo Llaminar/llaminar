@@ -121,11 +121,14 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
     dst_ptrs.d_scales = d_dst_scales;
     dst_ptrs.d_mins = d_dst_mins;
 
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(0),
-        vnni_bytes, scales_bytes, mins_bytes, 0, nullptr);
+        vnni_bytes, scales_bytes, mins_bytes, 0, stream);
     ASSERT_TRUE(ok);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     // Verify all three arrays
     std::vector<uint8_t> result_vnni(vnni_bytes);
@@ -140,6 +143,7 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
     EXPECT_EQ(pattern_scales, result_scales) << "Scales corrupted during P2P transfer";
     EXPECT_EQ(pattern_mins, result_mins) << "Mins corrupted during P2P transfer";
 
+    hipStreamDestroy(stream);
     hipFree(d_src_vnni); hipFree(d_dst_vnni);
     hipFree(d_src_scales); hipFree(d_dst_scales);
     hipFree(d_src_mins); hipFree(d_dst_mins);
@@ -173,6 +177,8 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
     uint8_t *d_dst_vnni = nullptr, *d_dst_scales = nullptr;
     ASSERT_EQ(hipMalloc(&d_dst_vnni, vnni_bytes), hipSuccess);
     ASSERT_EQ(hipMalloc(&d_dst_scales, scales_bytes), hipSuccess);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
     // Restore to device 0 to verify context preservation
     hipSetDevice(0);
@@ -186,13 +192,14 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(1),
-        vnni_bytes, scales_bytes, 0, 0, nullptr);
+        vnni_bytes, scales_bytes, 0, 0, stream);
     ASSERT_TRUE(ok);
 
     // Verify device context preserved
     int current = -1;
     ASSERT_EQ(hipGetDevice(&current), hipSuccess);
     EXPECT_EQ(current, 0) << "Caller device context must be preserved";
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
     // Read back from device 1
     hipSetDevice(1);
@@ -205,7 +212,7 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
     EXPECT_EQ(pattern_scales, result_scales) << "Cross-device scales corrupted";
 
     hipSetDevice(0); hipFree(d_src_vnni); hipFree(d_src_scales);
-    hipSetDevice(1); hipFree(d_dst_vnni); hipFree(d_dst_scales);
+    hipSetDevice(1); hipStreamDestroy(stream); hipFree(d_dst_vnni); hipFree(d_dst_scales);
 }
 
 // ===========================================================================

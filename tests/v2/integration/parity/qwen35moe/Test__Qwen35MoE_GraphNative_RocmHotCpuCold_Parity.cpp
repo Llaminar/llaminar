@@ -1,18 +1,18 @@
 /**
  * @file Test__Qwen35MoE_GraphNative_RocmHotCpuCold_Parity.cpp
  * @brief Phase 15: Production-path PyTorch parity gate for Qwen3.5 MoE graph-native
- *        overlay with `rocm_hot` (ROCm device 0, ReplicatedExperts) and
- *        `cpu_cold` (CPU fallback tier, ReplicatedExperts) two-tier layout.
+ *        overlay with `rocm_hot` (ROCm device 0, ApportionedExperts) and
+ *        `cpu_cold` (CPU fallback tier, ApportionedExperts) two-tier layout.
  *
  * Topology:
- *   rocm_hot   — single ROCm device (rocm:0), world rank 0, ReplicatedExperts.
+ *   rocm_hot   — single ROCm device (rocm:0), world rank 0, ApportionedExperts.
  *                This is the continuation domain and shared expert domain.
  *                Hot experts (first num_experts/2 by ID) reside here.
- *   cpu_cold   — single CPU participant, world rank 1, ReplicatedExperts, fallback=true.
+ *   cpu_cold   — single CPU participant, world rank 1, ApportionedExperts, fallback=true.
  *                Cold experts (remaining num_experts/2 by ID) fall back here.
  *
  * Key differences from legacy ExpertOverlay tests (Test__Qwen35MoE_ExpertOverlay_Parity.cpp):
- *   - Both domains use ReplicatedExperts, NOT TensorParallelExperts.
+ *   - Both domains use ApportionedExperts, NOT ShardedExperts.
  *   - rocm_hot is ExpertDomainKind::SingleDevice (not LocalTP).
  *   - cpu_cold is ExpertDomainKind::SingleDevice CPU on rank 1 (not NodeLocalTP cross-socket).
  *   - Parity bodies are NOT unconditionally skipped — Phase 14 graph-native is implemented.
@@ -90,9 +90,9 @@ namespace
     }
 
     /**
-     * @brief rocm_hot domain: single ROCm device (rocm:0), world rank 0, ReplicatedExperts.
+     * @brief rocm_hot domain: single ROCm device (rocm:0), world rank 0, ApportionedExperts.
      *
-     * Uses ExpertDomainKind::SingleDevice and ReplicatedExperts so that the
+     * Uses ExpertDomainKind::SingleDevice and ApportionedExperts so that the
      * graph-native path treats each domain as a whole-expert owner (one expert
      * per node in the MoEExpertOwnerMap), exercising gn_sparse_dispatch /
      * gn_local_expert / gn_return_reduce stages introduced in Phase 14.
@@ -106,15 +106,15 @@ namespace
         domain.participants = {GlobalDeviceAddress::rocm(0)};
         domain.world_ranks = {0};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
     /**
-     * @brief cpu_cold domain: single CPU on world rank 1, ReplicatedExperts, fallback tier.
+     * @brief cpu_cold domain: single CPU on world rank 1, ApportionedExperts, fallback tier.
      *
      * When the hot tier is exhausted, remaining experts fall back to this domain.
-     * Uses ReplicatedExperts — each expert is fully owned by rank 1's CPU rather
+     * Uses ApportionedExperts — each expert is fully owned by rank 1's CPU rather
      * than tensor-parallel sharded across sockets. This is the graph-native whole-expert
      * owner path for the cold tier.
      *
@@ -131,7 +131,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::cpu(0)};
         domain.world_ranks = {1};
         domain.owner_rank = 1;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -672,7 +672,7 @@ protected:
  *        without loading the real model or requiring ROCm hardware.
  *
  * Asserts (rank 0 only):
- *   - Both domains use ReplicatedExperts (graph-native whole-expert owner path)
+ *   - Both domains use ApportionedExperts (graph-native whole-expert owner path)
  *   - cpu_cold routed tier has fallback=true
  *   - All layers have placements
  *   - Both hot and cold tiers have expert assignments (cpu_fallback path is reachable)
@@ -695,8 +695,8 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, TopologySmoke)
     std::shared_ptr<MoEExpertParallelPlan> plan;
     ASSERT_NO_THROW(plan = makePlannedOverlayPlan(metadata))
         << "Plan construction threw — check ExpertComputeDomain definitions for "
-           "rocm_hot (SingleDevice, RCCL, ReplicatedExperts) and "
-           "cpu_cold (SingleDevice, HOST, ReplicatedExperts, fallback)";
+           "rocm_hot (SingleDevice, RCCL, ApportionedExperts) and "
+           "cpu_cold (SingleDevice, HOST, ApportionedExperts, fallback)";
     ASSERT_NE(plan, nullptr);
 
     // Basic plan structure
@@ -706,14 +706,14 @@ TEST_F(Qwen35MoEGraphNativeRocmHotCpuCold, TopologySmoke)
     ASSERT_EQ(plan->domains.size(), 2u);
     ASSERT_EQ(plan->routed_tiers.size(), 2u);
 
-    // CRITICAL: both domains must use ReplicatedExperts for the graph-native path.
-    // TensorParallelExperts would select the legacy expert-sharded GEMM path.
+    // CRITICAL: both domains must use ApportionedExperts for the graph-native path.
+    // ShardedExperts would select the legacy expert-sharded GEMM path.
     for (const auto &domain : plan->domains)
     {
-        EXPECT_EQ(domain.compute_kind, ExpertDomainComputeKind::ReplicatedExperts)
+        EXPECT_EQ(domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts)
             << "Domain '" << domain.name
-            << "' must use ReplicatedExperts (whole-expert graph-native owner), "
-               "not TensorParallelExperts (legacy sharded GEMM path)";
+            << "' must use ApportionedExperts (whole-expert graph-native owner), "
+               "not ShardedExperts (legacy sharded GEMM path)";
     }
 
     // rocm_hot domain must be SingleDevice (not LocalTP/NodeLocalTP)

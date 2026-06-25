@@ -316,7 +316,7 @@ namespace llaminar2
             return it == plan.domains.end() ? nullptr : &*it;
         }
 
-        bool allRoutedOverlayDomainsUseReplicatedExperts(const MoEExpertParallelPlan &plan)
+        bool allRoutedOverlayDomainsUseApportionedExperts(const MoEExpertParallelPlan &plan)
         {
             if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
                 return false;
@@ -324,10 +324,16 @@ namespace llaminar2
             for (const auto &tier : plan.routed_tiers)
             {
                 const auto *domain = findMoEExpertDomain(plan, tier.domain);
-                if (!domain || domain->compute_kind != ExpertDomainComputeKind::ReplicatedExperts)
+                if (!domain || domain->compute_kind != ExpertDomainComputeKind::ApportionedExperts)
                     return false;
             }
             return true;
+        }
+
+        bool overlayPlanDisablesDenseTP(const MoEExpertParallelPlan &plan)
+        {
+            return plan.isTieredOverlay() &&
+                   !plan.continuation_domain_spec.dense_tp_enabled;
         }
 
         int participantIndexForDenseDomain(
@@ -449,12 +455,21 @@ namespace llaminar2
             graph_config.moe.overlay_mpi_ctx = config.moe_expert_overlay_mpi_ctx
                                                    ? config.moe_expert_overlay_mpi_ctx
                                                    : runner_mpi_ctx;
+            graph_config.dense_tp_enabled = !overlayPlanDisablesDenseTP(*plan);
+        graph_config.dense_tp_decode_replicated =
+            graph_config.dense_tp_enabled &&
+            plan->continuation_domain_spec.dense_decode_replicated;
+        graph_config.dense_tp_decode_mirrored_embedding =
+            graph_config.dense_tp_enabled &&
+            plan->continuation_domain_spec.dense_decode_mirrored_embedding;
+        graph_config.refreshMoEParallelPolicies();
 
             if (plan->isTieredOverlay())
             {
-                if (allRoutedOverlayDomainsUseReplicatedExperts(*plan))
+                if (allRoutedOverlayDomainsUseApportionedExperts(*plan))
                 {
-                    graph_config.moe.expert_mode = MoEExpertMode::Replicated;
+                    graph_config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
+                    graph_config.refreshMoEParallelPolicies();
                 }
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
@@ -789,11 +804,24 @@ namespace llaminar2
                 add_controller(
                     domain.rebalance_domain_id,
                     overlayRebalanceParticipants(domain),
-                    /*max_replicas=*/0);
+                    effective_replicas);
             }
         }
 
         return controllers;
+    }
+
+    MoERebalanceController *bindActiveMoERebalanceControllerForGraph(
+        GraphConfig &graph_config,
+        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers)
+    {
+        auto *controller = selectActiveMoERebalanceController(controllers);
+        if (!controller)
+            return nullptr;
+
+        graph_config.moe.decode_histogram = controller->histogram();
+        graph_config.moe.rebalance_mode = controller->mode();
+        return controller;
     }
 
     std::shared_ptr<MoEExpertParallelPlan> resolveMoEExpertParallelPlanForModel(
@@ -851,7 +879,7 @@ namespace llaminar2
         bool include_tp_config)
     {
         const WeightShardingMode expert_mode =
-            graph_config.moe.expert_mode == MoEExpertMode::Replicated
+            graph_config.moe.expert_mode == MoEExpertMode::ReplicatedExperts
                 ? WeightShardingMode::Replicate
                 : WeightShardingMode::ExpertParallel;
 
@@ -866,7 +894,7 @@ namespace llaminar2
                     pattern.pattern == "ffn_down_exps.weight")
                 {
                     pattern.mode = expert_mode;
-                    pattern.description = graph_config.moe.expert_mode == MoEExpertMode::Replicated
+                    pattern.description = graph_config.moe.expert_mode == MoEExpertMode::ReplicatedExperts
                                               ? "MoE routed expert weights - replicated"
                                               : "MoE routed expert weights - expert-id parallel";
                 }
@@ -913,7 +941,8 @@ namespace llaminar2
         int tp_rank_or_device_index = 0,
         int tp_domain = -1,
         int pp_stage = -1,
-        WeightSliceSpec slice = {})
+        WeightSliceSpec slice = {},
+        bool bypass_tensor_parallel = false)
     {
         WeightRequirement requirement;
         requirement.canonical_name = canonical_name;
@@ -926,14 +955,35 @@ namespace llaminar2
         requirement.pp_stage = pp_stage;
         requirement.target_device = device;
         requirement.lookup_device = lookup_device;
+        requirement.bypass_tensor_parallel = bypass_tensor_parallel;
         requirement.host_policy = device.is_cpu()
                                       ? WeightHostPolicy::RequiredForCPUExecution
                                       : WeightHostPolicy::RequiredUntilGraphMaterialized;
-        requirement.expected_prepared_kind = role == WeightRole::Embedding
-                                                 ? PreparedWeightKind::None
-                                                 : expectedPreparedKindForWeight(weight_mgr, canonical_name, device);
+        requirement.expected_prepared_kind =
+            role == WeightRole::Embedding && device.is_gpu()
+                ? PreparedWeightKind::PreparedEmbedding
+                : (role == WeightRole::Embedding
+                       ? PreparedWeightKind::None
+                       : expectedPreparedKindForWeight(weight_mgr, canonical_name, device));
         requirement.slice = slice;
         return requirement;
+    }
+
+    struct SingleDeviceWeightPlanOptions
+    {
+        bool include_terminal_mtp_embedding = false;
+        int tp_rank_override = -1;
+        bool bypass_tensor_parallel = false;
+        bool dense_decode_replicated_subset = false;
+        bool dense_decode_mirrored_embedding_only = false;
+    };
+
+    static bool includeWeightInDenseDecodeReplicatedPlan(const std::string &weight_name)
+    {
+        const WeightRole role = inferWeightRole(weight_name);
+        // Shared experts are always-on dense FFN work; only routed experts are
+        // excluded from the dense/shared replicated subset.
+        return !isRoutedExpertRole(role);
     }
 
     static WeightSliceSpec vocabSliceSpecForAssignment(
@@ -966,8 +1016,7 @@ namespace llaminar2
         DeviceId device,
         const TensorParallelConfig *tp_config = nullptr,
         const FactoryPPStageConfig *pp_config = nullptr,
-        bool include_terminal_mtp_embedding = false,
-        int tp_rank_override = -1)
+        SingleDeviceWeightPlanOptions options = {})
     {
         InferenceStrategy strategy;
         const bool has_tp = tp_config && tp_config->worldSize() > 1;
@@ -996,18 +1045,20 @@ namespace llaminar2
         std::optional<DeviceId> lookup_device = DeviceId::cpu();
         if (tp_config)
         {
-            const auto &assignment = tp_rank_override >= 0
-                                         ? tp_config->forRank(tp_rank_override)
+            const auto &assignment = options.tp_rank_override >= 0
+                                         ? tp_config->forRank(options.tp_rank_override)
                                          : tp_config->forDevice(device);
             tp_rank_or_device_index = assignment.local_rank;
             tp_domain = 0;
             lookup_device = device;
         }
 
-        const WeightSliceSpec vocab_slice = vocabSliceSpecForAssignment(tp_config, device, tp_rank_override);
+        const WeightSliceSpec vocab_slice = options.bypass_tensor_parallel
+                                                ? WeightSliceSpec{}
+                                                : vocabSliceSpecForAssignment(tp_config, device, options.tp_rank_override);
         const int pp_stage = pp_config ? pp_config->first_layer : -1;
 
-        if (!pp_config || pp_config->has_embedding || include_terminal_mtp_embedding)
+        if (!pp_config || pp_config->has_embedding || options.include_terminal_mtp_embedding)
         {
             /**
              * Terminal PP stages normally do not own the main embedding stage,
@@ -1027,8 +1078,12 @@ namespace llaminar2
                 tp_rank_or_device_index,
                 tp_domain,
                 pp_stage,
-                vocab_slice));
+                vocab_slice,
+                options.bypass_tensor_parallel));
         }
+
+        if (options.dense_decode_mirrored_embedding_only)
+            return plan;
 
         if (!pp_config || pp_config->has_lm_head)
         {
@@ -1041,9 +1096,9 @@ namespace llaminar2
                 {},
                 WeightDerivationKind::Source,
                 lookup_device,
-                tp_rank_or_device_index,
-                tp_domain,
-                pp_stage));
+                    tp_rank_or_device_index,
+                    tp_domain,
+                    pp_stage));
 
             if (model_ctx.hasTensor("output.weight"))
             {
@@ -1059,7 +1114,8 @@ namespace llaminar2
                     tp_rank_or_device_index,
                     tp_domain,
                     pp_stage,
-                    vocab_slice));
+                    vocab_slice,
+                    options.bypass_tensor_parallel));
             }
             else
             {
@@ -1076,12 +1132,19 @@ namespace llaminar2
                     tp_rank_or_device_index,
                     tp_domain,
                     pp_stage,
-                    vocab_slice));
+                    vocab_slice,
+                    options.bypass_tensor_parallel));
             }
         }
 
         for (const auto &[weight_name, is_optional] : validation.weights_to_load)
         {
+            if (options.dense_decode_replicated_subset &&
+                !includeWeightInDenseDecodeReplicatedPlan(weight_name))
+            {
+                continue;
+            }
+
             plan.add(makeSingleDeviceRequirement(
                 weight_mgr,
                 weight_name,
@@ -1093,7 +1156,9 @@ namespace llaminar2
                 lookup_device,
                 tp_rank_or_device_index,
                 tp_domain,
-                pp_stage));
+                pp_stage,
+                {},
+                options.bypass_tensor_parallel));
         }
 
         return plan;
@@ -1271,13 +1336,13 @@ namespace llaminar2
         if (!graph_config.moe.enabled())
             return true;
 
-        if (graph_config.moe.expert_mode == MoEExpertMode::TensorParallel)
+        if (graph_config.moe.expert_mode == MoEExpertMode::ShardedExperts)
         {
-            LOG_ERROR("[InferenceRunner] Not Implemented: MoE tensor-parallel expert mode is not implemented for the standard Qwen3.5 MoE path.");
+            LOG_ERROR("[InferenceRunner] Not Implemented: MoE sharded-experts mode is not implemented for the standard Qwen3.5 MoE path.");
             return false;
         }
 
-        if (graph_config.moe.expert_mode != MoEExpertMode::ExpertParallel)
+        if (graph_config.moe.expert_mode != MoEExpertMode::ApportionedExperts)
             return true;
 
         int participants = 1;
@@ -1290,7 +1355,9 @@ namespace llaminar2
         else if (graph_config.tp_ctx && graph_config.tp_ctx->degree() > 1)
         {
             participants = graph_config.tp_ctx->degree();
-            participant_index = graph_config.tp_ctx->myIndex();
+            participant_index = graph_config.tp_ctx->isLocal()
+                                    ? graph_config.tp_device_idx
+                                    : graph_config.tp_ctx->myIndex();
         }
 
         if (participants <= 1)
@@ -1472,6 +1539,39 @@ namespace llaminar2
         return true;
     }
 
+    static bool bindLocalTPContextWithoutDenseSharding(
+        GraphConfig &graph_config,
+        ILocalTPContext *local_tp_ctx,
+        int device_idx)
+    {
+        if (!local_tp_ctx || local_tp_ctx->degree() <= 1)
+            return false;
+
+        const int tp_degree = local_tp_ctx->degree();
+        if (device_idx < 0 || device_idx >= tp_degree)
+        {
+            LOG_ERROR("[InferenceRunner] Invalid local_tp_device_index: " << device_idx
+                                                                          << " (degree=" << tp_degree << ")");
+            return false;
+        }
+
+        setFullDimensions(graph_config);
+        graph_config.dense_tp_enabled = false;
+        graph_config.tp_ctx = local_tp_ctx;
+        graph_config.tp_device_idx = device_idx;
+        graph_config.local_rank = device_idx;
+        graph_config.tp_config.reset();
+
+        const auto &devices = local_tp_ctx->devices();
+        LOG_DEBUG("[InferenceRunner] LOCAL TP context bound for MoE expert participants only: degree="
+                  << tp_degree
+                  << " device_idx=" << device_idx
+                  << " device=" << devices[device_idx].toString()
+                  << " backend=" << static_cast<int>(local_tp_ctx->backend())
+                  << " dense_tp=false");
+        return true;
+    }
+
     // =========================================================================
     // Helper: Apply PROPORTIONAL GLOBAL TP assignment to graph config
     // =========================================================================
@@ -1624,6 +1724,11 @@ namespace llaminar2
         // which indicates MDO configured it for TP weight slicing within a PP stage
         const bool local_tp_weights_configured = tp_config != nullptr;
 
+        if (local_tp_ctx && local_tp_ctx->degree() > 1 && !graph_config.dense_tp_enabled)
+        {
+            return bindLocalTPContextWithoutDenseSharding(graph_config, local_tp_ctx, tp_device_idx);
+        }
+
         if (local_tp_ctx && local_tp_ctx->degree() > 1 && (weights_sharded || local_tp_weights_configured))
         {
             return applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx);
@@ -1741,6 +1846,12 @@ namespace llaminar2
         {
             return nullptr;
         }
+        graph_config.refreshMoEParallelPolicies();
+        LOG_DEBUG("[InferenceRunner] MoE semantic policy="
+                  << moeParallelPolicyToString(graph_config.moe.parallel_policy)
+                  << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
+                  << " routed=" << routedExpertParallelPolicyToString(graph_config.moe.routed_expert_parallel_policy)
+                  << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try
         {
@@ -1791,6 +1902,8 @@ namespace llaminar2
         // kv_cache_scale_k/v are set by the model config builder (e.g. QwenStandardGraphConfigBuilder)
         // which is the sole authority on K/V scale values for each model architecture.
         graph_config.kv_cache_precision = config.kv_cache_precision;
+        graph_config.tp_allreduce_precision_override =
+            config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
         graph_config.mtp = config.mtp;
         LOG_DEBUG("[InferenceRunner] KV cache scale: K=" << graph_config.kv_cache_scale_k
@@ -1971,8 +2084,7 @@ namespace llaminar2
             graph_config.tp_ctx);
         if (!moe_controllers.empty())
         {
-            graph_config.moe.decode_histogram = moe_controllers.front()->histogram();
-            graph_config.moe.rebalance_mode = moe_controllers.front()->mode();
+            bindActiveMoERebalanceControllerForGraph(graph_config, moe_controllers);
 
             const auto rebalance_config = graph_config.moe.rebalance_config;
             for (const auto &controller : moe_controllers)
@@ -1999,6 +2111,11 @@ namespace llaminar2
             graph_builder->setModelContext(model_ctx);
             orchestrator = std::make_unique<DeviceGraphOrchestrator>(
                 std::move(graph_builder), mpi_ctx);
+            if (auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx))
+            {
+                orchestrator->retainModelContext(model_ctx);
+                orchestrator->setWeightManager(concrete_model_ctx->concreteWeightManager());
+            }
         }
 
         if (!owned_domain_tp_contexts.empty())
@@ -2536,8 +2653,9 @@ namespace llaminar2
             device,
             graph_config.tp_config.get(),
             nullptr,
-            false,
-            graph_config.tp_config ? graph_config.local_rank : -1);
+            SingleDeviceWeightPlanOptions{
+                .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+            });
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[InferenceRunner]"))
             return false;
         LOG_DEBUG("[InferenceRunner] SingleDevice WeightPlan built with "
@@ -2588,7 +2706,8 @@ namespace llaminar2
                      << device.to_string());
         }
 
-        if (overlay_runtime_plan_for_weight_prep)
+        if (overlay_runtime_plan_for_weight_prep &&
+            !config.moe_expert_overlay_weights_prepared_by_parent)
         {
             if (!weight_mgr->prepareMoEExpertOverlayWeights(
                     *overlay_runtime_plan_for_weight_prep,
@@ -2600,8 +2719,46 @@ namespace llaminar2
             }
         }
 
+        std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
+        if ((graph_config.dense_tp_decode_replicated ||
+             graph_config.dense_tp_decode_mirrored_embedding) &&
+            graph_config.tp_config)
+        {
+            auto decode_weight_plan = buildSingleDeviceWeightPlan(
+                *weight_mgr,
+                *model_ctx,
+                validation,
+                device,
+                graph_config.tp_config.get(),
+                nullptr,
+                SingleDeviceWeightPlanOptions{
+                    .tp_rank_override = graph_config.local_rank,
+                    .bypass_tensor_parallel = true,
+                    .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
+                    .dense_decode_mirrored_embedding_only =
+                        graph_config.dense_tp_decode_mirrored_embedding &&
+                        !graph_config.dense_tp_decode_replicated,
+                });
+            if (!installPreparedWeightStoreForPlan(*weight_mgr, config, decode_weight_plan, "[InferenceRunner] decode replicated dense"))
+                return false;
+            auto decode_frozen_weights = weight_mgr->materialize(decode_weight_plan);
+            if (!weight_mgr->prepareWeightsForDevice(
+                    decode_frozen_weights,
+                    device,
+                    /*include_expert_jobs=*/false))
+            {
+                LOG_ERROR("[InferenceRunner] Replicated dense decode weight preparation failed for device "
+                          << device.to_string());
+                return false;
+            }
+            decode_replicated_dense_weights =
+                std::make_unique<FrozenModelWeightSet>(std::move(decode_frozen_weights));
+        }
+
         orchestrator->setFrozenWeightSet(
             std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
+        if (decode_replicated_dense_weights)
+            orchestrator->setDecodeReplicatedDenseWeightSet(std::move(decode_replicated_dense_weights));
         LOG_DEBUG("[InferenceRunner] Frozen weight bindings configured on orchestrator");
 
         // Phase 4-5: Populate prepared weight store from frozen bindings
@@ -2780,7 +2937,9 @@ namespace llaminar2
             device,
             nullptr,
             &pp_config,
-            config.mtp.enabled && pp_config.has_lm_head);
+            SingleDeviceWeightPlanOptions{
+                .include_terminal_mtp_embedding = config.mtp.enabled && pp_config.has_lm_head,
+            });
         if (!installPreparedWeightStoreForPlan(*weight_mgr, config, weight_plan, "[PPStageRunner]"))
             return false;
         FrozenModelWeightSet frozen_weights = weight_mgr->materialize(weight_plan);
@@ -2978,6 +3137,8 @@ namespace llaminar2
         // Execution-specific settings
         graph_config.max_seq_len = config.max_seq_len;
         graph_config.activation_precision = config.activation_precision;
+        graph_config.tp_allreduce_precision_override =
+            config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
         graph_config.mtp = config.mtp;
 
@@ -3109,6 +3270,8 @@ namespace llaminar2
 
         // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
+        graph_config.tp_allreduce_precision_override =
+            config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
         graph_config.mtp = config.mtp;
 
@@ -3283,6 +3446,12 @@ namespace llaminar2
         {
             return nullptr;
         }
+        graph_config.refreshMoEParallelPolicies();
+        LOG_DEBUG("[InferenceRunner] MoE semantic policy="
+                  << moeParallelPolicyToString(graph_config.moe.parallel_policy)
+                  << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
+                  << " routed=" << routedExpertParallelPolicyToString(graph_config.moe.routed_expert_parallel_policy)
+                  << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try
         {
@@ -3306,6 +3475,8 @@ namespace llaminar2
         graph_config.fused_attention_backend = config.fused_attention_backend;
         // kv_cache_scale_k/v set by config builder — don't overwrite
         graph_config.kv_cache_precision = config.kv_cache_precision;
+        graph_config.tp_allreduce_precision_override =
+            config.tp_allreduce_precision_override;
         graph_config.prefix_cache = config.prefix_cache;
         graph_config.mtp = config.mtp;
 
@@ -3344,7 +3515,14 @@ namespace llaminar2
                                                        : nullptr;
         const int tp_device_idx = config.tp_device_index;
 
-        if (local_tp_ctx && local_tp_ctx->degree() > 1)
+        if (local_tp_ctx && local_tp_ctx->degree() > 1 && !graph_config.dense_tp_enabled)
+        {
+            if (!bindLocalTPContextWithoutDenseSharding(graph_config, local_tp_ctx, tp_device_idx))
+            {
+                return nullptr;
+            }
+        }
+        else if (local_tp_ctx && local_tp_ctx->degree() > 1)
         {
             if (!applyLocalTPAssignment(graph_config, local_tp_ctx, tp_device_idx))
             {
@@ -3398,8 +3576,7 @@ namespace llaminar2
             graph_config.tp_ctx);
         if (!moe_controllers.empty())
         {
-            graph_config.moe.decode_histogram = moe_controllers.front()->histogram();
-            graph_config.moe.rebalance_mode = moe_controllers.front()->mode();
+            bindActiveMoERebalanceControllerForGraph(graph_config, moe_controllers);
         }
 
         // Create Dependencies struct
@@ -3518,8 +3695,10 @@ namespace llaminar2
                 device,
                 graph_config.tp_config.get(),
                 &pp_cfg,
-                config.mtp.enabled && pp_cfg.has_lm_head,
-                graph_config.tp_config ? graph_config.local_rank : -1);
+                SingleDeviceWeightPlanOptions{
+                    .include_terminal_mtp_embedding = config.mtp.enabled && pp_cfg.has_lm_head,
+                    .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+                });
             if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
                 return nullptr;
             auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
@@ -3605,8 +3784,9 @@ namespace llaminar2
                         device,
                         graph_config.tp_config.get(),
                         nullptr,
-                        false,
-                        graph_config.tp_config ? graph_config.local_rank : -1);
+                        SingleDeviceWeightPlanOptions{
+                            .tp_rank_override = graph_config.tp_config ? graph_config.local_rank : -1,
+                        });
                     if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
                         return nullptr;
                     auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
@@ -3639,7 +3819,8 @@ namespace llaminar2
                         return nullptr;
                     }
 
-                    if (graph_config.moe.expert_overlay_runtime_plan)
+                    if (graph_config.moe.expert_overlay_runtime_plan &&
+                        !config.moe_expert_overlay_weights_prepared_by_parent)
                     {
                         const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
                         if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
@@ -3653,8 +3834,53 @@ namespace llaminar2
                         }
                     }
 
+                    std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weights;
+                    if ((graph_config.dense_tp_decode_replicated ||
+                         graph_config.dense_tp_decode_mirrored_embedding) &&
+                        graph_config.tp_config)
+                    {
+                        auto decode_weight_plan = buildSingleDeviceWeightPlan(
+                            *concrete_weight_mgr,
+                            *concrete_model_ctx,
+                            validation,
+                            device,
+                            graph_config.tp_config.get(),
+                            nullptr,
+                            SingleDeviceWeightPlanOptions{
+                                .tp_rank_override = graph_config.local_rank,
+                                .bypass_tensor_parallel = true,
+                                .dense_decode_replicated_subset = graph_config.dense_tp_decode_replicated,
+                                .dense_decode_mirrored_embedding_only =
+                                    graph_config.dense_tp_decode_mirrored_embedding &&
+                                    !graph_config.dense_tp_decode_replicated,
+                            });
+                        if (!installPreparedWeightStoreForPlan(
+                                *concrete_weight_mgr,
+                                config,
+                                decode_weight_plan,
+                                "[InferenceRunner] LocalTP decode replicated dense"))
+                        {
+                            return nullptr;
+                        }
+
+                        auto decode_frozen_weights = concrete_weight_mgr->materialize(decode_weight_plan);
+                        if (!concrete_weight_mgr->prepareWeightsForDevice(
+                                decode_frozen_weights,
+                                device,
+                                /*include_expert_jobs=*/false))
+                        {
+                            LOG_ERROR("[InferenceRunner] LocalTP replicated dense decode weight preparation failed for device "
+                                      << device.to_string());
+                            return nullptr;
+                        }
+                        decode_replicated_dense_weights =
+                            std::make_unique<FrozenModelWeightSet>(std::move(decode_frozen_weights));
+                    }
+
                     orchestrator->setFrozenWeightSet(
                         std::make_unique<FrozenModelWeightSet>(std::move(frozen_weights)));
+                    if (decode_replicated_dense_weights)
+                        orchestrator->setDecodeReplicatedDenseWeightSet(std::move(decode_replicated_dense_weights));
                     orchestrator->initializePreparedWeightStore(device);
                     configured_from_frozen = true;
                 }
@@ -3683,6 +3909,38 @@ namespace llaminar2
                 }
 
                 orchestrator->setWeights(weights);
+                auto concrete_model_ctx = std::dynamic_pointer_cast<ModelContext>(model_ctx);
+                auto concrete_weight_mgr = concrete_model_ctx ? concrete_model_ctx->concreteWeightManager() : nullptr;
+                if (concrete_weight_mgr && orchestrator->frozenWeightSet())
+                {
+                    const bool include_expert_jobs = !graph_config.moe.expert_overlay_runtime_plan;
+                    if (!concrete_weight_mgr->prepareWeightsForDevice(
+                            *orchestrator->frozenWeightSet(),
+                            device,
+                            include_expert_jobs))
+                    {
+                        LOG_ERROR("[InferenceRunner] Full-weight binding-driven weight preparation failed for device "
+                                  << device.to_string());
+                        return nullptr;
+                    }
+                }
+                if (graph_config.moe.expert_overlay_runtime_plan &&
+                    !config.moe_expert_overlay_weights_prepared_by_parent)
+                {
+                    if (concrete_weight_mgr)
+                    {
+                        const auto *execution_plan = graph_config.moe.expert_overlay_execution_plan.get();
+                        if (!concrete_weight_mgr->prepareMoEExpertOverlayWeights(
+                                *graph_config.moe.expert_overlay_runtime_plan,
+                                orchestrator->frozenWeightSet(),
+                                execution_plan))
+                        {
+                            LOG_ERROR("[InferenceRunner] Full-weight path failed to prepare MoE expert overlay weights for device "
+                                      << device.to_string());
+                            return nullptr;
+                        }
+                    }
+                }
                 orchestrator->initializePreparedWeightStore(device);
             }
         }

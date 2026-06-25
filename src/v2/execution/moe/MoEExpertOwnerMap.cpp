@@ -66,12 +66,12 @@ namespace llaminar2
             const auto &tier = plan.routed_tiers[tier_index];
             const auto &domain = requireDomain(plan, tier.domain, "routed tier");
 
-            if (options.reject_tensor_parallel_experts &&
-                domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts)
+            if (options.reject_sharded_experts &&
+                domain.compute_kind == ExpertDomainComputeKind::ShardedExperts)
             {
                 std::ostringstream message;
                 message << "Graph-native routed tier '" << tier.name << "' in domain '" << domain.name
-                        << "' requests TensorParallelExperts; Phase 4 whole-expert owner maps reject routed expert GEMM sharding";
+                        << "' requests ShardedExperts; graph-native whole-expert owner maps reject routed expert GEMM sharding";
                 throw std::invalid_argument(message.str());
             }
 
@@ -177,7 +177,7 @@ namespace llaminar2
         const auto validation = validateMoEExpertParallelPlan(
             plan,
             MoEExpertParallelValidationOptions{
-                .allow_routed_tensor_parallel_experts = !options.reject_tensor_parallel_experts,
+                .allow_routed_sharded_experts = !options.reject_sharded_experts,
             });
         if (!validation.ok())
             throw std::invalid_argument(formatValidationErrors(validation));

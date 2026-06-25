@@ -331,6 +331,7 @@ TEST(Test__DecodeExpertHistogram, UpdatePlacement_ChangesSocketMapping)
     auto loads_after = hist.socketLoads(0);
     EXPECT_EQ(loads_after[0], 0u);
     EXPECT_EQ(loads_after[1], 100u);
+    EXPECT_EQ(hist.config().expert_to_socket, new_placement);
 }
 
 TEST(Test__DecodeExpertHistogram, ThreadSafety_ConcurrentRecords)

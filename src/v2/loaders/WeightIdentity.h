@@ -44,6 +44,20 @@ namespace llaminar2
         Other,
     };
 
+    inline bool isRoutedExpertRole(WeightRole role)
+    {
+        return role == WeightRole::MoEExpertGate ||
+               role == WeightRole::MoEExpertUp ||
+               role == WeightRole::MoEExpertDown;
+    }
+
+    inline bool isSharedExpertRole(WeightRole role)
+    {
+        return role == WeightRole::SharedExpertGate ||
+               role == WeightRole::SharedExpertUp ||
+               role == WeightRole::SharedExpertDown;
+    }
+
     enum class WeightDerivationKind
     {
         Source,

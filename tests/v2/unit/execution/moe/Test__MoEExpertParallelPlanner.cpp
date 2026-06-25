@@ -20,7 +20,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::SingleDevice;
             domain.backend = CollectiveBackendType::AUTO;
             domain.participants = {GlobalDeviceAddress::cuda(0)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -31,7 +31,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::LocalTP;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -42,7 +42,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::NodeLocalTP;
             domain.backend = CollectiveBackendType::UPI;
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "loaders/GPUVramPreflight.h"
 #include "../mocks/MockBackend.h"
 
 /**
@@ -197,6 +198,33 @@ namespace llaminar2
         auto *pool = orch.getPool(0);
         ASSERT_NE(pool, nullptr);
         EXPECT_TRUE(pool->isAllocated());
+    }
+
+    TEST(Test__LoadOrchestrator, DirectRebalanceMarginAllowsTightNoStagingArrival)
+    {
+        const size_t planned_bytes = 8ULL * kMiB;
+        BudgetMockBackend backend(/*total_bytes=*/24ULL * 1024ULL * kMiB,
+                                  /*free_bytes=*/131ULL * kMiB);
+
+        {
+            LoadOrchestrator generic(&backend);
+            generic.setVramPreflightSafetyMarginBytes(128ULL * kMiB);
+            generic.addDevice(0);
+            generic.planRawWeight(0, "arrival_generic_margin", 1, 1, planned_bytes);
+            EXPECT_THROW(generic.allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0),
+                         std::runtime_error);
+        }
+        EXPECT_EQ(backend.allocateCalls(), 0)
+            << "The generic reserve should fail before any device allocation";
+
+        LoadOrchestrator direct(&backend);
+        direct.setVramPreflightSafetyMarginBytes(gpuDirectRebalanceVramSafetyMarginBytes());
+        direct.addDevice(0);
+        direct.planRawWeight(0, "arrival_direct_margin", 1, 1, planned_bytes);
+
+        ASSERT_NO_THROW(direct.allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0));
+        EXPECT_GT(backend.allocateCalls(), 0);
+        EXPECT_GT(backend.lastAllocateBytes(), 0u);
     }
 
     TEST(Test__LoadOrchestrator, FinalizeReleasesTemporaryStagingOnly)

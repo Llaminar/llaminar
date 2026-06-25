@@ -155,6 +155,9 @@ namespace llaminar2
         /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
         virtual bool isMoeRebalancingActive() const { return false; }
 
+        /** Check if the host execution mode should run prefill eagerly instead of graph-capturing it. */
+        virtual bool prefillGraphCaptureDisabledByHost() const { return false; }
+
         /** Whether the current forward graph must materialize logits for every input row. */
         virtual bool computeAllPositionLogitsEnabled() const { return false; }
 
@@ -613,8 +616,11 @@ namespace llaminar2
          * re-coherence.  When @p preserve_replay_safe_segmented_captures is true,
          * single-token decode and all-position verifier segment captures survive
          * the request reset because their device inputs are rebound/refreshed
-         * before every launch; unproven prefill and multi-token ordinary decode
-         * replay state is still discarded.
+         * before every launch. Exact and bucketed prefill graph-cache state also
+         * uses the preserving reset path: ready entries may replay from refreshed
+         * graph-facing buffers, while warmup-only entries are demoted to
+         * lazy-initialized state and must capture on a later request. Multi-token
+         * ordinary decode replay state is still discarded.
          */
         ReplayStateResetSummary resetSessionReplayState(
             bool preserve_replay_safe_segmented_captures = false);

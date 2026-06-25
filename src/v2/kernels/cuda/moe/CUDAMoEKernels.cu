@@ -24,7 +24,10 @@ namespace
     constexpr int kThreads = 256;
     constexpr int kMaxExperts = 1024;
     constexpr int kDeviceMoEMaxExperts = 256;
+    constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kMaxTopK = 16;
+    constexpr uint8_t kMixedCodebookSentinel = 0xffu;
+    constexpr uint32_t kDeviceMoEFlagReplicated = 1u << 2;
 
     struct DeviceNativeVNNIMatrixDesc
     {
@@ -38,6 +41,256 @@ namespace
         uint8_t codebook_id = 0;
         uint8_t reserved[3] = {0, 0, 0};
     };
+
+    struct DeviceMoEExpertDescriptorView
+    {
+        DeviceNativeVNNIMatrixDesc gate;
+        DeviceNativeVNNIMatrixDesc up;
+        DeviceNativeVNNIMatrixDesc down;
+        int32_t logical_expert_id;
+        int32_t owner_participant;
+        int32_t local_slot;
+        uint32_t flags;
+    };
+
+    struct DeviceMoEPlacementBankView
+    {
+        DeviceMoEExpertDescriptorView experts[kDeviceMoEMaxExperts];
+        uint8_t local_compute_mask[kDeviceMoEMaxExperts];
+        uint8_t replica_role[kDeviceMoEMaxExperts];
+        uint32_t epoch;
+        uint32_t expert_count;
+        uint32_t reserved[2];
+    };
+
+    struct DeviceMoELayerRuntimeView
+    {
+        uint32_t active_bank;
+        uint32_t active_epoch;
+        uint32_t expert_count;
+        uint32_t top_k;
+        DeviceMoEPlacementBankView banks[2];
+        int32_t topk_expert_ids[kMaxTopK];
+        float topk_weights[kMaxTopK];
+        uint64_t decode_histogram[kDeviceMoEMaxExperts];
+        uint64_t decode_local_histogram[kDeviceMoEMaxExperts];
+        int32_t *route_expert_ids;
+        float *route_weights;
+        int32_t *expert_counts;
+        int32_t *expert_offsets;
+        int32_t *grouped_token_ids;
+        float *grouped_route_weights;
+        float *grouped_gate_scratch;
+        float *grouped_up_scratch;
+        float *grouped_output_partials;
+        void *decode_scratch;
+        void *reserved_ptrs[3];
+        uint64_t reserved_u64[4];
+        uint32_t prefill_token_capacity;
+        uint32_t prefill_route_capacity;
+        uint32_t participant_id;
+        uint32_t participant_count;
+    };
+
+    __device__ __forceinline__ bool runtime_shape_ok(
+        const DeviceMoELayerRuntimeView *runtime,
+        int num_experts,
+        int top_k)
+    {
+        return runtime &&
+               runtime->active_bank <= 1u &&
+               runtime->active_epoch != 0u &&
+               runtime->expert_count == static_cast<uint32_t>(num_experts) &&
+               runtime->top_k == static_cast<uint32_t>(top_k);
+    }
+
+    __device__ __forceinline__ bool runtime_expert_replicated(
+        const DeviceMoEPlacementBankView &bank,
+        int expert_id)
+    {
+        return (bank.experts[expert_id].flags & kDeviceMoEFlagReplicated) != 0u;
+    }
+
+    __device__ __forceinline__ int runtime_expert_owner(
+        const DeviceMoEPlacementBankView &bank,
+        int expert_id)
+    {
+        return bank.experts[expert_id].owner_participant;
+    }
+
+    __device__ __forceinline__ bool runtime_selected_slot_local_compute(
+        const DeviceMoELayerRuntimeView *runtime,
+        const int *selected_experts,
+        int selected_slot,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_shape_ok(runtime, num_experts, top_k) ||
+            selected_slot < 0 ||
+            selected_slot >= top_k)
+        {
+            return false;
+        }
+
+        const auto &bank = runtime->banks[runtime->active_bank];
+        const int expert_id = selected_experts[selected_slot];
+        if (expert_id < 0 || expert_id >= num_experts)
+            return false;
+
+        const bool local_resident = bank.local_compute_mask[expert_id] != 0u;
+        if (!runtime_expert_replicated(bank, expert_id))
+            return local_resident;
+
+        const uint32_t participant_count = runtime->participant_count;
+        const uint32_t participant_id = runtime->participant_id;
+        if (participant_count == 0u ||
+            participant_count > static_cast<uint32_t>(kDeviceMoEMaxParticipants) ||
+            participant_id >= participant_count)
+        {
+            return local_resident;
+        }
+
+        const int current_owner = runtime_expert_owner(bank, expert_id);
+        if (current_owner < 0 || current_owner >= static_cast<int>(participant_count))
+            return local_resident;
+
+        int load[kDeviceMoEMaxParticipants] = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int fixed_expert = selected_experts[slot];
+            if (fixed_expert < 0 || fixed_expert >= num_experts ||
+                runtime_expert_replicated(bank, fixed_expert))
+            {
+                continue;
+            }
+
+            const int owner = runtime_expert_owner(bank, fixed_expert);
+            if (owner >= 0 && owner < static_cast<int>(participant_count))
+                ++load[owner];
+        }
+
+        for (int slot = 0; slot <= selected_slot; ++slot)
+        {
+            const int replicated_expert = selected_experts[slot];
+            if (replicated_expert < 0 || replicated_expert >= num_experts ||
+                !runtime_expert_replicated(bank, replicated_expert))
+            {
+                continue;
+            }
+
+            const int owner = runtime_expert_owner(bank, replicated_expert);
+            if (owner < 0 || owner >= static_cast<int>(participant_count))
+                continue;
+
+            int best = owner;
+            for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
+            {
+                if (load[participant] < load[best] ||
+                    (load[participant] == load[best] && participant == owner))
+                {
+                    best = participant;
+                }
+            }
+
+            if (slot == selected_slot)
+                return local_resident && best == static_cast<int>(participant_id);
+
+            ++load[best];
+        }
+
+        return false;
+    }
+
+    __device__ __forceinline__ bool grouped_desc_supports_codebook(uint8_t codebook_id)
+    {
+        switch (codebook_id)
+        {
+        case 0:
+        case 4:
+        case 5:
+        case 6:
+        case 7:
+        case 8:
+        case 9:
+        case 10:
+        case 11:
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+        case 16:
+        case 17:
+        case 19:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    __device__ __forceinline__ bool grouped_desc_requires_mins(uint8_t codebook_id)
+    {
+        switch (codebook_id)
+        {
+        case 5:
+        case 7:
+        case 8:
+        case 9:
+        case 10:
+        case 13:
+        case 14:
+        case 16:
+        case 17:
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    __device__ __forceinline__ bool grouped_desc_requires_emins(uint8_t codebook_id)
+    {
+        return codebook_id == 10;
+    }
+
+    __device__ __forceinline__ bool native_vnni_desc_shape_ok_dynamic(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int N,
+        int K)
+    {
+        return desc.payload &&
+               desc.scales &&
+               desc.n == N &&
+               desc.k == K &&
+               desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
+               grouped_desc_supports_codebook(desc.codebook_id) &&
+               (!grouped_desc_requires_mins(desc.codebook_id) || desc.mins) &&
+               (!grouped_desc_requires_emins(desc.codebook_id) || desc.emins);
+    }
+
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ bool native_vnni_desc_shape_ok(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int N,
+        int K)
+    {
+        if constexpr (CodebookId == kMixedCodebookSentinel)
+        {
+            return native_vnni_desc_shape_ok_dynamic(desc, N, K);
+        }
+        else
+        {
+            return desc.payload &&
+                   desc.scales &&
+                   desc.n == N &&
+                   desc.k == K &&
+                   desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
+                   desc.codebook_id == CodebookId &&
+                   (!(llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_asymmetric ||
+                      llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale) ||
+                    desc.mins) &&
+                   (!llaminar2::cuda_native_vnni::CodebookTraits<CodebookId>::is_dual_scale_asym ||
+                    desc.emins);
+        }
+    }
 
     __device__ __forceinline__ float silu(float x)
     {
@@ -426,9 +679,7 @@ namespace
 
     __global__ void softmax_topk_decode_runtime_kernel(
         float *__restrict__ logits,
-        int *__restrict__ runtime_expert_ids,
-        float *__restrict__ runtime_weights,
-        uint64_t *__restrict__ runtime_histogram,
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
         float *legacy_indices,
         float *legacy_weights,
         int num_experts, int top_k,
@@ -480,6 +731,7 @@ namespace
 
         if (threadIdx.x == 0)
         {
+            const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
             float topk_sum = 0.0f;
             for (int k = 0; k < top_k; ++k)
             {
@@ -504,16 +756,29 @@ namespace
                 const float weight = normalize_weights && topk_sum > 0.0f
                                          ? selected_weights[k] / topk_sum
                                          : selected_weights[k];
-                runtime_expert_ids[k] = selected[k];
-                runtime_weights[k] = weight;
+                bool local_compute = false;
+                if (shape_ok)
+                {
+                    local_compute =
+                        runtime_selected_slot_local_compute(runtime, selected, k, num_experts, top_k);
+                    runtime->topk_expert_ids[k] = local_compute ? selected[k] : -1;
+                    runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+                }
                 if (write_legacy_outputs)
                 {
                     legacy_indices[k] = static_cast<float>(selected[k]);
                     legacy_weights[k] = weight;
                 }
                 if (update_runtime_histogram)
-                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime_histogram[selected[k]]),
+                {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[selected[k]]),
                               static_cast<unsigned long long>(1));
+                    if (shape_ok && local_compute)
+                    {
+                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[selected[k]]),
+                                  static_cast<unsigned long long>(1));
+                    }
+                }
             }
         }
     }
@@ -521,31 +786,46 @@ namespace
     __global__ void decode_route_select_runtime_kernel(
         const int *__restrict__ expert_indices,
         const float *__restrict__ expert_weights,
-        int *__restrict__ runtime_expert_ids,
-        float *__restrict__ runtime_weights,
-        uint64_t *__restrict__ runtime_histogram,
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
         float *legacy_indices,
         float *legacy_weights,
+        int num_experts,
         int top_k,
         bool write_legacy_outputs,
         bool update_runtime_histogram)
     {
-        const int k = threadIdx.x;
-        if (k >= top_k)
+        if (threadIdx.x != 0)
             return;
+        const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+        for (int k = 0; k < top_k; ++k)
+        {
         const int expert = expert_indices[k];
         const float weight = expert_weights[k];
-        runtime_expert_ids[k] = expert;
-        runtime_weights[k] = weight;
-        if (write_legacy_outputs)
+        bool local_compute = false;
+        if (shape_ok)
         {
-            legacy_indices[k] = static_cast<float>(expert);
-            legacy_weights[k] = weight;
+            local_compute =
+                runtime_selected_slot_local_compute(runtime, expert_indices, k, num_experts, top_k);
+            runtime->topk_expert_ids[k] = local_compute ? expert : -1;
+            runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+        }
+            if (write_legacy_outputs)
+            {
+                legacy_indices[k] = static_cast<float>(expert);
+                legacy_weights[k] = weight;
         }
         if (update_runtime_histogram && expert >= 0 && expert < kDeviceMoEMaxExperts)
-            atomicAdd(reinterpret_cast<unsigned long long *>(&runtime_histogram[expert]),
+        {
+            atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert]),
                       static_cast<unsigned long long>(1));
+            if (shape_ok && local_compute)
+            {
+                atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert]),
+                          static_cast<unsigned long long>(1));
+            }
+        }
     }
+}
 
     __global__ void int_to_float_kernel(const int *__restrict__ input, float *__restrict__ output, int count)
     {
@@ -559,6 +839,23 @@ namespace
         const int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx < count)
             output[idx] = static_cast<int>(input[idx]);
+    }
+
+    __global__ void float_to_masked_int_kernel(
+        const float *__restrict__ input,
+        int *__restrict__ output,
+        const uint8_t *__restrict__ expert_mask,
+        int count,
+        int num_experts)
+    {
+        const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (idx >= count)
+            return;
+        const int expert = static_cast<int>(input[idx]);
+        output[idx] =
+            (expert >= 0 && expert < num_experts && expert_mask && expert_mask[expert] != 0u)
+                ? expert
+                : -1;
     }
 
     __global__ void gather_tokens_kernel(
@@ -1191,6 +1488,7 @@ namespace
     __global__ void grouped_swiglu_quantize_blockwise_kernel(
         const float *const *__restrict__ gate_ptrs,
         const float *const *__restrict__ up_ptrs,
+        const int *__restrict__ expert_ids,
         int8_t *__restrict__ A_int8,
         float *__restrict__ scales_A_blockwise,
         int num_active,
@@ -1198,6 +1496,8 @@ namespace
     {
         const int slot = blockIdx.x;
         if (slot >= num_active)
+            return;
+        if (expert_ids && expert_ids[slot] < 0)
             return;
 
         constexpr int kBlockSize = 32;
@@ -1428,7 +1728,8 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (gate_desc.codebook_id != CodebookId || up_desc.codebook_id != CodebookId)
+        if (!native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
+            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
@@ -1570,7 +1871,8 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (gate_desc.codebook_id != CodebookId || up_desc.codebook_id != CodebookId)
+        if (!native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
+            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
             return;
 
         const uint8_t *gate_payload_base = gate_desc.payload;
@@ -1739,7 +2041,7 @@ namespace
         const bool active = (n < N);
 
         const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
-        if (desc.codebook_id != CodebookId)
+        if (!native_vnni_desc_shape_ok<CodebookId>(desc, N, K))
             return;
 
         const uint8_t *payload_base = desc.payload;
@@ -1882,6 +2184,15 @@ namespace
         int b_end)
     {
         const int blocks_per_row = K / 32;
+        if (!A_int8 ||
+            !scales_A_blockwise ||
+            n < 0 ||
+            n >= N ||
+            blocks_per_row <= 0 ||
+            !native_vnni_desc_shape_ok<CodebookId>(desc, N, K))
+        {
+            return 0.0f;
+        }
         const uint8_t *payload_base = desc.payload;
         const uint16_t *scale_base = static_cast<const uint16_t *>(desc.scales);
         const uint16_t *min_base = static_cast<const uint16_t *>(desc.mins);
@@ -1998,6 +2309,91 @@ namespace
             desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
     }
 
+    __device__ __forceinline__ float native_vnni_dot_desc_range_dynamic(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int n,
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        int N,
+        int K,
+        int b_start,
+        int b_end)
+    {
+        switch (desc.codebook_id)
+        {
+        case 0:
+            return native_vnni_dot_desc_range<0>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 4:
+            return native_vnni_dot_desc_range<4>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 5:
+            return native_vnni_dot_desc_range<5>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 6:
+            return native_vnni_dot_desc_range<6>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 7:
+            return native_vnni_dot_desc_range<7>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 8:
+            return native_vnni_dot_desc_range<8>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 9:
+            return native_vnni_dot_desc_range<9>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 10:
+            return native_vnni_dot_desc_range<10>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 11:
+            return native_vnni_dot_desc_range<11>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 12:
+            return native_vnni_dot_desc_range<12>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 13:
+            return native_vnni_dot_desc_range<13>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 14:
+            return native_vnni_dot_desc_range<14>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 15:
+            return native_vnni_dot_desc_range<15>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 16:
+            return native_vnni_dot_desc_range<16>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 17:
+            return native_vnni_dot_desc_range<17>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        case 19:
+            return native_vnni_dot_desc_range<19>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        default:
+            return 0.0f;
+        }
+    }
+
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ float native_vnni_dot_desc_range_dispatch(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int n,
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        int N,
+        int K,
+        int b_start,
+        int b_end)
+    {
+        if constexpr (CodebookId == kMixedCodebookSentinel)
+        {
+            return native_vnni_dot_desc_range_dynamic(
+                desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        }
+        else
+        {
+            return native_vnni_dot_desc_range<CodebookId>(
+                desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        }
+    }
+
+    template <uint8_t CodebookId>
+    __device__ __forceinline__ float native_vnni_dot_desc_dispatch(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        int n,
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        int N,
+        int K)
+    {
+        return native_vnni_dot_desc_range_dispatch<CodebookId>(
+            desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
+    }
+
     /**
      * @brief Split-K scatter kernel for grouped gate/up decode projection.
      *
@@ -2041,11 +2437,7 @@ namespace
 
         const int expert_id = expert_ids[slot];
         if (expert_id < 0)
-        {
-            gate_partials[partial_index] = 0.0f;
-            up_partials[partial_index] = 0.0f;
             return;
-        }
         assert(expert_id < num_experts);
         if (expert_id >= num_experts)
         {
@@ -2072,9 +2464,9 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        gate_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+        gate_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
             gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
-        up_partials[partial_index] = native_vnni_dot_desc_range<CodebookId>(
+        up_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
             up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
     }
 
@@ -2090,6 +2482,7 @@ namespace
     __global__ void grouped_native_vnni_gate_up_kpart_reduce_kernel(
         const float *__restrict__ gate_partials,
         const float *__restrict__ up_partials,
+        const int *__restrict__ expert_ids,
         float *const *__restrict__ gate_outputs,
         float *const *__restrict__ up_outputs,
         int num_active,
@@ -2100,6 +2493,8 @@ namespace
         const int n = blockIdx.x * kTileN + threadIdx.x;
         const int slot = blockIdx.y;
         if (slot >= num_active || n >= N)
+            return;
+        if (expert_ids && expert_ids[slot] < 0)
             return;
 
         float gate_sum = 0.0f;
@@ -2176,7 +2571,8 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        if (gate_desc.codebook_id != CodebookId || up_desc.codebook_id != CodebookId)
+        if (!native_vnni_desc_shape_ok<CodebookId>(gate_desc, N, K) ||
+            !native_vnni_desc_shape_ok<CodebookId>(up_desc, N, K))
             return;
 
 #pragma unroll
@@ -2294,8 +2690,10 @@ namespace
 
         const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
-        gate_outputs[slot][n] = native_vnni_dot_desc<CodebookId>(gate_desc, n, A_int8, scales_A_blockwise, N, K);
-        up_outputs[slot][n] = native_vnni_dot_desc<CodebookId>(up_desc, n, A_int8, scales_A_blockwise, N, K);
+        gate_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
+            gate_desc, n, A_int8, scales_A_blockwise, N, K);
+        up_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
+            up_desc, n, A_int8, scales_A_blockwise, N, K);
     }
 
     template <uint8_t CodebookId>
@@ -2327,7 +2725,8 @@ namespace
             const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
             const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
             const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc<CodebookId>(desc, n, slot_A, slot_scales, N, K);
+            const float expert_value = native_vnni_dot_desc_dispatch<CodebookId>(
+                desc, n, slot_A, slot_scales, N, K);
             total += route_weights[slot] * expert_value;
         }
         output[n] = total;
@@ -2403,7 +2802,7 @@ namespace
             const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
             const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
             const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
-            const float expert_value = native_vnni_dot_desc_range<CodebookId>(
+            const float expert_value = native_vnni_dot_desc_range_dispatch<CodebookId>(
                 desc, n, slot_A, slot_scales, N, K, b_start, b_end);
             total += route_weights[slot] * expert_value;
         }
@@ -2526,36 +2925,34 @@ extern "C"
     }
 
     bool cudaMoE_softmax_topk_decode_runtime(float *logits,
-                                             int *runtime_expert_ids,
-                                             float *runtime_weights,
-                                             uint64_t *runtime_histogram,
+                                             void *runtime_layer,
                                              float *legacy_indices, float *legacy_weights,
                                              int num_experts, int top_k, bool normalize_weights,
                                              bool write_legacy_outputs, bool update_runtime_histogram,
                                              int device_idx, void *stream)
     {
-        if (num_experts > kMaxExperts || top_k > kMaxTopK)
+        if (!runtime_layer || num_experts > kDeviceMoEMaxExperts || top_k > kMaxTopK)
             return false;
         cudaSetDevice(device_idx);
         softmax_topk_decode_runtime_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
-            logits, runtime_expert_ids, runtime_weights, runtime_histogram,
+            logits, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
             legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,
             write_legacy_outputs, update_runtime_histogram);
         return finishLaunch("cudaMoE_softmax_topk_decode_runtime");
     }
 
     bool cudaMoE_decode_route_select_runtime(const int *expert_indices, const float *expert_weights,
-                                             int *runtime_expert_ids,
-                                             float *runtime_weights,
-                                             uint64_t *runtime_histogram,
+                                             void *runtime_layer,
                                              float *legacy_indices, float *legacy_weights,
-                                             int, int top_k, bool write_legacy_outputs,
+                                             int num_experts, int top_k, bool write_legacy_outputs,
                                              bool update_runtime_histogram, int device_idx, void *stream)
     {
+        if (!runtime_layer || num_experts > kDeviceMoEMaxExperts || top_k > kMaxTopK)
+            return false;
         cudaSetDevice(device_idx);
         decode_route_select_runtime_kernel<<<1, kMaxTopK, 0, static_cast<cudaStream_t>(stream)>>>(
-            expert_indices, expert_weights, runtime_expert_ids, runtime_weights, runtime_histogram,
-            legacy_indices, legacy_weights, top_k, write_legacy_outputs, update_runtime_histogram);
+            expert_indices, expert_weights, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
+            legacy_indices, legacy_weights, num_experts, top_k, write_legacy_outputs, update_runtime_histogram);
         return finishLaunch("cudaMoE_decode_route_select_runtime");
     }
 
@@ -2571,6 +2968,21 @@ extern "C"
         cudaSetDevice(device_idx);
         float_to_int_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(input, output, count);
         return finishLaunch("cudaMoE_float_to_int");
+    }
+
+    bool cudaMoE_float_to_masked_int(
+        const float *input,
+        int *output,
+        const uint8_t *expert_mask,
+        int count,
+        int num_experts,
+        int device_idx,
+        void *stream)
+    {
+        cudaSetDevice(device_idx);
+        float_to_masked_int_kernel<<<blocksFor(count), kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            input, output, expert_mask, count, num_experts);
+        return finishLaunch("cudaMoE_float_to_masked_int");
     }
 
     bool cudaMoE_gather_tokens(const float *hidden, float *batch_buffer, const int *token_indices,
@@ -2900,6 +3312,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_GATE_UP(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
@@ -2982,6 +3395,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_GATE_UP_KPART(16); break;
         case 17: LAUNCH_GROUPED_GATE_UP_KPART(17); break;
         case 19: LAUNCH_GROUPED_GATE_UP_KPART(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
@@ -2996,7 +3410,7 @@ extern "C"
         // Step 3: reduce the k_partitions partials into the final gate/up outputs.
         dim3 reduce_grid((N + kTileN - 1) / kTileN, num_active);
         grouped_native_vnni_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
-            d_gate_partials, d_up_partials, d_gate_outputs, d_up_outputs,
+            d_gate_partials, d_up_partials, d_expert_ids, d_gate_outputs, d_up_outputs,
             num_active, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart");
@@ -3029,7 +3443,7 @@ extern "C"
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
         grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales, num_active, K);
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, K);
         if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
             return false;
 
@@ -3060,6 +3474,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_DOWN(16); break;
         case 17: LAUNCH_GROUPED_DOWN(17); break;
         case 19: LAUNCH_GROUPED_DOWN(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));
@@ -3107,7 +3522,7 @@ extern "C"
 
         // Step 1: quantize the per-slot SwiGLU activations (shared with serial path).
         grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
-            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
         if (!finishLaunch("cudaMoE_grouped_swiglu_quantize"))
             return false;
 
@@ -3142,6 +3557,7 @@ extern "C"
         case 16: LAUNCH_GROUPED_DOWN_KPART(16); break;
         case 17: LAUNCH_GROUPED_DOWN_KPART(17); break;
         case 19: LAUNCH_GROUPED_DOWN_KPART(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_KPART(kMixedCodebookSentinel); break;
         default:
             std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart] unsupported codebook_id=%u\n",
                          static_cast<unsigned>(codebook_id));

@@ -40,6 +40,7 @@
 #include "../../mpi_orchestration/PlacementStrategy.h" // For InferencePhase
 #include "../../compute_stages/ComputeStages.h"        // For StageDumpInfo
 #include "../../moe/ExpertWeightTransfer.h"            // For ReceivedWeightsMap, ExpertMigration
+#include "../../moe/MoERebalanceController.h"          // For ExpertReplicaSet
 #include "../../moe/MoEExpertOverlayProfiler.h"        // For overlay profiling summary flush
 #include "../../factory/InferenceRunnerFactory.h"      // For FactoryPPStageConfig
 #include "../../../snapshots/SnapshotCapture.h"        // Snapshot capture (extracted Phase 2)
@@ -91,7 +92,6 @@ namespace llaminar2
     class DiskPrefixStorageBackend;
     class DeviceHotPrefixStorageBackend;
     struct PrefixBlockHandle;
-    struct ExpertReplicaSet;
     class ActivationRotation;
     enum class KVCacheLayoutMode : uint8_t;
 
@@ -742,6 +742,9 @@ namespace llaminar2
          */
         void setFrozenWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set);
 
+        /// Install alternate full dense bindings for replicated-dense decode.
+        void setDecodeReplicatedDenseWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set);
+
         /**
          * @brief Set activation buffers for full forward pass
          *
@@ -903,6 +906,14 @@ namespace llaminar2
         /// without falling back to raw GGUF host tensors.
         ReceivedWeightsMap collectExpertWeightsForMasks(
             const std::vector<std::vector<bool>> &masks) const;
+
+        /// Try to satisfy requested expert arrivals by directly copying GPU
+        /// packed descriptors from a sibling device orchestrator. Returns a
+        /// copy of masks with successfully copied experts cleared; remaining
+        /// true bits should use collectExpertWeightsForMasks() fallback.
+        std::vector<std::vector<bool>> transferExpertWeightsDirectForMasksFrom(
+            DeviceGraphOrchestrator &source,
+            const std::vector<std::vector<bool>> &masks);
 
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
@@ -1490,14 +1501,15 @@ namespace llaminar2
 
         DeviceId primaryDeviceId() const override { return state_.device_id; }
 
-        bool hasLogitsLocal() const override { return state_.logits_local != nullptr; }
+        bool hasLogitsLocal() const override { return activeMainLogitsAreColumnParallel(); }
 
         LogitsLocalInfo getLogitsLocalInfo() const override
         {
-            if (!state_.logits_local)
+            if (!activeMainLogitsAreColumnParallel())
                 return {};
-            const auto &shape = state_.logits_local->shape();
             auto device_opt = state_.logits_local->current_device();
+            const size_t vocab_local = localLogitsVocabColumns(state_.logits_local.get());
+            const size_t row_stride = localLogitsRowStrideColumns(state_.logits_local.get());
             // Resolve the explicit worker stream for this device to avoid NULL stream races
             void *stream = nullptr;
             if (device_opt.has_value() && device_opt->is_gpu())
@@ -1507,7 +1519,7 @@ namespace llaminar2
             return LogitsLocalInfo{
                 state_.logits_local->gpu_data_ptr(),
                 device_opt,
-                shape.size() >= 2 ? shape[1] : 0,
+                vocab_local,
                 state_.logits_local.get(),
                 stream,
                 // Expose this runner's arena-owned argmax scratch so the
@@ -1515,16 +1527,18 @@ namespace llaminar2
                 // without any hot-path allocation.
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
-                argmax_partial_capacity_};
+                argmax_partial_capacity_,
+                row_stride};
         }
 
         LogitsLocalInfo consumeLogitsLocalInfoForSampling() override
         {
-            if (!state_.logits_local)
+            if (!activeMainLogitsAreColumnParallel())
                 return {};
 
-            const auto &shape = state_.logits_local->shape();
             auto device_opt = state_.logits_local->current_device();
+            const size_t vocab_local = localLogitsVocabColumns(state_.logits_local.get());
+            const size_t row_stride = localLogitsRowStrideColumns(state_.logits_local.get());
 
             /*
              * TP sampling is the semantic consumer of main-decode logits.  Use
@@ -1547,12 +1561,13 @@ namespace llaminar2
             return LogitsLocalInfo{
                 state_.logits_local->gpu_data_ptr(),
                 device_opt,
-                shape.size() >= 2 ? shape[1] : 0,
+                vocab_local,
                 state_.logits_local.get(),
                 stream,
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
-                argmax_partial_capacity_};
+                argmax_partial_capacity_,
+                row_stride};
         }
 
         bool hasMTPLogitsLocal() const override
@@ -1570,8 +1585,9 @@ namespace llaminar2
 
             auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
             TensorBase *mtp_logits = it->second.get();
-            const auto &shape = mtp_logits->shape();
             auto device_opt = mtp_logits->current_device();
+            const size_t vocab_local = localLogitsVocabColumns(mtp_logits);
+            const size_t row_stride = localLogitsRowStrideColumns(mtp_logits);
             void *stream = nullptr;
             if (device_opt.has_value() && device_opt->is_gpu())
             {
@@ -1580,12 +1596,13 @@ namespace llaminar2
             return LogitsLocalInfo{
                 mtp_logits->gpu_data_ptr(),
                 device_opt,
-                shape.size() >= 2 ? shape[1] : 0,
+                vocab_local,
                 mtp_logits,
                 stream,
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
-                argmax_partial_capacity_};
+                argmax_partial_capacity_,
+                row_stride};
         }
 
         LogitsLocalInfo consumeMTPLogitsLocalInfoForSampling() override
@@ -1595,8 +1612,9 @@ namespace llaminar2
 
             auto it = state_.extension_buffers.find(BufferId::MTP_LOGITS);
             TensorBase *mtp_logits = it->second.get();
-            const auto &shape = mtp_logits->shape();
             auto device_opt = mtp_logits->current_device();
+            const size_t vocab_local = localLogitsVocabColumns(mtp_logits);
+            const size_t row_stride = localLogitsRowStrideColumns(mtp_logits);
 
             /*
              * LocalTP MTP sampling is the semantic consumer of sidecar logits.
@@ -1619,12 +1637,13 @@ namespace llaminar2
             return LogitsLocalInfo{
                 mtp_logits->gpu_data_ptr(),
                 device_opt,
-                shape.size() >= 2 ? shape[1] : 0,
+                vocab_local,
                 mtp_logits,
                 stream,
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
-                argmax_partial_capacity_};
+                argmax_partial_capacity_,
+                row_stride};
         }
 
         bool hasAllPositionLogitsLocal() const override
@@ -1639,8 +1658,11 @@ namespace llaminar2
             if (!hasAllPositionLogitsLocal())
                 return {};
 
-            const auto &shape = state_.all_position_logits_local->shape();
             auto device_opt = state_.all_position_logits_local->current_device();
+            const size_t vocab_local =
+                localLogitsVocabColumns(state_.all_position_logits_local.get());
+            const size_t row_stride =
+                localLogitsRowStrideColumns(state_.all_position_logits_local.get());
             void *stream = nullptr;
             if (device_opt.has_value() && device_opt->is_gpu())
             {
@@ -1649,12 +1671,13 @@ namespace llaminar2
             return LogitsLocalInfo{
                 state_.all_position_logits_local->gpu_data_ptr(),
                 device_opt,
-                shape.size() >= 2 ? shape[1] : 0,
+                vocab_local,
                 state_.all_position_logits_local.get(),
                 stream,
                 argmax_partial_vals_dev_,
                 argmax_partial_idxs_dev_,
-                argmax_partial_capacity_};
+                argmax_partial_capacity_,
+                row_stride};
         }
 
         LogitsLocalInfo consumeAllPositionLogitsLocalInfoForSampling() override
@@ -2197,6 +2220,7 @@ namespace llaminar2
 
         /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
         bool isMoeRebalancingActive() const override;
+        bool prefillGraphCaptureDisabledByHost() const override;
 
         /** Return the active MoE placement epoch for graph-cache keying. */
         uint64_t moePlacementEpoch() const override;
@@ -2745,6 +2769,10 @@ namespace llaminar2
             int seq_len,
             int batch_size);
 
+        size_t localLogitsVocabColumns(const TensorBase *tensor) const;
+        size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
+        bool activeMainLogitsAreColumnParallel() const;
+
         /**
          * @brief Update dynamic parameters in a cached graph
          *
@@ -2818,6 +2846,11 @@ namespace llaminar2
         bool collectivesSupportSegmentedReplay() const;
 
         /**
+         * @brief Check whether LocalTP collectives may be captured inside GPU graphs
+         */
+        bool collectivesSupportCapturedGraph() const;
+
+        /**
          * @brief Check if we can use cached graph for current execution
          *
          * @param layer_idx Layer index
@@ -2832,6 +2865,9 @@ namespace llaminar2
 
         /** Build forward graph via fluent builder API. */
         GraphBuildResult buildForwardGraph(const ForwardInput &input) override;
+
+        /// Apply the currently active MoE replica assignment to newly built graphs.
+        void applyCurrentExpertReplicaSetToGraph(ComputeGraph &graph);
 
         /** Get device contexts for all PP pipeline devices. */
         std::unordered_map<DeviceId, IDeviceContext *> getPipelineDeviceContexts() override;
@@ -4442,6 +4478,11 @@ namespace llaminar2
         /// Additional routed overlay-domain rebalance controllers (owned).
         std::vector<std::unique_ptr<MoERebalanceController>> moe_rebalance_extra_controllers_;
 
+        /// Last applied expert replica assignment, replayed onto rebuilt graphs.
+        ExpertReplicaSet current_expert_replica_set_;
+        int current_expert_replica_participant_id_ = -1;
+        uint64_t current_expert_replica_epoch_ = 0;
+
         /// Optional expert weight payload provider for metadata-based host retention (owned)
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;
 
@@ -4450,6 +4491,7 @@ namespace llaminar2
 
         /// Frozen model weight set for audit/validation (Phase 6)
         std::unique_ptr<FrozenModelWeightSet> frozen_weight_set_;
+        std::unique_ptr<FrozenModelWeightSet> decode_replicated_dense_weight_set_;
 
         /// Build FrozenModelWeightSet from pre-resolved layer weights (Phase 6)
         void buildFrozenWeightSet(

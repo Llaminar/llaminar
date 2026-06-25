@@ -255,12 +255,15 @@ namespace llaminar2
                 config_.moe_hot_expert_cache,
                 config_.moe_rebalance,
                 config_.prefix_cache,
-                config_.mtp);
+                config_.mtp,
+                config_.tp_allreduce_precision_override);
             InferenceRunnerConfig base_runner_cfg;
             base_runner_cfg.max_seq_len = runtime_cfg.max_seq_len;
             base_runner_cfg.batch_size = runtime_cfg.batch_size;
             base_runner_cfg.activation_precision = runtime_cfg.activation_precision;
             base_runner_cfg.kv_cache_precision = runtime_cfg.kv_cache_precision;
+            base_runner_cfg.tp_allreduce_precision_override =
+                runtime_cfg.tp_allreduce_precision_override;
             base_runner_cfg.fused_attention_backend = runtime_cfg.fused_attention_backend;
             base_runner_cfg.moe_expert_mode = runtime_cfg.moe_expert_mode;
             base_runner_cfg.moe_hot_expert_cache = runtime_cfg.moe_hot_expert_cache;

@@ -549,6 +549,8 @@ namespace llaminar2
             ss << "    max_seq_len: " << runtime.max_seq_len << "\n";
             ss << "    activation_precision: " << activationPrecisionToString(runtime.activation_precision) << "\n";
             ss << "    kv_cache_precision: " << kvCachePrecisionToString(runtime.kv_cache_precision) << "\n";
+            if (!runtime.tp_allreduce_precision_override.empty())
+                ss << "    tp_allreduce_precision: " << runtime.tp_allreduce_precision_override << "\n";
             ss << "    fused_attention_backend: " << fusedAttentionBackendToString(runtime.fused_attention_backend) << "\n";
             ss << "    prefix_cache.enabled: " << (runtime.prefix_cache.enabled ? "true" : "false") << "\n";
             ss << "    prefix_cache.storage: " << prefixCacheStorageModeToString(runtime.prefix_cache.storage_mode) << "\n";

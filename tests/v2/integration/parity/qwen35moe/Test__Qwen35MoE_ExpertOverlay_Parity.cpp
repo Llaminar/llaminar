@@ -77,7 +77,7 @@ namespace
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -90,7 +90,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::cuda(0)};
         domain.world_ranks = {0};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -103,7 +103,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
         domain.world_ranks = {0, 1};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 

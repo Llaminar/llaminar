@@ -80,6 +80,7 @@ namespace llaminar2
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
         StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
+        HostPolicyDisabled,     ///< Host-level graph contract is not proven for this execution mode
         NoGPUContext,           ///< GPU context unavailable
         InvalidatedByPlacement, ///< Expert placement mutation since last capture
         SessionReset,           ///< Legacy name for request/session reset invalidation
@@ -149,7 +150,8 @@ namespace llaminar2
             bool moe_rebalancing_active = false,
             int real_seq_len = 0,
             int bucket_seq_len = 0,
-            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default) const;
+            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
+            bool collectives_graph_capturable = false) const;
 
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);

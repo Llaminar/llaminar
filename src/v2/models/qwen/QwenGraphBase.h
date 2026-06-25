@@ -148,6 +148,10 @@ namespace llaminar2
 
         void setWeights(const ModelWeights &weights) override { weights_ = weights; }
         void setWeightBindings(const ModelWeightBindings &bindings) override { weight_bindings_ = bindings; }
+        void setDecodeReplicatedDenseWeightBindings(const ModelWeightBindings &bindings) override
+        {
+            decode_replicated_dense_weight_bindings_ = bindings;
+        }
         void setBuffers(const ModelBuffers &buffers) override { buffers_ = buffers; }
 
         /**
@@ -322,8 +326,12 @@ namespace llaminar2
         PreparedWeightStore *prepared_weight_store_ = nullptr;
         ModelWeights weights_;
         ModelWeightBindings weight_bindings_;
+        ModelWeightBindings decode_replicated_dense_weight_bindings_;
         ModelBuffers buffers_;
         StageSnapshotCallback snapshot_callback_;
+        bool decode_replicated_dense_graph_active_ = false;
+        bool replicated_attention_state_graph_active_ = false;
+        bool decode_mirrored_embedding_graph_active_ = false;
 
         // =====================================================================
         // Helpers
@@ -331,8 +339,36 @@ namespace llaminar2
 
         TensorContext buildTensorContext() const;
         bool needsTPAllreduce() const;
+        bool denseTPAllreduceEnabledForCurrentGraph() const;
         bool hasActiveExpertMask(const std::vector<bool> &expert_mask) const;
         bool hasLayerWeightSource() const;
+        bool hasDecodeReplicatedDenseWeightSource() const;
+        bool useDecodeReplicatedDenseWeights() const;
+        bool hasDecodeMirroredEmbeddingWeightSource() const;
+        bool useDecodeMirroredEmbeddingWeights() const;
+        bool useFullVocabEmbeddingForCurrentGraph() const;
+        bool useReplicatedAttentionStateWeights() const;
+        bool denseDecodeReplicatedActiveForTokens(int total_tokens) const;
+        bool denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const;
+        bool replicatedAttentionStateActiveForTokens(int total_tokens) const;
+        bool attentionTPAllreduceEnabledForCurrentGraph() const;
+
+        class DecodeReplicatedDenseScope
+        {
+        public:
+            DecodeReplicatedDenseScope(QwenGraphBase &owner, int total_tokens);
+            ~DecodeReplicatedDenseScope();
+
+            DecodeReplicatedDenseScope(const DecodeReplicatedDenseScope &) = delete;
+            DecodeReplicatedDenseScope &operator=(const DecodeReplicatedDenseScope &) = delete;
+
+        private:
+            QwenGraphBase &owner_;
+            bool previous_;
+            bool previous_attention_;
+            bool previous_embedding_;
+        };
+
         LayerWeightBindings layerWeightBindingsForGraph(int layer_idx) const;
         LayerWeights layerWeightsForGraph(int layer_idx) const;
         TensorBase *modelEmbeddingTable() const;

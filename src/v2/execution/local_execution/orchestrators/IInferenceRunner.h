@@ -59,6 +59,7 @@ namespace llaminar2
         void *argmax_partial_vals = nullptr; ///< FP32 scratch [argmax_partial_capacity]
         void *argmax_partial_idxs = nullptr; ///< INT32 scratch [argmax_partial_capacity]
         int argmax_partial_capacity = 0;     ///< Number of entries in the scratch buffers
+        size_t row_stride = 0;               ///< Physical row stride in floats; 0 means vocab_local
 
         /// True if this info is valid (has a tensor)
         explicit operator bool() const { return tensor != nullptr; }
@@ -1832,7 +1833,9 @@ namespace llaminar2
          * result pairs (8 bytes per device vs ~600 KB for full logits).
          *
          * @return Token ID (>= 0) if on-device sampling succeeded,
-         *         -1 if not supported (caller should fall back to logits() + CPU argmax)
+         *         -1 if not supported or failed. Callers may use host logits
+         *         only for CPU-only execution; GPU decode treats this as a
+         *         hard failure so it does not silently copy logits to host.
          */
         virtual int sampleGreedyOnDevice() { return -1; }
 
@@ -1994,7 +1997,9 @@ namespace llaminar2
          *
          * @param penalties Sparse penalty entries (token_id, penalty) to subtract
          * @param vocab_size Vocabulary size (for bounds checking)
-         * @return true if applied on device, false if not supported (caller should fall back)
+         * @return true if applied on device, false if unsupported or failed.
+         *         GPU decode callers must treat false as a hard failure rather
+         *         than silently falling back to host logits.
          */
         virtual bool applyPenaltiesOnDevice(const std::vector<LogitPenalty> &penalties,
                                             int vocab_size)

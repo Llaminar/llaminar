@@ -432,7 +432,7 @@ namespace llaminar2
         bool moe_sparse_experts_cpu = true; ///< Place sparse experts on CPU
 
         /// Routed MoE expert execution mode for the standard Qwen3.5 MoE path.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
 
         /// Bounded hot remote expert cache for dynamic expert-parallel execution.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
@@ -449,6 +449,7 @@ namespace llaminar2
 
         std::string activation_precision = "fp32"; ///< "fp32", "bf16", "fp16", "q8_1"
         std::string kv_cache_precision = "auto";   ///< "auto" (q16_1 on CPU, fp16 on GPU), "fp32", "fp16", "q8_1", "q16_1"
+        std::string tp_allreduce_precision_override; ///< "", "auto"/"schema", "fp32", "fp16", or "bf16"
 
         // =========================================================================
         // Prefix Cache and MTP

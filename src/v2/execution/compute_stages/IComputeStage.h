@@ -806,10 +806,11 @@ namespace llaminar2
         /**
          * @brief Get the GPU stream for kernel dispatch
          *
-         * Returns the stream assigned by the executor, or nullptr if none was set.
-         * GPU kernel wrapper functions should pass this to their launch calls.
+         * Returns the explicit stream assigned by the executor, or nullptr if
+         * none was set. GPU code that needs stream ordering must treat nullptr
+         * as an error, not as permission to use the CUDA/HIP legacy stream.
          *
-         * @return Opaque GPU stream pointer (nullptr = use default stream)
+         * @return Opaque GPU stream pointer (nullptr = no explicit stream)
          */
         void *gpuStream() const { return gpu_stream_; }
 

@@ -148,6 +148,7 @@ namespace llaminar2
     enum class ForwardReplayStateCacheClass
     {
         Other,
+        ExactPrefill,
         BucketedPrefill,
         OrdinaryDecode,
         SingleTokenOrdinaryDecode,
@@ -174,7 +175,7 @@ namespace llaminar2
         {
             if (signature.is_bucketed_prefill)
                 return ForwardReplayStateCacheClass::BucketedPrefill;
-            return ForwardReplayStateCacheClass::Other;
+            return ForwardReplayStateCacheClass::ExactPrefill;
         }
         if (signature.all_position_logits)
             return ForwardReplayStateCacheClass::AllPositionVerifier;
@@ -222,6 +223,7 @@ namespace llaminar2
         if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
             (cache_class == ForwardReplayStateCacheClass::SingleTokenOrdinaryDecode ||
              cache_class == ForwardReplayStateCacheClass::AllPositionVerifier ||
+             cache_class == ForwardReplayStateCacheClass::ExactPrefill ||
              cache_class == ForwardReplayStateCacheClass::BucketedPrefill))
         {
             return ForwardReplayStateAction::PreserveReplayStateAndRebindStreams;
@@ -606,13 +608,11 @@ namespace llaminar2
          * clears stage/kernels' dynamic metadata and decode replay captures so
          * the next prompt starts from cleared KV/GDN model state.
          *
-         * Monolithic prefill graph captures are dropped here even though the
-         * cached ComputeGraph topology is preserved.  Prefill captures record a
-         * stateful prompt mutation over KV/GDN/short-conv buffers and may embed
-         * backend context/workspace pointers in captured kernel parameters.  A
-         * request clear resets those live buffers, so the next request must warm
-         * or capture prefill against the fresh state instead of replaying the
-         * prior request's executable graph.
+         * Callers that need reusable prefill graph-cache state should use
+         * resetSessionStatePreservingSegmentedReplay().  That path delegates to
+         * PrefillGraphCache::prepareEntriesForRequestReset(), which either keeps
+         * replay-ready executable graphs or demotes warmup-only entries to
+         * Initialized so they can capture against fresh request state.
          */
         void resetSessionState()
         {

@@ -905,6 +905,8 @@ namespace llaminar2
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
      *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
      *                                        containing collectives (default: 0 - OFF, experimental)
+     *   LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES - Capture LocalTP NCCL/RCCL collectives directly into
+     *                                        decode GPU graphs (default: 0 - OFF, experimental)
      *
      * Device Placement / Heterogeneous Execution:
      *   LLAMINAR_CPU_PREFILL_PARTICIPATE   - Enable CPU participation in PREFILL phase (default: 0 - OFF)
@@ -947,6 +949,8 @@ namespace llaminar2
         bool gpu_graph_recapture = false;                                      ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
         int gpu_graph_max_stages = 0;                                          ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
         bool gpu_graph_collective_segmented = false;                           ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
+        bool gpu_graph_capture_collectives = false;                            ///< Capture homogeneous LocalTP NCCL/RCCL collectives inside decode GPU graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES)
+        bool gpu_graph_defer_captured_collective_final_sync = false;           ///< Allow final-sync deferral when collective nodes are captured in the replay graph (env: LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC)
         std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist for segmented collective capture (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
         bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
         bool gpu_graph_stream_only_default = false;                            ///< Stream-only mode uses default stream (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY_DEFAULT)
@@ -1126,6 +1130,20 @@ namespace llaminar2
             if (gpu_graph_collective_segmented_env)
             {
                 gpu_graph_collective_segmented = (std::atoi(gpu_graph_collective_segmented_env) != 0);
+            }
+
+            const char *gpu_graph_capture_collectives_env = std::getenv("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES");
+            if (gpu_graph_capture_collectives_env)
+            {
+                gpu_graph_capture_collectives = (std::atoi(gpu_graph_capture_collectives_env) != 0);
+            }
+
+            const char *gpu_graph_defer_captured_collective_sync_env =
+                std::getenv("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC");
+            if (gpu_graph_defer_captured_collective_sync_env)
+            {
+                gpu_graph_defer_captured_collective_final_sync =
+                    (std::atoi(gpu_graph_defer_captured_collective_sync_env) != 0);
             }
 
             gpu_graph_collective_segmented_capture_allow.clear();
@@ -3443,6 +3461,24 @@ namespace llaminar2
         /// FP16/BF16 halves PCIe transfer bandwidth; FP32 is lossless but slower on bandwidth-limited links.
         std::string allreduce_precision = "fp32";
 
+        /// Minimum element count required before an FP32 tensor requested as FP16
+        /// actually takes the cast-to-FP16 collective path.
+        /// (env: LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS, default: 0)
+        /// Tiny decode reductions can be faster in FP32 because the two cast kernels
+        /// cost more than the bandwidth savings.
+        size_t allreduce_fp16_min_elements = 0;
+
+        /// Experimental LocalTP fast path for tiny two-GPU FP32/SUM allreduces.
+        /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE, default: disabled)
+        /// When enabled, homogeneous two-card CUDA/ROCm LocalTP domains can use
+        /// a graph-capturable peer-add kernel instead of NCCL/RCCL for small decode
+        /// reductions where library collective launch overhead dominates payload cost.
+        bool localtp_small_gpu_allreduce = false;
+
+        /// Maximum element count for the small peer-add allreduce fast path.
+        /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS, default: 8192)
+        size_t localtp_small_gpu_allreduce_max_elements = 8192;
+
         /// Timeout in ms for tensor-parallel coordination waits and blocking MPI collectives
         /// (env: LLAMINAR_TP_COLLECT_TIMEOUT_MS).
         /// Debug/Integration builds default to a 30s safety net to avoid deadlocked tests;
@@ -3459,6 +3495,18 @@ namespace llaminar2
         /// Emit coarse GPU VRAM checkpoints around major allocation phases.
         /// (env: LLAMINAR_VRAM_TRACE=1)
         bool vram_trace = false;
+
+        /// Emit per-buffer VRAM bill-of-materials rows for allocation diagnosis.
+        /// (env: LLAMINAR_VRAM_BOM=1)
+        bool vram_bom = false;
+
+        /// GPU weight-pipeline VRAM preflight safety margin as a percent of total VRAM.
+        /// (env: LLAMINAR_GPU_VRAM_PREFLIGHT_MARGIN_PCT, default: 5)
+        double gpu_vram_preflight_margin_pct = 5.0;
+
+        /// Minimum GPU weight-pipeline VRAM preflight safety margin in MiB.
+        /// (env: LLAMINAR_GPU_VRAM_PREFLIGHT_MIN_MARGIN_MB, default: 512)
+        int gpu_vram_preflight_min_margin_mib = 512;
 
         static const char *envValue(const char *name)
         {
@@ -3526,6 +3574,17 @@ namespace llaminar2
                 moe_expert_overlay.profile_csv_path = csv;
         }
 
+        void reloadGpuVramPreflightEnv()
+        {
+            gpu_vram_preflight_margin_pct = 5.0;
+            if (const char *pct = std::getenv("LLAMINAR_GPU_VRAM_PREFLIGHT_MARGIN_PCT"))
+                gpu_vram_preflight_margin_pct = std::max(0.0, std::atof(pct));
+
+            gpu_vram_preflight_min_margin_mib = 512;
+            if (const char *min_mib = std::getenv("LLAMINAR_GPU_VRAM_PREFLIGHT_MIN_MARGIN_MB"))
+                gpu_vram_preflight_min_margin_mib = std::max(0, std::atoi(min_mib));
+        }
+
         DebugEnv()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
@@ -3542,12 +3601,21 @@ namespace llaminar2
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
                 allreduce_precision = ar_prec;
+            allreduce_fp16_min_elements = 0;
+            if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
+                allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
+            localtp_small_gpu_allreduce = isTruthyEnvValue(std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"));
+            localtp_small_gpu_allreduce_max_elements = 8192;
+            if (const char *small_ar_max = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS"))
+                localtp_small_gpu_allreduce_max_elements = static_cast<size_t>(std::max(0, std::atoi(small_ar_max)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
+            vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
+            reloadGpuVramPreflightEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -3604,12 +3672,21 @@ namespace llaminar2
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
                 allreduce_precision = ar_prec;
+            allreduce_fp16_min_elements = 0;
+            if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
+                allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
+            localtp_small_gpu_allreduce = isTruthyEnvValue(std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"));
+            localtp_small_gpu_allreduce_max_elements = 8192;
+            if (const char *small_ar_max = std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS"))
+                localtp_small_gpu_allreduce_max_elements = static_cast<size_t>(std::max(0, std::atoi(small_ar_max)));
             const char *collect_timeout = std::getenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS");
             if (collect_timeout)
                 tp_collect_timeout_ms = std::atoi(collect_timeout);
             const char *weight_trace = std::getenv("LLAMINAR_WEIGHT_LIFECYCLE_TRACE");
             weight_lifecycle_trace = weight_trace && std::string(weight_trace) == "1";
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
+            vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
+            reloadGpuVramPreflightEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on

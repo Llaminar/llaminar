@@ -1646,9 +1646,27 @@ struct DeviceNativeVNNIMatrixDesc
     uint8_t reserved[3];
 };
 
+template <NativeVNNIFormat FMT>
+__device__ __forceinline__ bool native_vnni_desc_shape_ok(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int N,
+    int K)
+{
+    using Traits = NVNNITraits<FMT>;
+    return desc.payload &&
+           desc.scales &&
+           desc.n == N &&
+           desc.k == K &&
+           desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
+           desc.codebook_id == static_cast<uint8_t>(FMT) &&
+           (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
+           (!Traits::is_dual_scale_asym || desc.emins);
+}
+
 __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
     const float* const* __restrict__ gate_ptrs,
     const float* const* __restrict__ up_ptrs,
+    const int* __restrict__ expert_ids,
     int8_t* __restrict__ A_int8,
     float* __restrict__ scales_A_blockwise,
     int num_active,
@@ -1656,6 +1674,7 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
 {
     const int slot = blockIdx.x;
     if (slot >= num_active) return;
+    if (expert_ids && expert_ids[slot] < 0) return;
 
     constexpr int BLOCK_SIZE = 32;
     constexpr int NUM_WARPS = 8;
@@ -2071,7 +2090,11 @@ __global__ void moe_grouped_native_vnni_down_kernel_t(
         int desc_idx = slot;
         if constexpr (INDEX_BY_EXPERT_ID)
             desc_idx = expert_ids[slot];
+        if (desc_idx < 0)
+            continue;
         const DeviceNativeVNNIMatrixDesc desc = descs[desc_idx];
+        if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+            continue;
         const uint8_t* payload_base = desc.payload;
         const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
         const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
@@ -2166,6 +2189,8 @@ __global__ void moe_grouped_native_vnni_down_parallel_experts_kernel_t(
 
     const int blocks_per_row = K / 32;
     const DeviceNativeVNNIMatrixDesc desc = descs[expert_id];
+    if (!native_vnni_desc_shape_ok<FMT>(desc, N, K))
+        return;
     const uint8_t* payload_base = desc.payload;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
     const uint16_t* min_base = static_cast<const uint16_t*>(desc.mins);
@@ -2271,6 +2296,17 @@ __device__ __forceinline__ float moe_native_vnni_dot_desc_range(
     int b_start,
     int b_end)
 {
+    if (!A_int8 ||
+        !scales_A_blockwise ||
+        n < 0 ||
+        n >= N ||
+        K <= 0 ||
+        (K % 32) != 0 ||
+        !native_vnni_desc_shape_ok<FMT>(desc, N, K))
+    {
+        return 0.0f;
+    }
+
     const int blocks_per_row = K / 32;
     const uint8_t* payload_base = desc.payload;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
@@ -2374,8 +2410,15 @@ __global__ void moe_grouped_native_vnni_gate_up_kernel_t(
     if (slot >= num_active || n >= N) return;
 
     const int expert_id = expert_ids[slot];
+    if (expert_id < 0)
+        return;
     const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
     const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        return;
+    }
 
     gate_outputs[slot][n] = moe_native_vnni_dot_desc<FMT>(
         gate_desc, n, A_int8, scales_A_blockwise, N, K);
@@ -2419,11 +2462,7 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
         static_cast<size_t>(n);
 
     if (expert_id < 0)
-    {
-        gate_partials[partial_index] = 0.0f;
-        up_partials[partial_index] = 0.0f;
         return;
-    }
 
     const int blocks_per_row = K / 32;
     const int blocks_per_part = (blocks_per_row + effective_k_partitions - 1) / effective_k_partitions;
@@ -2440,6 +2479,13 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
 
     const DeviceNativeVNNIMatrixDesc gate_desc = gate_descs[expert_id];
     const DeviceNativeVNNIMatrixDesc up_desc = up_descs[expert_id];
+    if (!native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
+    {
+        gate_partials[partial_index] = 0.0f;
+        up_partials[partial_index] = 0.0f;
+        return;
+    }
 
     gate_partials[partial_index] = moe_native_vnni_dot_desc_range<FMT>(
         gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
@@ -2450,6 +2496,7 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_kernel_t(
 __global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_kernel(
     const float* __restrict__ gate_partials,
     const float* __restrict__ up_partials,
+    const int* __restrict__ expert_ids,
     float* const* __restrict__ gate_outputs,
     float* const* __restrict__ up_outputs,
     int num_active,
@@ -2460,6 +2507,7 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_kernel(
     const int n = blockIdx.x * TILE_N + threadIdx.x;
     const int slot = blockIdx.y;
     if (slot >= num_active || n >= N) return;
+    if (expert_ids && expert_ids[slot] < 0) return;
 
     float gate_sum = 0.0f;
     float up_sum = 0.0f;
@@ -2479,6 +2527,7 @@ template <int K_PARTITIONS>
 __global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel(
     const float* __restrict__ gate_partials,
     const float* __restrict__ up_partials,
+    const int* __restrict__ expert_ids,
     int8_t* __restrict__ swiglu_int8,
     float* __restrict__ swiglu_scales,
     int num_active,
@@ -2490,6 +2539,7 @@ __global__ void moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel
 
     const int slot = blockIdx.y;
     if (slot >= num_active) return;
+    if (expert_ids && expert_ids[slot] < 0) return;
 
     constexpr int BLOCK_SIZE = 32;
     const int blocks_per_row = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -3739,7 +3789,7 @@ bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
     dim3 reduce_grid((N + TN - 1) / TN, num_active);
     hipLaunchKernelGGL(moe_grouped_native_vnni_gate_up_kpart_reduce_kernel,
         reduce_grid, block, 0, hip_stream,
-        d_gate_partials, d_up_partials, d_gate_outputs, d_up_outputs,
+        d_gate_partials, d_up_partials, d_expert_ids, d_gate_outputs, d_up_outputs,
         num_active, N, k_partitions);
 
     err = hipGetLastError();
@@ -3872,7 +3922,7 @@ bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
         hipLaunchKernelGGL(                                                                      \
             HIP_KERNEL_NAME(moe_grouped_native_vnni_gate_up_kpart_reduce_swiglu_quant_kernel<KPARTS_TAG>), \
             quant_grid, quant_block, 0, hip_stream,                                              \
-            d_gate_partials, d_up_partials, d_swiglu_int8, d_swiglu_scales,                     \
+            d_gate_partials, d_up_partials, d_expert_ids, d_swiglu_int8, d_swiglu_scales,       \
             num_active, N)
 
     switch (k_partitions)
@@ -3928,7 +3978,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode(
     constexpr int QUANT_THREADS = 256;
     hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
         dim3(num_active), dim3(QUANT_THREADS), 0, static_cast<hipStream_t>(stream),
-        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
+        d_gate_ptrs, d_up_ptrs, nullptr, d_swiglu_int8, d_swiglu_scales,
         num_active, K);
 
     hipError_t err = hipGetLastError();
@@ -4016,7 +4066,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
     constexpr int QUANT_THREADS = 256;
     hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
         dim3(num_active), dim3(QUANT_THREADS), 0, static_cast<hipStream_t>(stream),
-        d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
+        d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales,
         num_active, K);
 
     hipError_t err = hipGetLastError();
@@ -4110,7 +4160,7 @@ bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
         constexpr int QUANT_THREADS = 256;
         hipLaunchKernelGGL(moe_grouped_swiglu_quantize_blockwise_kernel,
             dim3(num_active), dim3(QUANT_THREADS), 0, hip_stream,
-            d_gate_ptrs, d_up_ptrs, d_swiglu_int8, d_swiglu_scales,
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales,
             num_active, K);
 
         err = hipGetLastError();

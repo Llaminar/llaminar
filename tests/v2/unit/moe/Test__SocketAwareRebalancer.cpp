@@ -233,6 +233,50 @@ TEST(Test__SocketAwareRebalancer, SingleLayerSwap_SkewedRouting)
     EXPECT_GT(proposal.layer_metrics[0].imbalance_before, 1.1f);
 }
 
+TEST(Test__SocketAwareRebalancer, ProposeUsesUpdatedHistogramPlacement)
+{
+    auto cfg = makeConfig(1, 4, 1, 256);
+    DecodeExpertHistogram hist(cfg);
+
+    // Move the hot expert to socket 1 before recording the next window.
+    // Proposals must use this current map, not the construction-time map.
+    const std::vector<int> updated_placement = {1, 1, 0, 0};
+    hist.updatePlacement(updated_placement);
+
+    std::vector<float> weights = {1.0f};
+    for (int t = 0; t < 50; ++t)
+        recordToken(hist, 0, {0}, weights);
+    for (int t = 0; t < 35; ++t)
+        recordToken(hist, 0, {1}, weights);
+    for (int t = 0; t < 10; ++t)
+        recordToken(hist, 0, {2}, weights);
+    for (int t = 0; t < 20; ++t)
+        recordToken(hist, 0, {3}, weights);
+
+    SocketRebalanceConfig rcfg;
+    rcfg.imbalance_threshold = 1.1f;
+    rcfg.max_swaps_per_layer = 1;
+    rcfg.min_window_activations = 1;
+    rcfg.min_improvement_ratio = 0.0f;
+    SocketAwareRebalancer rebalancer(rcfg);
+
+    auto proposal = rebalancer.propose(hist);
+    ASSERT_FALSE(proposal.empty());
+
+    bool saw_hot_expert = false;
+    for (const auto &swap : proposal.swaps)
+    {
+        EXPECT_EQ(swap.from_socket, updated_placement[swap.expert_id]);
+        if (swap.expert_id == 0)
+        {
+            saw_hot_expert = true;
+            EXPECT_EQ(swap.from_socket, 1);
+            EXPECT_EQ(swap.to_socket, 0);
+        }
+    }
+    EXPECT_TRUE(saw_hot_expert);
+}
+
 TEST(Test__SocketAwareRebalancer, MultiLayerSwaps)
 {
     const int num_layers = 4;

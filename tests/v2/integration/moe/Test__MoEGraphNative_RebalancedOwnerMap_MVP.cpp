@@ -45,7 +45,7 @@ namespace llaminar2::test
             d.backend = CollectiveBackendType::NCCL;
             d.participants = {GlobalDeviceAddress::cuda(0, 0)};
             d.owner_rank = 0;
-            d.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            d.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return d;
         }
 
@@ -57,7 +57,7 @@ namespace llaminar2::test
             d.backend = CollectiveBackendType::RCCL;
             d.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(0, 1)};
             d.owner_rank = 0;
-            d.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            d.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return d;
         }
 
@@ -69,7 +69,7 @@ namespace llaminar2::test
             d.backend = CollectiveBackendType::MPI;
             d.participants = {GlobalDeviceAddress::cpu(0)};
             d.owner_rank = 0;
-            d.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            d.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return d;
         }
 

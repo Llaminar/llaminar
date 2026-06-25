@@ -117,7 +117,7 @@ namespace llaminar2
 
         if (active_sampling_params_.has_penalties())
         {
-            token = -1; // Force CPU fallback
+            token = -1;
         }
         else if (active_sampling_params_.is_greedy())
         {
@@ -130,7 +130,16 @@ namespace llaminar2
 
         if (token < 0)
         {
-            // Fallback: CPU-side sampling
+            if (global_orch_->primaryDeviceId().is_gpu())
+            {
+                result.error =
+                    active_sampling_params_.has_penalties()
+                        ? "GPU decode penalty application failed; CPU logits fallback is disabled"
+                        : "GPU decode sampling failed; CPU logits fallback is disabled";
+                return result;
+            }
+
+            // CPU-only host sampling.
             const float *logits_ptr = global_orch_->logits();
             if (!logits_ptr)
             {

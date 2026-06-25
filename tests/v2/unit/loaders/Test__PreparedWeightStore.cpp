@@ -210,6 +210,101 @@ TEST(Test__PreparedWeightStore, AdoptsPreparedGemmByCanonicalNameAfterHostPayloa
     EXPECT_TRUE(later_tensor->hasPreparedDeviceState());
 }
 
+TEST(Test__PreparedWeightStore, DoesNotAdoptPreparedGemmAcrossDifferentSlicesWithSameCanonicalName)
+{
+    PreparedWeightStore store(ModelContextId{99});
+
+    auto sharded_tensor = makeQ8_0Tensor(2048, 4096);
+    auto sharded_binding = makeStoreBinding(41, "blk.19.attn_output.weight", DeviceId::cuda(1));
+    sharded_binding.tensor = sharded_tensor.get();
+    sharded_binding.slice.source_rows = 4096;
+    sharded_binding.slice.source_cols = 4096;
+    sharded_binding.slice.row_start = 2048;
+    sharded_binding.slice.row_count = 2048;
+    sharded_binding.slice.col_start = 0;
+    sharded_binding.slice.col_count = 4096;
+    sharded_binding.slice.inner_is_presliced = true;
+
+    auto handle = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+    handle->tensor = sharded_tensor.get();
+    handle->device_id = DeviceId::cuda(1);
+    handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
+    handle->prepared_weights = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+
+    auto sharded_ref = store.registerPreparedGemmHandle(
+        sharded_binding,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(1),
+        std::move(handle));
+    ASSERT_TRUE(store.contains(sharded_ref));
+
+    auto full_tensor = makeQ8_0Tensor(4096, 4096);
+    auto full_binding = makeStoreBinding(42, "blk.19.attn_output.weight", DeviceId::cuda(1));
+    full_binding.tensor = full_tensor.get();
+    full_binding.slice.source_rows = 4096;
+    full_binding.slice.source_cols = 4096;
+    full_binding.slice.row_start = 0;
+    full_binding.slice.row_count = 4096;
+    full_binding.slice.col_start = 0;
+    full_binding.slice.col_count = 4096;
+    full_binding.prepared = PreparedWeightRef{
+        ModelContextId{99},
+        full_binding.binding_id,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(1)};
+
+    EXPECT_FALSE(store.adoptPreparedGemmForBinding(full_binding, DeviceId::cuda(1)))
+        << "Dense decode replicated full weights must not inherit a TP shard prepared handle by canonical name";
+    EXPECT_FALSE(store.preparedRefForBinding(full_binding.binding_id, DeviceId::cuda(1)).has_value());
+}
+
+TEST(Test__PreparedWeightStore, AdoptsPreparedGemmAcrossEquivalentSlicesWithSameCanonicalName)
+{
+    PreparedWeightStore store(ModelContextId{99});
+
+    auto prepared_tensor = makeQ8_0Tensor(2048, 2048);
+    auto prepared_binding = makeStoreBinding(43, "output.weight", DeviceId::cuda(0));
+    prepared_binding.tensor = prepared_tensor.get();
+    prepared_binding.slice.source_rows = 4096;
+    prepared_binding.slice.source_cols = 2048;
+    prepared_binding.slice.row_start = 0;
+    prepared_binding.slice.row_count = 2048;
+    prepared_binding.slice.col_start = 0;
+    prepared_binding.slice.col_count = 2048;
+    prepared_binding.slice.inner_is_presliced = true;
+
+    auto handle = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmHandle>();
+    handle->tensor = prepared_tensor.get();
+    handle->device_id = DeviceId::cuda(0);
+    handle->kind = llaminar::v2::kernels::KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED;
+    handle->prepared_weights = std::make_shared<llaminar::v2::kernels::KernelFactory::PreparedGemmWeights>();
+
+    auto prepared_ref = store.registerPreparedGemmHandle(
+        prepared_binding,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(0),
+        std::move(handle));
+    ASSERT_TRUE(store.contains(prepared_ref));
+
+    auto later_tensor = makeQ8_0Tensor(2048, 2048);
+    later_tensor->release_host_weight_data();
+    auto later_binding = makeStoreBinding(44, "output.weight", DeviceId::cuda(0));
+    later_binding.tensor = later_tensor.get();
+    later_binding.slice = prepared_binding.slice;
+    later_binding.prepared = PreparedWeightRef{
+        ModelContextId{99},
+        later_binding.binding_id,
+        PreparedWeightKind::CudaInt8PackedGemm,
+        DeviceId::cuda(0)};
+
+    EXPECT_TRUE(store.adoptPreparedGemmForBinding(later_binding, DeviceId::cuda(0)))
+        << "Frozen sharded bindings should be able to adopt equivalent generic pipeline handles";
+    auto adopted_ref = store.preparedRefForBinding(later_binding.binding_id, DeviceId::cuda(0));
+    ASSERT_TRUE(adopted_ref.has_value());
+    EXPECT_EQ(adopted_ref->binding_id, later_binding.binding_id);
+    EXPECT_TRUE(later_tensor->hasPreparedDeviceState());
+}
+
 TEST(Test__PreparedWeightStore, SameTensorDifferentBindingDoesNotResolveAccidentally)
 {
     PreparedWeightStore store(ModelContextId{99});

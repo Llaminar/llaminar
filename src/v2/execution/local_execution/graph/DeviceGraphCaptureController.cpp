@@ -2076,6 +2076,7 @@ namespace llaminar2
         IDeviceContext *ctx,
         IWorkerGPUContext *gpu_ctx,
         bool has_collective_nodes,
+        bool collectives_graph_capturable,
         uint64_t current_step,
         const ReplayHooks &hooks,
         bool force_recapture,
@@ -2118,9 +2119,15 @@ namespace llaminar2
             return result;
         }
 
+        const bool captured_collectives_can_defer_final_sync =
+            has_collective_nodes &&
+            collectives_graph_capturable &&
+            exec_cfg.gpu_graph_defer_captured_collective_final_sync;
+        const bool collective_sync_requires_eager_wait =
+            has_collective_nodes && !captured_collectives_can_defer_final_sync;
         const bool can_defer_final_sync =
             defer_final_sync &&
-            !has_collective_nodes &&
+            !collective_sync_requires_eager_wait &&
             std::all_of(segment_cache.segments.begin(),
                         segment_cache.segments.end(),
                         [](const DeviceGraphExecutor::GraphSegment &segment)

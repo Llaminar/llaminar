@@ -966,7 +966,7 @@ TEST(Test__ForwardReplayStatePolicy, CorrectionReplayPreservesSingleTokenDecodeC
         << "All-position verifier replay publishes row-local state through stage-owned capture slots "
            "and refreshes row metadata before every launch.";
     EXPECT_EQ(classifyForwardReplayStateCache(prefill),
-              ForwardReplayStateCacheClass::Other);
+              ForwardReplayStateCacheClass::ExactPrefill);
     EXPECT_EQ(classifyForwardReplayStateCache(bucketed_prefill),
               ForwardReplayStateCacheClass::BucketedPrefill);
 
@@ -1043,8 +1043,8 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecod
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
                   prefill),
-              ForwardReplayStateAction::ResetReplayState)
-        << "Non-bucketed prefill remains request-stateful.";
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "Exact prefill cache reset demotes warmup to Initialized and refreshes graph-facing buffers before capture/replay.";
     EXPECT_EQ(chooseForwardReplayStateAction(
                   ForwardReplayStateMutationKind::RequestBoundaryStateReset,
                   bucketed_prefill),
@@ -1214,6 +1214,7 @@ TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
         1.0);
 
     PerfStatsCollector::reset();
+    mutableDebugEnv().execution.gpu_graph_defer_captured_collective_final_sync = false;
 }
 
 TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
@@ -1256,6 +1257,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
     EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
 
     PerfStatsCollector::reset();
+    mutableDebugEnv().execution.gpu_graph_defer_captured_collective_final_sync = false;
 }
 
 TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
@@ -1323,6 +1325,7 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/3,
         hooks);
 
@@ -1408,7 +1411,7 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     cache.segments.back().stage_names = {"row_select"};
     cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
 
-    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
@@ -1421,6 +1424,7 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/3,
         hooks);
 
@@ -1507,6 +1511,7 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/5,
         hooks);
 
@@ -1576,6 +1581,7 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
         &ctx,
         &gpu_ctx,
         /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
         /*current_step=*/7,
         hooks,
         /*force_recapture=*/false,
@@ -1624,6 +1630,120 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
         {"type", "capturable"}};
     EXPECT_DOUBLE_EQ(findCounterValue(
                          forward_records,
+                         "segmented_replay_final_sync_deferred",
+                         deferred_tags),
+                     1.0);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDoesNotDeferFinalSyncByDefault)
+{
+    ScopedEnvVar disable_collective_defer("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", "0");
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    mutableDebugEnv().execution.reload();
+    PerfStatsCollector::reset();
+    ASSERT_FALSE(debugEnv().execution.gpu_graph_defer_captured_collective_final_sync);
+
+    ComputeGraph graph;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "main_decode";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"captured_collective_graph"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/true,
+        /*current_step=*/9,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_GT(gpu_ctx.synchronize_stream_checked_calls_, 0)
+        << "Captured collective graphs remain eagerly synchronized unless the opt-in is set";
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags sync_tags = {
+        {"attribution", "host_wall"},
+        {"context", "main_decode"},
+        {"graph_capture_scope", "segmented_replay_host"},
+        {"segment_count", "1"},
+        {"source", "segmented_graph_capture"},
+        {"stage_count", "1"},
+        {"timing_scope", "final_stream_sync_host_wall"},
+        {"type", "capturable"}};
+    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", sync_tags), 1u);
+
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn)
+{
+    ScopedEnvVar enable_collective_defer("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", "1");
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar enable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "1");
+    mutableDebugEnv().execution.reload();
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "main_decode";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"captured_collective_graph"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/true,
+        /*current_step=*/10,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 1);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"context", "main_decode"},
+        {"segment_count", "1"},
+        {"stage_count", "1"},
+        {"type", "capturable"}};
+    EXPECT_DOUBLE_EQ(findCounterValue(
+                         records,
                          "segmented_replay_final_sync_deferred",
                          deferred_tags),
                      1.0);

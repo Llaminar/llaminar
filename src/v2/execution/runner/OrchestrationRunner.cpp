@@ -11190,11 +11190,19 @@ namespace llaminar2
             pending_mtp_condition_resident_state_.reset();
         }
 
-        // Tail stage: try GPU-side sampling first, fall back to CPU
-        // When penalties are active, compute the sparse penalty map on CPU,
-        // upload to GPU, apply in-place, then sample on GPU.
-        // This avoids the full ~600KB D2H transfer of logits.
+        // Tail stage: keep GPU logits on the device sampling path.  CPU-only
+        // runners may sample from host logits below, but a GPU sampler failure
+        // is a hard error rather than a silent D2H fallback.
         int token = -1;
+        bool device_sampling_attempted = false;
+        bool device_penalty_application_failed = false;
+        auto sample_current_logits_on_device = [&]() -> int
+        {
+            device_sampling_attempted = true;
+            return active_sampling_params_.is_greedy()
+                       ? runner_->sampleGreedyOnDevice()
+                       : runner_->sampleOnDevice(active_sampling_params_);
+        };
 
         const bool mpi_sampling_collective_required =
             mpi_coordinated_world &&
@@ -11235,9 +11243,11 @@ namespace llaminar2
                     runner_->applyPenaltiesOnDevice(penalty_map, vocab);
                 if (gpu_penalties_applied)
                 {
-                    token = active_sampling_params_.is_greedy()
-                                ? runner_->sampleGreedyOnDevice()
-                                : runner_->sampleOnDevice(active_sampling_params_);
+                    token = sample_current_logits_on_device();
+                }
+                else if (runner_->primaryDeviceId().is_gpu())
+                {
+                    device_penalty_application_failed = true;
                 }
             }
             else
@@ -11248,9 +11258,7 @@ namespace llaminar2
                              << mpi_ctx_->rank()
                              << " worker sampling begin");
                 }
-                token = active_sampling_params_.is_greedy()
-                            ? runner_->sampleGreedyOnDevice()
-                            : runner_->sampleOnDevice(active_sampling_params_);
+                token = sample_current_logits_on_device();
             }
             if (traceChatGeneratedTokensEnabled())
             {
@@ -11280,46 +11288,31 @@ namespace llaminar2
                     bool gpu_penalties_applied = runner_->applyPenaltiesOnDevice(penalty_map, vocab);
                     if (gpu_penalties_applied)
                     {
-                        // Penalties applied on GPU — now sample from penalized logits.
-                        if (active_sampling_params_.is_greedy())
-                        {
-                            token = runner_->sampleGreedyOnDevice();
-                        }
-                        else
-                        {
-                            token = runner_->sampleOnDevice(active_sampling_params_);
-                        }
+                        token = sample_current_logits_on_device();
+                    }
+                    else if (runner_->primaryDeviceId().is_gpu())
+                    {
+                        device_penalty_application_failed = true;
                     }
                 }
                 else
                 {
-                    // No penalties to apply — sample directly on GPU.
-                    if (active_sampling_params_.is_greedy())
-                    {
-                        token = runner_->sampleGreedyOnDevice();
-                    }
-                    else
-                    {
-                        token = runner_->sampleOnDevice(active_sampling_params_);
-                    }
+                    token = sample_current_logits_on_device();
                 }
             }
-            // If GPU path failed, fall through to CPU fallback below
         }
         else if (active_sampling_params_.is_greedy())
         {
-            // Try GPU-side greedy (argmax)
             if (!mpi_coordinated_world || mpi_sampling_collective_required)
             {
-                token = runner_->sampleGreedyOnDevice();
+                token = sample_current_logits_on_device();
             }
         }
         else
         {
-            // Try GPU-side top-k/top-p
             if (!mpi_coordinated_world || mpi_sampling_collective_required)
             {
-                token = runner_->sampleOnDevice(active_sampling_params_);
+                token = sample_current_logits_on_device();
                 if (token >= 0)
                 {
                     LOG_TRACE("[decodeStep] GPU top-k/top-p sampled token=" << token);
@@ -11329,15 +11322,29 @@ namespace llaminar2
 
         if (token < 0)
         {
-            if (decode_sampling_sync_deferred)
+            if (runner_->primaryDeviceId().is_gpu())
             {
-                result.error =
-                    "GPU decode sampling failed after deferred logits sync; "
-                    "CPU fallback would read unsynchronized logits";
+                if (device_penalty_application_failed)
+                {
+                    result.error =
+                        "GPU decode penalty application failed; CPU logits fallback is disabled";
+                }
+                else if (device_sampling_attempted)
+                {
+                    result.error =
+                        "GPU decode sampling failed; CPU logits fallback is disabled";
+                }
+                else
+                {
+                    result.error =
+                        "GPU decode sampling was required but not attempted; CPU logits fallback is disabled";
+                }
+                if (decode_sampling_sync_deferred)
+                    result.error += " after deferred logits sync";
                 return result;
             }
-            // Fallback: CPU-side sampling (requires logits D2H)
-            LOG_TRACE("[decodeStep] GPU sampling returned -1, falling back to CPU");
+
+            // CPU-only host sampling.  GPU runners must not reach this path.
             const float *logits = runner_->logits();
             if (!logits)
             {
@@ -11693,7 +11700,19 @@ namespace llaminar2
     bool OrchestrationRunner::maybeApplyMoERebalance()
     {
         auto *controller = moeRebalanceController();
-        if (!controller || !controller->shouldRebalance())
+        if (!controller)
+            return true;
+
+        if (auto *histogram = controller->histogram())
+        {
+            if (histogram->windowFull() && !histogram->syncRuntimeHistograms())
+            {
+                setError("MoE rebalance failed to sync runtime histogram");
+                return false;
+            }
+        }
+
+        if (!controller->shouldRebalance())
             return true;
 
         if (mpi_coordinated_mode_ && mpi_ctx_ &&
@@ -13134,7 +13153,7 @@ namespace llaminar2
     MoERebalanceController *OrchestrationRunner::moeRebalanceController() const
     {
         auto controllers = moeRebalanceControllers();
-        return controllers.empty() ? nullptr : controllers.front();
+        return selectActiveMoERebalanceController(controllers);
     }
 
     std::vector<MoERebalanceController *> OrchestrationRunner::moeRebalanceControllers() const
@@ -13167,13 +13186,14 @@ namespace llaminar2
     }
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
-        const MoERebalanceController &controller)
+        const MoERebalanceController &controller,
+        const ExpertReplicaSet *replica_arrivals)
     {
         if (!runner_)
             return false;
         if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
-            rank->applyMoEExpertMasksForAllDevices(controller);
+            rank->applyMoEExpertMasksForAllDevices(controller, replica_arrivals);
             return true;
         }
         return false;
@@ -13215,6 +13235,34 @@ namespace llaminar2
         if (!controller)
             return true;
 
+        const std::string device =
+            runner_ && runner_->primaryDeviceId().is_valid()
+                ? runner_->primaryDeviceId().toString()
+                : std::string{};
+        const std::string domain_id = controller->domainId();
+        PerfStatsCollector::ScopedTimer apply_timer(
+            "moe_rebalance",
+            "apply_total",
+            "rebalance",
+            device,
+            {{"domain_id", domain_id}});
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "apply_calls",
+            1.0,
+            "rebalance",
+            device,
+            {{"domain_id", domain_id}});
+
+        if (auto *histogram = controller->histogram())
+        {
+            if (!histogram->syncRuntimeHistograms())
+            {
+                setError("MoE rebalance failed to sync runtime histogram");
+                return false;
+            }
+        }
+
         if (log_histogram_summary)
             controller->logHistogramSummary();
 
@@ -13231,6 +13279,13 @@ namespace llaminar2
         bool replica_state_changed = false;
 
         const int max_replicas = controller->maxReplicasPerSocket();
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "max_replicas_per_participant",
+            static_cast<double>(max_replicas),
+            "rebalance",
+            device,
+            {{"domain_id", domain_id}});
         if (max_replicas > 0)
         {
             controller->proposeReplicasForParticipants(max_replicas);
@@ -13278,25 +13333,79 @@ namespace llaminar2
         }
 
         if (controller->hasReplicas() && !replica_state_changed && gpu_cache_masks_by_participant.empty())
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "unchanged_replica_skips",
+                1.0,
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
             return true;
+        }
 
         if (new_placement.empty() && !controller->hasReplicas() && !replica_state_changed && gpu_cache_masks_by_participant.empty())
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "no_change_skips",
+                1.0,
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
             return true;
+        }
 
-        ReceivedWeightsMap received;
-        if (controller->hasReplicas())
-        {
-            if (replica_arrivals.num_replicated > 0)
-                received = transferReplicaWeights(replica_arrivals, controller->numLayers());
-        }
-        else if (!new_placement.empty())
-        {
-            auto manifest = ExpertWeightTransfer::buildManifest(old_placement, new_placement);
-            if (!manifest.empty())
-                received = transferExpertWeights(manifest, controller->numLayers());
-        }
+        PerfStatsCollector::Tags rebalance_tags{
+            {"domain_id", domain_id},
+            {"has_replicas", perfBool(controller->hasReplicas())},
+            {"replica_state_changed", perfBool(replica_state_changed)}};
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "replica_arrivals",
+            static_cast<double>(replica_arrivals.num_replicated),
+            "rebalance",
+            device,
+            rebalance_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "new_placement_entries",
+            static_cast<double>(new_placement.size()),
+            "rebalance",
+            device,
+            rebalance_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "gpu_cache_mask_participants",
+            static_cast<double>(gpu_cache_masks_by_participant.size()),
+            "rebalance",
+            device,
+            rebalance_tags);
 
         const int participant_id = runner_ ? runner_->moeRebalanceParticipantId() : 0;
+        const bool local_tp_runner = dynamic_cast<RankOrchestrator *>(runner_.get()) != nullptr;
+        const bool replica_mask_update = controller->hasReplicas() || (had_replicas && replica_state_changed);
+        ReceivedWeightsMap received;
+        if (!local_tp_runner)
+        {
+            if (controller->hasReplicas())
+            {
+                if (replica_arrivals.num_replicated > 0)
+                    received = transferReplicaWeights(replica_arrivals, controller->numLayers());
+            }
+            else if (!new_placement.empty())
+            {
+                auto manifest = ExpertWeightTransfer::buildManifest(old_placement, new_placement);
+                if (!manifest.empty())
+                    received = transferExpertWeights(manifest, controller->numLayers());
+            }
+        }
+        else
+        {
+            LOG_DEBUG("[MoE] LocalTP rebalance delegation: RankOrchestrator owns local expert transfer and mask apply"
+                      << (replica_mask_update ? " (replica-arrival delta)" : ""));
+        }
+
         if (!gpu_cache_masks_by_participant.empty())
         {
             if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant, controller->domainId()))
@@ -13305,7 +13414,9 @@ namespace llaminar2
                     applyMoEExpertMasks(gpu_cache_masks_by_participant[participant_id], received, controller->domainId());
             }
         }
-        else if (!applyMoEExpertMasksForAllLocalDevices(*controller))
+        else if (!applyMoEExpertMasksForAllLocalDevices(
+                     *controller,
+                     local_tp_runner && replica_mask_update ? &replica_arrivals : nullptr))
         {
             auto masks = controller->computeExpertMasksForParticipant(participant_id);
             applyMoEExpertMasks(masks, received, controller->domainId());
@@ -13319,6 +13430,13 @@ namespace llaminar2
         if (config_.moe_rebalance.release_raw_expert_weights || debugEnv().moe_rebalance.release_raw_weights)
         {
             const size_t freed = releaseRawExpertWeights();
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "released_raw_expert_weight_bytes",
+                static_cast<double>(freed),
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
             if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
                 LOG_DEBUG("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
         }

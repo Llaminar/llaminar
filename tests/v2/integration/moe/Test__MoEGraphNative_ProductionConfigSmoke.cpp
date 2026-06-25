@@ -61,7 +61,7 @@ namespace llaminar2::test
             domain.weights = {0.5f, 0.5f};
             domain.backend = CollectiveBackendType::HOST;
             domain.owner_rank = 0;
-            domain.compute_kind = ExecutionDomainComputeKind::REPLICATED_EXPERTS;
+            domain.compute_kind = ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
             return domain;
         }
 
@@ -73,7 +73,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::HOST;
             domain.participants = {std::move(participant)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 

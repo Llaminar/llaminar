@@ -64,10 +64,10 @@ namespace llaminar2
                                });
         }
 
-        bool isAcceleratorLocalTPTensorParallelDomain(const MoEOverlayRuntimeDomain &domain)
+        bool isAcceleratorLocalTPShardedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
         {
             if (domain.kind != ExpertDomainKind::LocalTP ||
-                domain.compute_kind != ExpertDomainComputeKind::TensorParallelExperts ||
+                domain.compute_kind != ExpertDomainComputeKind::ShardedExperts ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -82,10 +82,10 @@ namespace llaminar2
                                });
         }
 
-        bool isLocalTPReplicatedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
+        bool isLocalTPApportionedExpertsDomain(const MoEOverlayRuntimeDomain &domain)
         {
             if (domain.kind != ExpertDomainKind::LocalTP ||
-                domain.compute_kind != ExpertDomainComputeKind::ReplicatedExperts ||
+                domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts ||
                 domain.participants.size() < 2)
             {
                 return false;
@@ -102,8 +102,8 @@ namespace llaminar2
         bool hasDomainScopedRuntimeSupport(const MoEOverlayRuntimeDomain &domain)
         {
             return isCpuNodeLocalFallbackDomain(domain) ||
-                   isAcceleratorLocalTPTensorParallelDomain(domain) ||
-                   isLocalTPReplicatedExpertsDomain(domain);
+                   isAcceleratorLocalTPShardedExpertsDomain(domain) ||
+                   isLocalTPApportionedExpertsDomain(domain);
         }
 
         std::string sanitizeDomainToken(std::string value)
@@ -187,13 +187,13 @@ namespace llaminar2
                 domain.hasMultipleParticipants() && !resolved.domain_scoped_collective_context_ready;
             if (resolved.multi_participant_execution_pending)
             {
-                const bool tensor_parallel_experts =
-                    domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts;
+                const bool sharded_experts =
+                    domain.compute_kind == ExpertDomainComputeKind::ShardedExperts;
                 std::ostringstream reason;
                 reason << "Domain-scoped runtime support is not available for this "
-                       << (tensor_parallel_experts ? "TensorParallelExperts" : "multi-participant")
+                       << (sharded_experts ? "ShardedExperts" : "multi-participant")
                        << " domain shape. Bridge Phase 5C covers accelerator LocalTP "
-                       << "TensorParallelExperts and CPU NodeLocalTP fallback helpers; Bridge Phase 5D "
+                       << "ShardedExperts and CPU NodeLocalTP fallback helpers; Bridge Phase 5D "
                        << "still wires the accelerator LocalTP executor into the Qwen graph. "
                        << "Primary-only lowering to " << resolved.primary_device.to_string()
                        << " is no longer used for routed tier work";
@@ -364,7 +364,7 @@ namespace llaminar2
 
         const auto validation = validateMoEExpertParallelPlan(
             *plan,
-            MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
+            MoEExpertParallelValidationOptions{.allow_routed_sharded_experts = true});
         if (!validation.ok())
             throw std::invalid_argument(formatValidationErrors(validation));
 

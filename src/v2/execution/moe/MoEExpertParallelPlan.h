@@ -10,6 +10,7 @@
 #pragma once
 
 #include "config/ExecutionDomainDefinition.h"
+#include "execution/config/RuntimeConfig.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -68,16 +69,22 @@ namespace llaminar2
     /**
      * @brief Domain-internal expert compute strategy.
      *
-     * ExpertIdSharded is the configuration-level representation of the narrow
-     * TPMode::ExpertParallel-style expert-id split inside one TP context.
-     * TensorParallelExperts means each selected expert's GEMMs are sharded
-     * across a multi-participant domain-scoped TP context.
+     * ReplicatedExperts means every participant owns every routed expert.
+     * ApportionedExperts means whole routed expert ids are divided across
+     * participants. ShardedExperts means each selected expert's GEMMs are
+     * sharded across a multi-participant domain-scoped TP context.
      */
     enum class ExpertDomainComputeKind
     {
         ReplicatedExperts,
-        ExpertIdSharded,
-        TensorParallelExperts,
+        ApportionedExperts,
+        ShardedExperts,
+
+        // Compatibility aliases for older config plumbing. "ExpertIdSharded"
+        // historically meant apportioned whole experts, not per-expert tensor
+        // shards.
+        ExpertIdSharded = ApportionedExperts,
+        TensorParallelExperts = ShardedExperts,
     };
 
     struct ExpertComputeDomain
@@ -93,7 +100,7 @@ namespace llaminar2
         std::vector<GlobalDeviceAddress> participants;
         std::vector<int> world_ranks;
         int owner_rank = -1;
-        ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         std::vector<float> weights;
 
         ExecutionDomainDefinition toExecutionDomainDefinition() const
@@ -124,11 +131,11 @@ namespace llaminar2
             case ExpertDomainComputeKind::ReplicatedExperts:
                 domain.compute_kind = ExecutionDomainComputeKind::REPLICATED_EXPERTS;
                 break;
-            case ExpertDomainComputeKind::ExpertIdSharded:
-                domain.compute_kind = ExecutionDomainComputeKind::EXPERT_ID_SHARDED;
+            case ExpertDomainComputeKind::ApportionedExperts:
+                domain.compute_kind = ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
                 break;
-            case ExpertDomainComputeKind::TensorParallelExperts:
-                domain.compute_kind = ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS;
+            case ExpertDomainComputeKind::ShardedExperts:
+                domain.compute_kind = ExecutionDomainComputeKind::SHARDED_EXPERTS;
                 break;
             }
 
@@ -168,14 +175,14 @@ namespace llaminar2
             switch (domain.compute_kind)
             {
             case ExecutionDomainComputeKind::UNSPECIFIED:
+            case ExecutionDomainComputeKind::APPORTIONED_EXPERTS:
+                result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+                break;
             case ExecutionDomainComputeKind::REPLICATED_EXPERTS:
                 result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
                 break;
-            case ExecutionDomainComputeKind::EXPERT_ID_SHARDED:
-                result.compute_kind = ExpertDomainComputeKind::ExpertIdSharded;
-                break;
-            case ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS:
-                result.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+            case ExecutionDomainComputeKind::SHARDED_EXPERTS:
+                result.compute_kind = ExpertDomainComputeKind::ShardedExperts;
                 break;
             }
 
@@ -192,14 +199,24 @@ namespace llaminar2
             return participants.size() > 1;
         }
 
-        bool supportsDomainScopedTensorParallelExperts() const
+        bool supportsDomainScopedShardedExperts() const
         {
             return isDomainScopedTPKind() && hasMultipleParticipants();
         }
 
+        bool supportsApportionedExperts() const
+        {
+            return !participants.empty();
+        }
+
+        bool supportsDomainScopedTensorParallelExperts() const
+        {
+            return supportsDomainScopedShardedExperts();
+        }
+
         bool supportsExpertIdSharding() const
         {
-            return isDomainScopedTPKind() && hasMultipleParticipants();
+            return supportsApportionedExperts();
         }
     };
 
@@ -218,8 +235,34 @@ namespace llaminar2
         std::string domain;
         int logical_root_participant = 0;
         bool dense_tp_enabled = false;
+        bool dense_decode_replicated = false;
+        bool dense_decode_mirrored_embedding = false;
+        DenseParallelPolicy dense_policy = DenseParallelPolicy::Replicated;
         MoEContinuationActivationLayout hidden_layout = MoEContinuationActivationLayout::ReplicatedHidden;
         bool shared_expert_uses_dense_tp = true;
+
+        DenseParallelPolicy effectiveDensePolicy() const
+        {
+            return denseParallelPolicyFromFlags(
+                dense_tp_enabled,
+                dense_decode_replicated,
+                dense_decode_mirrored_embedding);
+        }
+
+        void setDensePolicy(DenseParallelPolicy policy)
+        {
+            dense_policy = policy;
+            dense_tp_enabled = denseParallelPolicyEnablesTP(policy);
+            dense_decode_replicated = denseParallelPolicyReplicatesDecode(policy);
+            dense_decode_mirrored_embedding =
+                denseParallelPolicyMirrorsDecodeEmbedding(policy) &&
+                !dense_decode_replicated;
+        }
+
+        void refreshDensePolicyFromFlags()
+        {
+            dense_policy = effectiveDensePolicy();
+        }
     };
 
     struct ExpertLayerPlacement
@@ -247,8 +290,8 @@ namespace llaminar2
         std::vector<ExecutionDomainDefinition> dense_domains;
 
         /// Routed expert ownership domains. These remain whole-expert domains
-        /// in the graph-native reset; TensorParallelExperts is rejected by
-        /// validation unless explicitly allowed by legacy compatibility code.
+        /// in the graph-native reset; ShardedExperts is rejected by validation
+        /// unless explicitly allowed by legacy compatibility code.
         std::vector<ExpertComputeDomain> domains;
         std::vector<ExpertRoutedTier> routed_tiers;
         std::vector<ExpertLayerPlacement> placements;
@@ -272,9 +315,10 @@ namespace llaminar2
         /// When > 0 and placements are provided, each placement must cover exactly this many experts.
         int routed_expert_count = 0;
 
-        /// Legacy compatibility only: graph-native routed tiers reject true
-        /// tensor-sharded expert GEMMs by default and use whole-expert owners.
-        bool allow_routed_tensor_parallel_experts = false;
+        /// Graph-native routed tiers reject true tensor-sharded expert GEMMs by
+        /// default and use whole-expert owners.
+        bool allow_routed_sharded_experts = false;
+
     };
 
     struct MoEExpertParallelValidationResult
@@ -324,10 +368,10 @@ namespace llaminar2
         {
         case ExpertDomainComputeKind::ReplicatedExperts:
             return "ReplicatedExperts";
-        case ExpertDomainComputeKind::ExpertIdSharded:
-            return "ExpertIdSharded";
-        case ExpertDomainComputeKind::TensorParallelExperts:
-            return "TensorParallelExperts";
+        case ExpertDomainComputeKind::ApportionedExperts:
+            return "ApportionedExperts";
+        case ExpertDomainComputeKind::ShardedExperts:
+            return "ShardedExperts";
         }
         return "Unknown";
     }
@@ -431,7 +475,9 @@ namespace llaminar2
         out << "    residency_policy: " << toString(plan.residency_policy) << "\n";
         out << "    continuation_domain: " << plan.continuation_domain
             << " root_participant=" << plan.continuation_domain_spec.logical_root_participant
+            << " dense_policy=" << denseParallelPolicyToString(plan.continuation_domain_spec.effectiveDensePolicy())
             << " dense_tp=" << (plan.continuation_domain_spec.dense_tp_enabled ? "true" : "false")
+            << " dense_decode_replicated=" << (plan.continuation_domain_spec.dense_decode_replicated ? "true" : "false")
             << " hidden_layout=" << toString(plan.continuation_domain_spec.hidden_layout) << "\n";
         out << "    base_model_domain: " << plan.effectiveBaseModelDomain() << "\n";
         out << "    shared_expert_domain: " << plan.shared_expert_domain << "\n";
@@ -765,14 +811,14 @@ namespace llaminar2
                 addError("expert compute domain '" + domain.name + "' is SingleDevice but declares multiple participants");
             }
 
-            if (domain.compute_kind == ExpertDomainComputeKind::ExpertIdSharded && !domain.supportsExpertIdSharding())
+            if (domain.compute_kind == ExpertDomainComputeKind::ApportionedExperts && !domain.supportsApportionedExperts())
             {
-                addError("expert compute domain '" + domain.name + "' uses ExpertIdSharded, which maps to TPMode::ExpertParallel and requires a multi-participant TP domain");
+                addError("expert compute domain '" + domain.name + "' uses ApportionedExperts but declares no participants");
             }
 
-            if (domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts && !domain.supportsDomainScopedTensorParallelExperts())
+            if (domain.compute_kind == ExpertDomainComputeKind::ShardedExperts && !domain.supportsDomainScopedShardedExperts())
             {
-                addError("expert compute domain '" + domain.name + "' uses TensorParallelExperts but is not a multi-participant domain-scoped TP domain");
+                addError("expert compute domain '" + domain.name + "' uses ShardedExperts but is not a multi-participant domain-scoped TP domain");
             }
         }
 
@@ -865,7 +911,7 @@ namespace llaminar2
                 ++fallback_count;
         }
 
-        if (!options.allow_routed_tensor_parallel_experts)
+        if (!options.allow_routed_sharded_experts)
         {
             for (const auto &domain_name : routed_domain_names)
             {
@@ -873,13 +919,13 @@ namespace llaminar2
                 if (domain_it == domains_by_name.end() || !domain_it->second)
                     continue;
                 const auto &domain = *domain_it->second;
-                if (domain.compute_kind == ExpertDomainComputeKind::TensorParallelExperts)
+                if (domain.compute_kind == ExpertDomainComputeKind::ShardedExperts)
                 {
                     addError("routed expert domain '" + domain.name +
-                             "' uses TensorParallelExperts, which is unsupported for graph-native whole-expert routed tiers; "
-                             "the TensorParallelExperts routed tier path is disabled by default because "
+                             "' uses ShardedExperts, which is unsupported for graph-native whole-expert routed tiers; "
+                             "the ShardedExperts routed tier path is disabled by default because "
                              "graph-native MoE overlay has no shadow LocalTP runtime. Use whole-expert ownership or "
-                             "enable an explicit future TensorParallelExperts path with its own reduction stage");
+                             "enable an explicit future ShardedExperts path with its own reduction stage");
                 }
             }
         }

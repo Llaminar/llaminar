@@ -143,6 +143,37 @@ TEST(Test__PerfStatsCollector, SummaryTableCanBeRequestedByEnv)
     EXPECT_NE(summary.find("mtp.sidecar_forward"), std::string::npos);
 }
 
+TEST(Test__PerfStatsCollector, ResetCanPreserveSelectedDomains)
+{
+    ScopedEnv enable("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    PerfStatsCollector::addCounter("moe_rebalance", "apply_calls", 1.0, "rebalance");
+    PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer", 2000, "rebalance");
+    PerfStatsCollector::addCounter("stage_gpu", "graph_replay.total", 3.0, "decode");
+    PerfStatsCollector::addCounter("forward_pass", "decode", 1.0, "decode");
+
+    PerfStatsCollector::resetPreservingDomains({"moe_rebalance"});
+
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 2u);
+    EXPECT_TRUE(std::all_of(records.begin(), records.end(), [](const auto &record)
+                            { return record.domain == "moe_rebalance"; }));
+
+    const auto has_apply = std::any_of(records.begin(), records.end(), [](const auto &record)
+                                       {
+                                           return record.kind == PerfStatRecord::Kind::Counter &&
+                                                  record.name == "apply_calls";
+                                       });
+    const auto has_transfer = std::any_of(records.begin(), records.end(), [](const auto &record)
+                                          {
+                                              return record.kind == PerfStatRecord::Kind::Timer &&
+                                                     record.name == "gpu_direct_transfer";
+                                          });
+    EXPECT_TRUE(has_apply);
+    EXPECT_TRUE(has_transfer);
+}
+
 TEST(Test__PerfStatsCollector, PerfStatsExportAloneDoesNotEnableGpuStageEventTiming)
 {
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);

@@ -27,8 +27,10 @@ namespace
 {
     constexpr int kDeviceMoEMaxExperts = 256;
     constexpr int kDeviceMoEMaxTopK = 16;
+    constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kGateLogitsExpertsPerBlock = 4;
     constexpr int kGateLogitsGroupedThreads = 256;
+    constexpr uint32_t kDeviceMoEFlagReplicated = 1u << 2;
 
     __device__ inline float route_weight_to_float(__half value)
     {
@@ -84,6 +86,7 @@ namespace
         int32_t topk_expert_ids[kDeviceMoEMaxTopK];
         float topk_weights[kDeviceMoEMaxTopK];
         uint64_t decode_histogram[kDeviceMoEMaxExperts];
+        uint64_t decode_local_histogram[kDeviceMoEMaxExperts];
         int32_t *route_expert_ids;
         float *route_weights;
         int32_t *expert_counts;
@@ -98,8 +101,118 @@ namespace
         uint64_t reserved_u64[4];
         uint32_t prefill_token_capacity;
         uint32_t prefill_route_capacity;
-        uint32_t reserved_u32[2];
+        uint32_t participant_id;
+        uint32_t participant_count;
     };
+
+    __device__ __forceinline__ bool runtime_shape_ok(
+        const DeviceMoELayerRuntimeView *runtime,
+        int num_experts,
+        int top_k)
+    {
+        return runtime &&
+               runtime->active_bank <= 1u &&
+               runtime->active_epoch != 0u &&
+               runtime->expert_count == static_cast<uint32_t>(num_experts) &&
+               runtime->top_k == static_cast<uint32_t>(top_k);
+    }
+
+    __device__ __forceinline__ bool runtime_expert_replicated(
+        const DeviceMoEPlacementBankView &bank,
+        int expert_id)
+    {
+        return (bank.experts[expert_id].flags & kDeviceMoEFlagReplicated) != 0u;
+    }
+
+    __device__ __forceinline__ int runtime_expert_owner(
+        const DeviceMoEPlacementBankView &bank,
+        int expert_id)
+    {
+        return bank.experts[expert_id].owner_participant;
+    }
+
+    __device__ __forceinline__ bool runtime_selected_slot_local_compute(
+        const DeviceMoELayerRuntimeView *runtime,
+        const int *selected_experts,
+        int selected_slot,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_shape_ok(runtime, num_experts, top_k) ||
+            selected_slot < 0 ||
+            selected_slot >= top_k)
+        {
+            return false;
+        }
+
+        const auto &bank = runtime->banks[runtime->active_bank];
+        const int expert_id = selected_experts[selected_slot];
+        if (expert_id < 0 || expert_id >= num_experts)
+            return false;
+
+        const bool local_resident = bank.local_compute_mask[expert_id] != 0u;
+        if (!runtime_expert_replicated(bank, expert_id))
+            return local_resident;
+
+        const uint32_t participant_count = runtime->participant_count;
+        const uint32_t participant_id = runtime->participant_id;
+        if (participant_count == 0u ||
+            participant_count > static_cast<uint32_t>(kDeviceMoEMaxParticipants) ||
+            participant_id >= participant_count)
+        {
+            return local_resident;
+        }
+
+        const int current_owner = runtime_expert_owner(bank, expert_id);
+        if (current_owner < 0 || current_owner >= static_cast<int>(participant_count))
+            return local_resident;
+
+        int load[kDeviceMoEMaxParticipants] = {};
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int fixed_expert = selected_experts[slot];
+            if (fixed_expert < 0 || fixed_expert >= num_experts ||
+                runtime_expert_replicated(bank, fixed_expert))
+            {
+                continue;
+            }
+
+            const int owner = runtime_expert_owner(bank, fixed_expert);
+            if (owner >= 0 && owner < static_cast<int>(participant_count))
+                ++load[owner];
+        }
+
+        for (int slot = 0; slot <= selected_slot; ++slot)
+        {
+            const int replicated_expert = selected_experts[slot];
+            if (replicated_expert < 0 || replicated_expert >= num_experts ||
+                !runtime_expert_replicated(bank, replicated_expert))
+            {
+                continue;
+            }
+
+            const int owner = runtime_expert_owner(bank, replicated_expert);
+            if (owner < 0 || owner >= static_cast<int>(participant_count))
+                continue;
+
+            int best = owner;
+            for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
+            {
+                if (load[participant] < load[best] ||
+                    (load[participant] == load[best] && participant == owner))
+                {
+                    best = participant;
+                }
+            }
+
+            if (slot == selected_slot)
+                return local_resident && best == static_cast<int>(participant_id);
+
+            ++load[best];
+        }
+
+        return false;
+    }
 
     constexpr int kMoEPointerStageMax = 16;
 
@@ -1189,24 +1302,27 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_kernel(
             }
         }
 
-        const bool runtime_shape_ok =
-            runtime->active_bank <= 1u &&
-            runtime->active_epoch != 0u &&
-            runtime->expert_count == static_cast<uint32_t>(num_experts) &&
-            runtime->top_k == static_cast<uint32_t>(top_k);
+        const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
 
         for (int slot = 0; slot < top_k; ++slot)
         {
             const int expert_id = selected_ids[slot];
             const float weight = selected_weights[slot];
+            bool local_compute = false;
 
-            if (runtime_shape_ok)
+            if (shape_ok)
             {
-                runtime->topk_expert_ids[slot] = expert_id;
-                runtime->topk_weights[slot] = weight;
+                local_compute =
+                    runtime_selected_slot_local_compute(runtime, selected_ids, slot, num_experts, top_k);
+                runtime->topk_expert_ids[slot] = local_compute ? expert_id : -1;
+                runtime->topk_weights[slot] = local_compute ? weight : 0.0f;
                 if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
                 {
                     atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                    if (local_compute)
+                    {
+                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert_id]), 1ULL);
+                    }
                 }
             }
 
@@ -1311,24 +1427,27 @@ __global__ void rocm_moe_softmax_topk_decode_runtime_wave64_kernel(
             }
         }
 
-        const bool runtime_shape_ok =
-            runtime->active_bank <= 1u &&
-            runtime->active_epoch != 0u &&
-            runtime->expert_count == static_cast<uint32_t>(num_experts) &&
-            runtime->top_k == static_cast<uint32_t>(top_k);
+        const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
 
         for (int slot = 0; slot < top_k; ++slot)
         {
             const int expert_id = selected_ids[slot];
             const float weight = selected_weights[slot];
+            bool local_compute = false;
 
-            if (runtime_shape_ok)
+            if (shape_ok)
             {
-                runtime->topk_expert_ids[slot] = expert_id;
-                runtime->topk_weights[slot] = weight;
+                local_compute =
+                    runtime_selected_slot_local_compute(runtime, selected_ids, slot, num_experts, top_k);
+                runtime->topk_expert_ids[slot] = local_compute ? expert_id : -1;
+                runtime->topk_weights[slot] = local_compute ? weight : 0.0f;
                 if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
                 {
                     atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                    if (local_compute)
+                    {
+                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert_id]), 1ULL);
+                    }
                 }
             }
 
@@ -1441,24 +1560,27 @@ __global__ void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
             }
         }
 
-        const bool runtime_shape_ok =
-            runtime->active_bank <= 1u &&
-            runtime->active_epoch != 0u &&
-            runtime->expert_count == static_cast<uint32_t>(num_experts) &&
-            runtime->top_k == static_cast<uint32_t>(top_k);
+        const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
 
         for (int slot = 0; slot < top_k; ++slot)
         {
             const int expert_id = selected_ids[slot];
             const float weight = selected_weights[slot];
+            bool local_compute = false;
 
-            if (runtime_shape_ok)
+            if (shape_ok)
             {
-                runtime->topk_expert_ids[slot] = expert_id;
-                runtime->topk_weights[slot] = weight;
+                local_compute =
+                    runtime_selected_slot_local_compute(runtime, selected_ids, slot, num_experts, top_k);
+                runtime->topk_expert_ids[slot] = local_compute ? expert_id : -1;
+                runtime->topk_weights[slot] = local_compute ? weight : 0.0f;
                 if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
                 {
                     atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                    if (local_compute)
+                    {
+                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert_id]), 1ULL);
+                    }
                 }
             }
 
@@ -1490,32 +1612,35 @@ __global__ void rocm_moe_decode_route_select_runtime_kernel(
     bool write_legacy_outputs,
     bool update_runtime_histogram)
 {
-    const int k = threadIdx.x;
-    if (k >= top_k || k >= kDeviceMoEMaxTopK || !runtime) return;
-
-    const int expert_id = expert_indices[k];
-    const float weight = expert_weights[k];
-
-    const bool runtime_shape_ok =
-        runtime->active_bank <= 1u &&
-        runtime->active_epoch != 0u &&
-        runtime->expert_count == static_cast<uint32_t>(num_experts) &&
-        runtime->top_k == static_cast<uint32_t>(top_k);
-
-    if (runtime_shape_ok)
+    if (threadIdx.x != 0 || !runtime) return;
+    const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
+    for (int k = 0; k < top_k; ++k)
     {
-        runtime->topk_expert_ids[k] = expert_id;
-        runtime->topk_weights[k] = weight;
-        if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
+        const int expert_id = expert_indices[k];
+        const float weight = expert_weights[k];
+        bool local_compute = false;
+
+        if (shape_ok)
         {
-            atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+            local_compute =
+                runtime_selected_slot_local_compute(runtime, expert_indices, k, num_experts, top_k);
+            runtime->topk_expert_ids[k] = local_compute ? expert_id : -1;
+            runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+            if (update_runtime_histogram && expert_id >= 0 && expert_id < num_experts)
+            {
+                atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert_id]), 1ULL);
+                if (local_compute)
+                {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert_id]), 1ULL);
+                }
+            }
         }
-    }
 
-    if (write_legacy_outputs)
-    {
-        legacy_indices[k] = static_cast<float>(expert_id);
-        legacy_weights[k] = weight;
+        if (write_legacy_outputs)
+        {
+            legacy_indices[k] = static_cast<float>(expert_id);
+            legacy_weights[k] = weight;
+        }
     }
 }
 
@@ -3151,6 +3276,7 @@ __global__ void rocm_moe_scatter_tokens_kernel(
     const int *__restrict__ expert_offsets,       // [num_experts]
     int *__restrict__ write_heads,               // [num_experts] (init to 0)
     int *__restrict__ grouped_token_indices,     // [total_slots] OUT
+    int *__restrict__ original_to_grouped,        // [total_slots] OUT, optional
     float *__restrict__ grouped_weights,         // [total_slots] OUT
     int total_slots, int num_experts, int top_k)
 {
@@ -3165,6 +3291,8 @@ __global__ void rocm_moe_scatter_tokens_kernel(
         int write_pos = atomicAdd(&write_heads[expert_id], 1);
         int dest = expert_offsets[expert_id] + write_pos;
         grouped_token_indices[dest] = token_idx;
+        if (original_to_grouped)
+            original_to_grouped[slot] = dest;
         grouped_weights[dest] = routing_weights[slot];
     }
 }
@@ -3492,7 +3620,8 @@ bool hipMoE_max_expert_count(
 bool hipMoE_scatter_tokens(
     const int *routing_indices, const float *routing_weights,
     const int *expert_offsets, int *write_heads,
-    int *grouped_token_indices, float *grouped_weights,
+    int *grouped_token_indices, int *original_to_grouped,
+    float *grouped_weights,
     int total_slots, int num_experts, int top_k,
     int device_idx, void *stream)
 {
@@ -3505,7 +3634,7 @@ bool hipMoE_scatter_tokens(
     hipLaunchKernelGGL(rocm_moe_scatter_tokens_kernel,
         dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
         routing_indices, routing_weights, expert_offsets, write_heads,
-        grouped_token_indices, grouped_weights,
+        grouped_token_indices, original_to_grouped, grouped_weights,
         total_slots, num_experts, top_k);
 
     hipError_t err = hipGetLastError();
@@ -3766,6 +3895,23 @@ __global__ void rocm_moe_float_to_int_kernel(
         output[idx] = static_cast<int>(input[idx]);
 }
 
+__global__ void rocm_moe_float_to_masked_int_kernel(
+    const float *__restrict__ input,
+    int *__restrict__ output,
+    const uint8_t *__restrict__ expert_mask,
+    int count,
+    int num_experts)
+{
+    int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= count)
+        return;
+    const int expert = static_cast<int>(input[idx]);
+    output[idx] =
+        (expert >= 0 && expert < num_experts && expert_mask && expert_mask[expert] != 0u)
+            ? expert
+            : -1;
+}
+
 extern "C" {
 
 bool hipMoE_stage_mutable_pointer_arrays(
@@ -3900,6 +4046,34 @@ bool hipMoE_float_to_int(
     if (err != hipSuccess)
     {
         fprintf(stderr, "HIP MoE float_to_int kernel launch failed: %s\n", hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool hipMoE_float_to_masked_int(
+    const float *d_input,
+    int *d_output,
+    const uint8_t *d_expert_mask,
+    int count,
+    int num_experts,
+    int device_idx,
+    void *stream)
+{
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    (void)hipGetLastError();
+
+    const int threads = 256;
+    const int blocks = (count + threads - 1) / threads;
+
+    hipLaunchKernelGGL(rocm_moe_float_to_masked_int_kernel,
+        dim3(blocks), dim3(threads), 0, static_cast<hipStream_t>(stream),
+        d_input, d_output, d_expert_mask, count, num_experts);
+
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE float_to_masked_int kernel launch failed: %s\n", hipGetErrorString(err));
         return false;
     }
     return true;

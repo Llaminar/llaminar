@@ -634,6 +634,15 @@ namespace llaminar2
 
         if (isDeviceRoutedDecodeGraphCapturable())
         {
+            void *route_stream = gpuStream();
+            if (!route_stream)
+            {
+                LOG_ERROR("[MoERoutingStage] Runtime-table GPU decode routing requires an explicit stream on "
+                          << params_.device_id.toString());
+                return false;
+            }
+            params_.moe_runtime_table->recordDecodeHistogramProducerStream(route_stream);
+
             // The current grouped expert decode still consumes the legacy routing
             // tensors, so keep them device-resident while also filling runtime top-k.
             if (!kernel->decodeRouteSelect(

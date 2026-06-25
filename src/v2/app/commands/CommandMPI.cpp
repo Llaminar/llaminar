@@ -100,7 +100,8 @@ namespace llaminar2
         full_argv.push_back(subcmd_str.data());
         for (int i = 1; i < params.argc; ++i)
             full_argv.push_back(params.argv[i]);
-        int full_argc = static_cast<int>(full_argv.size());
+        full_argv.push_back(nullptr);
+        int full_argc = static_cast<int>(full_argv.size() - 1);
 
         MPIBootstrapPhase bootstrap_phase;
         auto bs_result = bootstrap_phase.execute(orch_config, full_argc, full_argv.data());

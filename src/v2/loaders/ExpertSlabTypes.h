@@ -12,6 +12,27 @@ namespace llaminar2
     class ITensorGemm;
     class TensorBase;
 
+    /// Completion handle for an asynchronous same-backend GPU expert transfer.
+    ///
+    /// The transfer stream records `ready_event` after packed-weight peer copies
+    /// are enqueued.  Any stage that consumes the arrived expert must make its
+    /// explicit compute stream wait on `ready_event` before launching GEMMs.
+    struct GpuDirectTransferCompletion
+    {
+        DeviceId device_id;
+        int device_ordinal = -1;
+        std::shared_ptr<void> ready_event;
+        std::shared_ptr<void> source_ready_event;
+        std::shared_ptr<void> transfer_stream;
+
+        bool valid() const
+        {
+            return device_id.is_gpu() &&
+                   device_ordinal >= 0 &&
+                   ready_event != nullptr;
+        }
+    };
+
     /// Identifies a "slab" of expert GEMM weights for one weight group × one layer.
     struct ExpertSlabRef
     {
@@ -50,5 +71,6 @@ namespace llaminar2
         std::shared_ptr<TensorBase> view_lifetime;
         WeightDerivationKind derivation = WeightDerivationKind::ExpertSlice;
         std::optional<DeviceId> source_device; // Non-null for RebalancedExpertReplica
+        std::optional<GpuDirectTransferCompletion> gpu_direct_completion;
     };
 }

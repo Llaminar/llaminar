@@ -44,7 +44,7 @@ namespace
         domain.kind = ExpertDomainKind::SingleDevice;
         domain.backend = CollectiveBackendType::AUTO;
         domain.participants = {std::move(participant)};
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -94,7 +94,7 @@ namespace
         domain.backend = CollectiveBackendType::RCCL;
         domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
         domain.owner_rank = owner_rank;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -108,7 +108,7 @@ namespace
         domain.backend = CollectiveBackendType::HOST;
         domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
         domain.owner_rank = owner_rank;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 

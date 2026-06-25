@@ -19,7 +19,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::SingleDevice;
             domain.backend = CollectiveBackendType::AUTO;
             domain.participants = {GlobalDeviceAddress::cuda(0)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -30,7 +30,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::LocalTP;
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -41,7 +41,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::NodeLocalTP;
             domain.backend = CollectiveBackendType::UPI;
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -248,29 +248,28 @@ namespace llaminar2::test
         EXPECT_TRUE(hasErrorContaining(result, "at most one fallback tier"));
     }
 
-    TEST(Test__MoEExpertParallelPlan, RejectsTensorParallelExpertsWithoutMultiParticipantDomainScopedTP)
+    TEST(Test__MoEExpertParallelPlan, RejectsShardedExpertsWithoutMultiParticipantDomainScopedTP)
     {
         auto plan = validTwoTierPlan();
         plan.domains[0] = singleGpuDomain("gpu_hot");
-        plan.domains[0].compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        plan.domains[0].compute_kind = ExpertDomainComputeKind::ShardedExperts;
 
         const auto result = validateMoEExpertParallelPlan(plan, twoLayerFourExpertOptions());
 
         EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "TensorParallelExperts"));
+        EXPECT_TRUE(hasErrorContaining(result, "ShardedExperts"));
         EXPECT_TRUE(hasErrorContaining(result, "multi-participant domain-scoped TP domain"));
     }
 
-    TEST(Test__MoEExpertParallelPlan, RejectsExpertIdShardedWithoutExpertParallelCapableTPDomain)
+    TEST(Test__MoEExpertParallelPlan, AcceptsSingleParticipantApportionedExpertsAsDegenerateWholeExpertOwnership)
     {
         auto plan = validTwoTierPlan();
         plan.domains[1] = singleGpuDomain("cpu_cold");
-        plan.domains[1].compute_kind = ExpertDomainComputeKind::ExpertIdSharded;
+        plan.domains[1].compute_kind = ExpertDomainComputeKind::ApportionedExperts;
 
         const auto result = validateMoEExpertParallelPlan(plan, twoLayerFourExpertOptions());
 
-        EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "TPMode::ExpertParallel"));
+        EXPECT_TRUE(result.ok()) << "ApportionedExperts on one participant means every whole expert is assigned to that participant";
     }
 
     TEST(Test__MoEExpertParallelPlan, RejectsSingleDomainExpertShardedAcrossMultipleDomains)
@@ -284,7 +283,7 @@ namespace llaminar2::test
         EXPECT_TRUE(hasErrorContaining(result, "one compute domain"));
     }
 
-    TEST(Test__MoEExpertParallelPlan, AcceptsSingleDomainExpertShardedWithExpertIdShardedDomain)
+    TEST(Test__MoEExpertParallelPlan, AcceptsSingleDomainExpertShardedWithApportionedExpertsDomain)
     {
         MoEExpertParallelPlan plan;
         plan.enabled = true;
@@ -293,7 +292,7 @@ namespace llaminar2::test
         plan.shared_expert_domain = "cpu_sockets";
         plan.residency_policy = ExpertResidencyPolicy::StaticById;
         plan.domains = {cpuNodeLocalTPDomain("cpu_sockets")};
-        plan.domains[0].compute_kind = ExpertDomainComputeKind::ExpertIdSharded;
+        plan.domains[0].compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         plan.routed_tiers = {tier("routed", "cpu_sockets", 0, true)};
         plan.placements = {
             placement(0, {0, 0, 0, 0}),

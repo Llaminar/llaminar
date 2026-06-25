@@ -471,7 +471,9 @@ namespace llaminar2
          * Avoids D2H transfer of logits + CPU scan. Each device runs argmax
          * on its local logits shard, then the host picks the global winner.
          *
-         * @return Token ID (>= 0) on success, -1 if not supported or failed
+         * @return Token ID (>= 0) on success, -1 if not supported or failed.
+         *         GPU decode callers must treat -1 as a hard failure rather
+         *         than silently falling back to host logits.
          */
         virtual int sampleGreedyOnDevice() { return -1; }
 

@@ -26,6 +26,7 @@
 #include "execution/global_pp/GlobalPPTopology.h"
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
+#include "execution/moe/MoERebalanceController.h"
 #include "execution/mtp/MTPSpecDecodeMetadata.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "config/OrchestrationConfig.h"
@@ -643,6 +644,29 @@ namespace
         DeviceId primaryDeviceId() const override
         {
             return primary_device_;
+        }
+
+        void setMoERebalanceController(std::unique_ptr<MoERebalanceController> controller)
+        {
+            moe_rebalance_controller_ = std::move(controller);
+        }
+
+        std::vector<MoERebalanceController *> moeRebalanceControllers() const override
+        {
+            if (!moe_rebalance_controller_)
+                return {};
+            return {moe_rebalance_controller_.get()};
+        }
+
+        MoERebalanceController *moeRebalanceControllerForDomain(
+            const std::string &domain_id) const override
+        {
+            if (!moe_rebalance_controller_ ||
+                moe_rebalance_controller_->domainId() != domain_id)
+            {
+                return nullptr;
+            }
+            return moe_rebalance_controller_.get();
         }
 
         bool supportsMTPTokenCoordination() const override
@@ -1635,7 +1659,8 @@ namespace
             return makeLocalInfo(logits_local_.get());
         }
 
-        // GPU sampling returns -1 by default to force CPU fallback.
+        // Device sampling returns -1 by default.  CPU runners may sample host
+        // logits; GPU runners must fail fast instead of falling back to host.
         int sampleGreedyOnDevice() override
         {
             ++sample_main_logits_count_;
@@ -4312,6 +4337,7 @@ namespace
         int position_{0};
         int batch_capacity_{1};
         int padded_seq_len_{0};
+        std::unique_ptr<MoERebalanceController> moe_rebalance_controller_;
     };
 
     // =========================================================================
@@ -4566,6 +4592,42 @@ namespace
     // =========================================================================
     // Core Regression Tests
     // =========================================================================
+
+    TEST_F(Test__PrefillDecodeTransition, DirectMoERebalanceApplySyncsRuntimeHistogramCallbacks)
+    {
+        auto mock = std::make_unique<MockInferenceRunner>();
+        auto *mock_ptr = mock.get();
+
+        MoERebalanceController::Config controller_config;
+        controller_config.domain_id = "local_tp_cuda_0_cuda_1";
+        controller_config.mode = MoERebalanceMode::DYNAMIC;
+        controller_config.num_layers = 1;
+        controller_config.num_experts = 4;
+        controller_config.top_k = 2;
+        controller_config.window_size = 64;
+        controller_config.sockets = {DeviceId::cuda(0), DeviceId::cuda(1)};
+        controller_config.initial_expert_to_socket = {0, 0, 1, 1};
+
+        auto controller =
+            std::make_unique<MoERebalanceController>(std::move(controller_config));
+        auto *histogram = controller->histogram();
+        ASSERT_NE(histogram, nullptr);
+
+        int sync_calls = 0;
+        histogram->registerRuntimeHistogramSync([&sync_calls]()
+                                                {
+                                                    ++sync_calls;
+                                                    return true;
+                                                });
+        mock_ptr->setMoERebalanceController(std::move(controller));
+
+        OrchestrationConfig config;
+        config.device_for_this_rank = GlobalDeviceAddress::cuda(0);
+        OrchestrationRunner runner(std::move(config), plan_, std::move(mock));
+
+        ASSERT_TRUE(runner.applyMoERebalanceWithReplicas());
+        EXPECT_EQ(sync_calls, 1);
+    }
 
     /**
      * @brief Verify that prefill calls forward with full prompt tokens
@@ -5438,6 +5500,27 @@ namespace
         ASSERT_TRUE(step1.success());
         ASSERT_EQ(step1.tokens.size(), 1u);
         EXPECT_EQ(step1.tokens[0], MockInferenceRunner::PREFILL_ARGMAX_TOKEN);
+    }
+
+    TEST_F(Test__PrefillDecodeTransition, GPUDecodeSamplingFailureDoesNotFallbackToHostLogits)
+    {
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/false,
+            /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{},
+            /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false,
+            /*hide_local_logits=*/false,
+            DeviceId::cuda(0));
+
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+
+        GenerationResult step = runner->decodeStep();
+        EXPECT_FALSE(step.success());
+        EXPECT_THAT(step.error, HasSubstr("GPU decode sampling failed"));
+        EXPECT_THAT(step.error, HasSubstr("CPU logits fallback is disabled"));
+        EXPECT_EQ(mock->sampleMainLogitsCount(), 1);
+        EXPECT_TRUE(step.tokens.empty());
     }
 
     /**

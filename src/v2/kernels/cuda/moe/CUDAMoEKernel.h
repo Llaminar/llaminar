@@ -179,6 +179,11 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k) override;
 
+        bool prepareExpertGroupsAsyncMasked(
+            ITensor *routing_indices, ITensor *routing_weights,
+            int seq_len, int num_experts, int top_k,
+            const uint8_t *expert_mask) override;
+
         /// @brief Prepare grouped prefill metadata for the always-active shared expert.
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
@@ -455,9 +460,12 @@ namespace llaminar2
         int *d_group_write_heads_ = nullptr;
         float *d_group_weights_ = nullptr;
         int *d_group_active_expert_ids_ = nullptr;
+        uint8_t *d_group_expert_mask_ = nullptr;
         int group_active_expert_slots_ = 0;
         int group_slots_cap_ = 0;
         int group_experts_cap_ = 0;
+        int group_expert_mask_cap_ = 0;
+        uint64_t group_expert_mask_hash_ = 0;
 
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;

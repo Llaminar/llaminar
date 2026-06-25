@@ -182,8 +182,15 @@ namespace llaminar2
 
             // Add MoE-specific stage sharding
             config["MOE_ROUTER"] = SnapshotShardingMode::REPLICATED;
+            config["MOE_ROUTER_OUTPUT"] = SnapshotShardingMode::REPLICATED;
+            config["MOE_ROUTING_INDICES"] = SnapshotShardingMode::REPLICATED;
+            config["MOE_ROUTING_WEIGHTS"] = SnapshotShardingMode::REPLICATED;
             config["MOE_EXPERT_FFN"] = SnapshotShardingMode::REPLICATED;
             config["MOE_SHARED_EXPERT"] = SnapshotShardingMode::REPLICATED;
+            config["MOE_EXPERT_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
+            config["MOE_SHARED_EXPERT_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
+            config["MOE_SHARED_GATE_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
+            config["MOE_COMBINED_OUTPUT"] = SnapshotShardingMode::ROW_PARALLEL;
 
             return config;
         }

@@ -318,6 +318,24 @@ public:
         return best;
     }
 
+    int sampleGreedyOnDevice() override
+    {
+        ++sample_greedy_on_device_calls_;
+        if (logits_.empty())
+            return -1;
+        return static_cast<int>(
+            std::distance(logits_.begin(),
+                          std::max_element(logits_.begin(), logits_.end())));
+    }
+
+    int sampleOnDevice(const SamplingParams &params) override
+    {
+        ++sample_on_device_calls_;
+        if (params.is_greedy())
+            return sampleGreedyOnDevice();
+        return stochastic_sample_token_;
+    }
+
     bool commitMTPShiftedRowsFromPartialForward(
         const int32_t *tokens,
         int token_count,
@@ -1038,6 +1056,8 @@ public:
     size_t forward_mtp_call_count() const { return forward_mtp_calls_.load(std::memory_order_relaxed); }
     size_t forward_mtp_from_last_draft_call_count() const { return forward_mtp_from_last_draft_calls_.load(std::memory_order_relaxed); }
     size_t sample_mtp_logits_call_count() const { return sample_mtp_logits_calls_; }
+    size_t sample_greedy_on_device_call_count() const { return sample_greedy_on_device_calls_; }
+    size_t sample_on_device_call_count() const { return sample_on_device_calls_; }
     size_t get_mtp_logits_local_info_call_count() const { return get_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t consume_mtp_logits_local_info_call_count() const { return consume_mtp_logits_local_info_calls_.load(std::memory_order_relaxed); }
     size_t commit_mtp_shifted_rows_call_count() const { return commit_mtp_shifted_rows_calls_; }
@@ -1109,6 +1129,8 @@ public:
         forward_mtp_calls_.store(0, std::memory_order_relaxed);
         forward_mtp_from_last_draft_calls_.store(0, std::memory_order_relaxed);
         sample_mtp_logits_calls_ = 0;
+        sample_greedy_on_device_calls_ = 0;
+        sample_on_device_calls_ = 0;
         commit_mtp_shifted_rows_calls_ = 0;
         ensure_mtp_checkpoint_terminal_hidden_calls_ = 0;
         publish_mtp_spec_state_calls_.store(0, std::memory_order_relaxed);
@@ -1191,6 +1213,8 @@ private:
     MTPSpecStepPlanBatch last_mtp_spec_state_batch_;
     MTPSpecDecodeVerifierInputPlan last_mtp_spec_verifier_input_plan_;
     size_t sample_mtp_logits_calls_ = 0;
+    size_t sample_greedy_on_device_calls_ = 0;
+    size_t sample_on_device_calls_ = 0;
     size_t commit_mtp_shifted_rows_calls_ = 0;
     size_t apply_penalties_on_device_calls_ = 0;
     size_t apply_penalties_to_mtp_logits_calls_ = 0;
@@ -2113,6 +2137,113 @@ TEST_F(Test__RankOrchestrator, MoERebalanceControllersAreLookupByDomain)
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("hot_rocm"), controllers[0]);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("cold_cpu"), controllers[1]);
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("missing"), nullptr);
+}
+
+TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferIsDirectOnly)
+{
+    using rank_orchestrator_detail::sameBackendGpuExpertTransferIsDirectOnly;
+
+    EXPECT_TRUE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cuda(0), DeviceId::cuda(1)));
+    EXPECT_TRUE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::rocm(0), DeviceId::rocm(1)));
+
+    EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cuda(0), DeviceId::rocm(0)));
+    EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cuda(0), DeviceId::cpu()));
+    EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cpu(), DeviceId::cuda(0)));
+}
+
+TEST_F(Test__RankOrchestrator, ReplicaArrivalTransferMasksCopyOnlyToNonOwners)
+{
+    MoERebalanceController::Config cfg;
+    cfg.domain_id = "gpu";
+    cfg.mode = MoERebalanceMode::OBSERVE;
+    cfg.num_layers = 2;
+    cfg.num_experts = 4;
+    cfg.top_k = 1;
+    cfg.window_size = 4;
+    cfg.sockets = {
+        DeviceId(DeviceType::CPU, 0),
+        DeviceId(DeviceType::CPU, 1),
+        DeviceId(DeviceType::CPU, 2)};
+    cfg.initial_expert_to_socket = {0, 1, 0, 2};
+    MoERebalanceController controller(std::move(cfg));
+
+    ExpertReplicaSet arrivals;
+    arrivals.domain_id = "gpu";
+    arrivals.is_replicated = {false, true, true, false};
+    arrivals.owner_socket = {0, 1, 0, 2};
+    arrivals.num_replicated = 2;
+    arrivals.num_sockets = 3;
+
+    auto masks = rank_orchestrator_detail::buildReplicaArrivalTransferMasks(controller, arrivals);
+    ASSERT_EQ(masks.size(), 3u);
+    for (const auto &participant_masks : masks)
+    {
+        ASSERT_EQ(participant_masks.size(), 2u);
+        for (const auto &layer_mask : participant_masks)
+            ASSERT_EQ(layer_mask.size(), 4u);
+    }
+
+    for (int layer = 0; layer < 2; ++layer)
+    {
+        EXPECT_TRUE(masks[0][layer][1]);
+        EXPECT_FALSE(masks[1][layer][1])
+            << "participant 1 owns expert 1 and must not copy its own replica arrival";
+        EXPECT_TRUE(masks[2][layer][1]);
+
+        EXPECT_FALSE(masks[0][layer][2])
+            << "participant 0 owns expert 2 and must not copy its own replica arrival";
+        EXPECT_TRUE(masks[1][layer][2]);
+        EXPECT_TRUE(masks[2][layer][2]);
+
+        EXPECT_FALSE(masks[0][layer][0]);
+        EXPECT_FALSE(masks[1][layer][0]);
+        EXPECT_FALSE(masks[2][layer][0]);
+        EXPECT_FALSE(masks[0][layer][3]);
+        EXPECT_FALSE(masks[1][layer][3]);
+        EXPECT_FALSE(masks[2][layer][3]);
+    }
+}
+
+TEST_F(Test__RankOrchestrator, EmptyReplicaArrivalTransferMasksSuppressCopies)
+{
+    MoERebalanceController::Config cfg;
+    cfg.domain_id = "gpu";
+    cfg.mode = MoERebalanceMode::OBSERVE;
+    cfg.num_layers = 2;
+    cfg.num_experts = 2;
+    cfg.top_k = 1;
+    cfg.window_size = 4;
+    cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
+    cfg.initial_expert_to_socket = {0, 1};
+    MoERebalanceController controller(std::move(cfg));
+
+    ExpertReplicaSet arrivals;
+    arrivals.domain_id = "gpu";
+    arrivals.is_replicated = {false, false};
+    arrivals.owner_socket = {0, 1};
+    arrivals.num_replicated = 0;
+    arrivals.num_sockets = 2;
+
+    const auto full_mask0 = controller.computeExpertMasksForParticipant(0);
+    ASSERT_EQ(full_mask0.size(), 2u);
+    ASSERT_EQ(full_mask0[0].size(), 2u);
+    EXPECT_TRUE(full_mask0[0][0])
+        << "full compute masks still contain owned experts";
+
+    auto transfer_masks = rank_orchestrator_detail::buildReplicaArrivalTransferMasks(
+        controller,
+        arrivals);
+    ASSERT_EQ(transfer_masks.size(), 2u);
+    for (const auto &participant_masks : transfer_masks)
+    {
+        ASSERT_EQ(participant_masks.size(), 2u);
+        for (const auto &layer_mask : participant_masks)
+        {
+            ASSERT_EQ(layer_mask.size(), 2u);
+            EXPECT_FALSE(layer_mask[0]);
+            EXPECT_FALSE(layer_mask[1]);
+        }
+    }
 }
 
 TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)
@@ -3433,6 +3564,62 @@ TEST_F(Test__RankOrchestrator, MultiChildMTPDecodeAllowsReplicatedLogitTopology)
         makeRankConfigForRunnerCount(2));
 
     EXPECT_TRUE(orchestrator->mtpDecodeUnsupportedReason().empty());
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMainSamplingDelegatesToPrimaryReplicatedLogits)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0->set_mock_logits({0.0f, 1.0f, 9.0f, 2.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1->set_mock_logits({0.0f, 8.0f, 1.0f, 3.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    EXPECT_EQ(orchestrator->sampleGreedyOnDevice(), 2)
+        << "Phase-split decode uses replicated full logits, not LOGITS_LOCAL shards.";
+    EXPECT_EQ(runner0_ptr->sample_greedy_on_device_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->sample_greedy_on_device_call_count(), 0u);
+}
+
+TEST_F(Test__RankOrchestrator, MultiChildMainStochasticSamplingDelegatesToPrimaryReplicatedLogits)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0->set_stochastic_sample_token(23);
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1->set_stochastic_sample_token(42);
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    SamplingParams params;
+    params.temperature = 0.8f;
+    params.top_k = 8;
+    params.top_p = 0.95f;
+
+    EXPECT_EQ(orchestrator->sampleOnDevice(params), 23);
+    EXPECT_EQ(runner0_ptr->sample_on_device_call_count(), 1u);
+    EXPECT_EQ(runner1_ptr->sample_on_device_call_count(), 0u);
 }
 
 TEST_F(Test__RankOrchestrator, MultiChildMTPLogitsRequireMatchingReplicas)

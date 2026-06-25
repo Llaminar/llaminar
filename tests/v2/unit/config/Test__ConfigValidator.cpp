@@ -135,11 +135,11 @@ TEST(Test__ConfigValidator, DefaultConfig_NoErrors)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_DefaultExpertParallel_NoErrors)
+TEST(Test__ConfigValidator, MoE_DefaultApportionedExperts_NoErrors)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::ExpertParallel;
+    cfg.moe_expert_mode = MoEExpertMode::ApportionedExperts;
 
     EXPECT_TRUE(noErrors(v, cfg));
 }
@@ -148,18 +148,18 @@ TEST(Test__ConfigValidator, MoE_ReplicatedExperts_NoErrors)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::Replicated;
+    cfg.moe_expert_mode = MoEExpertMode::ReplicatedExperts;
 
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_TensorParallelExperts_NotImplemented)
+TEST(Test__ConfigValidator, MoE_ShardedExperts_NotImplemented)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
-    cfg.moe_expert_mode = MoEExpertMode::TensorParallel;
+    cfg.moe_expert_mode = MoEExpertMode::ShardedExperts;
 
-    EXPECT_TRUE(ruleFiresFor(v, "moe-tensor-parallel-experts-not-implemented", cfg));
+    EXPECT_TRUE(ruleFiresFor(v, "moe-sharded-experts-not-implemented", cfg));
 }
 
 TEST(Test__ConfigValidator, StandardValidator_HasRules)
@@ -718,7 +718,7 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
             .backend = CollectiveBackendType::AUTO,
             .participants = {GlobalDeviceAddress::cuda(0)},
             .owner_rank = 0,
-            .compute_kind = ExpertDomainComputeKind::ReplicatedExperts,
+            .compute_kind = ExpertDomainComputeKind::ApportionedExperts,
         },
         ExpertComputeDomain{
             .name = "cpu_cold",
@@ -726,7 +726,7 @@ TEST(Test__ConfigValidator, Integration_OverlayRootPlacementRejectsLegacySingleD
             .backend = CollectiveBackendType::UPI,
             .participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
             .world_ranks = {0, 1},
-            .compute_kind = ExpertDomainComputeKind::TensorParallelExperts,
+            .compute_kind = ExpertDomainComputeKind::ShardedExperts,
         },
     };
     cfg.moe_expert_parallel_plan->routed_tiers = {

@@ -8,6 +8,7 @@
 #include "MmapRegion.h"
 #include "PreparedWeightStore.h"
 #include "GPUVramPreflight.h"
+#include "utils/VramBillOfMaterials.h"
 #include "../execution/moe/ExpertWeightPayloadProvider.h"
 #include "../execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "../execution/moe/MoEExpertOverlayRuntimePlan.h"
@@ -98,6 +99,7 @@ namespace llaminar2
             mixInt(requirement.pp_stage);
             mixInt(requirement.tp_domain);
             mixInt(requirement.tp_rank_or_device_index);
+            mixInt(requirement.bypass_tensor_parallel ? 1 : 0);
             mixInt(static_cast<int>(requirement.residency_category));
             mixString(requirement.overlay_domain);
             mixInt(requirement.overlay_participant_index);
@@ -118,6 +120,114 @@ namespace llaminar2
         {
             const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(tensor);
             return unpackable && unpackable->vnniFormatInfo() != nullptr;
+        }
+
+        bool hasExplicitSlice(const WeightSliceSpec &slice)
+        {
+            return slice.source_rows != 0 ||
+                   slice.source_cols != 0 ||
+                   slice.row_start != 0 ||
+                   slice.row_count != 0 ||
+                   slice.col_start != 0 ||
+                   slice.col_count != 0 ||
+                   slice.expert_start != 0 ||
+                   slice.expert_count != 0 ||
+                   slice.inner_is_presliced;
+        }
+
+        bool isEmptySliceSpec(const WeightSliceSpec &slice)
+        {
+            return !hasExplicitSlice(slice);
+        }
+
+        WeightSliceSpec mergeRequirementSlice(
+            const WeightSliceSpec &materialized,
+            const WeightSliceSpec &requirement)
+        {
+            if (!hasExplicitSlice(requirement))
+                return materialized;
+            if (isEmptySliceSpec(materialized))
+                return requirement;
+
+            WeightSliceSpec merged = materialized;
+            if (requirement.source_rows != 0)
+                merged.source_rows = requirement.source_rows;
+            if (requirement.source_cols != 0)
+                merged.source_cols = requirement.source_cols;
+
+            if (requirement.row_start != 0 || requirement.row_count != 0)
+            {
+                merged.row_start = requirement.row_start;
+                if (requirement.row_count != 0)
+                    merged.row_count = requirement.row_count;
+            }
+            if (requirement.col_start != 0 || requirement.col_count != 0)
+            {
+                merged.col_start = requirement.col_start;
+                if (requirement.col_count != 0)
+                    merged.col_count = requirement.col_count;
+            }
+            if (requirement.expert_start != 0 || requirement.expert_count != 0)
+            {
+                merged.expert_start = requirement.expert_start;
+                if (requirement.expert_count != 0)
+                    merged.expert_count = requirement.expert_count;
+            }
+            if (requirement.inner_is_presliced)
+                merged.inner_is_presliced = true;
+            return merged;
+        }
+
+        bool isRoutedExpertResidencyCategory(WeightResidencyCategory category)
+        {
+            return category == WeightResidencyCategory::AcceleratorRoutedExpert ||
+                   category == WeightResidencyCategory::CpuFallbackExpert ||
+                   category == WeightResidencyCategory::WorkerFallbackExpert;
+        }
+
+        bool isRoutedExpertBinding(const WeightBinding &binding)
+        {
+            return isRoutedExpertRole(binding.identity.role) ||
+                   isRoutedExpertResidencyCategory(binding.identity.residency_category);
+        }
+
+        bool bindingTargetsDevice(const WeightBinding &binding, DeviceId device)
+        {
+            return binding.residency.home_device == device ||
+                   (binding.residency.resident_device.has_value() &&
+                    *binding.residency.resident_device == device) ||
+                   (binding.prepared.has_value() && binding.prepared->device == device);
+        }
+
+        bool shouldPrepareFrozenGemmBinding(
+            const WeightManager &manager,
+            const WeightBinding &binding,
+            DeviceId device,
+            bool include_expert_jobs)
+        {
+            if (!bindingTargetsDevice(binding, device))
+                return false;
+            if (!binding.tensor || binding.tensor->shape().size() != 2)
+                return false;
+            if (binding.identity.role == WeightRole::Embedding ||
+                binding.identity.role == WeightRole::Norm ||
+                binding.identity.role == WeightRole::Bias)
+            {
+                return false;
+            }
+            if (!include_expert_jobs && isRoutedExpertBinding(binding))
+                return false;
+            if (binding.prepared.has_value() && binding.prepared->device == device)
+                return true;
+
+            try
+            {
+                return manager.isGemmWeight(binding.identity.canonical_name);
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
         }
 
         bool endsWith(const std::string &value, const std::string &suffix)
@@ -1572,7 +1682,13 @@ namespace llaminar2
                                                : requirement.source_name;
             const DeviceId lookup_device = requirement.lookup_device.value_or(requirement.target_device);
             std::shared_ptr<TensorBase> tensor;
-            if (tp_config_ && requirement.tp_domain >= 0 && requirement.tp_rank_or_device_index >= 0)
+            if (requirement.bypass_tensor_parallel)
+            {
+                tensor = getReplicatedWeight(load_name, lookup_device);
+                if (!tensor && load_name == "output.weight" && requirement.canonical_name == "output.weight")
+                    tensor = getReplicatedWeight("token_embd.weight", lookup_device);
+            }
+            else if (tp_config_ && requirement.tp_domain >= 0 && requirement.tp_rank_or_device_index >= 0)
             {
                 try
                 {
@@ -1673,12 +1789,7 @@ namespace llaminar2
                 }
             }
 
-            if (requirement.slice.source_rows != 0 || requirement.slice.source_cols != 0 ||
-                requirement.slice.row_count != 0 || requirement.slice.col_count != 0 ||
-                requirement.slice.expert_count != 0)
-            {
-                binding.slice = requirement.slice;
-            }
+            binding.slice = mergeRequirementSlice(binding.slice, requirement.slice);
 
             if (auto fp32_override = createGdnTinySsmProjectionFp32Override(
                     requirement.canonical_name,
@@ -2759,16 +2870,8 @@ namespace llaminar2
 
             for (const auto &binding : frozen_weights.bindings())
             {
-                if (!binding.prepared.has_value() || binding.prepared->device != device)
+                if (!shouldPrepareFrozenGemmBinding(*this, binding, device, include_expert_jobs))
                     continue;
-                if (!binding.tensor || binding.tensor->shape().size() != 2)
-                    continue;
-                if (binding.identity.role == WeightRole::Embedding ||
-                    binding.identity.role == WeightRole::Norm ||
-                    binding.identity.role == WeightRole::Bias)
-                {
-                    continue;
-                }
                 if (!store->preparedRefForBinding(binding.binding_id, device).has_value())
                 {
                     store->prepareGemm(binding);
@@ -2789,16 +2892,8 @@ namespace llaminar2
             size_t released_count = 0;
             for (const auto &binding : frozen_weights.bindings())
             {
-                if (!binding.prepared.has_value() || binding.prepared->device != device)
+                if (!shouldPrepareFrozenGemmBinding(*this, binding, device, include_expert_jobs))
                     continue;
-                if (!binding.tensor || binding.tensor->shape().size() != 2)
-                    continue;
-                if (binding.identity.role == WeightRole::Embedding ||
-                    binding.identity.role == WeightRole::Norm ||
-                    binding.identity.role == WeightRole::Bias)
-                {
-                    continue;
-                }
                 if (hasVnniPackedQuantizedPayload(binding.tensor))
                 {
                     binding.tensor->release_host_weight_data();
@@ -2979,7 +3074,8 @@ namespace llaminar2
     }
 
     bool WeightManager::finalizeForDevices(const std::vector<DeviceId> &devices,
-                                           bool release_host_data)
+                                           bool release_host_data,
+                                           bool include_expert_jobs)
     {
         if (devices.empty())
         {
@@ -3020,8 +3116,8 @@ namespace llaminar2
                     LOG_DEBUG("[WeightManager] finalizeForDevices: launching GPU pipeline for "
                               << dev.toString());
                     gemm_futures.push_back(std::async(std::launch::async,
-                                                      [this, dev]()
-                                                      { return packGemmWeightsViaPipeline(dev, nullptr); }));
+                                                      [this, dev, include_expert_jobs]()
+                                                      { return packGemmWeightsViaPipeline(dev, nullptr, nullptr, include_expert_jobs); }));
                 }
                 else
                 {
@@ -4066,16 +4162,20 @@ namespace llaminar2
             {
                 for (const auto &binding : frozen_weights->bindings())
                 {
-                    if (!binding.prepared.has_value() || binding.prepared->device != target_device)
-                        continue;
-                    if (!binding.tensor || binding.tensor->shape().size() != 2)
-                        continue;
-                    if (binding.identity.role == WeightRole::Embedding ||
-                        binding.identity.role == WeightRole::Norm ||
-                        binding.identity.role == WeightRole::Bias)
+                    if (!shouldPrepareFrozenGemmBinding(*this, binding, target_device, include_expert_jobs))
                     {
+                        if (bindingTargetsDevice(binding, target_device) &&
+                            !include_expert_jobs &&
+                            isRoutedExpertBinding(binding))
+                        {
+                            LOG_DEBUG("[WeightManager] GPU pipeline: deferring routed expert binding "
+                                      << binding.identity.canonical_name
+                                      << " to explicit MoE expert preparation");
+                        }
                         continue;
                     }
+                    if (layer_filter && !layer_filter(binding.identity.canonical_name))
+                        continue;
 
                     gemm_weights.push_back(DenseGemmJob{
                         binding.identity.canonical_name,
@@ -4202,6 +4302,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> view; // 2D expert view (keeps parent alive)
         };
         std::vector<MoEExpertJob> moe_jobs;
+        size_t moe_jobs_already_satisfied = 0;
 
         // Track 3D parent tensors by name so release readiness is tensor-specific.
         struct MoEParentTensorRecord
@@ -4402,16 +4503,6 @@ namespace llaminar2
                             continue;
                         }
 
-                        const size_t tensor_expert_idx = rt.source->tensor_expert_start + local_idx;
-                        const size_t element_offset = tensor_expert_idx * role_elements_per_expert;
-                        std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
-                        auto view = rt.source->tensor->create_view(view_shape, element_offset);
-                        if (!view)
-                        {
-                            throw std::runtime_error(
-                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(global_expert) + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols) + "], offset=" + std::to_string(element_offset) + ")");
-                        }
-
                         std::string slot_name = "moe_L" + std::to_string(layer_idx) + "_" + rt.tag + "_e" + std::to_string(global_expert);
                         std::string domain_name;
                         std::string tier_name;
@@ -4428,6 +4519,34 @@ namespace llaminar2
                             slot_name = "moe_" + registrySlotComponent(domain_name) + "_tier" +
                                         std::to_string(tier_index) + "_L" + std::to_string(layer_idx) +
                                         "_" + rt.tag + "_e" + std::to_string(global_expert);
+
+                            const bool domain_ready =
+                                expert_gemm_registry_.getEngineForDomain(
+                                    domain_name, target_device, layer_idx, global_expert, rt.role) != nullptr ||
+                                expert_gemm_registry_.aliasEngineForDomainFromDevice(
+                                    domain_name, target_device, layer_idx, global_expert, rt.role);
+                            const bool participant_ready =
+                                expert_gemm_registry_.getEngineForParticipant(
+                                    domain_name, target_device, participant_world_rank, participant_index,
+                                    layer_idx, global_expert, rt.role) != nullptr ||
+                                expert_gemm_registry_.aliasEngineForParticipantFromDevice(
+                                    domain_name, target_device, participant_world_rank, participant_index,
+                                    layer_idx, global_expert, rt.role);
+                            if (domain_ready && participant_ready)
+                            {
+                                ++moe_jobs_already_satisfied;
+                                continue;
+                            }
+                        }
+
+                        const size_t tensor_expert_idx = rt.source->tensor_expert_start + local_idx;
+                        const size_t element_offset = tensor_expert_idx * role_elements_per_expert;
+                        std::vector<size_t> view_shape = {role_rows_per_expert, role_cols};
+                        auto view = rt.source->tensor->create_view(view_shape, element_offset);
+                        if (!view)
+                        {
+                            throw std::runtime_error(
+                                "[WeightManager] GPU pipeline: failed to create expert view for layer " + std::to_string(layer_idx) + " " + rt.tag + " expert " + std::to_string(global_expert) + " (shape=[" + std::to_string(role_rows_per_expert) + "," + std::to_string(role_cols) + "], offset=" + std::to_string(element_offset) + ")");
                         }
 
                         moe_jobs.push_back({layer_idx, global_expert, rt.role, std::move(slot_name),
@@ -4507,9 +4626,135 @@ namespace llaminar2
             gemm_weights = std::move(pending_gemm_weights);
         }
 
+        if (frozen_weights)
+        {
+            auto refresh_dense_job = [&](DenseGemmJob &dense_job,
+                                         std::shared_ptr<TensorBase> fresh,
+                                         WeightDerivationKind derivation,
+                                         const WeightSliceSpec &slice,
+                                         const std::string &source_name) -> bool
+            {
+                if (!fresh || !dense_job.binding.has_value() || !dense_job.tensor)
+                    return false;
+                if (fresh->shape() != dense_job.tensor->shape())
+                {
+                    LOG_WARN("[WeightManager] GPU pipeline: reloaded raw source " << source_name
+                                                                                  << " for " << dense_job.binding->identity.canonical_name
+                                                                                  << " but shape changed from ["
+                                                                                  << dense_job.tensor->rows() << "," << dense_job.tensor->cols()
+                                                                                  << "] to [" << fresh->rows() << "," << fresh->cols()
+                                                                                  << "]; keeping existing binding");
+                    return false;
+                }
+                if (fresh->size_bytes() == 0 || fresh->raw_data() == nullptr)
+                    return false;
+
+                registerDerivedMetadata(
+                    dense_job.binding->identity.canonical_name,
+                    fresh,
+                    derivation,
+                    slice,
+                    target_device);
+
+                dense_job.owner = fresh;
+                dense_job.tensor = fresh.get();
+                dense_job.binding->tensor_owner = fresh;
+                dense_job.binding->tensor = fresh.get();
+                if (dense_job.binding->slice.source_rows == 0 &&
+                    dense_job.binding->slice.source_cols == 0 &&
+                    dense_job.binding->slice.row_count == 0 &&
+                    dense_job.binding->slice.col_count == 0)
+                {
+                    dense_job.binding->slice = fullSliceSpec(*fresh);
+                }
+                LOG_DEBUG("[WeightManager] GPU pipeline: reloaded raw source " << source_name
+                                                                               << " for frozen binding "
+                                                                               << dense_job.binding->identity.canonical_name
+                                                                               << " on " << target_device.to_string());
+                return true;
+            };
+
+            auto full_binding_can_reload_raw = [](const WeightBinding &binding) -> bool
+            {
+                if (!binding.tensor || binding.tensor->shape().size() < 2)
+                    return false;
+                const auto &slice = binding.slice;
+                const auto &shape = binding.tensor->shape();
+                if (slice.inner_is_presliced || slice.expert_count != 0 || slice.expert_start != 0)
+                    return false;
+                if (slice.row_start != 0 || slice.col_start != 0)
+                    return false;
+                const bool row_is_full = slice.row_count == 0 || slice.row_count == shape[0];
+                const bool col_is_full = slice.col_count == 0 || slice.col_count == shape[1];
+                const bool source_rows_ok = slice.source_rows == 0 || slice.source_rows == shape[0];
+                const bool source_cols_ok = slice.source_cols == 0 || slice.source_cols == shape[1];
+                return row_is_full && col_is_full && source_rows_ok && source_cols_ok;
+            };
+
+            for (auto &dense_job : gemm_weights)
+            {
+                if (!dense_job.binding.has_value() || !dense_job.tensor)
+                    continue;
+                if (dense_job.tensor->size_bytes() != 0 && dense_job.tensor->raw_data() != nullptr)
+                    continue;
+
+                const auto &binding = *dense_job.binding;
+                if (binding.identity.derivation == WeightDerivationKind::TiedAlias &&
+                    binding.identity.canonical_name == "output.weight" &&
+                    binding.slice.inner_is_presliced &&
+                    binding.slice.row_count > 0 &&
+                    binding.slice.col_start == 0 &&
+                    binding.slice.expert_count == 0)
+                {
+                    auto fresh = loader_.loadTensorRowSlice(
+                        "token_embd.weight",
+                        binding.slice.row_start,
+                        binding.slice.row_start + binding.slice.row_count,
+                        target_device,
+                        weight_precision_);
+                    if (refresh_dense_job(
+                            dense_job,
+                            std::move(fresh),
+                            WeightDerivationKind::TiedAlias,
+                            binding.slice,
+                            "token_embd.weight"))
+                    {
+                        continue;
+                    }
+                }
+
+                if (!full_binding_can_reload_raw(binding))
+                    continue;
+
+                std::string source_name = binding.identity.canonical_name;
+                if (binding.identity.derivation == WeightDerivationKind::TiedAlias &&
+                    source_name == "output.weight")
+                {
+                    source_name = "token_embd.weight";
+                }
+
+                auto fresh = getReplicatedWeight(source_name, target_device);
+                (void)refresh_dense_job(
+                    dense_job,
+                    std::move(fresh),
+                    binding.identity.derivation,
+                    binding.slice,
+                    source_name);
+            }
+        }
+
         if (gemm_weights.empty() && moe_jobs.empty())
         {
-            LOG_DEBUG("[WeightManager] GPU pipeline: no weights to load");
+            if (moe_jobs_already_satisfied > 0)
+            {
+                LOG_DEBUG("[WeightManager] GPU pipeline: all " << moe_jobs_already_satisfied
+                                                               << " requested MoE overlay expert slots already have registry entries for "
+                                                               << target_device.to_string());
+            }
+            else
+            {
+                LOG_DEBUG("[WeightManager] GPU pipeline: no weights to load");
+            }
             return true;
         }
 
@@ -4749,11 +4994,25 @@ namespace llaminar2
         const size_t required_vram_bytes = planned_weight_bytes + staging_bytes;
         const size_t free_vram_bytes = backend->deviceMemoryFree(target_device.ordinal);
         const size_t total_vram_bytes = backend->deviceMemoryTotal(target_device.ordinal);
-        const size_t safety_margin_bytes = std::max<size_t>(512ULL * 1024ULL * 1024ULL,
-                                                            total_vram_bytes / 20ULL); // 5%, at least 512 MiB
+        const size_t safety_margin_bytes = gpuPipelineVramSafetyMarginBytes(total_vram_bytes);
 
         if (free_vram_bytes > 0 && required_vram_bytes + safety_margin_bytes > free_vram_bytes)
         {
+            logVramBomLine(
+                "weight_preflight",
+                "source=WeightManager status=fail device=" + target_device.to_string() +
+                    " required_bytes=" + std::to_string(required_vram_bytes) +
+                    " required_mib=" + vramBomMiB(required_vram_bytes) +
+                    " planned_weights_bytes=" + std::to_string(planned_weight_bytes) +
+                    " planned_weights_mib=" + vramBomMiB(planned_weight_bytes) +
+                    " staging_bytes=" + std::to_string(staging_bytes) +
+                    " staging_mib=" + vramBomMiB(staging_bytes) +
+                    " safety_margin_bytes=" + std::to_string(safety_margin_bytes) +
+                    " safety_margin_mib=" + vramBomMiB(safety_margin_bytes) +
+                    " free_bytes=" + std::to_string(free_vram_bytes) +
+                    " free_mib=" + vramBomMiB(free_vram_bytes) +
+                    " total_bytes=" + std::to_string(total_vram_bytes) +
+                    " total_mib=" + vramBomMiB(total_vram_bytes));
             LOG_ERROR("[WeightManager] GPU pipeline VRAM preflight failed for "
                       << target_device.to_string()
                       << ": required=" << formatMiB(required_vram_bytes)
@@ -4771,6 +5030,21 @@ namespace llaminar2
             return false;
         }
 
+        logVramBomLine(
+            "weight_preflight",
+            "source=WeightManager status=pass device=" + target_device.to_string() +
+                " required_bytes=" + std::to_string(required_vram_bytes) +
+                " required_mib=" + vramBomMiB(required_vram_bytes) +
+                " planned_weights_bytes=" + std::to_string(planned_weight_bytes) +
+                " planned_weights_mib=" + vramBomMiB(planned_weight_bytes) +
+                " staging_bytes=" + std::to_string(staging_bytes) +
+                " staging_mib=" + vramBomMiB(staging_bytes) +
+                " safety_margin_bytes=" + std::to_string(safety_margin_bytes) +
+                " safety_margin_mib=" + vramBomMiB(safety_margin_bytes) +
+                " free_bytes=" + std::to_string(free_vram_bytes) +
+                " free_mib=" + vramBomMiB(free_vram_bytes) +
+                " total_bytes=" + std::to_string(total_vram_bytes) +
+                " total_mib=" + vramBomMiB(total_vram_bytes));
         LOG_DEBUG("[WeightManager] GPU pipeline VRAM preflight for " << target_device.to_string()
                                                                      << ": required=" << formatMiB(required_vram_bytes)
                                                                      << " planned_weights=" << formatMiB(planned_weight_bytes)
@@ -4975,6 +5249,20 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 binding.binding_id = next_pipeline_prepared_binding_id_++;
                 binding.identity = makeSourceWeightIdentity(name, {}, binding.binding_id);
+                if (weight_metadata_)
+                {
+                    if (auto metadata = weight_metadata_->metadata(tensor))
+                    {
+                        binding.identity.derivation = metadata->identity.derivation;
+                        binding.identity.role = metadata->identity.role == WeightRole::Other
+                                                    ? inferWeightRole(name)
+                                                    : metadata->identity.role;
+                        binding.identity.layer = metadata->identity.layer;
+                        binding.identity.expert = metadata->identity.expert;
+                        binding.slice = metadata->slice;
+                        binding.residency = metadata->residency;
+                    }
+                }
             }
             binding.tensor = tensor;
             if (dense_job.owner)

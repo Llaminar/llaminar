@@ -37,7 +37,7 @@ namespace llaminar2
         std::string name;
         ExpertDomainKind kind = ExpertDomainKind::SingleDevice;
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
-        ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ApportionedExperts;
 
         std::vector<MoEOverlayDomainParticipant> participants;
         GlobalDeviceAddress primary_participant;

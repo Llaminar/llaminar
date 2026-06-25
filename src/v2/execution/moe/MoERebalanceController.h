@@ -282,4 +282,12 @@ namespace llaminar2
         void growWindowIfAdaptive();
     };
 
+    /// Pick the controller that should own graph-side routed expert telemetry
+    /// and runtime rebalance decisions when multiple domains are present.
+    MoERebalanceController *selectActiveMoERebalanceController(
+        const std::vector<MoERebalanceController *> &controllers);
+
+    MoERebalanceController *selectActiveMoERebalanceController(
+        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers);
+
 } // namespace llaminar2

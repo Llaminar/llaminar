@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <numeric>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <cstring>
@@ -188,6 +189,25 @@ TEST_F(Test__LocalTPContext, GpuGraphPolicyAllowsRCCLWithoutSegmentedCollectives
 
     EXPECT_TRUE(supported);
     EXPECT_EQ(reason, "rccl_gpu_graphs_without_segmented_collectives");
+}
+
+TEST_F(Test__LocalTPContext, DebugEnvParsesSmallGpuAllreduceKnobs)
+{
+    ScopedEnvVar enabled("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE", "1");
+    ScopedEnvVar max_elements("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS", "4096");
+
+    EXPECT_TRUE(debugEnv().localtp_small_gpu_allreduce);
+    EXPECT_EQ(debugEnv().localtp_small_gpu_allreduce_max_elements, 4096u);
+}
+
+TEST_F(Test__LocalTPContext, AllreduceOnStreamRejectsNullStream)
+{
+    auto ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::HOST);
+    auto tensor = TestTensorFactory::createFP32({2, 4});
+
+    EXPECT_THROW(
+        ctx->allreduceOnStream(tensor.get(), "unit_null_stream_allreduce", tensor->numel(), nullptr, "fp16"),
+        std::invalid_argument);
 }
 
 /**

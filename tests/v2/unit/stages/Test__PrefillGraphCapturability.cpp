@@ -752,17 +752,44 @@ TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFull
 #endif
 }
 
-TEST_F(MoEExpertPrefillGraphCapture, RejectsWithExpertMaskHavingDisabled)
+TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEnginesOnly)
 {
     ScopedRocmMoEFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
-    params.expert_mask = {true, true, false, true}; // one disabled
+    params.expert_mask = {true, false, true, false};
+    params.prepared_gate_gemm[1] = nullptr;
+    params.prepared_up_gemm[1] = nullptr;
+    params.prepared_down_gemm[1] = nullptr;
+    params.prepared_gate_gemm[3] = nullptr;
+    params.prepared_up_gemm[3] = nullptr;
+    params.prepared_down_gemm[3] = nullptr;
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Masked LocalTP prefill should capture when local expert engines are ready";
+#else
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
+    EXPECT_FALSE(stage.isGraphCapturable());
+#endif
+}
+
+TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyRejectsMissingLocalEngine)
+{
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    auto params = makeValidPrefillParams();
+    params.expert_mask = {true, false, true, false};
+    params.prepared_gate_gemm[2] = nullptr;
+    MoEExpertComputeStage stage(params);
+    stage.setMoEKernelForTesting(&stub_kernel_);
+
+    EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable())
-        << "Should reject when expert mask has disabled entries";
+        << "Masked LocalTP prefill still needs every locally computed expert engine";
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithReplicas)
@@ -888,6 +915,59 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
     EXPECT_TRUE(stage.isGraphCapturable())
         << "After the first warmup token, segmented capture should be armed "
            "without requiring a fallback decode step.";
+#else
+    GTEST_SKIP() << "Release GPU graph-capture path is disabled in this build";
+#endif
+}
+
+TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWithReplicas)
+{
+#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+    ScopedRocmMoEFlags flags(true, true, true);
+
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+
+    auto params = makeValidPrefillParams();
+    params.device_id = DeviceId::rocm(0);
+    params.seq_len = 1;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+    params.output_registered_in_arena = true;
+    params.expert_mask = {true, false, true, true};
+
+    ExpertReplicaSet replicas;
+    replicas.is_replicated = {false, false, true, true};
+    replicas.owner_socket = {0, 1, 0, 1};
+    replicas.num_replicated = 2;
+    replicas.num_sockets = 2;
+
+    MoEExpertComputeStage stage(params);
+    stage.setMoEKernelForTesting(&stub_kernel_);
+    stage.releaseRawExpertWeights();
+    stage.setReplicaSet(replicas, /*socket_id=*/0);
+
+    ASSERT_TRUE(stage.supportsWarmupDependentGraphCapture());
+    ASSERT_TRUE(stage.execute(nullptr))
+        << "Replicated GPU participants must still use the device runtime "
+           "decode path after the first warmup token.";
+    EXPECT_EQ(stub_kernel_.fused_runtime_decode_calls, 1);
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Replica-aware runtime-table metadata should make the warmed decode "
+           "stage graph-capturable.";
+
+    const auto &state = runtime_table.hostLayerState(0);
+    ASSERT_LT(state.active_bank, 2u);
+    EXPECT_EQ(state.participant_id, 0u);
+    EXPECT_EQ(state.participant_count, 2u);
+
+    const auto &bank = state.banks[state.active_bank];
+    EXPECT_EQ(bank.local_compute_mask[0], 1u);
+    EXPECT_EQ(bank.local_compute_mask[1], 0u);
+    EXPECT_EQ(bank.local_compute_mask[2], 1u);
+    EXPECT_EQ(bank.local_compute_mask[3], 1u);
+    EXPECT_EQ(bank.experts[3].owner_participant, 1);
+    EXPECT_TRUE(hasMoEExpertFlag(bank.experts[3].flags, DeviceMoEExpertFlags::Replicated));
+    EXPECT_EQ(bank.replica_role[3], static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
 #else
     GTEST_SKIP() << "Release GPU graph-capture path is disabled in this build";
 #endif

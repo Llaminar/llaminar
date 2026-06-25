@@ -352,6 +352,7 @@ namespace llaminar2
             IDeviceContext *ctx,
             IWorkerGPUContext *gpu_ctx,
             bool has_collective_nodes,
+            bool collectives_graph_capturable,
             uint64_t current_step,
             const ReplayHooks &hooks,
             bool force_recapture = false,

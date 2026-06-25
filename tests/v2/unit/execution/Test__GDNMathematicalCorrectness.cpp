@@ -878,6 +878,53 @@ TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_PerHeadNormDim)
         << "Full-dim and per-head normalization should produce different results";
 }
 
+TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_ExplicitFeatureDimAllowsWiderBackingBuffer)
+{
+    // Dense decode can reserve a full-width backing buffer while TP prefill
+    // still packs the local active feature rows contiguously at the front.
+    const int active_dim = 2;
+    const int backing_dim = 4;
+    const int seq_len = 2;
+
+    std::vector<float> input_data = {
+        2.0f, 2.0f,
+        3.0f, 3.0f,
+        99.0f, 99.0f, 99.0f, 99.0f,
+    };
+    std::vector<float> gate_data = {
+        1.0f, 1.0f,
+        1.0f, 1.0f,
+    };
+    auto input = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(backing_dim)}, input_data.data());
+    auto gate = makeFP32({static_cast<size_t>(seq_len), static_cast<size_t>(active_dim)}, gate_data.data());
+    auto gamma = makeFP32Const({static_cast<size_t>(active_dim)}, 1.0f);
+    auto output = makeFP32Const({static_cast<size_t>(seq_len), static_cast<size_t>(backing_dim)}, 0.0f);
+
+    GatedRMSNormStage::Params params;
+    params.input = input.get();
+    params.gate = gate.get();
+    params.output = output.get();
+    params.gamma = gamma.get();
+    params.eps = 1e-6f;
+    params.seq_len = seq_len;
+    params.feature_dim = active_dim;
+    params.norm_dim = active_dim;
+
+    auto ctx = makeCPUContext();
+    GatedRMSNormStage stage(params);
+    ASSERT_TRUE(stage.execute(ctx.get()));
+
+    const float *out = output->data();
+    for (int i = 0; i < seq_len * active_dim; ++i)
+    {
+        EXPECT_NEAR(out[i], 1.0f, 1e-4f) << "packed active element " << i;
+    }
+    for (int i = seq_len * active_dim; i < seq_len * backing_dim; ++i)
+    {
+        EXPECT_EQ(out[i], 0.0f) << "padding element " << i;
+    }
+}
+
 TEST(Test__GDNMathematicalCorrectness, GatedRMSNorm_PerHeadNormDim_WithSiLU)
 {
     // Per-head norm_dim with gate_silu=true

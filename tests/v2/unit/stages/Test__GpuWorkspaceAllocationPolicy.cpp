@@ -368,6 +368,9 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExp
     const auto *active_ids = reqs.find(llaminar2::MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS);
     ASSERT_NE(active_ids, nullptr);
     EXPECT_GE(active_ids->size_bytes, static_cast<size_t>(num_experts) * sizeof(int));
+    const auto *expert_mask = reqs.find(llaminar2::MoEWorkspaceBuffers::GROUP_EXPERT_MASK);
+    ASSERT_NE(expert_mask, nullptr);
+    EXPECT_GE(expert_mask->size_bytes, static_cast<size_t>(num_experts) * sizeof(uint8_t));
     EXPECT_GT(static_cast<size_t>(num_experts), static_cast<size_t>(max_seq_len) * top_k)
         << "fixture must cover the small-token, many-expert regression";
 }
@@ -3720,7 +3723,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEMTPSidecarUsesPersistentDepthScopedM
            "main-state preservation and shifted-row reuse.";
 }
 
-TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableRequiresFullExpertOwnership)
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableGuardsOwnershipShape)
 {
     const auto graph_source =
         readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
@@ -3745,17 +3748,38 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEDeviceRoutedDecodeTableRequire
               std::string::npos)
         << "GPU expert-cache bootstrap masks also break full-owner runtime-table "
            "semantics and must keep decode capture disabled.";
-    EXPECT_NE(compact.find("&&static_full_local_expert_ownership)"),
+    EXPECT_NE(compact.find("if(use_expert_overlay)returnfalse"),
+              std::string::npos)
+        << "Graph-native tiered overlays use per-participant expert masks even "
+           "when the tier domain says compute=ApportionedExperts; they must not "
+           "receive the full-owner decode runtime table.";
+    EXPECT_NE(compact.find("constbooldecode_runtime_table_eligible="),
+              std::string::npos)
+        << "Runtime-table creation must use one explicit eligibility predicate "
+           "before MoERoutingStage and MoEExpertComputeStage are built.";
+    EXPECT_NE(compact.find("&&decode_runtime_table_eligible)"),
               std::string::npos)
         << "Runtime-table creation must be gated before MoERoutingStage and "
            "MoEExpertComputeStage are built; failing later in the expert stage "
            "turns E2E requests into parse errors instead of policy counters.";
+    EXPECT_NE(compact.find("masked_local_tp_overlay_decode_runtime_table"),
+              std::string::npos)
+        << "Masked LocalTP overlays may use their own runtime table, but the "
+           "masked path must stay separate from the full-owner table contract.";
     const std::string compact_graph =
         removeAsciiWhitespace(stripCommentsAndStringLiterals(graph_source));
+    EXPECT_NE(compact_graph.find("initializeMaskedLocalDecodeRuntimeTable("),
+              std::string::npos)
+        << "Masked LocalTP runtime tables must be initialized through the "
+           "mask-aware helper, not the full local decode helper.";
     EXPECT_NE(compact_graph.find("route_params.allow_eager_gpu_single_row_route_for_partial_expert_owner=allow_eager_partial_owner_gpu_route"),
               std::string::npos)
         << "The temporary partial-owner LocalTP route path must stay explicit "
            "at the graph-builder boundary.";
+    EXPECT_NE(compact_graph.find("config_.moe.expert_mode==MoEExpertMode::ApportionedExperts||use_expert_overlay"),
+              std::string::npos)
+        << "Tiered overlays must opt into the explicit eager partial-owner "
+           "route path until a sharded runtime-table reducer exists.";
 
     const auto routing_source =
         readFile(repoRoot() / "src/v2/execution/compute_stages/stages/MoERoutingStage.cpp");

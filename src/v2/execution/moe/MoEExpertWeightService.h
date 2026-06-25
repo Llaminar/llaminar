@@ -28,6 +28,7 @@ class ITensorGemm;
 class ExpertWeightPayloadProvider;
 class PreparedWeightStore;
 class ExpertGemmRegistry;
+class GpuExpertSlotPool;
 
 /// Lightweight reference struct pointing to the MoEExpertComputeStage::Params fields
 /// that the weight service operates on. Avoids coupling the service to the
@@ -85,6 +86,11 @@ struct MoEWeightContext {
     // Initial prep may share mmap-backed parent tensors across accelerator and
     // CPU fallback tiers. Disable eager page advice until every consumer is done.
     bool advise_raw_pages_after_prepare = true;
+
+    // Optional per-stage dynamic GPU arrival pool. When present, same-backend
+    // GPU-direct arrivals can reuse physical expert slots instead of creating a
+    // fresh VRAM allocation for every rebalanced expert.
+    std::shared_ptr<GpuExpertSlotPool>* gpu_direct_slot_pool = nullptr;
 };
 
 /// Weight lifecycle service for MoE expert GEMM engines.
@@ -140,12 +146,20 @@ public:
     /// @param dst_ctx Destination MoE weight context (will receive weights)
     /// @param expert_ids Experts to transfer
     /// @param layer_idx Layer index (for logging)
+    /// @param source_producer_stream Explicit source GPU stream. The destination
+    /// transfer stream waits on an event recorded here before copying.
+    /// @param satisfied_expert_ids Optional output populated with requested experts
+    /// that are resident on the destination after the attempt. Includes experts
+    /// that were already resident before the peer copy.
     /// @return true if GPU-direct transfer succeeded, false to fall back to serialize path
     static bool transferExpertsGPUDirect(
         const MoEWeightContext& src_ctx,
         MoEWeightContext& dst_ctx,
         const std::vector<int>& expert_ids,
-        int layer_idx);
+        int layer_idx,
+        void* source_producer_stream,
+        std::vector<int>* satisfied_expert_ids = nullptr,
+        GpuDirectTransferCompletion* completion = nullptr);
 
 private:
     /// GPU pipeline path: raw H2D + GPU repack via LoadOrchestrator.

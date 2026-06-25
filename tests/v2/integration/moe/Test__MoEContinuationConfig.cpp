@@ -34,7 +34,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::LocalTP;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.backend = CollectiveBackendType::RCCL;
-            domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
             domain.owner_rank = 0;
             return domain;
         }
@@ -66,7 +66,7 @@ namespace llaminar2::test
             return ExecutionDomainScope::AUTO;
         }
 
-        OrchestrationConfig configWithContinuationAndRoutedTensorParallelExperts(TPScope continuation_scope)
+        OrchestrationConfig configWithContinuationAndRoutedShardedExperts(TPScope continuation_scope)
         {
             OrchestrationConfig config;
             config.domain_definitions.push_back(continuationDomain("dense_cont", continuation_scope));
@@ -93,9 +93,9 @@ namespace llaminar2::test
                                { return error.find(needle) != std::string::npos; });
         }
 
-        void expectContinuationConfigRejectsOnlyRoutedTensorParallelExperts(TPScope continuation_scope)
+        void expectContinuationConfigRejectsOnlyRoutedShardedExperts(TPScope continuation_scope)
         {
-            auto config = configWithContinuationAndRoutedTensorParallelExperts(continuation_scope);
+            auto config = configWithContinuationAndRoutedShardedExperts(continuation_scope);
             auto normalize_errors = normalizeMoEExpertOverlayDomains(config);
             ASSERT_TRUE(normalize_errors.empty()) << (normalize_errors.empty() ? "" : normalize_errors.front());
             ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
@@ -106,21 +106,21 @@ namespace llaminar2::test
 
             const auto result = validateMoEExpertParallelPlan(plan);
             EXPECT_FALSE(result.ok());
-            EXPECT_TRUE(hasErrorContaining(result, "TensorParallelExperts"));
+            EXPECT_TRUE(hasErrorContaining(result, "ShardedExperts"));
             EXPECT_TRUE(hasErrorContaining(result, "disabled by default"));
             EXPECT_FALSE(hasErrorContaining(result, "scope=global"));
         }
 
     } // namespace
 
-    TEST(Test__MoEContinuationConfig, LocalTPContinuationStillRejectsRoutedTensorParallelExpertsByDefault)
+    TEST(Test__MoEContinuationConfig, LocalTPContinuationStillRejectsRoutedShardedExpertsByDefault)
     {
-        expectContinuationConfigRejectsOnlyRoutedTensorParallelExperts(TPScope::LOCAL);
+        expectContinuationConfigRejectsOnlyRoutedShardedExperts(TPScope::LOCAL);
     }
 
-    TEST(Test__MoEContinuationConfig, GlobalTPContinuationStillRejectsRoutedTensorParallelExpertsByDefault)
+    TEST(Test__MoEContinuationConfig, GlobalTPContinuationStillRejectsRoutedShardedExpertsByDefault)
     {
-        expectContinuationConfigRejectsOnlyRoutedTensorParallelExperts(TPScope::GLOBAL);
+        expectContinuationConfigRejectsOnlyRoutedShardedExperts(TPScope::GLOBAL);
     }
 
 } // namespace llaminar2::test

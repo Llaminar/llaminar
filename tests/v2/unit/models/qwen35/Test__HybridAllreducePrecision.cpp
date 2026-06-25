@@ -12,6 +12,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdlib>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -23,6 +25,37 @@
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
 
 using namespace llaminar2;
+
+namespace
+{
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+                old_value_ = std::string(old);
+            ::setenv(name_.c_str(), value, 1);
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_)
+                ::setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
+    };
+} // namespace
 
 // ============================================================================
 // populateAllreducePrecision — basic count-based overload (existing)
@@ -265,6 +298,74 @@ TEST(Test__HybridAllreducePrecision, EmptyMap_ReturnsEmptyString)
     EXPECT_EQ(config.getAllreducePrecisionForLayer(0), "");
     EXPECT_EQ(config.getAllreducePrecisionForLayer(7), "");
     EXPECT_EQ(config.getAllreducePrecisionForLayer(100), "");
+}
+
+TEST(Test__HybridAllreducePrecision, ExplicitEnvPrecisionOverridesPopulatedLayerMap)
+{
+    ScopedEnv force_precision("LLAMINAR_ALLREDUCE_PRECISION", "fp16");
+
+    GraphConfig config;
+    config.n_layers = 4;
+    config.populateAllreducePrecision("fp16", 4);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(config.getAllreducePrecisionForLayer(i), "fp16")
+            << "LLAMINAR_ALLREDUCE_PRECISION should force the transport precision";
+    }
+}
+
+TEST(Test__HybridAllreducePrecision, ConfigOverrideOverridesPopulatedLayerMap)
+{
+    GraphConfig config;
+    config.n_layers = 4;
+    config.populateAllreducePrecision("fp16", 4);
+    config.tp_allreduce_precision_override = "fp16";
+
+    for (int i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(config.getAllreducePrecisionForLayer(i), "fp16")
+            << "tp_allreduce_precision_override should force transport precision";
+    }
+}
+
+TEST(Test__HybridAllreducePrecision, SchemaOverrideAliasPreservesPopulatedLayerMap)
+{
+    GraphConfig config;
+    config.n_layers = 4;
+    config.populateAllreducePrecision("fp16", 2);
+    config.tp_allreduce_precision_override = "schema";
+
+    EXPECT_EQ(config.getAllreducePrecisionForLayer(0), "fp32");
+    EXPECT_EQ(config.getAllreducePrecisionForLayer(1), "fp32");
+    EXPECT_EQ(config.getAllreducePrecisionForLayer(2), "fp16");
+    EXPECT_EQ(config.getAllreducePrecisionForLayer(3), "fp16");
+}
+
+TEST(Test__HybridAllreducePrecision, ConfigOverrideCanonicalizesShortPrecisionAlias)
+{
+    GraphConfig config;
+    config.n_layers = 1;
+    config.populateAllreducePrecision("fp16", 1);
+    config.tp_allreduce_precision_override = "f16";
+
+    EXPECT_EQ(config.getAllreducePrecisionForLayer(0), "fp16");
+}
+
+TEST(Test__HybridAllreducePrecision, EnvOverrideWinsOverConfigOverride)
+{
+    ScopedEnv force_precision("LLAMINAR_ALLREDUCE_PRECISION", "bf16");
+
+    GraphConfig config;
+    config.n_layers = 4;
+    config.populateAllreducePrecision("fp16", 4);
+    config.tp_allreduce_precision_override = "fp16";
+
+    for (int i = 0; i < 4; ++i)
+    {
+        EXPECT_EQ(config.getAllreducePrecisionForLayer(i), "bf16")
+            << "diagnostic env override remains highest precedence";
+    }
 }
 
 TEST(Test__HybridAllreducePrecision, PopulateClearsExistingEntries)

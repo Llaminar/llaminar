@@ -145,7 +145,7 @@ namespace llaminar2::test
             domain.participants = {GlobalDeviceAddress::rocm(0, 0)};
             domain.world_ranks = {0};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -158,7 +158,7 @@ namespace llaminar2::test
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.world_ranks = {1};
             domain.owner_rank = 1;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 

@@ -8,9 +8,11 @@
 #include "DecodeExpertHistogram.h"
 #include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
+#include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -265,6 +267,21 @@ namespace llaminar2
                state.grouped_route_weights;
     }
 
+    void DeviceMoERuntimeTable::recordDecodeHistogramProducerStream(void *stream)
+    {
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored decode histogram producer stream must be explicit");
+        }
+        decode_histogram_producer_stream_ = stream;
+    }
+
+    void *DeviceMoERuntimeTable::decodeHistogramProducerStream() const
+    {
+        return decode_histogram_producer_stream_;
+    }
+
     bool DeviceMoERuntimeTable::syncDecodeHistogramToHost(
         DecodeExpertHistogram &histogram,
         void *stream,
@@ -283,7 +300,14 @@ namespace llaminar2
             return false;
         }
 
+        if (mirror_to_device_ && !stream)
+        {
+            throw std::invalid_argument(
+                "[MoERuntimeTable] mirrored decode histogram sync requires an explicit stream");
+        }
+
         std::vector<uint64_t> counts(static_cast<size_t>(num_layers_) * static_cast<size_t>(num_experts_), 0);
+        std::vector<uint64_t> local_counts(static_cast<size_t>(num_layers_) * static_cast<size_t>(num_experts_), 0);
 
         if (!mirror_to_device_)
         {
@@ -294,6 +318,10 @@ namespace llaminar2
                 std::copy(state.decode_histogram,
                           state.decode_histogram + num_experts_,
                           dst);
+                auto *local_dst = local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                std::copy(state.decode_local_histogram,
+                          state.decode_local_histogram + num_experts_,
+                          local_dst);
             }
         }
         else
@@ -306,6 +334,13 @@ namespace llaminar2
                                  static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                                  stream,
                                  layerPrefix(layer_idx) + "decode histogram D2H");
+
+                const auto *local_src = device_layers_[layer_idx].decode_local_histogram;
+                auto *local_dst = local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                copyMirrorToHost(device_id_, local_dst, local_src,
+                                 static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                                 stream,
+                                 layerPrefix(layer_idx) + "decode local histogram D2H");
             }
         }
 
@@ -313,13 +348,47 @@ namespace llaminar2
         {
             const auto *layer_counts = counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
             histogram.mergeLayerCounts(layer_idx, layer_counts, num_experts_, /*count_window_tokens=*/false);
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                const auto *layer_local_counts =
+                    local_counts.data() + static_cast<size_t>(layer_idx) * static_cast<size_t>(num_experts_);
+                const uint64_t selected_slots =
+                    std::accumulate(layer_counts, layer_counts + num_experts_, uint64_t{0});
+                const uint64_t local_slots =
+                    std::accumulate(layer_local_counts, layer_local_counts + num_experts_, uint64_t{0});
+                const auto &state = host_layers_[static_cast<size_t>(layer_idx)];
+                const PerfStatsCollector::Tags tags{
+                    {"layer", std::to_string(layer_idx)},
+                    {"participant", std::to_string(state.participant_id)},
+                    {"participants", std::to_string(state.participant_count)},
+                    {"active_epoch", std::to_string(state.active_epoch)},
+                    {"reset", reset_runtime_counts ? "true" : "false"}};
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "runtime_selected_slots",
+                    static_cast<double>(selected_slots),
+                    "rebalance",
+                    device_id_.toString(),
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "runtime_local_compute_slots",
+                    static_cast<double>(local_slots),
+                    "rebalance",
+                    device_id_.toString(),
+                    tags);
+            }
         }
 
         if (!reset_runtime_counts)
             return true;
 
         for (auto &state : host_layers_)
+        {
             std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
+            std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts_, 0ULL);
+        }
 
         if (mirror_to_device_)
         {
@@ -330,6 +399,11 @@ namespace llaminar2
                              static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                              stream,
                              layerPrefix(layer_idx) + "decode histogram reset");
+                auto *local_dst = device_layers_[layer_idx].decode_local_histogram;
+                memsetMirror(device_id_, local_dst, 0,
+                             static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                             stream,
+                             layerPrefix(layer_idx) + "decode local histogram reset");
             }
             synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram reset sync");
         }
@@ -340,7 +414,10 @@ namespace llaminar2
     void DeviceMoERuntimeTable::resetDecodeHistogramCounts(void *stream)
     {
         for (auto &state : host_layers_)
+        {
             std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
+            std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts_, 0ULL);
+        }
 
         if (!mirror_to_device_)
             return;
@@ -352,6 +429,11 @@ namespace llaminar2
                          static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                          stream,
                          layerPrefix(layer_idx) + "decode histogram reset");
+            auto *local_dst = device_layers_[layer_idx].decode_local_histogram;
+            memsetMirror(device_id_, local_dst, 0,
+                         static_cast<size_t>(num_experts_) * sizeof(uint64_t),
+                         stream,
+                         layerPrefix(layer_idx) + "decode local histogram reset");
         }
         synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram reset sync");
     }
@@ -423,6 +505,8 @@ namespace llaminar2
         auto &state = host_layers_[static_cast<size_t>(layer_idx)];
         const uint32_t inactive_bank = 1u - state.active_bank;
         auto &bank = state.banks[inactive_bank];
+        state.participant_id = update.participant_id;
+        state.participant_count = update.participant_count;
         bank = {};
         bank.epoch = update.epoch;
         bank.expert_count = update.expert_count;
@@ -475,6 +559,11 @@ namespace llaminar2
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update epoch must be newer than active epoch");
         if (update.expert_count != static_cast<uint32_t>(num_experts_))
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update expert_count must match table expert_count");
+        if (update.participant_count == 0 || update.participant_count > kDeviceMoEMaxParticipants)
+            throw std::invalid_argument(layerPrefix(layer_idx) + "participant_count must be in [1, " +
+                                        std::to_string(kDeviceMoEMaxParticipants) + "]");
+        if (update.participant_id >= update.participant_count)
+            throw std::invalid_argument(layerPrefix(layer_idx) + "participant_id must be less than participant_count");
         if (update.experts.size() != update.expert_count ||
             update.local_compute_mask.size() != update.expert_count ||
             update.replica_role.size() != update.expert_count)
@@ -509,6 +598,8 @@ namespace llaminar2
         state = {};
         state.expert_count = static_cast<uint32_t>(num_experts_);
         state.top_k = static_cast<uint32_t>(top_k_);
+        state.participant_id = 0;
+        state.participant_count = 1;
         state.banks[0].expert_count = static_cast<uint32_t>(num_experts_);
         state.banks[1].expert_count = static_cast<uint32_t>(num_experts_);
     }

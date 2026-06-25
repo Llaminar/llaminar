@@ -59,7 +59,7 @@ namespace llaminar2::test
             result.kind = ExpertDomainKind::SingleDevice;
             result.backend = CollectiveBackendType::HOST;
             result.participants = {std::move(participant)};
-            result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             result.owner_rank = 0;
             return result;
         }
@@ -73,7 +73,7 @@ namespace llaminar2::test
             result.kind = ExpertDomainKind::LocalTP;
             result.backend = CollectiveBackendType::RCCL;
             result.participants = std::move(participants);
-            result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             result.owner_rank = 0;
             return result;
         }
@@ -120,7 +120,7 @@ namespace llaminar2::test
             return plan;
         }
 
-        std::shared_ptr<MoEExpertParallelPlan> makeLocalTPReplicatedHotPlan()
+        std::shared_ptr<MoEExpertParallelPlan> makeLocalTPApportionedHotPlan()
         {
             auto plan = std::make_shared<MoEExpertParallelPlan>();
             plan->enabled = true;
@@ -338,9 +338,9 @@ namespace llaminar2::test
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPReplicatedExpertsLowerOnlyGraphLocalGpuParticipant)
+         LocalTPApportionedExpertsLowerOnlyGraphLocalGpuParticipant)
     {
-        GraphConfig config = makeConfig(makeLocalTPReplicatedHotPlan());
+        GraphConfig config = makeConfig(makeLocalTPApportionedHotPlan());
         config.default_device = DeviceId::rocm(0);
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});

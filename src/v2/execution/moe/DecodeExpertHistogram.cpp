@@ -327,6 +327,7 @@ namespace llaminar2
     {
         std::lock_guard<std::mutex> lock(placement_mutex_);
         expert_to_socket_ = expert_to_socket;
+        config_.expert_to_socket = expert_to_socket;
     }
 
     // ── Diagnostics ───────────────────────────────────

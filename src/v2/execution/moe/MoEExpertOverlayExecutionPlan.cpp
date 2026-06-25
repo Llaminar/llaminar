@@ -122,7 +122,7 @@ namespace llaminar2
             std::vector<std::string> errors;
             const auto validation = validateMoEExpertParallelPlan(
                 plan,
-                MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
+                MoEExpertParallelValidationOptions{.allow_routed_sharded_experts = true});
             for (const auto &error : validation.errors)
                 errors.push_back(error);
 
@@ -336,7 +336,7 @@ namespace llaminar2
                 return false;
 
             if (descriptor.source->kind == ExpertDomainKind::LocalTP &&
-                descriptor.source->compute_kind == ExpertDomainComputeKind::TensorParallelExperts)
+                descriptor.source->compute_kind == ExpertDomainComputeKind::ShardedExperts)
             {
                 return true;
             }

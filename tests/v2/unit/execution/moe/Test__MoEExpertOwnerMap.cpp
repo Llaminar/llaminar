@@ -33,7 +33,7 @@ namespace llaminar2::test
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.world_ranks = {2};
             domain.owner_rank = 2;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -83,7 +83,7 @@ namespace llaminar2::test
 
     TEST(Test__MoEExpertOwnerMap, DisjointAcceleratorParticipantsOwnWholeExperts)
     {
-        const auto plan = disjointRocmPlan(ExpertDomainComputeKind::ReplicatedExperts);
+        const auto plan = disjointRocmPlan(ExpertDomainComputeKind::ApportionedExperts);
         const auto owner_map = MoEExpertOwnerMap::build(plan);
 
         ASSERT_EQ(owner_map.participants().size(), 3u);
@@ -117,9 +117,9 @@ namespace llaminar2::test
             EXPECT_TRUE(first_mask[expert] || second_mask[expert]) << "expert=" << expert;
     }
 
-    TEST(Test__MoEExpertOwnerMap, RejectsTensorParallelExpertsForGraphNativeRoutedTiers)
+    TEST(Test__MoEExpertOwnerMap, RejectsShardedExpertsForGraphNativeRoutedTiers)
     {
-        const auto plan = disjointRocmPlan(ExpertDomainComputeKind::TensorParallelExperts);
+        const auto plan = disjointRocmPlan(ExpertDomainComputeKind::ShardedExperts);
         EXPECT_THROW((void)MoEExpertOwnerMap::build(plan), std::invalid_argument);
     }
 

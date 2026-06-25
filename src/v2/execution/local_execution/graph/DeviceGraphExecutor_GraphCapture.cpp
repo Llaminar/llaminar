@@ -571,7 +571,7 @@ namespace llaminar2
 
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
-                has_collective_nodes, current_step, fast_hooks,
+                has_collective_nodes, collectives_graph_capturable, current_step, fast_hooks,
                 /*force_recapture=*/false,
                 defer_final_sync);
 
@@ -714,7 +714,7 @@ namespace llaminar2
         {
             const auto replay_result = DeviceGraphCaptureController::executeReplayPhase(
                 graph, segment_cache, ctx, gpu_ctx,
-                has_collective_nodes, current_step, replay_hooks, force_recapture,
+                has_collective_nodes, collectives_graph_capturable, current_step, replay_hooks, force_recapture,
                 defer_final_sync);
 
             if (!replay_result.success)

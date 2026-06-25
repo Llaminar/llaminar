@@ -37,6 +37,7 @@
 #pragma once
 
 #include "../../backends/DeviceId.h"
+#include "../../tensors/TensorKernels.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -50,6 +51,88 @@ struct GPUExpertPointers {
     void* d_mins = nullptr;      // uint16_t* (FP16), nullptr if symmetric
     void* d_emins = nullptr;     // uint32_t*, nullptr if not present
 };
+
+/// Backend-neutral descriptor for one GPU-resident expert projection in the
+/// separated NativeVNNI layout consumed by both CUDA and ROCm kernels.
+struct GpuExpertPackedDescriptor {
+    GPUExpertPointers ptrs;
+    int n = 0;
+    int k = 0;
+    uint32_t blocks_per_row = 0;
+    uint8_t codebook_id = 0;
+    uint8_t payload_bytes_per_block = 0;
+    bool is_asymmetric = false;
+    bool has_emins = false;
+
+    size_t vnni_bytes = 0;
+    size_t scales_bytes = 0;
+    size_t mins_bytes = 0;
+    size_t emins_bytes = 0;
+
+    bool valid() const
+    {
+        return ptrs.d_vnni != nullptr &&
+               ptrs.d_scales != nullptr &&
+               n > 0 &&
+               k > 0 &&
+               blocks_per_row > 0 &&
+               payload_bytes_per_block > 0 &&
+               vnni_bytes > 0 &&
+               scales_bytes > 0;
+    }
+
+    size_t totalBytes() const
+    {
+        return vnni_bytes + scales_bytes + mins_bytes + emins_bytes;
+    }
+};
+
+inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    uint8_t payload_bytes_per_block,
+    bool is_asymmetric,
+    bool has_emins)
+{
+    const size_t block_count =
+        static_cast<size_t>(desc.blocks_per_row) * static_cast<size_t>(desc.n);
+
+    GpuExpertPackedDescriptor out;
+    out.ptrs.d_vnni = const_cast<uint8_t*>(desc.payload);
+    out.ptrs.d_scales = const_cast<void*>(desc.scales);
+    out.ptrs.d_mins = const_cast<void*>(desc.mins);
+    out.ptrs.d_emins = const_cast<void*>(desc.emins);
+    out.n = desc.n;
+    out.k = desc.k;
+    out.blocks_per_row = desc.blocks_per_row;
+    out.codebook_id = desc.codebook_id;
+    out.payload_bytes_per_block = payload_bytes_per_block;
+    out.is_asymmetric = is_asymmetric;
+    out.has_emins = has_emins;
+    out.vnni_bytes = block_count * payload_bytes_per_block;
+    out.scales_bytes = block_count * sizeof(uint16_t);
+    out.mins_bytes = is_asymmetric ? out.scales_bytes : 0;
+    out.emins_bytes = has_emins ? block_count * sizeof(uint32_t) : 0;
+    return out;
+}
+
+inline bool gpuExpertPackedDescriptorsCompatible(
+    const GpuExpertPackedDescriptor& src,
+    const GpuExpertPackedDescriptor& dst)
+{
+    return src.valid() &&
+           dst.valid() &&
+           src.n == dst.n &&
+           src.k == dst.k &&
+           src.blocks_per_row == dst.blocks_per_row &&
+           src.codebook_id == dst.codebook_id &&
+           src.payload_bytes_per_block == dst.payload_bytes_per_block &&
+           src.is_asymmetric == dst.is_asymmetric &&
+           src.has_emins == dst.has_emins &&
+           src.vnni_bytes == dst.vnni_bytes &&
+           src.scales_bytes == dst.scales_bytes &&
+           src.mins_bytes == dst.mins_bytes &&
+           src.emins_bytes == dst.emins_bytes;
+}
 
 /// Transfer expert weights between GPU devices via peer DMA or host-staged copy.
 ///
@@ -67,7 +150,8 @@ public:
     /// @param scales_bytes Size of scales array for this expert (in bytes)
     /// @param mins_bytes Size of mins array in bytes (0 if symmetric)
     /// @param emins_bytes Size of emins array in bytes (0 if not present)
-    /// @param stream Stream on dst_device for async transfer (nullptr = sync)
+    /// @param stream Explicit stream on dst_device for async transfer. nullptr
+    /// is rejected; callers must never use the CUDA/HIP legacy stream here.
     /// @return true on success
     static bool transferExpert(
         const GPUExpertPointers& src_ptrs,
@@ -80,11 +164,24 @@ public:
         size_t emins_bytes,
         void* stream);
 
-    /// Check if peer-to-peer access is available between two ROCm devices.
+    /// Transfer one expert projection described by backend-neutral descriptors.
+    static bool transferExpert(
+        const GpuExpertPackedDescriptor& src,
+        const GpuExpertPackedDescriptor& dst,
+        const DeviceId& src_device,
+        const DeviceId& dst_device,
+        void* stream);
+
+    /// Check if peer-to-peer access is available between two same-backend devices.
+    static bool canAccessPeer(const DeviceId& src_device, const DeviceId& dst_device);
+
+    /// Enable peer access for a same-backend device pair.
+    static bool enablePeerAccess(const DeviceId& current_device, const DeviceId& peer_device);
+
+    /// Legacy ROCm ordinal helper retained for existing tests.
     static bool canAccessPeer(int src_ordinal, int dst_ordinal);
 
-    /// Enable peer access from current device to peer device.
-    /// Safe to call multiple times (handles already-enabled case).
+    /// Legacy ROCm ordinal helper retained for existing tests.
     static bool enablePeerAccess(int peer_ordinal);
 };
 

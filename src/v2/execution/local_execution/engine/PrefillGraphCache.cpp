@@ -99,6 +99,8 @@ namespace llaminar2
             return "StageNotCapturable";
         case PrefillGraphRejectReason::GDNWithPaddedBucket:
             return "GDNWithPaddedBucket";
+        case PrefillGraphRejectReason::HostPolicyDisabled:
+            return "HostPolicyDisabled";
         case PrefillGraphRejectReason::NoGPUContext:
             return "NoGPUContext";
         case PrefillGraphRejectReason::InvalidatedByPlacement:
@@ -195,7 +197,8 @@ namespace llaminar2
         bool moe_rebalancing_active,
         int real_seq_len,
         int bucket_seq_len,
-        PrefillGraphPreflightMode mode) const
+        PrefillGraphPreflightMode mode,
+        bool collectives_graph_capturable) const
     {
         if (!config_.enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
@@ -212,7 +215,7 @@ namespace llaminar2
         if (moe_rebalancing_active)
             return PrefillGraphRejectReason::ActiveMoERebalancing;
 
-        if (collective_nodes && !collective_nodes->empty())
+        if (collective_nodes && !collective_nodes->empty() && !collectives_graph_capturable)
             return PrefillGraphRejectReason::CollectiveNodesPresent;
 
         const bool padded_bucket =

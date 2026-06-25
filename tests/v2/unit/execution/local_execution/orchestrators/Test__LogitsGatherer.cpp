@@ -12,6 +12,7 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "mocks/MockBackend.h"
 #include "tensors/Tensors.h"
+#include <array>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -515,6 +516,43 @@ TEST_F(Test__LogitsGatherer, GatherColumnParallel_TwoDevices_Decode)
     EXPECT_EQ(g->lastGatheredSize(), static_cast<size_t>(FULL_V));
 }
 
+TEST_F(Test__LogitsGatherer, GatherLocalInfos_ReplicatedFullVocabUsesPrimary)
+{
+    // LocalTP expert-overlay runs can replicate dense weights, including the LM
+    // head. In that mode every participant exposes a full-vocab logits row; the
+    // gatherer must not concatenate those replicas into a bogus 2x vocab row.
+    constexpr int FULL_V = 128;
+
+    auto tensor0 = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(FULL_V)}, DeviceId::cpu());
+    auto tensor1 = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{1, static_cast<size_t>(FULL_V)}, DeviceId::cpu());
+
+    for (int i = 0; i < FULL_V; ++i)
+    {
+        tensor0->mutable_data()[i] = static_cast<float>(i);
+        tensor1->mutable_data()[i] = static_cast<float>(1000 + i);
+    }
+
+    LogitsLocalInfo info0;
+    info0.vocab_local = FULL_V;
+    info0.tensor = tensor0.get();
+
+    LogitsLocalInfo info1;
+    info1.vocab_local = FULL_V;
+    info1.tensor = tensor1.get();
+
+    auto g = std::make_unique<LogitsGatherer>(FULL_V, 1);
+    EXPECT_TRUE(g->gatherLocalInfos({info0, info1}, 1, FULL_V));
+
+    const float *out = g->data();
+    ASSERT_NE(out, nullptr);
+    for (int i = 0; i < FULL_V; ++i)
+        EXPECT_FLOAT_EQ(out[i], static_cast<float>(i)) << "Mismatch at index " << i;
+
+    EXPECT_EQ(g->lastGatheredSize(), static_cast<size_t>(FULL_V));
+}
+
 TEST_F(Test__LogitsGatherer, GatherColumnParallel_TwoDevices_Prefill)
 {
     // 2 devices, 2 sequence positions, local vocab = 3 each
@@ -589,6 +627,52 @@ TEST_F(Test__LogitsGatherer, GatherColumnParallel_TwoDevices_Prefill)
     EXPECT_FLOAT_EQ(out[11], 60.0f);
 
     EXPECT_EQ(g->lastGatheredSize(), SEQ * FULL_V);
+}
+
+TEST_F(Test__LogitsGatherer, GatherLocalInfos_ColumnParallelFullStorageUsesSemanticStride)
+{
+    constexpr int LOCAL_V = 4;
+    constexpr int FULL_V = 8;
+    constexpr size_t SEQ = 2;
+
+    auto tensor0 = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{SEQ, static_cast<size_t>(FULL_V)}, DeviceId::cpu());
+    auto tensor1 = std::make_shared<FP32Tensor>(
+        std::vector<size_t>{SEQ, static_cast<size_t>(FULL_V)}, DeviceId::cpu());
+
+    std::fill(tensor0->mutable_data(), tensor0->mutable_data() + SEQ * FULL_V, -1000.0f);
+    std::fill(tensor1->mutable_data(), tensor1->mutable_data() + SEQ * FULL_V, -2000.0f);
+
+    const std::array<float, LOCAL_V> row0_dev0 = {1, 2, 3, 4};
+    const std::array<float, LOCAL_V> row1_dev0 = {5, 6, 7, 8};
+    const std::array<float, LOCAL_V> row0_dev1 = {10, 20, 30, 40};
+    const std::array<float, LOCAL_V> row1_dev1 = {50, 60, 70, 80};
+
+    std::memcpy(tensor0->mutable_data(), row0_dev0.data(), LOCAL_V * sizeof(float));
+    std::memcpy(tensor0->mutable_data() + FULL_V, row1_dev0.data(), LOCAL_V * sizeof(float));
+    std::memcpy(tensor1->mutable_data(), row0_dev1.data(), LOCAL_V * sizeof(float));
+    std::memcpy(tensor1->mutable_data() + FULL_V, row1_dev1.data(), LOCAL_V * sizeof(float));
+
+    LogitsLocalInfo info0;
+    info0.vocab_local = LOCAL_V;
+    info0.tensor = tensor0.get();
+    info0.row_stride = FULL_V;
+
+    LogitsLocalInfo info1;
+    info1.vocab_local = LOCAL_V;
+    info1.tensor = tensor1.get();
+    info1.row_stride = FULL_V;
+
+    auto g = std::make_unique<LogitsGatherer>(FULL_V, SEQ);
+    EXPECT_TRUE(g->gatherLocalInfos({info0, info1}, SEQ, FULL_V));
+
+    const float *out = g->data();
+    ASSERT_NE(out, nullptr);
+    const std::array<float, SEQ * FULL_V> expected = {
+        1, 2, 3, 4, 10, 20, 30, 40,
+        5, 6, 7, 8, 50, 60, 70, 80};
+    for (size_t i = 0; i < expected.size(); ++i)
+        EXPECT_FLOAT_EQ(out[i], expected[i]) << "Mismatch at index " << i;
 }
 
 TEST_F(Test__LogitsGatherer, GatherColumnParallel_NullRunnerInList_Fails)

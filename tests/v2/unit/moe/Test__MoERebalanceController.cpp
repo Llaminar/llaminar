@@ -198,6 +198,48 @@ TEST(Test__MoERebalanceController, ParticipantVocabularyAliasesLegacySocketState
     EXPECT_TRUE(participant_replicas.sameReplicaPlacement(legacy_replicas));
 }
 
+TEST(Test__MoERebalanceController, NonCpuParticipantsSupportOwnershipAndReplicaRebalance)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
+                          /*num_layers=*/1, /*top_k=*/2, /*window_size=*/16);
+    cfg.domain_id = "cuda_ep";
+    cfg.sockets = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    for (int e = 0; e < 8; ++e)
+        cfg.initial_expert_to_socket[e] = (e < 6) ? 0 : 1;
+
+    MoERebalanceController replica_ctrl(cfg);
+    EXPECT_EQ(replica_ctrl.participantDevices(), cfg.sockets);
+
+    fillWindowSkewed(*replica_ctrl.histogram(), 16, 1, 2);
+    auto replicas = replica_ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    ASSERT_GT(replicas.num_replicated, 0);
+    EXPECT_EQ(replicas.domain_id, "cuda_ep");
+
+    auto replica_masks0 = replica_ctrl.computeExpertMasksForParticipant(0);
+    auto replica_masks1 = replica_ctrl.computeExpertMasksForParticipant(1);
+    ASSERT_EQ(replica_masks0.size(), 1u);
+    ASSERT_EQ(replica_masks1.size(), 1u);
+    ASSERT_EQ(replica_masks0[0].size(), 8u);
+    ASSERT_EQ(replica_masks1[0].size(), 8u);
+    EXPECT_TRUE(replica_masks0[0][0]);
+    EXPECT_TRUE(replica_masks1[0][0]);
+
+    MoERebalanceController swap_ctrl(cfg);
+    fillWindowSkewed(*swap_ctrl.histogram(), 16, 1, 2);
+    ASSERT_TRUE(swap_ctrl.shouldRebalance());
+    const auto new_placement = swap_ctrl.rebalance();
+    ASSERT_EQ(new_placement.size(), 8u);
+    EXPECT_NE(new_placement, cfg.initial_expert_to_socket);
+    EXPECT_EQ(swap_ctrl.placementEpoch(), 1u);
+
+    auto masks0 = swap_ctrl.computeExpertMasksForParticipant(0);
+    auto masks1 = swap_ctrl.computeExpertMasksForParticipant(1);
+    ASSERT_EQ(masks0.size(), 1u);
+    ASSERT_EQ(masks1.size(), 1u);
+    EXPECT_EQ(masks0[0].size(), 8u);
+    EXPECT_EQ(masks1[0].size(), 8u);
+}
+
 TEST(Test__MoERebalanceController, ReplicaSetsCarryDomainId)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/8, /*num_sockets=*/2,
@@ -509,6 +551,69 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
     EXPECT_FALSE(ctrl.shouldRebalance());
     EXPECT_FALSE(ctrl.histogram()->windowFull());
     EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
+}
+
+TEST(Test__MoERebalanceController, ReplicaProposalKeepsStillWarmExistingReplica)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/6, /*num_sockets=*/2,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{1, 10}});
+    auto first = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    ASSERT_EQ(first.num_replicated, 1);
+    ASSERT_TRUE(first.is_replicated[1]);
+
+    ctrl.resetRebalanceWindow();
+    recordExpertHits(*ctrl.histogram(), 0, {{1, 8}, {3, 10}});
+    auto second = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    EXPECT_EQ(second.num_replicated, 1);
+    EXPECT_TRUE(second.is_replicated[1])
+        << "existing replica remains within 50% of the hottest replacement";
+    EXPECT_FALSE(second.is_replicated[3]);
+    EXPECT_EQ(ctrl.placementEpoch(), 1u)
+        << "keeping the same replica placement must not invalidate graph caches";
+}
+
+TEST(Test__MoERebalanceController, ReplicaProposalReplacesColdExistingReplica)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/6, /*num_sockets=*/2,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{1, 10}});
+    auto first = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    ASSERT_EQ(first.num_replicated, 1);
+    ASSERT_TRUE(first.is_replicated[1]);
+
+    ctrl.resetRebalanceWindow();
+    recordExpertHits(*ctrl.histogram(), 0, {{1, 4}, {3, 10}});
+    auto second = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    EXPECT_EQ(second.num_replicated, 1);
+    EXPECT_FALSE(second.is_replicated[1]);
+    EXPECT_TRUE(second.is_replicated[3])
+        << "cold existing replica should make room for a much hotter expert";
+    EXPECT_EQ(ctrl.placementEpoch(), 2u);
+}
+
+TEST(Test__MoERebalanceController, ReplicaProposalPreservesExistingReplicasWithoutNewSignal)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/6, /*num_sockets=*/2,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{1, 10}});
+    auto first = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    ASSERT_EQ(first.num_replicated, 1);
+    ASSERT_TRUE(first.is_replicated[1]);
+    const auto epoch_after_first = ctrl.placementEpoch();
+
+    ctrl.resetRebalanceWindow();
+    auto second = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
+    EXPECT_TRUE(second.sameReplicaPlacement(first))
+        << "an empty post-reset window is no evidence, not a replica eviction signal";
+    EXPECT_EQ(ctrl.currentReplicas().num_replicated, first.num_replicated);
+    EXPECT_EQ(ctrl.placementEpoch(), epoch_after_first);
 }
 
 TEST(Test__MoERebalanceController, ReplicaPrefillMaskKeepsReplicatedExpertsOnOwnerOnly)

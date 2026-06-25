@@ -279,6 +279,9 @@ namespace llaminar2
         /// Set frozen model-weight bindings for graph-build validation and diagnostics.
         virtual void setWeightBindings(const ModelWeightBindings &bindings) { (void)bindings; }
 
+        /// Set optional full dense bindings used by replicated-dense decode graphs.
+        virtual void setDecodeReplicatedDenseWeightBindings(const ModelWeightBindings &bindings) { (void)bindings; }
+
         /// Set activation buffers (for manual buffer management)
         virtual void setBuffers(const ModelBuffers &buffers) = 0;
 

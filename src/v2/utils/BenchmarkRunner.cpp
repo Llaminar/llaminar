@@ -33,7 +33,7 @@ namespace llaminar2
     // Number of benchmark iterations (after warmup)
     static constexpr int BENCHMARK_ITERATIONS = 3;
     static constexpr int WARMUP_ITERATIONS = 1;
-    static constexpr int PREFILL_GRAPH_WARMUP_ITERATIONS = 2;
+    static constexpr int PREFILL_GRAPH_WARMUP_ITERATIONS = 3;
 
     // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
     static void logGPUMemorySnapshot(const char *label)
@@ -182,6 +182,32 @@ namespace llaminar2
                    : 0.0;
     }
 
+    static double meanLatencyMs(const std::vector<double> &samples)
+    {
+        if (samples.empty())
+            return 0.0;
+        return std::accumulate(samples.begin(), samples.end(), 0.0) /
+               static_cast<double>(samples.size());
+    }
+
+    static double percentileLatencyMs(std::vector<double> samples, double quantile)
+    {
+        if (samples.empty())
+            return 0.0;
+        if (samples.size() == 1)
+            return samples.front();
+
+        quantile = std::clamp(quantile, 0.0, 1.0);
+        std::sort(samples.begin(), samples.end());
+
+        const double position = quantile * static_cast<double>(samples.size() - 1);
+        const auto lower_index = static_cast<size_t>(position);
+        const size_t upper_index = std::min(lower_index + 1, samples.size() - 1);
+        const double fraction = position - static_cast<double>(lower_index);
+        return samples[lower_index] +
+               (samples[upper_index] - samples[lower_index]) * fraction;
+    }
+
     /**
      * @brief Merge one measured benchmark request into the benchmark-level MTP view.
      *
@@ -299,6 +325,10 @@ namespace llaminar2
                                                             ? ((result.prefill_tokens + result.decode_tokens) * 1000.0) /
                                                                   result.total_time_ms
                                                             : 0.0}}},
+            {"decode_latency_ms", {{"mean", result.decode_latency_mean_ms},
+                                    {"p50", result.decode_latency_p50_ms},
+                                    {"p90", result.decode_latency_p90_ms},
+                                    {"samples", result.decode_token_latencies_ms.size()}}},
             {"generated_text_bytes", result.generated_text.size()},
             {"generated_token_ids", result.generated_token_ids},
             {"runtime_state", {{"initialized", state.initialized},
@@ -565,6 +595,7 @@ namespace llaminar2
         DecodeRunResult result;
         result.generated_text.reserve(n_tokens * 4); // Pre-allocate ~4 bytes/token to avoid reallocs
         result.generated_token_ids.reserve(static_cast<size_t>(std::max(0, n_tokens)));
+        result.token_latencies_ms.reserve(static_cast<size_t>(std::max(0, n_tokens)));
         int tokens_generated = 0;
 
         // Sampler profiling (enabled when LLAMINAR_PROFILING=1)
@@ -621,6 +652,7 @@ namespace llaminar2
 
             while (!all_requests_done())
             {
+                const auto step_start = std::chrono::high_resolution_clock::now();
                 int remaining_budget = 0;
                 for (int i = 0; i < request_batch; ++i)
                 {
@@ -719,6 +751,18 @@ namespace llaminar2
                     result.tokens_generated = tokens_generated;
                     return result;
                 }
+
+                if (mpi_ctx_->rank() == 0 && emitted_this_step > 0)
+                {
+                    const auto step_end = std::chrono::high_resolution_clock::now();
+                    const double per_token_ms =
+                        std::chrono::duration<double, std::milli>(step_end - step_start).count() /
+                        static_cast<double>(emitted_this_step);
+                    result.token_latencies_ms.insert(
+                        result.token_latencies_ms.end(),
+                        static_cast<size_t>(emitted_this_step),
+                        per_token_ms);
+                }
             }
 
             const bool decode_success = synchronizeSuccess(true, "request-batched decode complete");
@@ -737,6 +781,7 @@ namespace llaminar2
 
             while (tokens_generated < n_tokens)
             {
+                const auto step_start = std::chrono::high_resolution_clock::now();
                 const int remaining = n_tokens - tokens_generated;
                 runner_->setDecodeStepTokenBudget(remaining);
                 DecodeStepOutput step = runner_->decodeStepForBenchmark();
@@ -800,7 +845,20 @@ namespace llaminar2
                 tokens_generated += step_token_count;
 
                 if (stop_reached != 0)
+                {
+                    if (mpi_ctx_->rank() == 0 && step_token_count > 0)
+                    {
+                        const auto step_end = std::chrono::high_resolution_clock::now();
+                        const double per_token_ms =
+                            std::chrono::duration<double, std::milli>(step_end - step_start).count() /
+                            static_cast<double>(step_token_count);
+                        result.token_latencies_ms.insert(
+                            result.token_latencies_ms.end(),
+                            static_cast<size_t>(step_token_count),
+                            per_token_ms);
+                    }
                     break;
+                }
 
                 const bool maintenance_success = runner_->maybeApplyDecodeBoundaryMaintenance();
                 if (!synchronizeSuccess(maintenance_success, "decode maintenance"))
@@ -811,6 +869,18 @@ namespace llaminar2
                     result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
                     result.tokens_generated = tokens_generated;
                     return result;
+                }
+
+                if (mpi_ctx_->rank() == 0 && step_token_count > 0)
+                {
+                    const auto step_end = std::chrono::high_resolution_clock::now();
+                    const double per_token_ms =
+                        std::chrono::duration<double, std::milli>(step_end - step_start).count() /
+                        static_cast<double>(step_token_count);
+                    result.token_latencies_ms.insert(
+                        result.token_latencies_ms.end(),
+                        static_cast<size_t>(step_token_count),
+                        per_token_ms);
                 }
             }
 
@@ -824,6 +894,7 @@ namespace llaminar2
 
         for (int i = 0; i < n_tokens; ++i)
         {
+            const auto token_start = std::chrono::high_resolution_clock::now();
             int next_token = -1;
 
             // Rank 0: Sample next token (greedy for deterministic benchmark)
@@ -831,13 +902,27 @@ namespace llaminar2
             {
                 auto t0 = profile_sampler ? std::chrono::high_resolution_clock::now() : std::chrono::high_resolution_clock::time_point{};
 
-                // Try GPU-side argmax first (avoids ~600 KB D2H + CPU scan)
+                // Try device-side argmax first.  CPU-only runners may fall
+                // back to host logits; GPU runners must fail loudly instead of
+                // silently paying a D2H logits transfer.
                 next_token = runner_->sampleGreedyOnDevice();
 
                 if (next_token < 0)
                 {
-                    // GPU argmax not available (CPU device or unsupported backend).
-                    // Fall back to host-side argmax over gathered logits.
+                    if (runner_->primaryDeviceId().is_gpu())
+                    {
+                        LOG_ERROR("GPU device sampling failed at decode step " << i
+                                                                                << "; CPU logits fallback is disabled.");
+                        last_failure_reason_ =
+                            "GPU device sampling failed: CPU logits fallback is disabled";
+                        auto end = std::chrono::high_resolution_clock::now();
+                        result.success = false;
+                        result.time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+                        result.tokens_generated = tokens_generated;
+                        return result;
+                    }
+
+                    // CPU-only host sampling over local logits.
                     const float *logit_data = runner_->logits();
                     if (!logit_data)
                     {
@@ -910,6 +995,13 @@ namespace llaminar2
             // Optional per-step callback (e.g., incremental MoE expert rebalancing)
             if (decode_step_cb_)
                 decode_step_cb_();
+
+            if (mpi_ctx_->rank() == 0)
+            {
+                const auto token_end = std::chrono::high_resolution_clock::now();
+                result.token_latencies_ms.push_back(
+                    std::chrono::duration<double, std::milli>(token_end - token_start).count());
+            }
         }
 
         // Synchronize after decode phase (skip for single-rank)
@@ -1166,6 +1258,17 @@ namespace llaminar2
             return true;
         };
 
+        /*
+         * Prefill graph capture clears graph/runtime state as it warms capture
+         * buckets. Run it before the decode warmup so post-warmup rebalance sees
+         * the histogram from the immediately preceding decode window.
+         */
+        if (!warmPrefillGraphCapture())
+        {
+            return capture_and_return();
+        }
+        runner_->clear_cache();
+
         // Warmup prefill
         auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
         if (!warmup_prefill_success)
@@ -1201,11 +1304,6 @@ namespace llaminar2
             }
         }
 
-        if (!warmPrefillGraphCapture())
-        {
-            return capture_and_return();
-        }
-
         if (mpi_ctx_->rank() == 0)
         {
             LOG_INFO("Warmup complete.");
@@ -1213,7 +1311,7 @@ namespace llaminar2
         logGPUMemorySnapshot("after-warmup");
 
         // Post-warmup callback (e.g., MoE expert rebalancing)
-        if (post_warmup_cb_)
+        if (post_warmup_cb_ && n_decode > 0)
         {
             post_warmup_cb_();
 
@@ -1234,6 +1332,10 @@ namespace llaminar2
                 return capture_and_return();
             }
         }
+        else if (!warmPrefillGraphCapture())
+        {
+            return capture_and_return();
+        }
 
         if (mpi_ctx_->rank() == 0)
         {
@@ -1248,7 +1350,10 @@ namespace llaminar2
             CUDAKernelProfiler::reset();
             ROCmKernelProfiler::reset();
         }
-        PerfStatsCollector::reset();
+        if (post_warmup_cb_ && n_decode > 0)
+            PerfStatsCollector::resetPreservingDomains({"moe_rebalance"});
+        else
+            PerfStatsCollector::reset();
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
@@ -1266,6 +1371,7 @@ namespace llaminar2
         std::vector<double> prefill_times;
         std::vector<double> decode_times;
         std::vector<int> decode_token_counts;
+        std::vector<double> decode_token_latencies_ms;
         std::string last_generated_text;
 
         logGPUMemorySnapshot("pre-iter-loop");
@@ -1330,6 +1436,10 @@ namespace llaminar2
                 }
                 decode_times.push_back(decode_result.time_ms);
                 decode_token_counts.push_back(decode_result.tokens_generated);
+                decode_token_latencies_ms.insert(
+                    decode_token_latencies_ms.end(),
+                    decode_result.token_latencies_ms.begin(),
+                    decode_result.token_latencies_ms.end());
                 last_generated_text = decode_result.generated_text;
                 result.generated_token_ids = std::move(decode_result.generated_token_ids);
                 const PrefixRuntimeStateSnapshot iteration_state =
@@ -1372,6 +1482,10 @@ namespace llaminar2
             result.decode_time_ms = avg_decode_time;
             result.decode_tokens = avg_decode_tokens;
             result.decode_tokens_per_sec = (avg_decode_tokens * 1000.0) / avg_decode_time;
+            result.decode_latency_mean_ms = meanLatencyMs(decode_token_latencies_ms);
+            result.decode_latency_p50_ms = percentileLatencyMs(decode_token_latencies_ms, 0.50);
+            result.decode_latency_p90_ms = percentileLatencyMs(decode_token_latencies_ms, 0.90);
+            result.decode_token_latencies_ms = std::move(decode_token_latencies_ms);
             result.decode_success = true;
             result.generated_text = last_generated_text;
         }
@@ -1381,6 +1495,10 @@ namespace llaminar2
             result.decode_tokens = 0;
             result.decode_time_ms = 0.0;
             result.decode_tokens_per_sec = 0.0;
+            result.decode_token_latencies_ms.clear();
+            result.decode_latency_mean_ms = 0.0;
+            result.decode_latency_p50_ms = 0.0;
+            result.decode_latency_p90_ms = 0.0;
         }
 
         // Calculate totals

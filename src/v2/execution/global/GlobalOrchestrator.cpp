@@ -1592,13 +1592,13 @@ namespace llaminar2
             // Tail rank: sample locally
             IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             token = runner ? runner->sampleGreedyOnDevice() : -1;
-            if (token < 0)
+            if (token < 0 && runner && !runner->primaryDeviceId().is_gpu())
             {
-                // Fallback to CPU sampling
+                // CPU-only host sampling. GPU runners must surface the device
+                // sampling failure so callers do not silently copy logits.
                 const float *log = logits();
                 if (log)
                 {
-                    // Simple argmax fallback
                     token = 0;
                     float best = log[0];
                     for (int i = 1; i < config_.vocab_size; ++i)
@@ -1644,13 +1644,6 @@ namespace llaminar2
         {
             IInferenceRunner *runner = stage_runners_.pipelineTailRunner();
             token = runner ? runner->sampleOnDevice(params) : -1;
-            if (token < 0)
-            {
-                // Fallback: greedy
-                token = sampleGreedyOnDevice();
-                // Note: sampleGreedyOnDevice already broadcasts, so return directly
-                return token;
-            }
         }
 
         // Broadcast sampled token from tail rank to all ranks

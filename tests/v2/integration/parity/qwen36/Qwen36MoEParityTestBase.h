@@ -42,6 +42,7 @@ namespace llaminar2::test::parity::qwen36
     enum class MoEPrefixParityTopology
     {
         SingleDevice,
+        ExpertOverlayCuda2TPHotOnly,
         ExpertOverlayRocm2TPHotOnly,
         ExpertOverlayRocm2TPHotCpu2LocalTPCold,
     };
@@ -57,6 +58,7 @@ namespace llaminar2::test::parity::qwen36
         std::string default_metadata_path;
         std::string prompt = "The quick brown fox jumps over the lazy dog";
         std::string kv_cache_precision = "auto";
+        std::string tp_allreduce_precision_override;
         int decode_steps = 3;
         int max_seq_len = 96;
         int required_cuda_devices = 0;
@@ -280,7 +282,7 @@ namespace llaminar2::test::parity::qwen36
         domain.backend = backend;
         domain.participants = std::move(participants);
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -349,6 +351,32 @@ namespace llaminar2::test::parity::qwen36
         plan->routed_tiers = {
             routedTier("hot", kRocmHotDomain, 0, 256, gib(8)),
         };
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::PhaseSplitHybridTP_AE);
+        return plan;
+    }
+
+    inline std::shared_ptr<MoEExpertParallelPlan> qwen36MoEOverlayPlanCuda2TPHotOnly()
+    {
+        constexpr const char *kCudaHotDomain = "qwen36_moe_cuda_hot";
+
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->residency_policy = ExpertResidencyPolicy::StaticById;
+        plan->continuation_domain = kCudaHotDomain;
+        plan->shared_expert_domain = kCudaHotDomain;
+        plan->domains = {
+            localTPMoEDomain(
+                kCudaHotDomain,
+                CollectiveBackendType::NCCL,
+                {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)}),
+        };
+        plan->routed_tiers = {
+            routedTier("hot", kCudaHotDomain, 0, 256, gib(8)),
+        };
+        plan->continuation_domain_spec.setDensePolicy(
+            DenseParallelPolicy::PhaseSplitHybridTP_AE);
         return plan;
     }
 
@@ -699,6 +727,8 @@ namespace llaminar2::test::parity::qwen36
         config.batch_size = 1;
         config.activation_precision = "fp32";
         config.kv_cache_precision = test_case.kv_cache_precision;
+        config.tp_allreduce_precision_override =
+            test_case.tp_allreduce_precision_override;
         config.prefix_cache.enabled = enable_prefix_cache;
         config.prefix_cache.storage_mode = enable_prefix_cache
                                                ? PrefixCacheStorageMode::Ram
@@ -720,6 +750,7 @@ namespace llaminar2::test::parity::qwen36
                                               ? GlobalDeviceAddress::cpu()
                                               : test_case.devices.front();
             break;
+        case MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly:
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotCpu2LocalTPCold:
             config.tp_degree = 1;
@@ -759,12 +790,23 @@ namespace llaminar2::test::parity::qwen36
             test_case.devices = {GlobalDeviceAddress::rocm(0)};
             test_case.required_rocm_devices = 1;
             break;
+        case MoEPrefixParityTopology::ExpertOverlayCuda2TPHotOnly:
+            test_case.devices = {
+                GlobalDeviceAddress::cuda(0),
+                GlobalDeviceAddress::cuda(1),
+            };
+            test_case.required_cuda_devices = 2;
+            test_case.tp_allreduce_precision_override = "fp16";
+            test_case.moe_expert_parallel_plan =
+                qwen36MoEOverlayPlanCuda2TPHotOnly();
+            break;
         case MoEPrefixParityTopology::ExpertOverlayRocm2TPHotOnly:
             test_case.devices = {
                 GlobalDeviceAddress::rocm(0),
                 GlobalDeviceAddress::rocm(1),
             };
             test_case.required_rocm_devices = 2;
+            test_case.tp_allreduce_precision_override = "fp16";
             test_case.moe_expert_parallel_plan =
                 qwen36MoEOverlayPlanRocm2TPHotOnly();
             break;

@@ -158,7 +158,19 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "Invalid MoE expert mode: '" + value +
-                    "' (valid: expert-parallel, tensor-parallel, replicated)");
+                    "' (valid: apportioned-experts, sharded-experts, replicated-experts)");
+            }
+            return *parsed;
+        }
+
+        DenseParallelPolicy parseDenseParallelPolicyValue(const std::string &value)
+        {
+            auto parsed = parseDenseParallelPolicy(value);
+            if (!parsed)
+            {
+                throw std::invalid_argument(
+                    "Invalid MoE dense parallel policy: '" + value +
+                    "' (valid: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, phase-split-hybrid-tp-ae)");
             }
             return *parsed;
         }
@@ -1376,8 +1388,8 @@ namespace llaminar2
             .long_name = "--moe-expert-mode",
             .category = "MoE Configuration",
             .value_label = "<mode>",
-            .description = "Routed expert execution: expert-parallel (default), tensor-parallel, replicated",
-            .valid_values = {"expert-parallel", "tensor-parallel", "replicated"},
+            .description = "Routed expert execution: apportioned-experts (default), sharded-experts, replicated-experts",
+            .valid_values = {"apportioned-experts", "sharded-experts", "replicated-experts"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1497,11 +1509,55 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--moe-expert-overlay-dense-tp",
+            .category = "MoE Configuration",
+            .value_label = "<bool>",
+            .description = "Enable dense/non-expert tensor parallelism inside the MoE overlay continuation domain",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto plan = ensureMoEExpertParallelPlan(c);
+                    plan->continuation_domain_spec.dense_tp_enabled = parseBoolValue(v);
+                    plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-dense-decode-replicated",
+            .category = "MoE Configuration",
+            .value_label = "<bool>",
+            .description = "Use replicated full dense weights for MoE overlay decode while retaining dense TP for prefill",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto plan = ensureMoEExpertParallelPlan(c);
+                    plan->continuation_domain_spec.dense_decode_replicated = parseBoolValue(v);
+                    plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-expert-overlay-dense-policy",
+            .category = "MoE Configuration",
+            .value_label = "<policy>",
+            .description = "Dense/shared MoE overlay policy: replicated, tensor-parallel, tensor-parallel-decode-mirrored-embedding, phase-split-hybrid-tp-ae",
+            .valid_values = {
+                "replicated",
+                "tensor-parallel",
+                "tensor-parallel-decode-mirrored-embedding",
+                "phase-split-hybrid-tp-ae",
+                "phase_split_hybrid_tp_ae"},
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    auto plan = ensureMoEExpertParallelPlan(c);
+                    plan->continuation_domain_spec.setDensePolicy(parseDenseParallelPolicyValue(v));
+                }),
+        });
+        spec.add({
             .long_name = "--moe-expert-overlay-residency",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "MoE overlay residency: static-by-id, histogram, explicit-masks",
-            .valid_values = {"static-by-id", "histogram", "explicit-masks"},
+            .description = "MoE overlay residency: static-by-id, histogram, explicit-masks, rebalanced",
+            .valid_values = {"static-by-id", "histogram", "explicit-masks", "rebalanced"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1512,7 +1568,7 @@ namespace llaminar2
             .long_name = "--moe-expert-overlay-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|expert_id_sharded|tensor_parallel_experts[;owner=N][;ranks=0,1]\"",
+            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|apportioned_experts|sharded_experts[;owner=N][;ranks=0,1]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1566,6 +1622,31 @@ namespace llaminar2
                             "' (valid: auto, fp32, fp16, q8_1, q16_1, tq4, tq)");
                     }
                     c.kv_cache_precision = lower;
+                }),
+        });
+        spec.add({
+            .long_name = "--tp-allreduce-precision",
+            .aliases = {"--allreduce-precision"},
+            .category = "Precision",
+            .value_label = "<type>",
+            .description = "TP allreduce transport precision override: auto/schema (default), fp32, fp16, bf16",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &value)
+                {
+                    std::string lower = toLower(value);
+                    static const std::set<std::string> valid_precisions = {
+                        "auto", "schema", "default", "off", "fp32", "f32", "fp16", "f16", "bf16"};
+                    if (valid_precisions.find(lower) == valid_precisions.end())
+                    {
+                        throw std::invalid_argument(
+                            "Invalid value for --tp-allreduce-precision: '" + value +
+                            "' (valid: auto, schema, fp32, fp16, bf16)");
+                    }
+                    if (lower == "f32")
+                        lower = "fp32";
+                    else if (lower == "f16")
+                        lower = "fp16";
+                    c.tp_allreduce_precision_override = lower;
                 }),
         });
 
@@ -2479,6 +2560,17 @@ namespace llaminar2
             else if (key == "kv_cache_precision")
             {
                 config.kv_cache_precision = value;
+            }
+            else if (key == "tp_allreduce_precision" ||
+                     key == "tp_allreduce_precision_override" ||
+                     key == "allreduce_precision")
+            {
+                std::string lower = toLower(value);
+                if (lower == "f32")
+                    lower = "fp32";
+                else if (lower == "f16")
+                    lower = "fp16";
+                config.tp_allreduce_precision_override = lower;
             }
             else if (normalized_key == "prefix_cache")
             {

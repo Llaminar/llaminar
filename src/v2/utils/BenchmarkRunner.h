@@ -62,6 +62,10 @@ namespace llaminar2
         int decode_tokens = 0;              ///< Number of tokens generated
         double decode_time_ms = 0.0;        ///< Time for decode phase (ms)
         double decode_tokens_per_sec = 0.0; ///< Decode throughput (tok/s)
+        std::vector<double> decode_token_latencies_ms; ///< Per emitted token latency samples (ms/token)
+        double decode_latency_mean_ms = 0.0;            ///< Mean per-token decode latency
+        double decode_latency_p50_ms = 0.0;             ///< p50 per-token decode latency
+        double decode_latency_p90_ms = 0.0;             ///< p90 per-token decode latency
         bool decode_success = false;
 
         // Overall
@@ -197,6 +201,7 @@ namespace llaminar2
             int tokens_generated = 0;
             std::string generated_text;
             std::vector<int32_t> generated_token_ids;
+            std::vector<double> token_latencies_ms;
         };
 
         DecodeRunResult runDecode(int n_tokens, int eos_token_id, bool ignore_stop_tokens = false);

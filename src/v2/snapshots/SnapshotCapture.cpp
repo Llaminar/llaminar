@@ -508,6 +508,10 @@ namespace llaminar2
             {"_down_proj", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
             // MoE stages
+            {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_combined_allreduce", "_MOE_COMBINED_OUTPUT"},
+            {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT"},
+            {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
             {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
             {"_moe_expert_parallel_reduce", "_MOE_EXPERT_OUTPUT"},

@@ -22,6 +22,11 @@ TEST(Test__WeightIdentity, InfersCommonWeightRoles)
     EXPECT_EQ(inferWeightRole("output_norm.weight"), WeightRole::OutputNorm);
     EXPECT_EQ(inferWeightRole("blk.3.attn_qkv.weight"), WeightRole::FusedQKV);
     EXPECT_EQ(inferWeightRole("blk.3.attn_output.weight"), WeightRole::AttentionWO);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_alpha.weight"), WeightRole::GDNProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_beta.weight"), WeightRole::GDNProjection);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_a"), WeightRole::GDNSsmParam);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_dt.bias"), WeightRole::Bias);
+    EXPECT_EQ(inferWeightRole("blk.3.ssm_conv1d.weight"), WeightRole::GDNSsmParam);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_exps.weight"), WeightRole::MoEExpertGate);
     EXPECT_EQ(inferWeightRole("blk.3.ffn_gate_inp.weight"), WeightRole::MoERouter);
     EXPECT_EQ(inferWeightRole("blk.40.ffn_gate_inp.weight"), WeightRole::MoERouter);
@@ -38,6 +43,22 @@ TEST(Test__WeightIdentity, InfersLayerAndExpert)
     EXPECT_EQ(inferWeightLayer("token_embd.weight"), -1);
     EXPECT_EQ(inferWeightExpert("blk.2.experts.42.ffn_gate.weight"), 42);
     EXPECT_EQ(inferWeightExpert("blk.2.ffn_gate_exps.weight"), -1);
+}
+
+TEST(Test__WeightIdentity, DistinguishesRoutedExpertsFromSharedExperts)
+{
+    EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertGate));
+    EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertUp));
+    EXPECT_TRUE(isRoutedExpertRole(WeightRole::MoEExpertDown));
+
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertGate));
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertUp));
+    EXPECT_TRUE(isSharedExpertRole(WeightRole::SharedExpertDown));
+
+    EXPECT_FALSE(isRoutedExpertRole(WeightRole::SharedExpertGate));
+    EXPECT_FALSE(isRoutedExpertRole(WeightRole::SharedExpertUp));
+    EXPECT_FALSE(isRoutedExpertRole(WeightRole::SharedExpertDown));
+    EXPECT_FALSE(isSharedExpertRole(WeightRole::MoEExpertGate));
 }
 
 TEST(Test__WeightIdentity, CreatesStableSourceIdentity)

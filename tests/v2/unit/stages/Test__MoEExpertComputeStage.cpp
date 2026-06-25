@@ -135,6 +135,33 @@ namespace
         }
     };
 
+    class StreamCapturingGemm final : public ITensorGemm
+    {
+    public:
+        bool supports_device(int) const override { return true; }
+
+        void setGPUStream(void *stream) override
+        {
+            observed_stream = stream;
+            ++set_stream_calls;
+        }
+
+        bool multiply_tensor(const TensorBase *, TensorBase *,
+                             int, int, int,
+                             bool, float, float,
+                             const TensorBase *,
+                             const IMPIContext *,
+                             int,
+                             DeviceWorkspaceManager *,
+                             int) override
+        {
+            return false;
+        }
+
+        void *observed_stream = nullptr;
+        int set_stream_calls = 0;
+    };
+
     class WorkspaceOnlyGemm final : public ITensorGemm, public IWorkspaceConsumer
     {
     public:
@@ -1765,6 +1792,182 @@ TEST_F(MoEExpertComputeStageTest, MoEFFN_TypeAndName)
     EXPECT_TRUE(stage.supportsBackend(ComputeBackendType::CPU));
     EXPECT_FALSE(stage.supportsBackend(ComputeBackendType::GPU_CUDA));
     EXPECT_GT(stage.estimatedFlops(), 0u);
+}
+
+TEST_F(MoEExpertComputeStageTest, DirectArrivalBindingUsesStageStream)
+{
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.prepared_gate_gemm.assign(NUM_EXPERTS, nullptr);
+    params.prepared_up_gemm.assign(NUM_EXPERTS, nullptr);
+    params.prepared_down_gemm.assign(NUM_EXPERTS, nullptr);
+
+    auto gate = std::make_shared<StreamCapturingGemm>();
+    auto up = std::make_shared<StreamCapturingGemm>();
+    auto down = std::make_shared<StreamCapturingGemm>();
+    auto untouched = std::make_shared<StreamCapturingGemm>();
+    params.prepared_gate_gemm[1] = gate.get();
+    params.prepared_up_gemm[1] = up.get();
+    params.prepared_down_gemm[1] = down.get();
+    params.prepared_gate_gemm[2] = untouched.get();
+
+    MoEExpertComputeStage stage(params);
+    void *stage_stream = reinterpret_cast<void *>(0x1234);
+    stage.setGPUStream(stage_stream);
+    stage.bindPreparedExpertEnginesForTesting({1});
+
+    EXPECT_EQ(gate->observed_stream, stage_stream);
+    EXPECT_EQ(up->observed_stream, stage_stream);
+    EXPECT_EQ(down->observed_stream, stage_stream);
+    EXPECT_EQ(gate->set_stream_calls, 1);
+    EXPECT_EQ(up->set_stream_calls, 1);
+    EXPECT_EQ(down->set_stream_calls, 1);
+    EXPECT_EQ(untouched->observed_stream, nullptr);
+    EXPECT_EQ(untouched->set_stream_calls, 0);
+}
+
+TEST_F(MoEExpertComputeStageTest, PendingGpuDirectArrivalRequiresExplicitComputeStream)
+{
+    FP32Tensor input({1, static_cast<size_t>(D_MODEL)});
+    FP32Tensor output({1, static_cast<size_t>(D_MODEL)});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.input = &input;
+    params.output = &output;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.layer_idx = 3;
+
+    MoEExpertComputeStage stage(params);
+
+    GpuDirectTransferCompletion completion;
+    completion.device_id = params.device_id;
+    completion.device_ordinal = 0;
+    completion.ready_event = std::shared_ptr<void>(
+        reinterpret_cast<void *>(0x1234),
+        [](void *) {});
+    stage.addPendingGpuDirectTransferForTesting(std::move(completion));
+
+    EXPECT_FALSE(stage.execute(cpu_ctx_.get()))
+        << "A pending GPU-direct arrival must not fall back to the default stream";
+    EXPECT_EQ(stage.pendingGpuDirectTransferCountForTesting(), 1u)
+        << "Failed event consumption must leave the pending arrival visible";
+}
+
+TEST_F(MoEExpertComputeStageTest, RebuiltStageAdoptsPendingGpuDirectArrivalFromStore)
+{
+    PreparedWeightStore store(ModelContextId{17});
+    ExpertSlabDescriptor desc;
+    desc.layer_idx = 3;
+    desc.role = WeightRole::MoEExpertGate;
+    desc.device = DeviceId::cuda(0);
+    desc.num_experts = NUM_EXPERTS;
+    desc.local_expert_start = 0;
+    desc.local_expert_count = NUM_EXPERTS;
+    desc.rows_per_expert = INTERMEDIATE;
+    desc.cols_per_expert = D_MODEL;
+    auto gate_ref = store.registerExpertSlab(desc);
+
+    ExpertArrival arrival;
+    arrival.expert_id = 1;
+    arrival.engine = reinterpret_cast<ITensorGemm *>(0x7000);
+    arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+    GpuDirectTransferCompletion completion;
+    completion.device_id = DeviceId::cuda(0);
+    completion.device_ordinal = 0;
+    completion.ready_event = std::shared_ptr<void>(
+        reinterpret_cast<void *>(0x1234),
+        [](void *) {});
+    arrival.gpu_direct_completion = completion;
+    store.registerArrivedExperts(gate_ref, {arrival});
+
+    FP32Tensor input({1, static_cast<size_t>(D_MODEL)});
+    FP32Tensor output({1, static_cast<size_t>(D_MODEL)});
+
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.input = &input;
+    params.output = &output;
+    params.num_experts = NUM_EXPERTS;
+    params.top_k = TOP_K;
+    params.expert_intermediate = INTERMEDIATE;
+    params.seq_len = 1;
+    params.d_model = D_MODEL;
+    params.layer_idx = 3;
+    params.prepared_store = &store;
+    params.gate_slab_ref = gate_ref;
+
+    MoEExpertComputeStage stage(params);
+    stage.addPendingGpuDirectTransfersFromStoreForTesting({1});
+
+    ASSERT_EQ(stage.pendingGpuDirectTransferCountForTesting(), 1u);
+    EXPECT_FALSE(stage.execute(cpu_ctx_.get()))
+        << "A rebuilt stage must inherit GPU-direct readiness and require an explicit stream";
+}
+
+TEST_F(MoEExpertComputeStageTest, FixedTopologyPrefillUsesOwnerOnlyMaskWhenReplicasActive)
+{
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 8;
+    params.d_model = 16;
+    params.num_experts = 4;
+    params.top_k = 2;
+    params.expert_intermediate = 32;
+    params.my_socket_id = 0;
+
+    params.expert_mask = {true, true, true, false};
+    params.replica_set.domain_id = "cuda_ep";
+    params.replica_set.is_replicated = {false, true, false, false};
+    params.replica_set.owner_socket = {0, 1, 0, 1};
+    params.replica_set.num_replicated = 1;
+    params.replica_set.num_sockets = 2;
+    params.replica_set.buildPrefillMask(params.my_socket_id, params.expert_mask);
+
+    MoEExpertComputeStage stage(params);
+    const auto ids = stage.fixedTopologyPrefillExpertIdsForTesting();
+    const auto mask = stage.fixedTopologyPrefillExpertMaskBytesForTesting();
+
+    EXPECT_TRUE(stage.usesFixedTopologyGroupedPrefillForTesting());
+    EXPECT_EQ(ids, std::vector<int>({0, 2}));
+    ASSERT_EQ(mask.size(), 4u);
+    EXPECT_EQ(mask[0], 1u);
+    EXPECT_EQ(mask[1], 0u) << "replica expert is resident for decode but owner-only for prefill";
+    EXPECT_EQ(mask[2], 1u);
+    EXPECT_EQ(mask[3], 0u);
+}
+
+TEST_F(MoEExpertComputeStageTest, FixedTopologyVerifierReplayStillRejectsReplicas)
+{
+    MoEExpertComputeStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.seq_len = 1;
+    params.d_model = 16;
+    params.num_experts = 4;
+    params.top_k = 2;
+    params.expert_intermediate = 32;
+    params.my_socket_id = 0;
+    params.force_grouped_verifier_prefill_for_decode = true;
+
+    params.expert_mask = {true, true, true, false};
+    params.replica_set.domain_id = "cuda_ep";
+    params.replica_set.is_replicated = {false, true, false, false};
+    params.replica_set.owner_socket = {0, 1, 0, 1};
+    params.replica_set.num_replicated = 1;
+    params.replica_set.num_sockets = 2;
+    params.replica_set.buildPrefillMask(params.my_socket_id, params.expert_mask);
+
+    MoEExpertComputeStage stage(params);
+    EXPECT_FALSE(stage.usesFixedTopologyGroupedVerifierReplayForTesting());
 }
 
 TEST_F(MoEExpertComputeStageTest, SharedExpert_TypeAndName)

@@ -39,6 +39,86 @@ namespace llaminar2
                    stored.kind == requested.kind &&
                    stored.device == requested.device;
         }
+
+        bool sameExpertSlabDescriptor(const ExpertSlabDescriptor &stored, const ExpertSlabDescriptor &requested)
+        {
+            return stored.layer_idx == requested.layer_idx &&
+                   stored.role == requested.role &&
+                   stored.device == requested.device &&
+                   stored.num_experts == requested.num_experts &&
+                   stored.rows_per_expert == requested.rows_per_expert &&
+                   stored.cols_per_expert == requested.cols_per_expert;
+        }
+
+        bool isEmptySlice(const WeightSliceSpec &slice)
+        {
+            return slice.source_rows == 0 &&
+                   slice.source_cols == 0 &&
+                   slice.row_start == 0 &&
+                   slice.row_count == 0 &&
+                   slice.col_start == 0 &&
+                   slice.col_count == 0 &&
+                   slice.expert_start == 0 &&
+                   slice.expert_count == 0 &&
+                   !slice.inner_is_presliced;
+        }
+
+        bool isFullTensorSlice(const WeightSliceSpec &slice, const TensorBase *tensor)
+        {
+            if (!tensor || tensor->shape().size() < 2)
+                return false;
+            const auto &shape = tensor->shape();
+            return slice.row_start == 0 &&
+                   slice.col_start == 0 &&
+                   slice.expert_start == 0 &&
+                   slice.expert_count == 0 &&
+                   !slice.inner_is_presliced &&
+                   slice.row_count == shape[0] &&
+                   slice.col_count == shape[1] &&
+                   (slice.source_rows == 0 || slice.source_rows == shape[0]) &&
+                   (slice.source_cols == 0 || slice.source_cols == shape[1]);
+        }
+
+        bool sameWeightSliceForAdoption(
+            const WeightSliceSpec &stored,
+            const TensorBase *stored_tensor,
+            const WeightSliceSpec &requested,
+            const TensorBase *requested_tensor)
+        {
+            const bool stored_empty = isEmptySlice(stored);
+            const bool requested_empty = isEmptySlice(requested);
+            if (stored_empty && requested_empty)
+                return true;
+            if (stored_empty)
+                return isFullTensorSlice(requested, requested_tensor);
+            if (requested_empty)
+                return isFullTensorSlice(stored, stored_tensor);
+
+            return stored.source_rows == requested.source_rows &&
+                   stored.source_cols == requested.source_cols &&
+                   stored.row_start == requested.row_start &&
+                   stored.row_count == requested.row_count &&
+                   stored.col_start == requested.col_start &&
+                   stored.col_count == requested.col_count &&
+                   stored.expert_start == requested.expert_start &&
+                   stored.expert_count == requested.expert_count &&
+                   stored.inner_is_presliced == requested.inner_is_presliced;
+        }
+
+        bool compatiblePreparedAdoptionBinding(
+            const WeightBinding &stored,
+            const WeightBinding &requested)
+        {
+            if (!stored.tensor || !requested.tensor)
+                return false;
+            if (stored.tensor->shape() != requested.tensor->shape())
+                return false;
+            return sameWeightSliceForAdoption(
+                stored.slice,
+                stored.tensor,
+                requested.slice,
+                requested.tensor);
+        }
     }
 
     PreparedWeightStore::PreparedWeightStore(ModelContextId model_id)
@@ -183,6 +263,8 @@ namespace llaminar2
             const bool same_canonical_name = !entry.binding.identity.canonical_name.empty() &&
                                              entry.binding.identity.canonical_name == binding.identity.canonical_name;
             if (!same_tensor && !same_canonical_name)
+                continue;
+            if (!compatiblePreparedAdoptionBinding(entry.binding, binding))
                 continue;
 
             auto handle = entry.owned_handle;
@@ -510,6 +592,13 @@ namespace llaminar2
         if (desc.layer_idx < 0)
             throw std::runtime_error("ExpertSlabDescriptor requires layer_idx >= 0");
 
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &[_, entry] : expert_slabs_)
+        {
+            if (sameExpertSlabDescriptor(entry->descriptor, desc))
+                return entry->ref;
+        }
+
         ExpertSlabRef ref;
         ref.model_id = model_id_;
         ref.layer_idx = desc.layer_idx;
@@ -520,7 +609,6 @@ namespace llaminar2
         entry->descriptor = desc;
         entry->experts.resize(static_cast<size_t>(desc.num_experts));
 
-        std::lock_guard<std::mutex> lock(mutex_);
         ref.slab_id = next_slab_id_++;
         entry->ref = ref;
         expert_slabs_[ref.slab_id] = std::move(entry);
@@ -532,18 +620,8 @@ namespace llaminar2
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto &[_, entry] : expert_slabs_)
         {
-            const auto &candidate = entry->descriptor;
-            if (candidate.layer_idx == desc.layer_idx &&
-                candidate.role == desc.role &&
-                candidate.device == desc.device &&
-                candidate.num_experts == desc.num_experts &&
-                candidate.local_expert_start == desc.local_expert_start &&
-                candidate.local_expert_count == desc.local_expert_count &&
-                candidate.rows_per_expert == desc.rows_per_expert &&
-                candidate.cols_per_expert == desc.cols_per_expert)
-            {
+            if (sameExpertSlabDescriptor(entry->descriptor, desc))
                 return entry->ref;
-            }
         }
         return std::nullopt;
     }
@@ -567,6 +645,48 @@ namespace llaminar2
             return nullptr;
         const auto &expert = slab_ptr->experts[static_cast<size_t>(expert_id)];
         return expert.available ? expert.engine : nullptr;
+    }
+
+    std::shared_ptr<ITensorGemm> PreparedWeightStore::expertGemmKernelLifetime(
+        const ExpertSlabRef &slab,
+        int expert_id) const
+    {
+        std::shared_ptr<ExpertSlabEntry> slab_ptr;
+        {
+            std::lock_guard<std::mutex> outer_lock(mutex_);
+            auto it = expert_slabs_.find(slab.slab_id);
+            if (it == expert_slabs_.end())
+                return nullptr;
+            slab_ptr = it->second;
+        }
+
+        std::shared_lock<std::shared_mutex> slab_lock(slab_ptr->slab_mutex);
+        if (expert_id < 0 || expert_id >= static_cast<int>(slab_ptr->experts.size()))
+            return nullptr;
+        const auto &expert = slab_ptr->experts[static_cast<size_t>(expert_id)];
+        return expert.available ? expert.engine_lifetime : nullptr;
+    }
+
+    std::optional<GpuDirectTransferCompletion> PreparedWeightStore::expertGpuDirectCompletion(
+        const ExpertSlabRef &slab,
+        int expert_id) const
+    {
+        std::shared_ptr<ExpertSlabEntry> slab_ptr;
+        {
+            std::lock_guard<std::mutex> outer_lock(mutex_);
+            auto it = expert_slabs_.find(slab.slab_id);
+            if (it == expert_slabs_.end())
+                return std::nullopt;
+            slab_ptr = it->second;
+        }
+
+        std::shared_lock<std::shared_mutex> slab_lock(slab_ptr->slab_mutex);
+        if (expert_id < 0 || expert_id >= static_cast<int>(slab_ptr->experts.size()))
+            return std::nullopt;
+        const auto &expert = slab_ptr->experts[static_cast<size_t>(expert_id)];
+        if (!expert.available || !expert.gpu_direct_completion.has_value())
+            return std::nullopt;
+        return expert.gpu_direct_completion;
     }
 
     std::vector<int> PreparedWeightStore::registerArrivedExperts(
@@ -598,6 +718,7 @@ namespace llaminar2
             slot.view_lifetime = arrival.view_lifetime;
             slot.derivation = arrival.derivation;
             slot.source_device = arrival.source_device;
+            slot.gpu_direct_completion = arrival.gpu_direct_completion;
             slot.available = true;
             actually_new.push_back(arrival.expert_id);
         }
@@ -626,6 +747,7 @@ namespace llaminar2
             slot.engine_lifetime.reset();
             slot.view_lifetime.reset();
             slot.source_device.reset();
+            slot.gpu_direct_completion.reset();
             slot.available = false;
         }
     }

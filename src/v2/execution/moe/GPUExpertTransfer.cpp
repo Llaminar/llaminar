@@ -1,174 +1,163 @@
 /**
  * @file GPUExpertTransfer.cpp
- * @brief GPU↔GPU direct expert weight transfer implementation.
- *
- * Uses HIP peer-to-peer DMA (hipMemcpyPeerAsync) for ROCm↔ROCm transfers.
- * Falls back to host-staged copy when P2P is not available.
+ * @brief Backend-neutral GPU expert weight transfer dispatch.
  */
 
 #include "GPUExpertTransfer.h"
+#include "GPUExpertTransferBackend.h"
 #include "../../utils/Logger.h"
 
-#ifdef HAVE_ROCM
-#include <hip/hip_runtime.h>
-#endif
-
-namespace llaminar2 {
-
-#ifdef HAVE_ROCM
-
-namespace {
-
-/// Copy one array from src_device to dst_device using peer DMA or host-staged fallback.
-/// Returns true on success.
-bool copyArrayPeerAsync(
-    void* dst, int dst_ordinal,
-    const void* src, int src_ordinal,
-    size_t bytes, hipStream_t stream,
-    bool peer_available)
+namespace llaminar2
 {
-    if (bytes == 0 || dst == nullptr || src == nullptr)
-        return true;  // nothing to transfer
-
-    if (peer_available) {
-        hipError_t err = hipMemcpyPeerAsync(dst, dst_ordinal, src, src_ordinal, bytes, stream);
-        if (err != hipSuccess) {
-            LOG_ERROR("[GPUExpertTransfer] hipMemcpyPeerAsync failed: " << hipGetErrorString(err)
-                      << " (src=" << src_ordinal << " dst=" << dst_ordinal << " bytes=" << bytes << ")");
+    bool GPUExpertTransfer::transferExpert(
+        const GPUExpertPointers &src_ptrs,
+        const GPUExpertPointers &dst_ptrs,
+        const DeviceId &src_device,
+        const DeviceId &dst_device,
+        size_t vnni_bytes,
+        size_t scales_bytes,
+        size_t mins_bytes,
+        size_t emins_bytes,
+        void *stream)
+    {
+        if (!stream)
+        {
+            LOG_ERROR("[GPUExpertTransfer] Refusing GPU expert transfer on nullptr stream");
             return false;
         }
-        return true;
-    }
 
-    // Fallback: hipMemcpyPeer handles host-staging internally and is much faster
-    // than manual bounce buffer allocation per array.
-    hipError_t err = hipMemcpyPeer(dst, dst_ordinal, src, src_ordinal, bytes);
-    if (err != hipSuccess) {
-        LOG_ERROR("[GPUExpertTransfer] hipMemcpyPeer fallback failed: " << hipGetErrorString(err)
-                  << " (src=" << src_ordinal << " dst=" << dst_ordinal << " bytes=" << bytes << ")");
-        return false;
-    }
-    return true;
-}
+        if (src_device.is_cuda() && dst_device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            return detail::transferExpertCUDABackend(
+                src_ptrs, dst_ptrs, src_device, dst_device,
+                vnni_bytes, scales_bytes, mins_bytes, emins_bytes, stream);
+#else
+            LOG_ERROR("[GPUExpertTransfer] CUDA support not available");
+            return false;
+#endif
+        }
 
-} // anonymous namespace
+        if (src_device.is_rocm() && dst_device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            return detail::transferExpertROCmBackend(
+                src_ptrs, dst_ptrs, src_device, dst_device,
+                vnni_bytes, scales_bytes, mins_bytes, emins_bytes, stream);
+#else
+            LOG_ERROR("[GPUExpertTransfer] ROCm support not available");
+            return false;
+#endif
+        }
 
-bool GPUExpertTransfer::transferExpert(
-    const GPUExpertPointers& src_ptrs,
-    const GPUExpertPointers& dst_ptrs,
-    const DeviceId& src_device,
-    const DeviceId& dst_device,
-    size_t vnni_bytes,
-    size_t scales_bytes,
-    size_t mins_bytes,
-    size_t emins_bytes,
-    void* stream)
-{
-    if (!src_device.is_rocm() || !dst_device.is_rocm()) {
-        LOG_ERROR("[GPUExpertTransfer] Both devices must be ROCm, got "
-                  << src_device.to_string() << " → " << dst_device.to_string());
+        LOG_ERROR("[GPUExpertTransfer] Same-backend GPU transfer required, got "
+                  << src_device.to_string() << " -> " << dst_device.to_string());
         return false;
     }
 
-    // Save caller's active device to restore on exit
-    int original_device = -1;
-    (void)hipGetDevice(&original_device);
+    bool GPUExpertTransfer::transferExpert(
+        const GpuExpertPackedDescriptor &src,
+        const GpuExpertPackedDescriptor &dst,
+        const DeviceId &src_device,
+        const DeviceId &dst_device,
+        void *stream)
+    {
+        if (!gpuExpertPackedDescriptorsCompatible(src, dst))
+        {
+            LOG_ERROR("[GPUExpertTransfer] Incompatible GPU expert packed descriptors"
+                      << " src_valid=" << src.valid()
+                      << " dst_valid=" << dst.valid()
+                      << " src_n=" << src.n << " dst_n=" << dst.n
+                      << " src_k=" << src.k << " dst_k=" << dst.k
+                      << " src_codebook=" << static_cast<int>(src.codebook_id)
+                      << " dst_codebook=" << static_cast<int>(dst.codebook_id));
+            return false;
+        }
 
-    const int src_ord = src_device.rocm_ordinal();
-    const int dst_ord = dst_device.rocm_ordinal();
-    const bool peer = canAccessPeer(src_ord, dst_ord);
-
-    if (peer) {
-        enablePeerAccess(dst_ord);
+        return transferExpert(src.ptrs, dst.ptrs, src_device, dst_device,
+                              src.vnni_bytes, src.scales_bytes,
+                              src.mins_bytes, src.emins_bytes, stream);
     }
 
-    auto hip_stream = static_cast<hipStream_t>(stream);
+    bool GPUExpertTransfer::canAccessPeer(const DeviceId &src_device, const DeviceId &dst_device)
+    {
+        if (src_device == dst_device)
+            return true;
 
-    // Transfer all arrays
-    bool success = true;
-    if (!copyArrayPeerAsync(dst_ptrs.d_vnni, dst_ord,
-                            src_ptrs.d_vnni, src_ord,
-                            vnni_bytes, hip_stream, peer))
-        success = false;
+        if (src_device.is_cuda() && dst_device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            return detail::canAccessPeerCUDABackend(src_device, dst_device);
+#else
+            return false;
+#endif
+        }
 
-    if (success && !copyArrayPeerAsync(dst_ptrs.d_scales, dst_ord,
-                            src_ptrs.d_scales, src_ord,
-                            scales_bytes, hip_stream, peer))
-        success = false;
+        if (src_device.is_rocm() && dst_device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            return detail::canAccessPeerROCmBackend(src_device, dst_device);
+#else
+            return false;
+#endif
+        }
 
-    if (success && mins_bytes > 0) {
-        if (!copyArrayPeerAsync(dst_ptrs.d_mins, dst_ord,
-                                src_ptrs.d_mins, src_ord,
-                                mins_bytes, hip_stream, peer))
-            success = false;
+        return false;
     }
 
-    if (success && emins_bytes > 0) {
-        if (!copyArrayPeerAsync(dst_ptrs.d_emins, dst_ord,
-                                src_ptrs.d_emins, src_ord,
-                                emins_bytes, hip_stream, peer))
-            success = false;
+    bool GPUExpertTransfer::enablePeerAccess(
+        const DeviceId &current_device,
+        const DeviceId &peer_device)
+    {
+        if (current_device == peer_device)
+            return true;
+
+        if (current_device.is_cuda() && peer_device.is_cuda())
+        {
+#ifdef HAVE_CUDA
+            return detail::enablePeerAccessCUDABackend(current_device, peer_device);
+#else
+            return false;
+#endif
+        }
+
+        if (current_device.is_rocm() && peer_device.is_rocm())
+        {
+#ifdef HAVE_ROCM
+            return detail::enablePeerAccessROCmBackend(current_device, peer_device);
+#else
+            return false;
+#endif
+        }
+
+        return false;
     }
 
-    // Restore caller's original device context
-    if (original_device >= 0) {
-        (void)hipSetDevice(original_device);
+    bool GPUExpertTransfer::canAccessPeer(int src_ordinal, int dst_ordinal)
+    {
+        if (src_ordinal == dst_ordinal)
+            return true;
+
+#ifdef HAVE_ROCM
+        return canAccessPeer(DeviceId::rocm(src_ordinal), DeviceId::rocm(dst_ordinal));
+#elif defined(HAVE_CUDA)
+        return canAccessPeer(DeviceId::cuda(src_ordinal), DeviceId::cuda(dst_ordinal));
+#else
+        (void)src_ordinal;
+        (void)dst_ordinal;
+        return false;
+#endif
     }
 
-    if (success) {
-        LOG_DEBUG("[GPUExpertTransfer] Transferred expert ROCm:" << src_ord
-                  << " → ROCm:" << dst_ord
-                  << " vnni=" << vnni_bytes << "B scales=" << scales_bytes << "B"
-                  << " mins=" << mins_bytes << "B emins=" << emins_bytes << "B"
-                  << (peer ? " (P2P)" : " (host-staged)"));
+    bool GPUExpertTransfer::enablePeerAccess(int peer_ordinal)
+    {
+#ifdef HAVE_ROCM
+        return enablePeerAccess(DeviceId::rocm(0), DeviceId::rocm(peer_ordinal));
+#elif defined(HAVE_CUDA)
+        return enablePeerAccess(DeviceId::cuda(0), DeviceId::cuda(peer_ordinal));
+#else
+        (void)peer_ordinal;
+        return false;
+#endif
     }
-    return success;
 }
-
-bool GPUExpertTransfer::canAccessPeer(int src_ordinal, int dst_ordinal)
-{
-    if (src_ordinal == dst_ordinal)
-        return true;
-
-    int can_access = 0;
-    hipError_t err = hipDeviceCanAccessPeer(&can_access, src_ordinal, dst_ordinal);
-    return (err == hipSuccess && can_access != 0);
-}
-
-bool GPUExpertTransfer::enablePeerAccess(int peer_ordinal)
-{
-    hipError_t err = hipDeviceEnablePeerAccess(peer_ordinal, 0);
-    // hipErrorPeerAccessAlreadyEnabled is fine — idempotent
-    return (err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled);
-}
-
-#else // !HAVE_ROCM
-
-bool GPUExpertTransfer::transferExpert(
-    const GPUExpertPointers& /*src_ptrs*/,
-    const GPUExpertPointers& /*dst_ptrs*/,
-    const DeviceId& /*src_device*/,
-    const DeviceId& /*dst_device*/,
-    size_t /*vnni_bytes*/,
-    size_t /*scales_bytes*/,
-    size_t /*mins_bytes*/,
-    size_t /*emins_bytes*/,
-    void* /*stream*/)
-{
-    LOG_ERROR("[GPUExpertTransfer] ROCm not available");
-    return false;
-}
-
-bool GPUExpertTransfer::canAccessPeer(int /*src_ordinal*/, int /*dst_ordinal*/)
-{
-    return false;
-}
-
-bool GPUExpertTransfer::enablePeerAccess(int /*peer_ordinal*/)
-{
-    return false;
-}
-
-#endif // HAVE_ROCM
-
-} // namespace llaminar2

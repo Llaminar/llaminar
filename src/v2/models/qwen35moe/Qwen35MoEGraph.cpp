@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -150,6 +151,17 @@ namespace llaminar2
                                 { return enabled; }));
         }
 
+        bool expertMaskEnablesExpert(const std::vector<bool> &expert_mask,
+                                     int expert,
+                                     int num_experts)
+        {
+            return expert_mask.empty() ||
+                   (expert_mask.size() == static_cast<size_t>(num_experts) &&
+                    expert >= 0 &&
+                    expert < num_experts &&
+                    expert_mask[static_cast<size_t>(expert)]);
+        }
+
         bool runtimeTableHasUsableDecodeBank(
             IMoERuntimeTable *runtime_table,
             int layer_idx,
@@ -196,6 +208,212 @@ namespace llaminar2
                 }
             }
             return true;
+        }
+
+        bool runtimeTableHasUsableMaskedDecodeBank(
+            IMoERuntimeTable *runtime_table,
+            int layer_idx,
+            int num_experts,
+            int top_k,
+            const std::vector<bool> &expert_mask)
+        {
+            if (!runtime_table || layer_idx < 0)
+                return false;
+            if (!expert_mask.empty() &&
+                expert_mask.size() != static_cast<size_t>(num_experts))
+                return false;
+
+            const auto &state = runtime_table->hostLayerState(layer_idx);
+            if (state.active_bank > 1 ||
+                state.active_epoch == 0 ||
+                state.expert_count != static_cast<uint32_t>(num_experts) ||
+                state.top_k != static_cast<uint32_t>(top_k))
+            {
+                return false;
+            }
+
+            const auto &bank = state.banks[state.active_bank];
+            if (bank.epoch != state.active_epoch ||
+                bank.expert_count != static_cast<uint32_t>(num_experts))
+            {
+                return false;
+            }
+
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                const bool expected_local = expertMaskEnablesExpert(expert_mask, expert, num_experts);
+                if (bank.local_compute_mask[static_cast<size_t>(expert)] != (expected_local ? 1u : 0u))
+                    return false;
+                if (!expected_local)
+                    continue;
+
+                const auto &desc = bank.experts[static_cast<size_t>(expert)];
+                if (desc.logical_expert_id != expert ||
+                    desc.local_slot < 0 ||
+                    !desc.gate.valid() ||
+                    !desc.up.valid() ||
+                    !desc.down.valid() ||
+                    !hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::Valid) ||
+                    !hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::Resident) ||
+                    !hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::LocalCompute))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        bool initializeMaskedLocalDecodeRuntimeTable(
+            IMoERuntimeTable *runtime_table,
+            int layer_idx,
+            int num_experts,
+            int top_k,
+            int d_model,
+            int expert_intermediate,
+            const std::vector<bool> &expert_mask,
+            int owner_participant,
+            int participant_count,
+            const std::vector<ITensorGemm *> &gate_gemms,
+            const std::vector<ITensorGemm *> &up_gemms,
+            const std::vector<ITensorGemm *> &down_gemms,
+            void *stream,
+            const std::string &context)
+        {
+            if (!runtime_table || layer_idx < 0)
+                return false;
+            if (!expert_mask.empty() &&
+                expert_mask.size() != static_cast<size_t>(num_experts))
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": expert mask size does not match num_experts="
+                                              << num_experts);
+                return false;
+            }
+            if (participant_count <= 0 ||
+                participant_count > static_cast<int>(kDeviceMoEMaxParticipants) ||
+                owner_participant < 0 ||
+                owner_participant >= participant_count)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": invalid participant metadata id="
+                                              << owner_participant
+                                              << " count=" << participant_count);
+                return false;
+            }
+
+            if (runtimeTableHasUsableMaskedDecodeBank(
+                    runtime_table, layer_idx, num_experts, top_k, expert_mask))
+            {
+                return true;
+            }
+
+            const auto &state = runtime_table->hostLayerState(layer_idx);
+            if (state.active_epoch != 0)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": refusing to replace active MoE decode runtime bank for layer "
+                                              << layer_idx << " epoch " << state.active_epoch);
+                return false;
+            }
+
+            if (gate_gemms.size() != static_cast<size_t>(num_experts) ||
+                up_gemms.size() != static_cast<size_t>(num_experts) ||
+                down_gemms.size() != static_cast<size_t>(num_experts))
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": prepared expert GEMM vector sizes do not match num_experts="
+                                              << num_experts);
+                return false;
+            }
+
+            MoEPlacementUpdate update;
+            update.epoch = 1;
+            update.expert_count = static_cast<uint32_t>(num_experts);
+            update.participant_id = static_cast<uint32_t>(owner_participant);
+            update.participant_count = static_cast<uint32_t>(participant_count);
+            update.experts.resize(static_cast<size_t>(num_experts));
+            update.local_compute_mask.assign(static_cast<size_t>(num_experts), 0u);
+            update.replica_role.assign(static_cast<size_t>(num_experts),
+                                       static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+
+            const uint32_t flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                    DeviceMoEExpertFlags::Resident |
+                                                    DeviceMoEExpertFlags::PreferredOwner |
+                                                    DeviceMoEExpertFlags::LocalCompute);
+
+            bool has_local_expert = false;
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                if (!expertMaskEnablesExpert(expert_mask, expert, num_experts))
+                    continue;
+
+                auto *gate = gate_gemms[static_cast<size_t>(expert)];
+                auto *up = up_gemms[static_cast<size_t>(expert)];
+                auto *down = down_gemms[static_cast<size_t>(expert)];
+                if (!gate || !up || !down)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": missing prepared GEMM engine for local expert "
+                                                  << expert << " layer " << layer_idx);
+                    return false;
+                }
+
+                DeviceMoEExpertDescriptor desc;
+                if (!gate->exportNativeVNNIMatrixDesc(desc.gate) ||
+                    !up->exportNativeVNNIMatrixDesc(desc.up) ||
+                    !down->exportNativeVNNIMatrixDesc(desc.down))
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": prepared GEMM engines for local expert "
+                                                  << expert << " layer " << layer_idx
+                                                  << " cannot export native-VNNI descriptors");
+                    return false;
+                }
+
+                if (desc.gate.n != expert_intermediate || desc.gate.k != d_model ||
+                    desc.up.n != expert_intermediate || desc.up.k != d_model ||
+                    desc.down.n != d_model || desc.down.k != expert_intermediate)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": native-VNNI descriptor shape mismatch for local expert "
+                                                  << expert << " layer " << layer_idx);
+                    return false;
+                }
+
+                desc.logical_expert_id = expert;
+                desc.owner_participant = owner_participant;
+                desc.local_slot = expert;
+                desc.flags = flags;
+                update.experts[static_cast<size_t>(expert)] = desc;
+                update.local_compute_mask[static_cast<size_t>(expert)] = 1u;
+                update.replica_role[static_cast<size_t>(expert)] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+                has_local_expert = true;
+            }
+
+            if (!has_local_expert)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": expert mask contains no local experts for layer "
+                                              << layer_idx);
+                return false;
+            }
+
+            try
+            {
+                runtime_table->prepareInactiveBank(layer_idx, update);
+                runtime_table->flipActiveBank(layer_idx, update.epoch, stream);
+            }
+            catch (const std::exception &ex)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": failed to publish masked MoE decode runtime bank for layer "
+                                              << layer_idx << ": " << ex.what());
+                return false;
+            }
+
+            return runtimeTableHasUsableMaskedDecodeBank(
+                runtime_table, layer_idx, num_experts, top_k, expert_mask);
         }
 
         bool initializeFullLocalDecodeRuntimeTable(
@@ -563,15 +781,50 @@ namespace llaminar2
             return it == plan.domains.end() ? nullptr : &(*it);
         }
 
-        bool isLocalTPReplicatedExpertsTier(
+        bool isLocalTPApportionedExpertsTier(
             const MoEExpertParallelPlan &plan,
             const ExpertRoutedTier &tier)
         {
             const auto *domain = expertDomainForTier(plan, tier);
             return domain &&
                    domain->kind == ExpertDomainKind::LocalTP &&
-                   domain->compute_kind == ExpertDomainComputeKind::ReplicatedExperts &&
+                   domain->compute_kind == ExpertDomainComputeKind::ApportionedExperts &&
                    domain->participants.size() > 1;
+        }
+
+        bool canUseLocalTPApportionedExpertsFastPath(
+            const MoEExpertParallelPlan &plan,
+            const DeviceId &device,
+            const ExpertRoutedTier **out_tier = nullptr)
+        {
+            if (!plan.isTieredOverlay() ||
+                plan.routed_tiers.size() != 1 ||
+                plan.continuation_domain != plan.routed_tiers.front().domain)
+            {
+                return false;
+            }
+
+            const ExpertRoutedTier &tier = plan.routed_tiers.front();
+            if (!isLocalTPApportionedExpertsTier(plan, tier))
+                return false;
+
+            const auto *domain = expertDomainForTier(plan, tier);
+            if (!domain)
+                return false;
+
+            const bool contains_device = std::any_of(
+                domain->participants.begin(),
+                domain->participants.end(),
+                [&](const GlobalDeviceAddress &address)
+                {
+                    return address.toLocalDeviceId() == device;
+                });
+            if (!contains_device)
+                return false;
+
+            if (out_tier)
+                *out_tier = &tier;
+            return true;
         }
 
         int participantIdForTierDevice(
@@ -723,6 +976,10 @@ namespace llaminar2
         {
             if (prefill_token_capacity > 0)
                 it->second->ensurePrefillRouteScratchCapacity(prefill_token_capacity);
+            registerRuntimeTableHistogramSyncIfNeeded(
+                key,
+                it->second.get(),
+                register_decode_histogram);
             if (!key_suffix.empty() && key_suffix.rfind("mtp_depth", 0) == 0)
             {
                 PerfStatsCollector::addCounter(
@@ -748,12 +1005,10 @@ namespace llaminar2
 
         auto table = std::make_unique<MoERuntimeTable>(table_config);
         IMoERuntimeTable *ptr = table.get();
-        if (register_decode_histogram && config_.moe.decode_histogram)
-        {
-            auto *histogram = config_.moe.decode_histogram;
-            histogram->registerRuntimeHistogramSync([ptr, histogram]()
-                                                    { return ptr->syncDecodeHistogramToHost(*histogram); });
-        }
+        registerRuntimeTableHistogramSyncIfNeeded(
+            key,
+            ptr,
+            register_decode_histogram);
         moe_runtime_tables_.emplace(key, std::move(table));
         if (!key_suffix.empty() && key_suffix.rfind("mtp_depth", 0) == 0)
         {
@@ -773,6 +1028,38 @@ namespace llaminar2
         }
         return ptr;
 #endif
+    }
+
+    void Qwen35MoEGraph::registerRuntimeTableHistogramSyncIfNeeded(
+        const std::string &key,
+        IMoERuntimeTable *table,
+        bool register_decode_histogram)
+    {
+        if (!register_decode_histogram || !table || !config_.moe.decode_histogram)
+            return;
+
+        auto *histogram = config_.moe.decode_histogram;
+        const std::string sync_key =
+            key + "@" + std::to_string(reinterpret_cast<std::uintptr_t>(histogram));
+        if (!moe_runtime_histogram_sync_keys_.insert(sync_key).second)
+            return;
+
+        histogram->registerRuntimeHistogramSync(
+            [table, histogram]()
+            {
+                void *stream = table->decodeHistogramProducerStream();
+                if (!stream)
+                    throw std::runtime_error(
+                        "[Qwen35MoEGraph] runtime histogram sync requested before a decode producer stream was recorded");
+                return table->syncDecodeHistogramToHost(*histogram, stream);
+            });
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "runtime_histogram_sync_registrations",
+            1.0,
+            "graph",
+            "",
+            {{"key", key}});
     }
 
     // =========================================================================
@@ -985,11 +1272,17 @@ namespace llaminar2
              * ExpertParallel runners own only a contiguous expert range, so
              * handing them this table would make the expert stage fail at graph
              * build or, worse, capture a single-device contract for a sharded
-             * topology.  Keep the fast table for full-owner lanes and let
-             * partial-owner TP use the ordinary mask/range + allreduce path
-             * until a sharded runtime table/reducer is implemented.
+             * topology.  Tiered overlays also express routed ownership with
+             * per-participant masks, even when a routed tier's compute kind is
+             * ApportionedExperts.  Keep the fast table for full-owner lanes and
+             * let partial-owner TP/overlay paths use the ordinary mask/range +
+             * allreduce path until a sharded runtime table/reducer is
+             * implemented.
              */
-            if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel)
+            if (use_expert_overlay)
+                return false;
+
+            if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts)
             {
                 const int local_count = config_.moe.local_expert_count < 0
                                             ? config_.moe.num_experts
@@ -1008,15 +1301,26 @@ namespace llaminar2
         };
         const bool static_full_local_expert_ownership =
             has_static_full_local_expert_ownership();
+        const bool masked_local_tp_overlay_decode_runtime_table =
+            device.is_gpu() &&
+            total_tokens == 1 &&
+            use_expert_overlay &&
+            overlay_plan &&
+            canUseLocalTPApportionedExpertsFastPath(*overlay_plan, device) &&
+            debugEnv().moe_rebalance.gpu_cache_experts_per_layer <= 0;
+        const bool decode_runtime_table_eligible =
+            static_full_local_expert_ownership ||
+            masked_local_tp_overlay_decode_runtime_table;
         const bool allow_eager_partial_owner_gpu_route =
             device.is_gpu() &&
             total_tokens == 1 &&
             !static_full_local_expert_ownership &&
-            config_.moe.expert_mode == MoEExpertMode::ExpertParallel;
+            (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts ||
+             use_expert_overlay);
         if (total_tokens == 1 &&
             rocm_env.moe_grouped_decode &&
             rocm_env.moe_device_routed_decode &&
-            static_full_local_expert_ownership)
+            decode_runtime_table_eligible)
         {
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
@@ -1106,7 +1410,41 @@ namespace llaminar2
         // Stage 3: MoE Expert Compute (routed expert SwiGLU FFN)
         // =====================================================================
         TensorBase *moe_output = buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+        TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
         bool shared_gate_writes_combined_output = false;
+        std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
+
+        auto plannedSharedExpertDevice = [&]() -> DeviceId
+        {
+            DeviceId shared_device = device;
+            if (overlay_runtime_plan)
+            {
+                const auto &shared_domain = overlay_runtime_plan->sharedExpertDomain();
+                shared_device = overlay_runtime_plan->sharedExpertDeviceForMVP(layer_idx);
+                if (domainContainsDevice(shared_domain, device))
+                    shared_device = device;
+            }
+            return shared_device;
+        };
+        const bool has_shared_expert_branch =
+            layer.shared_expert_gate && layer.shared_expert_up &&
+            layer.shared_expert_down && shared_output;
+        const DeviceId planned_shared_device =
+            has_shared_expert_branch ? plannedSharedExpertDevice() : device;
+        auto needsMoEParticipantAllreduce = [&]() -> bool
+        {
+            return config_.tp_ctx && config_.tp_ctx->degree() > 1;
+        };
+        const bool can_defer_local_tp_moe_allreduce_to_combined =
+            needsMoEParticipantAllreduce() &&
+            needsTPAllreduce() &&
+            !config_.compute_all_position_logits &&
+            has_shared_expert_branch &&
+            layer.shared_expert_gate_inp &&
+            planned_shared_device == device &&
+            moe_output &&
+            buffers.attn_proj;
+        bool deferred_local_tp_moe_allreduce_to_combined = false;
 
         {
             // Infer expert intermediate size from weight shape
@@ -1150,7 +1488,7 @@ namespace llaminar2
                 expert_params.force_decode_equivalent_verifier_prefill =
                     forceDecodeEquivalentMoEVerifier(stage_device);
 
-                if (config_.moe.expert_mode == MoEExpertMode::ExpertParallel &&
+                if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts &&
                     expert_params.expert_mask.empty())
                 {
                     expert_params.local_expert_start = config_.moe.local_expert_start;
@@ -1323,13 +1661,135 @@ namespace llaminar2
              */
             const bool can_combine_shared_verifier = false;
 
+            const ExpertRoutedTier *local_tp_fast_tier = nullptr;
+            const bool use_local_tp_replicated_fast_path =
+                use_expert_overlay &&
+                canUseLocalTPApportionedExpertsFastPath(
+                    *overlay_plan,
+                    device,
+                    &local_tp_fast_tier);
+
             if (overlay_requested && !use_expert_overlay)
             {
                 LOG_WARN("[Qwen35MoEGraph] Expert overlay requested for layer " << layer_idx
                                                                                 << " but no usable placement was found; using legacy routed expert path");
             }
 
-            if (use_expert_overlay)
+            if (use_local_tp_replicated_fast_path)
+            {
+                auto owner_map_lifetime = std::make_shared<MoEExpertOwnerMap>(
+                    MoEExpertOwnerMap::build(*overlay_plan));
+                const int local_participant = participantIdForTierDevice(
+                    *owner_map_lifetime,
+                    0,
+                    device);
+                if (local_participant < 0)
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE LocalTP apportioned-experts fast path could not find graph-local participant for " +
+                        device.to_string() + " in layer " + std::to_string(layer_idx));
+                }
+
+                auto participant_mask = owner_map_lifetime->expertMaskForParticipant(
+                    layer_idx,
+                    local_participant,
+                    config_.moe.num_experts);
+                if (!hasActiveExpertMask(participant_mask))
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE LocalTP apportioned-experts fast path produced an empty expert mask for participant " +
+                        std::to_string(local_participant) + " in layer " + std::to_string(layer_idx));
+                }
+
+                auto expert_params = makeExpertParams(
+                    moe_output,
+                    buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                    std::move(participant_mask),
+                    device);
+                const std::string domain_name = local_tp_fast_tier ? local_tp_fast_tier->domain : std::string{};
+                if (!prepareExpertParams(
+                        expert_params,
+                        device,
+                        "LocalTP apportioned-experts fast path participant " +
+                            std::to_string(local_participant),
+                        domain_name))
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE graph failed to prepare LocalTP apportioned-experts fast-path parameters for layer " +
+                        std::to_string(layer_idx) + " on " + device.to_string());
+                }
+
+                if (moe_runtime_table &&
+                    masked_local_tp_overlay_decode_runtime_table &&
+                    expert_params.replica_set.num_replicated == 0)
+                {
+                    const int participant_count =
+                        participantCountForGraphNativeOverlay(
+                            *owner_map_lifetime,
+                            continuationRootParticipant(*overlay_plan));
+                    if (!initializeMaskedLocalDecodeRuntimeTable(
+                            moe_runtime_table,
+                            layer_idx,
+                            config_.moe.num_experts,
+                            config_.moe.top_k,
+                            config_.d_model,
+                            expert_intermediate,
+                            expert_params.expert_mask,
+                            local_participant,
+                            participant_count,
+                            expert_params.prepared_gate_gemm,
+                            expert_params.prepared_up_gemm,
+                            expert_params.prepared_down_gemm,
+                            nullptr,
+                            "LocalTP apportioned-experts masked GPU decode graph build"))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph failed to initialize masked LocalTP decode runtime table for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+                }
+
+                graph.addNode(prefix + "moe_expert_ffn_overlay_fast",
+                              ComputeStageFactory::createMoEExpertCompute(expert_params),
+                              device);
+                graph.addDependency(prefix + "moe_expert_ffn_overlay_fast", prefix + "moe_routing");
+                ffn_terminal = prefix + "moe_expert_ffn_overlay_fast";
+
+                if (needsMoEParticipantAllreduce())
+                {
+                    if (can_defer_local_tp_moe_allreduce_to_combined)
+                    {
+                        deferred_local_tp_moe_allreduce_to_combined = true;
+                    }
+                    else
+                    {
+                        const size_t allreduce_count =
+                            static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+                        const std::string ar_name = prefix + "moe_expert_overlay_fast_allreduce";
+                        auto allreduce_stage = createTPAllreduceStage(
+                            moe_output,
+                            allreduce_count,
+                            device,
+                            layer_idx,
+                            /*is_attention=*/false,
+                            ar_name,
+                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+                        if (allreduce_stage)
+                        {
+                            graph.addNode(ar_name, std::move(allreduce_stage), device);
+                            graph.addDependency(ar_name, prefix + "moe_expert_ffn_overlay_fast");
+                            ffn_terminal = ar_name;
+                        }
+                    }
+                }
+
+                LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
+                                                    << " using LocalTP apportioned-experts fast path on "
+                                                    << device.to_string()
+                                                    << " participant=" << local_participant
+                                                    << " domain=" << domain_name);
+            }
+            else if (use_expert_overlay)
             {
                 auto dispatch_output_lifetime = std::make_shared<MoEExpertDispatchOutput>();
 
@@ -1406,7 +1866,7 @@ namespace llaminar2
                     std::vector<int> target_participants = owner_map_lifetime->participantIdsForTier(
                         static_cast<int>(tier_index));
                     const bool local_tp_replicated_tier =
-                        isLocalTPReplicatedExpertsTier(*overlay_plan, tier);
+                        isLocalTPApportionedExpertsTier(*overlay_plan, tier);
                     const int graph_local_participant =
                         local_tp_replicated_tier
                             ? participantIdForTierDevice(
@@ -1441,7 +1901,7 @@ namespace llaminar2
                                 std::to_string(target_participant) + " on " +
                                 target_device.to_string() + " from graph device " +
                                 device.to_string() +
-                                ". LocalTP ReplicatedExperts GPU domains must lower only the graph-local participant; "
+                                ". LocalTP ApportionedExperts GPU domains must lower only the graph-local participant; "
                                 "other cross-device GPU expert execution requires a real participant/domain executor.");
                         }
                         const std::string participant_suffix =
@@ -1665,7 +2125,7 @@ namespace llaminar2
                         if (!root_return_node.empty())
                         {
                             std::string tier_terminal = root_return_node;
-                            if (compute_replicated_tier_on_graph_local_participant && needsTPAllreduce())
+                            if (compute_replicated_tier_on_graph_local_participant && needsMoEParticipantAllreduce())
                             {
                                 const size_t allreduce_count =
                                     static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
@@ -1784,20 +2244,15 @@ namespace llaminar2
         // =====================================================================
         // Stage 4: Shared Expert FFN (always-active dense SwiGLU)
         // =====================================================================
-        TensorBase *shared_output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
-        std::string shared_ffn_last; // Track last shared expert stage (empty if no shared expert)
 
         if (!shared_gate_writes_combined_output &&
             layer.shared_expert_gate && layer.shared_expert_up && layer.shared_expert_down && shared_output)
         {
-            DeviceId shared_device = device;
+            DeviceId shared_device = planned_shared_device;
             if (overlay_runtime_plan)
             {
                 const auto &continuation_domain = overlay_runtime_plan->continuationDomain();
                 const auto &shared_domain = overlay_runtime_plan->sharedExpertDomain();
-                shared_device = overlay_runtime_plan->sharedExpertDeviceForMVP(layer_idx);
-                if (domainContainsDevice(shared_domain, device))
-                    shared_device = device;
 
                 LOG_DEBUG("[Qwen35MoEGraph] Layer " << layer_idx
                                                     << " shared expert uses domain " << shared_domain.name
@@ -1883,8 +2338,16 @@ namespace llaminar2
             }
             shared_ffn_last = prefix + "shared_expert_ffn";
 
-            // Allreduce after shared expert down projection (InputParallel sharding)
-            if (needsTPAllreduce())
+            const bool fuse_shared_gate_then_combined_allreduce =
+                deferred_local_tp_moe_allreduce_to_combined &&
+                shared_device == device &&
+                moe_output &&
+                buffers.attn_proj;
+
+            // Allreduce after shared expert down projection (InputParallel sharding),
+            // unless the LocalTP apportioned-experts path will combine routed and
+            // gated shared partials locally and reduce that single combined buffer.
+            if (needsTPAllreduce() && !fuse_shared_gate_then_combined_allreduce)
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                 std::string ar_name = prefix + "shared_expert_allreduce";
@@ -1903,8 +2366,11 @@ namespace llaminar2
             if (layer.shared_expert_gate_inp)
             {
                 const bool can_fuse_gate_and_combine =
-                    !overlay_runtime_plan && !needsTPAllreduce() && shared_device == device &&
+                    !needsTPAllreduce() && shared_device == device &&
                     moe_output && buffers.attn_proj;
+                const bool gate_writes_combined_output =
+                    can_fuse_gate_and_combine ||
+                    fuse_shared_gate_then_combined_allreduce;
 
                 SharedExpertGateStage::Params gate_params;
                 gate_params.device_id = shared_device;
@@ -1915,7 +2381,7 @@ namespace llaminar2
                 gate_params.d_model = config_.d_model;
                 gate_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
                 gate_params.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
-                if (can_fuse_gate_and_combine)
+                if (gate_writes_combined_output)
                 {
                     gate_params.routed_residual = moe_output;
                     gate_params.combined_output = buffers.attn_proj;
@@ -1927,17 +2393,41 @@ namespace llaminar2
                               ComputeStageFactory::createSharedExpertGate(gate_params),
                               shared_device);
                 graph.addDependency(prefix + "shared_expert_gate", shared_ffn_last);
-                if (can_fuse_gate_and_combine)
+                if (gate_writes_combined_output)
                 {
                     // The fused epilogue consumes both the shared-expert output
-                    // and the routed-expert output, so it is the final MoE FFN
-                    // producer for this single-device layer.
+                    // and the routed-expert output.
                     graph.addDependency(prefix + "shared_expert_gate", ffn_terminal);
                     shared_gate_writes_combined_output = true;
                 }
                 shared_ffn_last = prefix + "shared_expert_gate";
-                if (shared_gate_writes_combined_output)
+                if (fuse_shared_gate_then_combined_allreduce)
+                {
+                    const size_t allreduce_count =
+                        static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
+                    const std::string ar_name = prefix + "moe_combined_allreduce";
+                    auto allreduce_stage = createTPAllreduceStage(
+                        buffers.attn_proj,
+                        allreduce_count,
+                        device,
+                        layer_idx,
+                        /*is_attention=*/false,
+                        ar_name,
+                        buffers.idFor(BufferId::ATTN_PROJ));
+                    if (!allreduce_stage)
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph failed to create combined MoE TP allreduce for layer " +
+                            std::to_string(layer_idx));
+                    }
+                    graph.addNode(ar_name, std::move(allreduce_stage), device);
+                    graph.addDependency(ar_name, prefix + "shared_expert_gate");
+                    ffn_terminal = ar_name;
+                }
+                else if (shared_gate_writes_combined_output)
+                {
                     ffn_terminal = prefix + "shared_expert_gate";
+                }
             }
         }
 

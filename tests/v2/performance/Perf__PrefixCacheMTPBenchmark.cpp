@@ -27,6 +27,10 @@ namespace
         result.decode_tokens = 8;
         result.decode_time_ms = 4.0;
         result.decode_tokens_per_sec = 2000.0;
+        result.decode_token_latencies_ms = {1.0, 2.0, 3.0, 4.0};
+        result.decode_latency_mean_ms = 2.5;
+        result.decode_latency_p50_ms = 2.5;
+        result.decode_latency_p90_ms = 3.7;
         result.total_time_ms = 20.0;
         result.decode_success = true;
         result.success = true;
@@ -112,6 +116,9 @@ TEST(Perf__PrefixCacheMTPBenchmark, JsonSchemaCarriesPrefixAndMTPCounters)
     EXPECT_EQ(doc.at("tokens").at("prefill"), 128);
     EXPECT_EQ(doc.at("tokens").at("decode"), 8);
     EXPECT_DOUBLE_EQ(doc.at("throughput_tokens_per_sec").at("overall").get<double>(), 6800.0);
+    EXPECT_EQ(doc.at("decode_latency_ms").at("samples"), 4);
+    EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("p50").get<double>(), 2.5);
+    EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("p90").get<double>(), 3.7);
 
     const auto &prefix = doc.at("prefix_cache");
     EXPECT_TRUE(prefix.at("config_enabled").get<bool>());

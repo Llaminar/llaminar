@@ -351,6 +351,11 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k) override;
 
+        bool prepareExpertGroupsAsyncMasked(
+            ITensor *routing_indices, ITensor *routing_weights,
+            int seq_len, int num_experts, int top_k,
+            const uint8_t *expert_mask) override;
+
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
         bool executeGroupedPrefillPipeline(
@@ -560,8 +565,11 @@ namespace llaminar2
         // Phase 2: device-resident histogram and expert mask
         uint64_t *d_histogram_ = nullptr; ///< [max_layers_ * max_experts_] on device
         bool *d_expert_mask_ = nullptr;   ///< [max_experts_] on device
+        uint8_t *d_group_expert_mask_ = nullptr; ///< [max_experts_] for masked async grouping
         int max_experts_ = 0;
         int max_layers_ = 0;
+        int group_expert_mask_cap_ = 0;
+        uint64_t group_expert_mask_hash_ = 0;
 
         // Phase 3: write_heads scratch buffer for token grouping
         int *d_write_heads_ = nullptr; ///< [max_write_heads_experts_] on device

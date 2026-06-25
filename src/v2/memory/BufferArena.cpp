@@ -12,6 +12,7 @@
 #include "tensors/ITensor.h"
 #include "models/qwen/Qwen2BufferSpec.h"
 #include "utils/Logger.h"
+#include "utils/VramBillOfMaterials.h"
 
 #include <algorithm>
 #include <cassert>
@@ -493,10 +494,14 @@ namespace llaminar2
             size_t cols;
             const char *dtype;
             size_t bytes;
+            std::string device;
+            const char *ownership;
         };
         std::vector<BufInfo> infos;
         infos.reserve(stats_.total_buffers);
 
+        size_t owned_bytes = 0;
+        size_t external_bytes = 0;
         for (size_t i = 0; i < kBufferCount; ++i)
         {
             const auto &b = buffers_[i];
@@ -505,16 +510,57 @@ namespace llaminar2
             auto bid = static_cast<BufferId>(i);
             size_t bytes = 0;
             if (b.owned_tensor)
+            {
                 bytes = b.owned_tensor->size_bytes();
+                owned_bytes += bytes;
+            }
             else if (b.external_tensor)
+            {
                 bytes = b.external_tensor->size_bytes();
+                external_bytes += bytes;
+            }
+
+            std::string device = b.home_device.is_valid() ? b.home_device.toString() : "CPU";
+            if (auto *tensor = b.tensorBase())
+            {
+                if (auto current = tensor->current_device())
+                    device = current->toString();
+            }
+
             infos.push_back({bufferIdName(bid), b.rows, b.cols,
-                             b.dtype ? b.dtype : "ext", bytes});
+                             b.dtype ? b.dtype : "ext", bytes, device,
+                             b.owned_tensor ? "arena" : "external"});
         }
 
         std::sort(infos.begin(), infos.end(),
                   [](const BufInfo &a, const BufInfo &b)
                   { return a.bytes > b.bytes; });
+
+        if (vramBomEnabled())
+        {
+            logVramBomLine(
+                "arena_summary",
+                "buffers=" + std::to_string(infos.size()) +
+                    " owned_bytes=" + std::to_string(owned_bytes) +
+                    " owned_mib=" + vramBomMiB(owned_bytes) +
+                    " external_bytes=" + std::to_string(external_bytes) +
+                    " external_mib=" + vramBomMiB(external_bytes) +
+                    " total_bytes=" + std::to_string(owned_bytes + external_bytes) +
+                    " total_mib=" + vramBomMiB(owned_bytes + external_bytes));
+
+            for (const auto &info : infos)
+            {
+                logVramBomLine(
+                    "arena_buffer",
+                    "device=" + info.device +
+                        " name=" + info.name +
+                        " ownership=" + info.ownership +
+                        " rows=" + std::to_string(info.rows) +
+                        " cols=" + std::to_string(info.cols) +
+                        " dtype=" + info.dtype +
+                        " " + vramBomBytes(info.bytes));
+            }
+        }
 
         // Find max name length for alignment
         size_t max_name = 6; // "Buffer" header

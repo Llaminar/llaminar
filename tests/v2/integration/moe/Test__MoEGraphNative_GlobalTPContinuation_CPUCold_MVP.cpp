@@ -157,7 +157,7 @@ namespace llaminar2::test
             hot.participants = {GlobalDeviceAddress::cpu(0)};
             hot.world_ranks = {0};
             hot.owner_rank = 0;
-            hot.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            hot.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
 
             ExpertComputeDomain cold;
             cold.name = "cpu_cold";
@@ -166,7 +166,7 @@ namespace llaminar2::test
             cold.participants = {GlobalDeviceAddress::cpu(1)};
             cold.world_ranks = {1};
             cold.owner_rank = 1;
-            cold.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            cold.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
 
             plan.domains = {hot, cold};
             plan.routed_tiers = {

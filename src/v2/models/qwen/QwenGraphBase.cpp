@@ -288,17 +288,192 @@ namespace llaminar2
         return weight_bindings_.get_layer_weights != nullptr || weights_.get_layer_weights != nullptr;
     }
 
+    bool QwenGraphBase::hasDecodeReplicatedDenseWeightSource() const
+    {
+        return decode_replicated_dense_weight_bindings_.get_layer_weights != nullptr;
+    }
+
+    bool QwenGraphBase::useDecodeReplicatedDenseWeights() const
+    {
+        return decode_replicated_dense_graph_active_ &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    bool QwenGraphBase::hasDecodeMirroredEmbeddingWeightSource() const
+    {
+        return decode_replicated_dense_weight_bindings_.embedding_table != nullptr;
+    }
+
+    bool QwenGraphBase::useDecodeMirroredEmbeddingWeights() const
+    {
+        return decode_mirrored_embedding_graph_active_ &&
+               hasDecodeMirroredEmbeddingWeightSource();
+    }
+
+    bool QwenGraphBase::useFullVocabEmbeddingForCurrentGraph() const
+    {
+        return useDecodeReplicatedDenseWeights() ||
+               useDecodeMirroredEmbeddingWeights();
+    }
+
+    bool QwenGraphBase::useReplicatedAttentionStateWeights() const
+    {
+        return replicated_attention_state_graph_active_ &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
+    {
+        return config_.dense_tp_enabled &&
+               config_.dense_tp_decode_replicated &&
+               total_tokens == 1 &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    bool QwenGraphBase::denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const
+    {
+        return config_.dense_tp_enabled &&
+               config_.dense_tp_decode_mirrored_embedding &&
+               total_tokens == 1 &&
+               hasDecodeMirroredEmbeddingWeightSource();
+    }
+
+    bool QwenGraphBase::replicatedAttentionStateActiveForTokens(int total_tokens) const
+    {
+        return config_.dense_tp_enabled &&
+               config_.dense_tp_decode_replicated &&
+               total_tokens == 1 &&
+               hasDecodeReplicatedDenseWeightSource();
+    }
+
+    bool QwenGraphBase::denseTPAllreduceEnabledForCurrentGraph() const
+    {
+        return !useDecodeReplicatedDenseWeights();
+    }
+
+    bool QwenGraphBase::attentionTPAllreduceEnabledForCurrentGraph() const
+    {
+        return !useReplicatedAttentionStateWeights();
+    }
+
+    QwenGraphBase::DecodeReplicatedDenseScope::DecodeReplicatedDenseScope(
+        QwenGraphBase &owner,
+        int total_tokens)
+        : owner_(owner),
+          previous_(owner.decode_replicated_dense_graph_active_),
+          previous_attention_(owner.replicated_attention_state_graph_active_),
+          previous_embedding_(owner.decode_mirrored_embedding_graph_active_)
+    {
+        owner_.decode_replicated_dense_graph_active_ =
+            owner_.denseDecodeReplicatedActiveForTokens(total_tokens);
+        owner_.decode_mirrored_embedding_graph_active_ =
+            owner_.denseDecodeMirroredEmbeddingActiveForTokens(total_tokens);
+        owner_.replicated_attention_state_graph_active_ =
+            owner_.replicatedAttentionStateActiveForTokens(total_tokens);
+    }
+
+    QwenGraphBase::DecodeReplicatedDenseScope::~DecodeReplicatedDenseScope()
+    {
+        owner_.decode_replicated_dense_graph_active_ = previous_;
+        owner_.replicated_attention_state_graph_active_ = previous_attention_;
+        owner_.decode_mirrored_embedding_graph_active_ = previous_embedding_;
+    }
+
+    namespace
+    {
+        LayerWeightBindings mergeReplicatedAttentionBindings(
+            LayerWeightBindings base,
+            const LayerWeightBindings &replicated)
+        {
+            auto pick = [](const WeightBinding *override_binding,
+                           const WeightBinding *base_binding)
+            {
+                return override_binding ? override_binding : base_binding;
+            };
+
+            base.wq = pick(replicated.wq, base.wq);
+            base.wk = pick(replicated.wk, base.wk);
+            base.wv = pick(replicated.wv, base.wv);
+            base.wo = pick(replicated.wo, base.wo);
+            base.q_bias = pick(replicated.q_bias, base.q_bias);
+            base.k_bias = pick(replicated.k_bias, base.k_bias);
+            base.v_bias = pick(replicated.v_bias, base.v_bias);
+            base.attn_qkv = pick(replicated.attn_qkv, base.attn_qkv);
+            base.attn_gate = pick(replicated.attn_gate, base.attn_gate);
+            base.ssm_alpha = pick(replicated.ssm_alpha, base.ssm_alpha);
+            base.ssm_beta = pick(replicated.ssm_beta, base.ssm_beta);
+            base.ssm_conv1d = pick(replicated.ssm_conv1d, base.ssm_conv1d);
+            base.ssm_dt_bias = pick(replicated.ssm_dt_bias, base.ssm_dt_bias);
+            base.ssm_a = pick(replicated.ssm_a, base.ssm_a);
+            base.ssm_norm = pick(replicated.ssm_norm, base.ssm_norm);
+            base.ssm_out = pick(replicated.ssm_out, base.ssm_out);
+            return base;
+        }
+
+        LayerWeightBindings mergeDenseDecodeBindings(
+            LayerWeightBindings base,
+            const LayerWeightBindings &decode_dense)
+        {
+            auto pick = [](const WeightBinding *override_binding,
+                           const WeightBinding *base_binding)
+            {
+                return override_binding ? override_binding : base_binding;
+            };
+
+            base.wq = pick(decode_dense.wq, base.wq);
+            base.wk = pick(decode_dense.wk, base.wk);
+            base.wv = pick(decode_dense.wv, base.wv);
+            base.wo = pick(decode_dense.wo, base.wo);
+            base.q_bias = pick(decode_dense.q_bias, base.q_bias);
+            base.k_bias = pick(decode_dense.k_bias, base.k_bias);
+            base.v_bias = pick(decode_dense.v_bias, base.v_bias);
+            base.attn_qkv = pick(decode_dense.attn_qkv, base.attn_qkv);
+            base.attn_gate = pick(decode_dense.attn_gate, base.attn_gate);
+            base.ssm_alpha = pick(decode_dense.ssm_alpha, base.ssm_alpha);
+            base.ssm_beta = pick(decode_dense.ssm_beta, base.ssm_beta);
+            base.ssm_conv1d = pick(decode_dense.ssm_conv1d, base.ssm_conv1d);
+            base.ssm_dt_bias = pick(decode_dense.ssm_dt_bias, base.ssm_dt_bias);
+            base.ssm_a = pick(decode_dense.ssm_a, base.ssm_a);
+            base.ssm_norm = pick(decode_dense.ssm_norm, base.ssm_norm);
+            base.ssm_out = pick(decode_dense.ssm_out, base.ssm_out);
+            base.gate_proj = pick(decode_dense.gate_proj, base.gate_proj);
+            base.up_proj = pick(decode_dense.up_proj, base.up_proj);
+            base.down_proj = pick(decode_dense.down_proj, base.down_proj);
+            base.moe_gate = pick(decode_dense.moe_gate, base.moe_gate);
+
+            return base;
+        }
+    }
+
     LayerWeightBindings QwenGraphBase::layerWeightBindingsForGraph(int layer_idx) const
     {
+        LayerWeightBindings bindings;
         if (weight_bindings_.get_layer_weights)
-            return weight_bindings_.get_layer_weights(layer_idx);
-        return {};
+            bindings = weight_bindings_.get_layer_weights(layer_idx);
+
+        if (useReplicatedAttentionStateWeights() &&
+            decode_replicated_dense_weight_bindings_.get_layer_weights)
+        {
+            bindings = mergeReplicatedAttentionBindings(
+                bindings,
+                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+        }
+
+        if (useDecodeReplicatedDenseWeights() &&
+            decode_replicated_dense_weight_bindings_.get_layer_weights)
+        {
+            bindings = mergeDenseDecodeBindings(
+                bindings,
+                decode_replicated_dense_weight_bindings_.get_layer_weights(layer_idx));
+        }
+
+        return bindings;
     }
 
     LayerWeights QwenGraphBase::layerWeightsForGraph(int layer_idx) const
     {
         if (weight_bindings_.get_layer_weights)
-            return toLegacyLayerWeights(weight_bindings_.get_layer_weights(layer_idx));
+            return toLegacyLayerWeights(layerWeightBindingsForGraph(layer_idx));
         if (weights_.get_layer_weights)
             return weights_.get_layer_weights(layer_idx);
         return {};
@@ -306,6 +481,12 @@ namespace llaminar2
 
     TensorBase *QwenGraphBase::modelEmbeddingTable() const
     {
+        if (useFullVocabEmbeddingForCurrentGraph())
+        {
+            TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.embedding_table);
+            if (decode_bound)
+                return decode_bound;
+        }
         TensorBase *bound = legacyTensor(weight_bindings_.embedding_table);
         return bound ? bound : weights_.embedding_table;
     }
@@ -318,12 +499,20 @@ namespace llaminar2
 
     TensorBase *QwenGraphBase::modelLMHead() const
     {
+        if (useDecodeReplicatedDenseWeights())
+        {
+            TensorBase *decode_bound = legacyTensor(decode_replicated_dense_weight_bindings_.lm_head);
+            if (decode_bound)
+                return decode_bound;
+        }
         TensorBase *bound = legacyTensor(weight_bindings_.lm_head);
         return bound ? bound : weights_.lm_head;
     }
 
     const WeightBinding *QwenGraphBase::modelEmbeddingBinding() const
     {
+        if (useFullVocabEmbeddingForCurrentGraph() && decode_replicated_dense_weight_bindings_.embedding_table)
+            return decode_replicated_dense_weight_bindings_.embedding_table;
         return weight_bindings_.embedding_table;
     }
 
@@ -334,6 +523,8 @@ namespace llaminar2
 
     const WeightBinding *QwenGraphBase::modelLMHeadBinding() const
     {
+        if (useDecodeReplicatedDenseWeights() && decode_replicated_dense_weight_bindings_.lm_head)
+            return decode_replicated_dense_weight_bindings_.lm_head;
         return weight_bindings_.lm_head;
     }
 
@@ -598,6 +789,9 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         // Adapt generic ForwardInput to ForwardInput
         ForwardInput qwen_input;
         qwen_input.token_ids = input.token_ids;
@@ -631,6 +825,8 @@ namespace llaminar2
 
     ComputeGraph QwenGraphBase::buildLayerGraph(const LayerContext &ctx)
     {
+        DecodeReplicatedDenseScope decode_dense_scope(*this, ctx.seq_len * ctx.batch_size);
+
         // Validate layer index against total model layers (supports absolute PP indices)
         int max_layers = config_.total_n_layers > 0 ? config_.total_n_layers : config_.n_layers;
         if (ctx.layer_idx < 0 || ctx.layer_idx >= max_layers)
@@ -674,6 +870,9 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building full forward graph: "
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
@@ -691,7 +890,6 @@ namespace llaminar2
         }
 
         DeviceId device = config_.default_device;
-        int total_tokens = input.batch_size * input.seq_len;
 
         ComputeGraph graph;
 
@@ -712,7 +910,9 @@ namespace llaminar2
         embed_params.num_tokens = total_tokens;
         embed_params.d_model = config_.d_model;
         embed_params.vocab_size = config_.vocab_size;
-        embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        embed_params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
+                                        ? 0
+                                        : embeddingVocabOffsetForDevice(config_, config_.default_device);
         embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         embed_params.device_id = config_.default_device;
         embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
@@ -733,7 +933,7 @@ namespace llaminar2
         const bool embedding_is_sharded =
             modelEmbeddingTable() &&
             static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
-        if (embedding_is_sharded && needsTPAllreduce())
+        if (embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
         {
             size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
             auto allreduce_stage = createTPAllreduceStage(
@@ -750,7 +950,7 @@ namespace llaminar2
         // -------------------------------------------------------------------------
         // Stage 2: Transformer Layers (complete graphs, not placeholders)
         // -------------------------------------------------------------------------
-        std::string prev_node = embedding_is_sharded && needsTPAllreduce()
+        std::string prev_node = embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph()
                                     ? "embedding_allreduce"
                                     : "embedding";
 
@@ -850,7 +1050,10 @@ namespace llaminar2
         // - LM head outputs to buffers_.logits_local: [seq_len, vocab_local]
         // - AllGather collects to buffers_.logits: [seq_len, vocab_size]
         // -------------------------------------------------------------------------
-        bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+        bool use_column_parallel =
+            config_.lm_head_column_parallel &&
+            denseTPAllreduceEnabledForCurrentGraph() &&
+            buffers_.logits_local != nullptr;
 
         // Determine output buffer and vocab size for LM head stage
         TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
@@ -936,6 +1139,9 @@ namespace llaminar2
         bool has_embedding,
         bool has_lm_head)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building partial forward graph: "
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len
@@ -982,7 +1188,6 @@ namespace llaminar2
         }
 
         DeviceId device = config_.default_device;
-        int total_tokens = input.batch_size * input.seq_len;
 
         ComputeGraph graph;
         std::string prev_node;
@@ -1006,7 +1211,9 @@ namespace llaminar2
             embed_params.num_tokens = total_tokens;
             embed_params.d_model = config_.d_model;
             embed_params.vocab_size = config_.vocab_size;
-            embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+            embed_params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
+                                            ? 0
+                                            : embeddingVocabOffsetForDevice(config_, config_.default_device);
             embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
             embed_params.device_id = config_.default_device;
             embed_params.output_buffer_id = BufferId::HIDDEN_STATE;
@@ -1026,7 +1233,7 @@ namespace llaminar2
             const bool embedding_is_sharded =
                 modelEmbeddingTable() &&
                 static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
-            if (embedding_is_sharded && needsTPAllreduce())
+            if (embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * config_.d_model;
                 auto allreduce_stage = createTPAllreduceStage(
@@ -1204,7 +1411,10 @@ namespace llaminar2
                 lm_head_dependency);
 
             // LM Head (with optional Column-Parallel + AllGather)
-            bool use_column_parallel = config_.lm_head_column_parallel && buffers_.logits_local != nullptr;
+            bool use_column_parallel =
+                config_.lm_head_column_parallel &&
+                denseTPAllreduceEnabledForCurrentGraph() &&
+                buffers_.logits_local != nullptr;
 
             TensorBase *lm_head_output = use_column_parallel ? buffers_.logits_local : buffers_.logits;
             int lm_head_vocab_size = use_column_parallel ? config_.vocab_local : config_.vocab_size;
@@ -1397,7 +1607,9 @@ namespace llaminar2
                 embed_params.num_tokens = total_tokens;
                 embed_params.d_model = config_.d_model;
                 embed_params.vocab_size = config_.vocab_size;
-                embed_params.vocab_offset = embeddingVocabOffsetForDevice(config_, stage_device);
+                embed_params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
+                                                ? 0
+                                                : embeddingVocabOffsetForDevice(config_, stage_device);
                 embed_params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
                 embed_params.device_id = stage_device;
                 embed_params.mpi_ctx = mpi_ctx_.get();
@@ -1650,6 +1862,9 @@ namespace llaminar2
         const ForwardInput &input,
         ForwardOutput &output)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building forward graph from schema: "
                   << "batch_size=" << input.batch_size
                   << ", seq_len=" << input.seq_len);
@@ -1710,8 +1925,11 @@ namespace llaminar2
         const ForwardInput &input,
         TensorBase *output_hidden)
     {
+        const int total_tokens = input.batch_size * input.seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building embedding graph for "
-                  << (input.batch_size * input.seq_len) << " tokens");
+                  << total_tokens << " tokens");
 
         ComputeGraph graph;
 
@@ -1720,10 +1938,12 @@ namespace llaminar2
         params.token_ids = input.token_ids;
         params.token_ids_device = input.token_ids_device;
         params.output = output_hidden;
-        params.num_tokens = input.batch_size * input.seq_len;
+        params.num_tokens = total_tokens;
         params.d_model = config_.d_model;
         params.vocab_size = config_.vocab_size;
-        params.vocab_offset = embeddingVocabOffsetForDevice(config_, config_.default_device);
+        params.vocab_offset = useFullVocabEmbeddingForCurrentGraph()
+                                  ? 0
+                                  : embeddingVocabOffsetForDevice(config_, config_.default_device);
         params.local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0;
         params.device_id = config_.default_device;
         params.prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), config_.default_device);
@@ -1793,6 +2013,8 @@ namespace llaminar2
         DeviceId device,
         TensorBase *logits_local)
     {
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
+
         LOG_DEBUG("[QwenGraphBase] Building LM head graph for " << total_tokens << " tokens"
                                                                 << " lm_head_column_parallel=" << config_.lm_head_column_parallel
                                                                 << " vocab_local=" << config_.vocab_local);
@@ -1821,7 +2043,10 @@ namespace llaminar2
         // - AllGather collects to output_logits: [seq_len, vocab_size]
         // =================================================================
 
-        bool use_column_parallel = config_.lm_head_column_parallel && logits_local != nullptr;
+        bool use_column_parallel =
+            config_.lm_head_column_parallel &&
+            denseTPAllreduceEnabledForCurrentGraph() &&
+            logits_local != nullptr;
 
         // Determine output buffer and vocab size for LM head stage
         TensorBase *lm_head_output = use_column_parallel ? logits_local : output_logits;
@@ -2114,7 +2339,7 @@ namespace llaminar2
             bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
             bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
 
-            if (needs_allreduce && needsTPAllreduce())
+            if (needs_allreduce && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * down_n;
                 LOG_DEBUG("[buildFFNGraph] Adding down_allreduce: ffn_column_parallel="
@@ -2161,7 +2386,7 @@ namespace llaminar2
                 bool down_is_row_sharded = isRowParallelSharded(layer.down_proj);
                 bool needs_allreduce = (down_is_row_sharded || config_.ffn_column_parallel);
 
-                if (needs_allreduce && needsTPAllreduce())
+                if (needs_allreduce && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
                 {
                     graph.addDependency(prefix + "ffn_residual", prefix + "down_allreduce");
                 }
@@ -2404,10 +2629,12 @@ namespace llaminar2
 
         // TP-adjusted local dimensions
         // Use local head counts when QKV is column-parallel
-        config.local_n_heads = config_.qkv_column_parallel
+        const bool reserve_full_dense_decode_buffers = config_.dense_tp_decode_replicated;
+
+        config.local_n_heads = config_.qkv_column_parallel && !reserve_full_dense_decode_buffers
                                    ? config_.local_n_heads
                                    : config_.n_heads;
-        config.local_n_kv_heads = config_.qkv_column_parallel
+        config.local_n_kv_heads = config_.qkv_column_parallel && !reserve_full_dense_decode_buffers
                                       ? config_.local_n_kv_heads
                                       : config_.n_kv_heads;
 
@@ -2418,14 +2645,14 @@ namespace llaminar2
             config.local_n_kv_heads = config_.n_kv_heads;
 
         // Use local FFN dimension when FFN is column-parallel
-        config.local_d_ff = config_.ffn_column_parallel
+        config.local_d_ff = config_.ffn_column_parallel && !reserve_full_dense_decode_buffers
                                 ? config_.d_ff_local
                                 : config_.d_ff;
         if (config.local_d_ff <= 0)
             config.local_d_ff = config_.d_ff;
 
         // Use local vocab when LM head is column-parallel
-        config.local_vocab = config_.lm_head_column_parallel
+        config.local_vocab = config_.lm_head_column_parallel && !reserve_full_dense_decode_buffers
                                  ? config_.vocab_local
                                  : config_.vocab_size;
         if (config.local_vocab <= 0)
@@ -2495,6 +2722,11 @@ namespace llaminar2
 
     bool QwenGraphBase::needsTPAllreduce() const
     {
+        if (!config_.dense_tp_enabled)
+        {
+            return false;
+        }
+
         // Unified check: any TP context with degree > 1 (LOCAL or GLOBAL)
         if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
         {
@@ -2570,6 +2802,9 @@ namespace llaminar2
 
     std::pair<int, int> QwenGraphBase::resolveLocalHeadCounts() const
     {
+        if (useReplicatedAttentionStateWeights())
+            return {config_.n_heads, config_.n_kv_heads};
+
         int local_n_heads = config_.qkv_column_parallel
                                 ? config_.local_n_heads
                                 : config_.n_heads;
@@ -2993,7 +3228,7 @@ namespace llaminar2
         std::string terminal = wo_node;
 
         // TP allreduce if row-parallel sharded
-        if (isRowParallelSharded(wo_weight) && needsTPAllreduce())
+        if (isRowParallelSharded(wo_weight) && needsTPAllreduce() && attentionTPAllreduceEnabledForCurrentGraph())
         {
             size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
             std::string ar_node = prefix + allreduce_node_suffix;

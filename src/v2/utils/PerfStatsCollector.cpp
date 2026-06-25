@@ -336,6 +336,34 @@ namespace llaminar2
         s.summary_version = 0;
     }
 
+    void PerfStatsCollector::resetPreservingDomains(
+        const std::vector<std::string> &domains_to_preserve)
+    {
+        if (domains_to_preserve.empty())
+        {
+            reset();
+            return;
+        }
+
+        auto &s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        for (auto it = s.records.begin(); it != s.records.end();)
+        {
+            const bool preserve =
+                std::find(domains_to_preserve.begin(),
+                          domains_to_preserve.end(),
+                          it->first.domain) != domains_to_preserve.end();
+            if (preserve)
+                ++it;
+            else
+                it = s.records.erase(it);
+        }
+        ++s.version;
+        s.json_version = 0;
+        s.csv_version = 0;
+        s.summary_version = 0;
+    }
+
     void PerfStatsCollector::addCounter(
         std::string domain,
         std::string name,

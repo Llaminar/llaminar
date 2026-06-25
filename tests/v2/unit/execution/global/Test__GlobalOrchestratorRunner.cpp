@@ -367,8 +367,8 @@ namespace llaminar2::test
         GlobalOrchestratorRunner runner(std::move(h.runner_config));
         runner.initialize();
 
-        // Set mock logits so that argmax returns token index 5 (stop token)
-        // (GPU greedy returns -1, so CPU fallback is used. Mock logits[5] = 1.0)
+        // Set mock logits so that host argmax can return a stop token on the
+        // CPU-only fallback path.
         auto& mock_logits = const_cast<std::vector<float>&>(
             *reinterpret_cast<const std::vector<float>*>(&h.mock_runner_ptr->logits()[0]));
         // Simpler: just set stop token to 0 (default argmax of all-zero logits)

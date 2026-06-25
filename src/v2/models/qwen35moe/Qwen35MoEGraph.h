@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace llaminar2
 {
@@ -94,7 +95,15 @@ namespace llaminar2
                                                    int num_layers_override = -1,
                                                    bool register_decode_histogram = true);
 
+    protected:
+        void registerRuntimeTableHistogramSyncIfNeeded(
+            const std::string &key,
+            IMoERuntimeTable *table,
+            bool register_decode_histogram);
+
+    private:
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
+        std::unordered_set<std::string> moe_runtime_histogram_sync_keys_;
         bool mtp_graph_context_active_ = false;
         int mtp_graph_depth_idx_ = -1;
     };

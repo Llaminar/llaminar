@@ -1752,6 +1752,45 @@ TEST_F(Test__ForwardExecutionEngine, AllPositionShortContinuationPublishesVerifi
     PerfStatsCollector::reset();
 }
 
+TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMainDecodeSync)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_PERF_STATS_JSON", "1"},
+        {"LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", "1"},
+    });
+    PerfStatsCollector::reset();
+
+    auto engine = makeEngine();
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_types = {ComputeStageType::ALLREDUCE};
+    host.mock_capture_policy.allow_fast_decode = true;
+    host.mock_capture_policy.allow_segmented_capture = true;
+    host.mock_capture_policy.collectives_graph_capturable = true;
+
+    int token = 42;
+    int pos = 7;
+    auto input = makeTestInput(1, 1, DeviceId::cpu(), &token, &pos);
+    ForwardOutput output{};
+
+    ASSERT_TRUE(engine.execute(input, output, host));
+    ASSERT_TRUE(engine.execute(input, output, host));
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags tags = {
+        {"allow_segmented", "true"},
+        {"collective_segmented", "false"},
+        {"collectives_graph_capturable", "true"},
+        {"context", "main_decode"},
+        {"defer_final_sync", "true"},
+        {"has_collectives", "true"}};
+    EXPECT_DOUBLE_EQ(findForwardGraphCounterValue(records, "decode_capture_policy", tags), 1.0)
+        << "Captured collective decode graphs must ask the replay controller to defer "
+           "final sync when the explicit diagnostic opt-in is enabled.";
+
+    PerfStatsCollector::reset();
+}
+
 TEST_F(Test__ForwardExecutionEngine, MoEPlacementEpochChangeMissesDecodeCache)
 {
     auto engine = makeEngine();

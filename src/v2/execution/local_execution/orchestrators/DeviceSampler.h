@@ -34,9 +34,10 @@ namespace llaminar2
      * merges candidates on host, applies temperature + softmax + top-p nucleus
      * filtering, then multinomial samples.
      *
-     * All methods return -1 if GPU-side sampling is unsupported (single device,
-     * CPU-only, no column-parallel LM head, backend unavailable). The caller
-     * then falls back to CPU logits gathering + host-side sampling.
+     * All methods return -1 if device-side shard sampling is unsupported
+     * (single device, CPU-only, no column-parallel LM head, backend
+     * unavailable). Callers may choose host sampling only for explicit CPU-only
+     * execution; GPU decode treats -1 as a hard failure.
      */
     class DeviceSampler
     {

@@ -80,6 +80,15 @@ namespace llaminar2
     struct PlacementPlan;
     struct PPActivationContract;
 
+    namespace rank_orchestrator_detail
+    {
+        bool sameBackendGpuExpertTransferIsDirectOnly(DeviceId destination, DeviceId source);
+
+        std::vector<std::vector<std::vector<bool>>> buildReplicaArrivalTransferMasks(
+            const MoERebalanceController &controller,
+            const ExpertReplicaSet &arrivals);
+    }
+
     /**
      * @brief Multi-device orchestrator for LOCAL tensor parallelism
      *
@@ -211,6 +220,9 @@ namespace llaminar2
             /// Explicit KV cache precision mode (AUTO preserves legacy behavior)
             KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+            /// Optional explicit transport precision for TP allreduces.
+            std::string tp_allreduce_precision_override;
+
             /// Prefix-state cache feature gates and storage limits.
             PrefixCacheRuntimeConfig prefix_cache;
 
@@ -218,7 +230,7 @@ namespace llaminar2
             MTPRuntimeConfig mtp;
 
             /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
-            MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+            MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
 
             /// Bounded hot remote expert cache for dynamic expert-parallel execution.
             MoEHotExpertCacheConfig moe_hot_expert_cache;
@@ -1001,10 +1013,13 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
-        void applyMoEExpertMasksForAllDevices(const MoERebalanceController &controller);
+        void applyMoEExpertMasksForAllDevices(
+            const MoERebalanceController &controller,
+            const ExpertReplicaSet *replica_arrivals = nullptr);
         void applyMoEExpertMasksForAllDevices(
             const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
-            const std::string &domain_id = {});
+            const std::string &domain_id = {},
+            const std::vector<std::vector<std::vector<bool>>> *transfer_masks_by_participant = nullptr);
         void setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas);
 
     private:

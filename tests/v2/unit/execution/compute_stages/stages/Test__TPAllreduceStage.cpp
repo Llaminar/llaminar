@@ -17,6 +17,10 @@
  */
 
 #include <gtest/gtest.h>
+#include <cstdint>
+#include <cstdlib>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
@@ -26,11 +30,46 @@
 #include "tensors/TensorFactory.h"
 #include "tensors/Tensors.h"
 #include "backends/GlobalDeviceAddress.h"
+#include "utils/DebugEnv.h"
 #include "utils/MPIContext.h"
+#include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
+
+namespace
+{
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name)
+        {
+            const char *old = std::getenv(name);
+            if (old)
+                old_value_ = std::string(old);
+            ::setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().reload();
+        }
+
+        ~ScopedEnv()
+        {
+            if (old_value_)
+                ::setenv(name_.c_str(), old_value_->c_str(), 1);
+            else
+                ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        std::optional<std::string> old_value_;
+    };
+} // namespace
 
 // =============================================================================
 // Test Fixture
@@ -326,6 +365,25 @@ TEST_F(Test__TPAllreduceStage, ExecuteSucceedsSingleDeviceLocalTP)
     }
 }
 
+TEST_F(Test__TPAllreduceStage, GpuAllreduceFailsFastWithoutExplicitStream)
+{
+    auto tp_ctx = createLocalTPContext({cuda0_, cuda1_}, {}, CollectiveBackendType::HOST);
+    auto *tensor = test_tensor_.get();
+
+    TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cuda(0);
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = tensor;
+    params.count = tensor->numel();
+    params.stage_name = "layer0_wo_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+    MockDeviceContext cuda_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    EXPECT_FALSE(stage.execute(&cuda_ctx));
+}
+
 // =============================================================================
 // Dump Info Tests
 // =============================================================================
@@ -462,4 +520,154 @@ TEST_F(Test__TPAllreduceStage, StageNameParameterStored)
 
     // Single device execute should succeed
     EXPECT_TRUE(stage->execute(ctx_.get()));
+}
+
+/**
+ * @test Execute records a per-buffer bill of materials entry when perf stats are enabled
+ */
+TEST_F(Test__TPAllreduceStage, RecordsBillOfMaterialsForMoERoutedAllreduce)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = test_tensor_.get();
+    params.count = 256;
+    params.stage_name = "layer0_moe_expert_overlay_fast_allreduce";
+    params.precision = "fp16";
+
+    auto stage = std::make_unique<TPAllreduceStage>(params);
+
+    ASSERT_TRUE(stage->execute(ctx_.get()));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    const PerfStatRecord *stages = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+        else if (record.name == "stages")
+            stages = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_EQ(bytes->domain, "tp_allreduce_bom");
+    EXPECT_DOUBLE_EQ(bytes->value, 256.0 * sizeof(std::uint16_t));
+    EXPECT_EQ(bytes->tags.at("role"), "moe_routed_expert");
+    EXPECT_EQ(bytes->tags.at("stage"), "layer0_moe_expert_overlay_fast_allreduce");
+    EXPECT_EQ(bytes->tags.at("elements"), "256");
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(std::uint16_t)));
+    EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("tensor_numel"), std::to_string(test_tensor_->numel()));
+    EXPECT_EQ(bytes->tags.at("tensor_type"), "FP32");
+    EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("scope"), "local");
+    EXPECT_EQ(bytes->tags.at("degree"), "1");
+    EXPECT_EQ(bytes->tags.at("no_op"), "true");
+
+    ASSERT_NE(stages, nullptr);
+    EXPECT_DOUBLE_EQ(stages->value, 1.0);
+    EXPECT_EQ(stages->tags.at("role"), "moe_routed_expert");
+    EXPECT_EQ(stages->tags.at("elements"), "256");
+    EXPECT_EQ(stages->tags.at("precision"), "fp16");
+    EXPECT_EQ(stages->tags.at("no_op"), "true");
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @test FP16 transport threshold reports tiny allreduces as FP32 in the BOM
+ */
+TEST_F(Test__TPAllreduceStage, BillOfMaterialsHonorsFP16MinimumElementThreshold)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnv fp16_min("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS", "1024");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = test_tensor_.get();
+    params.count = 256;
+    params.stage_name = "layer0_moe_combined_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_DOUBLE_EQ(bytes->value, 256.0 * sizeof(float));
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
+
+    PerfStatsCollector::reset();
+}
+
+/**
+ * @test Captured graph replay records the same allreduce BOM without re-entering execute()
+ */
+TEST_F(Test__TPAllreduceStage, GraphReplayRecordsBillOfMaterials)
+{
+    ScopedEnv enable_perf_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto tp_ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::AUTO);
+
+    TPAllreduceStage::Params params;
+    params.tp_ctx = tp_ctx.get();
+    params.tensor = test_tensor_.get();
+    params.count = 128;
+    params.stage_name = "layer0_moe_combined_allreduce";
+    params.precision = "fp16";
+
+    TPAllreduceStage stage(params);
+
+    ASSERT_TRUE(stage.needsOnGraphReplayed());
+    stage.onGraphReplayed();
+
+    const auto records = PerfStatsCollector::snapshot({"tp_allreduce_bom"});
+    const PerfStatRecord *bytes = nullptr;
+    const PerfStatRecord *stages = nullptr;
+    for (const auto &record : records)
+    {
+        if (record.name == "bytes")
+            bytes = &record;
+        else if (record.name == "stages")
+            stages = &record;
+    }
+
+    ASSERT_NE(bytes, nullptr);
+    EXPECT_DOUBLE_EQ(bytes->value, 128.0 * sizeof(std::uint16_t));
+    EXPECT_EQ(bytes->tags.at("role"), "moe_combined");
+    EXPECT_EQ(bytes->tags.at("stage"), "layer0_moe_combined_allreduce");
+    EXPECT_EQ(bytes->tags.at("elements"), "128");
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(std::uint16_t)));
+    EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
+    EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("no_op"), "true");
+
+    ASSERT_NE(stages, nullptr);
+    EXPECT_DOUBLE_EQ(stages->value, 1.0);
+    EXPECT_EQ(stages->tags.at("role"), "moe_combined");
+    EXPECT_EQ(stages->tags.at("elements"), "128");
+    EXPECT_EQ(stages->tags.at("precision"), "fp16");
+
+    PerfStatsCollector::reset();
 }

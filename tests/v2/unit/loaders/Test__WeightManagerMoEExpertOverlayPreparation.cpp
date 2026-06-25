@@ -66,15 +66,15 @@ namespace
         plan.domains = {
             domainWith("cuda_fast", ExpertDomainKind::SingleDevice,
                        {GlobalDeviceAddress::cuda(0)},
-                       ExpertDomainComputeKind::ReplicatedExperts,
+                       ExpertDomainComputeKind::ApportionedExperts,
                        CollectiveBackendType::NCCL),
             domainWith("rocm_warm", ExpertDomainKind::LocalTP,
                        {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)},
-                       ExpertDomainComputeKind::ReplicatedExperts,
+                       ExpertDomainComputeKind::ApportionedExperts,
                        CollectiveBackendType::RCCL),
             domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                       ExpertDomainComputeKind::ReplicatedExperts,
+                       ExpertDomainComputeKind::ApportionedExperts,
                        CollectiveBackendType::UPI),
         };
         plan.routed_tiers = {
@@ -176,7 +176,7 @@ namespace
         plan->domains = {
             domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                        {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                       ExpertDomainComputeKind::ReplicatedExperts,
+                       ExpertDomainComputeKind::ApportionedExperts,
                        CollectiveBackendType::UPI),
         };
         plan->domains[0].world_ranks = {0, 1};
@@ -306,11 +306,11 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, SmallModelBudgetKeepsCudaPa
     capped.domains = {
         domainWith("cuda_fast", ExpertDomainKind::SingleDevice,
                    {GlobalDeviceAddress::cuda(0)},
-                   ExpertDomainComputeKind::ReplicatedExperts,
+                   ExpertDomainComputeKind::ApportionedExperts,
                    CollectiveBackendType::NCCL),
         domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                    {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                   ExpertDomainComputeKind::ReplicatedExperts,
+                   ExpertDomainComputeKind::ApportionedExperts,
                    CollectiveBackendType::UPI),
     };
     capped.routed_tiers = {
@@ -347,15 +347,15 @@ TEST(Test__WeightManagerMoEExpertOverlayPreparation, KeepsSameDeviceDomainsSepar
     plan->domains = {
         domainWith("cuda_fast", ExpertDomainKind::SingleDevice,
                    {GlobalDeviceAddress::cuda(0)},
-                   ExpertDomainComputeKind::ReplicatedExperts,
+                   ExpertDomainComputeKind::ApportionedExperts,
                    CollectiveBackendType::NCCL),
         domainWith("cuda_warm", ExpertDomainKind::SingleDevice,
                    {GlobalDeviceAddress::cuda(0)},
-                   ExpertDomainComputeKind::ReplicatedExperts,
+                   ExpertDomainComputeKind::ApportionedExperts,
                    CollectiveBackendType::NCCL),
         domainWith("cpu_cold", ExpertDomainKind::NodeLocalTP,
                    {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)},
-                   ExpertDomainComputeKind::ReplicatedExperts,
+                   ExpertDomainComputeKind::ApportionedExperts,
                    CollectiveBackendType::UPI),
     };
     plan->routed_tiers = {

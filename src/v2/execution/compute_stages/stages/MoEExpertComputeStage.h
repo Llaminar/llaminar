@@ -38,6 +38,7 @@ namespace llaminar2
     class ExpertWeightPayloadProvider;
     class PreparedWeightStore;
     class ExpertGemmRegistry;
+    class GpuExpertSlotPool;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -119,6 +120,7 @@ namespace llaminar2
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
             std::shared_ptr<void> moe_packed_down_lifetime;
+            std::shared_ptr<GpuExpertSlotPool> gpu_direct_slot_pool;
 
             // ExpertGemmRegistry for dynamic rebalancing registry updates.
             // Set by graph builder when model_ctx is available.
@@ -202,6 +204,10 @@ namespace llaminar2
         /// Layer index this stage belongs to (-1 if unset).
         int layerIndex() const { return params_.layer_idx; }
 
+        /// Test-only visibility for replica metadata stamped onto rebuilt graphs.
+        int replicaCountForTesting() const { return params_.replica_set.num_replicated; }
+        int replicaParticipantForTesting() const { return params_.my_socket_id; }
+
         /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
         /// when no selected experts fall in its local range. The downstream
         /// AllReduce combines partial results across ranks.
@@ -222,6 +228,16 @@ namespace llaminar2
             // Pre-build prefill mask: single-lookup replaces multi-branch check
             if (replicas.num_replicated > 0 && !params_.expert_mask.empty())
                 params_.replica_set.buildPrefillMask(socket_id, params_.expert_mask);
+            grouped_gateup_desc_table_id_ = -1;
+            grouped_gateup_desc_table_num_experts_ = 0;
+            grouped_gateup_desc_table_d_model_ = 0;
+            grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_id_ = -1;
+            grouped_down_desc_table_num_experts_ = 0;
+            grouped_down_desc_table_d_model_ = 0;
+            grouped_down_desc_table_intermediate_ = 0;
+            moe_runtime_table_initialized_ = false;
+            runtime_grouped_decode_warmed_ = false;
         }
 
         /// Detach and serialize packed weights for a departing expert.
@@ -234,6 +250,14 @@ namespace llaminar2
         /// The owner keeps its GEMM engines intact. Used for replica transfers
         /// where both sockets need the weights.
         ExpertWeightBlobs serializeExpert(int expert_id) const;
+
+        /// Directly copy same-backend GPU packed expert weights from a sibling
+        /// stage into this stage. Returns requested experts that are now resident
+        /// on this stage, including experts that were already present before the copy.
+        std::vector<int> transferExpertsGPUDirectFrom(
+            MoEExpertComputeStage &source,
+            const std::vector<int> &expert_ids,
+            void *source_producer_stream);
 
         // ── Phased rebalance API (used by DeviceGraphOrchestrator) ───────
         //
@@ -349,9 +373,37 @@ namespace llaminar2
                    params_.seq_len == 1 &&
                    canUseFixedTopologyGroupedPrefill();
         }
+        bool usesFixedTopologyGroupedPrefillForTesting() const
+        {
+            return canUseFixedTopologyGroupedPrefill();
+        }
+        std::vector<int> fixedTopologyPrefillExpertIdsForTesting() const
+        {
+            return fixedTopologyPrefillExpertIds();
+        }
+        std::vector<uint8_t> fixedTopologyPrefillExpertMaskBytesForTesting() const
+        {
+            return fixedTopologyPrefillExpertMaskBytes();
+        }
         TensorBase *combinedSharedGateInputForTesting() const
         {
             return effectiveSafeCompositeSharedGateInput();
+        }
+        void bindPreparedExpertEnginesForTesting(const std::vector<int> &expert_ids)
+        {
+            bindPreparedExpertEnginesForExperts(expert_ids);
+        }
+        void addPendingGpuDirectTransferForTesting(GpuDirectTransferCompletion completion)
+        {
+            addPendingGpuDirectTransfer(std::move(completion));
+        }
+        size_t pendingGpuDirectTransferCountForTesting() const
+        {
+            return pending_gpu_direct_transfers_.size();
+        }
+        void addPendingGpuDirectTransfersFromStoreForTesting(const std::vector<int> &expert_ids)
+        {
+            addPendingGpuDirectTransfersFromStore(expert_ids);
         }
 
     private:
@@ -441,6 +493,10 @@ namespace llaminar2
 
         void ensureGemmEnginesCached();
         bool ensureGemmEnginesForExperts(const std::vector<int> &expert_ids);
+        void bindPreparedExpertEnginesForExperts(const std::vector<int> &expert_ids);
+        void addPendingGpuDirectTransfer(GpuDirectTransferCompletion completion);
+        void addPendingGpuDirectTransfersFromStore(const std::vector<int> &expert_ids);
+        bool waitForPendingGpuDirectTransfers();
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureCombinedSharedVerifierResources(IMoEKernel *kernel, int d_model, int intermediate);
@@ -466,9 +522,16 @@ namespace llaminar2
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;
+        const std::vector<bool> *fixedTopologyPrefillMask() const;
+        bool hasFixedTopologyPrefillExpertMask() const;
+        bool usesMaskedFixedTopologyPrefill() const;
+        std::vector<int> fixedTopologyPrefillExpertIds() const;
+        std::vector<uint8_t> fixedTopologyPrefillExpertMaskBytes() const;
+        bool expertComputesLocally(int expert_id) const;
         bool hasFullLocalExpertOwnership() const;
         bool expertMaskAllEnabled() const;
         bool hasAllPreparedExpertGemmEngines() const;
+        bool hasPreparedExpertGemmEnginesForExperts(const std::vector<int> &expert_ids) const;
         bool hasGroupedDecodeDescriptorExportSupport() const;
         const DeviceMoEPlacementBank *activeRuntimePlacementBank() const;
         bool runtimeLocalComputeEnabled(const DeviceMoEPlacementBank *bank, int expert_id) const;
@@ -501,6 +564,7 @@ namespace llaminar2
         bool moe_runtime_table_initialized_ = false;
         bool moe_prefill_runtime_grouping_available_ = false;
         bool moe_prefill_fixed_topology_available_ = false;
+        std::vector<GpuDirectTransferCompletion> pending_gpu_direct_transfers_;
     };
 
     /**

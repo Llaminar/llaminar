@@ -136,6 +136,23 @@ TEST(Test__ExpertGemmRegistry, ParticipantScopedEntriesOnSameDomainDeviceDoNotOv
     EXPECT_EQ(reg.size(), 3u);
 }
 
+TEST(Test__ExpertGemmRegistry, AliasDomainAndParticipantFromBaseDeviceReusesEngine)
+{
+    ExpertGemmRegistry reg;
+    const DeviceId device = DeviceId::cuda(0);
+    auto base = std::make_shared<MockGemm>(515);
+
+    reg.registerEngine(device, 2, 7, Role::UP, base.get(), base);
+
+    EXPECT_TRUE(reg.aliasEngineForDomainFromDevice("cuda_hot", device, 2, 7, Role::UP));
+    EXPECT_TRUE(reg.aliasEngineForParticipantFromDevice("cuda_hot", device, 0, 1, 2, 7, Role::UP));
+
+    EXPECT_EQ(reg.getEngine(device, 2, 7, Role::UP), base.get());
+    EXPECT_EQ(reg.getEngineForDomain("cuda_hot", device, 2, 7, Role::UP), base.get());
+    EXPECT_EQ(reg.getEngineForParticipant("cuda_hot", device, 0, 1, 2, 7, Role::UP), base.get());
+    EXPECT_EQ(reg.size(), 3u);
+}
+
 TEST(Test__ExpertGemmRegistry, PopulateExpertEnginesForParticipantUsesOnlyThatParticipant)
 {
     ExpertGemmRegistry reg;

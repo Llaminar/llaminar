@@ -608,6 +608,7 @@ namespace llaminar2
             !plan.shared_expert_domain.empty() ||
             plan.residency_policy != ExpertResidencyPolicy::Disabled ||
             !plan.continuation_domain_spec.domain.empty() ||
+            plan.continuation_domain_spec.dense_tp_enabled ||
             !plan.dense_domains.empty() ||
             !plan.domains.empty() ||
             !plan.routed_tiers.empty() ||
@@ -888,6 +889,19 @@ namespace llaminar2
             }
         }
 
+        if (!tp_allreduce_precision_override.empty())
+        {
+            const std::string tp_ar = toLower(tp_allreduce_precision_override);
+            static const std::unordered_set<std::string> valid_tp_ar = {
+                "auto", "schema", "default", "off", "fp32", "f32", "fp16", "f16", "bf16"};
+            if (!valid_tp_ar.count(tp_ar))
+            {
+                errors.push_back("Invalid tp_allreduce_precision_override: '" +
+                                 tp_allreduce_precision_override +
+                                 "' (valid: auto, schema, fp32, fp16, bf16)");
+            }
+        }
+
         if (prefix_cache.block_size <= 0)
         {
             errors.push_back("Prefix cache block size must be > 0");
@@ -1053,6 +1067,12 @@ namespace llaminar2
             if (!benchmark_json_output_path.empty())
                 oss << "    json_output: " << benchmark_json_output_path << "\n";
         }
+
+        oss << "  precision:\n";
+        oss << "    activation: " << activation_precision << "\n";
+        oss << "    kv_cache: " << kv_cache_precision << "\n";
+        if (!tp_allreduce_precision_override.empty())
+            oss << "    tp_allreduce: " << tp_allreduce_precision_override << "\n";
 
         oss << "  prefix_cache:\n";
         oss << "    enabled: " << (prefix_cache.enabled ? "true" : "false") << "\n";

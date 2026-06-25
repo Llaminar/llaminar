@@ -211,10 +211,13 @@ namespace llaminar2
          *                          packing and upload. Set false for nested
          *                          TP-in-PP setups where a later PP stage on
          *                          a different device still needs host copies.
+         * @param include_expert_jobs If false, routed MoE expert jobs are not
+         *                            packed by this broad finalize pass.
          * @return true on success
          */
         bool finalizeForDevices(const std::vector<DeviceId> &devices,
-                                bool release_host_data = true) override;
+                                bool release_host_data = true,
+                                bool include_expert_jobs = true) override;
 
         // =========================================================================
         // Weight Packing and Preloading (folded from WeightPreloader)

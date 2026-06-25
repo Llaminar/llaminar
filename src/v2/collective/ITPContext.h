@@ -34,6 +34,7 @@
 
 #pragma once
 
+#include <stdexcept>
 #include <string>
 #include "config/OrchestrationConfig.h" // For CollectiveBackendType
 
@@ -171,7 +172,8 @@ namespace llaminar2
          *
          * Like allreduce() but issues the collective directly on the provided
          * GPU stream. This makes the operation compatible with GPU graph capture.
-         * When stream is nullptr, falls back to the normal allreduce() path.
+         * Passing nullptr is a programming error; GPU collectives must use an
+         * explicit producer stream so ordering is visible and graph-capturable.
          *
          * @param tensor Tensor to all-reduce (modified in-place)
          * @param stage_name Stage identifier
@@ -184,9 +186,11 @@ namespace llaminar2
                                        size_t count, void *stream,
                                        const std::string &precision = "")
         {
-            (void)stream;
             (void)precision;
-            // Default: delegate to normal allreduce, ignoring stream and precision
+            if (!stream)
+                throw std::invalid_argument("ITPContext::allreduceOnStream requires a non-null GPU stream");
+            // Default: delegate to normal allreduce, ignoring stream and precision.
+            // Implementations that support real on-stream collectives should override this.
             return allreduce(tensor, stage_name, count);
         }
 

@@ -385,6 +385,37 @@ TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
 }
 
 TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
+       NativeVNNIPrefillSplitKWorkspace_CoversMoEExpertSubBatchRows)
+{
+    auto weights = TestTensorFactory::createQ8_0Random({512, 2048}, /*seed=*/1011);
+    CUDAQuantisedGemmKernel kernel(weights.get(), kFakeCudaDeviceId);
+
+    constexpr int kPromptM = 595;
+    constexpr int kExpertRows = 312;
+    constexpr int kN = 512;
+    constexpr int kK = 2048;
+    auto prompt_reqs = kernel.getWorkspaceRequirements(kPromptM, kN, kK);
+    auto expert_reqs = kernel.getWorkspaceRequirements(kExpertRows, kN, kK);
+
+    const WorkspaceDescriptor *prompt_splitk =
+        prompt_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    const WorkspaceDescriptor *expert_splitk =
+        expert_reqs.find(GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS);
+    ASSERT_NE(prompt_splitk, nullptr);
+    ASSERT_NE(expert_splitk, nullptr);
+
+    EXPECT_GE(prompt_splitk->size_bytes, expert_splitk->size_bytes)
+        << "MoE grouped prefill can invoke the same gate/up GEMM with any per-expert "
+           "row count up to the prompt length. Workspace planned for the full prompt "
+           "must cover smaller hot-expert sub-batches that select larger split-K.";
+
+    const size_t observed_failure_bytes =
+        static_cast<size_t>(kConcurrentPrefillWorkspaceSlots) * 8u *
+        static_cast<size_t>(paddedPrefillM(kExpertRows)) * kN * sizeof(float);
+    EXPECT_GE(prompt_splitk->size_bytes, observed_failure_bytes);
+}
+
+TEST_F(Test__CUDAQuantisedGemmKernel_Workspace,
        ConcurrentPrefillAccumulatorWorkspace_HasThreeExtraPaddedSlots)
 {
     auto weights = TestTensorFactory::createQ8_0Random({64, 128}, /*seed=*/11);

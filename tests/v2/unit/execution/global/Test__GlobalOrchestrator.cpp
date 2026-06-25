@@ -850,7 +850,7 @@ namespace llaminar2::test
         EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
     }
 
-    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceFallsBackToGreedyWhenRunnerReturnsNegative)
+    TEST_F(Test__GlobalOrchestrator, SampleOnDeviceReturnsNegativeWhenRunnerReturnsNegative)
     {
         MockMPIContext mpi(0, 1);
         auto topo = buildSingleStageTopo(1);
@@ -859,7 +859,7 @@ namespace llaminar2::test
         runner_config.vocab_size = VOCAB_SIZE;
         runner_config.mock_logits = std::vector<float>(VOCAB_SIZE, 0.0f);
         runner_config.mock_logits[3] = 99.0f; // Token 3 wins argmax
-        // sample_on_device_token = -1 (default) → triggers greedy fallback
+        // sample_on_device_token = -1 (default) → surfaces unsupported sampling.
         auto runner = std::make_unique<MockDeviceRunner>(runner_config);
 
         GlobalOrchestrator orch(makeConfig(std::move(topo), 0, 1, &mpi, std::move(runner)));
@@ -872,10 +872,8 @@ namespace llaminar2::test
         size_t broadcast_before = mpi.broadcast_call_count();
         int token = orch.sampleOnDevice(params);
 
-        // Fell back to greedy (CPU argmax) → token 3
-        EXPECT_EQ(token, 3);
-        // Greedy fallback internally broadcasts once
-        EXPECT_GE(mpi.broadcast_call_count(), broadcast_before + 1);
+        EXPECT_EQ(token, -1);
+        EXPECT_EQ(mpi.broadcast_call_count(), broadcast_before + 1);
     }
 
     TEST_F(Test__GlobalOrchestrator, SampleOnDeviceSuccessPathBroadcasts)

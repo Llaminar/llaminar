@@ -890,6 +890,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Prepare device-side groups while excluding masked-off experts.
+         *
+         * Backends copy the host mask to device and build grouping metadata from
+         * a masked route view. The original routing tensors must not be modified:
+         * rebalance histograms still need to observe the model's true top-k
+         * choices even when this participant only computes a subset locally.
+         */
+        virtual bool prepareExpertGroupsAsyncMasked(
+            ITensor *routing_indices, ITensor *routing_weights,
+            int seq_len, int num_experts, int top_k,
+            const uint8_t *expert_mask)
+        {
+            (void)routing_indices;
+            (void)routing_weights;
+            (void)seq_len;
+            (void)num_experts;
+            (void)top_k;
+            (void)expert_mask;
+            return false;
+        }
+
+        /**
          * @brief Prepare a graph-capturable grouped prefill layout for a shared expert.
          *
          * Shared experts are always active for every token and have an implicit

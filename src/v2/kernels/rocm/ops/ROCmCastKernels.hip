@@ -46,6 +46,17 @@ static __global__ void fp16_to_fp32_kernel(const __half* __restrict__ input,
     }
 }
 
+static __global__ void fp32_peer_add_kernel(float *__restrict__ dst,
+                                            const float *__restrict__ peer,
+                                            const size_t count)
+{
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        dst[idx] += peer[idx];
+    }
+}
+
 // ============================================================================
 // Host API — called from LocalTPContext
 // ============================================================================
@@ -119,5 +130,91 @@ extern "C"
     {
         (void)hipSetDevice(ordinal);
         (void)hipFree(buf);
+    }
+
+    int rocmLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal)
+    {
+        if (!event_out)
+            return static_cast<int>(hipErrorInvalidValue);
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+            return static_cast<int>(err);
+        hipEvent_t event;
+        err = hipEventCreateWithFlags(&event, hipEventDisableTiming);
+        if (err != hipSuccess)
+        {
+            *event_out = nullptr;
+            return static_cast<int>(err);
+        }
+        *event_out = static_cast<void *>(event);
+        return static_cast<int>(hipSuccess);
+    }
+
+    void rocmLocalTPSmallFP32AllreduceDestroyEvent(void *event, int ordinal)
+    {
+        if (!event)
+            return;
+        (void)hipSetDevice(ordinal);
+        (void)hipEventDestroy(static_cast<hipEvent_t>(event));
+    }
+
+    int rocmLocalTPSmallFP32AllreduceRecordEvent(void *event, int ordinal, void *stream)
+    {
+        if (!event || !stream)
+            return static_cast<int>(hipErrorInvalidValue);
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+            return static_cast<int>(err);
+        err = hipEventRecord(static_cast<hipEvent_t>(event), static_cast<hipStream_t>(stream));
+        return static_cast<int>(err);
+    }
+
+    int rocmLocalTPSmallFP32AllreduceWaitEvent(void *event, int ordinal, void *stream)
+    {
+        if (!event || !stream)
+            return static_cast<int>(hipErrorInvalidValue);
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+            return static_cast<int>(err);
+        err = hipStreamWaitEvent(static_cast<hipStream_t>(stream), static_cast<hipEvent_t>(event), 0);
+        return static_cast<int>(err);
+    }
+
+    int rocmLocalTPSmallFP32AllreduceCanAccessPeer(int ordinal, int peer_ordinal)
+    {
+        int can_access = 0;
+        hipError_t err = hipDeviceCanAccessPeer(&can_access, ordinal, peer_ordinal);
+        if (err != hipSuccess)
+            return 0;
+        return can_access != 0;
+    }
+
+    int rocmLocalTPSmallFP32AllreduceEnablePeerAccess(int ordinal, int peer_ordinal)
+    {
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+            return static_cast<int>(err);
+        err = hipDeviceEnablePeerAccess(peer_ordinal, 0);
+        if (err == hipErrorPeerAccessAlreadyEnabled)
+            return static_cast<int>(hipSuccess);
+        return static_cast<int>(err);
+    }
+
+    int rocmLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,
+                                            size_t count, int ordinal, void *stream)
+    {
+        if (!dst || !peer || !stream)
+            return static_cast<int>(hipErrorInvalidValue);
+        if (count == 0)
+            return static_cast<int>(hipSuccess);
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess)
+            return static_cast<int>(err);
+
+        constexpr int BLOCK_SIZE = 256;
+        const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        hipLaunchKernelGGL(fp32_peer_add_kernel, dim3(grid_size), dim3(BLOCK_SIZE), 0,
+                           static_cast<hipStream_t>(stream), dst, peer, count);
+        return static_cast<int>(hipGetLastError());
     }
 }

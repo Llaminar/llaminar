@@ -20,6 +20,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <utility>
 
 namespace llaminar2
 {
@@ -733,21 +734,21 @@ namespace llaminar2
      */
     enum class MoEExpertMode
     {
-        ExpertParallel, ///< Split whole expert ids across TP participants
-        TensorParallel, ///< Shard every selected expert internally (not implemented yet)
-        Replicated      ///< Keep routed expert tensors/execution fully replicated
+        ApportionedExperts, ///< Split whole expert ids across participants
+        ShardedExperts,     ///< Shard every selected expert internally (not implemented yet)
+        ReplicatedExperts,  ///< Keep routed expert tensors/execution fully replicated
     };
 
     inline const char *moeExpertModeToString(MoEExpertMode mode)
     {
         switch (mode)
         {
-        case MoEExpertMode::ExpertParallel:
-            return "expert-parallel";
-        case MoEExpertMode::TensorParallel:
-            return "tensor-parallel";
-        case MoEExpertMode::Replicated:
-            return "replicated";
+        case MoEExpertMode::ApportionedExperts:
+            return "apportioned-experts";
+        case MoEExpertMode::ShardedExperts:
+            return "sharded-experts";
+        case MoEExpertMode::ReplicatedExperts:
+            return "replicated-experts";
         default:
             return "unknown";
         }
@@ -761,12 +762,294 @@ namespace llaminar2
                        { return static_cast<char>(std::tolower(c)); });
         std::replace(lower.begin(), lower.end(), '_', '-');
 
-        if (lower == "expert-parallel" || lower == "ep")
-            return MoEExpertMode::ExpertParallel;
-        if (lower == "tensor-parallel" || lower == "tp" || lower == "tensor-parallel-experts")
-            return MoEExpertMode::TensorParallel;
+        if (lower == "apportioned-experts" ||
+            lower == "apportioned")
+            return MoEExpertMode::ApportionedExperts;
+        if (lower == "sharded-experts" ||
+            lower == "sharded")
+            return MoEExpertMode::ShardedExperts;
+        if (lower == "replicated-experts" ||
+            lower == "replicated")
+            return MoEExpertMode::ReplicatedExperts;
+        return std::nullopt;
+    }
+
+    enum class DenseParallelPolicy
+    {
+        /// Dense/shared weights are fully present on each participant.
+        Replicated,
+
+        /// Dense/shared weights are tensor-parallel sharded, with collectives
+        /// emitted where sharded partials must be combined.
+        TensorParallel,
+
+        /// Dense/shared weights remain tensor-parallel, except decode uses a
+        /// mirrored full embedding table to avoid a tiny per-token allreduce.
+        TensorParallelDecodeMirroredEmbedding,
+
+        /// Prefill uses dense tensor parallelism. Decode uses replicated
+        /// dense/shared weights to avoid small per-token dense collectives.
+        PhaseSplitHybridTP_AE
+    };
+
+    enum class RoutedExpertParallelPolicy
+    {
+        ReplicatedExperts,  ///< Every participant can execute every routed expert
+        ApportionedExperts, ///< Whole routed expert ids are divided across participants
+        ShardedExperts,     ///< Each routed expert GEMM is internally sharded across participants
+    };
+
+    /**
+     * @brief Derived composite summary of dense/shared and routed-expert policy axes.
+     *
+     * This value is intentionally derived from DenseParallelPolicy and
+     * RoutedExpertParallelPolicy. The graph still branches on the underlying
+     * axes and overlay plan fields; this enum gives logs/tests one canonical
+     * name for the combined strategy.
+     */
+    enum class MoEParallelPolicy
+    {
+        /// Dense/shared: replicated on every participant.
+        /// Routed experts: replicated on every participant.
+        ReplicatedExperts,
+
+        /// Dense/shared: tensor-parallel sharded with collectives as needed.
+        /// Routed experts: sharded within each selected expert, so each
+        /// participant computes a tensor shard of every routed expert output.
+        TensorParallel,
+
+        /// Dense/shared: replicated on every participant.
+        /// Routed experts: apportioned as whole expert ids across participants;
+        /// an owner computes the complete selected expert output.
+        ApportionedExperts,
+
+        /// Dense/shared: tensor-parallel sharded with collectives as needed.
+        /// Routed experts: apportioned as whole expert ids across participants.
+        HybridTP_AE,
+
+        /// Dense/shared: tensor-parallel sharded with collectives as needed.
+        /// Routed experts: replicated on every participant.
+        HybridTP_RE,
+
+        /// Prefill dense/shared: tensor-parallel sharded with collectives.
+        /// Decode dense/shared: replicated to avoid tiny decode collectives.
+        /// Routed experts: apportioned as whole expert ids across participants.
+        PhaseSplitHybridTP_AE,
+    };
+
+    enum class ExpertReplicaPolicy
+    {
+        None,
+        HotExpertReplicaCache
+    };
+
+    inline std::string normalizeParallelPolicyToken(const std::string &value)
+    {
+        std::string lower = value;
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c)
+                       { return static_cast<char>(std::tolower(c)); });
+        std::replace(lower.begin(), lower.end(), '_', '-');
+        return lower;
+    }
+
+    inline const char *denseParallelPolicyToString(DenseParallelPolicy policy)
+    {
+        switch (policy)
+        {
+        case DenseParallelPolicy::Replicated:
+            return "replicated";
+        case DenseParallelPolicy::TensorParallel:
+            return "tensor-parallel";
+        case DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding:
+            return "tensor-parallel-decode-mirrored-embedding";
+        case DenseParallelPolicy::PhaseSplitHybridTP_AE:
+            return "phase-split-hybrid-tp-ae";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<DenseParallelPolicy> parseDenseParallelPolicy(const std::string &value)
+    {
+        const std::string lower = normalizeParallelPolicyToken(value);
         if (lower == "replicated" || lower == "replicate" || lower == "full")
-            return MoEExpertMode::Replicated;
+            return DenseParallelPolicy::Replicated;
+        if (lower == "tensor-parallel" || lower == "tp" || lower == "dense-tp")
+            return DenseParallelPolicy::TensorParallel;
+        if (lower == "tensor-parallel-decode-mirrored-embedding" ||
+            lower == "tp-decode-mirrored-embedding" ||
+            lower == "decode-mirrored-embedding" ||
+            lower == "decode-mirror-embedding")
+            return DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding;
+        if (lower == "phase-split" ||
+            lower == "phase-split-tp" ||
+            lower == "phase-split-dense-tp" ||
+            lower == "phase-split-hybrid-tp-ae" ||
+            lower == "phasesplithybridtp-ae")
+            return DenseParallelPolicy::PhaseSplitHybridTP_AE;
+        return std::nullopt;
+    }
+
+    inline DenseParallelPolicy denseParallelPolicyFromFlags(
+        bool dense_tp_enabled,
+        bool dense_decode_replicated,
+        bool dense_decode_mirrored_embedding = false)
+    {
+        if (!dense_tp_enabled)
+            return DenseParallelPolicy::Replicated;
+        if (dense_decode_replicated)
+            return DenseParallelPolicy::PhaseSplitHybridTP_AE;
+        if (dense_decode_mirrored_embedding)
+            return DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding;
+        return DenseParallelPolicy::TensorParallel;
+    }
+
+    inline bool denseParallelPolicyEnablesTP(DenseParallelPolicy policy)
+    {
+        return policy == DenseParallelPolicy::TensorParallel ||
+               policy == DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding ||
+               policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+    }
+
+    inline bool denseParallelPolicyReplicatesDecode(DenseParallelPolicy policy)
+    {
+        return policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+    }
+
+    inline bool denseParallelPolicyMirrorsDecodeEmbedding(DenseParallelPolicy policy)
+    {
+        return policy == DenseParallelPolicy::TensorParallelDecodeMirroredEmbedding ||
+               policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+    }
+
+    inline const char *routedExpertParallelPolicyToString(RoutedExpertParallelPolicy policy)
+    {
+        switch (policy)
+        {
+        case RoutedExpertParallelPolicy::ReplicatedExperts:
+            return "replicated-experts";
+        case RoutedExpertParallelPolicy::ApportionedExperts:
+            return "apportioned-experts";
+        case RoutedExpertParallelPolicy::ShardedExperts:
+            return "sharded-experts";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<RoutedExpertParallelPolicy> parseRoutedExpertParallelPolicy(const std::string &value)
+    {
+        const std::string lower = normalizeParallelPolicyToken(value);
+        if (lower == "replicated-experts" || lower == "replicated")
+            return RoutedExpertParallelPolicy::ReplicatedExperts;
+        if (lower == "apportioned-experts" ||
+            lower == "apportioned")
+            return RoutedExpertParallelPolicy::ApportionedExperts;
+        if (lower == "sharded-experts" ||
+            lower == "sharded")
+            return RoutedExpertParallelPolicy::ShardedExperts;
+        return std::nullopt;
+    }
+
+    inline RoutedExpertParallelPolicy routedExpertParallelPolicyFromMode(MoEExpertMode mode)
+    {
+        switch (mode)
+        {
+        case MoEExpertMode::ReplicatedExperts:
+            return RoutedExpertParallelPolicy::ReplicatedExperts;
+        case MoEExpertMode::ShardedExperts:
+            return RoutedExpertParallelPolicy::ShardedExperts;
+        case MoEExpertMode::ApportionedExperts:
+        default:
+            return RoutedExpertParallelPolicy::ApportionedExperts;
+        }
+    }
+
+    inline const char *moeParallelPolicyToString(MoEParallelPolicy policy)
+    {
+        switch (policy)
+        {
+        case MoEParallelPolicy::ReplicatedExperts:
+            return "replicated-experts";
+        case MoEParallelPolicy::TensorParallel:
+            return "tensor-parallel";
+        case MoEParallelPolicy::ApportionedExperts:
+            return "apportioned-experts";
+        case MoEParallelPolicy::HybridTP_AE:
+            return "hybrid-tp-ae";
+        case MoEParallelPolicy::HybridTP_RE:
+            return "hybrid-tp-re";
+        case MoEParallelPolicy::PhaseSplitHybridTP_AE:
+            return "phase-split-hybrid-tp-ae";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<MoEParallelPolicy> parseMoEParallelPolicy(const std::string &value)
+    {
+        const std::string lower = normalizeParallelPolicyToken(value);
+        if (lower == "replicated-experts" || lower == "replicated" || lower == "replicate" || lower == "full")
+            return MoEParallelPolicy::ReplicatedExperts;
+        if (lower == "tensor-parallel" || lower == "tp")
+            return MoEParallelPolicy::TensorParallel;
+        if (lower == "apportioned-experts" ||
+            lower == "apportioned")
+            return MoEParallelPolicy::ApportionedExperts;
+        if (lower == "hybrid-tp-ae" ||
+            lower == "hybridtpae")
+            return MoEParallelPolicy::HybridTP_AE;
+        if (lower == "hybrid-tp-re" ||
+            lower == "hybridtpre")
+            return MoEParallelPolicy::HybridTP_RE;
+        if (lower == "phase-split-hybrid-tp-ae" ||
+            lower == "phase-split" ||
+            lower == "phasesplithybridtp-ae")
+            return MoEParallelPolicy::PhaseSplitHybridTP_AE;
+        return std::nullopt;
+    }
+
+    inline MoEParallelPolicy deriveMoEParallelPolicy(
+        DenseParallelPolicy dense_policy,
+        RoutedExpertParallelPolicy routed_policy)
+    {
+        if (routed_policy == RoutedExpertParallelPolicy::ShardedExperts)
+            return MoEParallelPolicy::TensorParallel;
+        if (routed_policy == RoutedExpertParallelPolicy::ReplicatedExperts)
+            return dense_policy == DenseParallelPolicy::Replicated
+                       ? MoEParallelPolicy::ReplicatedExperts
+                       : MoEParallelPolicy::HybridTP_RE;
+        if (dense_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE)
+            return MoEParallelPolicy::PhaseSplitHybridTP_AE;
+        if (denseParallelPolicyEnablesTP(dense_policy))
+            return MoEParallelPolicy::HybridTP_AE;
+        return MoEParallelPolicy::ApportionedExperts;
+    }
+
+    inline const char *expertReplicaPolicyToString(ExpertReplicaPolicy policy)
+    {
+        switch (policy)
+        {
+        case ExpertReplicaPolicy::None:
+            return "none";
+        case ExpertReplicaPolicy::HotExpertReplicaCache:
+            return "hot-expert-replica-cache";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<ExpertReplicaPolicy> parseExpertReplicaPolicy(const std::string &value)
+    {
+        const std::string lower = normalizeParallelPolicyToken(value);
+        if (lower == "none" || lower == "off" || lower == "disabled")
+            return ExpertReplicaPolicy::None;
+        if (lower == "hot-expert-replica-cache" ||
+            lower == "hot-expert-cache" ||
+            lower == "hot-replica-cache" ||
+            lower == "hotexpertreplicacache")
+            return ExpertReplicaPolicy::HotExpertReplicaCache;
         return std::nullopt;
     }
 
@@ -813,6 +1096,14 @@ namespace llaminar2
             return oss.str();
         }
     };
+
+    inline ExpertReplicaPolicy expertReplicaPolicyFromHotExpertCache(
+        const MoEHotExpertCacheConfig &config)
+    {
+        return config.enabled()
+                   ? ExpertReplicaPolicy::HotExpertReplicaCache
+                   : ExpertReplicaPolicy::None;
+    }
 
     /**
      * @brief MoE decode histogram and dynamic rebalance configuration.
@@ -899,8 +1190,11 @@ namespace llaminar2
         /// Explicit KV cache precision (AUTO defaults to FP16)
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Optional explicit transport precision for TP allreduces.
+        std::string tp_allreduce_precision_override;
+
         /// Routed MoE expert execution mode.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
 
         /// Bounded remote hot-expert cache configuration for dynamic EP.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
@@ -927,17 +1221,19 @@ namespace llaminar2
             const std::string &activation_precision_str,
             const std::string &kv_cache_precision_str,
             FusedAttentionBackend fused_backend = FusedAttentionBackend::JIT,
-            MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel,
+            MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts,
             MoEHotExpertCacheConfig moe_hot_expert_cache = {},
             MoERebalanceRuntimeConfig moe_rebalance = {},
             PrefixCacheRuntimeConfig prefix_cache = {},
-            MTPRuntimeConfig mtp = {})
+            MTPRuntimeConfig mtp = {},
+            std::string tp_allreduce_precision_override = {})
         {
             RuntimeConfig rc;
             rc.max_seq_len = max_seq_len;
             rc.batch_size = resolveRuntimeBatchSizeForMTP(batch_size, mtp);
             rc.activation_precision = parseActivationPrecision(activation_precision_str);
             rc.kv_cache_precision = parseKVCachePrecision(kv_cache_precision_str);
+            rc.tp_allreduce_precision_override = std::move(tp_allreduce_precision_override);
             rc.fused_attention_backend = fused_backend;
             rc.moe_expert_mode = moe_expert_mode;
             rc.moe_hot_expert_cache = moe_hot_expert_cache;

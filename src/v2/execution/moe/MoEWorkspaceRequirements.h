@@ -27,6 +27,7 @@ namespace llaminar2
         constexpr const char *GROUP_WRITE_HEADS = "moe_group_write_heads";
         constexpr const char *GROUP_WEIGHTS = "moe_group_weights";
         constexpr const char *GROUP_ACTIVE_EXPERT_IDS = "moe_group_active_expert_ids";
+        constexpr const char *GROUP_EXPERT_MASK = "moe_group_expert_mask";
 
         constexpr const char *PREFILL_A_INT8 = "moe_prefill_a_int8";
         constexpr const char *PREFILL_A_SCALES = "moe_prefill_a_scales";
@@ -128,6 +129,7 @@ namespace llaminar2
             add(reqs, GROUP_ORIGINAL_EXPERT_IDS, total_slots * sizeof(int));
             add(reqs, GROUP_WEIGHTS, total_slots * sizeof(float));
             add(reqs, GROUP_ACTIVE_EXPERT_IDS, active_expert_id_slots * sizeof(int));
+            add(reqs, GROUP_EXPERT_MASK, static_cast<std::size_t>(num_experts) * sizeof(uint8_t));
             add(reqs, GROUP_OFFSETS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_COUNTS, static_cast<std::size_t>(num_experts) * sizeof(int));
             add(reqs, GROUP_WRITE_HEADS, static_cast<std::size_t>(num_experts) * sizeof(int));

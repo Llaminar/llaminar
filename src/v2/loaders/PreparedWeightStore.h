@@ -157,14 +157,23 @@ namespace llaminar2
         // MoE Expert Slab API
         // =========================================================================
 
-        /// Register a new expert slab (one weight group × one layer × one device).
+        /// Register an expert slab (one global expert-id table × weight group × layer × device).
         ExpertSlabRef registerExpertSlab(const ExpertSlabDescriptor &desc);
 
-        /// Find an existing expert slab with the same layer/role/device/dimensions.
+        /// Find an existing expert slab with the same global table identity.
+        /// local_expert_start/count are residency metadata and do not split slabs.
         std::optional<ExpertSlabRef> findExpertSlab(const ExpertSlabDescriptor &desc) const;
 
         /// Get the GEMM engine for a specific expert within a slab.
         ITensorGemm *expertGemmKernel(const ExpertSlabRef &slab, int expert_id) const;
+
+        /// Get the owned GEMM lifetime for a specific expert within a slab.
+        std::shared_ptr<ITensorGemm> expertGemmKernelLifetime(const ExpertSlabRef &slab, int expert_id) const;
+
+        /// Get a pending GPU-direct readiness event for an arrived expert, if any.
+        std::optional<GpuDirectTransferCompletion> expertGpuDirectCompletion(
+            const ExpertSlabRef &slab,
+            int expert_id) const;
 
         /// Register newly-arrived expert engines (from initial load or rebalance transfer).
         std::vector<int> registerArrivedExperts(
@@ -291,6 +300,7 @@ namespace llaminar2
             std::shared_ptr<TensorBase> view_lifetime;
             WeightDerivationKind derivation = WeightDerivationKind::ExpertSlice;
             std::optional<DeviceId> source_device;
+            std::optional<GpuDirectTransferCompletion> gpu_direct_completion;
             bool available = false;
         };
 

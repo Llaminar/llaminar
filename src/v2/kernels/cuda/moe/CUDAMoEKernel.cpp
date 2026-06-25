@@ -392,12 +392,6 @@ namespace
         return reinterpret_cast<float *>(base + offsetof(llaminar2::DeviceMoELayerRuntime, topk_weights));
     }
 
-    uint64_t *runtimeDecodeHistogramDevice(llaminar2::DeviceMoELayerRuntime *runtime_layer)
-    {
-        auto *base = reinterpret_cast<char *>(runtime_layer);
-        return reinterpret_cast<uint64_t *>(base + offsetof(llaminar2::DeviceMoELayerRuntime, decode_histogram));
-    }
-
     bool cudaGroupedPrefillSupportsCodebook(uint8_t cb)
     {
         switch (cb)
@@ -493,6 +487,17 @@ namespace
                (!cudaGroupedPrefillRequiresMins(desc.codebook_id) || desc.mins != nullptr) &&
                (!cudaGroupedPrefillRequiresEmins(desc.codebook_id) || desc.emins != nullptr);
     }
+
+    bool isBlankGroupedDesc(const llaminar2::DeviceNativeVNNIMatrixDesc &desc)
+    {
+        return desc.payload == nullptr &&
+               desc.scales == nullptr &&
+               desc.mins == nullptr &&
+               desc.emins == nullptr &&
+               desc.n == 0 &&
+               desc.k == 0 &&
+               desc.blocks_per_row == 0;
+    }
 }
 
 extern "C"
@@ -516,8 +521,7 @@ extern "C"
         const int *device_effective_seq_len);
 
     bool cudaMoE_softmax_topk_decode_runtime(
-        float *logits, int *runtime_expert_ids, float *runtime_weights,
-        uint64_t *runtime_histogram,
+        float *logits, void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool normalize_weights,
         bool write_legacy_outputs, bool update_runtime_histogram,
@@ -525,14 +529,21 @@ extern "C"
 
     bool cudaMoE_decode_route_select_runtime(
         const int *expert_indices, const float *expert_weights,
-        int *runtime_expert_ids, float *runtime_weights,
-        uint64_t *runtime_histogram,
+        void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool write_legacy_outputs,
         bool update_runtime_histogram, int device_idx, void *stream);
 
     bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream);
     bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream);
+    bool cudaMoE_float_to_masked_int(
+        const float *input,
+        int *output,
+        const uint8_t *expert_mask,
+        int count,
+        int num_experts,
+        int device_idx,
+        void *stream);
 
     bool cudaMoE_gather_tokens(
         const float *hidden, float *batch_buffer, const int *token_indices,
@@ -954,6 +965,7 @@ namespace llaminar2
             release(d_grouped_decode_weights_);
             release(d_routing_decode_expert_ids_);
         }
+        release(d_group_expert_mask_);
         for (auto &table : grouped_down_desc_tables_)
             release(table.device_descs);
         for (auto &table : grouped_gateup_desc_tables_)
@@ -967,6 +979,8 @@ namespace llaminar2
         group_slots_cap_ = 0;
         group_experts_cap_ = 0;
         group_active_expert_slots_ = 0;
+        group_expert_mask_cap_ = 0;
+        group_expert_mask_hash_ = 0;
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
@@ -2222,9 +2236,7 @@ namespace llaminar2
         if (!route_ok)
             return false;
         if (!cudaMoE_softmax_topk_decode_runtime(d_route_logits_,
-                                                 runtimeTopKExpertIdsDevice(runtime_layer),
-                                                 runtimeTopKWeightsDevice(runtime_layer),
-                                                 runtimeDecodeHistogramDevice(runtime_layer),
+                                                 runtime_layer,
                                                  legacy_indices, legacy_weights,
                                                  num_experts, top_k, normalize_weights,
                                                  write_legacy_outputs, update_runtime_histogram,
@@ -2637,6 +2649,9 @@ namespace llaminar2
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
+            if (isBlankGroupedDesc(desc))
+                continue;
+
             if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
             {
                 LOG_DEBUG("[CUDAMoEKernel::uploadGroupedExpertDownDescriptorTable] Invalid descriptor for expert "
@@ -2644,7 +2659,7 @@ namespace llaminar2
                 return -1;
             }
             codebook_mask |= cudaGroupedPrefillCodebookBit(desc.codebook_id);
-            if (expert_id == 0)
+            if (codebook_id == 0)
             {
                 codebook_id = desc.codebook_id;
             }
@@ -2747,6 +2762,17 @@ namespace llaminar2
         {
             const auto &gate_desc = gate_descs[expert_id];
             const auto &up_desc = up_descs[expert_id];
+            const bool gate_blank = isBlankGroupedDesc(gate_desc);
+            const bool up_blank = isBlankGroupedDesc(up_desc);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                LOG_DEBUG("[CUDAMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Incomplete sparse descriptor pair for expert "
+                          << expert_id);
+                return -1;
+            }
+
             if (!gate_desc.valid() || !up_desc.valid() ||
                 gate_desc.codebook_id != up_desc.codebook_id ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
@@ -2757,7 +2783,7 @@ namespace llaminar2
                 return -1;
             }
             codebook_mask |= cudaGroupedPrefillCodebookBit(gate_desc.codebook_id);
-            if (expert_id == 0)
+            if (codebook_id == 0)
             {
                 codebook_id = gate_desc.codebook_id;
             }
@@ -2926,6 +2952,100 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::prepareExpertGroupsAsyncMasked(
+        ITensor *routing_indices,
+        ITensor *routing_weights,
+        int seq_len,
+        int num_experts,
+        int top_k,
+        const uint8_t *expert_mask)
+    {
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0 || !expert_mask)
+            return false;
+        void *stream = requireStream("CUDAMoEKernel::prepareExpertGroupsAsyncMasked");
+        const DeviceId device = deviceId();
+        const int total_slots = seq_len * top_k;
+        if (!ensureTensorOnDevice(routing_indices, device, stream, "routing_indices") ||
+            !ensureTensorOnDevice(routing_weights, device, stream, "routing_weights") ||
+            !ensureGroupingBufferCapacity(total_slots, num_experts))
+            return false;
+
+        const float *d_float_indices = static_cast<const float *>(routing_indices->gpu_data_ptr());
+        const float *d_float_weights = static_cast<const float *>(routing_weights->gpu_data_ptr());
+        if (!d_float_indices || !d_float_weights)
+            return false;
+
+        uint64_t mask_hash = 1469598103934665603ull;
+        for (int i = 0; i < num_experts; ++i)
+        {
+            mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
+            mask_hash *= 1099511628211ull;
+        }
+        mask_hash ^= static_cast<uint64_t>(num_experts);
+        mask_hash *= 1099511628211ull;
+
+        if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
+        {
+            if (d_group_expert_mask_)
+            {
+                cudaFree(d_group_expert_mask_);
+                d_group_expert_mask_ = nullptr;
+            }
+            cudaError_t err = cudaMalloc(
+                reinterpret_cast<void **>(&d_group_expert_mask_),
+                static_cast<size_t>(num_experts) * sizeof(uint8_t));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAMoEKernel::prepareExpertGroupsAsyncMasked] cudaMalloc mask failed: "
+                          << cudaGetErrorString(err));
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_hash_ = 0;
+                return false;
+            }
+            group_expert_mask_cap_ = num_experts;
+            group_expert_mask_hash_ = 0;
+        }
+
+        if (group_expert_mask_hash_ != mask_hash)
+        {
+            cudaError_t err = cudaMemcpyAsync(
+                d_group_expert_mask_,
+                expert_mask,
+                static_cast<size_t>(num_experts) * sizeof(uint8_t),
+                cudaMemcpyHostToDevice,
+                static_cast<cudaStream_t>(stream));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAMoEKernel::prepareExpertGroupsAsyncMasked] H2D mask copy failed: "
+                          << cudaGetErrorString(err));
+                return false;
+            }
+            group_expert_mask_hash_ = mask_hash;
+        }
+
+        group_active_expert_slots_ = 0;
+        if (!cudaMoE_float_to_masked_int(
+                d_float_indices,
+                d_group_int_indices_,
+                d_group_expert_mask_,
+                total_slots,
+                num_experts,
+                device_ordinal_,
+                stream))
+        {
+            return false;
+        }
+
+        if (!groupTokensByExpertDevice(d_group_int_indices_, d_float_weights,
+                                       seq_len, num_experts, top_k,
+                                       d_group_offsets_, d_group_counts_,
+                                       d_group_token_indices_, d_group_weights_))
+            return false;
+
+        prepared_num_experts_ = num_experts;
+        return true;
+    }
+
     bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(int seq_len)
     {
         if (seq_len <= 0)
@@ -3020,7 +3140,7 @@ namespace llaminar2
          * zeroed destination before accumulation.
          */
         const bool ordered_scatter_overwrites_output =
-            active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
+            d_group_original_to_grouped_ != nullptr;
         if (!ordered_scatter_overwrites_output)
         {
             cudaError_t err = cudaMemsetAsync(d_output, 0,

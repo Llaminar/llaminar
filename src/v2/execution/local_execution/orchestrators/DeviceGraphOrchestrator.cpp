@@ -28,6 +28,7 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../../utils/VramBillOfMaterials.h"
 #include "../../../tensors/TensorFactory.h"
 #include "../../../tensors/TensorClasses.h" // For FP32Tensor::createMapped()
 #include "../../../kernels/cpu/CPUKVCache.h"
@@ -97,6 +98,41 @@ namespace llaminar2
          * while another capture stream is still consuming it.
          */
         constexpr int kMTPSidecarConditionTokenSlotCount = 10;
+
+        uint64_t stableLegacyGraphBindingId(
+            ModelContextId model_id,
+            const std::string &canonical_name,
+            WeightRole role,
+            int layer_idx,
+            DeviceId device)
+        {
+            uint64_t hash = 1469598103934665603ull;
+            auto mixByte = [&](uint8_t byte)
+            {
+                hash ^= static_cast<uint64_t>(byte);
+                hash *= 1099511628211ull;
+            };
+            auto mixString = [&](const std::string &value)
+            {
+                for (unsigned char ch : value)
+                    mixByte(ch);
+                mixByte(0xffu);
+            };
+            auto mixInt = [&](int64_t value)
+            {
+                uint64_t bits = static_cast<uint64_t>(value);
+                for (int i = 0; i < 8; ++i)
+                    mixByte(static_cast<uint8_t>((bits >> (i * 8)) & 0xffu));
+            };
+
+            mixInt(static_cast<int64_t>(model_id.value));
+            mixString(canonical_name);
+            mixInt(static_cast<int>(role));
+            mixInt(layer_idx);
+            mixInt(static_cast<int>(device.type));
+            mixInt(device.ordinal);
+            return hash == 0 ? 1 : hash;
+        }
 
         /**
          * @brief Complete a short helper stream owned by the orchestrator.
@@ -223,6 +259,79 @@ namespace llaminar2
                                      << " used_mib=" << (used_bytes / (1024 * 1024))
                                      << " free_mib=" << (free_bytes / (1024 * 1024))
                                      << " total_mib=" << (total_bytes / (1024 * 1024)));
+        }
+
+        void logKVCacheBom(const char *label,
+                           DeviceId device,
+                           IKVCache *cache,
+                           int batch_size)
+        {
+            if (!vramBomEnabled() || !cache)
+                return;
+
+            const std::string cache_label = label ? label : "kv";
+            const int first_layer = cache->first_layer_index();
+            const int layers = std::max(0, cache->n_layers());
+            const int sequences = std::max(1, batch_size);
+            const int max_seq_len = std::max(0, cache->max_seq_len());
+            size_t total_bytes = 0;
+            size_t buffer_count = 0;
+
+            for (int layer_offset = 0; layer_offset < layers; ++layer_offset)
+            {
+                const int layer = first_layer + layer_offset;
+                const auto layout = cache->logicalBlockLayout(layer, max_seq_len);
+                if (layout.k_bytes == 0 && layout.v_bytes == 0)
+                    continue;
+
+                for (int seq = 0; seq < sequences; ++seq)
+                {
+                    const int cached_tokens = cache->get_cached_tokens(layer, seq);
+
+                    auto log_reserved_tensor = [&](const char *side,
+                                                   ActivationPrecision precision,
+                                                   size_t bytes)
+                    {
+                        if (bytes == 0)
+                            return;
+                        total_bytes += bytes;
+                        ++buffer_count;
+                        logVramBomLine(
+                            "kv_cache_buffer",
+                            "label=" + cache_label +
+                                " device=" + device.toString() +
+                                " layer=" + std::to_string(layer) +
+                                " seq=" + std::to_string(seq) +
+                                " side=" + side +
+                                " precision=" + activationPrecisionToString(precision) +
+                                " layout=" + layoutNameShort(layout.layout) +
+                                " rows=" + std::to_string(max_seq_len) +
+                                " cols=" + std::to_string(layout.local_kv_heads * layout.head_dim) +
+                                " reserved_tokens=" + std::to_string(max_seq_len) +
+                                " cached_tokens=" + std::to_string(cached_tokens) +
+                                " " + vramBomBytes(bytes));
+                    };
+
+                    log_reserved_tensor("K", layout.k_precision, layout.k_bytes);
+                    log_reserved_tensor("V", layout.v_precision, layout.v_bytes);
+                }
+            }
+
+            logVramBomLine(
+                "kv_cache_summary",
+                "label=" + cache_label +
+                    " device=" + device.toString() +
+                    " layers=" + std::to_string(layers) +
+                    " first_layer=" + std::to_string(first_layer) +
+                    " batch_size=" + std::to_string(sequences) +
+                    " max_seq_len=" + std::to_string(max_seq_len) +
+                    " total_kv_heads=" + std::to_string(cache->n_kv_heads()) +
+                    " local_kv_heads=" + std::to_string(cache->local_n_kv_heads()) +
+                    " local_kv_dim=" + std::to_string(cache->local_kv_dim()) +
+                    " sharded=" + std::string(cache->is_sharded() ? "true" : "false") +
+                    " buffers=" + std::to_string(buffer_count) +
+                    " total_bytes=" + std::to_string(total_bytes) +
+                    " total_mib=" + vramBomMiB(total_bytes));
         }
 
         bool applyPenaltiesToTensorRowOnDevice(
@@ -372,6 +481,11 @@ namespace llaminar2
         std::string boolTag(bool value)
         {
             return value ? "true" : "false";
+        }
+
+        const char *capturedCollectiveRejectReason(bool supported)
+        {
+            return supported ? "supported" : "unsupported";
         }
 
         size_t fp32LogitsRowBytes(const TensorBase *tensor)
@@ -1429,11 +1543,17 @@ namespace llaminar2
         return moe_rebalance_controller_->mode() == MoERebalanceMode::DYNAMIC;
     }
 
+    bool DeviceGraphOrchestrator::prefillGraphCaptureDisabledByHost() const
+    {
+        return false;
+    }
+
     uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const
     {
+        uint64_t epoch = current_expert_replica_epoch_;
         if (!moe_rebalance_controller_)
-            return 0;
-        return moe_rebalance_controller_->placementEpoch();
+            return epoch;
+        return std::max(epoch, moe_rebalance_controller_->placementEpoch());
     }
 
     std::string DeviceGraphOrchestrator::prefillGraphDomainId() const
@@ -1634,6 +1754,31 @@ namespace llaminar2
                   << frozen_weight_set_->bindings().size() << " bindings");
     }
 
+    void DeviceGraphOrchestrator::setDecodeReplicatedDenseWeightSet(std::unique_ptr<FrozenModelWeightSet> weight_set)
+    {
+        if (!graph_builder_)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Cannot set replicated dense decode weights: graph builder not initialized");
+            return;
+        }
+
+        if (!weight_set)
+        {
+            decode_replicated_dense_weight_set_.reset();
+            graph_builder_->setDecodeReplicatedDenseWeightBindings({});
+            return;
+        }
+
+        weight_set->validateForGraph();
+        decode_replicated_dense_weight_set_ = std::move(weight_set);
+
+        auto weight_bindings = makeModelWeightBindings(*decode_replicated_dense_weight_set_);
+        graph_builder_->setDecodeReplicatedDenseWeightBindings(weight_bindings);
+
+        LOG_DEBUG("[DeviceGraphOrchestrator] Replicated dense decode FrozenModelWeightSet configured with "
+                  << decode_replicated_dense_weight_set_->bindings().size() << " bindings");
+    }
+
     void DeviceGraphOrchestrator::buildFrozenWeightSet(
         const ModelWeights &weights,
         const std::unordered_map<int, LayerWeights> &resolved_layers,
@@ -1644,11 +1789,42 @@ namespace llaminar2
         strategy.mode = WeightInferenceMode::SingleDevice;
         strategy.pp_stages = 1;
         strategy.tp_degree = 1;
+        if (prepared_weight_store_ && prepared_weight_store_->modelId().value != 0)
+        {
+            strategy.model_id = prepared_weight_store_->modelId();
+        }
+        else if (auto concrete_weight_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_))
+        {
+            if (auto store = concrete_weight_manager->preparedWeightStoreIfInitialized();
+                store && store->modelId().value != 0)
+            {
+                strategy.model_id = store->modelId();
+            }
+        }
         if (graph_builder_)
         {
             const auto &cfg = graph_builder_->config();
             strategy.devices.push_back(cfg.default_device);
         }
+        const DeviceId target_device = strategy.devices.empty()
+                                           ? DeviceId::cpu()
+                                           : strategy.devices.front();
+        const bool can_infer_prepared_metadata =
+            static_cast<bool>(std::dynamic_pointer_cast<WeightManager>(weight_manager_));
+        const auto preparedKindFor = [&](TensorBase *tensor, WeightRole role) -> PreparedWeightKind
+        {
+            if (!can_infer_prepared_metadata || !tensor)
+                return PreparedWeightKind::None;
+            if (role == WeightRole::Embedding)
+                return PreparedWeightKind::PreparedEmbedding;
+            if (role == WeightRole::Norm || role == WeightRole::Bias || tensor->shape().size() != 2)
+                return PreparedWeightKind::None;
+            if (target_device.is_cuda())
+                return PreparedWeightKind::CudaInt8PackedGemm;
+            if (target_device.is_rocm())
+                return PreparedWeightKind::RocmInt8PackedGemm;
+            return PreparedWeightKind::CpuPackedGemm;
+        };
 
         // Build bindings from global weights + resolved layer weights
         ModelWeightSetBuilder builder(strategy);
@@ -1660,12 +1836,30 @@ namespace llaminar2
                 return;
             WeightIdentity id;
             id.canonical_name = name;
+            id.model_id = strategy.model_id;
             id.role = role;
             id.logical_id = stableWeightLogicalId(name);
             WeightBinding binding;
+            binding.binding_id = stableLegacyGraphBindingId(
+                strategy.model_id,
+                name,
+                role,
+                -1,
+                target_device);
             binding.identity = id;
             binding.tensor = tensor;
             binding.immutable = true;
+            binding.residency.home_device = target_device;
+            binding.residency.resident_device = target_device;
+            if (const auto kind = preparedKindFor(tensor, role);
+                kind != PreparedWeightKind::None)
+            {
+                binding.prepared = PreparedWeightRef{
+                    strategy.model_id,
+                    0,
+                    kind,
+                    target_device};
+            }
             builder.addBinding(std::move(binding));
         };
 
@@ -1688,13 +1882,31 @@ namespace llaminar2
                 std::string canonical = "blk." + std::to_string(layer_idx) + "." + suffix;
                 WeightIdentity id;
                 id.canonical_name = canonical;
+                id.model_id = strategy.model_id;
                 id.role = role;
                 id.layer = layer_idx;
                 id.logical_id = stableWeightLogicalId(canonical);
                 WeightBinding binding;
+                binding.binding_id = stableLegacyGraphBindingId(
+                    strategy.model_id,
+                    canonical,
+                    role,
+                    layer_idx,
+                    target_device);
                 binding.identity = id;
                 binding.tensor = tensor;
                 binding.immutable = true;
+                binding.residency.home_device = target_device;
+                binding.residency.resident_device = target_device;
+                if (const auto kind = preparedKindFor(tensor, role);
+                    kind != PreparedWeightKind::None)
+                {
+                    binding.prepared = PreparedWeightRef{
+                        strategy.model_id,
+                        0,
+                        kind,
+                        target_device};
+                }
                 builder.addBinding(std::move(binding));
             };
 
@@ -1710,8 +1922,8 @@ namespace llaminar2
             addLayer(lw.k_norm, "attn_k_norm.weight", WeightRole::Norm);
             addLayer(lw.attn_qkv, "attn_qkv.weight", WeightRole::FusedQKV);
             addLayer(lw.attn_gate, "attn_gate.weight", WeightRole::GDNProjection);
-            addLayer(lw.ssm_alpha, "ssm_alpha.weight", WeightRole::GDNSsmParam);
-            addLayer(lw.ssm_beta, "ssm_beta.weight", WeightRole::GDNSsmParam);
+            addLayer(lw.ssm_alpha, "ssm_alpha.weight", WeightRole::GDNProjection);
+            addLayer(lw.ssm_beta, "ssm_beta.weight", WeightRole::GDNProjection);
             addLayer(lw.ssm_conv1d, "ssm_conv1d.weight", WeightRole::GDNSsmParam);
             addLayer(lw.ssm_dt_bias, "ssm_dt.bias", WeightRole::Bias);
             addLayer(lw.ssm_a, "ssm_a", WeightRole::GDNSsmParam);
@@ -2293,11 +2505,73 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to create MTP KV cache depth " << depth);
                 return false;
             }
+            logKVCacheBom(("mtp_depth_" + std::to_string(depth)).c_str(),
+                          device,
+                          cache.get(),
+                          batch_size);
             state_.mtp_kv_caches.push_back(std::move(cache));
         }
 
         LOG_DEBUG("[DeviceGraphOrchestrator] Created " << state_.mtp_kv_caches.size()
                                                        << " request-local MTP KV cache(s)");
+        return true;
+    }
+
+    size_t DeviceGraphOrchestrator::localLogitsVocabColumns(const TensorBase *tensor) const
+    {
+        size_t storage_cols = 0;
+        if (tensor)
+        {
+            const auto &shape = tensor->shape();
+            storage_cols = shape.size() >= 2 ? shape[1] : 0;
+        }
+
+        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        {
+            const int configured_vocab_local = graph_builder_->config().vocab_local;
+            if (configured_vocab_local > 0)
+            {
+                const size_t semantic_cols = static_cast<size_t>(configured_vocab_local);
+                if (storage_cols == 0 || semantic_cols <= storage_cols)
+                    return semantic_cols;
+
+                LOG_WARN("[DeviceGraphOrchestrator] Configured local logits vocab "
+                         << semantic_cols << " exceeds backing storage columns "
+                         << storage_cols << "; using storage width");
+            }
+        }
+
+        return storage_cols;
+    }
+
+    size_t DeviceGraphOrchestrator::localLogitsRowStrideColumns(const TensorBase *tensor) const
+    {
+        if (!tensor)
+            return 0;
+        const auto &shape = tensor->shape();
+        const size_t storage_cols = shape.size() >= 2 ? shape[1] : 0;
+        return storage_cols > 0 ? storage_cols : localLogitsVocabColumns(tensor);
+    }
+
+    bool DeviceGraphOrchestrator::activeMainLogitsAreColumnParallel() const
+    {
+        if (!state_.logits_local || !graph_builder_)
+            return false;
+
+        const auto &config = graph_builder_->config();
+        if (!config.lm_head_column_parallel)
+            return false;
+
+        /*
+         * Phase-split TP/EP reserves LOGITS_LOCAL with full-width storage so
+         * prefill can use column-parallel LM-head output, but decode writes the
+         * authoritative replicated row to LOGITS.  Treating LOGITS_LOCAL as
+         * active during decode reuses the last prefill row.
+         */
+        if (current_phase_ == InferencePhase::DECODE &&
+            config.dense_tp_decode_replicated)
+            return false;
+
         return true;
     }
 
@@ -2450,7 +2724,12 @@ namespace llaminar2
 
         auto finalize = [&](GraphBuildResult result) -> GraphBuildResult
         {
-            if (!result || raw_expert_weights_released_after_graph_build_ || !graph_builder_)
+            if (!result)
+                return result;
+
+            applyCurrentExpertReplicaSetToGraph(result.graph());
+
+            if (raw_expert_weights_released_after_graph_build_ || !graph_builder_)
                 return result;
 
             const auto &cfg = graph_builder_->config();
@@ -2534,6 +2813,50 @@ namespace llaminar2
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Building FULL forward graph...");
             return finalize(session.buildForward());
+        }
+    }
+
+    void DeviceGraphOrchestrator::applyCurrentExpertReplicaSetToGraph(ComputeGraph &graph)
+    {
+        if (current_expert_replica_participant_id_ < 0)
+            return;
+
+        int count = 0;
+        for (const auto &node_name : graph.getExecutionOrder())
+        {
+            ComputeNode *node = graph.getNode(node_name);
+            if (!node || !node->stage || node->stage->type() != ComputeStageType::MOE_EXPERT_FFN)
+                continue;
+
+            auto *moe = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+            if (!moe)
+                continue;
+
+            moe->setReplicaSet(current_expert_replica_set_,
+                               current_expert_replica_participant_id_);
+            ++count;
+        }
+
+        const std::string device =
+            graph_builder_ ? graph_builder_->config().default_device.toString() : std::string{};
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "replica_set_graph_stage_applications",
+            static_cast<double>(count),
+            "rebalance",
+            device,
+            {{"domain_id", current_expert_replica_set_.domain_id},
+             {"participant", std::to_string(current_expert_replica_participant_id_)},
+             {"replica_epoch", std::to_string(current_expert_replica_epoch_)},
+             {"replicas", std::to_string(current_expert_replica_set_.num_replicated)}});
+
+        if (count > 0)
+        {
+            LOG_DEBUG("[DGO] Applied persisted expert replica info ("
+                      << current_expert_replica_set_.num_replicated
+                      << " replicas) to " << count
+                      << " newly built MoE stages (participant "
+                      << current_expert_replica_participant_id_ << ")");
         }
     }
 
@@ -2678,21 +3001,29 @@ namespace llaminar2
             collective_segmented_backend_supported = collectivesSupportSegmentedReplay();
         }
 
+        bool captured_collectives_backend_supported = false;
+        if (has_collective_nodes && env.execution.gpu_graph_capture_collectives)
+        {
+            captured_collectives_backend_supported = collectivesSupportCapturedGraph();
+        }
+
         policy.collective_segmented_enabled =
             has_collective_nodes &&
             allow_collective_segmented &&
             collective_segmented_backend_supported;
 
         // Capturing TP collectives directly into HIP/CUDA graphs is still an
-        // experimental Tier-2 collective-capture project. By default, graphs
-        // that contain collectives may use segmented replay only when the
-        // explicit segmented-collective switch is enabled; the collective
-        // stages themselves stay manual synchronization points.
-        policy.collectives_graph_capturable = false;
+        // experimental Tier-2 collective-capture project. It is off by default
+        // and only admitted for homogeneous same-rank LocalTP NCCL/RCCL domains.
+        policy.collectives_graph_capturable =
+            has_collective_nodes &&
+            env.execution.gpu_graph_capture_collectives &&
+            captured_collectives_backend_supported;
 
         const bool can_use_segmented_graph =
             !has_collective_nodes ||
-            policy.collective_segmented_enabled;
+            policy.collective_segmented_enabled ||
+            policy.collectives_graph_capturable;
 
         // When profiling is enabled (LLAMINAR_PROFILING=1), disable GPU graph
         // capture/replay so decode runs through executeFastDecode(). This ensures
@@ -2708,6 +3039,20 @@ namespace llaminar2
             segment_consecutive_failures < DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
 
         policy.max_segment_failures = DeviceGraphExecutor::GraphSegmentCache::kMaxFailures;
+
+        if (has_collective_nodes && env.execution.gpu_graph_capture_collectives)
+        {
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_collective_graph_capture_policy",
+                1.0,
+                "decode",
+                ctx ? ctx->deviceId().toString() : std::string{},
+                {{"requested", "true"},
+                 {"allowed", boolTag(policy.collectives_graph_capturable)},
+                 {"backend_supported", boolTag(captured_collectives_backend_supported)},
+                 {"reason", capturedCollectiveRejectReason(captured_collectives_backend_supported)}});
+        }
         return policy;
     }
 
@@ -2743,6 +3088,54 @@ namespace llaminar2
         }
 
         return supported;
+    }
+
+    bool DeviceGraphOrchestrator::collectivesSupportCapturedGraph() const
+    {
+        const auto &graph_cfg = graph_builder_->config();
+        const ITPContext *tp_ctx = graph_cfg.tp_ctx;
+        if (!tp_ctx || !tp_ctx->isLocal() || tp_ctx->degree() <= 1)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for non-local or single-device TP");
+            return false;
+        }
+
+        const auto backend = tp_ctx->backend();
+        if (backend != CollectiveBackendType::NCCL &&
+            backend != CollectiveBackendType::RCCL)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for backend "
+                      << collectiveBackendTypeToString(backend));
+            return false;
+        }
+
+        const auto *local_tp = dynamic_cast<const ILocalTPContext *>(tp_ctx);
+        if (!local_tp)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs because LOCAL TP context lacks local device list");
+            return false;
+        }
+
+        const auto &devices = local_tp->devices();
+        if (static_cast<int>(devices.size()) != tp_ctx->degree() || devices.empty())
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs because device list does not match TP degree");
+            return false;
+        }
+
+        const DeviceType expected_type =
+            backend == CollectiveBackendType::NCCL ? DeviceType::CUDA : DeviceType::ROCm;
+        for (const auto &device : devices)
+        {
+            if (!device.isLocal() || !device.isGPU() || device.device_type != expected_type)
+            {
+                LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for non-homogeneous LocalTP device "
+                          << device.toString());
+                return false;
+            }
+        }
+
+        return true;
     }
 
     bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
@@ -3578,9 +3971,18 @@ namespace llaminar2
         // - LOCAL TP: Multiple devices within single rank (tp_ctx->isLocal() && degree() > 1)
         // - NODE_LOCAL TP: Cross-rank same node (tp_ctx->isNodeLocal())
         // - GLOBAL TP: Cross-rank (tp_ctx->isGlobal()) or MPI world_size > 1
-        bool use_sharded_cache = (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
+        const bool use_replicated_attention_state_cache =
+            config.dense_tp_enabled && config.dense_tp_decode_replicated;
+        bool use_sharded_cache =
+            !use_replicated_attention_state_cache &&
+            (config.local_n_kv_heads > 0 && config.local_n_kv_heads < n_kv_heads);
         bool has_tp = config.tp_ctx && config.tp_ctx->degree() > 1;
         bool is_global_tp = !has_tp && mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        if (use_replicated_attention_state_cache)
+        {
+            LOG_DEBUG("[DeviceGraphOrchestrator] Dense decode replication requires full per-device KV cache; "
+                      "disabling TP KV sharding for this graph");
+        }
 
         // =====================================================================
         // KV Cache Creation: Per-stage for PP, single for non-PP
@@ -3669,6 +4071,7 @@ namespace llaminar2
                               << stage_device.to_string());
                     return false;
                 }
+                logKVCacheBom("pp", stage_device, state_.pp_kv_caches[stage_device].get(), batch_size);
             }
 
             LOG_DEBUG("[DeviceGraphOrchestrator] Created " << state_.pp_kv_caches.size()
@@ -3775,6 +4178,13 @@ namespace llaminar2
 
             // Create cache via factory (handles sharded vs non-sharded automatically)
             state_.kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+            if (!state_.kv_cache)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to create KV cache for device "
+                          << device.to_string());
+                return false;
+            }
+            logKVCacheBom("main", device, state_.kv_cache.get(), batch_size);
         }
 
         if (config.mtp.enabled)
@@ -4262,9 +4672,7 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                const auto &local_shape = state_.logits_local->shape();
-                const size_t local_vocab =
-                    local_shape.size() >= 2 ? local_shape[1] : static_cast<size_t>(std::max(0, config.vocab_local));
+                const size_t local_vocab = localLogitsVocabColumns(state_.logits_local.get());
                 if (local_vocab == 0)
                 {
                     LOG_ERROR("[DeviceGraphOrchestrator] All-position local logits require a non-zero local vocab");
@@ -4282,6 +4690,15 @@ namespace llaminar2
                 {
                     auto tensor = tensor_factory_->createFP32({rows, local_vocab}, state_.device_id);
                     local_logits_owner = std::shared_ptr<TensorBase>(tensor.release());
+                    if (local_logits_owner)
+                    {
+                        logVramBomLine(
+                            "dynamic_tensor_buffer",
+                            "device=" + state_.device_id.toString() +
+                                " name=all_position_logits_local rows=" + std::to_string(rows) +
+                                " cols=" + std::to_string(local_vocab) +
+                                " dtype=FP32 " + vramBomBytes(local_logits_owner->size_bytes()));
+                    }
                 }
                 state_.all_position_logits_local = local_logits_owner;
                 logits_local_output = state_.all_position_logits_local.get();
@@ -4305,6 +4722,15 @@ namespace llaminar2
                 {
                     auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
                     logits_owner = std::shared_ptr<TensorBase>(tensor.release());
+                    if (logits_owner)
+                    {
+                        logVramBomLine(
+                            "dynamic_tensor_buffer",
+                            "device=" + state_.device_id.toString() +
+                                " name=all_position_logits rows=" + std::to_string(rows) +
+                                " cols=" + std::to_string(vocab) +
+                                " dtype=FP32 " + vramBomBytes(logits_owner->size_bytes()));
+                    }
                 }
                 state_.all_position_logits = logits_owner;
                 logits_output = state_.all_position_logits.get();
@@ -4336,6 +4762,15 @@ namespace llaminar2
                 {
                     auto tensor = tensor_factory_->createFP32({rows, vocab}, state_.device_id);
                     logits_owner = std::shared_ptr<TensorBase>(tensor.release());
+                    if (logits_owner)
+                    {
+                        logVramBomLine(
+                            "dynamic_tensor_buffer",
+                            "device=" + state_.device_id.toString() +
+                                " name=all_position_logits rows=" + std::to_string(rows) +
+                                " cols=" + std::to_string(vocab) +
+                                " dtype=FP32 " + vramBomBytes(logits_owner->size_bytes()));
+                    }
                 }
                 state_.all_position_logits = logits_owner;
                 logits_output = state_.all_position_logits.get();
@@ -15115,8 +15550,7 @@ namespace llaminar2
             prefix_config.terminal_state != PrefixCacheTerminalStateMode::Off;
         const bool owns_terminal_state =
             !pp_stage_config_.has_value() || pp_stage_config_->has_lm_head;
-        const bool use_local_terminal_logits =
-            config.lm_head_column_parallel && static_cast<bool>(state_.logits_local);
+        const bool use_local_terminal_logits = activeMainLogitsAreColumnParallel();
         const auto *terminal_logits_tensor =
             use_local_terminal_logits ? state_.logits_local.get() : state_.logits.get();
         const size_t terminal_hidden_bytes =
@@ -15442,9 +15876,7 @@ namespace llaminar2
     bool DeviceGraphOrchestrator::restorePrefixTerminalState(const PrefixLookupResult &hit)
     {
         TensorBase *terminal_logits_tensor =
-            graph_builder_ && graph_builder_->config().lm_head_column_parallel && state_.logits_local
-                ? state_.logits_local.get()
-                : state_.logits.get();
+            activeMainLogitsAreColumnParallel() ? state_.logits_local.get() : state_.logits.get();
         const BufferId terminal_logits_buffer_id =
             terminal_logits_tensor == state_.logits_local.get() ? BufferId::LOGITS_LOCAL : BufferId::LOGITS;
 
@@ -15708,9 +16140,7 @@ namespace llaminar2
             }
 
             TensorBase *terminal_logits_tensor =
-                graph_builder_ && graph_builder_->config().lm_head_column_parallel && state_.logits_local
-                    ? state_.logits_local.get()
-                    : state_.logits.get();
+                activeMainLogitsAreColumnParallel() ? state_.logits_local.get() : state_.logits.get();
             if (ok && terminal_block && prefix_layout_.includes_terminal_logits &&
                 terminal_logits_tensor && handle.terminal_logits)
             {
@@ -16993,8 +17423,7 @@ namespace llaminar2
         // prefill and decode.  In GlobalTP/NodeLocalTP, the terminal restore path
         // repopulates logits_local, so greedy sampling must use the shard-local
         // tensor and coordinate the winning candidate across ranks.
-        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel &&
-            state_.logits_local)
+        if (activeMainLogitsAreColumnParallel())
         {
             const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
             void *stream = nullptr;
@@ -17062,7 +17491,7 @@ namespace llaminar2
         {
             return -1;
         }
-        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        if (activeMainLogitsAreColumnParallel())
         {
             return -1;
         }
@@ -17162,7 +17591,7 @@ namespace llaminar2
         {
             return false;
         }
-        if (!graph_builder_ || !graph_builder_->config().lm_head_column_parallel)
+        if (!activeMainLogitsAreColumnParallel())
         {
             return false;
         }
@@ -17184,7 +17613,7 @@ namespace llaminar2
         {
             return false;
         }
-        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel)
+        if (activeMainLogitsAreColumnParallel())
         {
             LOG_DEBUG("[DeviceGraphOrchestrator] Request-batched main-logits "
                       "sampling is not enabled for column-parallel LM heads");
@@ -17366,8 +17795,7 @@ namespace llaminar2
         {
             TensorBase *tensor = nullptr;
             int token_offset = 0;
-            if (graph_builder_ && graph_builder_->config().lm_head_column_parallel &&
-                state_.logits_local)
+            if (activeMainLogitsAreColumnParallel())
             {
                 tensor = state_.logits_local.get();
                 token_offset = vocabOffsetForTPConfig(graph_builder_->config());
@@ -17392,8 +17820,7 @@ namespace llaminar2
             return false;
 
         bool ok = false;
-        if (graph_builder_ && graph_builder_->config().lm_head_column_parallel &&
-            state_.logits_local)
+        if (activeMainLogitsAreColumnParallel())
         {
             const int token_offset = vocabOffsetForTPConfig(graph_builder_->config());
             ok = applyPenaltiesToTensorRowOnDevice(
@@ -20766,6 +21193,8 @@ namespace llaminar2
                 concrete_weight_manager->setPreparedWeightStore(prepared_weight_store_);
             }
         }
+        if (!frozen_weight_set_ && prepared_weight_store_->modelId().value != 0)
+            requested_model_id = prepared_weight_store_->modelId();
 
         if (!prepared_weight_store_->bindModelIdIfUnset(requested_model_id))
         {
@@ -20786,6 +21215,41 @@ namespace llaminar2
             for (const auto &binding : frozen_weight_set_->bindings())
                 next_binding_id = std::max(next_binding_id, binding.binding_id + 1);
         }
+        if (decode_replicated_dense_weight_set_)
+        {
+            for (const auto &binding : decode_replicated_dense_weight_set_->bindings())
+                next_binding_id = std::max(next_binding_id, binding.binding_id + 1);
+        }
+
+        auto embedding_vocab_metadata = [&](const WeightBinding &binding)
+        {
+            size_t vocab_offset = binding.slice.row_start;
+            size_t total_vocab = binding.slice.source_rows;
+            if (total_vocab == 0 && binding.slice.row_count > 0)
+                total_vocab = binding.slice.row_start + binding.slice.row_count;
+
+            if (total_vocab == 0)
+            {
+                const auto &cfg = graph_builder_->config();
+                vocab_offset = 0;
+                total_vocab = static_cast<size_t>(cfg.vocab_size);
+                if (cfg.tp_config)
+                {
+                    try
+                    {
+                        const auto &assignment = cfg.tp_config->forDevice(device);
+                        vocab_offset = static_cast<size_t>(assignment.vocab_start);
+                        total_vocab = static_cast<size_t>(cfg.tp_config->totalVocab());
+                    }
+                    catch (const std::exception &)
+                    {
+                        // Fall back to unsharded metadata above.
+                    }
+                }
+            }
+
+            return std::pair<size_t, size_t>{vocab_offset, total_vocab};
+        };
 
         auto register_if_prepared = [&](const WeightBinding &source_binding)
         {
@@ -20813,21 +21277,8 @@ namespace llaminar2
                         if (prepared_weight_store_->preparedRefForBinding(binding.binding_id, device).has_value())
                             return;
                         const auto &cfg = graph_builder_->config();
-                        size_t vocab_offset = 0;
-                        size_t total_vocab = static_cast<size_t>(cfg.vocab_size);
-                        if (cfg.tp_config)
-                        {
-                            try
-                            {
-                                const auto &assignment = cfg.tp_config->forDevice(device);
-                                vocab_offset = static_cast<size_t>(assignment.vocab_start);
-                                total_vocab = static_cast<size_t>(cfg.tp_config->totalVocab());
-                            }
-                            catch (const std::exception &)
-                            {
-                                // Fall back to unsharded metadata below.
-                            }
-                        }
+                        const auto [vocab_offset, total_vocab] =
+                            embedding_vocab_metadata(binding);
 
                         prepared_weight_store_->prepareEmbedding(
                             binding,
@@ -20873,7 +21324,12 @@ namespace llaminar2
             for (const auto &binding : frozen_weight_set_->bindings())
                 register_if_prepared(binding);
         }
-        else
+        if (decode_replicated_dense_weight_set_)
+        {
+            for (const auto &binding : decode_replicated_dense_weight_set_->bindings())
+                register_if_prepared(binding);
+        }
+        if (!frozen_weight_set_ && !decode_replicated_dense_weight_set_)
         {
             // Fallback for non-frozen legacy graph setup.
             weight_manager_->forEachPreparedWeight([&](const std::string &name, TensorBase *tensor)
@@ -20965,7 +21421,7 @@ namespace llaminar2
             params.down_exps = down_exps;
             params.prepared_store = prepared_weight_store_.get();
 
-            if (cfg.moe.expert_mode == MoEExpertMode::ExpertParallel)
+            if (cfg.moe.expert_mode == MoEExpertMode::ApportionedExperts)
             {
                 params.local_expert_start = cfg.moe.local_expert_start;
                 params.local_expert_count = cfg.moe.local_expert_count;
@@ -21160,10 +21616,172 @@ namespace llaminar2
         return result;
     }
 
+    std::vector<std::vector<bool>> DeviceGraphOrchestrator::transferExpertWeightsDirectForMasksFrom(
+        DeviceGraphOrchestrator &source,
+        const std::vector<std::vector<bool>> &masks)
+    {
+        std::vector<std::vector<bool>> remaining = masks;
+        if (&source == this)
+            return remaining;
+
+        auto collect_moe_stages = [](DeviceGraphOrchestrator &orchestrator)
+        {
+            std::unordered_map<int, std::vector<MoEExpertComputeStage *>> by_layer;
+
+            if (orchestrator.forward_engine_)
+            {
+                orchestrator.forward_engine_->forEachCachedStage(
+                    ComputeStageType::MOE_EXPERT_FFN,
+                    [&](IComputeStage *stage)
+                    {
+                        auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(stage);
+                        if (moe_stage && moe_stage->layerIndex() >= 0)
+                            by_layer[moe_stage->layerIndex()].push_back(moe_stage);
+                    });
+            }
+
+            if (by_layer.empty())
+            {
+                for (size_t layer = 0; layer < orchestrator.layer_graph_cache_.size(); ++layer)
+                {
+                    auto &cache = orchestrator.layer_graph_cache_[layer];
+                    if (!cache.valid || !cache.ffn_decode)
+                        continue;
+                    for (const auto &node_name : cache.ffn_decode->getExecutionOrder())
+                    {
+                        auto *node = cache.ffn_decode->getNode(node_name);
+                        if (!node || !node->stage ||
+                            node->stage->type() != ComputeStageType::MOE_EXPERT_FFN)
+                        {
+                            continue;
+                        }
+                        auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+                        if (moe_stage && moe_stage->layerIndex() >= 0)
+                            by_layer[moe_stage->layerIndex()].push_back(moe_stage);
+                    }
+                }
+            }
+
+            return by_layer;
+        };
+
+        auto src_by_layer = collect_moe_stages(source);
+        auto dst_by_layer = collect_moe_stages(*this);
+        if (src_by_layer.empty() || dst_by_layer.empty())
+            return remaining;
+
+        int copied_layers = 0;
+        int copied_experts = 0;
+        for (size_t layer_idx = 0; layer_idx < remaining.size(); ++layer_idx)
+        {
+            auto src_it = src_by_layer.find(static_cast<int>(layer_idx));
+            auto dst_it = dst_by_layer.find(static_cast<int>(layer_idx));
+            if (src_it == src_by_layer.end() || dst_it == dst_by_layer.end())
+                continue;
+
+            std::vector<int> expert_ids;
+            const auto &layer_mask = remaining[layer_idx];
+            for (size_t expert_idx = 0; expert_idx < layer_mask.size(); ++expert_idx)
+            {
+                if (layer_mask[expert_idx])
+                    expert_ids.push_back(static_cast<int>(expert_idx));
+            }
+            if (expert_ids.empty())
+                continue;
+
+            std::vector<int> satisfied_counts(remaining[layer_idx].size(), 0);
+            int required_stage_count = 0;
+            for (auto *dst_stage : dst_it->second)
+            {
+                if (!dst_stage)
+                    continue;
+                ++required_stage_count;
+
+                std::vector<int> stage_pending = expert_ids;
+                for (auto *src_stage : src_it->second)
+                {
+                    if (!src_stage || stage_pending.empty())
+                        continue;
+
+                    void *source_producer_stream = src_stage->gpuStream();
+                    if (!source_producer_stream && source.primaryDeviceId().is_gpu())
+                    {
+                        source_producer_stream =
+                            source.explicitGPUStreamForOperation("moe_gpu_direct_transfer_source");
+                    }
+                    if (!source_producer_stream)
+                        continue;
+
+                    auto satisfied_experts =
+                        dst_stage->transferExpertsGPUDirectFrom(
+                            *src_stage,
+                            stage_pending,
+                            source_producer_stream);
+                    if (satisfied_experts.empty())
+                        continue;
+
+                    for (int expert_id : satisfied_experts)
+                    {
+                        if (expert_id >= 0 &&
+                            expert_id < static_cast<int>(satisfied_counts.size()))
+                        {
+                            ++satisfied_counts[static_cast<size_t>(expert_id)];
+                        }
+                    }
+
+                    stage_pending.erase(
+                        std::remove_if(stage_pending.begin(),
+                                       stage_pending.end(),
+                                       [&](int expert_id)
+                                       {
+                                           return std::find(satisfied_experts.begin(),
+                                                            satisfied_experts.end(),
+                                                            expert_id) != satisfied_experts.end();
+                                       }),
+                        stage_pending.end());
+                }
+            }
+
+            if (required_stage_count == 0)
+                continue;
+
+            for (int expert_id : expert_ids)
+            {
+                if (expert_id >= 0 &&
+                    expert_id < static_cast<int>(remaining[layer_idx].size()) &&
+                    remaining[layer_idx][static_cast<size_t>(expert_id)] &&
+                    expert_id < static_cast<int>(satisfied_counts.size()) &&
+                    satisfied_counts[static_cast<size_t>(expert_id)] >= required_stage_count)
+                {
+                    remaining[layer_idx][static_cast<size_t>(expert_id)] = false;
+                    ++copied_experts;
+                }
+            }
+            ++copied_layers;
+        }
+
+        if (copied_experts > 0)
+        {
+            LOG_DEBUG("[DGO] GPU-direct/local satisfied " << copied_experts
+                                                          << " expert arrival mask entries across "
+                                                          << copied_layers << " layer(s) from sibling orchestrator");
+        }
+
+        return remaining;
+    }
+
     void DeviceGraphOrchestrator::setExpertReplicaSetForParticipant(
         const ExpertReplicaSet &replicas, int participant_id)
     {
         validateMoERebalanceDomain(*this, replicas.domain_id, "setExpertReplicaSetForParticipant");
+
+        const bool replica_placement_changed =
+            current_expert_replica_participant_id_ != participant_id ||
+            !replicas.sameReplicaPlacement(current_expert_replica_set_);
+        current_expert_replica_set_ = replicas;
+        current_expert_replica_participant_id_ = participant_id;
+        if (replica_placement_changed)
+            ++current_expert_replica_epoch_;
 
         int count = 0;
         if (forward_engine_)
@@ -21180,6 +21798,21 @@ namespace llaminar2
                     }
                 });
         }
+
+        const std::string device =
+            graph_builder_ ? graph_builder_->config().default_device.toString() : std::string{};
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "replica_set_cached_stage_applications",
+            static_cast<double>(count),
+            "rebalance",
+            device,
+            {{"domain_id", replicas.domain_id},
+             {"participant", std::to_string(participant_id)},
+             {"replicas", std::to_string(replicas.num_replicated)},
+             {"replica_epoch", std::to_string(current_expert_replica_epoch_)},
+             {"placement_changed", replica_placement_changed ? "true" : "false"},
+             {"forward_engine", forward_engine_ ? "true" : "false"}});
 
         LOG_DEBUG("[DGO] Set expert replica info (" << replicas.num_replicated
                                                     << " replicas) on " << count

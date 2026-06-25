@@ -64,6 +64,7 @@ namespace llaminar2
         int overlay_participant_world_rank = -1;
         DeviceId target_device = DeviceId::cpu();
         std::optional<DeviceId> lookup_device;
+        bool bypass_tensor_parallel = false;
         WeightHostPolicy host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
         PreparedWeightKind expected_prepared_kind = PreparedWeightKind::None;
         WeightSliceSpec slice;

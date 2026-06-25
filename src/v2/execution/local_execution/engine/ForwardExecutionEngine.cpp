@@ -317,8 +317,12 @@ namespace llaminar2
             const ForwardInput &input,
             bool snapshots_active,
             bool moe_rebalancing_active,
-            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default)
+            PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
+            bool collectives_graph_capturable = false,
+            bool host_policy_disabled = false)
         {
+            if (host_policy_disabled)
+                return PrefillGraphRejectReason::HostPolicyDisabled;
             return cache.preflight(
                 graph,
                 key,
@@ -327,7 +331,8 @@ namespace llaminar2
                 moe_rebalancing_active,
                 effectiveRealSeqLen(input),
                 effectiveBucketSeqLen(input),
-                mode);
+                mode,
+                collectives_graph_capturable);
         }
 
         /// @brief Deterministic tie-breaker for bucketed forward-cache LRU victims.
@@ -1698,6 +1703,13 @@ namespace llaminar2
             const bool wants_main_decode_sync_defer =
                 !all_position_verifier &&
                 host.shouldDeferMainDecodeFinalSync();
+            const bool wants_captured_collective_sync_defer =
+                !all_position_verifier &&
+                has_collective_nodes &&
+                capture_policy.collectives_graph_capturable &&
+                debugEnv().execution.gpu_graph_defer_captured_collective_final_sync &&
+                !debugEnv().gpu_stage_timing &&
+                !debugEnv().gpu_stage_timing_detail;
 
             if (capture_policy.allow_segmented_capture &&
                 wants_all_position_sync_defer)
@@ -1705,18 +1717,20 @@ namespace llaminar2
                 capture_policy.defer_final_sync = true;
             }
             else if (capture_policy.allow_segmented_capture &&
-                     wants_main_decode_sync_defer)
+                     (wants_main_decode_sync_defer ||
+                      wants_captured_collective_sync_defer))
             {
                 capture_policy.defer_final_sync = true;
             }
             requested_deferred_all_position_sync =
                 wants_all_position_sync_defer;
             requested_deferred_main_decode_sync =
-                wants_main_decode_sync_defer;
+                wants_main_decode_sync_defer ||
+                wants_captured_collective_sync_defer;
             executed_deferred_all_position_sync =
                 wants_all_position_sync_defer && capture_policy.defer_final_sync;
             executed_deferred_main_decode_sync =
-                wants_main_decode_sync_defer && capture_policy.defer_final_sync;
+                requested_deferred_main_decode_sync && capture_policy.defer_final_sync;
 
             PerfStatsCollector::addCounter(
                 "forward_graph",
@@ -2001,6 +2015,14 @@ namespace llaminar2
         const bool padded_bucket = isPaddedBucketExecution(input);
         const bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
         const bool moe_rebalancing_active = host.isMoeRebalancingActive();
+        const bool host_prefill_graph_disabled = host.prefillGraphCaptureDisabledByHost();
+        const bool prefill_collectives_graph_capturable =
+            !forward_cache.collective_nodes.empty() &&
+            host.buildDecodeCapturePolicy(
+                    /*has_collective_nodes=*/true,
+                    ctx,
+                    /*segment_consecutive_failures=*/0)
+                .collectives_graph_capturable;
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
 
@@ -2118,7 +2140,9 @@ namespace llaminar2
                 input,
                 snapshots_active,
                 moe_rebalancing_active,
-                PrefillGraphPreflightMode::ColdPaddedSupport);
+                PrefillGraphPreflightMode::ColdPaddedSupport,
+                prefill_collectives_graph_capturable,
+                host_prefill_graph_disabled);
             padded_preflight_checked = true;
 
             if (padded_preflight_reason != PrefillGraphRejectReason::None)
@@ -2191,7 +2215,7 @@ namespace llaminar2
             return {gpu_ctx, forward_cache.prefill_capture_stream.stream};
         };
 
-        if (phase == PrefillGraphPhase::Ready)
+        if (phase == PrefillGraphPhase::Ready && !host_prefill_graph_disabled)
         {
             // === REPLAY PATH ===
             // Dynamic params already updated by executeCacheHit caller.
@@ -2243,7 +2267,9 @@ namespace llaminar2
                 input,
                 snapshots_active,
                 moe_rebalancing_active,
-                PrefillGraphPreflightMode::CaptureReady);
+                PrefillGraphPreflightMode::CaptureReady,
+                prefill_collectives_graph_capturable,
+                host_prefill_graph_disabled);
         }
 
         if (can_attempt_capture && capture_ready_reason == PrefillGraphRejectReason::None)
@@ -2362,7 +2388,9 @@ namespace llaminar2
                     moe_rebalancing_active,
                     padded_bucket
                         ? PrefillGraphPreflightMode::ColdPaddedSupport
-                        : PrefillGraphPreflightMode::Default);
+                        : PrefillGraphPreflightMode::Default,
+                    prefill_collectives_graph_capturable,
+                    host_prefill_graph_disabled);
             }
             cold_capture_candidate = (cold_reject_reason == PrefillGraphRejectReason::None);
         }
@@ -2521,6 +2549,17 @@ namespace llaminar2
         {
             PrefillGraphCache preflight_cache(makePrefillGraphConfigFromEnv());
             PrefillGraphCacheKey key = makePrefillGraphKey(effective_input, host);
+            bool prefill_collectives_graph_capturable = false;
+            if (!collective_nodes.empty())
+            {
+                IDeviceContext *prefill_preflight_ctx = host.getDeviceContext(effective_input.device);
+                prefill_collectives_graph_capturable =
+                    host.buildDecodeCapturePolicy(
+                        /*has_collective_nodes=*/true,
+                        prefill_preflight_ctx,
+                        /*segment_consecutive_failures=*/0)
+                        .collectives_graph_capturable;
+            }
 
             bucketed_prefill_reject_reason = preflightPrefillGraph(
                 preflight_cache,
@@ -2529,7 +2568,10 @@ namespace llaminar2
                 collective_nodes,
                 effective_input,
                 executor_.config().snapshot_callback != nullptr,
-                host.isMoeRebalancingActive());
+                host.isMoeRebalancingActive(),
+                PrefillGraphPreflightMode::Default,
+                prefill_collectives_graph_capturable,
+                host.prefillGraphCaptureDisabledByHost());
             bucketed_prefill_capture_candidate =
                 (bucketed_prefill_reject_reason == PrefillGraphRejectReason::None);
 

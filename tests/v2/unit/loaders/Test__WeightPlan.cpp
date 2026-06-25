@@ -3,12 +3,14 @@
 #include "loaders/WeightPlan.h"
 #include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
+#include "backends/ComputeBackend.h"
 #include "config/TensorParallelConfig.h"
 #include "models/GraphTypes.h"
 #include "../../mocks/MockModelLoader.h"
 #include "tensors/Tensors.h"
 
 #include <memory>
+#include <optional>
 #include <utility>
 
 using namespace llaminar2;
@@ -33,6 +35,20 @@ namespace
             binding.prepared = PreparedWeightRef{ModelContextId{7}, 0, prepared_kind, device};
         }
         return binding;
+    }
+
+    std::optional<DeviceId> firstAvailableGpuDevice()
+    {
+        auto &manager = DeviceManager::instance();
+        manager.initialize(-1, /*log_inventory=*/false);
+        for (const auto &device : manager.devices())
+        {
+            if (device.type == ComputeBackendType::GPU_CUDA)
+                return DeviceId::cuda(device.device_id);
+            if (device.type == ComputeBackendType::GPU_ROCM)
+                return DeviceId::rocm(device.device_id);
+        }
+        return std::nullopt;
     }
 }
 
@@ -200,6 +216,77 @@ TEST(Test__WeightManagerMaterialize, ProducesTiedAliasBindingFromSourceName)
     EXPECT_EQ(legacy.lm_head, embedding_binding.tensor);
 }
 
+TEST(Test__WeightManagerMaterialize, TiedAliasTPSliceHintPreservesMaterializedSliceMetadata)
+{
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("token_embd.weight", {128, 16})
+                      .build();
+
+    WeightManager manager(*loader, nullptr, nullptr,
+                          WeightDistributionStrategy::SHARDED,
+                          WeightPrecision::NATIVE);
+
+    WeightShardingConfig sharding;
+    sharding.exact_matches["output.weight"] = WeightShardingMode::ColumnParallel;
+    sharding.exact_dimension_matches["output.weight"] = WeightDimensionType::Vocab;
+    sharding.exact_matches["token_embd.weight"] = WeightShardingMode::ColumnParallel;
+    sharding.exact_dimension_matches["token_embd.weight"] = WeightDimensionType::Vocab;
+    manager.setWeightShardingConfig(sharding);
+
+    auto tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            2,
+            4,
+            4,
+            64,
+            128,
+            std::vector<DeviceId>{DeviceId::cuda(0), DeviceId::cuda(1)}));
+    manager.setTensorParallelConfig(tp_config);
+    const auto &rank1 = tp_config->forRank(1);
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::LocalTP;
+    strategy.model_id = ModelContextId{124};
+    strategy.tp_degree = 2;
+    strategy.devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+
+    WeightSliceSpec partial_vocab_hint;
+    partial_vocab_hint.source_rows = 128;
+    partial_vocab_hint.row_start = static_cast<size_t>(rank1.vocab_start);
+    partial_vocab_hint.row_count = static_cast<size_t>(rank1.vocab_count);
+
+    WeightPlan plan(strategy);
+    WeightRequirement lm_head_alias;
+    lm_head_alias.canonical_name = "output.weight";
+    lm_head_alias.source_name = "output.weight";
+    lm_head_alias.role = WeightRole::LMHead;
+    lm_head_alias.derivation = WeightDerivationKind::TiedAlias;
+    lm_head_alias.target_device = DeviceId::cuda(1);
+    lm_head_alias.lookup_device = DeviceId::cuda(1);
+    lm_head_alias.tp_domain = 0;
+    lm_head_alias.tp_rank_or_device_index = 1;
+    lm_head_alias.expected_prepared_kind = PreparedWeightKind::CudaInt8PackedGemm;
+    lm_head_alias.slice = partial_vocab_hint;
+    plan.add(lm_head_alias);
+
+    FrozenModelWeightSet frozen = manager.materialize(plan);
+    const auto &binding = frozen.global("output.weight");
+
+    EXPECT_EQ(binding.identity.canonical_name, "output.weight");
+    EXPECT_EQ(binding.identity.derivation, WeightDerivationKind::TiedAlias);
+    ASSERT_NE(binding.tensor, nullptr);
+    ASSERT_EQ(binding.tensor->shape().size(), 2u);
+    EXPECT_EQ(binding.tensor->shape()[0], static_cast<size_t>(rank1.vocab_count));
+    EXPECT_EQ(binding.tensor->shape()[1], 16u);
+    EXPECT_EQ(binding.slice.source_rows, 128u);
+    EXPECT_EQ(binding.slice.source_cols, 16u);
+    EXPECT_EQ(binding.slice.row_start, static_cast<size_t>(rank1.vocab_start));
+    EXPECT_EQ(binding.slice.row_count, static_cast<size_t>(rank1.vocab_count));
+    EXPECT_EQ(binding.slice.col_start, 0u);
+    EXPECT_EQ(binding.slice.col_count, 16u);
+    EXPECT_TRUE(binding.slice.inner_is_presliced);
+}
+
 TEST(Test__WeightManagerPrepare, RegistersExactFrozenBindingRefs)
 {
     auto loader = MockModelLoaderBuilder()
@@ -362,6 +449,111 @@ TEST(Test__WeightManagerMaterialize, LookupDeviceCanDifferFromTargetDevice)
     EXPECT_NE(binding.tensor, nullptr);
 }
 
+TEST(Test__WeightManagerPrepare, GpuFrozenBindingWithoutPreparedHintIsPreparedByStructure)
+{
+    const auto gpu = firstAvailableGpuDevice();
+    if (!gpu)
+        GTEST_SKIP() << "No CUDA/ROCm GPU available";
+
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("blk.0.ffn_down.weight", {16, 64})
+                      .build();
+
+    WeightManager manager(*loader);
+    WeightShardingConfig sharding;
+    manager.setWeightShardingConfig(sharding);
+
+    auto store = std::make_shared<PreparedWeightStore>(ModelContextId{909});
+    manager.setPreparedWeightStore(store);
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{909};
+    strategy.devices = {*gpu};
+
+    WeightPlan plan(strategy);
+    WeightRequirement requirement;
+    requirement.canonical_name = "blk.0.ffn_down.weight";
+    requirement.layer = 0;
+    requirement.target_device = *gpu;
+    requirement.lookup_device = DeviceId::cpu();
+    requirement.expected_prepared_kind = PreparedWeightKind::None;
+    requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+    plan.add(requirement);
+
+    FrozenModelWeightSet frozen = manager.materialize(plan);
+    const auto &binding = frozen.layer(0, "ffn_down.weight");
+    ASSERT_FALSE(binding.prepared.has_value());
+
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, *gpu, /*include_expert_jobs=*/false));
+
+    auto prepared = store->preparedRefForBinding(binding.binding_id, *gpu);
+    ASSERT_TRUE(prepared.has_value());
+    EXPECT_EQ(prepared->binding_id, binding.binding_id);
+    EXPECT_EQ(prepared->device, *gpu);
+    EXPECT_EQ(prepared->kind, gpu->is_cuda()
+                                  ? PreparedWeightKind::CudaInt8PackedGemm
+                                  : PreparedWeightKind::RocmInt8PackedGemm);
+}
+
+TEST(Test__WeightManagerPrepare, GpuGdnAlphaBetaProjectionBindingsArePreparedByStructure)
+{
+    const auto gpu = firstAvailableGpuDevice();
+    if (!gpu)
+        GTEST_SKIP() << "No CUDA/ROCm GPU available";
+
+    auto loader = MockModelLoaderBuilder()
+                      .addFP32RandomTensor("blk.0.ssm_alpha.weight", {4, 8})
+                      .addFP32RandomTensor("blk.0.ssm_beta.weight", {4, 8})
+                      .build();
+
+    WeightManager manager(*loader);
+    WeightShardingConfig sharding;
+    sharding.exact_matches["blk.0.ssm_alpha.weight"] = WeightShardingMode::ColumnParallel;
+    sharding.exact_dimension_matches["blk.0.ssm_alpha.weight"] = WeightDimensionType::ProportionalHeads;
+    sharding.exact_matches["blk.0.ssm_beta.weight"] = WeightShardingMode::ColumnParallel;
+    sharding.exact_dimension_matches["blk.0.ssm_beta.weight"] = WeightDimensionType::ProportionalHeads;
+    manager.setWeightShardingConfig(sharding);
+
+    auto store = std::make_shared<PreparedWeightStore>(ModelContextId{910});
+    manager.setPreparedWeightStore(store);
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{910};
+    strategy.devices = {*gpu};
+
+    WeightPlan plan(strategy);
+    for (const std::string &name : {"blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.layer = 0;
+        requirement.target_device = *gpu;
+        requirement.lookup_device = DeviceId::cpu();
+        requirement.expected_prepared_kind = PreparedWeightKind::None;
+        requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+        plan.add(requirement);
+    }
+
+    FrozenModelWeightSet frozen = manager.materialize(plan);
+    const auto &alpha_binding = frozen.layer(0, "ssm_alpha.weight");
+    const auto &beta_binding = frozen.layer(0, "ssm_beta.weight");
+    EXPECT_EQ(alpha_binding.identity.role, WeightRole::GDNProjection);
+    EXPECT_EQ(beta_binding.identity.role, WeightRole::GDNProjection);
+    ASSERT_FALSE(alpha_binding.prepared.has_value());
+    ASSERT_FALSE(beta_binding.prepared.has_value());
+
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, *gpu, /*include_expert_jobs=*/false));
+
+    auto alpha_prepared = store->preparedRefForBinding(alpha_binding.binding_id, *gpu);
+    auto beta_prepared = store->preparedRefForBinding(beta_binding.binding_id, *gpu);
+    ASSERT_TRUE(alpha_prepared.has_value());
+    ASSERT_TRUE(beta_prepared.has_value());
+    EXPECT_EQ(alpha_prepared->binding_id, alpha_binding.binding_id);
+    EXPECT_EQ(beta_prepared->binding_id, beta_binding.binding_id);
+}
+
 TEST(Test__WeightManagerMaterialize, FrozenBindingsRetainMaterializedTPSlices)
 {
     auto loader = MockModelLoaderBuilder()
@@ -457,7 +649,7 @@ TEST(Test__ModelWeightBindings, AdaptsFrozenBindingsToLegacyPointers)
         PreparedWeightKind::None,
         post_attn_norm.get());
     embedding_binding.identity.role = WeightRole::Embedding;
-    gdn_binding.identity.role = WeightRole::GDNSsmParam;
+    gdn_binding.identity.role = WeightRole::GDNProjection;
     moe_binding.identity.role = WeightRole::MoEExpertGate;
     dt_bias_binding.identity.role = WeightRole::Bias;
     post_attn_norm_binding.identity.role = WeightRole::Norm;
@@ -478,7 +670,7 @@ TEST(Test__ModelWeightBindings, AdaptsFrozenBindingsToLegacyPointers)
     ASSERT_NE(layer_bindings.ssm_dt_bias, nullptr);
     ASSERT_NE(layer_bindings.ffn_norm, nullptr);
     ASSERT_NE(layer_bindings.moe_gate_exps, nullptr);
-    EXPECT_EQ(layer_bindings.ssm_alpha->identity.role, WeightRole::GDNSsmParam);
+    EXPECT_EQ(layer_bindings.ssm_alpha->identity.role, WeightRole::GDNProjection);
     EXPECT_EQ(layer_bindings.ssm_dt_bias->tensor, gdn_dt_bias.get());
     EXPECT_EQ(layer_bindings.ffn_norm->tensor, post_attn_norm.get());
     EXPECT_EQ(layer_bindings.moe_gate_exps->identity.role, WeightRole::MoEExpertGate);

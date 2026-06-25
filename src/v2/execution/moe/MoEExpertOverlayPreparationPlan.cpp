@@ -134,7 +134,7 @@ namespace llaminar2
             int expert_id)
         {
             auto participants = preparationParticipantsFor(domain);
-            if (domain.compute_kind != ExpertDomainComputeKind::ReplicatedExperts ||
+            if (domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts ||
                 participants.size() <= 1 ||
                 owner_map == nullptr)
             {
@@ -381,13 +381,13 @@ namespace llaminar2
         if (std::any_of(runtime_plan.domains().begin(), runtime_plan.domains().end(),
                         [](const auto &domain)
                         {
-                            return domain.compute_kind == ExpertDomainComputeKind::ReplicatedExperts &&
+                            return domain.compute_kind == ExpertDomainComputeKind::ApportionedExperts &&
                                    domain.participants.size() > 1;
                         }))
         {
             owner_map = MoEExpertOwnerMap::build(
                 source,
-                MoEExpertOwnerMapBuildOptions{.reject_tensor_parallel_experts = false});
+                MoEExpertOwnerMapBuildOptions{.reject_sharded_experts = false});
         }
 
         for (const auto &placement : source.placements)

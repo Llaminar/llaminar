@@ -1677,6 +1677,15 @@ set_tests_properties(V2_Unit_NativeVNNIDispatchRefreshScript PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_Qwen36MoEGPURebalanceSprintScript
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_qwen36_moe_gpu_rebalance_sprint.py
+)
+set_tests_properties(V2_Unit_Qwen36MoEGPURebalanceSprintScript PROPERTIES
+    LABELS "V2;Unit;MoE;Benchmark;CUDA;ROCm;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_CUDAGemvDispatchGeneratorAliases
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_generator.py
@@ -5727,10 +5736,51 @@ if(ZLIB_FOUND)
     )
     discover_v2_parity_tests(v2_integration_parity_qwen36moe_expert_overlay_prefix_mtp
         TEST_PREFIX V2_Integration_Parity_Qwen36MoE_ExpertOverlay
-        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ExpertOverlay;SparseCollectives;ROCm;CPU;LocalTP;PyTorch"
+        LABELS "V2;Integration;Parity;Qwen36MoE;PrefixCache;MTP;RealModel;ExpertOverlay;SparseCollectives;CUDA;ROCm;NCCL;RCCL;CPU;LocalTP;PyTorch"
         MPI_PROCS 1
-        TIMEOUT 300
+        TIMEOUT 2400
     )
+
+    add_executable(v2_integration_parity_qwen36moe_expert_overlay_math
+        integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_MathParity.cpp
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy/cnpy.cpp
+    )
+    target_link_libraries(v2_integration_parity_qwen36moe_expert_overlay_math
+        llaminar2_core v2_test_utils GTest::gtest ZLIB::ZLIB
+    )
+    target_include_directories(v2_integration_parity_qwen36moe_expert_overlay_math PRIVATE
+        ${WORKSPACE_ROOT_PARITY}/external/cnpy
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    )
+    set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS
+        V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
+        CUDA ROCm NCCL RCCL LocalTP ExpertOverlay PhaseSplitHybridTP_AE
+        PyTorch GoldenReference FullModel
+    )
+    set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES
+        PrefillParity          CUDA2 Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport
+        PrefillParity          ROCm2 Qwen36MoE_ExpertOverlay_ROCm2TP_HotOnly_PhaseSplit_FP16Transport
+        DecodeParity           CUDA2 Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport
+        DecodeParity           ROCm2 Qwen36MoE_ExpertOverlay_ROCm2TP_HotOnly_PhaseSplit_FP16Transport
+        SnapshotInfrastructure CUDA2 Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport
+        SnapshotInfrastructure ROCm2 Qwen36MoE_ExpertOverlay_ROCm2TP_HotOnly_PhaseSplit_FP16Transport
+    )
+    list(LENGTH QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT)
+    math(EXPR QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_LAST "${QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT} - 1")
+    foreach(CASE_INDEX RANGE 0 ${QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_LAST} 3)
+        math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
+        math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
+        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${CASE_INDEX} CASE_NAME)
+        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${BACKEND_INDEX} CASE_BACKEND)
+        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
+        add_v2_test(V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_${CASE_NAME}_${CASE_BACKEND}
+            COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_expert_overlay_math>
+                    --gtest_filter=Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.${CASE_NAME}/${CASE_CONFIG}
+            LABELS ${QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS}
+            MPI_PROCS 1
+            TIMEOUT 3600
+        )
+    endforeach()
 
     add_executable(v2_integration_parity_qwen36moe_single_device
         integration/parity/qwen36/Test__Qwen36MoE_SingleDevice_Parity.cpp
@@ -5901,7 +5951,7 @@ if(ZLIB_FOUND)
 
     discover_v2_parity_tests(v2_integration_parity_qwen35moe_expert_overlay
         TEST_PREFIX V2_Integration_Parity_Qwen35MoEExpertOverlay
-        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;ReplicatedExperts;ModelLight"
+        LABELS "V2;Integration;Parity;Qwen35MoE;ExpertOverlay;MixtureOfExperts;MPI;ROCm;CUDA;CPU;NodeLocalTP;ApportionedExperts;ModelLight"
         MPI_PROCS 2
         TIMEOUT 600
     )
@@ -10349,11 +10399,26 @@ endif()
 # GPU Expert Transfer Unit Tests
 # =============================================================================
 # Tests GPU↔GPU (peer DMA or host-staged) transfer of packed MoE expert
-# weight arrays between ROCm devices. Requires ≥2 ROCm GPUs.
+# weight arrays between same-backend CUDA or ROCm devices. D2D tests require
+# ≥2 devices for the backend being exercised.
 
-if(HAVE_ROCM)
-    add_executable(v2_unit_gpu_expert_transfer
+if(HAVE_CUDA OR HAVE_ROCM)
+    set(V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
         unit/moe/Test__GPUExpertTransfer.cpp
+    )
+    if(HAVE_CUDA)
+        list(APPEND V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
+            unit/moe/Test__GPUExpertTransfer_CUDA.cpp
+        )
+    endif()
+    if(HAVE_ROCM)
+        list(APPEND V2_GPU_EXPERT_TRANSFER_TEST_SOURCES
+            unit/moe/Test__GPUExpertTransfer_ROCm.cpp
+        )
+    endif()
+
+    add_executable(v2_unit_gpu_expert_transfer
+        ${V2_GPU_EXPERT_TRANSFER_TEST_SOURCES}
     )
     target_link_libraries(v2_unit_gpu_expert_transfer
         llaminar2_core
@@ -10362,7 +10427,7 @@ if(HAVE_ROCM)
     )
     add_v2_test(V2_Integration_GPUExpertTransfer
         COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
-        LABELS "V2;Integration;MoE;GPUTransfer;ROCm"
+        LABELS "V2;Integration;MoE;GPUTransfer"
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added GPU Expert Transfer integration tests")

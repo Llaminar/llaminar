@@ -39,6 +39,17 @@ static __global__ void fp16_to_fp32_kernel(const __half *__restrict__ input,
     }
 }
 
+static __global__ void fp32_peer_add_kernel(float *__restrict__ dst,
+                                            const float *__restrict__ peer,
+                                            const size_t count)
+{
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < count)
+    {
+        dst[idx] += peer[idx];
+    }
+}
+
 // ============================================================================
 // Host API — called from LocalTPContext
 // ============================================================================
@@ -99,5 +110,94 @@ extern "C"
     {
         cudaSetDevice(ordinal);
         cudaFree(buf);
+    }
+
+    int cudaLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal)
+    {
+        if (!event_out)
+            return static_cast<int>(cudaErrorInvalidValue);
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return static_cast<int>(err);
+        cudaEvent_t event;
+        err = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+        if (err != cudaSuccess)
+        {
+            *event_out = nullptr;
+            return static_cast<int>(err);
+        }
+        *event_out = static_cast<void *>(event);
+        return static_cast<int>(cudaSuccess);
+    }
+
+    void cudaLocalTPSmallFP32AllreduceDestroyEvent(void *event, int ordinal)
+    {
+        if (!event)
+            return;
+        (void)cudaSetDevice(ordinal);
+        (void)cudaEventDestroy(static_cast<cudaEvent_t>(event));
+    }
+
+    int cudaLocalTPSmallFP32AllreduceRecordEvent(void *event, int ordinal, void *stream)
+    {
+        if (!event || !stream)
+            return static_cast<int>(cudaErrorInvalidValue);
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return static_cast<int>(err);
+        err = cudaEventRecord(static_cast<cudaEvent_t>(event), static_cast<cudaStream_t>(stream));
+        return static_cast<int>(err);
+    }
+
+    int cudaLocalTPSmallFP32AllreduceWaitEvent(void *event, int ordinal, void *stream)
+    {
+        if (!event || !stream)
+            return static_cast<int>(cudaErrorInvalidValue);
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return static_cast<int>(err);
+        err = cudaStreamWaitEvent(static_cast<cudaStream_t>(stream), static_cast<cudaEvent_t>(event), 0);
+        return static_cast<int>(err);
+    }
+
+    int cudaLocalTPSmallFP32AllreduceCanAccessPeer(int ordinal, int peer_ordinal)
+    {
+        int can_access = 0;
+        cudaError_t err = cudaDeviceCanAccessPeer(&can_access, ordinal, peer_ordinal);
+        if (err != cudaSuccess)
+            return 0;
+        return can_access != 0;
+    }
+
+    int cudaLocalTPSmallFP32AllreduceEnablePeerAccess(int ordinal, int peer_ordinal)
+    {
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return static_cast<int>(err);
+        err = cudaDeviceEnablePeerAccess(peer_ordinal, 0);
+        if (err == cudaErrorPeerAccessAlreadyEnabled)
+        {
+            (void)cudaGetLastError();
+            return static_cast<int>(cudaSuccess);
+        }
+        return static_cast<int>(err);
+    }
+
+    int cudaLocalTPSmallFP32AllreduceLaunch(float *dst, const float *peer,
+                                            size_t count, int ordinal, void *stream)
+    {
+        if (!dst || !peer || !stream)
+            return static_cast<int>(cudaErrorInvalidValue);
+        if (count == 0)
+            return static_cast<int>(cudaSuccess);
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return static_cast<int>(err);
+
+        constexpr int BLOCK_SIZE = 256;
+        const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        fp32_peer_add_kernel<<<grid_size, BLOCK_SIZE, 0, static_cast<cudaStream_t>(stream)>>>(
+            dst, peer, count);
+        return static_cast<int>(cudaGetLastError());
     }
 }

@@ -13,6 +13,7 @@
 #include "NCCLBackend.h"
 #include "../coordinators/NCCLCoordinator.h"
 #include "../../utils/Logger.h"
+#include "../../utils/VramBillOfMaterials.h"
 
 #ifdef HAVE_NCCL
 #include <mpi.h>
@@ -1187,6 +1188,12 @@ namespace llaminar2
                 return false;
             }
             strided_allgather_temp_size_ = alloc_bytes;
+            logVramBomLine(
+                "collective_temp_buffer",
+                "backend=NCCL name=strided_allgather_temp requested_bytes=" +
+                    std::to_string(temp_buffer_bytes) +
+                    " requested_mib=" + vramBomMiB(temp_buffer_bytes) +
+                    " " + vramBomBytes(alloc_bytes));
             LOG_DEBUG("[NCCLBackend] Allocated persistent stridedAllgather temp buffer: " << alloc_bytes << " bytes");
         }
 

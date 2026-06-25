@@ -103,6 +103,23 @@ struct PrefillNVNNITraits {
     static constexpr int center_5bit = (FMT == NVNNI_PF_Q5_0) ? 16 : 0;
 };
 
+template <NativeVNNIFormatPrefill FMT>
+__device__ __forceinline__ bool prefill_native_vnni_desc_shape_ok(
+    const DeviceNativeVNNIMatrixDesc& desc,
+    int N,
+    int K)
+{
+    using Traits = PrefillNVNNITraits<FMT>;
+    return desc.payload &&
+           desc.scales &&
+           desc.n == N &&
+           desc.k == K &&
+           desc.blocks_per_row == static_cast<uint32_t>(K / 32) &&
+           desc.codebook_id == static_cast<uint8_t>(FMT) &&
+           (!(Traits::is_asymmetric || Traits::is_dual_scale) || desc.mins) &&
+           (!Traits::is_dual_scale_asym || desc.emins);
+}
+
 __host__ __device__ inline int rocm_moe_select_grouped_prefill_tile_m(
     int requested_tile_m,
     int max_tokens_per_expert)
@@ -575,6 +592,19 @@ __device__ __forceinline__ float moe_prefill_dot_desc_range(
     int b_end)
 {
     using Traits = PrefillNVNNITraits<FMT>;
+    if (!slot_A ||
+        !slot_scales ||
+        n < 0 ||
+        n >= N ||
+        desc.n != N ||
+        desc.blocks_per_row == 0 ||
+        b_start < 0 ||
+        b_end > static_cast<int>(desc.blocks_per_row) ||
+        !prefill_native_vnni_desc_shape_ok<FMT>(
+            desc, N, static_cast<int>(desc.blocks_per_row) * 32))
+    {
+        return 0.0f;
+    }
 
     const uint8_t* payload_base = desc.payload;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
@@ -747,8 +777,8 @@ void moe_grouped_gate_up_prefill_kpart_kernel(
 
     const DeviceNativeVNNIMatrixDesc& gate_desc = gate_descs[expert_id];
     const DeviceNativeVNNIMatrixDesc& up_desc = up_descs[expert_id];
-    if (gate_desc.codebook_id != static_cast<uint8_t>(FMT) ||
-        up_desc.codebook_id != static_cast<uint8_t>(FMT))
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !prefill_native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
         return;
 
 #pragma unroll
@@ -878,8 +908,8 @@ void moe_grouped_gate_up_swiglu_prefill_gemm_kernel(
     // Get weight descriptors for this expert
     const DeviceNativeVNNIMatrixDesc& gate_desc = gate_descs[expert_id];
     const DeviceNativeVNNIMatrixDesc& up_desc = up_descs[expert_id];
-    if (gate_desc.codebook_id != static_cast<uint8_t>(FMT) ||
-        up_desc.codebook_id != static_cast<uint8_t>(FMT))
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(gate_desc, N, K) ||
+        !prefill_native_vnni_desc_shape_ok<FMT>(up_desc, N, K))
         return;
 
     const uint8_t* gate_payload_base = gate_desc.payload;
@@ -1214,7 +1244,7 @@ void moe_grouped_down_prefill_gemm_kernel(
     const bool active = n < N;
 
     const DeviceNativeVNNIMatrixDesc& desc = down_descs[expert_id];
-    if (desc.codebook_id != static_cast<uint8_t>(FMT))
+    if (!prefill_native_vnni_desc_shape_ok<FMT>(desc, N, K))
         return;
 
     const uint8_t* payload_base = desc.payload;

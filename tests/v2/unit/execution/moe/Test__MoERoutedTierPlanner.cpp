@@ -26,7 +26,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -38,7 +38,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(0, 1)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -50,7 +50,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::MPI;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -204,7 +204,7 @@ namespace llaminar2::test
         EXPECT_TRUE(fallback_owner->device.is_cpu());
 
         auto tensor_parallel_routed = gpu_only_result.planned_plan;
-        tensor_parallel_routed.domains[1].compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        tensor_parallel_routed.domains[1].compute_kind = ExpertDomainComputeKind::ShardedExperts;
         EXPECT_THROW((void)MoEExpertOwnerMap::build(tensor_parallel_routed), std::invalid_argument);
 
         auto explicit_over_capacity = gpu_only_result.planned_plan;

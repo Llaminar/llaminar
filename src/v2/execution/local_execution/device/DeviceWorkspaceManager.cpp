@@ -13,6 +13,7 @@
 #include "../../../backends/IBackend.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../../utils/VramBillOfMaterials.h"
 
 #include <algorithm>
 #include <atomic>
@@ -199,6 +200,14 @@ namespace llaminar2
                                                  << " bytes=" << total_size
                                                  << " device=" << device_.to_string()
                                                  << " ordinal=" << device_ordinal);
+        logVramBomLine(
+            "workspace_block",
+            "device=" + device_.to_string() +
+                " manager_id=" + std::to_string(id_) +
+                " buffer_count=" + std::to_string(buffers.size()) +
+                " budget_bytes=" + std::to_string(budget_bytes_) +
+                " budget_mib=" + vramBomMiB(budget_bytes_) +
+                " " + vramBomBytes(total_size));
         PerfStatsCollector::addCounter(
             "memory",
             "workspace_block_bytes",
@@ -244,6 +253,15 @@ namespace llaminar2
                                                << " offset=" << current_offset
                                                << " size=" << buf->size_bytes
                                                << " device=" << device_.to_string());
+            logVramBomLine(
+                "workspace_buffer",
+                "device=" + device_.to_string() +
+                    " manager_id=" + std::to_string(id_) +
+                    " name=" + buf->name +
+                    " required=" + (buf->required ? "true" : "false") +
+                    " alignment=" + std::to_string(buf->alignment) +
+                    " offset_bytes=" + std::to_string(current_offset) +
+                    " " + vramBomBytes(buf->size_bytes));
             PerfStatsCollector::addCounter(
                 "memory",
                 "workspace_suballoc_bytes",

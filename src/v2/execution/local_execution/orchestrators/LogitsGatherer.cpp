@@ -16,6 +16,14 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        size_t logitsRowStride(const LogitsLocalInfo &info)
+        {
+            return info.row_stride > 0 ? info.row_stride : info.vocab_local;
+        }
+    } // namespace
+
 
     LogitsGatherer::LogitsGatherer(int vocab_size, size_t max_tokens, BackendResolver backend_resolver)
         : backend_resolver_(backend_resolver)
@@ -95,11 +103,80 @@ namespace llaminar2
                 LOG_ERROR("LogitsGatherer::gatherLocalInfos: local logits has zero vocab");
                 return false;
             }
+            if (logitsRowStride(info) < info.vocab_local)
+            {
+                LOG_ERROR("LogitsGatherer::gatherLocalInfos: local logits row stride "
+                          << logitsRowStride(info) << " is smaller than local vocab "
+                          << info.vocab_local);
+                return false;
+            }
         }
 
         size_t total_vocab = 0;
         for (const auto &info : device_infos)
             total_vocab += info.vocab_local;
+
+        const bool has_full_vocab = full_vocab_size > 0;
+        bool replicated_full_vocab = has_full_vocab && device_infos.size() > 1;
+        if (replicated_full_vocab)
+        {
+            const size_t expected_vocab = static_cast<size_t>(full_vocab_size);
+            for (const auto &info : device_infos)
+            {
+                if (info.vocab_local != expected_vocab)
+                {
+                    replicated_full_vocab = false;
+                    break;
+                }
+            }
+        }
+
+        if (replicated_full_vocab)
+        {
+            const auto &primary = device_infos.front();
+            const size_t copy_elements =
+                seq_len * static_cast<size_t>(full_vocab_size);
+            const size_t copy_bytes = copy_elements * sizeof(float);
+            if (buffer_->numel() < copy_elements)
+            {
+                LOG_ERROR("LogitsGatherer::gatherLocalInfos: output buffer too small for replicated logits. "
+                          << "Need " << copy_elements << ", have " << buffer_->numel());
+                return false;
+            }
+
+            float *output = buffer_->mutable_data();
+            if (primary.gpu_ptr && primary.device.has_value())
+            {
+                IBackend *backend = resolveBackend(*primary.device);
+                if (backend)
+                {
+                    if (seq_len == 1)
+                    {
+                        backend->deviceToHostFast(output, primary.gpu_ptr, copy_bytes,
+                                                  primary.device->gpu_ordinal());
+                    }
+                    else
+                    {
+                        backend->deviceToHost(output, primary.gpu_ptr, copy_bytes,
+                                              primary.device->gpu_ordinal());
+                    }
+                }
+                else
+                {
+                    std::memcpy(output, primary.tensor->data(), copy_bytes);
+                }
+            }
+            else
+            {
+                std::memcpy(output, primary.tensor->data(), copy_bytes);
+            }
+
+            last_gathered_size_ = copy_elements;
+            LOG_DEBUG("LogitsGatherer::gatherLocalInfos: gathered replicated full-vocab logits "
+                      << "[" << seq_len << ", " << full_vocab_size << "] from primary of "
+                      << device_infos.size() << " devices");
+            return true;
+        }
 
         if (full_vocab_size > 0 && total_vocab != static_cast<size_t>(full_vocab_size))
         {
@@ -160,32 +237,52 @@ namespace llaminar2
         // =================================================================
         std::vector<std::vector<float>> staging_buffers(device_infos.size());
         std::vector<const float *> device_data(device_infos.size());
+        std::vector<size_t> device_strides(device_infos.size(), 0);
 
         for (size_t dev = 0; dev < device_infos.size(); ++dev)
         {
             const auto &info = device_infos[dev];
+            const size_t row_stride = logitsRowStride(info);
 
             if (info.gpu_ptr && info.device.has_value())
             {
                 IBackend *backend = resolveBackend(*info.device);
                 if (backend)
                 {
-                    size_t copy_bytes = seq_len * info.vocab_local * sizeof(float);
                     staging_buffers[dev].resize(seq_len * info.vocab_local);
-                    backend->deviceToHost(staging_buffers[dev].data(), info.gpu_ptr,
-                                          copy_bytes, info.device->gpu_ordinal());
+                    if (row_stride == info.vocab_local)
+                    {
+                        size_t copy_bytes = seq_len * info.vocab_local * sizeof(float);
+                        backend->deviceToHost(staging_buffers[dev].data(), info.gpu_ptr,
+                                              copy_bytes, info.device->gpu_ordinal());
+                    }
+                    else
+                    {
+                        const auto *src_base = static_cast<const float *>(info.gpu_ptr);
+                        for (size_t row = 0; row < seq_len; ++row)
+                        {
+                            backend->deviceToHost(
+                                staging_buffers[dev].data() + row * info.vocab_local,
+                                src_base + row * row_stride,
+                                info.vocab_local * sizeof(float),
+                                info.device->gpu_ordinal());
+                        }
+                    }
                     device_data[dev] = staging_buffers[dev].data();
+                    device_strides[dev] = info.vocab_local;
                 }
                 else
                 {
                     LOG_WARN("LogitsGatherer::gatherLocalInfos: no backend for device "
                              << info.device->toString() << ", falling back to full D2H");
                     device_data[dev] = info.tensor->data();
+                    device_strides[dev] = row_stride;
                 }
             }
             else
             {
                 device_data[dev] = info.tensor->data();
+                device_strides[dev] = row_stride;
             }
         }
 
@@ -195,7 +292,7 @@ namespace llaminar2
             size_t col_offset = 0;
             for (size_t dev = 0; dev < device_data.size(); ++dev)
             {
-                const float *src = device_data[dev] + row * device_infos[dev].vocab_local;
+                const float *src = device_data[dev] + row * device_strides[dev];
                 float *dst = output + row * total_vocab + col_offset;
                 std::memcpy(dst, src, device_infos[dev].vocab_local * sizeof(float));
                 col_offset += device_infos[dev].vocab_local;

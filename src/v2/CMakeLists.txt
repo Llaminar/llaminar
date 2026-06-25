@@ -1345,9 +1345,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
+    execution/moe/GpuExpertSlotPool.cpp
     execution/moe/MoEExpertWeightService.cpp
     execution/moe/ExpertWeightPayloadProvider.cpp
     execution/moe/GPUExpertTransfer.cpp
+    execution/moe/GPUExpertTransferCUDA.cpp
+    execution/moe/GPUExpertTransferROCm.cpp
     execution/moe/MoEPipeline.cpp
     execution/prefix_cache/BlockHash.cpp
     execution/prefix_cache/DeviceHotPrefixStorageBackend.cpp

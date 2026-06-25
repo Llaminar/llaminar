@@ -75,6 +75,7 @@
 #include "execution/debug/TPSnapshot.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/local_execution/orchestrators/DeviceGraphOrchestrator.h"
+#include "execution/mtp/MTPWeightManifest.h"
 
 // Pipeline parallelism support
 #include "config/PipelineConfig.h"
@@ -1683,6 +1684,26 @@ namespace llaminar2::test::parity
         // setupPipeline() to initialize runner_ (legacy path).
         std::unique_ptr<IOrchestrationRunner> orch_runner_;
 
+        int parityLayerCount() const
+        {
+            if (!model_ctx_)
+                return 0;
+
+            const int local_layers = model_ctx_->blockCount();
+            const int total_layers = model_ctx_->totalBlockCount();
+            if (local_layers != total_layers)
+                return local_layers;
+
+            auto loader = model_ctx_->loader();
+            if (!loader)
+                return local_layers;
+
+            return mainLayerCountExcludingMTP(
+                *loader,
+                model_ctx_->architecture(),
+                local_layers);
+        }
+
         // Optional TestConfig for declarative test configuration (LocalPP, LocalTP, etc.)
         // Subclasses override cfg() to return their test configuration.
         // Default returns a single-device CPU config for backward compatibility.
@@ -2900,7 +2921,7 @@ namespace llaminar2::test::parity
             }
 
             // Get model parameters (model-agnostic)
-            int n_layers = model_ctx_->blockCount();
+            int n_layers = parityLayerCount();
 
             // Build GlobalDeviceAddress list from TestConfig
             std::vector<GlobalDeviceAddress> all_device_addresses;
@@ -3444,7 +3465,7 @@ namespace llaminar2::test::parity
             if (!success)
                 return summary;
 
-            int n_layers = static_cast<int>(model_ctx_->model().block_count);
+            int n_layers = parityLayerCount();
 
             // Stages to compare per layer
             std::vector<std::string> per_layer_stages = {
@@ -3858,7 +3879,7 @@ namespace llaminar2::test::parity
             if (!success)
                 return summary;
 
-            int n_layers = static_cast<int>(model_ctx_->model().block_count);
+            int n_layers = parityLayerCount();
             size_t seq_len = config_.token_ids.size();
             size_t d_model = model_ctx_->model().embedding_length;
             size_t n_heads = model_ctx_->headCount();
@@ -4439,8 +4460,51 @@ namespace llaminar2::test::parity
             // - Tail rank: has LM_HEAD logits, validates logit metrics
             // Detection: if LM_HEAD summary is all-zero and we have a multi-rank MPI context,
             // this rank likely lacks the LM head. Similarly for early layers.
-            const bool has_lm_head_data = (summary.lm_head_cosine > 0.0f || summary.lm_head_top1 > 0.0f);
-            const bool has_early_layer_data = (summary.early_layers_passed > 0 || summary.embedding_passed);
+            const bool has_lm_head_data =
+                summary.lm_head_passed ||
+                summary.lm_head_cosine > 0.0f ||
+                summary.lm_head_kl > 0.0f ||
+                summary.lm_head_top1 > 0.0f ||
+                summary.lm_head_top5 > 0.0f;
+            const bool has_layer_comparisons = std::any_of(
+                summary.layer_stats.begin(),
+                summary.layer_stats.end(),
+                [](const LayerStats &stats)
+                {
+                    return stats.stages_compared > 0;
+                });
+            const bool has_early_layer_data =
+                has_layer_comparisons ||
+                summary.embedding_passed ||
+                summary.embedding_cosine > 0.0f;
+            const bool multi_rank = mpi_ctx_ && mpiWorldSize() > 1;
+
+            if (!has_early_layer_data && !has_lm_head_data)
+            {
+                ADD_FAILURE()
+                    << "Prefill parity produced no comparable snapshots. "
+                    << "This usually means the runner did not expose the standard "
+                    << "prefill snapshot keys for this topology.";
+                return;
+            }
+
+            if (!multi_rank)
+            {
+                if (!has_early_layer_data)
+                {
+                    ADD_FAILURE()
+                        << "Single-rank prefill parity produced no early/layer "
+                        << "snapshot comparisons";
+                    return;
+                }
+                if (!has_lm_head_data)
+                {
+                    ADD_FAILURE()
+                        << "Single-rank prefill parity produced no LM_HEAD "
+                        << "comparison";
+                    return;
+                }
+            }
 
             // Early layer assertions (skip if this rank has no early layer data, e.g. PP tail)
             if (has_early_layer_data)
@@ -4626,7 +4690,7 @@ namespace llaminar2::test::parity
                 // Per-layer cosine similarity comparison for this decode step
                 // ---------------------------------------------------------------
                 {
-                    int n_layers = static_cast<int>(model_ctx_->model().block_count);
+                    int n_layers = parityLayerCount();
                     auto snapshot_keys = runner_->getSnapshotKeys();
                     std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
                     const auto gdn_cfg_decode = getGDNHeadConfig();

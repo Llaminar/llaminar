@@ -19,6 +19,7 @@ namespace llaminar2
 
     inline constexpr uint32_t kDeviceMoEMaxExperts = 256;
     inline constexpr uint32_t kDeviceMoEMaxTopK = 16;
+    inline constexpr uint32_t kDeviceMoEMaxParticipants = 8;
 
     enum class DeviceMoEExpertFlags : uint32_t
     {
@@ -96,6 +97,7 @@ namespace llaminar2
         int32_t topk_expert_ids[kDeviceMoEMaxTopK] = {};
         float topk_weights[kDeviceMoEMaxTopK] = {};
         uint64_t decode_histogram[kDeviceMoEMaxExperts] = {};
+        uint64_t decode_local_histogram[kDeviceMoEMaxExperts] = {};
 
         int32_t *route_expert_ids = nullptr;
         float *route_weights = nullptr;
@@ -111,7 +113,8 @@ namespace llaminar2
         uint64_t reserved_u64[4] = {};
         uint32_t prefill_token_capacity = 0;
         uint32_t prefill_route_capacity = 0;
-        uint32_t reserved_u32[2] = {};
+        uint32_t participant_id = 0;
+        uint32_t participant_count = 1;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDescriptor>);
@@ -122,6 +125,8 @@ namespace llaminar2
     {
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
+        uint32_t participant_id = 0;
+        uint32_t participant_count = 1;
         std::vector<DeviceMoEExpertDescriptor> experts;
         std::vector<uint8_t> local_compute_mask;
         std::vector<uint8_t> replica_role;
@@ -138,6 +143,8 @@ namespace llaminar2
         virtual bool prepareInactiveBank(int layer_idx, const MoEPlacementUpdate &update) = 0;
         virtual bool flipActiveBank(int layer_idx, uint32_t epoch, void *stream) = 0;
         virtual bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const = 0;
+        virtual void recordDecodeHistogramProducerStream(void *stream) = 0;
+        virtual void *decodeHistogramProducerStream() const = 0;
         virtual bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                                void *stream = nullptr,
                                                bool reset_runtime_counts = true) = 0;
@@ -178,6 +185,8 @@ namespace llaminar2
         DeviceMoELayerRuntime &hostLayerState(int layer_idx);
         const DeviceMoELayerRuntime &hostLayerState(int layer_idx) const override;
         bool hasPrefillRouteScratchCapacity(int layer_idx, int token_count) const override;
+        void recordDecodeHistogramProducerStream(void *stream) override;
+        void *decodeHistogramProducerStream() const override;
         bool syncDecodeHistogramToHost(DecodeExpertHistogram &histogram,
                                        void *stream = nullptr,
                                        bool reset_runtime_counts = true) override;
@@ -200,6 +209,7 @@ namespace llaminar2
         int prefill_token_capacity_ = 0;
         std::vector<DeviceMoELayerRuntime> host_layers_;
         DeviceMoELayerRuntime *device_layers_ = nullptr;
+        void *decode_histogram_producer_stream_ = nullptr;
 
         struct PrefillRouteScratchAllocation
         {

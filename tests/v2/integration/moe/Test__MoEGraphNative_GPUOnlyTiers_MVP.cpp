@@ -34,7 +34,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -46,7 +46,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 

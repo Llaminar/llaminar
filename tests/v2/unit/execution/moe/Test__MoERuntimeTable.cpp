@@ -93,18 +93,24 @@ namespace llaminar2::test
         EXPECT_EQ(layer0->top_k, 2u);
         EXPECT_EQ(layer0->active_bank, 0u);
         EXPECT_EQ(layer0->active_epoch, 0u);
+        EXPECT_EQ(layer0->participant_id, 0u);
+        EXPECT_EQ(layer0->participant_count, 1u);
     }
 
     TEST(Test__MoERuntimeTable, PrepareInactiveBankCopiesDescriptorsMasksAndReplicaRoles)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
-        const auto update = updateForEpoch(1, 4);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 2;
 
         ASSERT_TRUE(table.prepareInactiveBank(0, update));
         const auto &state = table.hostLayerState(0);
         const auto &bank = state.banks[1];
 
         EXPECT_EQ(state.active_bank, 0u);
+        EXPECT_EQ(state.participant_id, 1u);
+        EXPECT_EQ(state.participant_count, 2u);
         EXPECT_EQ(bank.epoch, 1u);
         EXPECT_EQ(bank.expert_count, 4u);
         EXPECT_EQ(bank.experts[2].logical_expert_id, 2);
@@ -196,6 +202,8 @@ namespace llaminar2::test
 
         table.hostLayerState(0).decode_histogram[0] = 7;
         table.hostLayerState(0).decode_histogram[2] = 3;
+        table.hostLayerState(0).decode_local_histogram[0] = 5;
+        table.hostLayerState(0).decode_local_histogram[2] = 1;
 
         /**
          * Request/session boundaries clear runtime counters but must not clear
@@ -223,7 +231,10 @@ namespace llaminar2::test
                   static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica));
 
         for (int expert = 0; expert < 4; ++expert)
+        {
             EXPECT_EQ(after_reset->decode_histogram[expert], 0u);
+            EXPECT_EQ(after_reset->decode_local_histogram[expert], 0u);
+        }
     }
 
     TEST(Test__MoERuntimeTable, InvalidLayerBoundsAndUpdatesThrowConsistently)
@@ -241,6 +252,19 @@ namespace llaminar2::test
         auto bad_mask = updateForEpoch(1, 4);
         bad_mask.local_compute_mask.pop_back();
         EXPECT_THROW(table.prepareInactiveBank(0, bad_mask), std::invalid_argument);
+
+        auto bad_participant_count = updateForEpoch(1, 4);
+        bad_participant_count.participant_count = 0;
+        EXPECT_THROW(table.prepareInactiveBank(0, bad_participant_count), std::invalid_argument);
+
+        bad_participant_count = updateForEpoch(1, 4);
+        bad_participant_count.participant_count = kDeviceMoEMaxParticipants + 1;
+        EXPECT_THROW(table.prepareInactiveBank(0, bad_participant_count), std::invalid_argument);
+
+        auto bad_participant_id = updateForEpoch(1, 4);
+        bad_participant_id.participant_id = 2;
+        bad_participant_id.participant_count = 2;
+        EXPECT_THROW(table.prepareInactiveBank(0, bad_participant_id), std::invalid_argument);
 
         auto bad_replica_role = updateForEpoch(1, 4);
         bad_replica_role.replica_role[0] = 99;
@@ -274,8 +298,12 @@ namespace llaminar2::test
         MoERuntimeTable table(DeviceId::cpu(), 2, 4, 2);
         table.hostLayerState(0).decode_histogram[0] = 3;
         table.hostLayerState(0).decode_histogram[2] = 1;
+        table.hostLayerState(0).decode_local_histogram[0] = 2;
+        table.hostLayerState(0).decode_local_histogram[2] = 1;
         table.hostLayerState(1).decode_histogram[1] = 2;
         table.hostLayerState(1).decode_histogram[3] = 2;
+        table.hostLayerState(1).decode_local_histogram[1] = 1;
+        table.hostLayerState(1).decode_local_histogram[3] = 2;
 
         DecodeExpertHistogramConfig cfg;
         cfg.num_layers = 2;
@@ -297,7 +325,10 @@ namespace llaminar2::test
 
         for (int layer = 0; layer < 2; ++layer)
             for (int expert = 0; expert < 4; ++expert)
+            {
                 EXPECT_EQ(table.hostLayerState(layer).decode_histogram[expert], 0u);
+                EXPECT_EQ(table.hostLayerState(layer).decode_local_histogram[expert], 0u);
+            }
 
         ASSERT_TRUE(table.syncDecodeHistogramToHost(hist));
         EXPECT_EQ(hist.activationCount(0, 0), 3u);

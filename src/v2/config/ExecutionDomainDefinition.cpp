@@ -106,10 +106,10 @@ namespace llaminar2
             return "unspecified";
         case ExecutionDomainComputeKind::REPLICATED_EXPERTS:
             return "replicated_experts";
-        case ExecutionDomainComputeKind::EXPERT_ID_SHARDED:
-            return "expert_id_sharded";
-        case ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS:
-            return "tensor_parallel_experts";
+        case ExecutionDomainComputeKind::APPORTIONED_EXPERTS:
+            return "apportioned_experts";
+        case ExecutionDomainComputeKind::SHARDED_EXPERTS:
+            return "sharded_experts";
         }
         return "unknown";
     }
@@ -133,12 +133,25 @@ namespace llaminar2
     std::optional<ExecutionDomainComputeKind> parseExecutionDomainComputeKind(const std::string &value)
     {
         const std::string normalized = normalizeToken(value);
-        if (normalized == "replicated_experts")
+        if (normalized == "replicated_experts" ||
+            normalized == "replicated_routed_experts" ||
+            normalized == "routed_experts_replicated" ||
+            normalized == "all_replicated_experts" ||
+            normalized == "fully_replicated_experts")
             return ExecutionDomainComputeKind::REPLICATED_EXPERTS;
-        if (normalized == "expert_id_sharded")
-            return ExecutionDomainComputeKind::EXPERT_ID_SHARDED;
-        if (normalized == "tensor_parallel_experts")
-            return ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS;
+        if (normalized == "apportioned_experts" ||
+            normalized == "apportioned_routed_experts" ||
+            normalized == "whole_experts_apportioned" ||
+            normalized == "expert_id_sharded" ||
+            normalized == "expert_parallel" ||
+            normalized == "routed_expert_parallel" ||
+            normalized == "whole_expert_parallel")
+            return ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
+        if (normalized == "sharded_experts" ||
+            normalized == "tensor_parallel_experts" ||
+            normalized == "tensor_parallel" ||
+            normalized == "intra_expert_tensor_parallel")
+            return ExecutionDomainComputeKind::SHARDED_EXPERTS;
         return std::nullopt;
     }
 
@@ -257,7 +270,7 @@ namespace llaminar2
         if (options.require_scope && !saw_scope)
             throw std::invalid_argument(options.context + " '" + domain.name + "' is missing scope=<single|local|node_local>");
         if (options.require_compute && !saw_compute)
-            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing compute=<replicated_experts|expert_id_sharded|tensor_parallel_experts>");
+            throw std::invalid_argument(options.context + " '" + domain.name + "' is missing compute=<replicated_experts|apportioned_experts|sharded_experts>");
 
         return domain;
     }
@@ -281,14 +294,24 @@ namespace llaminar2
         return scope == ExecutionDomainScope::LOCAL || scope == ExecutionDomainScope::NODE_LOCAL;
     }
 
-    bool ExecutionDomainDefinition::supportsTensorParallelExperts() const
+    bool ExecutionDomainDefinition::supportsApportionedExperts() const
+    {
+        return !participants.empty();
+    }
+
+    bool ExecutionDomainDefinition::supportsShardedExperts() const
     {
         return isDomainScopedTP() && hasMultipleParticipants();
     }
 
+    bool ExecutionDomainDefinition::supportsTensorParallelExperts() const
+    {
+        return supportsShardedExperts();
+    }
+
     bool ExecutionDomainDefinition::supportsExpertIdSharding() const
     {
-        return isDomainScopedTP() && hasMultipleParticipants();
+        return supportsApportionedExperts();
     }
 
     bool ExecutionDomainDefinition::samePhysicalParticipants(const ExecutionDomainDefinition &other) const
@@ -350,14 +373,14 @@ namespace llaminar2
                              " is not in its rank list");
         }
 
-        if ((compute_kind == ExecutionDomainComputeKind::EXPERT_ID_SHARDED) && !supportsExpertIdSharding())
+        if ((compute_kind == ExecutionDomainComputeKind::APPORTIONED_EXPERTS) && !supportsApportionedExperts())
         {
-            errors.push_back("Domain '" + name + "' uses expert_id_sharded but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses apportioned_experts but is not a multi-participant domain-scoped TP domain");
         }
 
-        if ((compute_kind == ExecutionDomainComputeKind::TENSOR_PARALLEL_EXPERTS) && !supportsTensorParallelExperts())
+        if ((compute_kind == ExecutionDomainComputeKind::SHARDED_EXPERTS) && !supportsShardedExperts())
         {
-            errors.push_back("Domain '" + name + "' uses tensor_parallel_experts but is not a multi-participant domain-scoped TP domain");
+            errors.push_back("Domain '" + name + "' uses sharded_experts but is not a multi-participant domain-scoped TP domain");
         }
 
         return errors;

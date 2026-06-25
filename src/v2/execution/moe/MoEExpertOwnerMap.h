@@ -47,7 +47,7 @@ namespace llaminar2
 
     struct MoEExpertOwnerMapBuildOptions
     {
-        bool reject_tensor_parallel_experts = true;
+        bool reject_sharded_experts = true;
     };
 
     class MoEExpertOwnerMap

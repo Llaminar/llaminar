@@ -1016,4 +1016,47 @@ namespace llaminar2::test
                   std::string::npos);
     }
 
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmRuntimeNativeVNNIKernelsGuardSparseExpertTables)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path decode_path =
+            root / "src/v2/kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip";
+        const fs::path prefill_path =
+            root / "src/v2/kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip";
+        ASSERT_TRUE(fs::exists(decode_path)) << decode_path;
+        ASSERT_TRUE(fs::exists(prefill_path)) << prefill_path;
+
+        const std::string decode_contents = readFile(decode_path);
+        const std::string prefill_contents = readFile(prefill_path);
+        ASSERT_FALSE(decode_contents.empty()) << decode_path;
+        ASSERT_FALSE(prefill_contents.empty()) << prefill_path;
+
+        const std::vector<std::pair<std::string, std::string>> decode_required_tokens = {
+            {"descriptor validator", "native_vnni_desc_shape_ok"},
+            {"negative runtime expert guard", "if (expert_id < 0)"},
+            {"negative descriptor index guard", "if (desc_idx < 0)"},
+            {"blank descriptor guard", "!native_vnni_desc_shape_ok<FMT>(desc, N, K)"},
+            {"invalid k-partial zero fill", "gate_partials[partial_index] = 0.0f;"},
+            {"invalid up k-partial zero fill", "up_partials[partial_index] = 0.0f;"},
+        };
+        for (const auto &[label, token] : decode_required_tokens)
+        {
+            EXPECT_NE(decode_contents.find(token), std::string::npos)
+                << "ROCm grouped decode NativeVNNI kernels must retain " << label
+                << " for sparse rebalance descriptor tables";
+        }
+
+        const std::vector<std::pair<std::string, std::string>> prefill_required_tokens = {
+            {"descriptor validator", "prefill_native_vnni_desc_shape_ok"},
+            {"negative runtime expert guard", "if (expert_id < 0)"},
+            {"blank descriptor guard", "!prefill_native_vnni_desc_shape_ok<FMT>"},
+        };
+        for (const auto &[label, token] : prefill_required_tokens)
+        {
+            EXPECT_NE(prefill_contents.find(token), std::string::npos)
+                << "ROCm grouped prefill NativeVNNI kernels must retain " << label
+                << " for sparse rebalance descriptor tables";
+        }
+    }
+
 } // namespace llaminar2::test

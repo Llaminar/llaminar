@@ -212,7 +212,7 @@ namespace
         domain.kind = ExpertDomainKind::SingleDevice;
         domain.backend = CollectiveBackendType::AUTO;
         domain.participants = {std::move(participant)};
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -265,7 +265,7 @@ namespace
         rocm_hot.name = "rocm_hot";
         rocm_hot.kind = ExpertDomainKind::LocalTP;
         rocm_hot.backend = CollectiveBackendType::RCCL;
-        rocm_hot.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        rocm_hot.compute_kind = ExpertDomainComputeKind::ShardedExperts;
         rocm_hot.participants = {
             GlobalDeviceAddress::rocm(0),
             GlobalDeviceAddress::rocm(1),
@@ -275,7 +275,7 @@ namespace
         cpu_cold.name = "cpu_cold";
         cpu_cold.kind = ExpertDomainKind::NodeLocalTP;
         cpu_cold.backend = CollectiveBackendType::HOST;
-        cpu_cold.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        cpu_cold.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         cpu_cold.participants = {GlobalDeviceAddress::cpu()};
 
         plan->domains = {rocm_hot, cpu_cold};
@@ -292,7 +292,7 @@ namespace
     std::shared_ptr<MoEExpertParallelPlan> makeActiveRocmLocalTPReplicatedOverlayPlan()
     {
         auto plan = makeActiveRocmLocalTPOverlayPlan();
-        plan->domains[0].compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        plan->domains[0].compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return plan;
     }
 
@@ -506,6 +506,8 @@ namespace
         graph_config.moe.top_k = 2;
         graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Observe;
         graph_config.moe.rebalance_config.window_size = 32;
+        graph_config.moe.hot_expert_cache.kind = MoEHotExpertCacheConfig::Kind::Count;
+        graph_config.moe.hot_expert_cache.count = 2;
         graph_config.moe.expert_overlay_runtime_plan =
             resolveMoEExpertOverlayRuntimePlan(makeRequestedOverlayPlan());
 
@@ -522,6 +524,42 @@ namespace
         EXPECT_EQ(controllers[2]->participantCount(), 1);
         EXPECT_EQ(controllers[1]->mode(), MoERebalanceMode::OBSERVE);
         EXPECT_EQ(controllers[2]->mode(), MoERebalanceMode::OBSERVE);
+        EXPECT_EQ(controllers[0]->maxReplicasPerSocket(), 2);
+        EXPECT_EQ(controllers[1]->maxReplicasPerSocket(), 2);
+        EXPECT_EQ(controllers[2]->maxReplicasPerSocket(), 2);
+    }
+
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, GraphHistogramBindsToActiveOverlayRebalanceController)
+    {
+        GraphConfig graph_config;
+        graph_config.n_layers = kMoELayers;
+        graph_config.moe.num_experts = kMoEExperts;
+        graph_config.moe.top_k = 2;
+        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Dynamic;
+        graph_config.moe.rebalance_config.window_size = 32;
+        graph_config.moe.hot_expert_cache.kind = MoEHotExpertCacheConfig::Kind::Count;
+        graph_config.moe.hot_expert_cache.count = 2;
+        graph_config.moe.expert_overlay_runtime_plan =
+            resolveMoEExpertOverlayRuntimePlan(makeRequestedOverlayPlan());
+
+        auto controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            nullptr,
+            nullptr);
+
+        ASSERT_EQ(controllers.size(), 3u);
+        ASSERT_EQ(controllers.front()->domainId(), "single");
+
+        auto *active = bindActiveMoERebalanceControllerForGraph(
+            graph_config,
+            controllers);
+
+        ASSERT_NE(active, nullptr);
+        EXPECT_EQ(active->domainId(), "overlay_routed_gpu_hot");
+        ASSERT_NE(active->histogram(), nullptr);
+        EXPECT_EQ(graph_config.moe.decode_histogram, active->histogram());
+        EXPECT_NE(graph_config.moe.decode_histogram, controllers.front()->histogram());
+        EXPECT_EQ(graph_config.moe.rebalance_mode, active->mode());
     }
 
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, GlobalTPRebalanceControllerPreservesCpuDomain)

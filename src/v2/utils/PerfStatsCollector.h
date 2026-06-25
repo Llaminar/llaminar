@@ -43,6 +43,8 @@ namespace llaminar2
         static bool isEnabled();
         static bool gpuStageEventTimingEnabled();
         static void reset();
+        static void resetPreservingDomains(
+            const std::vector<std::string> &domains_to_preserve);
 
         static void addCounter(
             std::string domain,

@@ -12,6 +12,7 @@
 #include "../../compute_stages/IComputeStage.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
+#include "../../../utils/VramBillOfMaterials.h"
 #include <algorithm>
 #include <cctype>
 #include <limits>
@@ -148,7 +149,24 @@ namespace llaminar2
         const size_t base_workspace = lm_head_workspace + mk_overhead + padded_n_buffer;
         const size_t safety_margin = base_workspace / 10;
         const size_t min_budget = 768ULL * 1024 * 1024;
-        return std::max(min_budget, base_workspace + safety_margin);
+        const size_t floor = std::max(min_budget, base_workspace + safety_margin);
+        logVramBomLine(
+            "workspace_model_floor",
+            "max_seq_len=" + std::to_string(max_seq_len) +
+                " batch_size=" + std::to_string(batch_size) +
+                " vocab_size=" + std::to_string(vocab_size) +
+                " d_model=" + std::to_string(d_model) +
+                " lm_head_bytes=" + std::to_string(lm_head_workspace) +
+                " lm_head_mib=" + vramBomMiB(lm_head_workspace) +
+                " mk_overhead_bytes=" + std::to_string(mk_overhead) +
+                " mk_overhead_mib=" + vramBomMiB(mk_overhead) +
+                " padded_n_bytes=" + std::to_string(padded_n_buffer) +
+                " padded_n_mib=" + vramBomMiB(padded_n_buffer) +
+                " min_budget_bytes=" + std::to_string(min_budget) +
+                " min_budget_mib=" + vramBomMiB(min_budget) +
+                " floor_bytes=" + std::to_string(floor) +
+                " floor_mib=" + vramBomMiB(floor));
+        return floor;
     }
 
     bool WorkspaceAllocator::allocateForGraph(
@@ -454,6 +472,17 @@ namespace llaminar2
                           << combined.buffers.size() << " buffers ("
                           << (needed / (1024 * 1024)) << "MB needed, budget="
                           << (budget / (1024 * 1024)) << "MB)");
+                logVramBomLine(
+                    "workspace_plan",
+                    "phase=reallocate device=" + device.toString() +
+                        " consumers=" + std::to_string(consumers.size()) +
+                        " buffers=" + std::to_string(combined.buffers.size()) +
+                        " needed_bytes=" + std::to_string(needed) +
+                        " needed_mib=" + vramBomMiB(needed) +
+                        " budget_bytes=" + std::to_string(budget) +
+                        " budget_mib=" + vramBomMiB(budget) +
+                        " model_floor_bytes=" + std::to_string(model_floor_budget) +
+                        " model_floor_mib=" + vramBomMiB(model_floor_budget));
                 logWorkspaceVramTrace(device, "workspace.before_reallocate", needed);
 
                 auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
@@ -524,6 +553,17 @@ namespace llaminar2
             }
 
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            logVramBomLine(
+                "workspace_plan",
+                "phase=allocate device=" + device.toString() +
+                    " consumers=" + std::to_string(consumers.size()) +
+                    " buffers=" + std::to_string(combined.buffers.size()) +
+                    " needed_bytes=" + std::to_string(needed) +
+                    " needed_mib=" + vramBomMiB(needed) +
+                    " budget_bytes=" + std::to_string(budget) +
+                    " budget_mib=" + vramBomMiB(budget) +
+                    " model_floor_bytes=" + std::to_string(model_floor_budget) +
+                    " model_floor_mib=" + vramBomMiB(model_floor_budget));
             logWorkspaceVramTrace(device, "workspace.before_allocate", needed);
             if (!manager->allocate(combined))
             {
@@ -617,6 +657,15 @@ namespace llaminar2
                                                      << combined.total_bytes_with_alignment() << " bytes needed");
 
             auto manager = std::make_unique<DeviceWorkspaceManager>(device, budget);
+            logVramBomLine(
+                "workspace_plan",
+                "phase=legacy_allocate device=" + device.toString() +
+                    " consumers=" + std::to_string(consumers.size()) +
+                    " buffers=" + std::to_string(combined.buffers.size()) +
+                    " needed_bytes=" + std::to_string(combined.total_bytes_with_alignment()) +
+                    " needed_mib=" + vramBomMiB(combined.total_bytes_with_alignment()) +
+                    " budget_bytes=" + std::to_string(budget) +
+                    " budget_mib=" + vramBomMiB(budget));
             logWorkspaceVramTrace(device, "workspace.before_allocate_legacy", combined.total_bytes_with_alignment());
             if (!manager->allocate(combined))
             {

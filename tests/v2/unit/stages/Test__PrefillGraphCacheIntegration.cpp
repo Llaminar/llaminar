@@ -494,7 +494,13 @@ TEST(Test__PrefillGraphCacheIntegration, DefaultHostMoERebalancingReturnsFalse)
 {
     MinimalTestHost host;
     EXPECT_FALSE(host.isMoeRebalancingActive());
+    EXPECT_FALSE(host.prefillGraphCaptureDisabledByHost());
     EXPECT_EQ(host.moePlacementEpoch(), 0u);
+}
+
+TEST(Test__PrefillGraphCacheIntegration, HostPolicyDisabledReasonIsPrintable)
+{
+    EXPECT_STREQ(toString(PrefillGraphRejectReason::HostPolicyDisabled), "HostPolicyDisabled");
 }
 
 // =============================================================================

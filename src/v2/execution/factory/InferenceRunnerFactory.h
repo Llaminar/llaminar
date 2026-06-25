@@ -125,6 +125,9 @@ namespace llaminar2
         // AUTO preserves legacy behavior (derived from activation precision mode).
         KVCachePrecision kv_cache_precision = KVCachePrecision::AUTO;
 
+        /// Optional explicit transport precision for TP allreduces.
+        std::string tp_allreduce_precision_override;
+
         /// Prefix-state cache feature gates and storage limits.
         PrefixCacheRuntimeConfig prefix_cache;
 
@@ -132,7 +135,7 @@ namespace llaminar2
         MTPRuntimeConfig mtp;
 
         /// Routed MoE expert execution mode for standard Qwen3.5 MoE.
-        MoEExpertMode moe_expert_mode = MoEExpertMode::ExpertParallel;
+        MoEExpertMode moe_expert_mode = MoEExpertMode::ApportionedExperts;
 
         /// Bounded hot remote expert cache for dynamic expert-parallel execution.
         MoEHotExpertCacheConfig moe_hot_expert_cache;
@@ -189,6 +192,12 @@ namespace llaminar2
         /// Optional same-layer MoE expert overlay plan propagated into GraphConfig.
         std::shared_ptr<MoEExpertParallelPlan> moe_expert_parallel_plan;
 
+        /// True when a parent RankOrchestrator has already prepared overlay
+        /// expert weights for the whole LocalTP domain. Child device runners
+        /// still receive the overlay plan for graph routing, but skip the
+        /// expensive per-runner weight preparation side effect.
+        bool moe_expert_overlay_weights_prepared_by_parent = false;
+
         /// Optional MPI context used by MoE overlay domain-worker commands.
         std::shared_ptr<IMPIContext> moe_expert_overlay_mpi_ctx;
 
@@ -216,6 +225,8 @@ namespace llaminar2
             config.batch_size = plan.runtime.batch_size;
             config.activation_precision = plan.runtime.activation_precision;
             config.kv_cache_precision = plan.runtime.kv_cache_precision;
+            config.tp_allreduce_precision_override =
+                plan.runtime.tp_allreduce_precision_override;
             config.fused_attention_backend = plan.runtime.fused_attention_backend;
             config.kv_cache_scale_k = plan.runtime.kv_cache_scale_k;
             config.kv_cache_scale_v = plan.runtime.kv_cache_scale_v;
@@ -291,6 +302,10 @@ namespace llaminar2
         const GraphConfig &graph_config,
         const ILocalTPContext *local_tp_ctx,
         const ITPContext *tp_ctx);
+
+    MoERebalanceController *bindActiveMoERebalanceControllerForGraph(
+        GraphConfig &graph_config,
+        const std::vector<std::unique_ptr<MoERebalanceController>> &controllers);
 
     /**
      * @brief Factory function to create a unified LOCAL PP runner

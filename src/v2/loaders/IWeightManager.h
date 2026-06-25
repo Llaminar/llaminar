@@ -298,10 +298,13 @@ namespace llaminar2
          *                          packing and upload. Set false for nested
          *                          TP-in-PP setups where a later PP stage on
          *                          a different device still needs host copies.
+         * @param include_expert_jobs If false, defer routed MoE expert GEMM
+         *                            preparation to an explicit overlay/cache pass.
          * @return true on success
          */
         virtual bool finalizeForDevices(const std::vector<DeviceId> & /*devices*/,
-                                         bool /*release_host_data*/ = true) { return true; }
+                                         bool /*release_host_data*/ = true,
+                                         bool /*include_expert_jobs*/ = true) { return true; }
 
         // =========================================================================
         // Internal Lifecycle (called by prepareWeightsForDevice/finalizeForDevice)

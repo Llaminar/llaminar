@@ -29,6 +29,8 @@
 #include "../loaders/WeightPlan.h"
 #include "../utils/ToolCallTypes.h"
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <functional>
 #include <exception>
 #include <map>
@@ -115,6 +117,34 @@ namespace llaminar2
 
         /// Enable column-parallel QKV projection (weights sharded by head)
         bool qkv_column_parallel = false;
+
+        /// True when the dense/base graph is tensor-parallel sharded.
+        ///
+        /// Graph-native MoE overlays can still use a LocalTP context as an
+        /// expert-participant domain while keeping dense weights replicated.
+        /// In that mode this flag is false, tp_ctx remains populated for the
+        /// routed-expert reduction, and dense stages must not emit TP
+        /// allreduces or use sharded dimensions.
+        bool dense_tp_enabled = true;
+
+        /// When true, dense/non-expert decode graphs use replicated full dense
+        /// weights even if prefill uses dense tensor parallelism.
+        ///
+        /// This is the "prefill TP, decode replicated" mode for MoE overlays:
+        /// large prefill reductions stay tensor-parallel, while single-token
+        /// decode avoids the dense embedding/attention/LM-head collectives.
+        /// Routed expert reductions remain controlled by the MoE overlay plan.
+        bool dense_tp_decode_replicated = false;
+
+        /// When true, decode keeps dense TP except the vocab embedding table is
+        /// mirrored to avoid one tiny d_model allreduce per decode token.
+        bool dense_tp_decode_mirrored_embedding = false;
+
+        /// Explicit semantic policy for dense/shared always-on work.
+        ///
+        /// Shared experts intentionally follow this dense policy: they are
+        /// named "expert", but execution-wise they are always-on FFN work.
+        DenseParallelPolicy dense_parallel_policy = DenseParallelPolicy::TensorParallel;
 
         // Precision and execution
         float rms_norm_eps = 1e-6f;
@@ -300,22 +330,56 @@ namespace llaminar2
         /// global DebugEnv::allreduce_precision ("fp32" by default).
         std::unordered_map<int, std::string> tp_allreduce_precision;
 
+        /// Optional explicit transport precision for all TP allreduces.
+        /// Empty/auto/schema/default preserves the per-layer schema policy.
+        std::string tp_allreduce_precision_override;
+
         /**
          * @brief Get allreduce precision for a specific layer
          *
          * Resolution order:
-         * 1. Per-layer override from tp_allreduce_precision map
-         * 2. Global fallback from debugEnv().allreduce_precision
+         * 1. LLAMINAR_ALLREDUCE_PRECISION, when explicitly set for perf/diagnostics
+         * 2. GraphConfig::tp_allreduce_precision_override, when explicitly set
+         * 3. Per-layer override from tp_allreduce_precision map
+         * 4. Empty string, which lets execution defer to DebugEnv's default
          *
          * @param layer_idx Transformer layer index (0-based)
          * @return Precision string ("fp32", "fp16", "bf16")
          */
         std::string getAllreducePrecisionForLayer(int layer_idx) const
         {
+            if (const char *forced = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
+                forced && forced[0] != '\0')
+            {
+                auto normalized = normalizeAllreducePrecisionOverride(forced);
+                if (!normalized.empty())
+                    return normalized;
+            }
+            auto override_precision =
+                normalizeAllreducePrecisionOverride(tp_allreduce_precision_override);
+            if (!override_precision.empty())
+                return override_precision;
+
             auto it = tp_allreduce_precision.find(layer_idx);
             if (it != tp_allreduce_precision.end())
                 return it->second;
             return ""; // Empty = defer to global DebugEnv default
+        }
+
+        static std::string normalizeAllreducePrecisionOverride(std::string value)
+        {
+            std::transform(value.begin(), value.end(), value.begin(),
+                           [](unsigned char c)
+                           {
+                               return static_cast<char>(std::tolower(c));
+            });
+            if (value == "auto" || value == "schema" || value == "default" || value == "off")
+                return "";
+            if (value == "f32")
+                return "fp32";
+            if (value == "f16")
+                return "fp16";
+            return value;
         }
 
         /**
@@ -389,7 +453,14 @@ namespace llaminar2
             bool shared_expert_gate = false;  ///< Has sigmoid gating on shared expert
 
             /// Routed expert execution mode for the standard graph path.
-            MoEExpertMode expert_mode = MoEExpertMode::ExpertParallel;
+            MoEExpertMode expert_mode = MoEExpertMode::ApportionedExperts;
+
+            /// Explicit semantic policy for routed expert placement/compute.
+            RoutedExpertParallelPolicy routed_expert_parallel_policy =
+                RoutedExpertParallelPolicy::ApportionedExperts;
+
+            /// Composite MoE policy derived from dense/shared and routed expert axes.
+            MoEParallelPolicy parallel_policy = MoEParallelPolicy::HybridTP_AE;
 
             /// Static contiguous expert-id range owned by this TP participant.
             /// count < 0 means the routed expert output is full/replicated.
@@ -398,6 +469,10 @@ namespace llaminar2
 
             /// Bounded remote hot-expert cache configuration for dynamic EP.
             MoEHotExpertCacheConfig hot_expert_cache;
+
+            /// Explicit semantic policy for routed expert replicas.
+            ExpertReplicaPolicy expert_replica_policy =
+                ExpertReplicaPolicy::HotExpertReplicaCache;
 
             /// Runtime rebalance config carried for diagnostics and controller setup.
             MoERebalanceRuntimeConfig rebalance_config;
@@ -429,6 +504,23 @@ namespace llaminar2
             /// Returns true if MoE is enabled
             bool enabled() const { return num_experts > 0 && top_k > 0; }
         } moe;
+
+        /// Refresh explicit semantic policy fields from the compatibility knobs
+        /// that still drive much of the existing graph construction.
+        void refreshMoEParallelPolicies()
+        {
+            dense_parallel_policy = denseParallelPolicyFromFlags(
+                dense_tp_enabled,
+                dense_tp_decode_replicated,
+                dense_tp_decode_mirrored_embedding);
+            moe.routed_expert_parallel_policy =
+                routedExpertParallelPolicyFromMode(moe.expert_mode);
+            moe.parallel_policy = deriveMoEParallelPolicy(
+                dense_parallel_policy,
+                moe.routed_expert_parallel_policy);
+            moe.expert_replica_policy =
+                expertReplicaPolicyFromHotExpertCache(moe.hot_expert_cache);
+        }
 
         // =================================================================
         // Heterogeneous Layer Configuration (Phase B)

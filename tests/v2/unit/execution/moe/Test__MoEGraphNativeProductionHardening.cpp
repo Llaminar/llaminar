@@ -32,7 +32,7 @@ namespace llaminar2::test
             domain.backend = backend;
             domain.participants = {std::move(participant)};
             domain.owner_rank = owner_rank;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -47,7 +47,7 @@ namespace llaminar2::test
             domain.backend = backend;
             domain.participants = {GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)};
             domain.owner_rank = owner_rank;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -177,15 +177,15 @@ namespace llaminar2::test
         EXPECT_TRUE(hasErrorContaining(result, "covers only 3 of 4 routed experts"));
     }
 
-    TEST(Test__MoEGraphNativeProductionHardening, ValidatorRejectsRoutedTensorParallelExpertsForGraphNativeOverlay)
+    TEST(Test__MoEGraphNativeProductionHardening, ValidatorRejectsRoutedShardedExpertsForGraphNativeOverlay)
     {
         auto plan = productionPlan();
-        plan.domains[1].compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+        plan.domains[1].compute_kind = ExpertDomainComputeKind::ShardedExperts;
 
         const auto result = validateMoEExpertParallelPlan(plan);
 
         EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "TensorParallelExperts"));
+        EXPECT_TRUE(hasErrorContaining(result, "ShardedExperts"));
         EXPECT_TRUE(hasErrorContaining(result, "graph-native whole-expert routed tiers"));
         EXPECT_TRUE(hasErrorContaining(result, "no shadow LocalTP runtime"));
     }
@@ -224,7 +224,7 @@ namespace llaminar2::test
                                                           "--moe-expert-overlay", "tiered",
                                                           "--moe-expert-overlay-continuation", "cuda_hot",
                                                           "--moe-expert-overlay-shared-domain", "cuda_hot",
-                                                          "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0;backend=nccl;compute=replicated_experts",
+                                                          "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0;backend=nccl;compute=apportioned_experts",
                                                           "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=4"});
 
         EXPECT_NE(missing_scope.find("missing scope"), std::string::npos);

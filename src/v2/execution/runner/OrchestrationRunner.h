@@ -231,7 +231,9 @@ namespace llaminar2
 
         /// Apply MoE masks to every local device runner when the underlying
         /// runner is a RankOrchestrator. Returns true if handled.
-        bool applyMoEExpertMasksForAllLocalDevices(const MoERebalanceController &controller);
+        bool applyMoEExpertMasksForAllLocalDevices(
+            const MoERebalanceController &controller,
+            const ExpertReplicaSet *replica_arrivals = nullptr);
 
         /// Apply precomputed MoE masks to every local device runner when the
         /// underlying runner is a RankOrchestrator. Returns true if handled.

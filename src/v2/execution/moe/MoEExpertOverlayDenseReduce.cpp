@@ -55,7 +55,7 @@ namespace llaminar2
         const auto &plan = *request.plan;
         const auto plan_validation = validateMoEExpertParallelPlan(
             plan,
-            MoEExpertParallelValidationOptions{.allow_routed_tensor_parallel_experts = true});
+            MoEExpertParallelValidationOptions{.allow_routed_sharded_experts = true});
         for (const auto &error : plan_validation.errors)
             addError("plan: " + error);
 

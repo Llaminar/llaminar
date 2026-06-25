@@ -70,7 +70,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::cuda(0)};
         domain.world_ranks = {0};
         domain.owner_rank = 0;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -83,7 +83,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::rocm(0)};
         domain.world_ranks = {1};
         domain.owner_rank = 1;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -96,7 +96,7 @@ namespace
         domain.participants = {GlobalDeviceAddress::cpu(0)};
         domain.world_ranks = {2};
         domain.owner_rank = 2;
-        domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         return domain;
     }
 
@@ -632,7 +632,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold, TopologySmoke)
     const auto &cuda_domain = plan->domains[0];
     EXPECT_EQ(cuda_domain.name, kCudaHotDomain);
     EXPECT_EQ(cuda_domain.kind, ExpertDomainKind::SingleDevice);
-    EXPECT_EQ(cuda_domain.compute_kind, ExpertDomainComputeKind::ReplicatedExperts);
+    EXPECT_EQ(cuda_domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts);
     ASSERT_EQ(cuda_domain.participants.size(), 1u);
     EXPECT_TRUE(cuda_domain.participants[0].isCUDA());
     EXPECT_EQ(cuda_domain.owner_rank, 0);
@@ -642,7 +642,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold, TopologySmoke)
     const auto &rocm_domain = plan->domains[1];
     EXPECT_EQ(rocm_domain.name, kRocmWarmDomain);
     EXPECT_EQ(rocm_domain.kind, ExpertDomainKind::SingleDevice);
-    EXPECT_EQ(rocm_domain.compute_kind, ExpertDomainComputeKind::ReplicatedExperts);
+    EXPECT_EQ(rocm_domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts);
     ASSERT_EQ(rocm_domain.participants.size(), 1u);
     EXPECT_TRUE(rocm_domain.participants[0].isROCm());
     EXPECT_EQ(rocm_domain.owner_rank, 1);
@@ -652,7 +652,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold, TopologySmoke)
     const auto &cpu_domain = plan->domains[2];
     EXPECT_EQ(cpu_domain.name, kCpuColdDomain);
     EXPECT_EQ(cpu_domain.kind, ExpertDomainKind::SingleDevice);
-    EXPECT_EQ(cpu_domain.compute_kind, ExpertDomainComputeKind::ReplicatedExperts);
+    EXPECT_EQ(cpu_domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts);
     ASSERT_EQ(cpu_domain.participants.size(), 1u);
     EXPECT_TRUE(cpu_domain.participants[0].isCPU());
     EXPECT_EQ(cpu_domain.owner_rank, 2);
@@ -663,7 +663,7 @@ TEST_F(Qwen35MoEGraphNativeCudaHotRocmWarmCpuCold, TopologySmoke)
     {
         EXPECT_EQ(domain.kind, ExpertDomainKind::SingleDevice)
             << "Domain '" << domain.name << "' must remain a single graph-native participant";
-        EXPECT_EQ(domain.compute_kind, ExpertDomainComputeKind::ReplicatedExperts)
+        EXPECT_EQ(domain.compute_kind, ExpertDomainComputeKind::ApportionedExperts)
             << "Domain '" << domain.name << "' must use whole-expert graph-native ownership";
     }
 

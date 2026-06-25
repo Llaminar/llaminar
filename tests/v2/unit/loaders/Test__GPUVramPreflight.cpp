@@ -6,6 +6,8 @@
 
 namespace llaminar2::test
 {
+    static constexpr size_t kMiB = 1024ULL * 1024ULL;
+
     namespace
     {
         bool contains(const std::string &text, const std::string &needle)
@@ -53,5 +55,10 @@ namespace llaminar2::test
             << message;
         EXPECT_FALSE(contains(message, "set LLAMINAR_WEIGHT_STREAMING=1"))
             << message;
+    }
+
+    TEST(Test__GPUVramPreflight, GpuDirectRebalanceUsesSmallRuntimeMargin)
+    {
+        EXPECT_EQ(gpuDirectRebalanceVramSafetyMarginBytes(), 16ULL * kMiB);
     }
 } // namespace llaminar2::test

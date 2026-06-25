@@ -153,6 +153,39 @@ namespace
         return tensor;
     }
 
+    llaminar2::DeviceNativeVNNIMatrixDesc fakeNativeVNNIDesc(uintptr_t base)
+    {
+        llaminar2::DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = reinterpret_cast<const uint8_t *>(base);
+        desc.scales = reinterpret_cast<const void *>(base + 0x100u);
+        desc.n = 8;
+        desc.k = 8;
+        desc.blocks_per_row = 1;
+        desc.codebook_id = 7;
+        return desc;
+    }
+
+    void markAllExpertsLocalForRouting(llaminar2::MoEPlacementUpdate &update, int num_experts)
+    {
+        update.local_compute_mask.assign(num_experts, 1u);
+        update.replica_role.assign(num_experts, static_cast<uint8_t>(llaminar2::DeviceMoEReplicaRole::Primary));
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            auto &desc = update.experts[static_cast<size_t>(expert)];
+            const uintptr_t base = 0x30000000u + static_cast<uintptr_t>(expert) * 0x1000u;
+            desc.logical_expert_id = expert;
+            desc.owner_participant = 0;
+            desc.local_slot = expert;
+            desc.gate = fakeNativeVNNIDesc(base + 0x10u);
+            desc.up = fakeNativeVNNIDesc(base + 0x20u);
+            desc.down = fakeNativeVNNIDesc(base + 0x30u);
+            desc.flags = llaminar2::toMoEExpertFlags(llaminar2::DeviceMoEExpertFlags::Valid |
+                                                     llaminar2::DeviceMoEExpertFlags::Resident |
+                                                     llaminar2::DeviceMoEExpertFlags::PreferredOwner |
+                                                     llaminar2::DeviceMoEExpertFlags::LocalCompute);
+        }
+    }
+
     void expectNearArray(const float *actual, const float *expected, size_t count, float tolerance = 1.0e-5f)
     {
         for (size_t i = 0; i < count; ++i)
@@ -986,10 +1019,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectBF16GateMatchesCPU)
     update.epoch = 1;
     update.expert_count = num_experts;
     update.experts.resize(num_experts);
-    update.local_compute_mask.assign(num_experts, 0);
-    update.replica_role.resize(num_experts, 0);
-    for (int expert = 0; expert < num_experts; ++expert)
-        update.experts[expert].logical_expert_id = expert;
+    markAllExpertsLocalForRouting(update, num_experts);
 
     ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
@@ -1052,10 +1082,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRejectsUnsupportedGateType)
     update.epoch = 1;
     update.expert_count = num_experts;
     update.experts.resize(num_experts);
-    update.local_compute_mask.assign(num_experts, 0);
-    update.replica_role.resize(num_experts, 0);
-    for (int expert = 0; expert < num_experts; ++expert)
-        update.experts[expert].logical_expert_id = expert;
+    markAllExpertsLocalForRouting(update, num_experts);
 
     ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
@@ -1105,10 +1132,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
     update.epoch = 1;
     update.expert_count = num_experts;
     update.experts.resize(num_experts);
-    update.local_compute_mask.assign(num_experts, 0);
-    update.replica_role.resize(num_experts, 0);
-    for (int expert = 0; expert < num_experts; ++expert)
-        update.experts[expert].logical_expert_id = expert;
+    markAllExpertsLocalForRouting(update, num_experts);
 
     ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
@@ -1174,6 +1198,162 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeOnlyDoesNotRequireLegacyOutp
 #endif
 }
 
+TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParticipants)
+{
+#ifndef HAVE_CUDA
+    GTEST_SKIP() << "CUDA support not compiled";
+#else
+    if (!hasCudaDevice())
+        GTEST_SKIP() << "No CUDA device available";
+
+    using llaminar2::DeviceMoEExpertDescriptor;
+    using llaminar2::DeviceMoEExpertFlags;
+    using llaminar2::DeviceMoELayerRuntime;
+    using llaminar2::DeviceMoEReplicaRole;
+    using llaminar2::DeviceMoERuntimeTable;
+    using llaminar2::DeviceNativeVNNIMatrixDesc;
+    using llaminar2::MoEPlacementUpdate;
+
+    constexpr int num_layers = 1;
+    constexpr int num_experts = 4;
+    constexpr int top_k = 4;
+    constexpr int d_model = 4;
+    constexpr int seq_len = 1;
+
+    auto fake_desc = [](uintptr_t base, int n, int k)
+    {
+        DeviceNativeVNNIMatrixDesc desc;
+        desc.payload = reinterpret_cast<const uint8_t *>(base);
+        desc.scales = reinterpret_cast<const void *>(base + 0x100u);
+        desc.n = n;
+        desc.k = k;
+        desc.blocks_per_row = 1;
+        desc.codebook_id = 7;
+        return desc;
+    };
+
+    auto make_update = [&](uint32_t participant_id)
+    {
+        MoEPlacementUpdate update;
+        update.epoch = 1;
+        update.expert_count = num_experts;
+        update.participant_id = participant_id;
+        update.participant_count = 2;
+        update.experts.resize(num_experts);
+        update.local_compute_mask.assign(num_experts, 0u);
+        update.replica_role.assign(num_experts, static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const bool replicated = expert >= 2;
+            const int owner = expert % 2;
+            const bool local = replicated || owner == static_cast<int>(participant_id);
+
+            DeviceMoEExpertDescriptor desc;
+            desc.logical_expert_id = expert;
+            desc.owner_participant = owner;
+            desc.local_slot = local ? expert : -1;
+            if (local)
+            {
+                const uintptr_t base = 0x10000000u + static_cast<uintptr_t>(participant_id) * 0x100000u +
+                                       static_cast<uintptr_t>(expert) * 0x1000u;
+                desc.gate = fake_desc(base + 0x10u, 8, d_model);
+                desc.up = fake_desc(base + 0x20u, 8, d_model);
+                desc.down = fake_desc(base + 0x30u, d_model, 8);
+                DeviceMoEExpertFlags flags = DeviceMoEExpertFlags::Valid |
+                                             DeviceMoEExpertFlags::Resident |
+                                             DeviceMoEExpertFlags::LocalCompute;
+                if (owner == static_cast<int>(participant_id))
+                    flags |= DeviceMoEExpertFlags::PreferredOwner;
+                if (replicated)
+                    flags |= DeviceMoEExpertFlags::Replicated;
+                desc.flags = llaminar2::toMoEExpertFlags(flags);
+                update.local_compute_mask[expert] = 1u;
+                update.replica_role[expert] = static_cast<uint8_t>(
+                    replicated
+                        ? (owner == static_cast<int>(participant_id) ? DeviceMoEReplicaRole::Primary
+                                                                     : DeviceMoEReplicaRole::Replica)
+                        : DeviceMoEReplicaRole::Primary);
+            }
+            update.experts[expert] = desc;
+        }
+        return update;
+    };
+
+    auto make_table = [&](uint32_t participant_id)
+    {
+        DeviceMoERuntimeTable::Config config;
+        config.device_id = llaminar2::DeviceId::cuda(0);
+        config.num_layers = num_layers;
+        config.num_experts = num_experts;
+        config.top_k = top_k;
+        config.mirror_to_device = true;
+        auto table = std::make_unique<DeviceMoERuntimeTable>(config);
+        auto update = make_update(participant_id);
+        EXPECT_TRUE(table->prepareInactiveBank(0, update));
+        EXPECT_TRUE(table->flipActiveBank(0, update.epoch, stream_));
+        return table;
+    };
+
+    auto table0 = make_table(0);
+    auto table1 = make_table(1);
+
+    auto hidden = makeTensor({seq_len, d_model}, {1.0f, 0.0f, 0.0f, 0.0f});
+    auto gate = makeTensor({num_experts, d_model}, {4.0f, 0.0f, 0.0f, 0.0f,
+                                                    3.0f, 0.0f, 0.0f, 0.0f,
+                                                    2.0f, 0.0f, 0.0f, 0.0f,
+                                                    1.0f, 0.0f, 0.0f, 0.0f});
+    auto indices0 = makeZeros({seq_len, top_k});
+    auto weights0 = makeZeros({seq_len, top_k});
+    auto indices1 = makeZeros({seq_len, top_k});
+    auto weights1 = makeZeros({seq_len, top_k});
+
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        table0->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
+        false, indices0.get(), weights0.get(), true, true));
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        table1->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
+        false, indices1.get(), weights1.get(), true, true));
+
+    auto copy_runtime = [&](DeviceMoERuntimeTable &table,
+                            std::array<int32_t, top_k> &ids,
+                            std::array<float, top_k> &weights)
+    {
+        auto *layer = table.deviceLayerState(0);
+        const auto *base = reinterpret_cast<const char *>(layer);
+        const auto *ids_device = reinterpret_cast<const int32_t *>(
+            base + offsetof(DeviceMoELayerRuntime, topk_expert_ids));
+        const auto *weights_device = reinterpret_cast<const float *>(
+            base + offsetof(DeviceMoELayerRuntime, topk_weights));
+        ASSERT_EQ(cudaMemcpyAsync(ids.data(), ids_device, ids.size() * sizeof(int32_t),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+        ASSERT_EQ(cudaMemcpyAsync(weights.data(), weights_device, weights.size() * sizeof(float),
+                                  cudaMemcpyDeviceToHost, stream_),
+                  cudaSuccess);
+    };
+
+    std::array<int32_t, top_k> ids0{};
+    std::array<int32_t, top_k> ids1{};
+    std::array<float, top_k> runtime_weights0{};
+    std::array<float, top_k> runtime_weights1{};
+    copy_runtime(*table0, ids0, runtime_weights0);
+    copy_runtime(*table1, ids1, runtime_weights1);
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+
+    const std::array<int32_t, top_k> expected0{0, -1, 2, -1};
+    const std::array<int32_t, top_k> expected1{-1, 1, -1, 3};
+    EXPECT_EQ(ids0, expected0);
+    EXPECT_EQ(ids1, expected1);
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        EXPECT_EQ((ids0[slot] >= 0) + (ids1[slot] >= 0), 1) << "slot " << slot;
+        EXPECT_EQ(indices0->data()[slot], static_cast<float>(slot));
+        EXPECT_EQ(indices1->data()[slot], static_cast<float>(slot));
+    }
+#endif
+}
+
 TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
 {
 #ifndef HAVE_CUDA
@@ -1202,10 +1382,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectQwenScaleRuntimeTopKMatchesCPU)
     update.epoch = 1;
     update.expert_count = num_experts;
     update.experts.resize(num_experts);
-    update.local_compute_mask.assign(num_experts, 0);
-    update.replica_role.resize(num_experts, 0);
-    for (int expert = 0; expert < num_experts; ++expert)
-        update.experts[expert].logical_expert_id = expert;
+    markAllExpertsLocalForRouting(update, num_experts);
 
     ASSERT_TRUE(cuda_table.prepareInactiveBank(0, update));
     ASSERT_TRUE(cuda_table.flipActiveBank(0, update.epoch, stream_));
@@ -4671,6 +4848,8 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
 
     ScopedCudaMoEPrefillConfig prefill_config;
     prefill_config.set(/*tile_m=*/0, /*fuse_swiglu=*/true);
+    ScopedEnv perf_env("LLAMINAR_PERF_STATS_JSON", "1");
+    llaminar2::PerfStatsCollector::reset();
 
     constexpr int seq_len = 33;
     constexpr int real_seq_len = 29;
@@ -4796,6 +4975,9 @@ TEST_F(Test__CUDAMoEKernel, FixedTopologyRuntimeGroupedPrefillGraphReplayClearsI
     ASSERT_EQ(cudaGraphLaunch(executable, stream_), cudaSuccess);
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     output->transitionTo(llaminar2::TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+    expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 16,
+                                  "serial", "serial", "row_ordered",
+                                  /*expected_active_expert_slots=*/0);
 
     const float *output_data = output->data();
     int nonzero_real_rows = 0;
@@ -5536,7 +5718,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     update.epoch = 1;
     update.expert_count = num_experts;
     update.experts.resize(num_experts);
-    update.local_compute_mask.assign(num_experts, 1);
+    update.local_compute_mask.assign(num_experts, 0);
+    update.local_compute_mask[0] = 1;
     update.replica_role.resize(num_experts, 0);
     for (int expert = 0; expert < num_experts; ++expert)
     {
@@ -5580,6 +5763,21 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeDescriptorPathCapturesAfterWarmu
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
         true, nullptr, nullptr, /*write_legacy_outputs=*/false, /*update_runtime_histogram=*/false));
+    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    llaminar2::DeviceMoELayerRuntime host_runtime{};
+    ASSERT_EQ(cudaMemcpy(&host_runtime, runtime_layer, sizeof(host_runtime), cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    bool saw_masked = false;
+    bool saw_local = false;
+    for (int slot = 0; slot < top_k; ++slot)
+    {
+        saw_masked = saw_masked || host_runtime.topk_expert_ids[slot] < 0;
+        saw_local = saw_local || host_runtime.topk_expert_ids[slot] >= 0;
+    }
+    EXPECT_TRUE(saw_masked)
+        << "runtime route selection should mask the nonlocal expert";
+    EXPECT_TRUE(saw_local)
+        << "runtime route selection should keep the local expert";
     ASSERT_TRUE(cuda_kernel_->groupedExpertGateUpDecodeFromRuntime(
         runtime_layer, hidden.get(), gateup_table, top_k,
         gate_outputs.data(), up_outputs.data(), d_model, intermediate));

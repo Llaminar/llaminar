@@ -727,6 +727,54 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsCollectives)
     EXPECT_EQ(reason, PrefillGraphRejectReason::CollectiveNodesPresent);
 }
 
+TEST(Test__PrefillGraphCache, Preflight_AllowsCallerVettedGraphCapturableCollectives)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(512);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    std::unordered_set<std::string> collectives = {"allreduce_0"};
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &collectives,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/0,
+        /*bucket_seq_len=*/0,
+        PrefillGraphPreflightMode::Default,
+        /*collectives_graph_capturable=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_CallerVettedCollectivesStillRequireCapturableStages)
+{
+    PrefillGraphConfig config;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(512);
+
+    ComputeGraph graph;
+    graph.addNode("stage_0", std::make_unique<CapturableMockStage>("stage_0", key.device_id), key.device_id);
+    graph.addNode("stage_1", std::make_unique<NonCapturableMockStage>("stage_1", key.device_id), key.device_id);
+    graph.addDependency("stage_1", "stage_0");
+
+    std::unordered_set<std::string> collectives = {"allreduce_0"};
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &collectives,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/0,
+        /*bucket_seq_len=*/0,
+        PrefillGraphPreflightMode::Default,
+        /*collectives_graph_capturable=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+}
+
 TEST(Test__PrefillGraphCache, Preflight_RejectsNonCapturableStage)
 {
     PrefillGraphConfig config;

@@ -251,6 +251,10 @@ namespace llaminar2
                 int *used_bk256,
                 int *used_streamk);
 
+            int cudaNativeVNNIPrefill_getStreamKMode();
+            int cudaNativeVNNIPrefill_getBK256Mode();
+            void cudaNativeVNNIPrefill_getForceTile(int *tile_id, int *split_k);
+
             // cuBLAS FP16 GEMM for Q4_0 native VNNI weights (CUDAcuBLASQuantGemm.cu)
             bool cudaCuBLAS_fp16_gemm_q40(
                 const uint8_t *d_payload,
@@ -462,6 +466,221 @@ namespace llaminar2
                        paddedNativePrefillM(m) *
                        static_cast<size_t>(n) *
                        sizeof(float);
+            }
+
+            struct NativePrefillWorkspaceBounds
+            {
+                bool valid = false;
+                size_t splitk_partials_bytes = 0;
+                size_t streamk_fixup_bytes = 0;
+                int splitk_rows = 0;
+                int streamk_rows = 0;
+                int planned_split_k = 1;
+                int planned_streamk = 0;
+            };
+
+            struct NativePrefillWorkspaceCacheKey
+            {
+                uint8_t codebook_id = 0;
+                int max_m = 0;
+                int n = 0;
+                int k = 0;
+                int cuda_device_id = 0;
+                int deterministic = 0;
+                int streamk_mode = 0;
+                int bk256_mode = 0;
+                int force_tile = -1;
+                int force_split_k = 0;
+
+                bool operator==(const NativePrefillWorkspaceCacheKey &other) const
+                {
+                    return codebook_id == other.codebook_id &&
+                           max_m == other.max_m &&
+                           n == other.n &&
+                           k == other.k &&
+                           cuda_device_id == other.cuda_device_id &&
+                           deterministic == other.deterministic &&
+                           streamk_mode == other.streamk_mode &&
+                           bk256_mode == other.bk256_mode &&
+                           force_tile == other.force_tile &&
+                           force_split_k == other.force_split_k;
+                }
+            };
+
+            struct NativePrefillWorkspaceCacheKeyHash
+            {
+                size_t operator()(const NativePrefillWorkspaceCacheKey &key) const
+                {
+                    size_t h = 1469598103934665603ULL;
+                    auto mix = [&h](size_t v)
+                    {
+                        h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+                    };
+                    mix(static_cast<size_t>(key.codebook_id));
+                    mix(static_cast<size_t>(key.max_m));
+                    mix(static_cast<size_t>(key.n));
+                    mix(static_cast<size_t>(key.k));
+                    mix(static_cast<size_t>(key.cuda_device_id));
+                    mix(static_cast<size_t>(key.deterministic));
+                    mix(static_cast<size_t>(key.streamk_mode));
+                    mix(static_cast<size_t>(key.bk256_mode));
+                    mix(static_cast<size_t>(key.force_tile + 2));
+                    mix(static_cast<size_t>(key.force_split_k));
+                    return h;
+                }
+            };
+
+            std::mutex &nativePrefillWorkspaceCacheMutex()
+            {
+                static std::mutex m;
+                return m;
+            }
+
+            std::unordered_map<NativePrefillWorkspaceCacheKey,
+                               NativePrefillWorkspaceBounds,
+                               NativePrefillWorkspaceCacheKeyHash> &
+            nativePrefillWorkspaceCache()
+            {
+                static std::unordered_map<NativePrefillWorkspaceCacheKey,
+                                          NativePrefillWorkspaceBounds,
+                                          NativePrefillWorkspaceCacheKeyHash>
+                    cache;
+                return cache;
+            }
+
+            NativePrefillWorkspaceBounds nativePrefillWorkspaceForRows(
+                uint8_t codebook_id,
+                int rows,
+                int n,
+                int k,
+                int cuda_device_id)
+            {
+                NativePrefillWorkspaceBounds bounds;
+                if (rows <= 1)
+                    return bounds;
+
+                size_t splitk_partials_bytes = 0;
+                size_t streamk_fixup_bytes = 0;
+                int planned_split_k = 1;
+                int planned_streamk = 0;
+                if (!cudaNativeVNNIPrefill_getWorkspacePlan(
+                        codebook_id,
+                        rows,
+                        n,
+                        k,
+                        cuda_device_id,
+                        &splitk_partials_bytes,
+                        &streamk_fixup_bytes,
+                        &planned_split_k,
+                        &planned_streamk))
+                {
+                    return bounds;
+                }
+
+                bounds.valid = true;
+                bounds.splitk_partials_bytes =
+                    std::max(splitk_partials_bytes,
+                             paddedSplitKPartialBytes(rows, n, planned_split_k));
+                bounds.streamk_fixup_bytes = streamk_fixup_bytes;
+                bounds.splitk_rows = rows;
+                bounds.streamk_rows = rows;
+                bounds.planned_split_k = planned_split_k;
+                bounds.planned_streamk = planned_streamk;
+                return bounds;
+            }
+
+            std::vector<int> nativePrefillWorkspaceRowCandidates(int max_m)
+            {
+                std::vector<int> rows;
+                auto add = [&rows, max_m](int row)
+                {
+                    if (row > 1 && row <= max_m)
+                        rows.push_back(row);
+                };
+
+                add(max_m);
+
+                // Match the generated prefill dispatch row buckets, plus enough
+                // dense small-row coverage for MoE expert groups that can land
+                // between buckets with larger split-K than the full prompt.
+                const int dense_limit = std::min(max_m, 1024);
+                for (int row = 2; row <= dense_limit; ++row)
+                    add(row);
+
+                static constexpr int kGeneratedMPolicy[] = {
+                    2, 3, 4, 64, 128, 256, 384, 512, 544, 576, 600, 608,
+                    640, 672, 704, 736, 768, 1024, 1280, 1536, 2048, 2560,
+                    3072, 4096,
+                };
+                for (int row : kGeneratedMPolicy)
+                    add(row);
+
+                for (int row = 1152; row <= max_m; row += 128)
+                    add(row);
+
+                std::sort(rows.begin(), rows.end());
+                rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+                return rows;
+            }
+
+            NativePrefillWorkspaceBounds maxNativePrefillWorkspaceForRowsUpTo(
+                uint8_t codebook_id,
+                int max_m,
+                int n,
+                int k,
+                int cuda_device_id)
+            {
+                int force_tile = -1;
+                int force_split_k = 0;
+                cudaNativeVNNIPrefill_getForceTile(&force_tile, &force_split_k);
+
+                const NativePrefillWorkspaceCacheKey key{
+                    codebook_id,
+                    max_m,
+                    n,
+                    k,
+                    cuda_device_id,
+                    cudaNativeVNNIPrefill_getDeterministicMode() ? 1 : 0,
+                    cudaNativeVNNIPrefill_getStreamKMode(),
+                    cudaNativeVNNIPrefill_getBK256Mode(),
+                    force_tile,
+                    force_split_k,
+                };
+
+                {
+                    std::lock_guard<std::mutex> lock(nativePrefillWorkspaceCacheMutex());
+                    auto &cache = nativePrefillWorkspaceCache();
+                    auto it = cache.find(key);
+                    if (it != cache.end())
+                        return it->second;
+                }
+
+                NativePrefillWorkspaceBounds best;
+                for (int rows : nativePrefillWorkspaceRowCandidates(max_m))
+                {
+                    const NativePrefillWorkspaceBounds current =
+                        nativePrefillWorkspaceForRows(codebook_id, rows, n, k, cuda_device_id);
+                    if (!current.valid)
+                        continue;
+
+                    best.valid = true;
+                    if (current.splitk_partials_bytes > best.splitk_partials_bytes)
+                    {
+                        best.splitk_partials_bytes = current.splitk_partials_bytes;
+                        best.splitk_rows = rows;
+                        best.planned_split_k = current.planned_split_k;
+                    }
+                    if (current.streamk_fixup_bytes > best.streamk_fixup_bytes)
+                    {
+                        best.streamk_fixup_bytes = current.streamk_fixup_bytes;
+                        best.streamk_rows = rows;
+                        best.planned_streamk = current.planned_streamk;
+                    }
+                }
+
+                std::lock_guard<std::mutex> lock(nativePrefillWorkspaceCacheMutex());
+                nativePrefillWorkspaceCache().emplace(key, best);
+                return best;
             }
 
             template <typename T>
@@ -1339,7 +1558,15 @@ namespace llaminar2
                         " workspace is missing or undersized for concurrent split-K projection: need total " +
                         std::to_string(required_total) + " bytes (" +
                         std::to_string(splitk_bytes) + " per slot), have " +
-                        std::to_string(total_bytes));
+                        std::to_string(total_bytes) +
+                        " [M=" + std::to_string(m) +
+                        ", N=" + std::to_string(n) +
+                        ", K=" + std::to_string(k) +
+                        ", codebook=" + std::to_string(static_cast<int>(impl_->native_codebook_id)) +
+                        ", split_k=" + std::to_string(planned_split_k) +
+                        ", streamk=" + std::to_string(planned_streamk) +
+                        ", stream_idx=" + std::to_string(stream_idx) +
+                        ", slots=" + std::to_string(kCudaConcurrentPrefillWorkspaceSlots) + "]");
                 }
                 auto *base = static_cast<unsigned char *>(buffer);
                 splitk_ptr = reinterpret_cast<float *>(
@@ -1365,7 +1592,15 @@ namespace llaminar2
                         " workspace is missing or undersized for concurrent stream-K projection: need total " +
                         std::to_string(required_total) + " bytes (" +
                         std::to_string(streamk_bytes) + " per slot), have " +
-                        std::to_string(total_bytes));
+                        std::to_string(total_bytes) +
+                        " [M=" + std::to_string(m) +
+                        ", N=" + std::to_string(n) +
+                        ", K=" + std::to_string(k) +
+                        ", codebook=" + std::to_string(static_cast<int>(impl_->native_codebook_id)) +
+                        ", split_k=" + std::to_string(planned_split_k) +
+                        ", streamk=" + std::to_string(planned_streamk) +
+                        ", stream_idx=" + std::to_string(stream_idx) +
+                        ", slots=" + std::to_string(kCudaConcurrentPrefillWorkspaceSlots) + "]");
                 }
                 auto *base = static_cast<unsigned char *>(buffer);
                 streamk_ptr = reinterpret_cast<float *>(
@@ -3595,46 +3830,36 @@ namespace llaminar2
 
             if (has_native_codebook && workspace_m > 1)
             {
-                size_t splitk_partials_bytes = 0;
-                size_t streamk_fixup_bytes = 0;
-                int planned_split_k = 1;
-                int planned_streamk = 0;
-                if (cudaNativeVNNIPrefill_getWorkspacePlan(
+                const NativePrefillWorkspaceBounds prefill_bounds =
+                    maxNativePrefillWorkspaceForRowsUpTo(
                         native_codebook_id,
                         m,
                         n,
                         k,
-                        cuda_device_id_,
-                        &splitk_partials_bytes,
-                        &streamk_fixup_bytes,
-                        &planned_split_k,
-                        &planned_streamk))
+                        cuda_device_id_);
+                if (prefill_bounds.valid)
                 {
-                    if (planned_split_k > 1)
-                    {
-                        splitk_partials_bytes = std::max(
-                            splitk_partials_bytes,
-                            paddedSplitKPartialBytes(m, n, planned_split_k));
-                    }
-
                     const size_t prefill_scratch_slots = concurrentPrefillScratchSlotsForM(m);
 
-                    if (splitk_partials_bytes > 0)
+                    if (prefill_bounds.splitk_partials_bytes > 0)
                     {
                         reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_SPLITK_PARTIALS,
-                                                splitk_partials_bytes * prefill_scratch_slots, 256, true});
+                                                prefill_bounds.splitk_partials_bytes * prefill_scratch_slots, 256, true});
                     }
-                    if (streamk_fixup_bytes > 0)
+                    if (prefill_bounds.streamk_fixup_bytes > 0)
                     {
                         reqs.buffers.push_back({GemmWorkspaceBuffers::CUDA_NATIVE_VNNI_PREFILL_STREAMK_FIXUP,
-                                                streamk_fixup_bytes * prefill_scratch_slots, 256, true});
+                                                prefill_bounds.streamk_fixup_bytes * prefill_scratch_slots, 256, true});
                     }
                     LOG_DEBUG("[CUDAQuantisedGemmKernel::getWorkspaceRequirements] NativeVNNI prefill plan: codebook="
                               << static_cast<int>(native_codebook_id)
-                              << " split_k=" << planned_split_k
-                              << " streamk=" << planned_streamk
-                              << " splitk_partials=" << (splitk_partials_bytes / 1024) << "KB"
-                              << " streamk_fixup=" << (streamk_fixup_bytes / 1024) << "KB");
+                              << " max_rows=" << m
+                              << " splitk_rows=" << prefill_bounds.splitk_rows
+                              << " split_k=" << prefill_bounds.planned_split_k
+                              << " streamk_rows=" << prefill_bounds.streamk_rows
+                              << " streamk=" << prefill_bounds.planned_streamk
+                              << " splitk_partials=" << (prefill_bounds.splitk_partials_bytes / 1024) << "KB"
+                              << " streamk_fixup=" << (prefill_bounds.streamk_fixup_bytes / 1024) << "KB");
                 }
             }
 

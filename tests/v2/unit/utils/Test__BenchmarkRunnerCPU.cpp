@@ -4,7 +4,8 @@
  *
  * Regression tests for:
  * - setSkipLogitsGatherDecode must NOT be enabled on CPU devices
- * - Decode must fall back to host-side argmax when sampleGreedyOnDevice() returns -1
+ * - CPU decode may sample host logits when sampleGreedyOnDevice() returns -1
+ * - GPU decode must fail hard when device sampling fails
  */
 
 #include <gtest/gtest.h>
@@ -14,6 +15,7 @@
 #include <string>
 
 #include "utils/BenchmarkRunner.h"
+#include "utils/DebugEnv.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "config/OrchestrationConfig.h"
 #include "backends/DeviceId.h"
@@ -128,7 +130,15 @@ namespace
 
         // GPU device — GPU argmax available
         DeviceId primaryDeviceId() const override { return DeviceId::cuda(0); }
-        int sampleGreedyOnDevice() override { return GPU_ARGMAX_TOKEN; }
+        int sampleGreedyOnDevice() override
+        {
+            return device_argmax_available_ ? GPU_ARGMAX_TOKEN : -1;
+        }
+
+        void setDeviceArgmaxAvailable(bool available)
+        {
+            device_argmax_available_ = available;
+        }
 
         void setSkipLogitsGatherDecode(bool skip) override
         {
@@ -148,6 +158,7 @@ namespace
     private:
         std::vector<float> logits_;
         bool skip_logits_gather_decode_ = false;
+        bool device_argmax_available_ = true;
     };
 
     class MockStatsInferenceRunner : public MockCPUInferenceRunner
@@ -219,6 +230,44 @@ namespace
         int emitted_tokens_ = 0;
         bool sampling_params_set_ = false;
         SamplingParams last_sampling_params_;
+    };
+
+    class MockBenchmarkEventOrderRunner : public MockOrchestratedDecodeRunner
+    {
+    public:
+        bool forward(const int *tokens, int seq_len) override
+        {
+            events_.push_back(seq_len > 1 ? "prefill" : "forward");
+            return MockOrchestratedDecodeRunner::forward(tokens, seq_len);
+        }
+
+        void clear_cache() override
+        {
+            events_.push_back("clear");
+            MockOrchestratedDecodeRunner::clear_cache();
+        }
+
+        DecodeStepOutput decodeStepForBenchmark() override
+        {
+            events_.push_back("decode");
+            return MockOrchestratedDecodeRunner::decodeStepForBenchmark();
+        }
+
+        void resetExecutorStats() override
+        {
+            events_.push_back("reset_stats");
+            MockOrchestratedDecodeRunner::resetExecutorStats();
+        }
+
+        void recordCallback()
+        {
+            events_.push_back("callback");
+        }
+
+        const std::vector<std::string> &events() const { return events_; }
+
+    private:
+        std::vector<std::string> events_;
     };
 
     class MockBatchedOrchestratedDecodeRunner : public MockCPUInferenceRunner
@@ -457,6 +506,24 @@ namespace
         return tok;
     }
 
+    class ScopedGpuGraphsSetting
+    {
+    public:
+        explicit ScopedGpuGraphsSetting(bool enabled)
+            : previous_(mutableDebugEnv().execution.gpu_graphs)
+        {
+            mutableDebugEnv().execution.gpu_graphs = enabled;
+        }
+
+        ~ScopedGpuGraphsSetting()
+        {
+            mutableDebugEnv().execution.gpu_graphs = previous_;
+        }
+
+    private:
+        bool previous_ = false;
+    };
+
 } // namespace
 
 // =============================================================================
@@ -567,6 +634,29 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
         << "GPU decode phase must succeed";
 }
 
+TEST(Test__BenchmarkRunnerCPU, GPUDecodeFailsHardWhenDeviceArgmaxFails)
+{
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    runner->setDeviceArgmaxAvailable(false);
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 5;
+
+    auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_FALSE(result.decode_success);
+    EXPECT_NE(result.failure_reason.find("GPU device sampling failed"),
+              std::string::npos);
+    EXPECT_NE(result.failure_reason.find("CPU logits fallback is disabled"),
+              std::string::npos);
+}
+
 TEST(Test__BenchmarkRunnerCPU, FailsBeforePrefillWhenPromptExceedsContext)
 {
     auto runner = std::make_shared<MockCPUInferenceRunner>();
@@ -644,6 +734,141 @@ TEST(Test__BenchmarkRunnerCPU, UsesOrchestratedDecodeStepWhenAvailable)
     EXPECT_GT(runner->maintenanceCalls(), 0);
     EXPECT_EQ(runner->sampleGreedyCalls(), 0)
         << "BenchmarkRunner must not bypass orchestration decodeStep when it is available";
+}
+
+TEST(Test__BenchmarkRunnerCPU, PostWarmupCallbackSeesDecodeHistogramBeforePrefillCaptureClearsState)
+{
+    ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
+    auto runner = std::make_shared<MockBenchmarkEventOrderRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+    bench.setPostWarmupCallback([runner]() {
+        runner->recordCallback();
+    });
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success) << result.failure_reason;
+
+    const auto &events = runner->events();
+    const auto callback_it = std::find(events.begin(), events.end(), "callback");
+    ASSERT_NE(callback_it, events.end()) << ::testing::PrintToString(events);
+
+    const size_t callback_index = static_cast<size_t>(callback_it - events.begin());
+    size_t last_decode_before_callback = events.size();
+    size_t last_clear_before_callback = events.size();
+    size_t prefill_count_before_callback = 0;
+
+    for (size_t i = 0; i < callback_index; ++i)
+    {
+        if (events[i] == "decode")
+            last_decode_before_callback = i;
+        if (events[i] == "clear")
+            last_clear_before_callback = i;
+        if (events[i] == "prefill")
+            ++prefill_count_before_callback;
+    }
+
+    ASSERT_NE(last_decode_before_callback, events.size())
+        << "Warmup decode must run before the post-warmup callback: "
+        << ::testing::PrintToString(events);
+    ASSERT_NE(last_clear_before_callback, events.size())
+        << "Benchmark should have reset state before warmup: "
+        << ::testing::PrintToString(events);
+    EXPECT_LT(last_clear_before_callback, last_decode_before_callback)
+        << "Prefill graph warmup must not clear the decode histogram before rebalance: "
+        << ::testing::PrintToString(events);
+    EXPECT_GE(prefill_count_before_callback, 4u)
+        << "Exact prefill graph capture needs three graph-warmup forwards plus the ordinary "
+           "warmup prefill before post-warmup rebalance; otherwise measured 2-card prefill "
+           "can pay warmup/capture instead of replaying."
+        << ::testing::PrintToString(events);
+}
+
+TEST(Test__BenchmarkRunnerCPU, StaticWarmupRearmsPrefillGraphAfterDecodeWorkspaceGrowth)
+{
+    ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
+    auto runner = std::make_shared<MockBenchmarkEventOrderRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success) << result.failure_reason;
+
+    const auto &events = runner->events();
+    const auto reset_it = std::find(events.begin(), events.end(), "reset_stats");
+    ASSERT_NE(reset_it, events.end()) << ::testing::PrintToString(events);
+
+    size_t last_decode_before_reset = events.size();
+    for (auto it = events.begin(); it != reset_it; ++it)
+    {
+        if (*it == "decode")
+            last_decode_before_reset = static_cast<size_t>(it - events.begin());
+    }
+    ASSERT_NE(last_decode_before_reset, events.size())
+        << "Warmup decode must run before executor stats reset: "
+        << ::testing::PrintToString(events);
+
+    size_t prefill_after_decode_before_reset = 0;
+    for (size_t i = last_decode_before_reset + 1;
+         i < static_cast<size_t>(reset_it - events.begin());
+         ++i)
+    {
+        if (events[i] == "prefill")
+            ++prefill_after_decode_before_reset;
+    }
+
+    EXPECT_GE(prefill_after_decode_before_reset, 3u)
+        << "Static benchmark warmup must re-arm exact prefill graph capture after warmup decode "
+           "has had a chance to grow/rebind workspace; otherwise measured prefill pays warmup/capture."
+        << ::testing::PrintToString(events);
+}
+
+TEST(Test__BenchmarkRunnerCPU, PrefillOnlyBenchmarkSkipsDecodeHistogramCallback)
+{
+    ScopedGpuGraphsSetting force_gpu_graph_warmup(true);
+    auto runner = std::make_shared<MockBenchmarkEventOrderRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+    bench.setPostWarmupCallback([runner]() {
+        runner->recordCallback();
+    });
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    EXPECT_TRUE(result.prefill_success);
+    EXPECT_EQ(result.decode_tokens, 0);
+
+    const auto &events = runner->events();
+    EXPECT_EQ(std::find(events.begin(), events.end(), "callback"), events.end())
+        << "MoE post-warmup rebalance callbacks require a decode histogram producer stream; "
+           "prefill-only benchmark runs must skip them."
+        << ::testing::PrintToString(events);
+    EXPECT_EQ(std::find(events.begin(), events.end(), "decode"), events.end())
+        << "n_predict=0 should remain prefill-only."
+        << ::testing::PrintToString(events);
 }
 
 TEST(Test__BenchmarkRunnerCPU, UsesRequestBatchedDecodeStepWhenMTPBatchRequested)
@@ -1028,6 +1253,10 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     result.decode_tokens = 2;
     result.decode_time_ms = 2.0;
     result.decode_tokens_per_sec = 1000.0;
+    result.decode_token_latencies_ms = {0.9, 1.1};
+    result.decode_latency_mean_ms = 1.0;
+    result.decode_latency_p50_ms = 1.0;
+    result.decode_latency_p90_ms = 1.08;
     result.decode_success = true;
     result.total_time_ms = 6.0;
     result.success = true;
@@ -1128,6 +1357,10 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_EQ(doc.at("tokens").at("decode"), 2);
     EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);
     EXPECT_DOUBLE_EQ(doc.at("throughput_tokens_per_sec").at("overall").get<double>(), 2000.0);
+    EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("mean").get<double>(), 1.0);
+    EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("p50").get<double>(), 1.0);
+    EXPECT_DOUBLE_EQ(doc.at("decode_latency_ms").at("p90").get<double>(), 1.08);
+    EXPECT_EQ(doc.at("decode_latency_ms").at("samples"), 2);
     EXPECT_EQ(doc.at("generated_text_bytes"), 2);
     EXPECT_EQ(doc.at("generated_token_ids"), nlohmann::json::array({77, 88}));
 

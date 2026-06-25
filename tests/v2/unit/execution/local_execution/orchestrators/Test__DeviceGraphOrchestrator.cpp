@@ -19,13 +19,17 @@
 #include "execution/local_execution/device/WorkspaceDescriptor.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/compute_stages/IComputeStage.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoERebalanceController.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "models/qwen/QwenStandardGraph.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "loaders/WeightPlan.h"
+#include "loaders/WeightManager.h"
 #include "loaders/PreparedWeightStore.h"
 #include "backends/ComputeBackend.h"
+#include "../../../../mocks/MockModelContext.h"
+#include "../../../../mocks/MockModelLoader.h"
 #include "utils/Logger.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -90,6 +94,11 @@ public:
 
     TensorContext exposeTensorContext() const { return buildTensorContext(); }
     LayerWeights exposeLayerWeightsForGraph(int layer_idx) const { return layerWeightsForGraph(layer_idx); }
+    LayerWeightBindings exposeLayerWeightBindingsForGraph(int layer_idx, int total_tokens)
+    {
+        DecodeReplicatedDenseScope scope(*this, total_tokens);
+        return layerWeightBindingsForGraph(layer_idx);
+    }
     std::optional<PreparedWeightRef> exposePreparedRefForGraphWeight(
         const WeightBinding *binding,
         DeviceId device) const
@@ -311,6 +320,45 @@ namespace
             }
         }
     }
+
+    class RebuiltMoEGraphBuilder : public MockGraphBuilder
+    {
+    public:
+        ComputeGraph buildFullForwardGraph(
+            const ForwardInput &input,
+            ForwardOutput &output) override
+        {
+            (void)input;
+            (void)output;
+            ++full_forward_builds;
+
+            ComputeGraph graph;
+            auto stage = std::make_unique<MoEExpertComputeStage>(makeStageParams());
+            last_built_stage = stage.get();
+            graph.addNode("moe", std::move(stage), DeviceId::cpu());
+            return graph;
+        }
+
+        int full_forward_builds = 0;
+        MoEExpertComputeStage *last_built_stage = nullptr;
+
+    private:
+        static MoEExpertComputeStage::Params makeStageParams()
+        {
+            MoEExpertComputeStage::Params params;
+            params.device_id = DeviceId::cpu();
+            params.seq_len = 1;
+            params.d_model = 8;
+            params.num_experts = 4;
+            params.top_k = 2;
+            params.expert_intermediate = 4;
+            params.local_expert_start = 0;
+            params.local_expert_count = 4;
+            params.layer_idx = 0;
+            params.expert_mask = {true, false, true, false};
+            return params;
+        }
+    };
 }
 
 // =============================================================================
@@ -337,6 +385,143 @@ TEST_F(Test__DeviceGraphOrchestrator, ConstructWithConfig)
     EXPECT_TRUE(orchestrator->isGraphCachingEnabled());
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, PreparedStoreKeepsModelOwnedIdForLegacyFrozenGraph)
+{
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    const ModelContextId shared_model_id{12345};
+    auto shared_store = std::make_shared<PreparedWeightStore>(shared_model_id);
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    DeviceGraphOrchestrator::Dependencies deps;
+    deps.model_ctx = test::MockModelContext::createMinimal();
+    deps.graph_builder = std::make_shared<QwenStandardGraph>(config_, nullptr);
+    deps.weight_manager = weight_manager;
+
+    DeviceGraphOrchestrator orchestrator(std::move(deps));
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto ffn_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto ffn_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.final_norm = final_norm.get();
+    weights.lm_head = lm_head.get();
+    weights.get_layer_weights = [ffn_norm, ffn_down](int)
+    {
+        LayerWeights layer;
+        layer.ffn_norm = ffn_norm.get();
+        layer.down_proj = ffn_down.get();
+        return layer;
+    };
+
+    orchestrator.setWeights(weights);
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    EXPECT_EQ(orchestrator.frozenWeightSet()->strategy().model_id.value, shared_model_id.value);
+    const auto &embedding_binding = orchestrator.frozenWeightSet()->global("token_embd.weight");
+    ASSERT_TRUE(embedding_binding.prepared.has_value());
+    EXPECT_EQ(embedding_binding.prepared->kind, PreparedWeightKind::PreparedEmbedding);
+    const auto &down_binding = orchestrator.frozenWeightSet()->layer(0, "ffn_down.weight");
+    ASSERT_TRUE(down_binding.prepared.has_value());
+    EXPECT_EQ(down_binding.prepared->kind, PreparedWeightKind::CpuPackedGemm);
+
+    ASSERT_NO_THROW(orchestrator.initializePreparedWeightStore(DeviceId::cpu()));
+    ASSERT_EQ(orchestrator.preparedWeightStore(), shared_store.get());
+    EXPECT_EQ(orchestrator.preparedWeightStore()->modelId().value, shared_model_id.value);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, LegacyConstructorWithWeightManagerSeedsPreparedRefs)
+{
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    const ModelContextId shared_model_id{67890};
+    auto shared_store = std::make_shared<PreparedWeightStore>(shared_model_id);
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    auto graph_builder = std::make_shared<QwenStandardGraph>(config_, nullptr);
+    DeviceGraphOrchestrator orchestrator(graph_builder, nullptr);
+    orchestrator.setWeightManager(weight_manager);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto ffn_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto ffn_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.final_norm = final_norm.get();
+    weights.lm_head = lm_head.get();
+    weights.get_layer_weights = [ffn_norm, ffn_down](int)
+    {
+        LayerWeights layer;
+        layer.ffn_norm = ffn_norm.get();
+        layer.down_proj = ffn_down.get();
+        return layer;
+    };
+
+    orchestrator.setWeights(weights);
+
+    ASSERT_NE(orchestrator.frozenWeightSet(), nullptr);
+    EXPECT_EQ(orchestrator.frozenWeightSet()->strategy().model_id.value, shared_model_id.value);
+    const auto &embedding_binding = orchestrator.frozenWeightSet()->global("token_embd.weight");
+    ASSERT_TRUE(embedding_binding.prepared.has_value());
+    EXPECT_EQ(embedding_binding.prepared->kind, PreparedWeightKind::PreparedEmbedding);
+    const auto &down_binding = orchestrator.frozenWeightSet()->layer(0, "ffn_down.weight");
+    ASSERT_TRUE(down_binding.prepared.has_value());
+    EXPECT_EQ(down_binding.prepared->kind, PreparedWeightKind::CpuPackedGemm);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, LegacyFrozenBindingIdsAreDeviceScopedForSharedPreparedStore)
+{
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    auto shared_store = std::make_shared<PreparedWeightStore>(ModelContextId{24680});
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto ffn_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    ModelWeights weights;
+    weights.embedding_table = embedding.get();
+    weights.final_norm = final_norm.get();
+    weights.lm_head = lm_head.get();
+    weights.get_layer_weights = [ffn_down](int)
+    {
+        LayerWeights layer;
+        layer.down_proj = ffn_down.get();
+        return layer;
+    };
+
+    auto make_orchestrator = [&](DeviceId device)
+    {
+        GraphConfig cfg = config_;
+        cfg.default_device = device;
+        auto builder = std::make_shared<QwenStandardGraph>(cfg, nullptr);
+        auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(builder, nullptr);
+        orchestrator->setWeightManager(weight_manager);
+        orchestrator->setWeights(weights);
+        return orchestrator;
+    };
+
+    auto cuda0 = make_orchestrator(DeviceId::cuda(0));
+    auto cuda1 = make_orchestrator(DeviceId::cuda(1));
+
+    ASSERT_NE(cuda0->frozenWeightSet(), nullptr);
+    ASSERT_NE(cuda1->frozenWeightSet(), nullptr);
+    EXPECT_NE(
+        cuda0->frozenWeightSet()->global("token_embd.weight").binding_id,
+        cuda1->frozenWeightSet()->global("token_embd.weight").binding_id);
+    EXPECT_NE(
+        cuda0->frozenWeightSet()->layer(0, "ffn_down.weight").binding_id,
+        cuda1->frozenWeightSet()->layer(0, "ffn_down.weight").binding_id);
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, ConstructWithCacheDisabled)
 {
     GraphCacheConfig cache_config;
@@ -360,7 +545,7 @@ TEST_F(Test__DeviceGraphOrchestrator, SidecarMainStatePreservationIsInitializedA
 {
     auto moe_config = makeMaintenanceMoEGraphConfig();
     moe_config.mtp.enabled = true;
-    moe_config.moe.expert_mode = MoEExpertMode::ExpertParallel;
+    moe_config.moe.expert_mode = MoEExpertMode::ApportionedExperts;
     moe_config.moe.local_expert_start = 0;
     moe_config.moe.local_expert_count = -1;
     DeviceGraphOrchestrator moe_orchestrator(
@@ -675,6 +860,145 @@ TEST_F(Test__DeviceGraphOrchestrator, SetFrozenWeightSetConfiguresBindingsDirect
     ASSERT_TRUE(capturing_builder->captured_weights.get_layer_weights != nullptr);
     auto legacy_layer = capturing_builder->captured_weights.get_layer_weights(0);
     EXPECT_EQ(legacy_layer.wq, attn_q.get());
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, PreparedStoreIncludesDecodeReplicatedDenseFrozenSet)
+{
+    config_.n_layers = 1;
+    auto capturing_builder = std::make_shared<CapturingQwenStandardGraph>(config_, nullptr);
+
+    auto loader = test::MockModelLoader::createMinimal();
+    auto weight_manager = std::make_shared<WeightManager>(*loader);
+    auto shared_store = std::make_shared<PreparedWeightStore>(ModelContextId{4242});
+    weight_manager->setPreparedWeightStore(shared_store);
+
+    DeviceGraphOrchestrator orchestrator(capturing_builder, nullptr);
+    orchestrator.setWeightManager(weight_manager);
+
+    auto embedding = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto final_norm = std::make_shared<FP32Tensor>(std::vector<size_t>{8});
+    auto lm_head = std::make_shared<FP32Tensor>(std::vector<size_t>{16, 8});
+    auto primary_attn_q = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto decode_down = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 16});
+
+    auto make_binding = [](uint64_t binding_id,
+                           const std::string &name,
+                           WeightRole role,
+                           TensorBase *tensor,
+                           PreparedWeightKind prepared_kind = PreparedWeightKind::None)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{4242}, binding_id);
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.slice.source_rows = tensor ? tensor->rows() : 0;
+        binding.slice.source_cols = tensor ? tensor->cols() : 0;
+        binding.slice.row_count = binding.slice.source_rows;
+        binding.slice.col_count = binding.slice.source_cols;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        if (prepared_kind != PreparedWeightKind::None)
+        {
+            binding.prepared = PreparedWeightRef{
+                ModelContextId{4242},
+                binding_id,
+                prepared_kind,
+                DeviceId::cpu()};
+        }
+        return binding;
+    };
+
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = ModelContextId{4242};
+    strategy.devices = {DeviceId::cpu()};
+
+    ModelWeightSetBuilder primary_builder(strategy);
+    primary_builder.addBinding(make_binding(1, "token_embd.weight", WeightRole::Embedding, embedding.get()));
+    primary_builder.addBinding(make_binding(2, "output_norm.weight", WeightRole::OutputNorm, final_norm.get()));
+    primary_builder.addBinding(make_binding(3, "output.weight", WeightRole::LMHead, lm_head.get()));
+    primary_builder.addBinding(make_binding(4, "blk.0.attn_q.weight", WeightRole::AttentionQ, primary_attn_q.get(),
+                                            PreparedWeightKind::CpuPackedGemm));
+    orchestrator.setFrozenWeightSet(
+        std::make_unique<FrozenModelWeightSet>(strategy, primary_builder.freezeBindings()));
+
+    ModelWeightSetBuilder decode_builder(strategy);
+    auto &decode_binding = decode_builder.addBinding(
+        make_binding(100, "blk.0.ffn_down.weight", WeightRole::FFNDown, decode_down.get(),
+                     PreparedWeightKind::CpuPackedGemm));
+    const uint64_t decode_binding_id = decode_binding.binding_id;
+    orchestrator.setDecodeReplicatedDenseWeightSet(
+        std::make_unique<FrozenModelWeightSet>(strategy, decode_builder.freezeBindings()));
+
+    ASSERT_NO_THROW(orchestrator.initializePreparedWeightStore(DeviceId::cpu()));
+
+    auto decode_ref = shared_store->preparedRefForBinding(decode_binding_id, DeviceId::cpu());
+    ASSERT_TRUE(decode_ref.has_value())
+        << "decode-replicated dense frozen bindings must be registered in the shared prepared store";
+    EXPECT_EQ(decode_ref->kind, PreparedWeightKind::CpuPackedGemm);
+    EXPECT_EQ(decode_ref->binding_id, decode_binding_id);
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAttentionStateUsesDecodeDenseGdnBindingsForGroupedDecode)
+{
+    GraphConfig cfg = config_;
+    cfg.dense_tp_enabled = true;
+    cfg.dense_tp_decode_replicated = true;
+    auto graph = std::make_shared<CapturingQwenStandardGraph>(cfg, nullptr);
+
+    auto make_binding = [](uint64_t binding_id,
+                           const std::string &name,
+                           WeightRole role,
+                           TensorBase *tensor)
+    {
+        WeightBinding binding;
+        binding.binding_id = binding_id;
+        binding.identity = makeSourceWeightIdentity(name, ModelContextId{5150}, binding_id);
+        binding.identity.role = role;
+        binding.identity.layer = inferWeightLayer(name);
+        binding.tensor = tensor;
+        binding.slice.source_rows = tensor ? tensor->rows() : 0;
+        binding.slice.source_cols = tensor ? tensor->cols() : 0;
+        binding.slice.row_count = binding.slice.source_rows;
+        binding.slice.col_count = binding.slice.source_cols;
+        binding.residency.home_device = DeviceId::cpu();
+        binding.residency.resident_device = DeviceId::cpu();
+        return binding;
+    };
+
+    auto primary_alpha = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    auto decode_alpha = std::make_shared<FP32Tensor>(std::vector<size_t>{8, 8});
+    WeightBinding primary_alpha_binding = make_binding(
+        1, "blk.0.ssm_alpha.weight", WeightRole::GDNProjection, primary_alpha.get());
+    WeightBinding decode_alpha_binding = make_binding(
+        2, "blk.0.ssm_alpha.weight", WeightRole::GDNProjection, decode_alpha.get());
+
+    ModelWeightBindings primary_bindings;
+    primary_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.ssm_alpha = &primary_alpha_binding;
+        return layer;
+    };
+    graph->setWeightBindings(primary_bindings);
+
+    ModelWeightBindings decode_bindings;
+    decode_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.ssm_alpha = &decode_alpha_binding;
+        return layer;
+    };
+    graph->setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+    auto grouped_decode_bindings = graph->exposeLayerWeightBindingsForGraph(
+        0,
+        /*total_tokens=*/2);
+    ASSERT_NE(grouped_decode_bindings.ssm_alpha, nullptr);
+    EXPECT_EQ(grouped_decode_bindings.ssm_alpha->binding_id, decode_alpha_binding.binding_id);
+    EXPECT_EQ(grouped_decode_bindings.ssm_alpha->tensor, decode_alpha.get());
 }
 
 // =============================================================================
@@ -1378,6 +1702,23 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIsDomainScoped
     EXPECT_EQ(host.prefillGraphParticipantId(), 0);
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, DenseDecodeReplicatedKeepsPrefillGraphCaptureEligible)
+{
+    auto default_orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    IForwardExecutionHost &default_host = *default_orchestrator;
+    EXPECT_FALSE(default_host.prefillGraphCaptureDisabledByHost());
+
+    GraphConfig replicated_config = config_;
+    replicated_config.dense_tp_enabled = true;
+    replicated_config.dense_tp_decode_replicated = true;
+    auto replicated_graph = std::make_shared<QwenStandardGraph>(replicated_config, nullptr);
+    auto replicated_orchestrator = std::make_unique<DeviceGraphOrchestrator>(replicated_graph, nullptr);
+    IForwardExecutionHost &replicated_host = *replicated_orchestrator;
+    EXPECT_FALSE(replicated_host.prefillGraphCaptureDisabledByHost())
+        << "Phase-split dense policy mirrors dense weights only for decode; it must not veto "
+           "prefill graph capture for the tensor-parallel prefill path.";
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRoutedOverlayDomains)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -1407,6 +1748,62 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceControllerLookupIncludesRouted
     EXPECT_NO_THROW(
         orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0))
         << "domain validation must accept non-primary routed overlay controllers";
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, ExpertReplicaSetPersistsAcrossFreshGraphBuilds)
+{
+    auto builder = std::make_shared<RebuiltMoEGraphBuilder>();
+    auto cfg = makeMaintenanceMoEGraphConfig();
+    cfg.n_layers = 1;
+    cfg.total_n_layers = 1;
+    cfg.moe.num_experts = 4;
+    cfg.moe.top_k = 2;
+    builder->setConfig(cfg);
+
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(builder, nullptr);
+
+    auto controller_config = makeMaintenanceMoEConfig(
+        MoERebalanceMode::OBSERVE,
+        /*num_experts=*/4,
+        /*num_sockets=*/2,
+        /*num_layers=*/1,
+        /*top_k=*/2);
+    controller_config.domain_id = "single_cpu_moe";
+    orchestrator->setMoERebalanceController(
+        std::make_unique<MoERebalanceController>(controller_config));
+
+    ExpertReplicaSet replicas;
+    replicas.domain_id = "single_cpu_moe";
+    replicas.is_replicated = {false, true, false, true};
+    replicas.owner_socket = {0, 1, 0, 1};
+    replicas.num_replicated = 2;
+    replicas.num_sockets = 2;
+
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
+    orchestrator->setExpertReplicaSetForParticipant(
+        replicas, /*participant_id=*/1);
+    EXPECT_GT(orchestrator->moePlacementEpoch(), 0u)
+        << "Replica placement changes must invalidate MoE-sensitive forward graph cache keys";
+
+    int token = 7;
+    ForwardInput input;
+    input.token_ids = &token;
+    input.seq_len = 1;
+    input.batch_size = 1;
+    input.device = DeviceId::cpu();
+
+    IForwardExecutionHost &host = *orchestrator;
+    auto result = host.buildForwardGraph(input);
+    ASSERT_TRUE(result) << result.error();
+    ASSERT_EQ(builder->full_forward_builds, 1);
+
+    auto *node = result.graph().getNode("moe");
+    ASSERT_NE(node, nullptr);
+    auto *moe = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+    ASSERT_NE(moe, nullptr);
+    EXPECT_EQ(moe->replicaCountForTesting(), 2)
+        << "Replica metadata set before a rebuild must be applied to newly built MoE stages";
+    EXPECT_EQ(moe->replicaParticipantForTesting(), 1);
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainIndex)

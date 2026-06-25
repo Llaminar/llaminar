@@ -30,7 +30,7 @@ namespace llaminar2::test
             domain.name = name;
             domain.kind = ExpertDomainKind::SingleDevice;
             domain.participants = {GlobalDeviceAddress::cpu(0)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -41,7 +41,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::LocalTP;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.backend = CollectiveBackendType::RCCL;
-            domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
             return domain;
         }
 
@@ -114,7 +114,7 @@ namespace llaminar2::test
         EXPECT_TRUE(result.ok()) << (result.errors.empty() ? "" : result.errors.front());
     }
 
-    TEST(Test__MoEContinuationDomainSpec, RejectsRoutedTensorParallelExpertsByDefault)
+    TEST(Test__MoEContinuationDomainSpec, RejectsRoutedShardedExpertsByDefault)
     {
         auto plan = basePlanWithContinuation(
             denseDomain("local_cont", ExecutionDomainScope::LOCAL,
@@ -125,11 +125,11 @@ namespace llaminar2::test
         const auto result = validateMoEExpertParallelPlan(plan);
 
         EXPECT_FALSE(result.ok());
-        EXPECT_TRUE(hasErrorContaining(result, "TensorParallelExperts"));
+        EXPECT_TRUE(hasErrorContaining(result, "ShardedExperts"));
         EXPECT_TRUE(hasErrorContaining(result, "disabled by default"));
     }
 
-    TEST(Test__MoEContinuationDomainSpec, CanExplicitlyAllowLegacyRoutedTensorParallelExperts)
+    TEST(Test__MoEContinuationDomainSpec, CanExplicitlyAllowLegacyRoutedShardedExperts)
     {
         auto plan = basePlanWithContinuation(
             denseDomain("local_cont", ExecutionDomainScope::LOCAL,
@@ -138,7 +138,7 @@ namespace llaminar2::test
         plan.routed_tiers = {routedTier("warm", "rocm_warm", true)};
 
         MoEExpertParallelValidationOptions options;
-        options.allow_routed_tensor_parallel_experts = true;
+        options.allow_routed_sharded_experts = true;
         const auto result = validateMoEExpertParallelPlan(plan, options);
 
         EXPECT_TRUE(result.ok()) << (result.errors.empty() ? "" : result.errors.front());

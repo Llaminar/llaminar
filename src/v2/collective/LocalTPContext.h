@@ -334,7 +334,8 @@ namespace llaminar2
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
         // =====================================================================
-        // When allreduce precision is "fp16" (set per-layer via schema or globally\n        // via LLAMINAR_ALLREDUCE_PRECISION), FP32 allreduces cast to FP16 first
+        // When allreduce precision is "fp16" (set per-layer via schema,
+        // GraphConfig override, or LLAMINAR_ALLREDUCE_PRECISION), FP32 allreduces cast to FP16 first.
         // cast to FP16 first to halve PCIe transfer bandwidth. These device-local
         // scratch buffers hold the FP16 temporary (lazily allocated on first use).
 
@@ -342,6 +343,28 @@ namespace llaminar2
         std::vector<void *> fp16_scratch_buffers_;
         /// Current allocated element count per device
         std::vector<size_t> fp16_scratch_counts_;
+
+        // =====================================================================
+        // Experimental Small GPU Allreduce State
+        // =====================================================================
+        // Used only for homogeneous two-device FP32/SUM reductions when explicitly
+        // enabled. This state is separate from the blocking fallback barrier so
+        // captured decode graphs can enqueue peer-add work on each caller stream.
+        mutable std::mutex small_gpu_allreduce_mutex_;
+        std::condition_variable small_gpu_allreduce_cv_;
+        int small_gpu_allreduce_arrivals_{0};
+        int small_gpu_allreduce_recorded_{0};
+        int small_gpu_allreduce_departures_{0};
+        bool small_gpu_allreduce_result_{false};
+        bool small_gpu_allreduce_events_ready_{false};
+        bool small_gpu_allreduce_unavailable_{false};
+        uint64_t small_gpu_allreduce_generation_{0};
+        size_t small_gpu_allreduce_count_{0};
+        CollectiveDataType small_gpu_allreduce_dtype_{CollectiveDataType::FLOAT32};
+        std::string small_gpu_allreduce_stage_name_;
+        std::vector<void *> small_gpu_allreduce_buffers_;
+        std::vector<void *> small_gpu_allreduce_streams_;
+        std::vector<void *> small_gpu_allreduce_ready_events_;
 
         // =====================================================================
         // BAR-Backed Tensor Registry
@@ -399,6 +422,17 @@ namespace llaminar2
                                              CollectiveDataType dtype,
                                              void *stream,
                                              const std::string &precision);
+
+        bool trySmallGpuAllreduceOnStream(void *buffer,
+                                          size_t count,
+                                          CollectiveDataType dtype,
+                                          CollectiveOp op,
+                                          int device_index,
+                                          void *stream,
+                                          const std::string &stage_name);
+
+        bool initializeSmallGpuAllreduceEventsLocked();
+        void resetSmallGpuAllreduceStateLocked();
 
         /**
          * @brief Barrier-synchronized allreduce for NCCL/RCCL multi-GPU backends

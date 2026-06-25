@@ -787,7 +787,7 @@ namespace
         result.kind = ExpertDomainKind::SingleDevice;
         result.backend = CollectiveBackendType::HOST;
         result.participants = {participant};
-        result.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        result.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
         result.owner_rank = 0;
         return result;
     }
@@ -1915,6 +1915,62 @@ TEST(Test__MTPGraphConstruction, ColumnParallelAllPositionLMHeadUsesVerifierShar
     EXPECT_TRUE(contractWrites(gather_contract, BufferId::ALL_POSITION_LOGITS));
 }
 
+TEST(Test__MTPGraphConstruction, PhaseSplitColumnParallelLogitsReportsSemanticShardWidth)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    fixture.config.dense_tp_decode_replicated = true;
+
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    auto logits_local = orchestrator.inferenceState().logits_local;
+    ASSERT_NE(logits_local, nullptr);
+    ASSERT_GE(logits_local->shape().size(), 2u);
+    ASSERT_EQ(logits_local->shape()[1], static_cast<size_t>(fixture.config.vocab_size))
+        << "phase-split decode reserves full-width local logits storage";
+
+    const LogitsLocalInfo info = orchestrator.getLogitsLocalInfo();
+    ASSERT_TRUE(info);
+    EXPECT_EQ(info.vocab_local, static_cast<size_t>(fixture.config.vocab_local));
+    EXPECT_EQ(info.row_stride, static_cast<size_t>(fixture.config.vocab_size));
+}
+
+TEST(Test__MTPGraphConstruction, PhaseSplitDecodeDoesNotExposeStaleColumnParallelLogits)
+{
+    DeviceManager::instance().initialize(-1, false);
+
+    TinyQwenForwardFixture fixture(DeviceId::cpu(), KVCachePrecision::FP32);
+    fixture.config.lm_head_column_parallel = true;
+    fixture.config.vocab_local = fixture.config.vocab_size / 2;
+    fixture.config.dense_tp_decode_replicated = true;
+
+    auto graph_builder = std::make_shared<QwenStandardGraph>(fixture.config, fixture.mpi);
+    DeviceGraphOrchestrator orchestrator(graph_builder, fixture.mpi);
+
+    ASSERT_TRUE(orchestrator.initializeInferenceStateFromArena(
+        /*batch_size=*/1,
+        fixture.config.max_seq_len,
+        DeviceId::cpu()));
+
+    orchestrator.setPhase(InferencePhase::PREFILL);
+    EXPECT_TRUE(orchestrator.hasLogitsLocal());
+    EXPECT_TRUE(orchestrator.getLogitsLocalInfo());
+
+    orchestrator.setPhase(InferencePhase::DECODE);
+    EXPECT_FALSE(orchestrator.hasLogitsLocal());
+    EXPECT_FALSE(orchestrator.getLogitsLocalInfo());
+    EXPECT_FALSE(orchestrator.consumeLogitsLocalInfoForSampling());
+}
+
 TEST(Test__MTPGraphConstruction, CUDAGDNVerifierGraphDeclaresStateCaptureWorkspace)
 {
     auto mpi = std::make_shared<MockMPIContext>(0, 1);
@@ -2084,7 +2140,7 @@ TEST(Test__MTPGraphConstruction, BuildsQwen35MoESidecarGraphWithMoEOutputs)
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
     fixture.config.moe.has_shared_expert = false;
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
@@ -2153,7 +2209,7 @@ TEST(Test__MTPGraphConstruction, BuildsOverlayMoESidecarWithMTPCollectiveNamespa
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
     fixture.config.moe.has_shared_expert = false;
     fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(64);
 
@@ -2270,7 +2326,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarExecutionAppendsRealKVPayload)
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
     fixture.config.moe.has_shared_expert = false;
 
     Qwen35MoEGraph graph_builder(fixture.config, fixture.mpi);
@@ -2302,7 +2358,7 @@ TEST(Test__MTPGraphConstruction, OverlayMoESidecarExecutionAppendsRealKVPayload)
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
     fixture.config.moe.has_shared_expert = false;
     fixture.config.moe.expert_parallel_plan = makeMTPOverlayPlanForLayer(64);
 
@@ -2694,7 +2750,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     fixture.config.moe.num_experts = 4;
     fixture.config.moe.top_k = 2;
     fixture.config.moe.intermediate_size = 32;
-    fixture.config.moe.expert_mode = MoEExpertMode::Replicated;
+    fixture.config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
     fixture.config.moe.has_shared_expert = false;
 
     auto graph_builder = std::make_shared<Qwen35MoEGraph>(fixture.config, fixture.mpi);

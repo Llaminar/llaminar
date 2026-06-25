@@ -32,8 +32,14 @@ namespace llaminar2
     {
         UNSPECIFIED,
         REPLICATED_EXPERTS,
-        EXPERT_ID_SHARDED,
-        TENSOR_PARALLEL_EXPERTS,
+        APPORTIONED_EXPERTS,
+        SHARDED_EXPERTS,
+
+        // Compatibility aliases for older configs/tests.  "Expert id sharded"
+        // meant whole expert ids apportioned across participants, not tensor
+        // shards of an expert.
+        EXPERT_ID_SHARDED = APPORTIONED_EXPERTS,
+        TENSOR_PARALLEL_EXPERTS = SHARDED_EXPERTS,
     };
 
     const char *executionDomainScopeToString(ExecutionDomainScope scope);
@@ -75,6 +81,8 @@ namespace llaminar2
         bool hasComputeKind() const { return compute_kind != ExecutionDomainComputeKind::UNSPECIFIED; }
         bool hasMultipleParticipants() const { return participants.size() > 1; }
         bool isDomainScopedTP() const;
+        bool supportsApportionedExperts() const;
+        bool supportsShardedExperts() const;
         bool supportsTensorParallelExperts() const;
         bool supportsExpertIdSharding() const;
 

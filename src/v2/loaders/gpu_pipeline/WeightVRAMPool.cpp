@@ -2,6 +2,7 @@
 #include "backends/IBackend.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/VramBillOfMaterials.h"
 
 /**
  * @file WeightVRAMPool.cpp
@@ -290,6 +291,49 @@ namespace llaminar2
         }
 
         allocated_ = true;
+        const std::string backend_name = backend_ ? backend_->backendName() : "none";
+        logVramBomLine(
+            "weight_pool_summary",
+            "backend=" + backend_name +
+                " device_id=" + std::to_string(device_id_) +
+                " weights=" + std::to_string(plans_.size()) +
+                " persistent_bytes=" + std::to_string(weight_region_bytes_) +
+                " persistent_mib=" + vramBomMiB(weight_region_bytes_) +
+                " staging_bytes=" + std::to_string(staging_region_bytes_) +
+                " staging_mib=" + vramBomMiB(staging_region_bytes_) +
+                " staging_slots=" + std::to_string(staging_slot_count_) +
+                " staging_slot_bytes=" + std::to_string(max_staging_slot_bytes_) +
+                " staging_slot_mib=" + vramBomMiB(max_staging_slot_bytes_) +
+                " total_bytes=" + std::to_string(total_bytes_) +
+                " total_mib=" + vramBomMiB(total_bytes_));
+        for (const auto &name : weight_order_)
+        {
+            const auto it = plans_.find(name);
+            if (it == plans_.end())
+                continue;
+            const auto &plan = it->second;
+            const size_t persistent_bytes =
+                plan.payload_bytes + plan.scales_bytes + plan.mins_bytes + plan.emins_bytes;
+            logVramBomLine(
+                "weight_pool_weight",
+                "backend=" + backend_name +
+                    " device_id=" + std::to_string(device_id_) +
+                    " name=" + name +
+                    " N=" + std::to_string(plan.N) +
+                    " K=" + std::to_string(plan.K) +
+                    " payload_bytes=" + std::to_string(plan.payload_bytes) +
+                    " payload_mib=" + vramBomMiB(plan.payload_bytes) +
+                    " scales_bytes=" + std::to_string(plan.scales_bytes) +
+                    " scales_mib=" + vramBomMiB(plan.scales_bytes) +
+                    " mins_bytes=" + std::to_string(plan.mins_bytes) +
+                    " mins_mib=" + vramBomMiB(plan.mins_bytes) +
+                    " emins_bytes=" + std::to_string(plan.emins_bytes) +
+                    " emins_mib=" + vramBomMiB(plan.emins_bytes) +
+                    " persistent_bytes=" + std::to_string(persistent_bytes) +
+                    " persistent_mib=" + vramBomMiB(persistent_bytes) +
+                    " raw_staging_bytes=" + std::to_string(plan.staging_bytes) +
+                    " raw_staging_mib=" + vramBomMiB(plan.staging_bytes));
+        }
         LOG_DEBUG("WeightVRAMPool: allocated " << total_bytes_ << " bytes on device "
                                                << device_id_ << " for " << plans_.size() << " weights"
                                                << " (staging: " << staging_region_bytes_ << " bytes, "
@@ -380,6 +424,11 @@ namespace llaminar2
 
         if (released_bytes > 0)
         {
+            logVramBomLine(
+                "weight_pool_staging_release",
+                "backend=" + std::string(backend_ ? backend_->backendName() : "none") +
+                    " device_id=" + std::to_string(device_id_) +
+                    " " + vramBomBytes(released_bytes));
             total_bytes_ = total_bytes_ >= released_bytes ? total_bytes_ - released_bytes : weight_region_bytes_;
             LOG_DEBUG("WeightVRAMPool: released " << released_bytes
                                                   << " bytes of temporary staging on device " << device_id_);

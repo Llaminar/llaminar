@@ -344,7 +344,7 @@ describe_topology() {
         --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
         --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
         --moe-expert-overlay-residency static-by-id
-        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts"
+        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=apportioned_experts"
         --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
       )
       ;;
@@ -356,8 +356,8 @@ describe_topology() {
         --moe-expert-overlay-base-domain qwen36_moe_rocm_hot
         --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot
         --moe-expert-overlay-residency static-by-id
-        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=replicated_experts"
-        --moe-expert-overlay-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;compute=replicated_experts"
+        --moe-expert-overlay-domain "qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=apportioned_experts"
+        --moe-expert-overlay-domain "qwen36_moe_cpu_cold=cpu:0,cpu:1;scope=local;backend=upi;compute=apportioned_experts"
         --moe-expert-overlay-tier "hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=240;memory-mb=4096"
         --moe-expert-overlay-tier "cold@qwen36_moe_cpu_cold;priority=1;max-experts-per-layer=0;memory-mb=0;fallback=true"
       )

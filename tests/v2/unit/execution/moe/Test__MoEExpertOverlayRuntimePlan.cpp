@@ -21,7 +21,7 @@ namespace llaminar2::test
             domain.kind = ExpertDomainKind::SingleDevice;
             domain.backend = CollectiveBackendType::NCCL;
             domain.participants = {GlobalDeviceAddress::cuda(0)};
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -33,7 +33,7 @@ namespace llaminar2::test
             domain.backend = CollectiveBackendType::RCCL;
             domain.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
             return domain;
         }
 
@@ -46,7 +46,7 @@ namespace llaminar2::test
             domain.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
             domain.world_ranks = {0, 1};
             domain.owner_rank = 0;
-            domain.compute_kind = ExpertDomainComputeKind::TensorParallelExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ShardedExperts;
             return domain;
         }
 
@@ -59,7 +59,7 @@ namespace llaminar2::test
             domain.participants = {GlobalDeviceAddress::cpu(0)};
             domain.world_ranks = {owner_rank};
             domain.owner_rank = owner_rank;
-            domain.compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+            domain.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
             return domain;
         }
 
@@ -241,8 +241,8 @@ namespace llaminar2::test
         ASSERT_NE(cpu_domain, nullptr);
         EXPECT_EQ(rocm_domain->backend, CollectiveBackendType::RCCL);
         EXPECT_EQ(cpu_domain->backend, CollectiveBackendType::UPI);
-        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::TensorParallelExperts);
-        EXPECT_EQ(cpu_domain->compute_kind, ExpertDomainComputeKind::TensorParallelExperts);
+        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::ShardedExperts);
+        EXPECT_EQ(cpu_domain->compute_kind, ExpertDomainComputeKind::ShardedExperts);
         EXPECT_TRUE(rocm_domain->routed_rebalance_controller_eligible);
         EXPECT_EQ(rocm_domain->rebalance_domain_id, "overlay_routed_rocm_hot");
         EXPECT_EQ(rocm_domain->routed_tier_count, 1);
@@ -267,10 +267,10 @@ namespace llaminar2::test
         EXPECT_NE(diagnostics.find("routed_rebalance=overlay_routed_cpu_cold"), std::string::npos);
     }
 
-    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPReplicatedExpertsDomainIsGraphNativeReady)
+    TEST(Test__MoEExpertOverlayRuntimePlan, LocalTPApportionedExpertsDomainIsGraphNativeReady)
     {
         auto plan = layoutAPlan();
-        plan->domains[0].compute_kind = ExpertDomainComputeKind::ReplicatedExperts;
+        plan->domains[0].compute_kind = ExpertDomainComputeKind::ApportionedExperts;
 
         auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
 
@@ -278,7 +278,7 @@ namespace llaminar2::test
         const auto *rocm_domain = runtime_plan->domainForName("rocm_hot");
         ASSERT_NE(rocm_domain, nullptr);
         EXPECT_EQ(rocm_domain->kind, ExpertDomainKind::LocalTP);
-        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::ReplicatedExperts);
+        EXPECT_EQ(rocm_domain->compute_kind, ExpertDomainComputeKind::ApportionedExperts);
         EXPECT_FALSE(rocm_domain->multi_participant_execution_pending);
         EXPECT_TRUE(rocm_domain->domain_scoped_collective_context_ready);
         EXPECT_TRUE(rocm_domain->pending_reason.empty());

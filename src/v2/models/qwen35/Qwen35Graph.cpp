@@ -235,17 +235,20 @@ namespace llaminar2
         int n_k_heads_local = n_k_heads_full;
         int n_v_heads_local = n_v_heads_full;
         const bool gdn_modular_repeat = (n_v_heads_full > n_k_heads_full);
-        if (config_.qkv_column_parallel && config_.local_n_heads > 0 && config_.n_heads > 0)
+        const int resolver_local_n_heads = config.local_n_heads > 0
+                                               ? config.local_n_heads
+                                               : config_.local_n_heads;
+        if (config_.qkv_column_parallel && resolver_local_n_heads > 0 && config_.n_heads > 0)
         {
             // V-heads are always sharded
-            n_v_heads_local = n_v_heads_full * config_.local_n_heads / config_.n_heads;
+            n_v_heads_local = n_v_heads_full * resolver_local_n_heads / config_.n_heads;
             if (n_v_heads_local <= 0)
                 n_v_heads_local = 1;
 
             // K-heads: replicated for GDN modular repeat, sharded otherwise
             if (!gdn_modular_repeat)
             {
-                n_k_heads_local = n_k_heads_full * config_.local_n_heads / config_.n_heads;
+                n_k_heads_local = n_k_heads_full * resolver_local_n_heads / config_.n_heads;
                 if (n_k_heads_local <= 0)
                     n_k_heads_local = 1;
             }
@@ -265,8 +268,8 @@ namespace llaminar2
 
         // FA-specific: Q projection outputs query + sigmoid gate (2× normal Q dim)
         // Use local head count for TP
-        const int local_n_heads_fa = (config_.qkv_column_parallel && config_.local_n_heads > 0)
-                                         ? config_.local_n_heads
+        const int local_n_heads_fa = (config_.qkv_column_parallel && resolver_local_n_heads > 0)
+                                         ? resolver_local_n_heads
                                          : config_.n_heads;
         config.custom_formulas["fa_q_full_dim"] =
             static_cast<size_t>(local_n_heads_fa * config_.head_dim * 2);
@@ -411,7 +414,9 @@ namespace llaminar2
                           .num_tokens = total_tokens,
                           .d_model = config_.d_model,
                           .vocab_size = config_.vocab_size,
-                          .vocab_offset = embeddingVocabOffsetForDevice(config_, device),
+                          .vocab_offset = useFullVocabEmbeddingForCurrentGraph()
+                                              ? 0
+                                              : embeddingVocabOffsetForDevice(config_, device),
                           .local_vocab_size = modelEmbeddingTable() ? static_cast<int>(modelEmbeddingTable()->rows()) : 0,
                           .output_buffer_id = BufferId::MTP_EMBEDDING,
                           .prepared_ref = preparedRefForGraphWeight(modelEmbeddingBinding(), device),
@@ -422,7 +427,7 @@ namespace llaminar2
             modelEmbeddingTable() &&
             static_cast<int>(modelEmbeddingTable()->rows()) < config_.vocab_size;
         std::string embedding_terminal = prefix + "embedding";
-        if (embedding_is_sharded && needsTPAllreduce())
+        if (embedding_is_sharded && needsTPAllreduce() && denseTPAllreduceEnabledForCurrentGraph())
         {
             auto allreduce_stage = createTPAllreduceStage(
                 output.embedding,
@@ -703,7 +708,28 @@ namespace llaminar2
                 ? prefix
                 : prefix.substr(0, prefix.size() - 1);
         int total_tokens = batch_size * seq_len;
-        LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
+        const bool keep_gdn_state_tp_local =
+            useDecodeReplicatedDenseWeights() &&
+            config_.dense_tp_decode_replicated &&
+            config_.qkv_column_parallel &&
+            weight_bindings_.get_layer_weights != nullptr;
+
+        LayerWeightBindings layer_bindings = keep_gdn_state_tp_local
+                                                 ? weight_bindings_.get_layer_weights(layer_idx)
+                                                 : layerWeightBindingsForGraph(layer_idx);
+        LayerWeights tp_local_layer;
+        const LayerWeights *gdn_layer = &layer;
+        const bool saved_replicated_attention_state_graph_active =
+            replicated_attention_state_graph_active_;
+        if (keep_gdn_state_tp_local)
+        {
+            tp_local_layer = toLegacyLayerWeights(layer_bindings);
+            gdn_layer = &tp_local_layer;
+            replicated_attention_state_graph_active_ = false;
+            LOG_DEBUG("[Qwen35Graph] Keeping GDN layer " << layer_idx
+                                                        << " TP-local during replicated dense decode "
+                                                           "until GDN live-state allgather is available");
+        }
 
         // Get GDN state from hybrid KV cache
         auto *hybrid_cache = dynamic_cast<IHybridKVCache *>(kv_cache);
@@ -728,12 +754,12 @@ namespace llaminar2
         // When column-parallel TP is active, weights are already sharded by WeightManager
         // so shape[0] reflects the local output dimension for this rank.
         int qkv_dim, value_dim, n_k_heads, n_v_heads;
-        if (layer.attn_qkv)
+        if (gdn_layer->attn_qkv)
         {
             // Derive from actual weight shape (works for both sharded and full)
-            qkv_dim = static_cast<int>(layer.attn_qkv->shape()[0]);
-            value_dim = layer.attn_gate
-                            ? static_cast<int>(layer.attn_gate->shape()[0])
+            qkv_dim = static_cast<int>(gdn_layer->attn_qkv->shape()[0]);
+            value_dim = gdn_layer->attn_gate
+                            ? static_cast<int>(gdn_layer->attn_gate->shape()[0])
                             : (config_.gdn.inner_size > 0
                                    ? config_.gdn.inner_size
                                    : n_v_heads_full * d_v);
@@ -778,7 +804,7 @@ namespace llaminar2
         // Stage 1: Pre-attention RMSNorm
         // =====================================================================
         // GDN layers don't check HybridQ16 (always use fused when not first layer)
-        addPreAttentionNorm(graph, prefix, buffers, layer.attn_norm,
+        addPreAttentionNorm(graph, prefix, buffers, gdn_layer->attn_norm,
                             total_tokens, layer_idx, device, /*check_hybrid_q16=*/false);
 
         // =====================================================================
@@ -791,22 +817,22 @@ namespace llaminar2
         proj_params.m = total_tokens;
         proj_params.k = d_model;
 
-        proj_params.w_qkv = layer.attn_qkv;
+        proj_params.w_qkv = gdn_layer->attn_qkv;
         proj_params.prepared_ref_qkv = preparedRefForGraphWeight(layer_bindings.attn_qkv, device);
         proj_params.output_qkv = buffers.get(BufferId::GDN_QKV);
         proj_params.n_qkv = qkv_dim;
 
-        proj_params.w_z = layer.attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
+        proj_params.w_z = gdn_layer->attn_gate; // Z projection = attn_gate.weight (in_proj_z in HF)
         proj_params.prepared_ref_z = preparedRefForGraphWeight(layer_bindings.attn_gate, device);
         proj_params.output_z = buffers.get(BufferId::GDN_Z);
         proj_params.n_z = value_dim; // Z gate operates on value_dim (n_v_heads * d_v)
 
-        proj_params.w_a = layer.ssm_alpha;
+        proj_params.w_a = gdn_layer->ssm_alpha;
         proj_params.prepared_ref_a = preparedRefForGraphWeight(layer_bindings.ssm_alpha, device);
         proj_params.output_a = buffers.get(BufferId::GDN_ALPHA);
         proj_params.n_a = n_v_heads; // Alpha is per-value-head
 
-        proj_params.w_b = layer.ssm_beta;
+        proj_params.w_b = gdn_layer->ssm_beta;
         proj_params.prepared_ref_b = preparedRefForGraphWeight(layer_bindings.ssm_beta, device);
         proj_params.output_b = buffers.get(BufferId::GDN_BETA);
         proj_params.n_b = n_v_heads; // Beta is per-value-head
@@ -831,7 +857,7 @@ namespace llaminar2
         conv_params.device_id = device;
         conv_params.input = buffers.get(BufferId::GDN_QKV);
         conv_params.output = buffers.get(BufferId::GDN_QKV); // In-place (conv modifies QKV)
-        conv_params.weight = layer.ssm_conv1d;
+        conv_params.weight = gdn_layer->ssm_conv1d;
         conv_params.bias = nullptr; // Conv bias from ssm_dt.bias if available
         conv_params.conv_state = gdn_state->conv_state.data();
         conv_params.seq_len = total_tokens;
@@ -871,8 +897,8 @@ namespace llaminar2
         rec_params.V = buffers.get(BufferId::GDN_QKV); // Same tensor, offset by kernel
         rec_params.alpha = buffers.get(BufferId::GDN_ALPHA);
         rec_params.beta = buffers.get(BufferId::GDN_BETA);
-        rec_params.A_log = layer.ssm_a; // Learnable log-space gate
-        rec_params.dt_bias = layer.ssm_dt_bias;
+        rec_params.A_log = gdn_layer->ssm_a; // Learnable log-space gate
+        rec_params.dt_bias = gdn_layer->ssm_dt_bias;
         rec_params.output = buffers.attn_output;
         rec_params.recurrence_state = gdn_state->recurrence_state.data();
         rec_params.seq_len = total_tokens;
@@ -934,10 +960,11 @@ namespace llaminar2
         gnorm_params.input = buffers.attn_output;
         gnorm_params.gate = buffers.get(BufferId::GDN_Z);
         gnorm_params.output = buffers.attn_output; // In-place
-        gnorm_params.gamma = layer.ssm_norm;
+        gnorm_params.gamma = gdn_layer->ssm_norm;
         gnorm_params.eps = config_.rms_norm_eps;
         gnorm_params.subtract_one = config_.rms_norm_subtract_one;
         gnorm_params.seq_len = total_tokens;
+        gnorm_params.feature_dim = value_dim;
         gnorm_params.norm_dim = d_v;   // Per-head normalization over d_v (128)
                                        // PyTorch reshapes to [B*T, n_heads, d_v] before norm
         gnorm_params.gate_silu = true; // GDN uses SiLU(Z) as gate
@@ -954,10 +981,12 @@ namespace llaminar2
         // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce
         // =====================================================================
         std::string terminal_node = addWoProjectionAndAllreduce(
-            graph, prefix, buffers, layer.ssm_out, layer_bindings.ssm_out,
+            graph, prefix, buffers, gdn_layer->ssm_out, layer_bindings.ssm_out,
             total_tokens, layer_idx, device,
             prefix + "gated_norm",
             "gdn_out_proj", "gdn_wo_allreduce");
+        replicated_attention_state_graph_active_ =
+            saved_replicated_attention_state_graph_active;
 
         // NOTE: GDN layers do NOT apply a sigmoid output gate after out_proj.
         // The Z projection is consumed entirely by GatedRMSNorm (SiLU gating).

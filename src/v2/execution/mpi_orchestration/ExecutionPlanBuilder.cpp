@@ -775,7 +775,8 @@ namespace llaminar2
             config.moe_hot_expert_cache,
             config.moe_rebalance,
             config.prefix_cache,
-            config.mtp);
+            config.mtp,
+            config.tp_allreduce_precision_override);
 
         return plan;
     }
@@ -1049,7 +1050,8 @@ namespace llaminar2
             config.moe_hot_expert_cache,
             config.moe_rebalance,
             config.prefix_cache,
-            config.mtp);
+            config.mtp,
+            config.tp_allreduce_precision_override);
 
         return plan;
     }

@@ -21,6 +21,7 @@
 #include "../../../kernels/cpu/primitives/VectorPrimitives.h"
 #include "../../../kernels/cpu/primitives/SwiGLUPrimitives.h"
 #include "../../../loaders/PreparedWeightStore.h"
+#include "../../../backends/BackendManager.h"
 #include "../../../utils/Assertions.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
@@ -69,6 +70,12 @@ namespace llaminar2
                 t->allocateOnDevice(device);
             return t;
         }
+
+        const char *perfBool(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
         void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
         {
             if (!output || !device.is_gpu())
@@ -286,7 +293,8 @@ namespace llaminar2
         if (params_.moe_runtime_table && params_.layer_idx >= 0)
         {
             moe_runtime_layer_ = params_.moe_runtime_table->deviceLayerState(params_.layer_idx);
-            if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) && params_.seq_len == 1)
+            if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+                params_.seq_len == 1)
             {
                 moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank() ||
                                                  initializeMoERuntimeTableForGroupedDecode();
@@ -361,6 +369,10 @@ namespace llaminar2
             return false;
         }
         params_.expert_mask = mask;
+        if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
+            params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask);
+        else
+            params_.replica_set.prefill_mask.clear();
         grouped_gateup_desc_table_id_ = -1;
         grouped_gateup_desc_table_num_experts_ = 0;
         grouped_gateup_desc_table_d_model_ = 0;
@@ -369,6 +381,7 @@ namespace llaminar2
         grouped_down_desc_table_num_experts_ = 0;
         grouped_down_desc_table_d_model_ = 0;
         grouped_down_desc_table_intermediate_ = 0;
+        moe_runtime_table_initialized_ = false;
         runtime_grouped_decode_warmed_ = false;
         return true;
     }
@@ -383,6 +396,139 @@ namespace llaminar2
     {
         auto ctx = const_cast<MoEExpertComputeStage *>(this)->buildWeightContext();
         return MoEExpertWeightService::serializeExpert(ctx, expert_id);
+    }
+
+    std::vector<int> MoEExpertComputeStage::transferExpertsGPUDirectFrom(
+        MoEExpertComputeStage &source,
+        const std::vector<int> &expert_ids,
+        void *source_producer_stream)
+    {
+        std::vector<int> satisfied_expert_ids;
+        if (!source_producer_stream)
+        {
+            LOG_DEBUG("[MoEExpertComputeStage] GPU-direct transfer requires an explicit source producer stream"
+                      << " for layer " << params_.layer_idx);
+            return satisfied_expert_ids;
+        }
+
+        auto src_ctx = source.buildWeightContext();
+        auto dst_ctx = buildWeightContext();
+        GpuDirectTransferCompletion completion;
+        const bool ok = MoEExpertWeightService::transferExpertsGPUDirect(
+            src_ctx,
+            dst_ctx,
+            expert_ids,
+            params_.layer_idx,
+            source_producer_stream,
+            &satisfied_expert_ids,
+            &completion);
+        params_.gate_slab_ref = dst_ctx.gate_slab_ref;
+        params_.up_slab_ref = dst_ctx.up_slab_ref;
+        params_.down_slab_ref = dst_ctx.down_slab_ref;
+        if (!satisfied_expert_ids.empty())
+        {
+            if (completion.valid())
+                addPendingGpuDirectTransfer(std::move(completion));
+            bindPreparedExpertEnginesForExperts(satisfied_expert_ids);
+            if (gpuStream() && !pending_gpu_direct_transfers_.empty())
+            {
+                if (!waitForPendingGpuDirectTransfers())
+                {
+                    LOG_ERROR("[MoEExpertComputeStage] Failed to enqueue GPU-direct transfer wait"
+                              << " for layer " << params_.layer_idx
+                              << " on " << params_.device_id.to_string());
+                }
+            }
+            cached_gate_gemm_ = params_.prepared_gate_gemm;
+            cached_up_gemm_ = params_.prepared_up_gemm;
+            cached_down_gemm_ = params_.prepared_down_gemm;
+            grouped_gateup_desc_table_id_ = -1;
+            grouped_gateup_desc_table_num_experts_ = 0;
+            grouped_gateup_desc_table_d_model_ = 0;
+            grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_id_ = -1;
+            grouped_down_desc_table_num_experts_ = 0;
+            grouped_down_desc_table_d_model_ = 0;
+            grouped_down_desc_table_intermediate_ = 0;
+            moe_runtime_table_initialized_ = false;
+            runtime_grouped_decode_warmed_ = false;
+        }
+        if (!ok && satisfied_expert_ids.empty())
+        {
+            LOG_DEBUG("[MoEExpertComputeStage] GPU-direct transfer did not satisfy any requested experts"
+                      << " for layer " << params_.layer_idx);
+        }
+        return satisfied_expert_ids;
+    }
+
+    void MoEExpertComputeStage::bindPreparedExpertEnginesForExperts(
+        const std::vector<int> &expert_ids)
+    {
+        auto bind = [this](ITensorGemm *gemm)
+        {
+            if (!gemm)
+                return;
+            gemm->setGPUStream(gpuStream());
+            if (bound_workspace_)
+            {
+                auto *consumer = dynamic_cast<IWorkspaceConsumer *>(gemm);
+                if (consumer && !consumer->hasWorkspace())
+                    consumer->bindWorkspace(bound_workspace_);
+            }
+        };
+
+        for (int expert_id : expert_ids)
+        {
+            if (expert_id < 0 || expert_id >= params_.num_experts)
+                continue;
+            if (expert_id < static_cast<int>(params_.prepared_gate_gemm.size()))
+                bind(params_.prepared_gate_gemm[expert_id]);
+            if (expert_id < static_cast<int>(params_.prepared_up_gemm.size()))
+                bind(params_.prepared_up_gemm[expert_id]);
+            if (expert_id < static_cast<int>(params_.prepared_down_gemm.size()))
+                bind(params_.prepared_down_gemm[expert_id]);
+        }
+    }
+
+    void MoEExpertComputeStage::addPendingGpuDirectTransfer(
+        GpuDirectTransferCompletion completion)
+    {
+        if (!completion.valid())
+            return;
+        const void *event_ptr = completion.ready_event.get();
+        for (const auto &pending : pending_gpu_direct_transfers_)
+        {
+            if (pending.ready_event.get() == event_ptr)
+                return;
+        }
+        pending_gpu_direct_transfers_.push_back(std::move(completion));
+    }
+
+    void MoEExpertComputeStage::addPendingGpuDirectTransfersFromStore(
+        const std::vector<int> &expert_ids)
+    {
+        if (!params_.prepared_store)
+            return;
+
+        auto adopt_from_slab = [&](const std::optional<ExpertSlabRef> &slab_ref,
+                                   int expert_id)
+        {
+            if (!slab_ref.has_value())
+                return;
+            auto completion =
+                params_.prepared_store->expertGpuDirectCompletion(*slab_ref, expert_id);
+            if (completion.has_value())
+                addPendingGpuDirectTransfer(std::move(*completion));
+        };
+
+        for (int expert_id : expert_ids)
+        {
+            if (expert_id < 0 || expert_id >= params_.num_experts)
+                continue;
+            adopt_from_slab(params_.gate_slab_ref, expert_id);
+            adopt_from_slab(params_.up_slab_ref, expert_id);
+            adopt_from_slab(params_.down_slab_ref, expert_id);
+        }
     }
 
     size_t MoEExpertComputeStage::releaseRawExpertWeights()
@@ -408,8 +554,23 @@ namespace llaminar2
     {
         auto ctx = buildWeightContext();
         const bool ok = MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, received_weights);
+        params_.gate_slab_ref = ctx.gate_slab_ref;
+        params_.up_slab_ref = ctx.up_slab_ref;
+        params_.down_slab_ref = ctx.down_slab_ref;
         if (ok)
         {
+            std::vector<int> active_experts;
+            active_experts.reserve(new_mask.size());
+            for (size_t expert_id = 0; expert_id < new_mask.size(); ++expert_id)
+            {
+                if (new_mask[expert_id])
+                    active_experts.push_back(static_cast<int>(expert_id));
+            }
+            bindPreparedExpertEnginesForExperts(active_experts);
+            addPendingGpuDirectTransfersFromStore(active_experts);
+            cached_gate_gemm_ = params_.prepared_gate_gemm;
+            cached_up_gemm_ = params_.prepared_up_gemm;
+            cached_down_gemm_ = params_.prepared_down_gemm;
             grouped_gateup_desc_table_id_ = -1;
             grouped_gateup_desc_table_num_experts_ = 0;
             grouped_gateup_desc_table_d_model_ = 0;
@@ -427,6 +588,10 @@ namespace llaminar2
     void MoEExpertComputeStage::applyExpertMask(const std::vector<bool> &new_mask)
     {
         params_.expert_mask = new_mask;
+        if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
+            params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask);
+        else
+            params_.replica_set.prefill_mask.clear();
         cached_gate_gemm_.clear();
         cached_up_gemm_.clear();
         cached_down_gemm_.clear();
@@ -471,7 +636,9 @@ namespace llaminar2
             params_.expert_registry,
             params_.gate_slab_ref,
             params_.up_slab_ref,
-            params_.down_slab_ref};
+            params_.down_slab_ref,
+            true,
+            &params_.gpu_direct_slot_pool};
     }
 
     IMoEKernel *MoEExpertComputeStage::ensureMoEKernel() const
@@ -487,6 +654,82 @@ namespace llaminar2
             }
         }
         return kernel;
+    }
+
+    bool MoEExpertComputeStage::waitForPendingGpuDirectTransfers()
+    {
+        if (pending_gpu_direct_transfers_.empty())
+            return true;
+
+        if (!params_.device_id.is_gpu())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Pending GPU-direct expert transfers on non-GPU stage"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        void *consumer_stream = gpuStream();
+        if (!consumer_stream)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Pending GPU-direct expert transfers require an explicit compute stream"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(params_.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] No backend available to consume GPU-direct transfer event"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        const int device_ordinal = params_.device_id.is_cuda()
+                                       ? params_.device_id.cuda_ordinal()
+                                       : params_.device_id.rocm_ordinal();
+        int waited_events = 0;
+        for (const auto &completion : pending_gpu_direct_transfers_)
+        {
+            if (!completion.valid())
+                continue;
+            if (completion.device_id != params_.device_id ||
+                completion.device_ordinal != device_ordinal)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] GPU-direct transfer completion targets "
+                          << completion.device_id.to_string()
+                          << " ordinal=" << completion.device_ordinal
+                          << " but stage is " << params_.device_id.to_string()
+                          << " ordinal=" << device_ordinal
+                          << " layer=" << params_.layer_idx);
+                return false;
+            }
+            if (!backend->streamWaitEvent(consumer_stream,
+                                          completion.ready_event.get(),
+                                          device_ordinal))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Failed to wait on GPU-direct transfer completion event"
+                          << " layer=" << params_.layer_idx
+                          << " device=" << params_.device_id.to_string());
+                return false;
+            }
+            ++waited_events;
+        }
+
+        if (waited_events > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_consumer_event_waits",
+                static_cast<double>(waited_events),
+                "rebalance",
+                params_.device_id.to_string(),
+                {{"layer", std::to_string(params_.layer_idx)}});
+        }
+        pending_gpu_direct_transfers_.clear();
+        return true;
     }
 
     bool MoEExpertComputeStage::execute(IDeviceContext *ctx)
@@ -513,6 +756,9 @@ namespace llaminar2
                 return false;
             }
         }
+
+        if (!waitForPendingGpuDirectTransfers())
+            return false;
 
         if (!raw_weights_released_ && (!params_.gate_exps || !params_.up_exps || !params_.down_exps))
         {
@@ -610,7 +856,8 @@ namespace llaminar2
             }
             else if (grouped_gateup_desc_table_id_ < 0 || grouped_down_desc_table_id_ < 0)
             {
-                tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
+                const auto prefill_expert_ids = fixedTopologyPrefillExpertIds();
+                tables_ready = ensureGemmEnginesForExperts(prefill_expert_ids) &&
                                ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
                                ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
             }
@@ -1065,10 +1312,14 @@ namespace llaminar2
             moe_runtime_layer_ &&
             runtimeTableHasActiveGroupedDecodeBank();
         if (supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+            params_.moe_runtime_table &&
+            params_.layer_idx >= 0 &&
             (!moe_runtime_table_initialized_ || !runtime_decode_bank_active_for_expert_stage))
         {
-            moe_runtime_table_initialized_ = runtime_decode_bank_active_for_expert_stage ||
-                                             initializeMoERuntimeTableForGroupedDecode();
+            moe_runtime_table_initialized_ = !moe_runtime_table_initialized_
+                                                 ? initializeMoERuntimeTableForGroupedDecode()
+                                                 : (runtime_decode_bank_active_for_expert_stage ||
+                                                    initializeMoERuntimeTableForGroupedDecode());
             /*
              * The first decode step after clear_cache() may initialize the
              * placement/runtime bank itself.  Treat that freshly initialized
@@ -1093,11 +1344,27 @@ namespace llaminar2
             moe_runtime_layer_ &&
             moe_runtime_table_initialized_ &&
             runtime_decode_bank_active_for_expert_stage &&
-            top_k > 0 && top_k <= 16 &&
-            params_.replica_set.num_replicated == 0 &&
-            hasFullLocalExpertOwnership() &&
-            expertMaskAllEnabled();
+            top_k > 0 && top_k <= 16;
 #endif
+
+        if (params_.device_id.is_gpu() &&
+            params_.seq_len == 1 &&
+            params_.moe_runtime_table)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_runtime_decode",
+                can_try_device_routed_decode ? "predicate_ready" : "predicate_skipped",
+                1.0,
+                "decode",
+                params_.device_id.toString(),
+                {{"layer", std::to_string(params_.layer_idx)},
+                 {"backend_supported", perfBool(supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id))},
+                 {"runtime_layer", perfBool(moe_runtime_layer_ != nullptr)},
+                 {"initialized", perfBool(moe_runtime_table_initialized_)},
+                 {"active_bank", perfBool(runtime_decode_bank_active_for_expert_stage)},
+                 {"top_k", std::to_string(top_k)},
+                 {"replicas", std::to_string(params_.replica_set.num_replicated)}});
+        }
 
         if (can_try_device_routed_decode)
         {
@@ -1115,15 +1382,54 @@ namespace llaminar2
             bool grouped_tables_ready = have_grouped_tables;
             if (!grouped_tables_ready)
             {
-                if (static_cast<int>(all_expert_ids_.size()) != num_experts)
+                all_expert_ids_.clear();
+                all_expert_ids_.reserve(static_cast<size_t>(num_experts));
+                for (int expert_id = 0; expert_id < num_experts; ++expert_id)
                 {
-                    all_expert_ids_.resize(static_cast<size_t>(num_experts));
-                    std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+                    if (expertComputesLocally(expert_id))
+                        all_expert_ids_.push_back(expert_id);
                 }
 
-                grouped_tables_ready = ensureGemmEnginesForExperts(all_expert_ids_) &&
-                                       ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate) &&
-                                       ensureGroupedDownDescriptorTable(kernel, d_model, intermediate);
+                const PerfStatsCollector::Tags setup_tags{
+                    {"layer", std::to_string(params_.layer_idx)},
+                    {"num_experts", std::to_string(num_experts)},
+                    {"top_k", std::to_string(top_k)}};
+                PerfStatsCollector::addCounter(
+                    "moe_runtime_decode", "local_expert_count",
+                    static_cast<double>(all_expert_ids_.size()),
+                    "decode", params_.device_id.toString(), setup_tags);
+
+                if (all_expert_ids_.empty())
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_runtime_decode", "no_local_experts",
+                        1.0, "decode", params_.device_id.toString(), setup_tags);
+                }
+                else if (!ensureGemmEnginesForExperts(all_expert_ids_))
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_runtime_decode", "ensure_engines_failed",
+                        1.0, "decode", params_.device_id.toString(), setup_tags);
+                }
+                else if (!ensureGroupedGateUpDescriptorTable(kernel, d_model, intermediate))
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_runtime_decode", "gateup_descriptor_table_failed",
+                        1.0, "decode", params_.device_id.toString(), setup_tags);
+                }
+                else if (!ensureGroupedDownDescriptorTable(kernel, d_model, intermediate))
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_runtime_decode", "down_descriptor_table_failed",
+                        1.0, "decode", params_.device_id.toString(), setup_tags);
+                }
+                else
+                {
+                    grouped_tables_ready = true;
+                    PerfStatsCollector::addCounter(
+                        "moe_runtime_decode", "descriptor_tables_ready",
+                        1.0, "decode", params_.device_id.toString(), setup_tags);
+                }
             }
 
             if (grouped_tables_ready)
@@ -1341,15 +1647,18 @@ namespace llaminar2
             params_.moe_runtime_table &&
             !can_try_device_routed_decode)
         {
-            LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode has a runtime table but cannot "
-                      "use the device-owned route/expert path; refusing host-routed fallback for layer "
-                      << params_.layer_idx
-                      << " (initialized=" << moe_runtime_table_initialized_
-                      << ", runtime_layer=" << (moe_runtime_layer_ != nullptr)
-                      << ", full_ownership=" << hasFullLocalExpertOwnership()
-                      << ", expert_mask_all_enabled=" << expertMaskAllEnabled()
-                      << ", replicas=" << params_.replica_set.num_replicated << ")");
-            return false;
+            if (params_.replica_set.num_replicated == 0)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode has a runtime table but cannot "
+                          "use the device-owned route/expert path; refusing host-routed fallback for layer "
+                          << params_.layer_idx
+                          << " (initialized=" << moe_runtime_table_initialized_
+                          << ", runtime_layer=" << (moe_runtime_layer_ != nullptr)
+                          << ", full_ownership=" << hasFullLocalExpertOwnership()
+                          << ", expert_mask_all_enabled=" << expertMaskAllEnabled()
+                          << ", replicas=" << params_.replica_set.num_replicated << ")");
+                return false;
+            }
         }
 #endif
 
@@ -1383,6 +1692,10 @@ namespace llaminar2
         // Per-token dynamic dispatch for replicated experts.
         // When replicas are active, use ExpertReplicaSet::assignForToken()
         // to deterministically decide which socket computes each expert.
+        // TODO(gpu-moe-rebalance): after the GPU rebalancing correctness gates
+        // are proven, move this replica assignment into the device-side routing
+        // path so homogeneous GPU domains do not round-trip token ownership
+        // decisions through host-side ExpertReplicaSet logic.
         bool compute_here[16]; // stack-allocated, max top_k
 
         // Convert float indices to int for replica dispatch
@@ -2160,6 +2473,10 @@ namespace llaminar2
         cached_up_gemm_ = params_.prepared_up_gemm;
         cached_down_gemm_ = params_.prepared_down_gemm;
 
+        addPendingGpuDirectTransfersFromStore(expert_ids);
+        if (!waitForPendingGpuDirectTransfers())
+            return false;
+
         auto bind_if_needed = [this](ITensorGemm *gemm)
         {
             if (!gemm)
@@ -2400,41 +2717,82 @@ namespace llaminar2
                 return true;
 
             const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
-            if (state.active_epoch != 0)
+            if (state.active_epoch == std::numeric_limits<uint32_t>::max())
             {
-                LOG_ERROR("[MoEExpertComputeStage] Invalid active MoE runtime decode bank for layer "
-                          << params_.layer_idx << "; refusing to overwrite non-zero epoch "
-                          << state.active_epoch);
+                LOG_ERROR("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
+                          << params_.layer_idx << ": epoch counter exhausted");
                 return false;
             }
 
-            if (!hasFullLocalExpertOwnership() || !expertMaskAllEnabled())
-                return false;
-
-            if (static_cast<int>(all_expert_ids_.size()) != params_.num_experts)
+            const bool has_replicas = params_.replica_set.num_replicated > 0;
+            if (has_replicas &&
+                (params_.replica_set.is_replicated.size() != static_cast<size_t>(params_.num_experts) ||
+                 params_.replica_set.owner_socket.size() != static_cast<size_t>(params_.num_experts)))
             {
-                all_expert_ids_.resize(static_cast<size_t>(params_.num_experts));
-                std::iota(all_expert_ids_.begin(), all_expert_ids_.end(), 0);
+                LOG_ERROR("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
+                          << params_.layer_idx << ": replica metadata does not match num_experts="
+                          << params_.num_experts);
+                return false;
             }
+
+            int participant_count = has_replicas ? params_.replica_set.num_sockets : 0;
+            if (participant_count <= 0 && has_replicas)
+            {
+                for (int owner : params_.replica_set.owner_socket)
+                    participant_count = std::max(participant_count, owner + 1);
+            }
+            if (participant_count <= 0)
+                participant_count = std::max(1, params_.my_socket_id + 1);
+            if (params_.my_socket_id < 0 ||
+                params_.my_socket_id >= participant_count ||
+                participant_count > static_cast<int>(kDeviceMoEMaxParticipants))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
+                          << params_.layer_idx << ": invalid participant metadata id="
+                          << params_.my_socket_id << " count=" << participant_count);
+                return false;
+            }
+
+            all_expert_ids_.clear();
+            all_expert_ids_.reserve(static_cast<size_t>(params_.num_experts));
+            for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+            {
+                if (expertComputesLocally(expert_id))
+                    all_expert_ids_.push_back(expert_id);
+            }
+            if (all_expert_ids_.empty())
+                return false;
             if (!ensureGemmEnginesForExperts(all_expert_ids_))
                 return false;
 
             MoEPlacementUpdate update;
-            update.epoch = 1;
+            update.epoch = state.active_epoch + 1u;
             update.expert_count = static_cast<uint32_t>(params_.num_experts);
+            update.participant_id = static_cast<uint32_t>(params_.my_socket_id);
+            update.participant_count = static_cast<uint32_t>(participant_count);
             update.experts.resize(static_cast<size_t>(params_.num_experts));
-            update.local_compute_mask.assign(static_cast<size_t>(params_.num_experts), 1u);
+            update.local_compute_mask.assign(static_cast<size_t>(params_.num_experts), 0u);
             update.replica_role.assign(static_cast<size_t>(params_.num_experts),
-                                       static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
-
-            const uint32_t local_flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
-                                                          DeviceMoEExpertFlags::Resident |
-                                                          DeviceMoEExpertFlags::PreferredOwner |
-                                                          DeviceMoEExpertFlags::LocalCompute);
+                                       static_cast<uint8_t>(DeviceMoEReplicaRole::None));
 
             for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
             {
+                const bool computes_locally = expertComputesLocally(expert_id);
+                const bool replicated =
+                    has_replicas && params_.replica_set.is_replicated[static_cast<size_t>(expert_id)];
+                int owner_participant = params_.my_socket_id;
+                if (has_replicas)
+                    owner_participant = params_.replica_set.owner_socket[static_cast<size_t>(expert_id)];
+
                 DeviceMoEExpertDescriptor desc;
+                desc.logical_expert_id = expert_id;
+                desc.owner_participant = owner_participant;
+                desc.local_slot = computes_locally ? expert_id : -1;
+                update.experts[static_cast<size_t>(expert_id)] = desc;
+
+                if (!expertComputesLocally(expert_id))
+                    continue;
+
                 if (!cached_gate_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.gate) ||
                     !cached_up_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.up) ||
                     !cached_down_gemm_[static_cast<size_t>(expert_id)]->exportNativeVNNIMatrixDesc(desc.down))
@@ -2445,11 +2803,30 @@ namespace llaminar2
                     return false;
                 }
 
-                desc.logical_expert_id = expert_id;
-                desc.owner_participant = 0;
+                DeviceMoEExpertFlags flags = DeviceMoEExpertFlags::Valid |
+                                             DeviceMoEExpertFlags::Resident |
+                                             DeviceMoEExpertFlags::LocalCompute;
+                if (!has_replicas || owner_participant == params_.my_socket_id)
+                    flags |= DeviceMoEExpertFlags::PreferredOwner;
+                if (replicated)
+                    flags |= DeviceMoEExpertFlags::Replicated;
+
                 desc.local_slot = expert_id;
-                desc.flags = local_flags;
+                desc.flags = toMoEExpertFlags(flags);
                 update.experts[static_cast<size_t>(expert_id)] = desc;
+                update.local_compute_mask[static_cast<size_t>(expert_id)] = 1u;
+                if (replicated)
+                {
+                    update.replica_role[static_cast<size_t>(expert_id)] =
+                        static_cast<uint8_t>(owner_participant == params_.my_socket_id
+                                                 ? DeviceMoEReplicaRole::Primary
+                                                 : DeviceMoEReplicaRole::Replica);
+                }
+                else
+                {
+                    update.replica_role[static_cast<size_t>(expert_id)] =
+                        static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+                }
             }
 
             params_.moe_runtime_table->prepareInactiveBank(params_.layer_idx, update);
@@ -2483,9 +2860,13 @@ namespace llaminar2
 
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
+            const bool expected_local = expertComputesLocally(expert_id);
             const auto mask = bank->local_compute_mask[static_cast<size_t>(expert_id)];
-            if (mask != 1u)
+            if (mask != (expected_local ? 1u : 0u))
                 return false;
+
+            if (!expected_local)
+                continue;
 
             const auto &expert = bank->experts[static_cast<size_t>(expert_id)];
             if (expert.logical_expert_id != expert_id ||
@@ -2514,9 +2895,9 @@ namespace llaminar2
             params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
         return supportsGroupedPrefillExecutionBackend(params_.device_id) &&
                (params_.seq_len > 1 || forced_decode_replay) &&
-               hasFullLocalExpertOwnership() &&
-               expertMaskAllEnabled() &&
-               params_.replica_set.num_replicated == 0;
+               (!forced_decode_replay || params_.replica_set.num_replicated == 0) &&
+               ((hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
+                hasFixedTopologyPrefillExpertMask());
     }
 
     bool MoEExpertComputeStage::canUseSafeCombinedSharedVerifierComposite() const
@@ -2751,13 +3132,32 @@ namespace llaminar2
         const int d_model = params_.d_model;
         const int intermediate = params_.expert_intermediate;
 
-        // Async grouping (no D2H, no sync)
-        if (!kernel->prepareExpertGroupsAsync(
+        // Async grouping (no D2H, no sync). Masked LocalTP overlays exclude
+        // non-local experts from this participant's grouping scratch while
+        // preserving the original routing tensors for rebalance histograms.
+        const bool masked_grouping = usesMaskedFixedTopologyPrefill();
+        std::vector<uint8_t> expert_mask;
+        bool groups_prepared = false;
+        if (masked_grouping)
+        {
+            expert_mask = fixedTopologyPrefillExpertMaskBytes();
+            groups_prepared = kernel->prepareExpertGroupsAsyncMasked(
                 params_.routing_indices, params_.routing_weights,
-                seq_len, num_experts, top_k))
+                seq_len, num_experts, top_k,
+                expert_mask.data());
+        }
+        else
+        {
+            groups_prepared = kernel->prepareExpertGroupsAsync(
+                params_.routing_indices, params_.routing_weights,
+                seq_len, num_experts, top_k);
+        }
+
+        if (!groups_prepared)
         {
             LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                      "prepareExpertGroupsAsync failed");
+                      << (masked_grouping ? "prepareExpertGroupsAsyncMasked" : "prepareExpertGroupsAsync")
+                      << " failed");
             return false;
         }
 
@@ -2797,10 +3197,7 @@ namespace llaminar2
                params_.moe_runtime_table &&
                moe_runtime_layer_ &&
                moe_runtime_table_initialized_ &&
-               runtimeTableHasActiveGroupedDecodeBank() &&
-               params_.replica_set.num_replicated == 0 &&
-               hasFullLocalExpertOwnership() &&
-               expertMaskAllEnabled();
+               runtimeTableHasActiveGroupedDecodeBank();
 #endif
     }
 
@@ -2816,10 +3213,12 @@ namespace llaminar2
             (params_.seq_len <= 1 && !forced_decode_replay))
             return false;
 
-        // Require full local expert ownership, no masks, no replicas
-        if (!hasFullLocalExpertOwnership() || !expertMaskAllEnabled())
+        // Require either full local expert ownership or a fixed local expert
+        // mask whose non-local routes can be dropped before grouping.
+        if (!((hasFullLocalExpertOwnership() && expertMaskAllEnabled()) ||
+              hasFixedTopologyPrefillExpertMask()))
             return false;
-        if (params_.replica_set.num_replicated != 0)
+        if (forced_decode_replay && params_.replica_set.num_replicated != 0)
             return false;
 
         if (params_.d_model <= 0 ||
@@ -2833,8 +3232,10 @@ namespace llaminar2
             !params_.routing_weights)
             return false;
 
-        // Must have all prepared GEMM engines ready
-        return hasAllPreparedExpertGemmEngines();
+        // Must have prepared GEMM engines for every expert this participant
+        // can actually compute. Descriptor tables tolerate holes for masked
+        // experts because masked grouping never schedules those rows.
+        return hasPreparedExpertGemmEnginesForExperts(fixedTopologyPrefillExpertIds());
     }
 
     bool MoEExpertComputeStage::isFixedTopologyPrefillGraphCapturable() const
@@ -2847,6 +3248,94 @@ namespace llaminar2
             return false;
 
         return true;
+    }
+
+    bool MoEExpertComputeStage::expertComputesLocally(int expert_id) const
+    {
+        if (expert_id < 0 || expert_id >= params_.num_experts)
+            return false;
+
+        if (!params_.expert_mask.empty())
+        {
+            return params_.expert_mask.size() == static_cast<size_t>(params_.num_experts) &&
+                   params_.expert_mask[static_cast<size_t>(expert_id)];
+        }
+
+        const int local_count =
+            params_.local_expert_count < 0 ? params_.num_experts : params_.local_expert_count;
+        return expert_id >= params_.local_expert_start &&
+               expert_id < params_.local_expert_start + local_count;
+    }
+
+    const std::vector<bool> *MoEExpertComputeStage::fixedTopologyPrefillMask() const
+    {
+        if (params_.num_experts <= 0)
+            return nullptr;
+        if (params_.replica_set.num_replicated > 0 &&
+            params_.replica_set.prefill_mask.size() == static_cast<size_t>(params_.num_experts))
+        {
+            return &params_.replica_set.prefill_mask;
+        }
+        if (params_.expert_mask.size() == static_cast<size_t>(params_.num_experts))
+            return &params_.expert_mask;
+        return nullptr;
+    }
+
+    bool MoEExpertComputeStage::hasFixedTopologyPrefillExpertMask() const
+    {
+        const std::vector<bool> *mask = fixedTopologyPrefillMask();
+        if (!mask)
+            return false;
+
+        bool any_enabled = false;
+        for (bool enabled : *mask)
+        {
+            any_enabled = any_enabled || enabled;
+        }
+        return any_enabled;
+    }
+
+    bool MoEExpertComputeStage::usesMaskedFixedTopologyPrefill() const
+    {
+        return hasFixedTopologyPrefillExpertMask() &&
+               !(hasFullLocalExpertOwnership() && expertMaskAllEnabled());
+    }
+
+    std::vector<int> MoEExpertComputeStage::fixedTopologyPrefillExpertIds() const
+    {
+        std::vector<int> expert_ids;
+        if (const std::vector<bool> *mask = fixedTopologyPrefillMask())
+        {
+            expert_ids.reserve(static_cast<size_t>(params_.num_experts));
+            for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+            {
+                if ((*mask)[static_cast<size_t>(expert_id)])
+                    expert_ids.push_back(expert_id);
+            }
+            return expert_ids;
+        }
+
+        expert_ids.resize(static_cast<size_t>(params_.num_experts));
+        std::iota(expert_ids.begin(), expert_ids.end(), 0);
+        return expert_ids;
+    }
+
+    std::vector<uint8_t> MoEExpertComputeStage::fixedTopologyPrefillExpertMaskBytes() const
+    {
+        std::vector<uint8_t> mask(static_cast<size_t>(params_.num_experts), 0u);
+        const std::vector<bool> *prefill_mask = fixedTopologyPrefillMask();
+        if (!prefill_mask)
+        {
+            std::fill(mask.begin(), mask.end(), 1u);
+            return mask;
+        }
+
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            mask[static_cast<size_t>(expert_id)] =
+                (*prefill_mask)[static_cast<size_t>(expert_id)] ? 1u : 0u;
+        }
+        return mask;
     }
 
     bool MoEExpertComputeStage::hasFullLocalExpertOwnership() const
@@ -2874,6 +3363,32 @@ namespace llaminar2
         }
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
+            if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)] ||
+                !params_.prepared_up_gemm[static_cast<size_t>(expert_id)] ||
+                !params_.prepared_down_gemm[static_cast<size_t>(expert_id)])
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool MoEExpertComputeStage::hasPreparedExpertGemmEnginesForExperts(
+        const std::vector<int> &expert_ids) const
+    {
+        if (expert_ids.empty())
+            return false;
+        if (params_.prepared_gate_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+            params_.prepared_up_gemm.size() != static_cast<size_t>(params_.num_experts) ||
+            params_.prepared_down_gemm.size() != static_cast<size_t>(params_.num_experts))
+        {
+            return false;
+        }
+
+        for (int expert_id : expert_ids)
+        {
+            if (expert_id < 0 || expert_id >= params_.num_experts)
+                return false;
             if (!params_.prepared_gate_gemm[static_cast<size_t>(expert_id)] ||
                 !params_.prepared_up_gemm[static_cast<size_t>(expert_id)] ||
                 !params_.prepared_down_gemm[static_cast<size_t>(expert_id)])
@@ -3071,10 +3586,7 @@ namespace llaminar2
             params_.input &&
             params_.output &&
             params_.moe_runtime_table &&
-            params_.layer_idx >= 0 &&
-            params_.replica_set.num_replicated == 0 &&
-            hasFullLocalExpertOwnership() &&
-            expertMaskAllEnabled();
+            params_.layer_idx >= 0;
 
         return decode_supported || supportsFixedTopologyPrefillGraphCapturePreflight();
 #endif

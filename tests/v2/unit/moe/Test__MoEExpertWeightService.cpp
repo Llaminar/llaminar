@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEExpertWeightService.h"
+#include "execution/moe/GpuExpertSlotPool.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
@@ -20,6 +21,7 @@
 #include "utils/TestTensorFactory.h"
 
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -94,6 +96,9 @@ namespace
         std::shared_ptr<void> moe_packed_down_lifetime;
         PreparedWeightStore *prepared_store = nullptr;
         ExpertGemmRegistry *expert_registry = nullptr;
+        std::optional<ExpertSlabRef> gate_slab_ref;
+        std::optional<ExpertSlabRef> up_slab_ref;
+        std::optional<ExpertSlabRef> down_slab_ref;
 
         // 3D parent tensors (owned — must be shared_ptr for create_view/shared_from_this)
         std::shared_ptr<Q4_0Tensor> gate_3d;
@@ -135,7 +140,10 @@ namespace
                 moe_packed_down_lifetime,
                 nullptr,
                 prepared_store,
-                expert_registry};
+                expert_registry,
+                gate_slab_ref,
+                up_slab_ref,
+                down_slab_ref};
         }
     };
 
@@ -151,6 +159,97 @@ namespace
         if (hasCUDABackend())
             return DeviceId(DeviceType::CUDA, 0);
         return DeviceId::cpu();
+    }
+
+    ITensorGemm *fakeGemm(int id)
+    {
+        return reinterpret_cast<ITensorGemm *>(static_cast<uintptr_t>(0x7000 + id * 0x100));
+    }
+
+    class OwnedFakeGemm final : public ITensorGemm
+    {
+    public:
+        explicit OwnedFakeGemm(std::shared_ptr<int> release_count)
+            : release_count_(std::move(release_count)) {}
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(const TensorBase *, TensorBase *,
+                             int, int, int,
+                             bool, float, float,
+                             const TensorBase *,
+                             const IMPIContext *,
+                             int,
+                             DeviceWorkspaceManager *,
+                             int) override
+        {
+            return false;
+        }
+
+        void releaseWeights() override
+        {
+            if (release_count_)
+                ++(*release_count_);
+        }
+
+    private:
+        std::shared_ptr<int> release_count_;
+    };
+
+    class OwnedFakeGemmWithAllocation final : public ITensorGemm
+    {
+    public:
+        OwnedFakeGemmWithAllocation(std::shared_ptr<int> release_count,
+                                    std::shared_ptr<void> allocation_owner)
+            : release_count_(std::move(release_count)),
+              allocation_owner_(std::move(allocation_owner)) {}
+
+        bool supports_device(int) const override { return true; }
+
+        bool multiply_tensor(const TensorBase *, TensorBase *,
+                             int, int, int,
+                             bool, float, float,
+                             const TensorBase *,
+                             const IMPIContext *,
+                             int,
+                             DeviceWorkspaceManager *,
+                             int) override
+        {
+            return false;
+        }
+
+        void releaseWeights() override
+        {
+            if (release_count_)
+                ++(*release_count_);
+        }
+
+    private:
+        std::shared_ptr<int> release_count_;
+        std::shared_ptr<void> allocation_owner_;
+    };
+
+    ExpertSlabDescriptor makeGpuStoreDesc(DeviceId device, WeightRole role)
+    {
+        ExpertSlabDescriptor desc;
+        desc.layer_idx = 0;
+        desc.role = role;
+        desc.device = device;
+        desc.num_experts = kNumExperts;
+        desc.local_expert_start = 0;
+        desc.local_expert_count = kNumExperts;
+        desc.rows_per_expert = kExpertIntermediate;
+        desc.cols_per_expert = kDModel;
+        return desc;
+    }
+
+    void populateOneExpert(PreparedWeightStore &store, const ExpertSlabRef &ref, int expert_id, ITensorGemm *engine)
+    {
+        ExpertArrival arrival;
+        arrival.expert_id = expert_id;
+        arrival.engine = engine;
+        arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+        store.registerArrivedExperts(ref, {arrival});
     }
 
 } // namespace
@@ -302,6 +401,72 @@ TEST(Test__MoEExpertWeightService, PrepareGemmEngines_CPU_StoreOwnsPreparedEngin
         EXPECT_NE(owner.prepared_up_gemm[e], nullptr);
         EXPECT_NE(owner.prepared_down_gemm[e], nullptr);
     }
+}
+
+TEST(Test__MoEExpertWeightService, PrepareGemmEngines_GPU_ReusesCompletePreparedStoreSlabs)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    PreparedWeightStore store(ModelContextId{81});
+    owner.prepared_store = &store;
+
+    {
+        auto ctx = owner.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+    }
+
+    auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
+    auto up_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
+    auto down_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
+    for (int e = 0; e < kNumExperts; ++e)
+    {
+        populateOneExpert(store, gate_ref, e, fakeGemm(10 + e));
+        populateOneExpert(store, up_ref, e, fakeGemm(110 + e));
+        populateOneExpert(store, down_ref, e, fakeGemm(210 + e));
+    }
+
+    auto ctx = owner.buildContext();
+    ASSERT_TRUE(MoEExpertWeightService::prepareGemmEngines(ctx));
+
+    EXPECT_TRUE(owner.moe_owned_kernels.empty())
+        << "GPU prepared-store reuse must not allocate graph-local duplicate expert pools.";
+    ASSERT_TRUE(ctx.gate_slab_ref.has_value());
+    ASSERT_TRUE(ctx.up_slab_ref.has_value());
+    ASSERT_TRUE(ctx.down_slab_ref.has_value());
+    EXPECT_EQ(*ctx.gate_slab_ref, gate_ref);
+    EXPECT_EQ(*ctx.up_slab_ref, up_ref);
+    EXPECT_EQ(*ctx.down_slab_ref, down_ref);
+    for (int e = 0; e < kNumExperts; ++e)
+    {
+        EXPECT_EQ(owner.prepared_gate_gemm[e], fakeGemm(10 + e));
+        EXPECT_EQ(owner.prepared_up_gemm[e], fakeGemm(110 + e));
+        EXPECT_EQ(owner.prepared_down_gemm[e], fakeGemm(210 + e));
+    }
+}
+
+TEST(Test__MoEExpertWeightService, PrepareGemmEngines_GPU_IncompletePreparedStoreSlabsDoNotRepack)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    PreparedWeightStore store(ModelContextId{82});
+    owner.prepared_store = &store;
+
+    {
+        auto ctx = owner.buildContext();
+        ASSERT_TRUE(MoEExpertWeightService::extractExpertViews(ctx));
+    }
+
+    auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
+    auto up_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
+    auto down_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
+    populateOneExpert(store, gate_ref, 0, fakeGemm(10));
+    populateOneExpert(store, up_ref, 0, fakeGemm(110));
+    populateOneExpert(store, down_ref, 0, fakeGemm(210));
+
+    auto ctx = owner.buildContext();
+    EXPECT_FALSE(MoEExpertWeightService::prepareGemmEngines(ctx));
+    EXPECT_TRUE(owner.moe_owned_kernels.empty())
+        << "Incomplete GPU slabs should fail instead of allocating a second full expert pool.";
 }
 
 TEST(Test__MoEExpertWeightService, PrepareGemmEngines_CPU_IncrementallyFillsExistingStoreSlabs)
@@ -510,6 +675,306 @@ TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_RemovesRegistryEntries
     EXPECT_FALSE(registry.hasCompleteLayer(owner.device_id, 0, kNumExperts));
 }
 
+TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_DropsGraphLocalOwnersForDirectArrivals)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    owner.expert_mask.assign(kNumExperts, true);
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+
+    PreparedWeightStore store(ModelContextId{1234});
+    ExpertGemmRegistry registry;
+    owner.prepared_store = &store;
+    owner.expert_registry = &registry;
+    owner.gate_slab_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
+    owner.up_slab_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
+    owner.down_slab_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
+
+    struct RegisteredEngine
+    {
+        std::weak_ptr<ITensorGemm> weak;
+        std::shared_ptr<int> release_count;
+    };
+
+    auto register_engine = [&](int expert_id,
+                               WeightRole store_role,
+                               ExpertGemmRegistry::WeightRole registry_role,
+                               const ExpertSlabRef &slab_ref,
+                               std::vector<ITensorGemm *> &prepared) -> RegisteredEngine
+    {
+        auto release_count = std::make_shared<int>(0);
+        auto engine = std::make_shared<OwnedFakeGemm>(release_count);
+        std::weak_ptr<ITensorGemm> weak = engine;
+        prepared[expert_id] = engine.get();
+        owner.moe_owned_kernels.push_back(engine);
+
+        ExpertArrival arrival;
+        arrival.expert_id = expert_id;
+        arrival.engine = engine.get();
+        arrival.engine_lifetime = engine;
+        arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+        store.registerArrivedExperts(slab_ref, {arrival});
+        registry.registerEngine(owner.device_id, 0, expert_id, registry_role, engine.get(), engine);
+
+        (void)store_role;
+        return RegisteredEngine{weak, release_count};
+    };
+
+    auto retained_gate = register_engine(0, WeightRole::MoEExpertGate, ExpertGemmRegistry::WeightRole::GATE,
+                                         *owner.gate_slab_ref, owner.prepared_gate_gemm);
+    auto retained_up = register_engine(0, WeightRole::MoEExpertUp, ExpertGemmRegistry::WeightRole::UP,
+                                       *owner.up_slab_ref, owner.prepared_up_gemm);
+    auto retained_down = register_engine(0, WeightRole::MoEExpertDown, ExpertGemmRegistry::WeightRole::DOWN,
+                                         *owner.down_slab_ref, owner.prepared_down_gemm);
+    auto departed_gate = register_engine(1, WeightRole::MoEExpertGate, ExpertGemmRegistry::WeightRole::GATE,
+                                         *owner.gate_slab_ref, owner.prepared_gate_gemm);
+    auto departed_up = register_engine(1, WeightRole::MoEExpertUp, ExpertGemmRegistry::WeightRole::UP,
+                                       *owner.up_slab_ref, owner.prepared_up_gemm);
+    auto departed_down = register_engine(1, WeightRole::MoEExpertDown, ExpertGemmRegistry::WeightRole::DOWN,
+                                         *owner.down_slab_ref, owner.prepared_down_gemm);
+
+    ASSERT_EQ(owner.moe_owned_kernels.size(), 6u);
+    ASSERT_EQ(store.expertGemmKernel(*owner.gate_slab_ref, 1), owner.prepared_gate_gemm[1]);
+    ASSERT_NE(registry.getEngine(owner.device_id, 0, 1, ExpertGemmRegistry::WeightRole::GATE), nullptr);
+
+    std::vector<bool> new_mask = {true, false, false, false};
+    {
+        auto ctx = owner.buildContext();
+        (void)MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
+    }
+
+    EXPECT_EQ(owner.prepared_gate_gemm[1], nullptr);
+    EXPECT_EQ(owner.prepared_up_gemm[1], nullptr);
+    EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
+    EXPECT_EQ(store.expertGemmKernel(*owner.gate_slab_ref, 1), nullptr);
+    EXPECT_EQ(registry.getEngine(owner.device_id, 0, 1, ExpertGemmRegistry::WeightRole::GATE), nullptr);
+    EXPECT_EQ(owner.moe_owned_kernels.size(), 3u);
+
+    EXPECT_TRUE(departed_gate.weak.expired());
+    EXPECT_TRUE(departed_up.weak.expired());
+    EXPECT_TRUE(departed_down.weak.expired());
+    EXPECT_EQ(*departed_gate.release_count, 1);
+    EXPECT_EQ(*departed_up.release_count, 1);
+    EXPECT_EQ(*departed_down.release_count, 1);
+
+    EXPECT_FALSE(retained_gate.weak.expired());
+    EXPECT_FALSE(retained_up.weak.expired());
+    EXPECT_FALSE(retained_down.weak.expired());
+    EXPECT_EQ(*retained_gate.release_count, 0);
+    EXPECT_EQ(*retained_up.release_count, 0);
+    EXPECT_EQ(*retained_down.release_count, 0);
+}
+
+TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_FreesDepartedDirectArrivalAllocationOwner)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    owner.expert_mask.assign(kNumExperts, true);
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+
+    PreparedWeightStore store(ModelContextId{2345});
+    ExpertGemmRegistry registry;
+    owner.prepared_store = &store;
+    owner.expert_registry = &registry;
+    owner.gate_slab_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
+    owner.up_slab_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
+    owner.down_slab_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
+
+    struct AllocationRecord
+    {
+        std::weak_ptr<void> weak_allocation;
+        std::shared_ptr<int> free_count;
+    };
+
+    auto register_role = [&](int expert_id,
+                             WeightRole store_role,
+                             ExpertGemmRegistry::WeightRole registry_role,
+                             const ExpertSlabRef &slab_ref,
+                             std::vector<ITensorGemm *> &prepared,
+                             const std::shared_ptr<void> &allocation_owner)
+    {
+        auto release_count = std::make_shared<int>(0);
+        auto engine = std::make_shared<OwnedFakeGemmWithAllocation>(
+            release_count,
+            allocation_owner);
+        prepared[expert_id] = engine.get();
+        owner.moe_owned_kernels.push_back(engine);
+
+        ExpertArrival arrival;
+        arrival.expert_id = expert_id;
+        arrival.engine = engine.get();
+        arrival.engine_lifetime = engine;
+        arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+        store.registerArrivedExperts(slab_ref, {arrival});
+        registry.registerEngine(owner.device_id, 0, expert_id, registry_role, engine.get(), engine);
+        (void)store_role;
+    };
+
+    auto register_expert = [&](int expert_id) -> AllocationRecord
+    {
+        auto free_count = std::make_shared<int>(0);
+        std::weak_ptr<void> weak_allocation;
+        {
+            auto allocation_owner = std::shared_ptr<void>(
+                new int(1),
+                [free_count](void *ptr)
+                {
+                    ++(*free_count);
+                    delete static_cast<int *>(ptr);
+                });
+            weak_allocation = allocation_owner;
+
+            register_role(expert_id, WeightRole::MoEExpertGate, ExpertGemmRegistry::WeightRole::GATE,
+                          *owner.gate_slab_ref, owner.prepared_gate_gemm, allocation_owner);
+            register_role(expert_id, WeightRole::MoEExpertUp, ExpertGemmRegistry::WeightRole::UP,
+                          *owner.up_slab_ref, owner.prepared_up_gemm, allocation_owner);
+            register_role(expert_id, WeightRole::MoEExpertDown, ExpertGemmRegistry::WeightRole::DOWN,
+                          *owner.down_slab_ref, owner.prepared_down_gemm, allocation_owner);
+        }
+        return AllocationRecord{weak_allocation, free_count};
+    };
+
+    auto retained_allocation = register_expert(0);
+    auto departed_allocation = register_expert(1);
+
+    ASSERT_FALSE(retained_allocation.weak_allocation.expired());
+    ASSERT_FALSE(departed_allocation.weak_allocation.expired());
+    ASSERT_EQ(owner.moe_owned_kernels.size(), 6u);
+
+    std::vector<bool> new_mask = {true, false, false, false};
+    {
+        auto ctx = owner.buildContext();
+        (void)MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
+    }
+
+    EXPECT_FALSE(retained_allocation.weak_allocation.expired())
+        << "retained expert allocation should stay resident";
+    EXPECT_TRUE(departed_allocation.weak_allocation.expired())
+        << "departed expert allocation should not be pinned by unrelated arrivals";
+    EXPECT_EQ(*retained_allocation.free_count, 0);
+    EXPECT_EQ(*departed_allocation.free_count, 1);
+}
+
+TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_KeepsSiblingStageOwnerAlive)
+{
+    TestWeightContextOwner first_stage;
+    TestWeightContextOwner second_stage;
+    first_stage.device_id = DeviceId::cuda(0);
+    second_stage.device_id = DeviceId::cuda(0);
+    first_stage.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    first_stage.prepared_up_gemm.assign(kNumExperts, nullptr);
+    first_stage.prepared_down_gemm.assign(kNumExperts, nullptr);
+    second_stage.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    second_stage.prepared_up_gemm.assign(kNumExperts, nullptr);
+    second_stage.prepared_down_gemm.assign(kNumExperts, nullptr);
+
+    PreparedWeightStore store(ModelContextId{5678});
+    auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(first_stage.device_id, WeightRole::MoEExpertGate));
+    first_stage.prepared_store = &store;
+    second_stage.prepared_store = &store;
+    first_stage.gate_slab_ref = gate_ref;
+    second_stage.gate_slab_ref = gate_ref;
+
+    auto release_count = std::make_shared<int>(0);
+    std::weak_ptr<ITensorGemm> weak;
+    ITensorGemm *raw = nullptr;
+    {
+        auto engine = std::make_shared<OwnedFakeGemm>(release_count);
+        weak = engine;
+        raw = engine.get();
+        first_stage.prepared_gate_gemm[1] = raw;
+        second_stage.prepared_gate_gemm[1] = raw;
+        first_stage.moe_owned_kernels.push_back(engine);
+        second_stage.moe_owned_kernels.push_back(engine);
+
+        ExpertArrival arrival;
+        arrival.expert_id = 1;
+        arrival.engine = raw;
+        arrival.engine_lifetime = engine;
+        arrival.derivation = WeightDerivationKind::RebalancedExpertReplica;
+        store.registerArrivedExperts(gate_ref, {arrival});
+    }
+
+    std::vector<bool> new_mask = {true, false, true, true};
+    {
+        auto ctx = first_stage.buildContext();
+        (void)MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
+    }
+
+    EXPECT_EQ(first_stage.prepared_gate_gemm[1], nullptr);
+    EXPECT_EQ(first_stage.moe_owned_kernels.size(), 0u);
+    EXPECT_EQ(store.expertGemmKernel(gate_ref, 1), nullptr);
+    EXPECT_FALSE(weak.expired());
+    EXPECT_EQ(second_stage.prepared_gate_gemm[1], raw);
+    EXPECT_EQ(*release_count, 1);
+
+    {
+        auto ctx = second_stage.buildContext();
+        (void)MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
+    }
+
+    EXPECT_EQ(second_stage.prepared_gate_gemm[1], nullptr);
+    EXPECT_EQ(second_stage.moe_owned_kernels.size(), 0u);
+    EXPECT_TRUE(weak.expired());
+    EXPECT_EQ(*release_count, 2);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
+{
+    std::vector<GpuExpertSlotPool::ProjectionSpec> specs;
+    for (const char *label : {"gate", "up", "down"})
+    {
+        GpuExpertSlotPool::ProjectionSpec spec;
+        spec.label = label;
+        spec.N = 4;
+        spec.K = 32;
+        spec.payload_bytes_per_block = 16;
+        spec.is_asymmetric = true;
+        spec.has_emins = false;
+        spec.codebook_id = 7;
+        specs.push_back(std::move(spec));
+    }
+
+    auto pool = GpuExpertSlotPool::create(
+        nullptr,
+        DeviceId::cuda(0),
+        /*device_ordinal=*/0,
+        /*layer_idx=*/3,
+        /*capacity=*/2,
+        std::move(specs),
+        /*vram_safety_margin_bytes=*/0);
+
+    auto first = pool->acquire(11);
+    auto second = pool->acquire(12);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    EXPECT_EQ(pool->usedSlots(), 2u);
+    EXPECT_FALSE(pool->acquire(13).has_value());
+
+    const int released_slot = first->slot_index;
+    EXPECT_EQ(pool->slotForExpert(11), released_slot);
+    first->lifetime.reset();
+
+    EXPECT_FALSE(pool->slotForExpert(11).has_value());
+    EXPECT_EQ(pool->usedSlots(), 1u);
+
+    auto reused = pool->acquire(13);
+    ASSERT_TRUE(reused.has_value());
+    EXPECT_EQ(reused->slot_index, released_slot);
+    EXPECT_EQ(pool->slotForExpert(13), released_slot);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RecommendedCapacityCoversBatchAndTenPercent)
+{
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 2), 7);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 9), 9);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(1, 0), 1);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // registerAndPrepareNewExperts
 // ─────────────────────────────────────────────────────────────────────────────
@@ -665,6 +1130,48 @@ TEST(Test__MoEExpertWeightService, GPURebalanceRequiresPayloadWhenCacheMissing)
     EXPECT_EQ(owner.prepared_gate_gemm[1], nullptr);
     EXPECT_EQ(owner.prepared_up_gemm[1], nullptr);
     EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
+}
+
+TEST(Test__MoEExpertWeightService, GPURebalanceResolvesStoreSlabsWhenCachedRefsMissing)
+{
+    if (!hasGPU())
+    {
+        GTEST_SKIP() << "No GPU backend available";
+    }
+
+    TestWeightContextOwner owner;
+    owner.device_id = firstGPU();
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+
+    PreparedWeightStore store(ModelContextId{10});
+    owner.prepared_store = &store;
+
+    auto gate_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertGate));
+    auto up_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertUp));
+    auto down_ref = store.registerExpertSlab(makeGpuStoreDesc(owner.device_id, WeightRole::MoEExpertDown));
+    populateOneExpert(store, gate_ref, 1, fakeGemm(1));
+    populateOneExpert(store, up_ref, 1, fakeGemm(101));
+    populateOneExpert(store, down_ref, 1, fakeGemm(201));
+
+    std::vector<bool> new_mask = {false, true, false, false};
+    auto ctx = owner.buildContext();
+    ASSERT_FALSE(ctx.gate_slab_ref.has_value());
+    ASSERT_FALSE(ctx.up_slab_ref.has_value());
+    ASSERT_FALSE(ctx.down_slab_ref.has_value());
+
+    ASSERT_TRUE(MoEExpertWeightService::registerAndPrepareNewExperts(ctx, new_mask, nullptr));
+
+    EXPECT_EQ(owner.prepared_gate_gemm[1], fakeGemm(1));
+    EXPECT_EQ(owner.prepared_up_gemm[1], fakeGemm(101));
+    EXPECT_EQ(owner.prepared_down_gemm[1], fakeGemm(201));
+    ASSERT_TRUE(ctx.gate_slab_ref.has_value());
+    ASSERT_TRUE(ctx.up_slab_ref.has_value());
+    ASSERT_TRUE(ctx.down_slab_ref.has_value());
+    EXPECT_EQ(ctx.gate_slab_ref->slab_id, gate_ref.slab_id);
+    EXPECT_EQ(ctx.up_slab_ref->slab_id, up_ref.slab_id);
+    EXPECT_EQ(ctx.down_slab_ref->slab_id, down_ref.slab_id);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

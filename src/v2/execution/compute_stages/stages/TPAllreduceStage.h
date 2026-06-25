@@ -100,6 +100,13 @@ namespace llaminar2
         bool requiresAllreduce() const override { return true; }
 
         /**
+         * Captured graph replay does not re-enter execute(), so emit the same
+         * allreduce BOM from the replay callback path when perfstats are active.
+         */
+        void onGraphReplayed() override;
+        bool needsOnGraphReplayed() const override;
+
+        /**
          * @brief Check if stage supports a backend type
          * @param backend Backend to check
          * @return true for all backends (TP context handles routing internally)

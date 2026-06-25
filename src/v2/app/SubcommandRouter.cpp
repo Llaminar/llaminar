@@ -49,8 +49,9 @@ namespace llaminar2
                 shifted.push_back(argv[0]);
                 for (int i = 2; i < argc; ++i)
                     shifted.push_back(argv[i]);
+                shifted.push_back(nullptr);
 
-                return cmd->execute(static_cast<int>(shifted.size()), shifted.data());
+                return cmd->execute(static_cast<int>(shifted.size() - 1), shifted.data());
             }
         }
 

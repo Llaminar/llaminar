@@ -107,8 +107,13 @@ namespace llaminar2
             name.find("attn_o.weight") != std::string::npos)
             return WeightRole::AttentionWO;
         if (name.find("gdn_qkv.weight") != std::string::npos ||
-            name.find("ssm.qkv_proj.weight") != std::string::npos)
+            name.find("ssm.qkv_proj.weight") != std::string::npos ||
+            name.find("ssm_alpha.weight") != std::string::npos ||
+            name.find("ssm_beta.weight") != std::string::npos)
             return WeightRole::GDNProjection;
+        if (name.find("ssm_conv1d.weight") != std::string::npos ||
+            name.find(".ssm_a") != std::string::npos)
+            return WeightRole::GDNSsmParam;
         if (name.find("ssm.") != std::string::npos) return WeightRole::GDNSsmParam;
         if (name.find("ffn_gate_exps.weight") != std::string::npos) return WeightRole::MoEExpertGate;
         if (name.find("ffn_up_exps.weight") != std::string::npos) return WeightRole::MoEExpertUp;
