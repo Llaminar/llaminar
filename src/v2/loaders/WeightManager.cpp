@@ -5907,12 +5907,18 @@ namespace llaminar2
 
         size_t released_count = 0;
         size_t released_bytes = 0;
+        size_t skipped_views = 0;
         std::unordered_set<TensorBase *> visited_ptrs;
 
         auto try_release = [&](TensorBase *ptr, const std::string &key)
         {
             if (!ptr || !visited_ptrs.insert(ptr).second)
                 return;
+            if (ptr->is_view())
+            {
+                ++skipped_views;
+                return;
+            }
             if (ptr->is_raw_data_released())
                 return;
             if (!ptr->isHostResident())
@@ -5950,6 +5956,11 @@ namespace llaminar2
 #if defined(__GLIBC__)
             ::malloc_trim(0);
 #endif
+        }
+        if (skipped_views > 0)
+        {
+            LOG_DEBUG("[WeightManager] Post-upload host-resident release skipped "
+                      << skipped_views << " borrowed tensor views");
         }
 
         // Advise the OS to reclaim mmap physical pages. All GEMM weight data

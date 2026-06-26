@@ -563,6 +563,29 @@ TEST(Test__StageBufferContract, InOutBinding)
 
     EXPECT_EQ(contract.inouts.size(), 1u);
     EXPECT_EQ(contract.inouts[0].access, BufferAccess::READWRITE);
+    EXPECT_TRUE(contract.inouts[0].prepare_write_storage);
+}
+
+TEST(Test__StageBufferContract, PreallocatedInOutSkipsWritePreparationOnly)
+{
+    auto contract = StageBufferContract::build()
+                        .addOutput(BufferId::ATTN_OUTPUT)
+                        .addPreallocatedInOut(BufferId::HIDDEN_STATE, "FP32");
+
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts[0].access, BufferAccess::READWRITE);
+    EXPECT_FALSE(contract.inouts[0].prepare_write_storage);
+
+    auto reads = contract.allArenaReads();
+    EXPECT_EQ(reads.size(), 1u);
+    EXPECT_EQ(reads[0].id, BufferId::HIDDEN_STATE);
+
+    auto writes = contract.allWrites();
+    EXPECT_EQ(writes.size(), 2u);
+
+    auto write_preps = contract.writesRequiringPrepare();
+    ASSERT_EQ(write_preps.size(), 1u);
+    EXPECT_EQ(write_preps[0].id, BufferId::ATTN_OUTPUT);
 }
 
 TEST(Test__StageBufferContract, WorkspaceBinding)

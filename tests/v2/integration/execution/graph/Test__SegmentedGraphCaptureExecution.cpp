@@ -1,6 +1,6 @@
 /**
  * @file Test__SegmentedGraphCaptureExecution.cpp
- * @brief Integration tests for segmented GPU graph capture/replay via DeviceGraphExecutor::executeWithSegmentedGraphCapture()
+ * @brief Integration tests for cached GPU graph replay via DeviceGraphExecutor::executeWithCachedGraphReplay()
  *
  * Phase 0 coverage:
  * 1. Warmup → capture → replay lifecycle executes successfully.
@@ -34,7 +34,7 @@ using namespace llaminar2::test;
         GTEST_SKIP() << "No GPU available (neither CUDA nor ROCm)"; \
     }
 
-class SegmentedGraphCaptureExecutionTest : public ::testing::Test
+class CachedGraphReplayExecutionTest : public ::testing::Test
 {
 protected:
     IWorkerGPUContext *gpu_ctx_ = nullptr;
@@ -140,7 +140,7 @@ protected:
     }
 };
 
-TEST_F(SegmentedGraphCaptureExecutionTest, WarmupCaptureReplay_LifecycleStable)
+TEST_F(CachedGraphReplayExecutionTest, WarmupCaptureReplay_LifecycleStable)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(gpu_ctx_, nullptr);
@@ -162,7 +162,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, WarmupCaptureReplay_LifecycleStable)
     void *stream = gpu_ctx_->defaultStream();
     ASSERT_NE(stream, nullptr);
 
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, nullptr));
     EXPECT_TRUE(segment_cache.initialized);
     EXPECT_TRUE(segment_cache.needs_capture);
@@ -172,7 +172,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, WarmupCaptureReplay_LifecycleStable)
     std::memcpy(warmup_output.data(), result->data(), num_elements * sizeof(float));
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, nullptr));
     EXPECT_TRUE(segment_cache.initialized);
     EXPECT_FALSE(segment_cache.needs_capture);
@@ -182,7 +182,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, WarmupCaptureReplay_LifecycleStable)
     std::memcpy(capture_output.data(), result->data(), num_elements * sizeof(float));
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, nullptr));
     assertFiniteAndNonZero(result->data(), num_elements);
 
@@ -196,7 +196,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, WarmupCaptureReplay_LifecycleStable)
     }
 }
 
-TEST_F(SegmentedGraphCaptureExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunctional)
+TEST_F(CachedGraphReplayExecutionTest, DISABLED_CollectiveMarkedMode_RemainsFunctional)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(gpu_ctx_, nullptr);
@@ -224,7 +224,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, DISABLED_CollectiveMarkedMode_Remains
 
     std::unordered_set<std::string> collective_nodes = {"rmsnorm"};
 
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, &collective_nodes));
     EXPECT_TRUE(segment_cache.initialized);
     EXPECT_FALSE(segment_cache.segments.empty());
@@ -242,16 +242,16 @@ TEST_F(SegmentedGraphCaptureExecutionTest, DISABLED_CollectiveMarkedMode_Remains
     assertFiniteAndNonZero(result->data(), num_elements);
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, &collective_nodes));
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, stream, gpu_ctx_, &collective_nodes));
     assertFiniteAndNonZero(result->data(), num_elements);
 }
 
-TEST_F(SegmentedGraphCaptureExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)
+TEST_F(CachedGraphReplayExecutionTest, PreserveResetKeepsExplicitCaptureStreamForRecapture)
 {
     SKIP_IF_NO_GPU();
     ASSERT_NE(gpu_ctx_, nullptr);
@@ -273,14 +273,14 @@ TEST_F(SegmentedGraphCaptureExecutionTest, PreserveResetKeepsExplicitCaptureStre
     void *dispatch_stream = gpu_ctx_->defaultStream();
     ASSERT_NE(dispatch_stream, nullptr);
 
-    // First warmup creates the dedicated segmented replay stream and binds all
+    // First warmup creates the dedicated cached-replay stream and binds all
     // stages to it. This stream must not be replaced by retry/reset plumbing.
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     void *capture_stream = segment_cache.capture_stream;
     ASSERT_NE(capture_stream, nullptr);
     EXPECT_NE(capture_stream, dispatch_stream)
-        << "Segmented graph replay should use a dedicated explicit stream, not the dispatch/default stream";
+        << "Cached graph replay should use a dedicated explicit stream, not the dispatch/default stream";
     assertGraphStagesUseStream(graph, capture_stream);
     assertFiniteAndNonZero(result->data(), num_elements);
 
@@ -291,7 +291,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, PreserveResetKeepsExplicitCaptureStre
     EXPECT_EQ(segment_cache.capture_stream, capture_stream);
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     EXPECT_EQ(segment_cache.capture_stream, capture_stream);
     assertGraphStagesUseStream(graph, capture_stream);
@@ -299,7 +299,7 @@ TEST_F(SegmentedGraphCaptureExecutionTest, PreserveResetKeepsExplicitCaptureStre
 
     // The recapture pass should continue using that same explicit stream.
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph, device_ctx_.get(), segment_cache, dispatch_stream, gpu_ctx_, nullptr));
     EXPECT_EQ(segment_cache.capture_stream, capture_stream);
     assertGraphStagesUseStream(graph, capture_stream);

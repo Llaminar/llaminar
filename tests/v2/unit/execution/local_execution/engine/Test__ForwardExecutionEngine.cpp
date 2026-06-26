@@ -1415,7 +1415,7 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
         EXPECT_TRUE(observation.signature.decode);
         EXPECT_FALSE(observation.segment_initialized)
             << "CPU entries have graph-cache identity but no GPU replay state.";
-        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u);
+        EXPECT_EQ(observation.graph_replay_live_state_epoch, 0u);
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture);
         EXPECT_FALSE(observation.all_position_verifier_recapture_pending);
         if (observation.signature.all_position_logits)
@@ -1447,12 +1447,12 @@ TEST_F(Test__ForwardExecutionEngine, ReplayCacheObservationsTrackOrdinaryAndVeri
     {
         if (observation.signature.all_position_logits)
         {
-            EXPECT_EQ(observation.segmented_capture_live_state_epoch, 123u)
+            EXPECT_EQ(observation.graph_replay_live_state_epoch, 123u)
                 << "Multi-row verifier replay is preserved and stamped safe at the correction boundary.";
         }
         else
         {
-            EXPECT_EQ(observation.segmented_capture_live_state_epoch, 123u);
+            EXPECT_EQ(observation.graph_replay_live_state_epoch, 123u);
         }
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture);
     }
@@ -1764,7 +1764,7 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
     MockForwardExecutionHost host(&mock_ctx_);
     host.graph_stage_types = {ComputeStageType::ALLREDUCE};
     host.mock_capture_policy.allow_fast_decode = true;
-    host.mock_capture_policy.allow_segmented_capture = true;
+    host.mock_capture_policy.allow_cached_graph_replay = true;
     host.mock_capture_policy.collectives_graph_capturable = true;
 
     int token = 42;
@@ -1778,7 +1778,7 @@ TEST_F(Test__ForwardExecutionEngine, CapturedCollectiveOptInRequestsDeferredMain
 
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags tags = {
-        {"allow_segmented", "true"},
+        {"allow_graph_replay", "true"},
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "true"},
         {"context", "main_decode"},

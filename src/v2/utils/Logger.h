@@ -228,16 +228,16 @@ namespace llaminar2
 
             full_line += location + " " + message;
 
-            {
-                std::lock_guard<std::mutex> lk(buffer_mutex_);
-                recent_.push_back(full_line);
-                if (recent_.size() > max_buffer_)
-                    recent_.pop_front();
-            }
+            std::lock_guard<std::mutex> lk(buffer_mutex_);
+            recent_.push_back(full_line);
+            if (recent_.size() > max_buffer_)
+                recent_.pop_front();
 
             std::cerr << full_line << std::endl;
 
-            // Tee to log file if open
+            // Tee to log file if open. std::ofstream is not safe for
+            // concurrent writes, so this stays under the same mutex that
+            // protects rotation and closeLogFile().
             if (log_file_.is_open())
             {
                 log_file_ << full_line << '\n';

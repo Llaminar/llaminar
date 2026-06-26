@@ -168,6 +168,13 @@ namespace
         void *defaultStream() override { return &default_stream_; }
         void *createStream() override { return &capture_stream_; }
         void destroyStream(void *) override { ++destroy_stream_calls_; }
+        void *getOrCreateAuxiliaryStream(const std::string &, bool *created = nullptr) override
+        {
+            if (created)
+                *created = false;
+            return &auxiliary_stream_;
+        }
+        void resetAuxiliaryStreams() override {}
 
         void *createEvent() override
         {
@@ -220,6 +227,7 @@ namespace
     private:
         int default_stream_ = 0;
         int capture_stream_ = 0;
+        int auxiliary_stream_ = 0;
     };
 
     void addFakeSegmentStage(ComputeGraph &graph,
@@ -772,7 +780,7 @@ TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
     cache.segment_cache.initialized = true;
     cache.gpu_graph_update_failures = 3;
     cache.phase3_active = true;
-    cache.segmented_capture_live_state_epoch = 42;
+    cache.graph_replay_live_state_epoch = 42;
 
     cache.resetReplayState();
 
@@ -780,7 +788,7 @@ TEST(Test__ForwardGraphCache, ReplayResetPreservesSegmentCaptureStream)
     EXPECT_FALSE(cache.segment_cache.initialized);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
     EXPECT_FALSE(cache.phase3_active);
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
 }
 
 TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
@@ -794,7 +802,7 @@ TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
     cache.gpu_stream_applied = true;
     cache.applied_stream = stream;
     cache.phase3_active = true;
-    cache.segmented_capture_live_state_epoch = 42;
+    cache.graph_replay_live_state_epoch = 42;
 
     cache.markGPUStreamBindingsDirty();
 
@@ -804,7 +812,7 @@ TEST(Test__ForwardGraphCache, MarkGPUStreamBindingsDirtyPreservesReplayState)
     EXPECT_FALSE(cache.gpu_stream_applied);
     EXPECT_EQ(cache.applied_stream, nullptr);
     EXPECT_TRUE(cache.phase3_active);
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 42u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 42u);
 }
 
 TEST(Test__ForwardGraphCache, MarkReplayStateSafeForLiveEpochStampsPreservedCapture)
@@ -812,11 +820,11 @@ TEST(Test__ForwardGraphCache, MarkReplayStateSafeForLiveEpochStampsPreservedCapt
     ForwardGraphCache cache;
     cache.segment_cache.initialized = true;
     cache.segment_cache.needs_capture = false;
-    cache.segmented_capture_live_state_epoch = 17;
+    cache.graph_replay_live_state_epoch = 17;
 
     cache.markReplayStateSafeForLiveEpoch(23);
 
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 23u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 23u);
     EXPECT_TRUE(cache.segment_cache.initialized);
     EXPECT_FALSE(cache.segment_cache.needs_capture);
 }
@@ -831,7 +839,7 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
     cache.applied_stream = reinterpret_cast<void *>(0x4321);
     cache.gpu_graph_update_failures = 2;
     cache.phase3_active = true;
-    cache.segmented_capture_live_state_epoch = 17;
+    cache.graph_replay_live_state_epoch = 17;
 
     PrefillGraphConfig prefill_config;
     prefill_config.enabled = true;
@@ -843,10 +851,10 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
     cache.prefill_graph_cache->markWarmedUp(prefill_key);
     ASSERT_EQ(cache.prefill_graph_cache->phase(prefill_key), PrefillGraphPhase::Warmup);
 
-    cache.resetSessionStatePreservingSegmentedReplay();
+    cache.resetSessionStatePreservingGraphReplay();
 
     EXPECT_TRUE(cache.segment_cache.initialized)
-        << "Replay-safe decode/verifier segmented captures should stay hot across request reset.";
+        << "Replay-safe decode/verifier cached graph captures should stay hot across request reset.";
     EXPECT_FALSE(cache.segment_cache.needs_capture);
     EXPECT_EQ(cache.segment_cache.decode_step, 9u);
     EXPECT_FALSE(cache.gpu_stream_applied)
@@ -854,7 +862,7 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
     EXPECT_EQ(cache.applied_stream, nullptr);
     EXPECT_EQ(cache.gpu_graph_update_failures, 0);
     EXPECT_TRUE(cache.phase3_active);
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u)
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u)
         << "Request reset clears live-state epoch stamps; only version-safe caches may use this path.";
     EXPECT_EQ(cache.prefill_graph_cache->phase(prefill_key), PrefillGraphPhase::Initialized)
         << "A warmed prefill bucket has no executable graph, so request reset must drop request arming "
@@ -865,22 +873,22 @@ TEST(Test__ForwardGraphCache, RequestResetPreservesSegmentedReplayAndDemotesWarm
 TEST(Test__ForwardGraphCache, ReplayStateEpochClearsOnStateInvalidatingResets)
 {
     ForwardGraphCache cache;
-    cache.segmented_capture_live_state_epoch = 17;
+    cache.graph_replay_live_state_epoch = 17;
     cache.phase3_active = true;
 
     cache.resetReplayStateAfterWorkspaceRebind();
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
     EXPECT_FALSE(cache.phase3_active);
 
-    cache.segmented_capture_live_state_epoch = 23;
+    cache.graph_replay_live_state_epoch = 23;
     cache.valid = true;
     cache.resetSessionState();
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
 
-    cache.segmented_capture_live_state_epoch = 29;
+    cache.graph_replay_live_state_epoch = 29;
     cache.valid = true;
     cache.invalidate();
-    EXPECT_EQ(cache.segmented_capture_live_state_epoch, 0u);
+    EXPECT_EQ(cache.graph_replay_live_state_epoch, 0u);
     EXPECT_FALSE(cache.valid);
 }
 
@@ -889,30 +897,30 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureAppliesToReadyVersionedDeco
     ForwardGraphCache cache;
     cache.segment_cache.initialized = true;
     cache.segment_cache.needs_capture = false;
-    cache.segmented_capture_live_state_epoch = 7;
+    cache.graph_replay_live_state_epoch = 7;
 
     EXPECT_TRUE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8));
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/7));
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/false,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8))
         << "Single-row decode captures are version-safe and only need fresh dynamic metadata.";
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/false,
+        /*graph_replay_allowed=*/false,
         /*live_state_epoch=*/8));
 
     cache.segment_cache.needs_capture = true;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8))
         << "A graph queued for capture does not need an extra recapture reset.";
 
@@ -920,14 +928,14 @@ TEST(Test__ForwardGraphCache, LiveStateEpochRecaptureAppliesToReadyVersionedDeco
     cache.segment_cache.initialized = false;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8));
 
     cache.segment_cache.initialized = true;
-    cache.segmented_capture_live_state_epoch = 0;
+    cache.graph_replay_live_state_epoch = 0;
     EXPECT_FALSE(cache.requiresLiveStateEpochRecapture(
         /*live_state_versioned_context=*/true,
-        /*segmented_capture_allowed=*/true,
+        /*graph_replay_allowed=*/true,
         /*live_state_epoch=*/8))
         << "Unstamped captures are handled by existing reset paths.";
 }
@@ -1050,6 +1058,45 @@ TEST(Test__ForwardReplayStatePolicy, RequestBoundaryPreservesOnlyReplaySafeDecod
                   bucketed_prefill),
               ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
         << "Ready bucketed prefill captures replay from refreshed graph-facing buffers.";
+}
+
+TEST(Test__ForwardReplayStatePolicy, RequestBoundaryResetsDecodeCachesWithCollectives)
+{
+    ForwardGraphSignature single_token_decode;
+    single_token_decode.decode = true;
+    single_token_decode.seq_len = 1;
+    single_token_decode.batch_size = 1;
+
+    ForwardGraphSignature all_position_verifier = single_token_decode;
+    all_position_verifier.all_position_logits = true;
+
+    ForwardGraphSignature prefill;
+    prefill.decode = false;
+
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  single_token_decode,
+                  /*graph_has_collective_nodes=*/false),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams);
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  single_token_decode,
+                  /*graph_has_collective_nodes=*/true),
+              ForwardReplayStateAction::ResetReplayState)
+        << "LocalTP/MoE decode graphs must not replay a graph executable captured for the previous request.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  all_position_verifier,
+                  /*graph_has_collective_nodes=*/true),
+              ForwardReplayStateAction::ResetReplayState)
+        << "Verifier decode captures with collectives need the same request-boundary recapture contract.";
+    EXPECT_EQ(chooseForwardReplayStateAction(
+                  ForwardReplayStateMutationKind::RequestBoundaryStateReset,
+                  prefill,
+                  /*graph_has_collective_nodes=*/true),
+              ForwardReplayStateAction::PreserveReplayStateAndRebindStreams)
+        << "The current regression is request-crossing decode replay; prefill cache reset has a separate "
+           "capture/readiness state machine.";
 }
 
 TEST(Test__ForwardGraphCache, InvalidateDestroysSegmentCaptureStream)
@@ -1217,6 +1264,65 @@ TEST(Test__GraphSegmentCache, SegmentedPlanPublishesPerfStats)
     mutableDebugEnv().execution.gpu_graph_defer_captured_collective_final_sync = false;
 }
 
+TEST(Test__GraphSegmentCache, FullGraphPlanPublishesPerfStatsAsGraph)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "gemm", true, false, ComputeStageType::GEMM);
+    addFakeSegmentStage(graph, "lm_head", true, false, ComputeStageType::GEMM);
+    graph.addDependency("lm_head", "gemm");
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    DeviceGraphCaptureController::buildWarmupSegments(
+        graph,
+        cache,
+        nullptr,
+        /*has_collective_nodes=*/false);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_graphs", {{"type", "total"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_graphs", {{"type", "capturable"}}), 1.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_graphs", {{"type", "manual"}}), 0.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_stages", {{"type", "capturable"}}), 2.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_stages", {{"type", "manual"}}), 0.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_max_graph_stages", {{"type", "capturable"}}), 2.0);
+    EXPECT_DOUBLE_EQ(findCounterValue(records, "full_graph_plan_max_graph_stages", {{"type", "manual"}}), 0.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            records,
+            "full_graph_plan_stage_types",
+            {{"graph_type", "capturable"}, {"stage_type", "GEMM"}}),
+        2.0);
+
+    const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_graphs",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"source", "full_graph_capture"},
+             {"type", "total"}}),
+        1.0);
+    EXPECT_DOUBLE_EQ(
+        findCounterValue(
+            stage_records,
+            "stage_gpu",
+            "graph_replay_plan_stage_types",
+            {{"attribution", "graph_replay_metadata"},
+             {"graph_capture_scope", "full_graph_capture_plan"},
+             {"graph_type", "capturable"},
+             {"source", "full_graph_capture"},
+             {"stage_type", "GEMM"}}),
+        2.0);
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
 {
     ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
@@ -1236,6 +1342,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         &gpu_ctx,
         &capture_stream,
         /*needs_segment_sync=*/true,
+        /*full_graph_replay=*/true,
         /*perf_context=*/"",
         /*device_name=*/"CUDA:0",
         [&](DeviceGraphExecutor::GraphSegment &, void *)
@@ -1253,8 +1360,8 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeSegmentShapeTags)
         {"last_stage", "lm_head"},
         {"type", "capturable"},
         {"stage_count", "3"}};
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_graph_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_post_launch", expected_tags), 1u);
 
     PerfStatsCollector::reset();
     mutableDebugEnv().execution.gpu_graph_defer_captured_collective_final_sync = false;
@@ -1278,6 +1385,7 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
         &gpu_ctx,
         &capture_stream,
         /*needs_segment_sync=*/false,
+        /*full_graph_replay=*/true,
         /*perf_context=*/"main_verifier",
         /*device_name=*/"CUDA:0",
         [](DeviceGraphExecutor::GraphSegment &, void *) {}));
@@ -1289,8 +1397,8 @@ TEST(Test__GraphSegmentCache, CapturedReplayPerfStatsIncludeContextTag)
         {"last_stage", "lm_head"},
         {"type", "capturable"},
         {"stage_count", "3"}};
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_graph_launch", expected_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_post_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_graph_launch", expected_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_post_launch", expected_tags), 1u);
 
     PerfStatsCollector::reset();
 }
@@ -1334,42 +1442,42 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags capture_tags = {
         {"context", "main_verifier"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
         {"stream", "capture"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags default_tags = {
         {"context", "main_verifier"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
-        {"stream", "default"},
+        {"stream", "context_default"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags aggregate_tags = {
         {"context", "main_verifier"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
         {"type", "capturable"}};
     const PerfStatsCollector::Tags host_aggregate_tags = {
         {"attribution", "host_wall"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay_host"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_host"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"timing_scope", "final_stream_sync_host_wall"},
         {"type", "capturable"}};
 
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", capture_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_stream_sync", default_tags), 1u);
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", host_aggregate_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_stream_sync", capture_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_stream_sync", default_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_final_sync", host_aggregate_tags), 1u);
 
     const auto stage_records = PerfStatsCollector::snapshot({"stage_gpu"});
     const PerfStatsCollector::Tags stage_total_tags = {
         {"attribution", "gpu_event"},
         {"context", "main_verifier"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
         {"timing_scope", "total_replay_gpu_event"},
@@ -1378,17 +1486,17 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
         {"attribution", "gpu_event"},
         {"context", "main_verifier"},
         {"first_stage", "verifier_graph"},
-        {"graph_capture_scope", "segmented_replay_events"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_index", "0"},
         {"last_stage", "verifier_graph"},
-        {"segment_index", "0"},
-        {"source", "segmented_graph_capture"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
-        {"timing_scope", "segment_replay_gpu_event"},
+        {"timing_scope", "graph_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", stage_total_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", stage_segment_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", stage_segment_tags), 1u);
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.final_sync", aggregate_tags), 0u);
     EXPECT_EQ(gpu_ctx.events_created_, 4);
     EXPECT_EQ(gpu_ctx.events_recorded_, 4);
@@ -1521,9 +1629,9 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     const PerfStatsCollector::Tags total_tags = {
         {"attribution", "gpu_event"},
         {"context", "main_decode"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
         {"timing_scope", "total_replay_gpu_event"},
@@ -1532,17 +1640,17 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
         {"attribution", "gpu_event"},
         {"context", "main_decode"},
         {"first_stage", "captured_decode_graph"},
-        {"graph_capture_scope", "segmented_replay_events"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_index", "0"},
         {"last_stage", "captured_decode_graph"},
-        {"segment_index", "0"},
-        {"source", "segmented_graph_capture"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "stream_synchronized"},
-        {"timing_scope", "segment_replay_gpu_event"},
+        {"timing_scope", "graph_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", segment_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
     EXPECT_EQ(gpu_ctx.events_created_, 4);
     EXPECT_EQ(gpu_ctx.events_recorded_, 4);
     EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
@@ -1595,9 +1703,9 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     const PerfStatsCollector::Tags total_tags = {
         {"attribution", "gpu_event"},
         {"context", "mtp_decode_sidecar"},
-        {"graph_capture_scope", "segmented_replay_events"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "profiling_event_synchronized"},
         {"timing_scope", "total_replay_gpu_event"},
@@ -1606,17 +1714,17 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
         {"attribution", "gpu_event"},
         {"context", "mtp_decode_sidecar"},
         {"first_stage", "sidecar_graph"},
-        {"graph_capture_scope", "segmented_replay_events"},
+        {"graph_capture_scope", "full_graph_replay_events"},
+        {"graph_index", "0"},
         {"last_stage", "sidecar_graph"},
-        {"segment_index", "0"},
-        {"source", "segmented_graph_capture"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"sync_scope", "profiling_event_synchronized"},
-        {"timing_scope", "segment_replay_gpu_event"},
+        {"timing_scope", "graph_replay_gpu_event"},
         {"type", "capturable"}};
 
     EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.total", total_tags), 1u);
-    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.segment", segment_tags), 1u);
+    EXPECT_EQ(findTimerCount(stage_records, "stage_gpu", "graph_replay.graph", segment_tags), 1u);
     EXPECT_EQ(gpu_ctx.events_created_, 4);
     EXPECT_EQ(gpu_ctx.events_recorded_, 4);
     EXPECT_EQ(gpu_ctx.event_elapsed_queries_, 2);
@@ -1625,12 +1733,12 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     const auto forward_records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {
         {"context", "mtp_decode_sidecar"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
         {"type", "capturable"}};
     EXPECT_DOUBLE_EQ(findCounterValue(
                          forward_records,
-                         "segmented_replay_final_sync_deferred",
+                         "full_graph_replay_final_sync_deferred",
                          deferred_tags),
                      1.0);
 
@@ -1683,13 +1791,13 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDoesNotDeferFinalSyncByDef
     const PerfStatsCollector::Tags sync_tags = {
         {"attribution", "host_wall"},
         {"context", "main_decode"},
-        {"graph_capture_scope", "segmented_replay_host"},
-        {"segment_count", "1"},
-        {"source", "segmented_graph_capture"},
+        {"graph_capture_scope", "full_graph_replay_host"},
+        {"graph_count", "1"},
+        {"source", "full_graph_capture"},
         {"stage_count", "1"},
         {"timing_scope", "final_stream_sync_host_wall"},
         {"type", "capturable"}};
-    EXPECT_EQ(findTimerCount(records, "segmented_replay_final_sync", sync_tags), 1u);
+    EXPECT_EQ(findTimerCount(records, "full_graph_replay_final_sync", sync_tags), 1u);
 
     PerfStatsCollector::reset();
 }
@@ -1739,12 +1847,12 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
     const auto records = PerfStatsCollector::snapshot({"forward_graph"});
     const PerfStatsCollector::Tags deferred_tags = {
         {"context", "main_decode"},
-        {"segment_count", "1"},
+        {"graph_count", "1"},
         {"stage_count", "1"},
         {"type", "capturable"}};
     EXPECT_DOUBLE_EQ(findCounterValue(
                          records,
-                         "segmented_replay_final_sync_deferred",
+                         "full_graph_replay_final_sync_deferred",
                          deferred_tags),
                      1.0);
 
@@ -1771,7 +1879,7 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
     FakeReplayGPUContext gpu_ctx;
     llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
 
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
         cache,
@@ -1784,7 +1892,7 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
     ASSERT_NE(first_signature, 0u);
 
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
         cache,
@@ -1796,7 +1904,7 @@ TEST(Test__GraphSegmentCache, VariantSignatureChangeRecapturesBeforeReplay)
 
     variant = 0x22;
     graph.reset();
-    ASSERT_TRUE(executor.executeWithSegmentedGraphCapture(
+    ASSERT_TRUE(executor.executeWithCachedGraphReplay(
         graph,
         &ctx,
         cache,

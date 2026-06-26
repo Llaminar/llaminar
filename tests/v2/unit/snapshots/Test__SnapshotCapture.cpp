@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 #include "snapshots/SnapshotCapture.h"
@@ -154,6 +155,47 @@ TEST(Test__SnapshotCapture_Capture, SharedExpertGateFusedOutputsUseSemanticKeys)
     const auto *combined_snap = capture.get("MTP0_MOE_COMBINED_OUTPUT");
     ASSERT_NE(combined_snap, nullptr);
     EXPECT_EQ(combined_snap->data, combined);
+}
+
+TEST(Test__SnapshotCapture_Capture, ConcurrentStageCallbacksDoNotRaceSnapshotStorage)
+{
+    constexpr int kThreads = 8;
+    constexpr int kIterations = 200;
+
+    SnapshotCapture capture;
+    std::vector<std::vector<float>> payloads;
+    payloads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t)
+    {
+        payloads.push_back({static_cast<float>(t), static_cast<float>(t + 1),
+                            static_cast<float>(t + 2), static_cast<float>(t + 3)});
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int t = 0; t < kThreads; ++t)
+    {
+        threads.emplace_back([&, t]() {
+            const std::string stage_name = "layer" + std::to_string(t) + "_ffn_norm";
+            for (int i = 0; i < kIterations; ++i)
+            {
+                auto dump = makeSingleOutputDump("output", payloads[t].data(), 1, payloads[t].size());
+                capture.captureStage(stage_name, dump);
+            }
+        });
+    }
+    for (auto &thread : threads)
+    {
+        thread.join();
+    }
+
+    for (int t = 0; t < kThreads; ++t)
+    {
+        const std::string key = "layer" + std::to_string(t) + "_FFN_NORM";
+        const auto *snapshot = capture.get(key);
+        ASSERT_NE(snapshot, nullptr) << key;
+        EXPECT_EQ(snapshot->data, payloads[t]);
+    }
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, FallbackUpperCase)

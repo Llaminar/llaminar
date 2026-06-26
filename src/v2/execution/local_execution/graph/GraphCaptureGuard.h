@@ -37,7 +37,7 @@ namespace llaminar2
      *        host-side bookkeeping.
      *
      * Stream capture records GPU work but does not execute it until launch.
-     * Segmented decode capture skips replay callbacks on the immediate
+     * Cached decode graph capture skips replay callbacks on the immediate
      * launch-after-capture, so stateful stages still need to update host
      * metadata while recording for later stages in the same captured segment.
      * Prefill capture enables this for stateful stages whose later captured

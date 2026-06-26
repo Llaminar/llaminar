@@ -338,7 +338,7 @@ namespace llaminar2
                                      void *gpu_stream = nullptr);
 
         // =========================================================================
-        // Segmented GPU Graph Capture/Replay
+        // Cached GPU Graph Replay
         // =========================================================================
 
         /**
@@ -372,7 +372,7 @@ namespace llaminar2
         };
 
         /**
-         * @brief Persistent cache of graph segments for segmented capture/replay
+         * @brief Persistent cache of graph segments for cached graph replay
          *
          * Built once on the first decode step, reused across subsequent steps.
          * Capturable segments are replayed via GPU graph launch; non-capturable
@@ -517,8 +517,8 @@ namespace llaminar2
          * manual segments per decode step, with each hipGraphLaunch costing
          * ~5-10μs (total ~300-600μs host overhead vs ~43ms without graphs).
          *
-         * On first call: builds segment list, captures all capturable segments.
-         * On subsequent calls: replays captured graphs, re-executes manual stages.
+         * On first call: builds replay units and captures capturable units.
+         * On subsequent calls: replays captured graphs and re-executes manual units.
          *
          * @param graph The cached compute graph
          * @param ctx Device context for execution
@@ -527,7 +527,7 @@ namespace llaminar2
          * @param gpu_ctx GPU context for creating new graph captures
          * @return true on success
          */
-        bool executeWithSegmentedGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
+        bool executeWithCachedGraphReplay(ComputeGraph &graph, IDeviceContext *ctx,
                                               GraphSegmentCache &segment_cache,
                                               void *gpu_stream,
                                               IWorkerGPUContext *gpu_ctx,
@@ -542,7 +542,7 @@ namespace llaminar2
         struct DecodeCapturePolicy
         {
             bool allow_fast_decode = true;
-            bool allow_segmented_capture = false;
+            bool allow_cached_graph_replay = false;
             bool collective_segmented_enabled = false;
             bool collectives_graph_capturable = false; ///< True only for explicit future graph-captured collective paths
             bool force_recapture = false;              ///< Re-record graph segments on replay for callers with dynamic params not yet replay-safe
@@ -553,8 +553,8 @@ namespace llaminar2
         /**
          * @brief Execute decode graph according to a single policy object
          *
-         * Centralizes mode selection between segmented replay, fast decode, and
-         * full executor fallback. When segmented replay fails, this method falls
+         * Centralizes mode selection between cached GPU graph replay, fast decode,
+         * and full executor fallback. When graph replay fails, this method falls
          * back to fast decode automatically.
          */
         bool executeDecodeWithCapturePolicy(
@@ -565,7 +565,7 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             const std::unordered_set<std::string> *collective_nodes,
             const DecodeCapturePolicy &policy,
-            bool *used_segmented_capture = nullptr);
+            bool *used_graph_replay = nullptr);
 
     private:
         GraphExecutorConfig config_;

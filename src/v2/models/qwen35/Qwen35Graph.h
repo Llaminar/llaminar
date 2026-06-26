@@ -164,6 +164,8 @@ namespace llaminar2
         // GDN Attention Sub-Graph Building
         // =====================================================================
 
+        bool gdnLiveStateAllGatherAvailable(int total_tokens, DeviceId device) const;
+
         /**
          * @brief Build GDN attention sub-graph for a single layer
          *

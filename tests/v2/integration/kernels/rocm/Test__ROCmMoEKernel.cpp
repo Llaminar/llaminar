@@ -1024,21 +1024,31 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
         update.epoch = 1;
         update.expert_count = num_experts;
         update.participant_id = participant_id;
-        update.participant_count = 2;
+        update.participant_count = 3;
         update.experts.resize(num_experts);
         update.local_compute_mask.assign(num_experts, 0u);
         update.replica_role.assign(num_experts, static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+        update.resident_participant_mask.assign(num_experts, 0u);
 
         for (int expert = 0; expert < num_experts; ++expert)
         {
             const bool replicated = expert >= 2;
-            const int owner = expert % 2;
-            const bool local = replicated || owner == static_cast<int>(participant_id);
+            const int owner = (expert == 3) ? 2 : (expert % 2);
+            uint32_t resident_mask = 1u << static_cast<uint32_t>(owner);
+            if (expert == 2)
+                resident_mask |= 1u << 1u;
+            if (expert == 3)
+                resident_mask |= 1u << 0u;
+            const bool local =
+                (resident_mask & (1u << participant_id)) != 0u;
 
             DeviceMoEExpertDescriptor desc;
             desc.logical_expert_id = expert;
             desc.owner_participant = owner;
             desc.local_slot = local ? expert : -1;
+            if (replicated)
+                desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+            update.resident_participant_mask[expert] = resident_mask;
             if (local)
             {
                 const uintptr_t base = 0x20000000u + static_cast<uintptr_t>(participant_id) * 0x100000u +
@@ -1083,6 +1093,7 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
 
     auto table0 = make_table(0);
     auto table1 = make_table(1);
+    auto table2 = make_table(2);
 
     auto hidden = TestTensorFactory::createFP32({1, static_cast<size_t>(d_model)});
     auto gate_weights = TestTensorFactory::createFP32({static_cast<size_t>(num_experts), static_cast<size_t>(d_model)});
@@ -1099,6 +1110,8 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
     auto output_weights0 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
     auto output_indices1 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
     auto output_weights1 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
+    auto output_indices2 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
+    auto output_weights2 = TestTensorFactory::createFP32({static_cast<size_t>(top_k), 1});
 
     ASSERT_TRUE(hidden->ensureOnDevice(device));
     ASSERT_TRUE(gate_weights->ensureOnDevice(device));
@@ -1106,6 +1119,8 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
     ASSERT_TRUE(output_weights0->ensureOnDevice(device));
     ASSERT_TRUE(output_indices1->ensureOnDevice(device));
     ASSERT_TRUE(output_weights1->ensureOnDevice(device));
+    ASSERT_TRUE(output_indices2->ensureOnDevice(device));
+    ASSERT_TRUE(output_weights2->ensureOnDevice(device));
 
     ROCmMoEKernel gpu_kernel(0);
     auto gpu_kernel_workspace = bindDefaultMoEWorkspace(
@@ -1135,6 +1150,13 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
             false,
             output_indices1.get(), output_weights1.get(),
             true, true));
+        ASSERT_TRUE(gpu_kernel.decodeRouteSelect(
+            table2->deviceLayerState(0),
+            hidden.get(), gate_weights.get(),
+            d_model, num_experts, top_k,
+            false,
+            output_indices2.get(), output_weights2.get(),
+            true, true));
     }
 
     auto copy_runtime = [&](MoERuntimeTable &table,
@@ -1158,24 +1180,31 @@ TEST(Test__ROCmMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossParti
     ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
     std::array<int32_t, top_k> ids0{};
     std::array<int32_t, top_k> ids1{};
+    std::array<int32_t, top_k> ids2{};
     std::array<float, top_k> runtime_weights0{};
     std::array<float, top_k> runtime_weights1{};
+    std::array<float, top_k> runtime_weights2{};
     copy_runtime(*table0, ids0, runtime_weights0);
     copy_runtime(*table1, ids1, runtime_weights1);
+    copy_runtime(*table2, ids2, runtime_weights2);
 
     const std::array<int32_t, top_k> expected0{0, -1, 2, -1};
-    const std::array<int32_t, top_k> expected1{-1, 1, -1, 3};
+    const std::array<int32_t, top_k> expected1{-1, 1, -1, -1};
+    const std::array<int32_t, top_k> expected2{-1, -1, -1, 3};
     EXPECT_EQ(ids0, expected0);
     EXPECT_EQ(ids1, expected1);
+    EXPECT_EQ(ids2, expected2);
     for (int slot = 0; slot < top_k; ++slot)
-        EXPECT_EQ((ids0[slot] >= 0) + (ids1[slot] >= 0), 1) << "slot " << slot;
+        EXPECT_EQ((ids0[slot] >= 0) + (ids1[slot] >= 0) + (ids2[slot] >= 0), 1) << "slot " << slot;
 
     output_indices0->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     output_indices1->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
+    output_indices2->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE);
     for (int slot = 0; slot < top_k; ++slot)
     {
         EXPECT_EQ(output_indices0->data()[slot], static_cast<float>(slot));
         EXPECT_EQ(output_indices1->data()[slot], static_cast<float>(slot));
+        EXPECT_EQ(output_indices2->data()[slot], static_cast<float>(slot));
     }
 }
 

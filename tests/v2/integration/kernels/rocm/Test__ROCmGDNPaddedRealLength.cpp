@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
+
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"
@@ -406,6 +408,108 @@ namespace
 } // namespace
 
 #ifdef HAVE_ROCM
+
+TEST(Test__ROCmGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptureGuard)
+{
+    if (!hasROCm())
+        GTEST_SKIP() << "No ROCm device available";
+    checkHip(hipSetDevice(0), "hipSetDevice");
+
+    HipStreamHandle stream;
+
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int seq_len = 2;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state = full_heads * d_k * d_v;
+    constexpr int full_qk_stride = full_heads * d_k;
+    constexpr int full_v_stride = full_heads * d_v;
+
+    ROCmGatedDeltaNet recurrence(0);
+    recurrence.setGPUStream(stream.stream);
+    recurrence.allocateGPUState(local_recurrence_state);
+    ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state));
+    recurrence.allocateGPUState(full_recurrence_state);
+    ASSERT_TRUE(recurrence.isGPUStateReady(full_recurrence_state));
+    ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state))
+        << "Full decode-state handoff must not discard the local prefill state slot";
+    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+
+    HipFloatBuffer d_q(static_cast<size_t>(seq_len) * full_qk_stride, 0.01f);
+    HipFloatBuffer d_kbuf(static_cast<size_t>(seq_len) * full_qk_stride, 0.02f);
+    HipFloatBuffer d_vbuf(static_cast<size_t>(seq_len) * full_v_stride, 0.03f);
+    HipFloatBuffer d_alpha(static_cast<size_t>(seq_len) * full_heads, 0.2f);
+    HipFloatBuffer d_beta(static_cast<size_t>(seq_len) * full_heads, -0.1f);
+    HipFloatBuffer d_A_log(static_cast<size_t>(full_heads), -0.5f);
+    HipFloatBuffer d_dt_bias(static_cast<size_t>(full_heads), 0.1f);
+    HipFloatBuffer d_recurrence_out(static_cast<size_t>(seq_len) * full_v_stride, 0.0f);
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(recurrence.chunk_forward(
+            d_q.ptr, d_kbuf.ptr, d_vbuf.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_recurrence_out.ptr, nullptr,
+            seq_len, local_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/false));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(local recurrence slot)");
+    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(local_recurrence_state) * sizeof(float));
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(recurrence.recurrent_step(
+            d_q.ptr, d_kbuf.ptr, d_vbuf.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_recurrence_out.ptr, nullptr,
+            full_heads, d_k, d_v,
+            /*use_qk_l2norm=*/false));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(full recurrence slot)");
+    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+
+    constexpr int local_channels = 64;
+    constexpr int full_channels = 128;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    ROCmShortConvolution conv(0);
+    conv.setGPUStream(stream.stream);
+    conv.allocateGPUState(local_conv_state);
+    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
+    conv.allocateGPUState(full_conv_state);
+    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+
+    const auto weights = makeShortConvWeights(full_channels, kernel_size);
+    const auto bias = makeBias(full_channels);
+    HipFloatBuffer d_input(static_cast<size_t>(seq_len) * full_channels, 0.04f);
+    HipFloatBuffer d_weight(weights);
+    HipFloatBuffer d_bias(bias);
+    HipFloatBuffer d_conv_out(static_cast<size_t>(seq_len) * full_channels, 0.0f);
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(conv.forward(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_conv_out.ptr, nullptr,
+            seq_len, local_channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(local short-conv slot)");
+    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(conv.forward(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_conv_out.ptr, nullptr,
+            seq_len, full_channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkHip(hipStreamSynchronize(stream.stream), "hipStreamSynchronize(full short-conv slot)");
+    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+}
 
 TEST(Test__ROCmGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDecode)
 {

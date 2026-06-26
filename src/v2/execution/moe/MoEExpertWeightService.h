@@ -13,11 +13,15 @@
 #pragma once
 
 #include "ExpertWeightTransfer.h"    // ExpertWeightBlobs
+#include "GPUExpertTransfer.h"
 #include "MoERebalanceController.h"  // ExpertReplicaSet
 #include "../../backends/DeviceId.h"
 #include "../../loaders/ExpertSlabTypes.h"
 
 #include <memory>
+#include <optional>
+#include <cstddef>
+#include <cstdint>
 #include <unordered_map>
 #include <vector>
 
@@ -29,6 +33,7 @@ class ExpertWeightPayloadProvider;
 class PreparedWeightStore;
 class ExpertGemmRegistry;
 class GpuExpertSlotPool;
+class GpuExpertTransferStagingPool;
 
 /// Lightweight reference struct pointing to the MoEExpertComputeStage::Params fields
 /// that the weight service operates on. Avoids coupling the service to the
@@ -91,6 +96,89 @@ struct MoEWeightContext {
     // GPU-direct arrivals can reuse physical expert slots instead of creating a
     // fresh VRAM allocation for every rebalanced expert.
     std::shared_ptr<GpuExpertSlotPool>* gpu_direct_slot_pool = nullptr;
+
+};
+
+/// One projection of a GPU-direct expert arrival that has been copied into
+/// staging/active slots but has not yet been published to live stage tables.
+struct GpuDirectStagedExpertProjection
+{
+    int expert_id = -1;
+    WeightRole role = WeightRole::Other;
+    ITensorGemm* engine = nullptr;
+    std::shared_ptr<ITensorGemm> engine_lifetime;
+    std::optional<GpuExpertStagedActivation> activation;
+
+    bool valid() const
+    {
+        return expert_id >= 0 &&
+               engine != nullptr &&
+               (role == WeightRole::MoEExpertGate ||
+                role == WeightRole::MoEExpertUp ||
+                role == WeightRole::MoEExpertDown);
+    }
+};
+
+/// Background-safe carrier for staged GPU-direct expert arrivals.
+///
+/// Building this object must not mutate MoEExpertComputeStage prepared-engine
+/// vectors. Activation/publish code consumes it later on the runner thread.
+struct GpuDirectStagedExpertArrivals
+{
+    DeviceId device_id;
+    std::optional<DeviceId> source_device;
+    int layer_idx = -1;
+    std::vector<GpuDirectStagedExpertProjection> projections;
+    GpuDirectTransferCompletion completion;
+
+    bool empty() const { return projections.empty(); }
+    size_t projectionCount() const { return projections.size(); }
+    size_t activationCount() const;
+    std::vector<int> expertIds() const;
+};
+
+/// One projection copied into a surplus transfer slot.
+///
+/// This is deliberately not publishable: it owns scratch/staging metadata only.
+/// Runner-thread activation must allocate an active slot, enqueue the same-device
+/// slot copy, wrap active-slot pointers in a backend GEMM engine, and only then
+/// publish a GpuDirectStagedExpertProjection.
+struct GpuDirectTransferSlotProjection
+{
+    int expert_id = -1;
+    WeightRole role = WeightRole::Other;
+    GpuExpertPackedDescriptor staged;
+    int N = 0;
+    int K = 0;
+    uint32_t blocks_per_row = 0;
+    uint8_t payload_bytes_per_block = 0;
+    bool is_asymmetric = false;
+    bool has_emins = false;
+    uint8_t codebook_id = 0;
+    std::shared_ptr<void> transfer_slot_lifetime;
+
+    bool valid() const;
+    size_t bytes() const { return staged.totalBytes(); }
+};
+
+/// Background-safe carrier for expert projections staged in transfer slots.
+///
+/// Building this object may enqueue GPU copies and hold transfer-slot leases, but
+/// must not mutate live MoE stage tables, active slot ownership, or the prepared
+/// store. It is consumed later on the runner thread.
+struct GpuDirectTransferSlotArrivals
+{
+    DeviceId device_id;
+    std::optional<DeviceId> source_device;
+    int layer_idx = -1;
+    std::vector<GpuDirectTransferSlotProjection> projections;
+    GpuDirectTransferCompletion completion;
+
+    bool empty() const { return projections.empty(); }
+    size_t projectionCount() const { return projections.size(); }
+    size_t totalBytes() const;
+    std::vector<int> expertIds() const;
+    std::vector<std::shared_ptr<void>> transferSlotLifetimes() const;
 };
 
 /// Weight lifecycle service for MoE expert GEMM engines.
@@ -160,6 +248,41 @@ public:
         void* source_producer_stream,
         std::vector<int>* satisfied_expert_ids = nullptr,
         GpuDirectTransferCompletion* completion = nullptr);
+
+    /// Stage expert weights directly into surplus GPU transfer slots.
+    ///
+    /// This is the async prepare phase for same-backend local GPU rebalance:
+    /// source packed descriptors are copied into destination transfer slots and
+    /// a readiness event is recorded, but live prepared-engine tables, active
+    /// slots, registries, stores, and masks are not mutated.
+    static bool stageExpertsGPUDirectToTransferSlots(
+        const MoEWeightContext& src_ctx,
+        MoEWeightContext& dst_ctx,
+        const std::vector<int>& expert_ids,
+        int layer_idx,
+        void* source_producer_stream,
+        GpuDirectTransferSlotArrivals* staged_arrivals,
+        std::vector<int>* satisfied_expert_ids = nullptr,
+        size_t active_arrival_capacity = 0,
+        size_t staging_pool_capacity = 0,
+        std::vector<std::shared_ptr<GpuExpertTransferStagingPool>>* transfer_staging_pools = nullptr);
+
+    static std::vector<GpuExpertStagedActivation> activationBatchForStagedArrivals(
+        const GpuDirectStagedExpertArrivals& arrivals);
+
+    /// Activate transfer-slot arrivals into active expert slots on an explicit
+    /// destination stream. The returned staged arrivals are ready to install via
+    /// installActivatedGpuDirectArrivals().
+    static bool activateGpuDirectTransferSlotArrivals(
+        MoEWeightContext& ctx,
+        const GpuDirectTransferSlotArrivals& arrivals,
+        void* activation_stream,
+        GpuDirectStagedExpertArrivals* activated_arrivals,
+        GpuDirectTransferCompletion* completion = nullptr);
+
+    static bool installActivatedGpuDirectArrivals(
+        MoEWeightContext& ctx,
+        const GpuDirectStagedExpertArrivals& arrivals);
 
 private:
     /// GPU pipeline path: raw H2D + GPU repack via LoadOrchestrator.

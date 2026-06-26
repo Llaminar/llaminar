@@ -864,11 +864,16 @@ namespace llaminar2
 #endif
     }
 
-    bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const
+    bool MoERoutingStage::supportsLazyPrefillGraphCapturePreflight() const
     {
         if (params_.force_decode_equivalent_verifier_prefill)
             return isDecodeEquivalentVerifierPrefillGraphCaptureSupported();
         return isDeviceRoutedPrefillGraphCaptureSupported();
+    }
+
+    bool MoERoutingStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight();
     }
 
     bool MoERoutingStage::supportsPaddedPrefillRealLengthContract() const

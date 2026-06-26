@@ -321,7 +321,7 @@ namespace
     }
 
     /**
-     * @brief Sum a segmented decode graph lifecycle counter by execution context.
+     * @brief Sum a decode graph lifecycle counter by execution context.
      *
      * Phase 6 MTP graph capture relies on named forward-graph contexts
      * (`main_decode`, `main_verifier`, sidecar contexts, and later TP variants).
@@ -331,7 +331,7 @@ namespace
      * token counts, since speculative acceptance can change the number of
      * iterations a prompt needs.
      */
-    double segmentedDecodePhaseCount(
+    double decodeGraphPhaseCount(
         const std::vector<PerfStatRecord> &records,
         const std::string &context,
         const std::string &capture_phase)
@@ -341,7 +341,7 @@ namespace
         {
             if (record.kind != PerfStatRecord::Kind::Counter ||
                 record.domain != "forward_graph" ||
-                record.name != "decode_segmented_phase" ||
+                record.name != "decode_graph_phase" ||
                 record.phase != "decode")
             {
                 continue;
@@ -429,14 +429,14 @@ namespace
         SCOPED_TRACE(backend_name + " " + context);
         if (require_warmup_capture)
         {
-            EXPECT_GE(segmentedDecodePhaseCount(records, context, "warmup"), 1.0)
+            EXPECT_GE(decodeGraphPhaseCount(records, context, "warmup"), 1.0)
                 << context << " must execute an explicit warmup before graph capture";
-            EXPECT_GE(segmentedDecodePhaseCount(records, context, "capture"), 1.0)
+            EXPECT_GE(decodeGraphPhaseCount(records, context, "capture"), 1.0)
                 << context << " must record a graph capture before replay";
         }
         if (require_replay)
         {
-            EXPECT_GE(segmentedDecodePhaseCount(records, context, "replay"), 1.0)
+            EXPECT_GE(decodeGraphPhaseCount(records, context, "replay"), 1.0)
                 << context << " must replay a previously captured graph";
         }
     }
@@ -498,7 +498,7 @@ namespace
         const std::string &backend_name)
     {
         const bool catchup_replayed =
-            segmentedDecodePhaseCount(records, "mtp_decode_catchup", "replay") >= 1.0;
+            decodeGraphPhaseCount(records, "mtp_decode_catchup", "replay") >= 1.0;
         const bool resident_published =
             mtpCounterValue(records, "device_resident_state_publications") >= 1.0 &&
             mtpCounterValue(records, "device_resident_kv_sequence_state_publications") >= 1.0 &&

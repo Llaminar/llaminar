@@ -29,6 +29,7 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -69,6 +70,39 @@ using namespace llaminar2;
 #else
 #define SKIP_IF_NO_GPU() GTEST_SKIP() << "No GPU backend linked in this test binary"
 #endif
+
+namespace
+{
+    void expectAuxiliaryStreamsReuseByName(IWorkerGPUContext &ctx)
+    {
+        ctx.resetAuxiliaryStreams();
+
+        bool created = false;
+        void *transfer_stream = ctx.getOrCreateAuxiliaryStream("moe_gpu_direct_transfer_test", &created);
+        ASSERT_NE(transfer_stream, nullptr);
+        EXPECT_TRUE(created);
+
+        created = true;
+        void *reused_transfer_stream = ctx.getOrCreateAuxiliaryStream("moe_gpu_direct_transfer_test", &created);
+        EXPECT_EQ(reused_transfer_stream, transfer_stream);
+        EXPECT_FALSE(created);
+
+        created = false;
+        void *other_stream = ctx.getOrCreateAuxiliaryStream("moe_gpu_direct_transfer_other", &created);
+        ASSERT_NE(other_stream, nullptr);
+        EXPECT_NE(other_stream, transfer_stream);
+        EXPECT_TRUE(created);
+
+        ctx.resetAuxiliaryStreams();
+
+        created = false;
+        void *after_reset = ctx.getOrCreateAuxiliaryStream("moe_gpu_direct_transfer_test", &created);
+        ASSERT_NE(after_reset, nullptr);
+        EXPECT_TRUE(created);
+
+        ctx.resetAuxiliaryStreams();
+    }
+} // namespace
 
 // ===========================================================================
 // GPUDeviceContextPool Tests
@@ -402,6 +436,14 @@ TEST(Test__NvidiaDeviceContext, MultipleStreams)
         } });
 }
 
+TEST(Test__NvidiaDeviceContext, AuxiliaryStreamReusesByNameAndResets)
+{
+    SKIP_IF_NO_CUDA();
+
+    auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(0);
+    expectAuxiliaryStreamsReuseByName(ctx);
+}
+
 TEST(Test__NvidiaDeviceContext, DefaultStream)
 {
     SKIP_IF_NO_CUDA();
@@ -722,6 +764,14 @@ TEST(Test__AMDDeviceContext, MultipleStreams)
         for (int i = 0; i < NUM_STREAMS; ++i) {
             ctx.destroyStream(streams[i]);
         } });
+}
+
+TEST(Test__AMDDeviceContext, AuxiliaryStreamReusesByNameAndResets)
+{
+    SKIP_IF_NO_ROCM();
+
+    auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
+    expectAuxiliaryStreamsReuseByName(ctx);
 }
 
 TEST(Test__AMDDeviceContext, DefaultStream)

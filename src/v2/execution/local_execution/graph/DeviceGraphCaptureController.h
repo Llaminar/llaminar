@@ -11,7 +11,7 @@ namespace llaminar2
 {
 
     /**
-     * @brief Stateless helper that owns segmented graph-capture phase orchestration logic.
+     * @brief Stateless helper that owns GPU graph capture/replay phase orchestration logic.
      *
      * This controller extracts the warmup/capture/replay state machine from `DeviceGraphExecutor`
      * so executor code stays focused on fallback policy and node-level primitives.
@@ -19,6 +19,8 @@ namespace llaminar2
      * Design notes for junior developers:
      * - All methods are static to keep this utility side-effect free outside passed-in state.
      * - Mutable execution state lives in `DeviceGraphExecutor::GraphSegmentCache`.
+     *   A cache with one capturable unit and no manual units is a full-graph
+     *   replay plan; multiple units or manual units are segmented replay.
      * - Executor-provided hooks let this controller call back into execution/coherence behavior
      *   without creating circular ownership.
      */
@@ -102,15 +104,15 @@ namespace llaminar2
         };
 
         /**
-         * @brief Segmented execution phase selector.
+         * @brief Cached graph-replay phase selector.
          */
         enum class Phase
         {
-            /// First segmented pass: execute normally and build segment metadata.
+            /// First graph-replay pass: execute normally and build replay metadata.
             Warmup,
-            /// Second segmented pass: capture graph segments.
+            /// Second graph-replay pass: capture graph replay units.
             Capture,
-            /// Steady state: replay captured graph segments.
+            /// Steady state: replay captured graph units.
             Replay
         };
 
@@ -126,8 +128,8 @@ namespace llaminar2
         };
 
         /**
-         * @brief Advance segmented decode step and select warmup/capture/replay phase.
-         * @param initialized Whether segmented state has completed warmup.
+         * @brief Advance decode replay step and select warmup/capture/replay phase.
+         * @param initialized Whether graph-replay state has completed warmup.
          * @param needs_capture In/out flag requesting Phase-2 capture.
          * @param decode_step In/out monotonic step counter.
          * @return Phase transition decision with updated step.
@@ -140,21 +142,30 @@ namespace llaminar2
         static void markWarmupComplete(bool &initialized, bool &needs_capture);
 
         /**
-         * @brief Apply backend-specific device preparation for segmented capture.
+         * @brief Apply backend-specific device preparation for cached graph capture.
          *
          * Currently ensures ROCm device binding is correct on the active thread.
          */
-        static void prepareDeviceForSegmentedCapture(IDeviceContext *ctx);
+        static void prepareDeviceForGraphCapture(IDeviceContext *ctx);
 
         /**
          * @brief Compute a graph-wide launch-topology variant signature.
          *
          * The signature is zero when every stage reports the default variant.
          * Nonzero stage signatures are folded with stage identity so the
-         * segmented cache can recapture before replaying a graph whose baked
+         * replay cache can recapture before replaying a graph whose baked
          * launch topology no longer matches current dynamic parameters.
          */
         static uint64_t computeCaptureVariantSignature(ComputeGraph &graph);
+
+        /**
+         * @brief Return a stable mode label for the built replay plan.
+         *
+         * A cache with exactly one capturable unit and no manual units is a
+         * full-graph replay plan. Plans with manual boundaries or multiple
+         * captured units are segmented replay plans.
+         */
+        static const char *replayModeName(const DeviceGraphExecutor::GraphSegmentCache &segment_cache);
 
         /**
          * @brief Execute warmup-phase bookkeeping (segment build + state transition).
@@ -226,6 +237,7 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
             bool needs_segment_sync,
+            bool full_graph_replay,
             const std::string &perf_context,
             const std::string &device_name,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
@@ -306,6 +318,7 @@ namespace llaminar2
             bool needs_segment_sync,
             bool verify_mode,
             bool recapture_mode,
+            bool full_graph_replay,
             int segment_index,
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
@@ -324,6 +337,7 @@ namespace llaminar2
             bool needs_segment_sync,
             bool verify_mode,
             bool recapture_mode,
+            bool full_graph_replay,
             uint64_t current_step,
             int segment_index,
             const std::string &perf_context,

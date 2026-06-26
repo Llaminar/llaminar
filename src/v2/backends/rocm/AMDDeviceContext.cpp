@@ -344,6 +344,8 @@ namespace llaminar2
             hipblas_handle_ = nullptr;
         }
 
+        resetAuxiliaryStreams();
+
         // Destroy default stream
         if (default_stream_ != nullptr)
         {
@@ -439,6 +441,45 @@ namespace llaminar2
         }
 
         HIP_CHECK_VOID(hipStreamDestroy(hip_stream));
+    }
+
+    void *AMDDeviceContext::getOrCreateAuxiliaryStream(const std::string &name, bool *created)
+    {
+        if (created)
+            *created = false;
+        if (name.empty())
+        {
+            LOG_ERROR("[AMDDeviceContext] Auxiliary stream name must not be empty");
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        auto it = auxiliary_streams_.find(name);
+        if (it != auxiliary_streams_.end() && it->second)
+            return static_cast<void *>(it->second);
+
+        auto *stream = static_cast<hipStream_t>(createStream());
+        if (!stream)
+            return nullptr;
+        auxiliary_streams_[name] = stream;
+        if (created)
+            *created = true;
+        return static_cast<void *>(stream);
+    }
+
+    void AMDDeviceContext::resetAuxiliaryStreams()
+    {
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        for (auto &[name, stream] : auxiliary_streams_)
+        {
+            (void)name;
+            if (stream && stream != default_stream_)
+            {
+                if (setAMDDeviceForResource(device_ordinal_, "destroyAuxiliaryStream"))
+                    HIP_CHECK_VOID(hipStreamDestroy(stream));
+            }
+        }
+        auxiliary_streams_.clear();
     }
 
     // ============================================================================

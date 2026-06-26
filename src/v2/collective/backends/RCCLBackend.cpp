@@ -1312,6 +1312,71 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::allreduceMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allreduceMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allreduceMultiOnStreams(buffers, count, dtype, op, streams))
+        {
+            last_error_ = "RCCLCoordinator allreduceMultiOnStreams failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsAllreduceMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allreduceSingleDeviceAsync(
         void *buffer, size_t count,
         CollectiveDataType dtype, CollectiveOp op,
@@ -1387,6 +1452,124 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLBackend::allgatherSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t send_count,
+        CollectiveDataType dtype,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "No RCCLCoordinator";
+            return false;
+        }
+
+        if (!coordinator_->allgatherSingleDeviceOnStream(
+                send_buf, recv_buf, send_count, dtype, device_idx, stream))
+        {
+            last_error_ = "RCCLCoordinator allgatherSingleDeviceOnStream failed: " +
+                          coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)send_count;
+        (void)dtype;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsAllgatherSingleDeviceOnStream() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allgatherMultiOnStreams(
+        const std::vector<const void *> &send_bufs,
+        const std::vector<void *> &recv_bufs,
+        size_t send_count,
+        CollectiveDataType dtype,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allgatherMultiOnStreams requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            recv_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            streams.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer/stream count does not match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allgatherMultiOnStreams(send_bufs, recv_bufs, send_count, dtype, streams))
+        {
+            last_error_ = "RCCLCoordinator allgatherMultiOnStreams failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_bufs;
+        (void)recv_bufs;
+        (void)send_count;
+        (void)dtype;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::supportsAllgatherMultiOnStreams() const
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_;
+#else
+        return false;
+#endif
+    }
+
     bool RCCLBackend::allgatherMulti(
         const std::vector<const void *> &send_bufs,
         const std::vector<void *> &recv_bufs,
@@ -1427,6 +1610,60 @@ namespace llaminar2
         if (!coordinator_->allgatherMulti(send_bufs, recv_bufs, send_count, dtype))
         {
             last_error_ = "RCCLCoordinator allgatherMulti failed: " + coordinator_->lastError();
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_bufs;
+        (void)recv_bufs;
+        (void)send_count;
+        (void)dtype;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::allgatherMultiWithComputeDeps(
+        const std::vector<const void *> &send_bufs,
+        const std::vector<void *> &recv_bufs,
+        size_t send_count,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_)
+        {
+            last_error_ = "RCCLBackend not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!is_multi_gpu_single_process_)
+        {
+            last_error_ = "allgatherMultiWithComputeDeps requires multi-GPU single-process mode";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (send_bufs.size() != static_cast<size_t>(num_ranks_) ||
+            recv_bufs.size() != static_cast<size_t>(num_ranks_))
+        {
+            last_error_ = "Buffer count doesn't match GPU count";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_)
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            LOG_ERROR(last_error_);
+            return false;
+        }
+
+        if (!coordinator_->allgatherMultiWithComputeDeps(send_bufs, recv_bufs, send_count, dtype))
+        {
+            last_error_ = "RCCLCoordinator allgatherMultiWithComputeDeps failed: " + coordinator_->lastError();
             LOG_ERROR(last_error_);
             return false;
         }

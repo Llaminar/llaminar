@@ -1238,21 +1238,31 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
         update.epoch = 1;
         update.expert_count = num_experts;
         update.participant_id = participant_id;
-        update.participant_count = 2;
+        update.participant_count = 3;
         update.experts.resize(num_experts);
         update.local_compute_mask.assign(num_experts, 0u);
         update.replica_role.assign(num_experts, static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+        update.resident_participant_mask.assign(num_experts, 0u);
 
         for (int expert = 0; expert < num_experts; ++expert)
         {
             const bool replicated = expert >= 2;
-            const int owner = expert % 2;
-            const bool local = replicated || owner == static_cast<int>(participant_id);
+            const int owner = (expert == 3) ? 2 : (expert % 2);
+            uint32_t resident_mask = 1u << static_cast<uint32_t>(owner);
+            if (expert == 2)
+                resident_mask |= 1u << 1u;
+            if (expert == 3)
+                resident_mask |= 1u << 0u;
+            const bool local =
+                (resident_mask & (1u << participant_id)) != 0u;
 
             DeviceMoEExpertDescriptor desc;
             desc.logical_expert_id = expert;
             desc.owner_participant = owner;
             desc.local_slot = local ? expert : -1;
+            if (replicated)
+                desc.flags = llaminar2::toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+            update.resident_participant_mask[expert] = resident_mask;
             if (local)
             {
                 const uintptr_t base = 0x10000000u + static_cast<uintptr_t>(participant_id) * 0x100000u +
@@ -1297,6 +1307,7 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
 
     auto table0 = make_table(0);
     auto table1 = make_table(1);
+    auto table2 = make_table(2);
 
     auto hidden = makeTensor({seq_len, d_model}, {1.0f, 0.0f, 0.0f, 0.0f});
     auto gate = makeTensor({num_experts, d_model}, {4.0f, 0.0f, 0.0f, 0.0f,
@@ -1307,6 +1318,8 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
     auto weights0 = makeZeros({seq_len, top_k});
     auto indices1 = makeZeros({seq_len, top_k});
     auto weights1 = makeZeros({seq_len, top_k});
+    auto indices2 = makeZeros({seq_len, top_k});
+    auto weights2 = makeZeros({seq_len, top_k});
 
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         table0->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
@@ -1314,6 +1327,9 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         table1->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
         false, indices1.get(), weights1.get(), true, true));
+    ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
+        table2->deviceLayerState(0), hidden.get(), gate.get(), d_model, num_experts, top_k,
+        false, indices2.get(), weights2.get(), true, true));
 
     auto copy_runtime = [&](DeviceMoERuntimeTable &table,
                             std::array<int32_t, top_k> &ids,
@@ -1335,21 +1351,27 @@ TEST_F(Test__CUDAMoEKernel, DecodeRouteSelectRuntimeAssignsReplicasOnceAcrossPar
 
     std::array<int32_t, top_k> ids0{};
     std::array<int32_t, top_k> ids1{};
+    std::array<int32_t, top_k> ids2{};
     std::array<float, top_k> runtime_weights0{};
     std::array<float, top_k> runtime_weights1{};
+    std::array<float, top_k> runtime_weights2{};
     copy_runtime(*table0, ids0, runtime_weights0);
     copy_runtime(*table1, ids1, runtime_weights1);
+    copy_runtime(*table2, ids2, runtime_weights2);
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     const std::array<int32_t, top_k> expected0{0, -1, 2, -1};
-    const std::array<int32_t, top_k> expected1{-1, 1, -1, 3};
+    const std::array<int32_t, top_k> expected1{-1, 1, -1, -1};
+    const std::array<int32_t, top_k> expected2{-1, -1, -1, 3};
     EXPECT_EQ(ids0, expected0);
     EXPECT_EQ(ids1, expected1);
+    EXPECT_EQ(ids2, expected2);
     for (int slot = 0; slot < top_k; ++slot)
     {
-        EXPECT_EQ((ids0[slot] >= 0) + (ids1[slot] >= 0), 1) << "slot " << slot;
+        EXPECT_EQ((ids0[slot] >= 0) + (ids1[slot] >= 0) + (ids2[slot] >= 0), 1) << "slot " << slot;
         EXPECT_EQ(indices0->data()[slot], static_cast<float>(slot));
         EXPECT_EQ(indices1->data()[slot], static_cast<float>(slot));
+        EXPECT_EQ(indices2->data()[slot], static_cast<float>(slot));
     }
 #endif
 }

@@ -38,6 +38,7 @@
 #include "stages/GDNProjectionStage.h"
 #include "stages/ShortConv1dStage.h"
 #include "stages/GDNRecurrenceStage.h"
+#include "stages/GDNLiveStateAllGatherStage.h"
 #include "stages/GatedRMSNormStage.h"
 #include "stages/AttentionOutputGateStage.h"
 #include "stages/QGateSplitStage.h"
@@ -250,6 +251,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createGDNRecurrence(
             const GDNRecurrenceStage::Params &params);
+
+        /**
+         * @brief Create a LocalTP GDN live-state allgather handoff stage
+         */
+        static std::unique_ptr<IComputeStage> createGDNLiveStateAllGather(
+            const GDNLiveStateAllGatherStage::Params &params);
 
         /**
          * @brief Create a gated RMSNorm stage: RMSNorm(x) * SiLU(gate)

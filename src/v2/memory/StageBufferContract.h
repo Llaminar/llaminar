@@ -33,9 +33,10 @@ namespace llaminar2
      */
     struct BufferBinding
     {
-        BufferId id;                 ///< Which buffer
-        BufferAccess access;         ///< READ, WRITE, or READWRITE
-        const char *dtype = nullptr; ///< Expected dtype string for validation (optional)
+        BufferId id;                       ///< Which buffer
+        BufferAccess access;               ///< READ, WRITE, or READWRITE
+        const char *dtype = nullptr;       ///< Expected dtype string for validation (optional)
+        bool prepare_write_storage = true; ///< Whether pre-execute write allocation is required
     };
 
     /**
@@ -110,6 +111,12 @@ namespace llaminar2
             return *this;
         }
 
+        StageBufferContract &addPreallocatedInOut(BufferId id, const char *dtype = nullptr)
+        {
+            inouts.push_back({id, BufferAccess::READWRITE, dtype, false});
+            return *this;
+        }
+
         StageBufferContract &addWorkspace(const char *name, size_t size,
                                           size_t align = 64, bool required = true)
         {
@@ -137,6 +144,25 @@ namespace llaminar2
             result.reserve(outputs.size() + inouts.size());
             result.insert(result.end(), outputs.begin(), outputs.end());
             result.insert(result.end(), inouts.begin(), inouts.end());
+            return result;
+        }
+
+        /// Find write bindings whose storage must be allocated before execute().
+        ///
+        /// Some in-place stages, notably TP allreduce, consume a buffer produced
+        /// immediately upstream and only need post-execute dirty marking. Calling
+        /// prepareForWrite() on those buffers can migrate a live multi-device
+        /// tensor's primary pointer before the collective has consumed it.
+        std::vector<BufferBinding> writesRequiringPrepare() const
+        {
+            std::vector<BufferBinding> result;
+            result.reserve(outputs.size() + inouts.size());
+            result.insert(result.end(), outputs.begin(), outputs.end());
+            for (const auto &binding : inouts)
+            {
+                if (binding.prepare_write_storage)
+                    result.push_back(binding);
+            }
             return result;
         }
     };

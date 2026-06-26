@@ -6,10 +6,12 @@
  */
 
 #include "LocalTPContext.h"
+#include "CollectiveTimeoutPolicy.h"
 #include "backends/HostBackend.h"
 #include "../tensors/TensorClasses.h"
 #include "../backends/BackendManager.h" // For getCUDABackend, getROCmBackend
 #include "../backends/ComputeBackend.h" // For DeviceManager (NUMA lookup)
+#include "../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../utils/DebugEnv.h"
 #include "../utils/Logger.h"
 #include "../utils/PerfStatsCollector.h"
@@ -46,9 +48,9 @@
 extern "C"
 {
     cudaError_t cudaCastFP32ToFP16(const float *fp32_input, void *fp16_output,
-                                   size_t count, cudaStream_t stream);
+                                   size_t count, int ordinal, cudaStream_t stream);
     cudaError_t cudaCastFP16ToFP32(const void *fp16_input, float *fp32_output,
-                                   size_t count, cudaStream_t stream);
+                                   size_t count, int ordinal, cudaStream_t stream);
     int cudaFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
     void cudaFP16ScratchFree(void *buf, int ordinal);
     int cudaLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal);
@@ -66,9 +68,9 @@ extern "C"
 extern "C"
 {
     int rocmCastFP32ToFP16(const float *fp32_input, void *fp16_output,
-                           size_t count, void *stream);
+                           size_t count, int ordinal, void *stream);
     int rocmCastFP16ToFP32(const void *fp16_input, float *fp32_output,
-                           size_t count, void *stream);
+                           size_t count, int ordinal, void *stream);
     int rocmFP16ScratchAlloc(void **buf, size_t bytes, int ordinal);
     void rocmFP16ScratchFree(void *buf, int ordinal);
     int rocmLocalTPSmallFP32AllreduceCreateEvent(void **event_out, int ordinal);
@@ -84,6 +86,11 @@ extern "C"
 
 namespace llaminar2
 {
+    namespace
+    {
+        constexpr const char *kDefaultAllreducePrecision = "fp32";
+    }
+
     std::atomic<uint64_t> LocalTPContext::next_context_id_{1};
 
     namespace
@@ -684,6 +691,8 @@ namespace llaminar2
         // Wake any threads blocked on the barrier condition variable
         barrier_cv_.notify_all();
         small_gpu_allreduce_cv_.notify_all();
+        grouped_onstream_allreduce_cv_.notify_all();
+        raw_allgather_cv_.notify_all();
     }
 
     const std::vector<GlobalDeviceAddress> &LocalTPContext::devices() const
@@ -699,6 +708,17 @@ namespace llaminar2
     CollectiveBackendType LocalTPContext::backend() const
     {
         return backend_;
+    }
+
+    void LocalTPContext::setBackendForTesting(
+        std::unique_ptr<ICollectiveBackend> backend,
+        CollectiveBackendType backend_type,
+        bool initialized)
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        backend_impl_ = std::move(backend);
+        backend_ = backend_type;
+        backend_initialized_ = initialized && backend_impl_;
     }
 
     int LocalTPContext::degree() const
@@ -1349,23 +1369,42 @@ namespace llaminar2
             return false;
         }
 
-        // Issue allreduce directly on the caller's stream (graph-capturable)
-        CollectiveDataType dtype = tensorDTypeToCollective(tensor);
-        if (!traceOnStreamCollectiveContract(device_index, tensor, stage_name,
-                                             effective_count, dtype, stream, precision))
-        {
-            requestAbort();
-            return false;
-        }
-
         // =================================================================
         // FP16 mixed-precision allreduce path
         // =================================================================
         // Precision can be set per-layer via the schema precision policy,
         // via a graph-level override, or globally via LLAMINAR_ALLREDUCE_PRECISION.
         // Per-call precision (from schema) takes priority over the global env.
-        const std::string &effective_precision =
-            precision.empty() ? debugEnv().allreduce_precision : precision;
+        CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+        const std::string effective_precision =
+            precision.empty() ? std::string(kDefaultAllreducePrecision) : precision;
+        const bool grouped_explicit_streams =
+            backend_ == CollectiveBackendType::NCCL ||
+            backend_ == CollectiveBackendType::RCCL;
+
+        if (grouped_explicit_streams)
+        {
+            if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+            {
+                LOG_ERROR("LocalTPContext::allreduceOnStream: backend "
+                          << collectiveBackendTypeToString(backend_)
+                          << " does not support grouped explicit-stream allreduce for stage="
+                          << (stage_name.empty() ? "(none)" : stage_name));
+                requestAbort();
+                return false;
+            }
+        }
+        else if (!rendezvousOnStreamCollective(device_index, tensor, stage_name,
+                                               effective_count, dtype, stream, precision))
+        {
+            requestAbort();
+            return false;
+        }
+
+        // Homogeneous GPU domains use one grouped launch over every participant's
+        // explicit stream, including while those streams are being graph-captured.
+        // Capturing independent per-device NCCL/RCCL calls is fragile because a
+        // single asymmetric capture/replay decision poisons the communicator.
         const bool use_fp16_allreduce =
             effective_precision == "fp16" &&
             dtype == CollectiveDataType::FLOAT32 &&
@@ -1423,10 +1462,13 @@ namespace llaminar2
 #endif
                 if (!alloc_ok)
                 {
-                    LOG_WARN("LocalTPContext::allreduceOnStream: FP16 scratch alloc failed ("
-                             << alloc_bytes << " bytes on device " << ordinal
-                             << "), falling back to FP32 allreduce");
-                    // Fall through to FP32 path below
+                    LOG_ERROR("LocalTPContext::allreduceOnStream: FP16 scratch alloc failed ("
+                              << alloc_bytes << " bytes on device " << ordinal
+                              << ") for stage="
+                              << (stage_name.empty() ? "(none)" : stage_name)
+                              << "; failing fast to avoid asymmetric transport");
+                    requestAbort();
+                    return false;
                 }
                 else
                 {
@@ -1442,6 +1484,7 @@ namespace llaminar2
                 fp16_scratch_counts_[device_index] >= effective_count)
             {
                 void *fp16_buf = fp16_scratch_buffers_[device_index];
+                const int ordinal = devices_[device_index].device_ordinal;
                 bool cast_ok = false;
 
                 // Step 1: Cast FP32 → FP16 on caller's stream
@@ -1451,6 +1494,7 @@ namespace llaminar2
                     cast_ok = (cudaCastFP32ToFP16(
                                    static_cast<const float *>(buffer), fp16_buf,
                                    effective_count,
+                                   ordinal,
                                    static_cast<cudaStream_t>(stream)) == 0);
                 }
 #endif
@@ -1459,26 +1503,45 @@ namespace llaminar2
                 {
                     cast_ok = (rocmCastFP32ToFP16(
                                    static_cast<const float *>(buffer), fp16_buf,
-                                   effective_count, stream) == 0);
+                                   effective_count, ordinal, stream) == 0);
                 }
 #endif
                 if (!cast_ok)
                 {
-                    LOG_WARN("LocalTPContext: FP32→FP16 cast failed, falling back to FP32");
-                    // Fall through to FP32 path
+                    LOG_ERROR("LocalTPContext: FP32->FP16 cast failed for stage="
+                              << (stage_name.empty() ? "(none)" : stage_name)
+                              << "; failing fast to avoid asymmetric transport");
+                    requestAbort();
+                    return false;
                 }
                 else
                 {
                     // Step 2: Allreduce in FP16 (half the bytes!)
-                    bool ar_ok = backend_impl_->allreduceSingleDeviceOnStream(
-                        fp16_buf, effective_count, CollectiveDataType::FLOAT16,
-                        CollectiveOp::ALLREDUCE_SUM, device_index, stream);
+                    const bool ar_ok = grouped_explicit_streams
+                                           ? allreduceGroupedOnExplicitStreams(
+                                                 fp16_buf,
+                                                 effective_count,
+                                                 CollectiveDataType::FLOAT16,
+                                                 device_index,
+                                                 stream,
+                                                 stage_name,
+                                                 effective_precision)
+                                           : backend_impl_->allreduceSingleDeviceOnStream(
+                                                 fp16_buf, effective_count, CollectiveDataType::FLOAT16,
+                                                 CollectiveOp::ALLREDUCE_SUM, device_index, stream);
 
                     if (!ar_ok)
                     {
-                        LOG_WARN("LocalTPContext: FP16 allreduce failed: "
-                                 << backend_impl_->lastError() << ", falling back to FP32");
-                        // Fall through to FP32 path
+                        LOG_ERROR("LocalTPContext: FP16 allreduce failed: "
+                                  << (backend_impl_ ? backend_impl_->lastError() : "missing backend")
+                                  << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                        if (grouped_explicit_streams)
+                        {
+                            requestAbort();
+                            return false;
+                        }
+                        requestAbort();
+                        return false;
                     }
                     else
                     {
@@ -1491,6 +1554,7 @@ namespace llaminar2
                                            fp16_buf,
                                            static_cast<float *>(buffer),
                                            effective_count,
+                                           ordinal,
                                            static_cast<cudaStream_t>(stream)) == 0);
                         }
 #endif
@@ -1500,7 +1564,7 @@ namespace llaminar2
                             back_ok = (rocmCastFP16ToFP32(
                                            fp16_buf,
                                            static_cast<float *>(buffer),
-                                           effective_count, stream) == 0);
+                                           effective_count, ordinal, stream) == 0);
                         }
 #endif
                         if (back_ok)
@@ -1508,21 +1572,50 @@ namespace llaminar2
                             recordLocalTPRuntimeAllreduce(
                                 device_group_, backend_, devices_[device_index].toLocalDeviceId(),
                                 stage_name, static_cast<size_t>(degree()), effective_count,
-                                CollectiveDataType::FLOAT16, "on_stream_fp16_scratch",
+                                CollectiveDataType::FLOAT16,
+                                grouped_explicit_streams ? "on_stream_grouped_fp16_scratch"
+                                                         : "on_stream_fp16_scratch",
                                 effective_precision);
                             tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
                             return true;
                         }
-                        LOG_WARN("LocalTPContext: FP16→FP32 cast-back failed, data may be corrupt");
-                        // Fall through but data integrity is questionable
+                        LOG_ERROR("LocalTPContext: FP16->FP32 cast-back failed for stage="
+                                  << (stage_name.empty() ? "(none)" : stage_name)
+                                  << "; failing fast to avoid asymmetric transport");
+                        requestAbort();
+                        return false;
                     }
                 }
             }
         }
 
         // =================================================================
-        // Standard FP32 allreduce path (also fallback from FP16 failures)
+        // Standard FP32 allreduce path. FP16 transport failures fail fast above;
+        // grouped collectives must never fall through asymmetrically.
         // =================================================================
+        if (grouped_explicit_streams)
+        {
+            const bool success = allreduceGroupedOnExplicitStreams(
+                buffer, effective_count, dtype, device_index, stream,
+                stage_name, effective_precision);
+            if (!success)
+            {
+                LOG_ERROR("LocalTPContext::allreduceOnStream: grouped explicit-stream allreduce failed"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                          << " backend=" << collectiveBackendTypeToString(backend_)
+                          << " error=" << (backend_impl_ ? backend_impl_->lastError() : "missing backend"));
+                requestAbort();
+                return false;
+            }
+
+            recordLocalTPRuntimeAllreduce(
+                device_group_, backend_, devices_[device_index].toLocalDeviceId(),
+                stage_name, static_cast<size_t>(degree()), effective_count,
+                dtype, "on_stream_grouped", effective_precision);
+            tensor->transitionToWithEvent(TensorCoherenceState::DEVICE_AUTHORITATIVE, std::nullopt, stream);
+            return true;
+        }
+
         if (trySmallGpuAllreduceOnStream(buffer, effective_count, dtype,
                                          CollectiveOp::ALLREDUCE_SUM,
                                          device_index, stream, stage_name))
@@ -2977,6 +3070,281 @@ namespace llaminar2
         }
     }
 
+    bool LocalTPContext::supportsRawAllgatherOnStreamGraphCapture() const
+    {
+        if (degree() <= 1 || !backend_initialized_ || !backend_impl_)
+            return false;
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+            return false;
+        if (!backend_impl_->isMultiGpuSingleProcess())
+            return false;
+        return backend_impl_->supportsAllgatherSingleDeviceOnStream();
+    }
+
+    bool LocalTPContext::allgatherRawOnStream(
+        const void *local_send,
+        void *full_recv,
+        size_t send_count,
+        CollectiveDataType dtype,
+        int device_index,
+        void *producer_stream,
+        const std::string &stage_name)
+    {
+        if (!local_send || !full_recv)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: null buffer"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (send_count == 0)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: zero send_count"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: invalid device_index="
+                      << device_index << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (!producer_stream)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: explicit non-null producer stream is required"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " device_index=" << device_index);
+            return false;
+        }
+
+        if (degree() == 1)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: single-device raw allgather is not a valid handoff"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (!backend_initialized_ || !backend_impl_)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: backend is not initialized"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: only homogeneous NCCL/RCCL domains are supported"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            return false;
+        }
+
+        if (!backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawOnStream: backend does not support multi-GPU single-process allgather"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (isGraphCaptureActive())
+        {
+            if (!supportsRawAllgatherOnStreamGraphCapture())
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawOnStream: backend cannot capture raw allgather on explicit stream"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                          << " backend=" << collectiveBackendTypeToString(backend_));
+                return false;
+            }
+            if (!backend_impl_->allgatherSingleDeviceOnStream(
+                    local_send,
+                    full_recv,
+                    send_count,
+                    dtype,
+                    device_index,
+                    producer_stream))
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawOnStream: on-stream allgather failed"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                          << " backend_error=" << backend_impl_->lastError());
+                return false;
+            }
+            return true;
+        }
+
+        return allgatherRawWithBarrierMultiGpu(
+            local_send,
+            full_recv,
+            send_count,
+            dtype,
+            device_index,
+            producer_stream,
+            stage_name);
+    }
+
+    bool LocalTPContext::allgatherRawWithBarrierMultiGpu(
+        const void *local_send,
+        void *full_recv,
+        size_t send_count,
+        CollectiveDataType dtype,
+        int device_index,
+        void *producer_stream,
+        const std::string &stage_name)
+    {
+        const int num_participants = degree();
+
+        std::unique_lock<std::mutex> lock(raw_allgather_mutex_);
+
+        raw_allgather_cv_.wait(lock, [&]()
+                               { return abort_requested_.load(std::memory_order_acquire) ||
+                                        raw_allgather_departures_ == 0; });
+        if (abort_requested_.load(std::memory_order_acquire))
+            return false;
+
+        const uint64_t my_generation = raw_allgather_generation_;
+
+        auto reset_generation_state = [&]()
+        {
+            raw_allgather_arrivals_ = 0;
+            raw_allgather_departures_ = 0;
+            raw_allgather_send_buffers_.clear();
+            raw_allgather_recv_buffers_.clear();
+            raw_allgather_producer_streams_.clear();
+            raw_allgather_stage_name_.clear();
+            raw_allgather_send_count_ = 0;
+        };
+
+        auto depart_generation = [&]()
+        {
+            if (raw_allgather_departures_ > 0)
+                --raw_allgather_departures_;
+            if (raw_allgather_departures_ == 0)
+            {
+                reset_generation_state();
+                raw_allgather_cv_.notify_all();
+            }
+        };
+
+        auto abort_generation = [&]()
+        {
+            raw_allgather_result_ = false;
+            reset_generation_state();
+            raw_allgather_generation_++;
+            lock.unlock();
+            raw_allgather_cv_.notify_all();
+        };
+
+        if (raw_allgather_arrivals_ == 0)
+        {
+            raw_allgather_send_buffers_.assign(num_participants, nullptr);
+            raw_allgather_recv_buffers_.assign(num_participants, nullptr);
+            raw_allgather_producer_streams_.assign(num_participants, nullptr);
+            raw_allgather_stage_name_ = stage_name;
+            raw_allgather_send_count_ = send_count;
+            raw_allgather_dtype_ = dtype;
+            raw_allgather_result_ = false;
+        }
+        else if (raw_allgather_stage_name_ != stage_name ||
+                 raw_allgather_send_count_ != send_count ||
+                 raw_allgather_dtype_ != dtype)
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: mismatched participant contract"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " expected_stage=" << (raw_allgather_stage_name_.empty() ? "(none)" : raw_allgather_stage_name_)
+                      << " send_count=" << send_count
+                      << " expected_send_count=" << raw_allgather_send_count_
+                      << " dtype=" << collectiveDataTypeName(dtype)
+                      << " expected_dtype=" << collectiveDataTypeName(raw_allgather_dtype_));
+            abort_generation();
+            return false;
+        }
+
+        if (raw_allgather_send_buffers_[device_index] ||
+            raw_allgather_recv_buffers_[device_index] ||
+            raw_allgather_producer_streams_[device_index])
+        {
+            LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: duplicate participant"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " device_index=" << device_index);
+            abort_generation();
+            return false;
+        }
+
+        raw_allgather_send_buffers_[device_index] = local_send;
+        raw_allgather_recv_buffers_[device_index] = full_recv;
+        raw_allgather_producer_streams_[device_index] = producer_stream;
+        raw_allgather_arrivals_++;
+
+        if (raw_allgather_arrivals_ == num_participants)
+        {
+            for (int i = 0; i < num_participants; ++i)
+            {
+                if (!raw_allgather_send_buffers_[i] ||
+                    !raw_allgather_recv_buffers_[i] ||
+                    !raw_allgather_producer_streams_[i])
+                {
+                    LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: missing participant buffer"
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                              << " slot=" << i);
+                    abort_generation();
+                    return false;
+                }
+            }
+
+            LOG_DEBUG("LocalTPContext::allgatherRawWithBarrierMultiGpu: launching explicit-stream allgather"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " participants=" << num_participants
+                      << " send_count=" << send_count
+                      << " dtype=" << collectiveDataTypeName(dtype));
+
+            bool success = false;
+            if (!backend_impl_ || !backend_impl_->supportsAllgatherMultiOnStreams())
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: backend "
+                          << collectiveBackendTypeToString(backend_)
+                          << " does not support explicit-stream raw allgather"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            }
+            else
+            {
+                success = backend_impl_->allgatherMultiOnStreams(
+                    raw_allgather_send_buffers_,
+                    raw_allgather_recv_buffers_,
+                    send_count,
+                    dtype,
+                    raw_allgather_producer_streams_);
+            }
+            if (!success)
+            {
+                LOG_ERROR("LocalTPContext::allgatherRawWithBarrierMultiGpu: allgatherMultiOnStreams failed"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                          << " error=" << (backend_impl_ ? backend_impl_->lastError() : std::string("missing backend")));
+            }
+
+            raw_allgather_result_ = success;
+            raw_allgather_departures_ = num_participants;
+            raw_allgather_generation_++;
+            depart_generation();
+            const bool result = raw_allgather_result_;
+            lock.unlock();
+            raw_allgather_cv_.notify_all();
+            return result;
+        }
+
+        raw_allgather_cv_.wait(lock, [&]()
+                               { return abort_requested_.load(std::memory_order_acquire) ||
+                                        raw_allgather_generation_ != my_generation; });
+        if (abort_requested_.load(std::memory_order_acquire))
+        {
+            depart_generation();
+            return false;
+        }
+        const bool result = raw_allgather_result_;
+        depart_generation();
+        return result;
+    }
+
     bool LocalTPContext::gatherFromDevices(
         const std::vector<const TensorBase *> &shards,
         TensorBase *output)
@@ -3269,27 +3637,311 @@ namespace llaminar2
         }
     }
 
-    bool LocalTPContext::traceOnStreamCollectiveContract(int device_index,
-                                                         TensorBase *tensor,
-                                                         const std::string &stage_name,
-                                                         size_t effective_count,
-                                                         CollectiveDataType dtype,
-                                                         void *stream,
-                                                         const std::string &precision)
+    bool LocalTPContext::allreduceGroupedOnExplicitStreams(void *buffer,
+                                                           size_t effective_count,
+                                                           CollectiveDataType dtype,
+                                                           int device_index,
+                                                           void *stream,
+                                                           const std::string &stage_name,
+                                                           const std::string &precision)
     {
-        if (!debugEnv().tp_collective_contract_trace)
-        {
+        if (degree() <= 1)
             return true;
+
+        if (!buffer || !stream)
+        {
+            LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: null "
+                      << (!buffer ? "buffer" : "stream")
+                      << " slot=" << device_index
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            requestAbort();
+            return false;
         }
 
-        uint64_t sequence = 0;
-        bool mismatch = false;
-        std::string mismatch_reason;
+        if (device_index < 0 || device_index >= degree())
         {
-            std::lock_guard<std::mutex> lock(contract_trace_mutex_);
+            LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: invalid slot "
+                      << device_index << " degree=" << degree());
+            requestAbort();
+            return false;
+        }
+
+        std::unique_lock<std::mutex> lock(grouped_onstream_allreduce_mutex_);
+        if (abort_requested_.load(std::memory_order_acquire))
+            return false;
+
+        auto reset_generation_state = [&]()
+        {
+            grouped_onstream_allreduce_arrivals_ = 0;
+            grouped_onstream_allreduce_departures_ = 0;
+            grouped_onstream_allreduce_ready_ = false;
+            grouped_onstream_allreduce_result_ = false;
+            grouped_onstream_allreduce_count_ = 0;
+            grouped_onstream_allreduce_dtype_ = -1;
+            grouped_onstream_allreduce_stage_.clear();
+            grouped_onstream_allreduce_precision_.clear();
+            grouped_onstream_allreduce_buffers_.clear();
+            grouped_onstream_allreduce_streams_.clear();
+            grouped_onstream_allreduce_seen_.clear();
+            grouped_onstream_allreduce_generation_++;
+        };
+
+        while (grouped_onstream_allreduce_arrivals_ >= degree() &&
+               grouped_onstream_allreduce_departures_ > 0 &&
+               !abort_requested_.load(std::memory_order_acquire))
+        {
+            grouped_onstream_allreduce_cv_.wait(lock);
+        }
+        if (abort_requested_.load(std::memory_order_acquire))
+            return false;
+
+        const uint64_t my_generation = grouped_onstream_allreduce_generation_;
+        const int arrival_order = grouped_onstream_allreduce_arrivals_++;
+        auto fail_generation = [&](const std::string &error)
+        {
+            grouped_onstream_allreduce_ok_ = false;
+            grouped_onstream_allreduce_result_ = false;
+            grouped_onstream_allreduce_error_ = error;
+            reset_generation_state();
+            abort_requested_.store(true, std::memory_order_release);
+            LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: " << error);
+            lock.unlock();
+            grouped_onstream_allreduce_cv_.notify_all();
+        };
+
+        auto depart_generation = [&]() -> bool
+        {
+            const bool result = grouped_onstream_allreduce_ready_ &&
+                                grouped_onstream_allreduce_result_ &&
+                                !abort_requested_.load(std::memory_order_acquire);
+            grouped_onstream_allreduce_departures_++;
+            if (grouped_onstream_allreduce_departures_ >= degree())
+            {
+                reset_generation_state();
+                lock.unlock();
+                grouped_onstream_allreduce_cv_.notify_all();
+            }
+            return result;
+        };
+
+        if (arrival_order >= degree())
+        {
+            fail_generation("arrival overflow stage=" +
+                            (stage_name.empty() ? std::string("(none)") : stage_name));
+            return false;
+        }
+
+        if (arrival_order == 0)
+        {
+            grouped_onstream_allreduce_ok_ = true;
+            grouped_onstream_allreduce_ready_ = false;
+            grouped_onstream_allreduce_result_ = false;
+            grouped_onstream_allreduce_count_ = effective_count;
+            grouped_onstream_allreduce_dtype_ = static_cast<int>(dtype);
+            grouped_onstream_allreduce_stage_ = stage_name;
+            grouped_onstream_allreduce_precision_ = precision;
+            grouped_onstream_allreduce_error_.clear();
+            grouped_onstream_allreduce_buffers_.assign(static_cast<size_t>(degree()), nullptr);
+            grouped_onstream_allreduce_streams_.assign(static_cast<size_t>(degree()), nullptr);
+            grouped_onstream_allreduce_seen_.assign(static_cast<size_t>(degree()), false);
+        }
+        else
+        {
+            if (grouped_onstream_allreduce_stage_ != stage_name)
+            {
+                fail_generation("stage mismatch expected=" +
+                                (grouped_onstream_allreduce_stage_.empty() ? std::string("(none)") : grouped_onstream_allreduce_stage_) +
+                                " actual=" + (stage_name.empty() ? std::string("(none)") : stage_name));
+                return false;
+            }
+            if (grouped_onstream_allreduce_count_ != effective_count)
+            {
+                fail_generation("count mismatch expected=" +
+                                std::to_string(grouped_onstream_allreduce_count_) +
+                                " actual=" + std::to_string(effective_count));
+                return false;
+            }
+            if (grouped_onstream_allreduce_dtype_ != static_cast<int>(dtype))
+            {
+                fail_generation("dtype mismatch expected=" +
+                                std::to_string(grouped_onstream_allreduce_dtype_) +
+                                " actual=" + std::to_string(static_cast<int>(dtype)));
+                return false;
+            }
+            if (grouped_onstream_allreduce_precision_ != precision)
+            {
+                fail_generation("precision mismatch expected=" +
+                                (grouped_onstream_allreduce_precision_.empty() ? std::string("(default)") : grouped_onstream_allreduce_precision_) +
+                                " actual=" + (precision.empty() ? std::string("(default)") : precision));
+                return false;
+            }
+        }
+
+        if (grouped_onstream_allreduce_seen_[static_cast<size_t>(device_index)])
+        {
+            fail_generation("duplicate slot arrival slot=" + std::to_string(device_index) +
+                            " stage=" + (stage_name.empty() ? std::string("(none)") : stage_name));
+            return false;
+        }
+
+        grouped_onstream_allreduce_seen_[static_cast<size_t>(device_index)] = true;
+        grouped_onstream_allreduce_buffers_[static_cast<size_t>(device_index)] = buffer;
+        grouped_onstream_allreduce_streams_[static_cast<size_t>(device_index)] = stream;
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_grouped_onstream_arrival"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " generation=" << my_generation
+                      << " slot=" << device_index
+                      << " arrival_order=" << arrival_order
+                      << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " count=" << effective_count
+                      << " dtype=" << static_cast<int>(dtype)
+                      << " precision=" << (precision.empty() ? "(default)" : precision)
+                      << " stream=" << stream
+                      << " buffer=" << buffer);
+        }
+
+        if (arrival_order + 1 < degree())
+        {
+            auto ready = [&]()
+            {
+                return abort_requested_.load(std::memory_order_acquire) ||
+                       grouped_onstream_allreduce_generation_ > my_generation ||
+                       (grouped_onstream_allreduce_generation_ == my_generation &&
+                        grouped_onstream_allreduce_ready_);
+            };
+
+            const int timeout_ms = collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms,
+                first_onstream_collective_completed_.load(std::memory_order_acquire));
+            bool completed = true;
+            if (timeout_ms > 0)
+            {
+                completed = grouped_onstream_allreduce_cv_.wait_for(
+                    lock,
+                    std::chrono::milliseconds(timeout_ms),
+                    ready);
+            }
+            else
+            {
+                grouped_onstream_allreduce_cv_.wait(lock, ready);
+            }
+
+            if (!completed)
+            {
+                fail_generation("timeout waiting for grouped on-stream allreduce peers stage=" +
+                                (stage_name.empty() ? std::string("(none)") : stage_name) +
+                                " arrivals=" + std::to_string(grouped_onstream_allreduce_arrivals_) +
+                                " degree=" + std::to_string(degree()));
+                return false;
+            }
+
+            if (grouped_onstream_allreduce_generation_ != my_generation &&
+                !grouped_onstream_allreduce_ready_)
+            {
+                return false;
+            }
+
+            return depart_generation();
+        }
+
+        for (int i = 0; i < degree(); ++i)
+        {
+            if (i >= static_cast<int>(grouped_onstream_allreduce_seen_.size()) ||
+                !grouped_onstream_allreduce_seen_[static_cast<size_t>(i)] ||
+                !grouped_onstream_allreduce_buffers_[static_cast<size_t>(i)] ||
+                !grouped_onstream_allreduce_streams_[static_cast<size_t>(i)])
+            {
+                fail_generation("missing grouped on-stream participant slot=" +
+                                std::to_string(i) +
+                                " stage=" + (stage_name.empty() ? std::string("(none)") : stage_name));
+                return false;
+            }
+        }
+
+        if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+        {
+            fail_generation(std::string("backend does not support grouped explicit-stream allreduce backend=") +
+                            collectiveBackendTypeToString(backend_));
+            return false;
+        }
+
+        const bool success = backend_impl_->allreduceMultiOnStreams(
+            grouped_onstream_allreduce_buffers_,
+            effective_count,
+            dtype,
+            CollectiveOp::ALLREDUCE_SUM,
+            grouped_onstream_allreduce_streams_);
+
+        grouped_onstream_allreduce_result_ = success;
+        grouped_onstream_allreduce_ready_ = true;
+        if (!success)
+        {
+            grouped_onstream_allreduce_error_ =
+                backend_impl_ ? backend_impl_->lastError() : std::string("missing backend");
+            abort_requested_.store(true, std::memory_order_release);
+            LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: backend launch failed"
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " error=" << grouped_onstream_allreduce_error_);
+        }
+        else
+        {
+            first_onstream_collective_completed_.store(true, std::memory_order_release);
+        }
+
+        if (success && debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_grouped_onstream_enqueued"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " generation=" << my_generation
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " count=" << effective_count
+                      << " dtype=" << static_cast<int>(dtype));
+        }
+
+        grouped_onstream_allreduce_cv_.notify_all();
+        return depart_generation();
+    }
+
+    bool LocalTPContext::rendezvousOnStreamCollective(int device_index,
+                                                      TensorBase *tensor,
+                                                      const std::string &stage_name,
+                                                      size_t effective_count,
+                                                      CollectiveDataType dtype,
+                                                      void *stream,
+                                                      const std::string &precision)
+    {
+        if (degree() <= 1)
+            return true;
+
+        uint64_t sequence = 0;
+        bool ok = true;
+        std::string error;
+        {
+            std::unique_lock<std::mutex> lock(contract_trace_mutex_);
             if (onstream_sequence_by_slot_.size() != devices_.size())
             {
                 onstream_sequence_by_slot_.assign(devices_.size(), 0);
+            }
+
+            if (device_index < 0 ||
+                device_index >= static_cast<int>(onstream_sequence_by_slot_.size()))
+            {
+                LOG_ERROR("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_invalid_slot"
+                          << " context_id=" << context_id_
+                          << " context=" << static_cast<const void *>(this)
+                          << " slot=" << device_index
+                          << " degree=" << degree()
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
             }
 
             sequence = onstream_sequence_by_slot_[static_cast<size_t>(device_index)]++;
@@ -3302,77 +3954,129 @@ namespace llaminar2
                 entry.count = effective_count;
                 entry.dtype = dtype_value;
                 entry.precision = precision;
+                entry.ok = true;
             }
             else
             {
                 if (entry.stage_name != stage_name)
                 {
-                    mismatch = true;
-                    mismatch_reason = "stage mismatch expected=" + (entry.stage_name.empty() ? std::string("(none)") : entry.stage_name) +
-                                      " actual=" + (stage_name.empty() ? std::string("(none)") : stage_name);
+                    entry.ok = false;
+                    entry.error = "stage mismatch expected=" + (entry.stage_name.empty() ? std::string("(none)") : entry.stage_name) +
+                                  " actual=" + (stage_name.empty() ? std::string("(none)") : stage_name);
                 }
                 else if (entry.count != effective_count)
                 {
-                    mismatch = true;
-                    mismatch_reason = "count mismatch expected=" + std::to_string(entry.count) +
-                                      " actual=" + std::to_string(effective_count);
+                    entry.ok = false;
+                    entry.error = "count mismatch expected=" + std::to_string(entry.count) +
+                                  " actual=" + std::to_string(effective_count);
                 }
                 else if (entry.dtype != dtype_value)
                 {
-                    mismatch = true;
-                    mismatch_reason = "dtype mismatch expected=" + std::to_string(entry.dtype) +
-                                      " actual=" + std::to_string(dtype_value);
+                    entry.ok = false;
+                    entry.error = "dtype mismatch expected=" + std::to_string(entry.dtype) +
+                                  " actual=" + std::to_string(dtype_value);
                 }
             }
 
-            if (device_index >= 0 && device_index < 64)
+            if (device_index < 64)
             {
                 const uint64_t bit = 1ull << static_cast<uint64_t>(device_index);
                 if ((entry.seen_slots & bit) != 0)
                 {
-                    mismatch = true;
-                    mismatch_reason = "duplicate slot arrival for sequence=" + std::to_string(sequence) +
-                                      " slot=" + std::to_string(device_index);
+                    entry.ok = false;
+                    entry.error = "duplicate slot arrival for sequence=" + std::to_string(sequence) +
+                                  " slot=" + std::to_string(device_index);
                 }
                 entry.seen_slots |= bit;
             }
             ++entry.arrivals;
 
-            if (entry.arrivals >= degree())
+            if (entry.arrivals >= degree() || !entry.ok)
+                contract_trace_cv_.notify_all();
+
+            auto ready = [&]()
+            {
+                return abort_requested_.load(std::memory_order_acquire) ||
+                       !entry.ok ||
+                       entry.arrivals >= degree();
+            };
+
+            if (!ready())
+            {
+                const int timeout_ms = collective_timeout_policy::effectiveCollectTimeoutMs(
+                    debugEnv().tp_collect_timeout_ms,
+                    first_onstream_collective_completed_.load(std::memory_order_acquire));
+                if (timeout_ms > 0)
+                {
+                    const bool completed = contract_trace_cv_.wait_for(
+                        lock,
+                        std::chrono::milliseconds(timeout_ms),
+                        ready);
+                    if (!completed)
+                    {
+                        entry.ok = false;
+                        entry.error = "timeout waiting for on-stream collective peers"
+                                      " sequence=" +
+                                      std::to_string(sequence) +
+                                      " arrivals=" + std::to_string(entry.arrivals) +
+                                      " degree=" + std::to_string(degree()) +
+                                      " stage=" + (stage_name.empty() ? std::string("(none)") : stage_name);
+                        contract_trace_cv_.notify_all();
+                    }
+                }
+                else
+                {
+                    contract_trace_cv_.wait(lock, ready);
+                }
+            }
+
+            ok = entry.ok && !abort_requested_.load(std::memory_order_acquire);
+            error = entry.error;
+            if (ok)
+            {
+                first_onstream_collective_completed_.store(true, std::memory_order_release);
+            }
+            ++entry.departures;
+            if (entry.departures >= entry.arrivals)
             {
                 onstream_contracts_.erase(sequence);
+                contract_trace_cv_.notify_all();
             }
         }
 
-        LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_arrival"
-                  << " context_id=" << context_id_
-                  << " context=" << static_cast<const void *>(this)
-                  << " backend=" << collectiveBackendTypeToString(backend_)
-                  << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
-                  << " sequence=" << sequence
-                  << " slot=" << device_index
-                  << " degree=" << degree()
-                  << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
-                  << " count=" << effective_count
-                  << " dtype=" << static_cast<int>(dtype)
-                  << " precision=" << (precision.empty() ? "(default)" : precision)
-                  << " stream=" << stream
-                  << " tensor=" << static_cast<void *>(tensor)
-                  << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)")
-                  << " gpu_ptr=" << (tensor ? tensor->gpu_data_ptr() : nullptr));
-
-        if (mismatch)
+        if (debugEnv().tp_collective_contract_trace)
         {
-            LOG_ERROR("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_mismatch"
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_rendezvous"
+                      << " context_id=" << context_id_
+                      << " context=" << static_cast<const void *>(this)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " backend_impl=" << static_cast<const void *>(backend_impl_.get())
+                      << " sequence=" << sequence
+                      << " slot=" << device_index
+                      << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " count=" << effective_count
+                      << " dtype=" << static_cast<int>(dtype)
+                      << " precision=" << (precision.empty() ? "(default)" : precision)
+                      << " stream=" << stream
+                      << " tensor=" << static_cast<void *>(tensor)
+                      << " tensor_name=" << (tensor && !tensor->debugName().empty() ? tensor->debugName() : "(unnamed)")
+                      << " gpu_ptr=" << (tensor ? tensor->gpu_data_ptr() : nullptr)
+                      << " ok=" << (ok ? 1 : 0));
+        }
+
+        if (!ok)
+        {
+            LOG_ERROR("[TP_COLLECTIVE_CONTRACT] event=localtp_onstream_rendezvous_failed"
                       << " context_id=" << context_id_
                       << " context=" << static_cast<const void *>(this)
                       << " sequence=" << sequence
                       << " slot=" << device_index
-                      << " reason=" << mismatch_reason);
-            return false;
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " reason=" << (error.empty() ? "abort requested" : error));
         }
 
-        return true;
+        return ok;
     }
 
     // =========================================================================

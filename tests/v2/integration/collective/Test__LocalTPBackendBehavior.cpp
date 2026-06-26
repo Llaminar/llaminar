@@ -34,6 +34,10 @@
 #include "utils/DebugEnv.h"
 #include "../../utils/TestTensorFactory.h"
 
+#ifdef HAVE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 using namespace llaminar2;
 using namespace llaminar2::test;
 
@@ -289,6 +293,268 @@ TEST_F(Test__LocalTPBackendBehavior, NCCLAllreduce_DTypeMismatchAcrossParticipan
     EXPECT_FALSE(result0.load());
     EXPECT_FALSE(result1.load());
 }
+
+#ifdef HAVE_CUDA
+/**
+ * @test LocalTP CUDA on-stream allreduce uses a grouped explicit-stream launch.
+ *
+ * Regression for the Qwen3.6 expert overlay parity hang where both workers
+ * reached embedding_allreduce, then independent per-device ncclAllReduce calls
+ * stalled. The eager LocalTP path should enqueue one grouped NCCL collective
+ * over the two producer streams and return without a host fallback.
+ */
+TEST_F(Test__LocalTPBackendBehavior, NCCLAllreduce_OnStreamGroupedLaunch_Completes)
+{
+    if (cuda_count_ < 2)
+    {
+        GTEST_SKIP() << "Requires 2+ CUDA GPUs, found " << cuda_count_;
+    }
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::cuda(0),
+        GlobalDeviceAddress::cuda(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::NCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr size_t count = 1024;
+    auto tensor0 = TestTensorFactory::createFP32({count});
+    auto tensor1 = TestTensorFactory::createFP32({count});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::cuda(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::cuda(1)));
+
+    cudaStream_t stream0 = nullptr;
+    cudaStream_t stream1 = nullptr;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream0, cudaStreamNonBlocking), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamCreateWithFlags(&stream1, cudaStreamNonBlocking), cudaSuccess);
+
+    std::atomic<bool> result0{false};
+    std::atomic<bool> result1{false};
+
+    std::thread t0([&]()
+                   {
+                       ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+                       result0.store(ctx->allreduceOnStream(
+                                         tensor0.get(),
+                                         "on_stream_grouped_regression",
+                                         count,
+                                         stream0,
+                                         "fp32"),
+                                     std::memory_order_release);
+                   });
+    std::thread t1([&]()
+                   {
+                       ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+                       result1.store(ctx->allreduceOnStream(
+                                         tensor1.get(),
+                                         "on_stream_grouped_regression",
+                                         count,
+                                         stream1,
+                                         "fp32"),
+                                     std::memory_order_release);
+                   });
+
+    t0.join();
+    t1.join();
+
+    EXPECT_TRUE(result0.load(std::memory_order_acquire));
+    EXPECT_TRUE(result1.load(std::memory_order_acquire));
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    ASSERT_EQ(cudaStreamSynchronize(stream1), cudaSuccess);
+
+    const float *data0 = tensor0->data();
+    const float *data1 = tensor1->data();
+    ASSERT_NE(data0, nullptr);
+    ASSERT_NE(data1, nullptr);
+    for (size_t i = 0; i < count; ++i)
+    {
+        EXPECT_FLOAT_EQ(data0[i], 3.0f) << "CUDA:0 mismatch at index " << i;
+        EXPECT_FLOAT_EQ(data1[i], 3.0f) << "CUDA:1 mismatch at index " << i;
+    }
+
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    if (stream0)
+        EXPECT_EQ(cudaStreamDestroy(stream0), cudaSuccess);
+    ASSERT_EQ(cudaSetDevice(1), cudaSuccess);
+    if (stream1)
+        EXPECT_EQ(cudaStreamDestroy(stream1), cudaSuccess);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/**
+ * @test LocalTP RCCL allreduce uses a grouped launch on explicit producer streams
+ *
+ * Mirrors the CUDA regression above for ROCm. The Qwen3.6 expert overlay
+ * parity path first hit this with the tiny embedding projection allreduce
+ * (18,432 FP32 elements), so keep that count as the canary.
+ */
+TEST_F(Test__LocalTPBackendBehavior, RCCLAllreduce_OnStreamGroupedLaunch_Completes)
+{
+    SKIP_IF_LESS_THAN_2_ROCM();
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr size_t count = 18432;
+    auto tensor0 = TestTensorFactory::createFP32({count});
+    auto tensor1 = TestTensorFactory::createFP32({count});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::rocm(1)));
+
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    void *stream0 = rocm_backend->createStream(0);
+    void *stream1 = rocm_backend->createStream(1);
+    ASSERT_NE(stream0, nullptr);
+    ASSERT_NE(stream1, nullptr);
+
+    std::atomic<bool> result0{false};
+    std::atomic<bool> result1{false};
+
+    std::thread t0([&]()
+                   {
+                       result0.store(ctx->allreduceOnStream(
+                                         tensor0.get(),
+                                         "on_stream_grouped_regression_rccl",
+                                         count,
+                                         stream0,
+                                         "fp32"),
+                                     std::memory_order_release);
+                   });
+    std::thread t1([&]()
+                   {
+                       result1.store(ctx->allreduceOnStream(
+                                         tensor1.get(),
+                                         "on_stream_grouped_regression_rccl",
+                                         count,
+                                         stream1,
+                                         "fp32"),
+                                     std::memory_order_release);
+                   });
+
+    t0.join();
+    t1.join();
+
+    EXPECT_TRUE(result0.load(std::memory_order_acquire));
+    EXPECT_TRUE(result1.load(std::memory_order_acquire));
+
+    ASSERT_TRUE(rocm_backend->synchronizeStream(stream0, 0));
+    ASSERT_TRUE(rocm_backend->synchronizeStream(stream1, 1));
+
+    const float *data0 = tensor0->data();
+    const float *data1 = tensor1->data();
+    ASSERT_NE(data0, nullptr);
+    ASSERT_NE(data1, nullptr);
+    for (size_t i = 0; i < count; ++i)
+    {
+        EXPECT_FLOAT_EQ(data0[i], 3.0f) << "ROCm:0 mismatch at index " << i;
+        EXPECT_FLOAT_EQ(data1[i], 3.0f) << "ROCm:1 mismatch at index " << i;
+    }
+
+    if (stream0)
+        rocm_backend->destroyStream(stream0, 0);
+    if (stream1)
+        rocm_backend->destroyStream(stream1, 1);
+}
+
+/**
+ * @test LocalTP RCCL FP16 transport wraps grouped explicit-stream allreduce safely
+ *
+ * This covers the production Qwen3.6 expert overlay parity policy: FP32
+ * activations with schema-driven FP16 TP transport over RCCL.
+ */
+TEST_F(Test__LocalTPBackendBehavior, RCCLAllreduce_OnStreamGroupedFP16Transport_Completes)
+{
+    SKIP_IF_LESS_THAN_2_ROCM();
+
+    std::vector<GlobalDeviceAddress> devices = {
+        GlobalDeviceAddress::rocm(0),
+        GlobalDeviceAddress::rocm(1)};
+
+    auto ctx = createLocalTPContext(devices, {}, CollectiveBackendType::RCCL);
+    ASSERT_NE(ctx, nullptr);
+
+    constexpr size_t count = 18432;
+    auto tensor0 = TestTensorFactory::createFP32({count});
+    auto tensor1 = TestTensorFactory::createFP32({count});
+    TestTensorFactory::fillValue(tensor0.get(), 1.0f);
+    TestTensorFactory::fillValue(tensor1.get(), 2.0f);
+
+    ASSERT_TRUE(tensor0->ensureOnDevice(DeviceId::rocm(0)));
+    ASSERT_TRUE(tensor1->ensureOnDevice(DeviceId::rocm(1)));
+
+    auto *rocm_backend = getROCmBackend();
+    ASSERT_NE(rocm_backend, nullptr);
+    void *stream0 = rocm_backend->createStream(0);
+    void *stream1 = rocm_backend->createStream(1);
+    ASSERT_NE(stream0, nullptr);
+    ASSERT_NE(stream1, nullptr);
+
+    std::atomic<bool> result0{false};
+    std::atomic<bool> result1{false};
+
+    std::thread t0([&]()
+                   {
+                       result0.store(ctx->allreduceOnStream(
+                                         tensor0.get(),
+                                         "on_stream_grouped_fp16_transport_regression_rccl",
+                                         count,
+                                         stream0,
+                                         "fp16"),
+                                     std::memory_order_release);
+                   });
+    std::thread t1([&]()
+                   {
+                       result1.store(ctx->allreduceOnStream(
+                                         tensor1.get(),
+                                         "on_stream_grouped_fp16_transport_regression_rccl",
+                                         count,
+                                         stream1,
+                                         "fp16"),
+                                     std::memory_order_release);
+                   });
+
+    t0.join();
+    t1.join();
+
+    EXPECT_TRUE(result0.load(std::memory_order_acquire));
+    EXPECT_TRUE(result1.load(std::memory_order_acquire));
+
+    ASSERT_TRUE(rocm_backend->synchronizeStream(stream0, 0));
+    ASSERT_TRUE(rocm_backend->synchronizeStream(stream1, 1));
+
+    const float *data0 = tensor0->data();
+    const float *data1 = tensor1->data();
+    ASSERT_NE(data0, nullptr);
+    ASSERT_NE(data1, nullptr);
+    for (size_t i = 0; i < count; ++i)
+    {
+        EXPECT_FLOAT_EQ(data0[i], 3.0f) << "ROCm:0 mismatch at index " << i;
+        EXPECT_FLOAT_EQ(data1[i], 3.0f) << "ROCm:1 mismatch at index " << i;
+    }
+
+    if (stream0)
+        rocm_backend->destroyStream(stream0, 0);
+    if (stream1)
+        rocm_backend->destroyStream(stream1, 1);
+}
+#endif
 
 /**
  * @test LocalTP NCCL fails fast when GPU graphs are enabled without segmented collectives

@@ -220,6 +220,8 @@ namespace llaminar2
             void *stream) override;
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override { return params_.kernel != nullptr; }
+        /// @brief Allows cold GPU prefill graph preflight before warmup allocates recurrence state.
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
         /// @brief Allows cold GPU padded-prefill graph preflight before warmup allocates recurrence state.
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
 

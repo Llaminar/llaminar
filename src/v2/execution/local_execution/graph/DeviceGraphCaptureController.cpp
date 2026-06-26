@@ -24,6 +24,147 @@ namespace llaminar2
 {
     namespace
     {
+        enum class GraphReplayCaptureMode
+        {
+            Segmented,
+            FullGraph
+        };
+
+        const char *captureModeTag(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph ? "full_graph" : "segmented";
+        }
+
+        const char *captureModeSource(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "full_graph_capture"
+                       : "segmented_graph_capture";
+        }
+
+        const char *captureModeHostScope(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "full_graph_replay_host"
+                       : "segmented_replay_host";
+        }
+
+        const char *captureModeEventScope(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "full_graph_replay_events"
+                       : "segmented_replay_events";
+        }
+
+        const char *captureModePlanScope(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "full_graph_capture_plan"
+                       : "segmented_capture_plan";
+        }
+
+        std::string replayMetricName(GraphReplayCaptureMode mode, const char *suffix)
+        {
+            return std::string(mode == GraphReplayCaptureMode::FullGraph
+                                   ? "full_graph_replay_"
+                                   : "segmented_replay_") +
+                   suffix;
+        }
+
+        std::string planMetricName(GraphReplayCaptureMode mode, const char *suffix)
+        {
+            return std::string(mode == GraphReplayCaptureMode::FullGraph
+                                   ? "full_graph_plan_"
+                                   : "segmented_plan_") +
+                   suffix;
+        }
+
+        std::string planUnitMetricName(GraphReplayCaptureMode mode)
+        {
+            return planMetricName(mode, mode == GraphReplayCaptureMode::FullGraph
+                                            ? "graphs"
+                                            : "segments");
+        }
+
+        std::string planMaxUnitStagesMetricName(GraphReplayCaptureMode mode)
+        {
+            return planMetricName(mode, mode == GraphReplayCaptureMode::FullGraph
+                                            ? "max_graph_stages"
+                                            : "max_segment_stages");
+        }
+
+        const char *stageGpuPlanUnitMetricName(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "graph_replay_plan_graphs"
+                       : "graph_replay_plan_segments";
+        }
+
+        const char *planUnitTypeTagName(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "graph_type"
+                       : "segment_type";
+        }
+
+        const char *replayUnitCounterName(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "full_graph_replay_calls"
+                       : "segmented_replay_segments";
+        }
+
+        std::string replayUnitTimingName(GraphReplayCaptureMode mode)
+        {
+            return replayMetricName(mode, mode == GraphReplayCaptureMode::FullGraph
+                                              ? "graph"
+                                              : "segment");
+        }
+
+        const char *replayUnitGpuEventName(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "graph_replay.graph"
+                       : "graph_replay.segment";
+        }
+
+        const char *replayUnitIndexTagName(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "graph_index"
+                       : "segment_index";
+        }
+
+        const char *replayUnitTimingScope(GraphReplayCaptureMode mode)
+        {
+            return mode == GraphReplayCaptureMode::FullGraph
+                       ? "graph_replay_gpu_event"
+                       : "segment_replay_gpu_event";
+        }
+
+        GraphReplayCaptureMode captureModeForPlan(size_t total_segments,
+                                                  size_t capturable_segments,
+                                                  size_t manual_segments)
+        {
+            return total_segments == 1 && capturable_segments == 1 && manual_segments == 0
+                       ? GraphReplayCaptureMode::FullGraph
+                       : GraphReplayCaptureMode::Segmented;
+        }
+
+        GraphReplayCaptureMode captureModeForCache(const DeviceGraphExecutor::GraphSegmentCache &cache)
+        {
+            size_t capturable_segments = 0;
+            size_t manual_segments = 0;
+            for (const auto &segment : cache.segments)
+            {
+                if (segment.capturable)
+                    ++capturable_segments;
+                else
+                    ++manual_segments;
+            }
+            return captureModeForPlan(cache.segments.size(), capturable_segments, manual_segments);
+        }
+
         const char *segmentTypeName(const DeviceGraphExecutor::GraphSegment &segment)
         {
             return segment.capturable ? "capturable" : "manual";
@@ -92,12 +233,25 @@ namespace llaminar2
             return tags;
         }
 
+        PerfStatsCollector::Tags replayCacheTags(const DeviceGraphExecutor::GraphSegmentCache &cache,
+                                                 GraphReplayCaptureMode mode)
+        {
+            auto tags = replayCacheTags(cache);
+            if (mode == GraphReplayCaptureMode::FullGraph)
+            {
+                tags.erase("segment_count");
+                tags.emplace("graph_count", std::to_string(cache.segments.size()));
+            }
+            return tags;
+        }
+
         PerfStatsCollector::Tags graphReplayHostTimingTags(PerfStatsCollector::Tags tags,
-                                                           const char *timing_scope)
+                                                           const char *timing_scope,
+                                                           GraphReplayCaptureMode mode)
         {
             tags.emplace("attribution", "host_wall");
-            tags.emplace("source", "segmented_graph_capture");
-            tags.emplace("graph_capture_scope", "segmented_replay_host");
+            tags.emplace("source", captureModeSource(mode));
+            tags.emplace("graph_capture_scope", captureModeHostScope(mode));
             if (timing_scope && timing_scope[0] != '\0')
             {
                 tags.emplace("timing_scope", timing_scope);
@@ -106,11 +260,12 @@ namespace llaminar2
         }
 
         PerfStatsCollector::Tags graphReplayGpuEventTags(PerfStatsCollector::Tags tags,
-                                                         const char *timing_scope)
+                                                         const char *timing_scope,
+                                                         GraphReplayCaptureMode mode)
         {
             tags.emplace("attribution", "gpu_event");
-            tags.emplace("source", "segmented_graph_capture");
-            tags.emplace("graph_capture_scope", "segmented_replay_events");
+            tags.emplace("source", captureModeSource(mode));
+            tags.emplace("graph_capture_scope", captureModeEventScope(mode));
             if (timing_scope && timing_scope[0] != '\0')
             {
                 tags.emplace("timing_scope", timing_scope);
@@ -119,11 +274,12 @@ namespace llaminar2
         }
 
         PerfStatsCollector::Tags graphReplayMetadataTags(PerfStatsCollector::Tags tags,
-                                                         const std::string &perf_context)
+                                                         const std::string &perf_context,
+                                                         GraphReplayCaptureMode mode)
         {
             tags.emplace("attribution", "graph_replay_metadata");
-            tags.emplace("source", "segmented_graph_capture");
-            tags.emplace("graph_capture_scope", "segmented_capture_plan");
+            tags.emplace("source", captureModeSource(mode));
+            tags.emplace("graph_capture_scope", captureModePlanScope(mode));
             addContextTag(tags, perf_context);
             return tags;
         }
@@ -288,7 +444,7 @@ namespace llaminar2
         bool &needs_capture,
         uint64_t &decode_step)
     {
-        // Segmented decode uses a monotonic step so we can reason about which
+        // Cached graph replay uses a monotonic step so we can reason about which
         // segments were executed in each phase.
         ++decode_step;
 
@@ -312,7 +468,7 @@ namespace llaminar2
         needs_capture = true;
     }
 
-    void DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(IDeviceContext *ctx)
+    void DeviceGraphCaptureController::prepareDeviceForGraphCapture(IDeviceContext *ctx)
     {
         if (ctx)
             ctx->activateDevice();
@@ -351,6 +507,12 @@ namespace llaminar2
         }
 
         return has_variant ? h : 0;
+    }
+
+    const char *DeviceGraphCaptureController::replayModeName(
+        const DeviceGraphExecutor::GraphSegmentCache &segment_cache)
+    {
+        return captureModeTag(captureModeForCache(segment_cache));
     }
 
     void DeviceGraphCaptureController::executeWarmupPhase(
@@ -536,57 +698,70 @@ namespace llaminar2
             }
         }
 
-        LOG_DEBUG("[DeviceGraphExecutor] Segmented graph: " << capturable_segments << " capturable segments ("
-                                                            << capturable_stages << " stages) + " << manual_segments << " manual segments ("
-                                                            << manual_stages << " stages)");
+        const GraphReplayCaptureMode plan_mode =
+            captureModeForPlan(segment_cache.segments.size(), capturable_segments, manual_segments);
+
+        if (plan_mode == GraphReplayCaptureMode::FullGraph)
+        {
+            LOG_DEBUG("[DeviceGraphExecutor] Full graph capture plan: "
+                      << capturable_stages << " capturable stages, no manual segments");
+        }
+        else
+        {
+            LOG_DEBUG("[DeviceGraphExecutor] Segmented graph capture plan: "
+                      << capturable_segments << " capturable segments ("
+                      << capturable_stages << " stages) + "
+                      << manual_segments << " manual segments ("
+                      << manual_stages << " stages)");
+        }
 
         if (PerfStatsCollector::isEnabled())
         {
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_segments",
+                planUnitMetricName(plan_mode),
                 static_cast<double>(segment_cache.segments.size()),
                 "decode",
                 "",
                 {{"type", "total"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_segments",
+                planUnitMetricName(plan_mode),
                 static_cast<double>(capturable_segments),
                 "decode",
                 "",
                 {{"type", "capturable"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_segments",
+                planUnitMetricName(plan_mode),
                 static_cast<double>(manual_segments),
                 "decode",
                 "",
                 {{"type", "manual"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_stages",
+                planMetricName(plan_mode, "stages"),
                 static_cast<double>(capturable_stages),
                 "decode",
                 "",
                 {{"type", "capturable"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_stages",
+                planMetricName(plan_mode, "stages"),
                 static_cast<double>(manual_stages),
                 "decode",
                 "",
                 {{"type", "manual"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_max_segment_stages",
+                planMaxUnitStagesMetricName(plan_mode),
                 static_cast<double>(max_capturable_segment_stages),
                 "decode",
                 "",
                 {{"type", "capturable"}});
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_plan_max_segment_stages",
+                planMaxUnitStagesMetricName(plan_mode),
                 static_cast<double>(max_manual_segment_stages),
                 "decode",
                 "",
@@ -596,21 +771,21 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "forward_graph",
-                    "segmented_plan_stage_types",
+                    planMetricName(plan_mode, "stage_types"),
                     static_cast<double>(count),
                     "decode",
                     "",
-                    {{"segment_type", "capturable"}, {"stage_type", type_name}});
+                    {{planUnitTypeTagName(plan_mode), "capturable"}, {"stage_type", type_name}});
             }
             for (const auto &[type_name, count] : manual_stage_types)
             {
                 PerfStatsCollector::addCounter(
                     "forward_graph",
-                    "segmented_plan_stage_types",
+                    planMetricName(plan_mode, "stage_types"),
                     static_cast<double>(count),
                     "decode",
                     "",
-                    {{"segment_type", "manual"}, {"stage_type", type_name}});
+                    {{planUnitTypeTagName(plan_mode), "manual"}, {"stage_type", type_name}});
             }
 
             auto record_stage_gpu_plan = [&](const char *name,
@@ -623,19 +798,19 @@ namespace llaminar2
                     value,
                     "decode",
                     "",
-                    graphReplayMetadataTags(std::move(tags), segment_cache.perf_context));
+                    graphReplayMetadataTags(std::move(tags), segment_cache.perf_context, plan_mode));
             };
 
             record_stage_gpu_plan(
-                "graph_replay_plan_segments",
+                stageGpuPlanUnitMetricName(plan_mode),
                 static_cast<double>(segment_cache.segments.size()),
                 {{"type", "total"}});
             record_stage_gpu_plan(
-                "graph_replay_plan_segments",
+                stageGpuPlanUnitMetricName(plan_mode),
                 static_cast<double>(capturable_segments),
                 {{"type", "capturable"}});
             record_stage_gpu_plan(
-                "graph_replay_plan_segments",
+                stageGpuPlanUnitMetricName(plan_mode),
                 static_cast<double>(manual_segments),
                 {{"type", "manual"}});
             record_stage_gpu_plan(
@@ -652,14 +827,14 @@ namespace llaminar2
                 record_stage_gpu_plan(
                     "graph_replay_plan_stage_types",
                     static_cast<double>(count),
-                    {{"segment_type", "capturable"}, {"stage_type", type_name}});
+                    {{planUnitTypeTagName(plan_mode), "capturable"}, {"stage_type", type_name}});
             }
             for (const auto &[type_name, count] : manual_stage_types)
             {
                 record_stage_gpu_plan(
                     "graph_replay_plan_stage_types",
                     static_cast<double>(count),
-                    {{"segment_type", "manual"}, {"stage_type", type_name}});
+                    {{planUnitTypeTagName(plan_mode), "manual"}, {"stage_type", type_name}});
             }
         }
 
@@ -955,6 +1130,7 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         void *capture_stream,
         bool needs_segment_sync,
+        bool full_graph_replay,
         const std::string &perf_context,
         const std::string &device_name,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
@@ -971,6 +1147,9 @@ namespace llaminar2
         }
 
         const bool profiling = KernelProfiler::isEnabled();
+        const GraphReplayCaptureMode replay_mode = full_graph_replay
+                                                       ? GraphReplayCaptureMode::FullGraph
+                                                       : GraphReplayCaptureMode::Segmented;
 
         // Time the graph launch itself
         auto launch_t0 = std::chrono::high_resolution_clock::now();
@@ -990,7 +1169,7 @@ namespace llaminar2
             auto launch_t1 = std::chrono::high_resolution_clock::now();
             PerfStatsCollector::recordTimingNs(
                 "forward_graph",
-                "segmented_replay_graph_launch",
+                replayMetricName(replay_mode, "graph_launch"),
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(launch_t1 - launch_t0).count()),
                 "decode",
                 device_name,
@@ -1011,7 +1190,7 @@ namespace llaminar2
             auto post_t1 = std::chrono::high_resolution_clock::now();
             PerfStatsCollector::recordTimingNs(
                 "forward_graph",
-                "segmented_replay_post_launch",
+                replayMetricName(replay_mode, "post_launch"),
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(post_t1 - post_t0).count()),
                 "decode",
                 device_name,
@@ -1242,7 +1421,7 @@ namespace llaminar2
             graph_outputs[s].name = segment.stage_names[s];
             if (node && node->stage)
             {
-                const auto &dump_info = node->stage->getDumpInfo();
+                StageDumpInfo dump_info = node->stage->getDumpInfoSnapshot();
                 if (!dump_info.outputs.empty())
                 {
                     const auto &out = dump_info.outputs[0];
@@ -1295,7 +1474,7 @@ namespace llaminar2
             direct_outputs[s].name = segment.stage_names[s];
             if (node && node->stage)
             {
-                const auto &dump_info = node->stage->getDumpInfo();
+                StageDumpInfo dump_info = node->stage->getDumpInfoSnapshot();
                 if (!dump_info.outputs.empty())
                 {
                     const auto &out = dump_info.outputs[0];
@@ -1637,6 +1816,7 @@ namespace llaminar2
         bool needs_segment_sync,
         bool verify_mode,
         bool recapture_mode,
+        bool full_graph_replay,
         int segment_index,
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
@@ -1707,6 +1887,7 @@ namespace llaminar2
             gpu_ctx,
             capture_stream,
             needs_segment_sync,
+            full_graph_replay,
             perf_context,
             device_name,
             post_launch_cb);
@@ -1725,6 +1906,7 @@ namespace llaminar2
         bool needs_segment_sync,
         bool verify_mode,
         bool recapture_mode,
+        bool full_graph_replay,
         uint64_t current_step,
         int segment_index,
         const std::string &perf_context,
@@ -1745,6 +1927,7 @@ namespace llaminar2
                 needs_segment_sync,
                 verify_mode,
                 recapture_mode,
+                full_graph_replay,
                 segment_index,
                 perf_context,
                 cohere_inputs_cb,
@@ -1788,7 +1971,7 @@ namespace llaminar2
 
         if (!segment_cache.ensureCaptureStream(gpu_ctx, ctx->deviceId()))
         {
-            // No capture stream means segmented capture cannot proceed safely;
+            // No capture stream means cached graph capture cannot proceed safely;
             // caller should fall back to fast decode for this step.
             LOG_WARN("[DeviceGraphCaptureController] Failed to create capture stream, falling back");
             result.fallback_to_fast_decode = true;
@@ -1943,7 +2126,7 @@ namespace llaminar2
                         auto *node = graph.getNode(stage_name);
                         if (!node || !node->stage || !node->stage->execute(ctx))
                         {
-                            LOG_ERROR("[DeviceGraphCaptureController] Stage failed during segmented capture: " << stage_name);
+                            LOG_ERROR("[DeviceGraphCaptureController] Stage failed during cached graph capture: " << stage_name);
                             exec_ok = false;
                             break;
                         }
@@ -1976,7 +2159,7 @@ namespace llaminar2
 
                 if (!exec_ok || !end_capture_ok)
                 {
-                    LOG_WARN("[DeviceGraphCaptureController] Segmented capture failed, "
+                    LOG_WARN("[DeviceGraphCaptureController] Graph capture failed, "
                              "continuing without capture to preserve collective sync");
 
                     // After a failed capture, the HIP/CUDA error state is sticky —
@@ -2138,20 +2321,22 @@ namespace llaminar2
         const auto &device_id = ctx->deviceId();
         const std::string device_name = device_id.toString();
         const int total_segments = static_cast<int>(segment_cache.segments.size());
-        auto replay_total_tags = replayCacheTags(segment_cache);
+        const GraphReplayCaptureMode replay_mode = captureModeForCache(segment_cache);
+        const bool full_graph_replay = replay_mode == GraphReplayCaptureMode::FullGraph;
+        auto replay_total_tags = replayCacheTags(segment_cache, replay_mode);
         replay_total_tags.emplace(
             "sync_scope",
             can_defer_final_sync ? "launch_only_deferred" : "stream_synchronized");
         PerfStatsCollector::ScopedTimer replay_timer(
             "forward_graph",
-            "segmented_replay_total",
+            replayMetricName(replay_mode, "total"),
             "decode",
             device_name,
-            graphReplayHostTimingTags(std::move(replay_total_tags), "total_replay_host_wall"));
+            graphReplayHostTimingTags(std::move(replay_total_tags), "total_replay_host_wall", replay_mode));
 
         std::vector<ReplayGpuEventTimer> replay_event_timers;
         replay_event_timers.reserve(segment_cache.segments.size());
-        auto total_replay_event_tags = replayCacheTags(segment_cache);
+        auto total_replay_event_tags = replayCacheTags(segment_cache, replay_mode);
         total_replay_event_tags.emplace(
             "sync_scope",
             can_defer_final_sync ? "profiling_event_synchronized" : "stream_synchronized");
@@ -2161,7 +2346,7 @@ namespace llaminar2
             "graph_replay.total",
             "decode",
             device_name,
-            graphReplayGpuEventTags(std::move(total_replay_event_tags), "total_replay_gpu_event"));
+            graphReplayGpuEventTags(std::move(total_replay_event_tags), "total_replay_gpu_event", replay_mode));
 
         auto collect_replay_gpu_events = [&](bool synchronize_total_event)
         {
@@ -2179,7 +2364,6 @@ namespace llaminar2
         int seg_idx = 0;
         for (auto &seg : segment_cache.segments)
         {
-            const char *seg_type = segmentTypeName(seg);
             const auto seg_tags = replaySegmentTags(seg, segment_cache.perf_context);
             if (trace_replay)
             {
@@ -2195,24 +2379,24 @@ namespace llaminar2
 
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "segmented_replay_segments",
+                replayUnitCounterName(replay_mode),
                 1.0,
                 "decode",
                 device_name,
                 seg_tags);
 
             auto event_tags = seg_tags;
-            event_tags.emplace("segment_index", std::to_string(seg_idx));
+            event_tags.emplace(replayUnitIndexTagName(replay_mode), std::to_string(seg_idx));
             event_tags.emplace(
                 "sync_scope",
                 can_defer_final_sync ? "profiling_event_synchronized" : "stream_synchronized");
             replay_event_timers.emplace_back(
                 gpu_ctx,
                 capture_stream,
-                "graph_replay.segment",
+                replayUnitGpuEventName(replay_mode),
                 "decode",
                 device_name,
-                graphReplayGpuEventTags(std::move(event_tags), "segment_replay_gpu_event"));
+                graphReplayGpuEventTags(std::move(event_tags), replayUnitTimingScope(replay_mode), replay_mode));
 
             const auto segment_t0 = std::chrono::high_resolution_clock::now();
             // Segment execution picks capturable or manual behavior based on
@@ -2227,6 +2411,7 @@ namespace llaminar2
                 needs_segment_sync,
                 verify_mode,
                 recapture_mode,
+                full_graph_replay,
                 current_step,
                 seg_idx,
                 segment_cache.perf_context,
@@ -2240,11 +2425,15 @@ namespace llaminar2
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(segment_t1 - segment_t0).count());
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
-                    "segmented_replay_segment",
+                    replayUnitTimingName(replay_mode),
                     segment_ns,
                     "decode",
                     device_name,
-                    graphReplayHostTimingTags(seg_tags, "segment_replay_host_wall"));
+                    graphReplayHostTimingTags(seg_tags,
+                                               full_graph_replay
+                                                   ? "graph_replay_host_wall"
+                                                   : "segment_replay_host_wall",
+                                               replay_mode));
             }
 
             if (!replay_result.success)
@@ -2289,11 +2478,11 @@ namespace llaminar2
             {
                 PerfStatsCollector::addCounter(
                     "forward_graph",
-                    "segmented_replay_final_sync_deferred",
+                    replayMetricName(replay_mode, "final_sync_deferred"),
                     1.0,
                     "decode",
                     device_name,
-                    replayCacheTags(segment_cache));
+                    replayCacheTags(segment_cache, replay_mode));
             }
             // Production MTP sidecar replay can deliberately defer the final
             // stream sync. When GPU stage timing is requested, synchronize only
@@ -2330,31 +2519,33 @@ namespace llaminar2
             }
             if (PerfStatsCollector::isEnabled())
             {
-                auto capture_tags = replayCacheTags(segment_cache);
+                auto capture_tags = replayCacheTags(segment_cache, replay_mode);
                 capture_tags.emplace("stream", "capture");
-                auto default_tags = replayCacheTags(segment_cache);
+                auto default_tags = replayCacheTags(segment_cache, replay_mode);
                 default_tags.emplace("stream", "context_default");
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
-                    "segmented_replay_stream_sync",
+                    replayMetricName(replay_mode, "stream_sync"),
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_capture_t1 - sync_t0).count()),
                     "decode",
                     device_name,
                     std::move(capture_tags));
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
-                    "segmented_replay_stream_sync",
+                    replayMetricName(replay_mode, "stream_sync"),
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_capture_t1).count()),
                     "decode",
                     device_name,
                     std::move(default_tags));
                 PerfStatsCollector::recordTimingNs(
                     "forward_graph",
-                    "segmented_replay_final_sync",
+                    replayMetricName(replay_mode, "final_sync"),
                     static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sync_t1 - sync_t0).count()),
                     "decode",
                     device_name,
-                    graphReplayHostTimingTags(replayCacheTags(segment_cache), "final_stream_sync_host_wall"));
+                    graphReplayHostTimingTags(replayCacheTags(segment_cache, replay_mode),
+                                               "final_stream_sync_host_wall",
+                                               replay_mode));
             }
         }
         collect_replay_gpu_events(/*synchronize_total_event=*/false);

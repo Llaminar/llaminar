@@ -2855,7 +2855,7 @@ TEST(Test__MTPGraphConstruction, MoESidecarGraphCacheMissesWhenMoEPlacementEpoch
     PerfStatsCollector::reset();
 }
 
-TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCapture)
+TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeFullGraphReplay)
 {
     DeviceManager::instance().initialize(-1, false);
 
@@ -2920,12 +2920,12 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
         {"kv_cache_only", "false"},
         {"path", "plain_after_build"},
         {"seq_len", "1"}};
-    const auto segmented_tags = PerfStatsCollector::Tags{
+    const auto full_graph_tags = PerfStatsCollector::Tags{
         {"context", "mtp_decode_sidecar"},
         {"depth", "0"},
         {"device_tokens", "false"},
         {"kv_cache_only", "false"},
-        {"path", "segmented"},
+        {"path", "full_graph"},
         {"seq_len", "1"}};
 
     const PerfStatRecord *plain_path = findMTPRecord(
@@ -2936,16 +2936,16 @@ TEST(Test__MTPGraphConstruction, GPUSidecarGraphCacheRunsPlainBeforeSegmentedCap
     ASSERT_NE(plain_path, nullptr);
     EXPECT_DOUBLE_EQ(plain_path->value, 1.0);
 
-    const PerfStatRecord *segmented_path = findMTPRecord(
+    const PerfStatRecord *full_graph_path = findMTPRecord(
         records,
         PerfStatRecord::Kind::Counter,
         "sidecar_graph_capture_path",
-        segmented_tags);
-    ASSERT_NE(segmented_path, nullptr);
-    EXPECT_GE(segmented_path->value, 3.0);
+        full_graph_tags);
+    ASSERT_NE(full_graph_path, nullptr);
+    EXPECT_GE(full_graph_path->value, 3.0);
 
     const auto policy_tags = PerfStatsCollector::Tags{
-        {"allow_segmented", "true"},
+        {"allow_graph_replay", "true"},
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_decode_sidecar"},
@@ -3056,29 +3056,29 @@ TEST(Test__MTPGraphConstruction, GPUDeviceTokenFirstSidecarCacheIsIndependentFro
     };
 
     const auto host_plain_tags = capture_tags("mtp_decode_sidecar", "false", "plain_after_build");
-    const auto host_segmented_tags = capture_tags("mtp_decode_sidecar", "false", "segmented");
+    const auto host_full_graph_tags = capture_tags("mtp_decode_sidecar", "false", "full_graph");
     const auto device_plain_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "plain_after_build");
-    const auto device_segmented_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "segmented");
+    const auto device_full_graph_tags = capture_tags("mtp_decode_sidecar_device_target_token", "true", "full_graph");
 
     const PerfStatRecord *host_plain = findMTPRecord(
         records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_plain_tags);
     ASSERT_NE(host_plain, nullptr);
     EXPECT_DOUBLE_EQ(host_plain->value, 1.0);
 
-    const PerfStatRecord *host_segmented = findMTPRecord(
-        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_segmented_tags);
-    ASSERT_NE(host_segmented, nullptr);
-    EXPECT_GE(host_segmented->value, 3.0);
+    const PerfStatRecord *host_full_graph = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", host_full_graph_tags);
+    ASSERT_NE(host_full_graph, nullptr);
+    EXPECT_GE(host_full_graph->value, 3.0);
 
     const PerfStatRecord *device_plain = findMTPRecord(
         records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_plain_tags);
     ASSERT_NE(device_plain, nullptr);
     EXPECT_DOUBLE_EQ(device_plain->value, 1.0);
 
-    const PerfStatRecord *device_segmented = findMTPRecord(
-        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_segmented_tags);
-    ASSERT_NE(device_segmented, nullptr);
-    EXPECT_GE(device_segmented->value, 3.0);
+    const PerfStatRecord *device_full_graph = findMTPRecord(
+        records, PerfStatRecord::Kind::Counter, "sidecar_graph_capture_path", device_full_graph_tags);
+    ASSERT_NE(device_full_graph, nullptr);
+    EXPECT_GE(device_full_graph->value, 3.0);
 
     const PerfStatRecord *host_misses = findMTPRecord(
         records,
@@ -3181,7 +3181,7 @@ TEST(Test__MTPGraphConstruction, GPUShiftedPrefillSidecarPolicyUsesShiftedPrefil
 
     const auto records = PerfStatsCollector::snapshot({"mtp"});
     const auto policy_tags = PerfStatsCollector::Tags{
-        {"allow_segmented", "true"},
+        {"allow_graph_replay", "true"},
         {"collective_segmented", "false"},
         {"collectives_graph_capturable", "false"},
         {"context", "mtp_shifted_prefill"},
@@ -4064,7 +4064,7 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
         << "A one-token forward should populate the ordinary decode graph-cache identity.";
     for (const auto &observation : observations_after_decode)
     {
-        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u)
+        EXPECT_EQ(observation.graph_replay_live_state_epoch, 0u)
             << "CPU has no segmented GPU replay stamp.";
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture)
             << "CPU replay-cache identities must not be marked stale by GPU epoch logic.";
@@ -4094,7 +4094,7 @@ TEST(Test__MTPGraphConstruction, CPUReplayObservationsTrackLiveStateEpochAcrossR
     for (const auto &observation : observations_after_redecode)
     {
         EXPECT_TRUE(observation.valid);
-        EXPECT_EQ(observation.segmented_capture_live_state_epoch, 0u);
+        EXPECT_EQ(observation.graph_replay_live_state_epoch, 0u);
         EXPECT_FALSE(observation.requires_live_state_epoch_recapture)
             << "State-versioned replay must remain a no-op for CPU graph identities.";
     }

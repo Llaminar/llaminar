@@ -303,7 +303,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsMoERebalancing)
     std::unordered_set<std::string> no_collectives;
     auto reason = cache.preflight(graph, key, &no_collectives,
                                   false, /*moe_rebalancing_active=*/true);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::ActiveMoERebalancing);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 // =============================================================================
@@ -376,8 +376,23 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
     key.device_id = dev;
 
     std::unordered_set<std::string> no_collectives;
-    auto reason = cache.preflight(graph, key, &no_collectives, false, false);
+    std::string reject_stage_name;
+    std::string reject_stage_type;
+    auto reason = cache.preflight(
+        graph,
+        key,
+        &no_collectives,
+        false,
+        false,
+        512,
+        512,
+        PrefillGraphPreflightMode::Default,
+        false,
+        &reject_stage_name,
+        &reject_stage_type);
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+    EXPECT_EQ(reject_stage_name, "bad_stage");
+    EXPECT_EQ(reject_stage_type, "GEMM");
 }
 
 // =============================================================================

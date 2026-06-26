@@ -370,7 +370,7 @@ namespace llaminar2
         }
         params_.expert_mask = mask;
         if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
-            params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask);
+            params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask, params_.layer_idx);
         else
             params_.replica_set.prefill_mask.clear();
         grouped_gateup_desc_table_id_ = -1;
@@ -430,15 +430,6 @@ namespace llaminar2
             if (completion.valid())
                 addPendingGpuDirectTransfer(std::move(completion));
             bindPreparedExpertEnginesForExperts(satisfied_expert_ids);
-            if (gpuStream() && !pending_gpu_direct_transfers_.empty())
-            {
-                if (!waitForPendingGpuDirectTransfers())
-                {
-                    LOG_ERROR("[MoEExpertComputeStage] Failed to enqueue GPU-direct transfer wait"
-                              << " for layer " << params_.layer_idx
-                              << " on " << params_.device_id.to_string());
-                }
-            }
             cached_gate_gemm_ = params_.prepared_gate_gemm;
             cached_up_gemm_ = params_.prepared_up_gemm;
             cached_down_gemm_ = params_.prepared_down_gemm;
@@ -459,6 +450,153 @@ namespace llaminar2
                       << " for layer " << params_.layer_idx);
         }
         return satisfied_expert_ids;
+    }
+
+    std::vector<int> MoEExpertComputeStage::missingPreparedExpertIds(
+        const std::vector<int> &expert_ids) const
+    {
+        std::vector<int> missing;
+        missing.reserve(expert_ids.size());
+        for (int expert_id : expert_ids)
+        {
+            if (expert_id < 0 || expert_id >= params_.num_experts)
+                continue;
+            const size_t idx = static_cast<size_t>(expert_id);
+            const bool has_all =
+                idx < params_.prepared_gate_gemm.size() &&
+                idx < params_.prepared_up_gemm.size() &&
+                idx < params_.prepared_down_gemm.size() &&
+                params_.prepared_gate_gemm[idx] &&
+                params_.prepared_up_gemm[idx] &&
+                params_.prepared_down_gemm[idx];
+            if (!has_all)
+                missing.push_back(expert_id);
+        }
+        return missing;
+    }
+
+    std::vector<int> MoEExpertComputeStage::stageExpertsGPUDirectToTransferSlotsFrom(
+        MoEExpertComputeStage &source,
+        const std::vector<int> &expert_ids,
+        void *source_producer_stream,
+        GpuDirectTransferSlotArrivals *staged_arrivals,
+        size_t active_arrival_capacity,
+        size_t staging_pool_capacity,
+        std::vector<std::shared_ptr<GpuExpertTransferStagingPool>> *transfer_staging_pools)
+    {
+        std::vector<int> satisfied_expert_ids;
+        if (staged_arrivals)
+            *staged_arrivals = GpuDirectTransferSlotArrivals{};
+        if (!source_producer_stream)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] GPU-direct transfer-slot staging requires an explicit source producer stream"
+                      << " for layer " << params_.layer_idx);
+            return satisfied_expert_ids;
+        }
+        if (!staged_arrivals)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] GPU-direct transfer-slot staging requires an output carrier"
+                      << " for layer " << params_.layer_idx);
+            return satisfied_expert_ids;
+        }
+
+        auto src_ctx = source.buildWeightContext();
+        auto dst_ctx = buildWeightContext();
+        const bool ok = MoEExpertWeightService::stageExpertsGPUDirectToTransferSlots(
+            src_ctx,
+            dst_ctx,
+            expert_ids,
+            params_.layer_idx,
+            source_producer_stream,
+            staged_arrivals,
+            &satisfied_expert_ids,
+            active_arrival_capacity,
+            staging_pool_capacity,
+            transfer_staging_pools);
+        params_.gate_slab_ref = dst_ctx.gate_slab_ref;
+        params_.up_slab_ref = dst_ctx.up_slab_ref;
+        params_.down_slab_ref = dst_ctx.down_slab_ref;
+        if (!ok && satisfied_expert_ids.empty())
+        {
+            LOG_DEBUG("[MoEExpertComputeStage] GPU-direct transfer-slot staging did not satisfy requested experts"
+                      << " for layer " << params_.layer_idx);
+        }
+        return satisfied_expert_ids;
+    }
+
+    std::vector<int> MoEExpertComputeStage::activateGpuDirectTransferSlotArrivals(
+        const GpuDirectTransferSlotArrivals &arrivals,
+        void *activation_stream,
+        GpuDirectTransferCompletion *completion_out,
+        bool retain_pending_completion)
+    {
+        std::vector<int> activated_expert_ids;
+        if (arrivals.empty())
+            return activated_expert_ids;
+        if (!activation_stream)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-slot activation requires an explicit stream"
+                      << " for layer " << params_.layer_idx);
+            return activated_expert_ids;
+        }
+
+        auto ctx = buildWeightContext();
+        GpuDirectStagedExpertArrivals activated_arrivals;
+        GpuDirectTransferCompletion completion;
+        const bool activated = MoEExpertWeightService::activateGpuDirectTransferSlotArrivals(
+            ctx,
+            arrivals,
+            activation_stream,
+            &activated_arrivals,
+            &completion);
+        params_.gate_slab_ref = ctx.gate_slab_ref;
+        params_.up_slab_ref = ctx.up_slab_ref;
+        params_.down_slab_ref = ctx.down_slab_ref;
+        if (!activated)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Failed to activate GPU-direct transfer slots"
+                      << " for layer " << params_.layer_idx
+                      << " on " << params_.device_id.to_string());
+            return activated_expert_ids;
+        }
+
+        if (completion.valid())
+            activated_arrivals.completion = completion;
+
+        if (!MoEExpertWeightService::installActivatedGpuDirectArrivals(ctx, activated_arrivals))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Failed to publish activated GPU-direct arrivals"
+                      << " for layer " << params_.layer_idx
+                      << " on " << params_.device_id.to_string());
+            return activated_expert_ids;
+        }
+
+        params_.gate_slab_ref = ctx.gate_slab_ref;
+        params_.up_slab_ref = ctx.up_slab_ref;
+        params_.down_slab_ref = ctx.down_slab_ref;
+        activated_expert_ids = activated_arrivals.expertIds();
+        if (!activated_expert_ids.empty())
+        {
+            if (completion_out)
+                *completion_out = completion;
+            if (retain_pending_completion && completion.valid())
+                addPendingGpuDirectTransfer(std::move(completion));
+            bindPreparedExpertEnginesForExperts(activated_expert_ids);
+            cached_gate_gemm_ = params_.prepared_gate_gemm;
+            cached_up_gemm_ = params_.prepared_up_gemm;
+            cached_down_gemm_ = params_.prepared_down_gemm;
+            grouped_gateup_desc_table_id_ = -1;
+            grouped_gateup_desc_table_num_experts_ = 0;
+            grouped_gateup_desc_table_d_model_ = 0;
+            grouped_gateup_desc_table_intermediate_ = 0;
+            grouped_down_desc_table_id_ = -1;
+            grouped_down_desc_table_num_experts_ = 0;
+            grouped_down_desc_table_d_model_ = 0;
+            grouped_down_desc_table_intermediate_ = 0;
+            moe_runtime_table_initialized_ = false;
+            runtime_grouped_decode_warmed_ = false;
+        }
+        return activated_expert_ids;
     }
 
     void MoEExpertComputeStage::bindPreparedExpertEnginesForExperts(
@@ -589,7 +727,7 @@ namespace llaminar2
     {
         params_.expert_mask = new_mask;
         if (params_.replica_set.num_replicated > 0 && !params_.expert_mask.empty())
-            params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask);
+            params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask, params_.layer_idx);
         else
             params_.replica_set.prefill_mask.clear();
         cached_gate_gemm_.clear();
@@ -940,7 +1078,7 @@ namespace llaminar2
                 {
                     is_local = params_.expert_mask[e];
                     if (is_local && has_replicas &&
-                        params_.replica_set.is_replicated[e] &&
+                        params_.replica_set.isReplicatedForLayer(params_.layer_idx, e) &&
                         params_.replica_set.owner_socket[e] != params_.my_socket_id)
                         is_local = false;
                 }
@@ -983,7 +1121,7 @@ namespace llaminar2
                 {
                     is_local = params_.expert_mask[expert_id];
                     if (is_local && has_replicas &&
-                        params_.replica_set.is_replicated[expert_id] &&
+                        params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id) &&
                         params_.replica_set.owner_socket[expert_id] != params_.my_socket_id)
                         is_local = false;
                 }
@@ -1119,7 +1257,7 @@ namespace llaminar2
                     is_local = params_.expert_mask[expert_id];
                     // Replicated experts: only owner socket processes during prefill
                     if (is_local && has_replicas &&
-                        params_.replica_set.is_replicated[expert_id] &&
+                        params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id) &&
                         params_.replica_set.owner_socket[expert_id] != params_.my_socket_id)
                     {
                         is_local = false;
@@ -1324,7 +1462,7 @@ namespace llaminar2
              * The first decode step after clear_cache() may initialize the
              * placement/runtime bank itself.  Treat that freshly initialized
              * bank as available for the same warmup pass so the fused runtime
-             * grouped path is warmed before segmented capture is armed.
+             * grouped path is warmed before cached graph capture is armed.
              */
             runtime_decode_bank_active_for_expert_stage =
                 moe_runtime_table_initialized_ &&
@@ -1727,7 +1865,8 @@ namespace llaminar2
                 top_k,
                 params_.my_socket_id,
                 params_.expert_mask,
-                compute_here);
+                compute_here,
+                params_.layer_idx);
         }
         else
         {
@@ -1775,7 +1914,7 @@ namespace llaminar2
                 LOG_ERROR("[MoEExpertComputeStage] FATAL: Null gate/up GEMM engine for expert "
                           << expert_id << " (layer " << params_.layer_idx
                           << ", mask=" << (params_.expert_mask.empty() ? -1 : (int)params_.expert_mask[expert_id])
-                          << ", replicated=" << params_.replica_set.is_replicated[expert_id]
+                          << ", replicated=" << params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id)
                           << ", prepared_gate=" << (bool)params_.prepared_gate_gemm[expert_id] << ")");
                 MPI_Abort(MPI_COMM_WORLD, 1);
             }
@@ -2774,20 +2913,41 @@ namespace llaminar2
             update.local_compute_mask.assign(static_cast<size_t>(params_.num_experts), 0u);
             update.replica_role.assign(static_cast<size_t>(params_.num_experts),
                                        static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+            update.resident_participant_mask.assign(static_cast<size_t>(params_.num_experts), 0u);
 
             for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
             {
                 const bool computes_locally = expertComputesLocally(expert_id);
                 const bool replicated =
-                    has_replicas && params_.replica_set.is_replicated[static_cast<size_t>(expert_id)];
+                    has_replicas && params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id);
                 int owner_participant = params_.my_socket_id;
                 if (has_replicas)
                     owner_participant = params_.replica_set.owner_socket[static_cast<size_t>(expert_id)];
+
+                uint32_t resident_mask = 0u;
+                if (owner_participant >= 0 && owner_participant < participant_count)
+                    resident_mask |= (1u << static_cast<uint32_t>(owner_participant));
+                if (replicated)
+                {
+                    for (int participant = 0; participant < participant_count; ++participant)
+                    {
+                        if (params_.replica_set.hasReplicaOnParticipant(
+                                params_.layer_idx, expert_id, participant))
+                        {
+                            resident_mask |= (1u << static_cast<uint32_t>(participant));
+                        }
+                    }
+                }
+                if (computes_locally)
+                    resident_mask |= (1u << static_cast<uint32_t>(params_.my_socket_id));
+                update.resident_participant_mask[static_cast<size_t>(expert_id)] = resident_mask;
 
                 DeviceMoEExpertDescriptor desc;
                 desc.logical_expert_id = expert_id;
                 desc.owner_participant = owner_participant;
                 desc.local_slot = computes_locally ? expert_id : -1;
+                if (replicated)
+                    desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
                 update.experts[static_cast<size_t>(expert_id)] = desc;
 
                 if (!expertComputesLocally(expert_id))
@@ -2864,6 +3024,13 @@ namespace llaminar2
             const auto mask = bank->local_compute_mask[static_cast<size_t>(expert_id)];
             if (mask != (expected_local ? 1u : 0u))
                 return false;
+            const uint32_t resident_mask =
+                bank->resident_participant_mask[static_cast<size_t>(expert_id)];
+            if (expected_local &&
+                (resident_mask & (1u << static_cast<uint32_t>(params_.my_socket_id))) == 0u)
+            {
+                return false;
+            }
 
             if (!expected_local)
                 continue;
@@ -3592,9 +3759,14 @@ namespace llaminar2
 #endif
     }
 
-    bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
+    bool MoEExpertComputeStage::supportsLazyPrefillGraphCapturePreflight() const
     {
         return supportsFixedTopologyPrefillGraphCapturePreflight();
+    }
+
+    bool MoEExpertComputeStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight();
     }
 
     StageBufferRequirements MoEExpertComputeStage::getBufferRequirements() const
@@ -4516,7 +4688,7 @@ namespace llaminar2
                params_.output;
     }
 
-    bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
+    bool SharedExpertFFNStage::supportsLazyPrefillGraphCapturePreflight() const
     {
         const bool forced_decode_replay =
             params_.force_grouped_verifier_prefill_for_decode && params_.seq_len == 1;
@@ -4529,6 +4701,11 @@ namespace llaminar2
                params_.up_w &&
                params_.down_w &&
                params_.output;
+    }
+
+    bool SharedExpertFFNStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight();
     }
 
     StageBufferRequirements SharedExpertFFNStage::getBufferRequirements() const
@@ -5150,7 +5327,7 @@ namespace llaminar2
 #endif
     }
 
-    bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const
+    bool SharedExpertGateStage::supportsLazyPrefillGraphCapturePreflight() const
     {
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 1 &&
@@ -5160,6 +5337,11 @@ namespace llaminar2
                params_.shared_output &&
                ((!params_.routed_residual && !params_.combined_output) ||
                 (params_.routed_residual && params_.combined_output));
+    }
+
+    bool SharedExpertGateStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight();
     }
 
     bool SharedExpertGateStage::supportsPaddedPrefillRealLengthContract() const

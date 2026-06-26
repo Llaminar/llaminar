@@ -639,13 +639,12 @@ namespace llaminar2
         return params_.kernel && params_.kernel->supportsPaddedPrefillRealLength();
     }
 
-    bool GDNRecurrenceStage::supportsPaddedPrefillGraphCapturePreflight() const
+    bool GDNRecurrenceStage::supportsLazyPrefillGraphCapturePreflight() const
     {
         if (params_.seq_len == 1)
             return isGraphCapturable();
 
-        if (params_.seq_len <= 1 || !params_.device_id.is_gpu() || !params_.kernel ||
-            !params_.kernel->supportsPaddedPrefillRealLength())
+        if (params_.seq_len <= 1 || !params_.device_id.is_gpu() || !params_.kernel)
             return false;
 
         if (params_.device_id.is_cuda())
@@ -667,6 +666,13 @@ namespace llaminar2
         }
 
         return false;
+    }
+
+    bool GDNRecurrenceStage::supportsPaddedPrefillGraphCapturePreflight() const
+    {
+        return supportsLazyPrefillGraphCapturePreflight() &&
+               params_.kernel &&
+               params_.kernel->supportsPaddedPrefillRealLength();
     }
 
     bool GDNRecurrenceStage::ensureGpuEffectiveSeqLenStateInitialized()

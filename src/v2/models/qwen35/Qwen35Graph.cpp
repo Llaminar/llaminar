@@ -5,6 +5,7 @@
 
 #include "Qwen35Graph.h"
 #include "Qwen35Schema.h"
+#include "../../collective/ILocalTPContext.h"
 #include "../../execution/compute_stages/ComputeStages.h"
 #include "../../execution/local_execution/graph/GraphBuildUtils.h"
 #include "../../kernels/HybridKVCacheConfig.h"
@@ -212,6 +213,58 @@ namespace llaminar2
         // initializeInferenceStateFromArena() via forEachRegistered().
         // No manual wiring needed — the schema + resolver config register
         // them, and the auto-discovery pipeline handles propagation.
+    }
+
+    bool Qwen35Graph::gdnLiveStateAllGatherAvailable(int total_tokens, DeviceId device) const
+    {
+        (void)total_tokens;
+        if (!device.is_gpu() ||
+            !config_.dense_tp_enabled ||
+            !config_.dense_tp_decode_replicated ||
+            !config_.qkv_column_parallel ||
+            !hasDecodeReplicatedDenseWeightSource() ||
+            !config_.tp_ctx ||
+            !config_.tp_ctx->isLocal())
+        {
+            return false;
+        }
+
+        const auto *local_tp = static_cast<const ILocalTPContext *>(config_.tp_ctx);
+        if (local_tp->degree() <= 1)
+            return false;
+        const auto backend = local_tp->backend();
+        if (backend != CollectiveBackendType::NCCL &&
+            backend != CollectiveBackendType::RCCL)
+        {
+            return false;
+        }
+        const int degree = local_tp->degree();
+
+        const int n_k_heads_full = config_.gdn.group_count > 0
+                                       ? config_.gdn.group_count
+                                       : config_.n_heads;
+        const int n_v_heads_full = config_.gdn.time_step_rank > 0
+                                       ? config_.gdn.time_step_rank
+                                       : n_k_heads_full;
+        if (config_.local_n_heads <= 0 ||
+            config_.n_heads <= 0 ||
+            config_.local_n_heads >= config_.n_heads ||
+            config_.n_heads % degree != 0 ||
+            config_.local_n_heads != config_.n_heads / degree ||
+            n_v_heads_full % degree != 0)
+        {
+            return false;
+        }
+
+        if (n_v_heads_full <= 0 ||
+            n_k_heads_full <= 0 ||
+            config_.gdn.state_size <= 0 ||
+            config_.gdn.conv_kernel_size <= 1)
+        {
+            return false;
+        }
+
+        return true;
     }
 
     // =========================================================================
@@ -708,11 +761,14 @@ namespace llaminar2
                 ? prefix
                 : prefix.substr(0, prefix.size() - 1);
         int total_tokens = batch_size * seq_len;
+        const bool live_state_allgather_available =
+            gdnLiveStateAllGatherAvailable(total_tokens, device);
         const bool keep_gdn_state_tp_local =
             useDecodeReplicatedDenseWeights() &&
             config_.dense_tp_decode_replicated &&
             config_.qkv_column_parallel &&
-            weight_bindings_.get_layer_weights != nullptr;
+            weight_bindings_.get_layer_weights != nullptr &&
+            !live_state_allgather_available;
 
         LayerWeightBindings layer_bindings = keep_gdn_state_tp_local
                                                  ? weight_bindings_.get_layer_weights(layer_idx)
@@ -952,6 +1008,51 @@ namespace llaminar2
                       device);
         graph.addDependency(prefix + "gdn_recurrence", prefix + "short_conv");
 
+        std::string gdn_state_ready_node = prefix + "gdn_recurrence";
+        if (total_tokens > 1 && live_state_allgather_available)
+        {
+            const int full_key_dim = n_k_heads_full * d_k;
+            const int full_value_dim = config_.gdn.inner_size > 0
+                                           ? config_.gdn.inner_size
+                                           : n_v_heads_full * d_v;
+            const int full_qkv_dim = 2 * full_key_dim + full_value_dim;
+            const int conv_history_len = std::max(0, config_.gdn.conv_kernel_size - 1);
+            const bool modular_conv_state =
+                n_v_heads_full > n_k_heads_full &&
+                n_k_heads == n_k_heads_full &&
+                n_v_heads < n_v_heads_full;
+            GDNLiveStateAllGatherStage::Params state_gather_params;
+            state_gather_params.device_id = device;
+            state_gather_params.tp_ctx = static_cast<ILocalTPContext *>(config_.tp_ctx);
+            state_gather_params.conv_kernel = gdn_state->conv_kernel.get();
+            state_gather_params.recurrence_kernel = gdn_state->rec_kernel.get();
+            state_gather_params.layer_idx = layer_idx;
+            state_gather_params.tp_device_idx = config_.tp_device_idx;
+            state_gather_params.local_conv_state_floats =
+                qkv_dim * conv_history_len;
+            state_gather_params.full_conv_state_floats =
+                full_qkv_dim * conv_history_len;
+            state_gather_params.modular_conv_state = modular_conv_state;
+            if (modular_conv_state)
+            {
+                state_gather_params.conv_history_len = conv_history_len;
+                state_gather_params.conv_qk_channels = 2 * full_key_dim;
+                state_gather_params.conv_local_v_channels = value_dim;
+                state_gather_params.conv_full_v_channels = full_value_dim;
+            }
+            state_gather_params.local_recurrence_state_floats =
+                n_v_heads * d_k * d_v;
+            state_gather_params.full_recurrence_state_floats =
+                n_v_heads_full * d_k * d_v;
+            state_gather_params.stage_name = prefix + "gdn_live_state_allgather";
+
+            graph.addNode(prefix + "gdn_live_state_allgather",
+                          ComputeStageFactory::createGDNLiveStateAllGather(state_gather_params),
+                          device);
+            graph.addDependency(prefix + "gdn_live_state_allgather", prefix + "gdn_recurrence");
+            gdn_state_ready_node = prefix + "gdn_live_state_allgather";
+        }
+
         // =====================================================================
         // Stage 5: Gated RMSNorm — RMSNorm(output) * SiLU(Z)
         // =====================================================================
@@ -975,7 +1076,7 @@ namespace llaminar2
         graph.addNode(prefix + "gated_norm",
                       ComputeStageFactory::createGatedRMSNorm(gnorm_params),
                       device);
-        graph.addDependency(prefix + "gated_norm", prefix + "gdn_recurrence");
+        graph.addDependency(prefix + "gated_norm", gdn_state_ready_node);
 
         // =====================================================================
         // Stage 6: Output Projection (Wo GEMM) + optional TP AllReduce

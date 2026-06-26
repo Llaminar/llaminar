@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <functional>
@@ -248,8 +249,12 @@ namespace llaminar2
          * Call this BEFORE reading output.data for verification/dumping.
          * This is a deferred sync - outputs are NOT synced in addOutput().
          * This allows GPU kernels to run async without blocking.
+         *
+         * GPU-backed outputs that need a device-to-host publication require the
+         * producer stream. Passing null for those outputs is a programming error:
+         * the graph executor must thread the stage stream through explicitly.
          */
-        void ensureOutputsOnHost() const;
+        void ensureOutputsOnHost(void *stream = nullptr) const;
     };
 
     /**
@@ -337,6 +342,7 @@ namespace llaminar2
         GDN_PROJECTION,        ///< 4 separate GEMMs: in_proj_qkv, in_proj_z, in_proj_a, in_proj_b
         SHORT_CONV1D,          ///< Causal depthwise conv1d (kernel=4) + SiLU
         GDN_RECURRENCE,        ///< Delta rule recurrence (chunk prefill, single-step decode)
+        GDN_LIVE_STATE_ALLGATHER, ///< Gather TP-local GDN state into mirrored decode state
 
         // Qwen 3.5 FA-specific
         Q_GATE_SPLIT, ///< Split interleaved Q+gate GEMM output into separate buffers
@@ -470,6 +476,7 @@ namespace llaminar2
          */
         const StageDumpInfo &getDumpInfo() const
         {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
             if (!dump_info_cached_)
             {
                 cached_dump_info_ = buildDumpInfoImpl();
@@ -479,11 +486,47 @@ namespace llaminar2
         }
 
         /**
+         * @brief Return a stable copy of cached dump info.
+         *
+         * Use this in executor/debug paths that pass StageDumpInfo across
+         * callbacks, stream waits, async dump queues, or other code that should
+         * not observe a concurrent cache refresh.
+         */
+        StageDumpInfo getDumpInfoSnapshot() const
+        {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
+            if (!dump_info_cached_)
+            {
+                cached_dump_info_ = buildDumpInfoImpl();
+                dump_info_cached_ = true;
+            }
+            return cached_dump_info_;
+        }
+
+        /**
+         * @brief Rebuild dump info under the cache lock and return a stable copy.
+         *
+         * Post-execute debug consumers use this when stages may have populated
+         * outputs or diagnostic tensors during execute().
+         */
+        StageDumpInfo refreshDumpInfoSnapshot() const
+        {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
+            cached_dump_info_ = buildDumpInfoImpl();
+            dump_info_cached_ = true;
+            return cached_dump_info_;
+        }
+
+        /**
          * @brief Invalidate cached dump info (for dynamic reconfiguration)
          *
          * Call this if stage parameters change after construction (rare).
          */
-        void invalidateDumpInfoCache() const { dump_info_cached_ = false; }
+        void invalidateDumpInfoCache() const
+        {
+            std::lock_guard<std::mutex> lock(dump_info_mutex_);
+            dump_info_cached_ = false;
+        }
 
         /**
          * @brief Get buffer requirements for this stage
@@ -972,20 +1015,33 @@ namespace llaminar2
         virtual bool supportsPaddedPrefillRealLengthContract() const { return false; }
 
         /**
-         * @brief Whether cold padded-prefill graph preflight may allow this stage.
+         * @brief Whether cold prefill graph preflight may allow this stage.
          *
-         * Padded bucket preflight can run before the first normal warmup pass,
-         * while some stages intentionally allocate kernels, descriptor tables,
-         * or scratch buffers during that warmup. Such stages should return true
-         * here when their backend and shape support fixed-bucket prefill capture
-         * in principle, and keep isGraphCapturable() as the stricter
-         * capture-time readiness check.
+         * Cold preflight runs before the first normal warmup pass, while some
+         * stages intentionally allocate backend state, descriptor tables, or
+         * scratch buffers during that warmup. Such stages should return true
+         * here when their backend and shape support prefill capture in
+         * principle, and keep isGraphCapturable() as the stricter capture-time
+         * readiness check.
          *
          * The default preserves legacy behavior for existing stages: if a stage
-         * has no separate cold-support contract, padded preflight still requires
-         * normal graph-capture readiness.
+         * has no separate cold-support contract, preflight still requires normal
+         * graph-capture readiness.
          */
-        virtual bool supportsPaddedPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
+        virtual bool supportsLazyPrefillGraphCapturePreflight() const { return isGraphCapturable(); }
+
+        /**
+         * @brief Whether cold padded-prefill graph preflight may allow this stage.
+         *
+         * Padded buckets also require supportsPaddedPrefillRealLengthContract()
+         * to ensure recurrent state commits only the real prompt prefix. Stages
+         * may override this when the padded fixed-bucket contract differs from
+         * exact-shape prefill support.
+         */
+        virtual bool supportsPaddedPrefillGraphCapturePreflight() const
+        {
+            return supportsLazyPrefillGraphCapturePreflight();
+        }
 
         /**
          * @brief Prepare mutable device metadata before a captured graph launch.
@@ -1338,6 +1394,7 @@ namespace llaminar2
         // Cached dump info (built once, reused for all subsequent calls)
         mutable StageDumpInfo cached_dump_info_;
         mutable bool dump_info_cached_ = false;
+        mutable std::mutex dump_info_mutex_;
 
         static bool shapesMatch(const std::vector<size_t> &actual,
                                 const std::vector<size_t> &expected,

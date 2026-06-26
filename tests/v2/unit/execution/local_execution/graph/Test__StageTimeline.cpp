@@ -60,6 +60,13 @@ namespace
         void *defaultStream() override { return &fake_stream_; }
         void *createStream() override { return &fake_stream_; }
         void destroyStream(void *) override {}
+        void *getOrCreateAuxiliaryStream(const std::string &, bool *created = nullptr) override
+        {
+            if (created)
+                *created = false;
+            return &fake_auxiliary_stream_;
+        }
+        void resetAuxiliaryStreams() override {}
 
         void *createEvent() override
         {
@@ -123,6 +130,7 @@ namespace
 
     private:
         int fake_stream_ = 0;
+        int fake_auxiliary_stream_ = 0;
     };
 
     class ScopedEnv

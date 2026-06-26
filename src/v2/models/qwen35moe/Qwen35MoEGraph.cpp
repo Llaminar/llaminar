@@ -1338,12 +1338,16 @@ namespace llaminar2
             // runtime-table router as serial decode, so build the table even
             // when grouped prefill is disabled; otherwise the strict verifier
             // row proof would fail closed before reaching the rows under test.
+            // This table is prefill-only. It must not register as a decode
+            // histogram source, because hot-cache overlay decode may use the
+            // legacy host histogram path and never publish a runtime-table
+            // decode producer stream.
             moe_runtime_table = moeRuntimeTableForDevice(
                 device,
                 0,
                 runtime_table_suffix,
                 runtime_table_layers,
-                register_runtime_histogram);
+                /*register_decode_histogram=*/false);
         }
 
         // =====================================================================

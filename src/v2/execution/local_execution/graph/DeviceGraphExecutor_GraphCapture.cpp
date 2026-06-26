@@ -7,7 +7,7 @@
  * - GraphSegmentCache resource management (streams, events)
  * - executeWithGraphCapture (single-graph capture/replay)
  * - executeDecodeWithCapturePolicy (policy-based mode selection)
- * - executeWithSegmentedGraphCapture (segmented capture/replay)
+ * - executeWithCachedGraphReplay (cached graph replay)
  */
 
 #include "DeviceGraphExecutor.h"
@@ -273,7 +273,7 @@ namespace llaminar2
 
         // Step 2: Execute all stages into the captured stream
         // Set GPU device once before the loop (same as executeFastDecode)
-        DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+        DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
         bool exec_success = true;
 
@@ -388,11 +388,11 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         const std::unordered_set<std::string> *collective_nodes,
         const DecodeCapturePolicy &policy,
-        bool *used_segmented_capture)
+        bool *used_graph_replay)
     {
-        if (used_segmented_capture)
+        if (used_graph_replay)
         {
-            *used_segmented_capture = false;
+            *used_graph_replay = false;
         }
 
         if (!policy.allow_fast_decode)
@@ -401,7 +401,7 @@ namespace llaminar2
         }
 
         const bool segmented_ready =
-            policy.allow_segmented_capture &&
+            policy.allow_cached_graph_replay &&
             segment_cache &&
             gpu_stream &&
             gpu_ctx &&
@@ -409,7 +409,7 @@ namespace llaminar2
 
         if (segmented_ready)
         {
-            bool success = executeWithSegmentedGraphCapture(
+            bool success = executeWithCachedGraphReplay(
                 graph,
                 ctx,
                 *segment_cache,
@@ -422,14 +422,19 @@ namespace llaminar2
 
             if (success)
             {
-                if (used_segmented_capture)
+                if (used_graph_replay)
                 {
-                    *used_segmented_capture = true;
+                    *used_graph_replay = true;
                 }
                 return true;
             }
 
-            LOG_WARN("[DeviceGraphExecutor] Segmented replay failed under policy, falling back to fast decode");
+            const char *mode_name =
+                segment_cache->initialized
+                    ? DeviceGraphCaptureController::replayModeName(*segment_cache)
+                    : "graph_replay";
+            LOG_WARN("[DeviceGraphExecutor] " << mode_name
+                                              << " failed under policy, falling back to fast decode");
             graph.reset();
             return executeFastDecode(graph, ctx, collective_nodes);
         }
@@ -438,10 +443,10 @@ namespace llaminar2
     }
 
     // =========================================================================
-    // Segmented GPU Graph Capture/Replay
+    // Cached GPU Graph Replay
     // =========================================================================
 
-    bool DeviceGraphExecutor::executeWithSegmentedGraphCapture(ComputeGraph &graph, IDeviceContext *ctx,
+    bool DeviceGraphExecutor::executeWithCachedGraphReplay(ComputeGraph &graph, IDeviceContext *ctx,
                                                                GraphSegmentCache &segment_cache,
                                                                void *gpu_stream,
                                                                IWorkerGPUContext *gpu_ctx,
@@ -452,7 +457,7 @@ namespace llaminar2
     {
         if (!gpu_stream || !gpu_ctx)
         {
-            LOG_WARN("[DeviceGraphExecutor] Segmented graph capture: missing stream or gpu_ctx, falling back");
+            LOG_WARN("[DeviceGraphExecutor] GPU graph capture/replay: missing stream or gpu_ctx, falling back");
             return executeFastDecode(graph, ctx);
         }
 
@@ -463,12 +468,12 @@ namespace llaminar2
         if (segment_cache.initialized &&
             segment_cache.capture_variant_signature != current_variant_signature)
         {
-            LOG_DEBUG("[DeviceGraphExecutor] Segmented graph launch-topology variant changed from "
+            LOG_DEBUG("[DeviceGraphExecutor] GPU graph launch-topology variant changed from "
                       << segment_cache.capture_variant_signature << " to "
                       << current_variant_signature << "; recapturing");
             PerfStatsCollector::addCounter(
                 "forward_graph",
-                "decode_segmented_variant_recapture",
+                "decode_graph_variant_recapture",
                 1.0,
                 "decode",
                 ctx ? ctx->deviceId().toString() : std::string{},
@@ -503,14 +508,6 @@ namespace llaminar2
             phase_name = "replay";
             break;
         }
-        PerfStatsCollector::addCounter(
-            "forward_graph",
-            "decode_segmented_phase",
-            1.0,
-            "decode",
-            ctx ? ctx->deviceId().toString() : std::string{},
-            {{"context", segment_cache.perf_context},
-             {"phase", phase_name}});
         PerfStatsCollector::addCounter(
             "forward_graph",
             "decode_graph_phase",
@@ -551,7 +548,7 @@ namespace llaminar2
         if (phase_transition.phase == DeviceGraphCaptureController::Phase::Replay &&
             !replay_diagnostics_enabled)
         {
-            DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+            DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
             DeviceGraphCaptureController::ReplayHooks fast_hooks{
                 nullptr, // cohere_inputs — skipped during normal replay (skip_coherence=true)
@@ -582,7 +579,7 @@ namespace llaminar2
                     segment_cache.consecutive_failures++;
                     if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
                     {
-                        LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
+                        LOG_WARN("[DeviceGraphExecutor] Too many GPU graph replay failures, disabling");
                         segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
                     }
                     graph.reset();
@@ -649,8 +646,8 @@ namespace llaminar2
                 node.weights_cohered = true;
             }
 
-            // Cohere arena-managed writes (outputs + inouts)
-            for (const auto &binding : contract.allWrites())
+            // Cohere arena-managed writes that require fresh storage.
+            for (const auto &binding : contract.writesRequiringPrepare())
             {
                 if (!arena_->prepareForWrite(binding.id, target_device))
                 {
@@ -673,7 +670,7 @@ namespace llaminar2
                 });
         };
 
-        DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+        DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
             [&](const GraphSegment &segment)
@@ -724,7 +721,7 @@ namespace llaminar2
                     segment_cache.consecutive_failures++;
                     if (segment_cache.consecutive_failures >= GraphSegmentCache::kMaxFailures)
                     {
-                        LOG_WARN("[DeviceGraphExecutor] Too many segmented graph failures, disabling");
+                        LOG_WARN("[DeviceGraphExecutor] Too many GPU graph replay failures, disabling");
                         segment_cache.reset(GraphSegmentCache::StreamResetPolicy::Preserve);
                     }
                     graph.reset();
@@ -829,7 +826,7 @@ namespace llaminar2
 
         // Phase 3 is handled by the fast path above; this point is unreachable
         // after Phase 1 and Phase 2 both early-return.
-        LOG_ERROR("[DeviceGraphExecutor] Unexpected phase in segmented graph capture");
+        LOG_ERROR("[DeviceGraphExecutor] Unexpected phase in GPU graph capture/replay");
         return false;
     }
 

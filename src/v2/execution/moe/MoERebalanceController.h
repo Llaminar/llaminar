@@ -24,16 +24,26 @@
 namespace llaminar2
 {
 
-    /// Describes which experts are replicated across sockets.
-    /// Both sockets have GEMM engines for replicated experts;
-    /// per-token dynamic dispatch decides which socket computes each one.
+    /// Describes resident hot-expert replicas in an ExpertParallel domain.
+    ///
+    /// Base ownership stays in owner_socket: exactly one participant owns each
+    /// routed expert id.  Hot replicas are additional resident copies.  The
+    /// preferred representation is layer/expert/participant placement so an
+    /// expert hot in one layer does not implicitly become resident in every
+    /// layer.  The aggregate is_replicated vector is maintained as a compact
+    /// "has any replica anywhere" mirror for older call sites and diagnostics.
     struct ExpertReplicaSet
     {
-        std::string domain_id;          ///< ExpertParallel domain this replica set belongs to.
-        std::vector<bool> is_replicated; ///< [num_experts] true if on both sockets
-        std::vector<int> owner_socket;   ///< [num_experts] primary owner socket
-        int num_replicated = 0;          ///< Count of replicated experts
-        int num_sockets = 0;             ///< Cached socket count (computed once from owner_socket)
+        std::string domain_id;           ///< ExpertParallel domain this replica set belongs to.
+        std::vector<bool> is_replicated; ///< [num_experts] true if any layer has a non-owner replica.
+        std::vector<int> owner_socket;   ///< [num_experts] primary owner participant.
+        int num_replicated = 0;          ///< Count of resident replica slots, or aggregate experts for legacy sets.
+        int num_sockets = 0;             ///< Cached participant count (computed once from owner_socket).
+
+        /// [layer][expert][participant] true when participant has a non-owner
+        /// resident replica for that layer/expert. Owner residency is implicit
+        /// through owner_socket and must not be represented here.
+        std::vector<std::vector<std::vector<bool>>> replica_participants_by_layer;
 
         /// Pre-built prefill mask: expert_mask[e] && ownership check baked in.
         /// When non-empty, prefill path uses this single-lookup mask instead of
@@ -43,7 +53,16 @@ namespace llaminar2
 
         /// Build prefill mask from expert_mask + ownership for a specific socket.
         /// Call after rebalance when masks and owner_socket are finalized.
-        void buildPrefillMask(int my_socket_id, const std::vector<bool> &expert_mask);
+        void buildPrefillMask(
+            int my_socket_id,
+            const std::vector<bool> &expert_mask,
+            int layer_idx = -1);
+
+        bool hasLayerReplicaPlacement() const;
+        bool hasReplicaOnParticipant(int layer_idx, int expert_id, int participant_id) const;
+        bool isReplicatedForLayer(int layer_idx, int expert_id) const;
+        void setReplicaOnParticipant(int layer_idx, int expert_id, int participant_id, bool enabled = true);
+        void rebuildAggregateReplicaFlags();
 
         /// Compare replica placement only. Socket-specific prefill_mask is ignored.
         bool sameReplicaPlacement(const ExpertReplicaSet &other) const;
@@ -70,7 +89,8 @@ namespace llaminar2
             int top_k,
             int my_socket_id,
             const std::vector<bool> &expert_mask,
-            bool *compute_here) const;
+            bool *compute_here,
+            int layer_idx = -1) const;
     };
 
 } // namespace llaminar2 (forward decl block)
@@ -115,8 +135,8 @@ namespace llaminar2
             int window_size = 256;
             int max_window_size = 4096;                ///< Cap for adaptive growth (0 = no adaptive growth)
             float window_growth_factor = 1.5f;         ///< Multiply window_size by this after each rebalance
-            int max_replicas = 0;                      ///< Max experts to replicate per socket (0 = disabled)
-            std::vector<DeviceId> sockets;             ///< e.g. {cpu:0, cpu:1}
+        int max_replicas = 0;                      ///< Max replica slots per participant (0 = disabled)
+        std::vector<DeviceId> sockets;             ///< Domain participants, e.g. {cpu:0, cpu:1}
             std::vector<int> initial_expert_to_socket; ///< [num_experts]
             SocketRebalanceConfig rebalance_config;
         };
@@ -174,7 +194,7 @@ namespace llaminar2
         /// Get routed experts selected per token
         int topK() const { return config_.top_k; }
 
-        /// Get max hot expert replicas per socket/rank.
+        /// Get max hot expert replica slots per participant/rank.
         int maxReplicasPerSocket() const { return config_.max_replicas; }
 
         /// Get total rebalances performed
@@ -209,7 +229,7 @@ namespace llaminar2
         /// Includes: histogram stats, rebalance timing, expert movement counts.
         std::string getProfilingSummary() const;
 
-        /// Compute per-layer expert masks for a given socket/rank.
+        /// Compute per-layer expert masks for a given participant/rank.
         /// Returns a vector of num_layers expert masks (each size num_experts).
         /// expert_mask[layer][expert] == true means this rank computes that expert.
         /// After rebalanceLPT(), uses per-layer placement. Otherwise uses global placement.
@@ -230,10 +250,9 @@ namespace llaminar2
         std::vector<std::vector<std::vector<bool>>> computeGpuCacheExpertMasks(
             int gpu_cache_experts_per_layer) const;
 
-        /// Propose experts to replicate across sockets based on histogram data.
-        /// Identifies the top-N hottest experts on each socket and proposes
-        /// replicating them on the other socket. max_replicas_per_socket controls
-        /// how many experts each socket gets as replicas.
+        /// Propose layer/expert replica slots based on histogram data.
+        /// For each participant, chooses hot layer/expert slots owned by other
+        /// participants, up to max_replicas_per_socket slots for that target.
         /// Returns empty set if no replicas are beneficial.
         ExpertReplicaSet proposeReplicas(int max_replicas_per_socket);
 
@@ -255,7 +274,10 @@ namespace llaminar2
         void syncReplicaPlacement()
         {
             if (current_replicas_.num_replicated > 0)
+            {
                 current_replicas_.owner_socket = current_placement_;
+                current_replicas_.rebuildAggregateReplicaFlags();
+            }
         }
 
     private:

@@ -1156,17 +1156,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, ClearCachePreservesReplaySafeMTPGraphCa
     EXPECT_NE(clear_cache_body.find(
                   "forward_engine_->resetSessionReplayState(true);"),
               std::string::npos)
-        << "clear_cache() must preserve replay-safe segmented forward captures.";
+        << "clear_cache() must preserve replay-safe cached forward graph captures.";
     EXPECT_NE(clear_cache_body.find(
-                  "mtp_sidecar_depth0_cache_.resetSessionStatePreservingSegmentedReplay();"),
+                  "mtp_sidecar_depth0_cache_.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
         << "The ordinary MTP sidecar cache should stay replay-hot across requests.";
     EXPECT_NE(clear_cache_body.find(
-                  "mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingSegmentedReplay();"),
+                  "mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
         << "Device-token sidecar replay is the served stochastic path and must not recapture every request.";
     EXPECT_NE(clear_cache_body.find(
-                  "cache.resetSessionStatePreservingSegmentedReplay();"),
+                  "cache.resetSessionStatePreservingGraphReplay();"),
               std::string::npos)
         << "Batched KV-only sidecar caches must use the same replay-preserving request reset.";
     EXPECT_EQ(clear_cache_body.find(

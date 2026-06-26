@@ -57,10 +57,17 @@ static __global__ void fp32_peer_add_kernel(float *__restrict__ dst,
 extern "C"
 {
     cudaError_t cudaCastFP32ToFP16(const float *fp32_input, void *fp16_output,
-                                   size_t count, cudaStream_t stream)
+                                   size_t count, int ordinal, cudaStream_t stream)
     {
         if (count == 0)
             return cudaSuccess;
+        if (!fp32_input || !fp16_output || !stream)
+            return cudaErrorInvalidValue;
+
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return err;
+        (void)cudaGetLastError();
 
         constexpr int BLOCK_SIZE = 256;
         const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -72,10 +79,17 @@ extern "C"
     }
 
     cudaError_t cudaCastFP16ToFP32(const void *fp16_input, float *fp32_output,
-                                   size_t count, cudaStream_t stream)
+                                   size_t count, int ordinal, cudaStream_t stream)
     {
         if (count == 0)
             return cudaSuccess;
+        if (!fp16_input || !fp32_output || !stream)
+            return cudaErrorInvalidValue;
+
+        cudaError_t err = cudaSetDevice(ordinal);
+        if (err != cudaSuccess)
+            return err;
+        (void)cudaGetLastError();
 
         constexpr int BLOCK_SIZE = 256;
         const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);

@@ -79,6 +79,42 @@ namespace llaminar2
                               src.mins_bytes, src.emins_bytes, stream);
     }
 
+    bool GPUExpertTransfer::activateStagedExpert(
+        const GpuExpertPackedDescriptor &staged,
+        const GpuExpertPackedDescriptor &active,
+        const DeviceId &device,
+        void *stream)
+    {
+        return transferExpert(staged, active, device, device, stream);
+    }
+
+    bool GPUExpertTransfer::activateStagedExperts(
+        const std::vector<GpuExpertStagedActivation> &activations,
+        const DeviceId &device,
+        void *stream)
+    {
+        if (activations.empty())
+            return true;
+        if (!stream)
+        {
+            LOG_ERROR("[GPUExpertTransfer] Refusing staged expert activation batch on nullptr stream");
+            return false;
+        }
+
+        for (const auto &activation : activations)
+        {
+            if (!activateStagedExpert(
+                    activation.staged,
+                    activation.active,
+                    device,
+                    stream))
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool GPUExpertTransfer::canAccessPeer(const DeviceId &src_device, const DeviceId &dst_device)
     {
         if (src_device == dst_device)

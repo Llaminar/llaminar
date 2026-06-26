@@ -43,7 +43,7 @@ namespace llaminar2
         using namespace verification;
 
         const auto &validation = debugEnv().validation;
-        auto dump_info = node.stage->getDumpInfo();
+        StageDumpInfo dump_info = node.stage->getDumpInfoSnapshot();
 
         // Build verification config from global settings
         VerificationConfig vconfig;
@@ -137,7 +137,7 @@ namespace llaminar2
         using namespace verification;
 
         const auto &validation = debugEnv().validation;
-        auto dump_info = node.stage->getDumpInfo();
+        StageDumpInfo dump_info = node.stage->getDumpInfoSnapshot();
 
         // Build verification config from global settings
         VerificationConfig vconfig;
@@ -154,7 +154,7 @@ namespace llaminar2
 
         // Verify all outputs (NaN/Inf/null checks)
         // IMPORTANT: Sync outputs from GPU BEFORE reading data
-        dump_info.ensureOutputsOnHost();
+        dump_info.ensureOutputsOnHost(node.stage->gpuStream());
 
         for (const auto &output : dump_info.outputs)
         {
@@ -244,7 +244,7 @@ namespace llaminar2
         // NOTE: We intentionally access getDumpInfo() here even though it may trigger
         // GPU→host sync, because we only call this in Debug/Integration builds anyway.
         // The StageDumpInfo provides tensor pointers that we can use for GPU validation.
-        auto dump_info = node.stage->getDumpInfo();
+        StageDumpInfo dump_info = node.stage->getDumpInfoSnapshot();
         const bool zero_output_allowed = node.stage->allowsZeroOutput();
 
         bool all_valid = true;
@@ -333,7 +333,7 @@ namespace llaminar2
             {
                 if (auto *cpu_tensor = dynamic_cast<TensorBase *>(output.tensor))
                 {
-                    cpu_tensor->ensureOnHost();
+                    cpu_tensor->ensureOnHost(node.stage->gpuStream());
                 }
             }
             if (!output.data)

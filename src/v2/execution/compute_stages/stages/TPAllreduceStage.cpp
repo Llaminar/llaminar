@@ -23,6 +23,8 @@ namespace llaminar2
 {
     namespace
     {
+        constexpr const char *kDefaultAllreducePrecision = "fp32";
+
         const char *allreduceRoleForStage(const std::string &stage_name)
         {
             if (stage_name.find("embedding") != std::string::npos)
@@ -55,7 +57,7 @@ namespace llaminar2
 
         std::string requestedTransportPrecision(const TPAllreduceParams &params)
         {
-            return params.precision.empty() ? debugEnv().allreduce_precision : params.precision;
+            return params.precision.empty() ? std::string(kDefaultAllreducePrecision) : params.precision;
         }
 
         std::string effectiveTransportPrecision(
@@ -229,6 +231,7 @@ namespace llaminar2
         // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size)
         bool success;
         void *stage_stream = gpuStream();
+        const std::string transport_precision = requestedTransportPrecision(params_);
         const bool gpu_stage =
             params_.device_id.is_gpu() || (ctx && ctx->isGPU());
         if (gpu_stage)
@@ -242,7 +245,7 @@ namespace llaminar2
             }
             success = params_.tp_ctx->allreduceOnStream(
                 params_.tensor, params_.stage_name, effective_count, stage_stream,
-                params_.precision);
+                transport_precision);
         }
         else if (!params_.stage_name.empty())
         {
@@ -252,7 +255,7 @@ namespace llaminar2
             {
                 success = params_.tp_ctx->allreduceOnStream(
                     params_.tensor, params_.stage_name, effective_count, stage_stream,
-                    params_.precision);
+                    transport_precision);
             }
             else
             {
@@ -348,7 +351,7 @@ namespace llaminar2
             return {};
 
         return StageBufferContract::build()
-            .addInOut(*params_.tensor_buffer_id);
+            .addPreallocatedInOut(*params_.tensor_buffer_id);
     }
 
     void TPAllreduceStage::setParams(const Params &params)

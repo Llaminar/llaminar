@@ -58,6 +58,7 @@ namespace
         DeviceMoEExpertDescriptorView experts[kDeviceMoEMaxExperts];
         uint8_t local_compute_mask[kDeviceMoEMaxExperts];
         uint8_t replica_role[kDeviceMoEMaxExperts];
+        uint32_t resident_participant_mask[kDeviceMoEMaxExperts];
         uint32_t epoch;
         uint32_t expert_count;
         uint32_t reserved[2];
@@ -116,6 +117,117 @@ namespace
         int expert_id)
     {
         return bank.experts[expert_id].owner_participant;
+    }
+
+    __device__ __forceinline__ uint32_t runtime_participant_bit(int participant)
+    {
+        return 1u << static_cast<uint32_t>(participant);
+    }
+
+    __device__ __forceinline__ uint32_t runtime_valid_participant_mask(uint32_t participant_count)
+    {
+        return (1u << participant_count) - 1u;
+    }
+
+    __device__ __forceinline__ uint32_t runtime_expert_resident_mask(
+        const DeviceMoELayerRuntimeView *runtime,
+        const DeviceMoEPlacementBankView &bank,
+        int expert_id)
+    {
+        const uint32_t participant_count = runtime->participant_count;
+        uint32_t mask = bank.resident_participant_mask[expert_id] &
+                        runtime_valid_participant_mask(participant_count);
+        const int owner = runtime_expert_owner(bank, expert_id);
+        if (owner >= 0 && owner < static_cast<int>(participant_count))
+            mask |= runtime_participant_bit(owner);
+        if (bank.local_compute_mask[expert_id] != 0u &&
+            runtime->participant_id < participant_count)
+        {
+            mask |= runtime_participant_bit(static_cast<int>(runtime->participant_id));
+        }
+        return mask;
+    }
+
+    __device__ __forceinline__ int runtime_resident_count(
+        uint32_t resident_mask,
+        uint32_t participant_count)
+    {
+        int count = 0;
+        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
+        {
+            if ((resident_mask & runtime_participant_bit(participant)) != 0u)
+                ++count;
+        }
+        return count;
+    }
+
+    __device__ __forceinline__ int runtime_nth_resident_participant(
+        uint32_t resident_mask,
+        uint32_t participant_count,
+        int ordinal)
+    {
+        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
+        {
+            if ((resident_mask & runtime_participant_bit(participant)) == 0u)
+                continue;
+            if (ordinal == 0)
+                return participant;
+            --ordinal;
+        }
+        return -1;
+    }
+
+    __device__ __forceinline__ uint64_t runtime_same_expert_prior_occurrences(
+        const int *selected_experts,
+        int selected_slot,
+        int expert_id)
+    {
+        uint64_t occurrences = 0;
+        for (int slot = 0; slot < selected_slot; ++slot)
+        {
+            if (selected_experts[slot] == expert_id)
+                ++occurrences;
+        }
+        return occurrences;
+    }
+
+    __device__ __forceinline__ int runtime_choose_replicated_participant(
+        const DeviceMoELayerRuntimeView *runtime,
+        const DeviceMoEPlacementBankView &bank,
+        const int *selected_experts,
+        int selected_slot,
+        int expert_id,
+        const int *load)
+    {
+        const uint32_t participant_count = runtime->participant_count;
+        const uint32_t resident_mask =
+            runtime_expert_resident_mask(runtime, bank, expert_id);
+        const int resident_count = runtime_resident_count(resident_mask, participant_count);
+        if (resident_count <= 0)
+            return -1;
+
+        const uint64_t turn =
+            runtime->decode_histogram[expert_id] +
+            runtime_same_expert_prior_occurrences(selected_experts, selected_slot, expert_id);
+        const int preferred =
+            runtime_nth_resident_participant(
+                resident_mask,
+                participant_count,
+                static_cast<int>(turn % static_cast<uint64_t>(resident_count)));
+
+        int best = -1;
+        for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
+        {
+            if ((resident_mask & runtime_participant_bit(participant)) == 0u)
+                continue;
+            if (best < 0 ||
+                load[participant] < load[best] ||
+                (load[participant] == load[best] && participant == preferred))
+            {
+                best = participant;
+            }
+        }
+        return best;
     }
 
     __device__ __forceinline__ bool runtime_selected_slot_local_compute(
@@ -182,15 +294,11 @@ namespace
             if (owner < 0 || owner >= static_cast<int>(participant_count))
                 continue;
 
-            int best = owner;
-            for (int participant = 0; participant < static_cast<int>(participant_count); ++participant)
-            {
-                if (load[participant] < load[best] ||
-                    (load[participant] == load[best] && participant == owner))
-                {
-                    best = participant;
-                }
-            }
+            const int best =
+                runtime_choose_replicated_participant(
+                    runtime, bank, selected_experts, slot, replicated_expert, load);
+            if (best < 0)
+                continue;
 
             if (slot == selected_slot)
                 return local_resident && best == static_cast<int>(participant_id);

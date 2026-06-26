@@ -5,6 +5,9 @@
 
 #include <gtest/gtest.h>
 #include "execution/moe/MoERebalanceController.h"
+#include <algorithm>
+#include <iterator>
+#include <utility>
 #include <vector>
 
 using namespace llaminar2;
@@ -84,6 +87,9 @@ static void fillWindowSkewed(DecodeExpertHistogram &hist, int window_size,
         }
     }
 }
+
+static void recordExpertHits(DecodeExpertHistogram &hist, int layer,
+                             const std::vector<std::pair<int, int>> &expert_counts);
 
 // ── Tests ─────────────────────────────────────────────
 
@@ -247,7 +253,7 @@ TEST(Test__MoERebalanceController, ReplicaSetsCarryDomainId)
     cfg.domain_id = "expert_hot";
     MoERebalanceController ctrl(cfg);
 
-    fillWindowSkewed(*ctrl.histogram(), 16, 2, 2);
+    recordExpertHits(*ctrl.histogram(), 0, {{0, 16}});
     const auto replicas = ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
     ASSERT_GT(replicas.num_replicated, 0);
     EXPECT_EQ(replicas.domain_id, "expert_hot");
@@ -498,7 +504,15 @@ TEST(Test__MoERebalanceController, PlacementEpochTracksBasePlacementAndReplicas)
     ASSERT_FALSE(rebalanced.empty());
     EXPECT_EQ(ctrl.placementEpoch(), 1u);
 
-    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 4});
+    const auto placement_after_rebalance = ctrl.currentPlacement();
+    auto hot_expert = std::find(placement_after_rebalance.begin(), placement_after_rebalance.end(), 0);
+    if (hot_expert == placement_after_rebalance.end())
+        hot_expert = placement_after_rebalance.begin();
+    ASSERT_NE(hot_expert, placement_after_rebalance.end());
+    recordExpertHits(
+        *ctrl.histogram(),
+        0,
+        {{static_cast<int>(std::distance(placement_after_rebalance.begin(), hot_expert)), 16}});
     const auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_GT(replicas.num_replicated, 0);
     EXPECT_EQ(ctrl.placementEpoch(), 2u);
@@ -518,13 +532,21 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
     MoERebalanceController ctrl(cfg);
     const auto initial_placement = ctrl.currentPlacement();
 
-    fillWindowWithExperts(*ctrl.histogram(), 16, 2, {0, 4});
+    recordExpertHits(*ctrl.histogram(), 0, {{0, 20}});
+    recordExpertHits(*ctrl.histogram(), 1, {{4, 20}});
     ASSERT_TRUE(ctrl.shouldRebalance());
 
     auto replicas = ctrl.proposeReplicas(/*max_replicas_per_socket=*/1);
     ASSERT_EQ(replicas.num_replicated, 2);
     EXPECT_TRUE(replicas.is_replicated[0]);
     EXPECT_TRUE(replicas.is_replicated[4]);
+    EXPECT_TRUE(replicas.hasLayerReplicaPlacement());
+    EXPECT_TRUE(replicas.hasReplicaOnParticipant(0, 0, 1));
+    EXPECT_TRUE(replicas.hasReplicaOnParticipant(1, 4, 0));
+    EXPECT_FALSE(replicas.hasReplicaOnParticipant(0, 4, 0))
+        << "a hot expert id must not implicitly expand to every layer";
+    EXPECT_FALSE(replicas.hasReplicaOnParticipant(1, 0, 1))
+        << "a hot expert id must not implicitly expand to every layer";
     EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
 
     auto socket0_masks = ctrl.computeExpertMasks(0);
@@ -534,13 +556,17 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
     ASSERT_EQ(static_cast<int>(socket0_masks.size()), 2);
     ASSERT_EQ(static_cast<int>(socket1_masks.size()), 2);
 
+    EXPECT_TRUE(socket0_masks[0][0]);
+    EXPECT_TRUE(socket1_masks[0][0]);
+    EXPECT_FALSE(socket0_masks[0][4]);
+    EXPECT_TRUE(socket1_masks[0][4]);
+    EXPECT_TRUE(socket0_masks[1][0]);
+    EXPECT_FALSE(socket1_masks[1][0]);
+    EXPECT_TRUE(socket0_masks[1][4]);
+    EXPECT_TRUE(socket1_masks[1][4]);
+
     for (int layer = 0; layer < 2; ++layer)
     {
-        EXPECT_TRUE(socket0_masks[layer][0]);
-        EXPECT_TRUE(socket1_masks[layer][0]);
-        EXPECT_TRUE(socket0_masks[layer][4]);
-        EXPECT_TRUE(socket1_masks[layer][4]);
-
         EXPECT_TRUE(socket0_masks[layer][1]);
         EXPECT_FALSE(socket1_masks[layer][1]);
         EXPECT_FALSE(socket0_masks[layer][5]);
@@ -551,6 +577,96 @@ TEST(Test__MoERebalanceController, ReplicasExpandMasksButPreserveBasePlacement)
     EXPECT_FALSE(ctrl.shouldRebalance());
     EXPECT_FALSE(ctrl.histogram()->windowFull());
     EXPECT_EQ(ctrl.currentPlacement(), initial_placement);
+}
+
+TEST(Test__MoERebalanceController, ReplicaProposalSkipsHotRemoteExpertWhenTargetIsAlreadyHeavier)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/4, /*num_sockets=*/2,
+                          /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{0, 100}, {1, 90}});
+
+    auto replicas = ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    ASSERT_EQ(replicas.num_sockets, 2);
+    ASSERT_EQ(replicas.num_replicated, 1);
+
+    EXPECT_TRUE(replicas.hasReplicaOnParticipant(0, 0, 1))
+        << "expert 0 is owned by the heavier participant and should be offloaded";
+    EXPECT_FALSE(replicas.hasReplicaOnParticipant(0, 1, 0))
+        << "expert 1 is hot, but copying it to the already-heavier participant would not reduce load";
+}
+
+TEST(Test__MoERebalanceController, ReplicaProposalSkipsLowBenefitCandidates)
+{
+    auto low_cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/4, /*num_sockets=*/2,
+                              /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController low_ctrl(low_cfg);
+    recordExpertHits(*low_ctrl.histogram(), 0, {{0, 2}});
+
+    auto low_replicas = low_ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    EXPECT_EQ(low_replicas.num_replicated, 0)
+        << "a one-assignment projected shift is below the replica admission threshold";
+
+    auto high_cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/4, /*num_sockets=*/2,
+                               /*num_layers=*/1, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController high_ctrl(high_cfg);
+    recordExpertHits(*high_ctrl.histogram(), 0, {{0, 4}});
+
+    auto high_replicas = high_ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    ASSERT_EQ(high_replicas.num_replicated, 1);
+    EXPECT_TRUE(high_replicas.hasReplicaOnParticipant(0, 0, 1))
+        << "a two-assignment projected shift is large enough to admit";
+}
+
+TEST(Test__MoERebalanceController, ReplicaProposalIsLayerAndParticipantScopedForVariableDomain)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/6, /*num_sockets=*/3,
+                          /*num_layers=*/3, /*top_k=*/1, /*window_size=*/16);
+    MoERebalanceController ctrl(cfg);
+
+    recordExpertHits(*ctrl.histogram(), 0, {{1, 20}});
+    recordExpertHits(*ctrl.histogram(), 2, {{2, 15}});
+
+    auto replicas = ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    ASSERT_EQ(replicas.num_sockets, 3);
+    ASSERT_EQ(replicas.num_replicated, 3);
+    EXPECT_TRUE(replicas.hasLayerReplicaPlacement());
+
+    EXPECT_TRUE(replicas.hasReplicaOnParticipant(0, 1, 0));
+    EXPECT_FALSE(replicas.hasReplicaOnParticipant(0, 1, 1))
+        << "participant 1 owns expert 1 and should not receive its own replica";
+    EXPECT_TRUE(replicas.hasReplicaOnParticipant(0, 1, 2));
+
+    EXPECT_FALSE(replicas.hasReplicaOnParticipant(2, 2, 0))
+        << "participant 0 spent its one replica slot on the hotter layer-0 expert";
+    EXPECT_TRUE(replicas.hasReplicaOnParticipant(2, 2, 1));
+    EXPECT_FALSE(replicas.hasReplicaOnParticipant(2, 2, 2))
+        << "participant 2 owns expert 2 and should not receive its own replica";
+
+    for (int participant = 0; participant < 3; ++participant)
+    {
+        EXPECT_FALSE(replicas.hasReplicaOnParticipant(1, 1, participant));
+        EXPECT_FALSE(replicas.hasReplicaOnParticipant(1, 2, participant));
+    }
+
+    auto masks0 = ctrl.computeExpertMasksForParticipant(0);
+    auto masks1 = ctrl.computeExpertMasksForParticipant(1);
+    auto masks2 = ctrl.computeExpertMasksForParticipant(2);
+    ASSERT_EQ(masks0.size(), 3u);
+    ASSERT_EQ(masks1.size(), 3u);
+    ASSERT_EQ(masks2.size(), 3u);
+
+    EXPECT_TRUE(masks0[0][1]);
+    EXPECT_TRUE(masks1[0][1]);
+    EXPECT_TRUE(masks2[0][1]);
+    EXPECT_FALSE(masks0[1][1]);
+    EXPECT_TRUE(masks1[1][1]);
+    EXPECT_FALSE(masks2[1][1]);
+
+    EXPECT_FALSE(masks0[2][2]);
+    EXPECT_TRUE(masks1[2][2]);
+    EXPECT_TRUE(masks2[2][2]);
 }
 
 TEST(Test__MoERebalanceController, ReplicaProposalKeepsStillWarmExistingReplica)
@@ -682,6 +798,39 @@ TEST(Test__MoERebalanceController, ReplicaArrivalsSinceReturnsOnlyNewResidentExp
     EXPECT_FALSE(arrivals.is_replicated[3]);
     EXPECT_TRUE(arrivals.is_replicated[4]); // new replica
     EXPECT_FALSE(arrivals.is_replicated[5]);
+    EXPECT_EQ(arrivals.owner_socket, current.owner_socket);
+    EXPECT_EQ(arrivals.num_sockets, current.num_sockets);
+}
+
+TEST(Test__MoERebalanceController, ReplicaArrivalsSinceUsesLayerParticipantResidency)
+{
+    ExpertReplicaSet previous;
+    previous.owner_socket = {0, 1, 2, 0};
+    previous.num_sockets = 3;
+    previous.is_replicated.assign(4, false);
+    previous.replica_participants_by_layer.assign(
+        3,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
+    previous.setReplicaOnParticipant(0, 1, 0);
+    previous.setReplicaOnParticipant(1, 2, 0);
+    previous.rebuildAggregateReplicaFlags();
+    ASSERT_EQ(previous.num_replicated, 2);
+
+    ExpertReplicaSet current = previous;
+    current.setReplicaOnParticipant(0, 1, 2);
+    current.setReplicaOnParticipant(2, 3, 1);
+    current.rebuildAggregateReplicaFlags();
+    ASSERT_EQ(current.num_replicated, 4);
+
+    auto arrivals = current.arrivalsSince(previous);
+    EXPECT_EQ(arrivals.num_replicated, 2);
+    EXPECT_FALSE(arrivals.hasReplicaOnParticipant(0, 1, 0));
+    EXPECT_TRUE(arrivals.hasReplicaOnParticipant(0, 1, 2));
+    EXPECT_FALSE(arrivals.hasReplicaOnParticipant(1, 2, 0));
+    EXPECT_TRUE(arrivals.hasReplicaOnParticipant(2, 3, 1));
+
+    EXPECT_FALSE(arrivals.hasReplicaOnParticipant(1, 1, 2))
+        << "arrival residency should not expand to unrelated layers";
     EXPECT_EQ(arrivals.owner_socket, current.owner_socket);
     EXPECT_EQ(arrivals.num_sockets, current.num_sockets);
 }

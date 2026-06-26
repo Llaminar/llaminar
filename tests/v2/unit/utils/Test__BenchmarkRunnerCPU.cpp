@@ -10,12 +10,14 @@
 
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <string>
 
 #include "utils/BenchmarkRunner.h"
 #include "utils/DebugEnv.h"
+#include "utils/PerfStatsCollector.h"
 #include "app/InferenceRunnerAdapter.h"
 #include "config/OrchestrationConfig.h"
 #include "backends/DeviceId.h"
@@ -32,6 +34,36 @@ using ::testing::Return;
 
 namespace
 {
+    class ScopedEnv
+    {
+    public:
+        ScopedEnv(const char *name, const char *value)
+            : name_(name),
+              had_previous_(std::getenv(name) != nullptr),
+              previous_(had_previous_ ? std::getenv(name) : "")
+        {
+            if (value)
+                setenv(name, value, 1);
+            else
+                unsetenv(name);
+        }
+
+        ~ScopedEnv()
+        {
+            if (had_previous_)
+                setenv(name_.c_str(), previous_.c_str(), 1);
+            else
+                unsetenv(name_.c_str());
+        }
+
+        ScopedEnv(const ScopedEnv &) = delete;
+        ScopedEnv &operator=(const ScopedEnv &) = delete;
+
+    private:
+        std::string name_;
+        bool had_previous_ = false;
+        std::string previous_;
+    };
 
     /**
      * @brief Mock inference runner that simulates CPU-only execution.
@@ -1250,6 +1282,24 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
  */
 TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
 {
+    ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter(
+        "moe_rebalance",
+        "gpu_direct_transfer_count",
+        4.0,
+        "rebalance",
+        "cuda:1",
+        {{"layer", "3"}, {"src", "cuda:0"}, {"dst", "cuda:1"}});
+    PerfStatsCollector::recordTimingNs(
+        "forward_graph",
+        "full_graph_replay",
+        2000,
+        "decode",
+        "cuda:0",
+        {{"sync_scope", "explicit_stream"}});
+    PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
+
     BenchmarkResult result;
     result.prefill_tokens = 10;
     result.prefill_time_ms = 4.0;
@@ -1412,4 +1462,95 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_EQ(doc.at("config").at("mtp_depth_window"), 8);
     EXPECT_EQ(doc.at("config").at("mtp_depth_promote_windows"), 3);
     EXPECT_EQ(doc.at("config").at("benchmark_json_output_path"), "/tmp/bench.json");
+
+    const auto &perf_stats = doc.at("perf_stats");
+    EXPECT_EQ(perf_stats.at("schema"), "llaminar.perf_stats.v1");
+    EXPECT_TRUE(perf_stats.at("enabled").get<bool>());
+    EXPECT_NE(std::find(perf_stats.at("filters").begin(),
+                        perf_stats.at("filters").end(),
+                        "moe_rebalance"),
+              perf_stats.at("filters").end());
+    EXPECT_NE(std::find(perf_stats.at("filters").begin(),
+                        perf_stats.at("filters").end(),
+                        "forward_graph"),
+              perf_stats.at("filters").end());
+
+    bool saw_gpu_direct_transfer = false;
+    bool saw_full_graph_replay = false;
+    bool saw_filtered_mtp = false;
+    for (const auto &record : perf_stats.at("records"))
+    {
+        const std::string domain = record.at("domain").get<std::string>();
+        const std::string name = record.at("name").get<std::string>();
+        if (domain == "moe_rebalance" && name == "gpu_direct_transfer_count")
+        {
+            saw_gpu_direct_transfer = true;
+            EXPECT_EQ(record.at("kind"), "counter");
+            EXPECT_EQ(record.at("phase"), "rebalance");
+            EXPECT_EQ(record.at("device"), "cuda:1");
+            EXPECT_EQ(record.at("count"), 1);
+            EXPECT_DOUBLE_EQ(record.at("value").get<double>(), 4.0);
+            EXPECT_EQ(record.at("tags").at("src"), "cuda:0");
+            EXPECT_EQ(record.at("tags").at("dst"), "cuda:1");
+        }
+        if (domain == "forward_graph" && name == "full_graph_replay")
+        {
+            saw_full_graph_replay = true;
+            EXPECT_EQ(record.at("kind"), "timer");
+            EXPECT_EQ(record.at("phase"), "decode");
+            EXPECT_EQ(record.at("device"), "cuda:0");
+            EXPECT_EQ(record.at("total_ns"), 2000);
+            EXPECT_DOUBLE_EQ(record.at("total_ms").get<double>(), 0.002);
+            EXPECT_DOUBLE_EQ(record.at("avg_us").get<double>(), 2.0);
+        }
+        if (domain == "mtp")
+            saw_filtered_mtp = true;
+    }
+
+    EXPECT_TRUE(saw_gpu_direct_transfer);
+    EXPECT_TRUE(saw_full_graph_replay);
+    EXPECT_FALSE(saw_filtered_mtp);
+    PerfStatsCollector::reset();
+}
+
+TEST(Test__BenchmarkRunnerCPU, PreservesMemoryBOMAcrossMeasuredReset)
+{
+    ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    PerfStatsCollector::addCounter(
+        "memory",
+        "workspace_block_bytes",
+        4096.0,
+        "allocate",
+        "cuda:0",
+        {{"buffer_count", "2"}});
+    PerfStatsCollector::addCounter("mtp", "draft_steps", 1.0, "decode");
+
+    auto runner = std::make_shared<MockCPUInferenceRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 1;
+
+    auto result = bench.run(config);
+    ASSERT_TRUE(result.success);
+
+    const auto records = PerfStatsCollector::snapshot();
+    const auto has_record = [&](const char *domain, const char *name)
+    {
+        return std::any_of(records.begin(), records.end(),
+                           [&](const PerfStatRecord &record)
+                           {
+                               return record.domain == domain && record.name == name;
+                           });
+    };
+    EXPECT_TRUE(has_record("memory", "workspace_block_bytes"))
+        << "Benchmark JSON diagnostics need the allocation BOM after warmup reset";
+    EXPECT_FALSE(has_record("mtp", "draft_steps"))
+        << "Non-preserved warmup counters should still be cleared before measurement";
+    PerfStatsCollector::reset();
 }

@@ -81,6 +81,7 @@ namespace llaminar2
         DeviceMoEExpertDescriptor experts[kDeviceMoEMaxExperts] = {};
         uint8_t local_compute_mask[kDeviceMoEMaxExperts] = {};
         uint8_t replica_role[kDeviceMoEMaxExperts] = {};
+        uint32_t resident_participant_mask[kDeviceMoEMaxExperts] = {};
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
         uint32_t reserved[2] = {};
@@ -130,6 +131,9 @@ namespace llaminar2
         std::vector<DeviceMoEExpertDescriptor> experts;
         std::vector<uint8_t> local_compute_mask;
         std::vector<uint8_t> replica_role;
+        /// Optional [expert] bitmask of participants with resident weights.
+        /// If omitted, prepareInactiveBank synthesizes owner/local residency.
+        std::vector<uint32_t> resident_participant_mask;
     };
 
     class IMoERuntimeTable

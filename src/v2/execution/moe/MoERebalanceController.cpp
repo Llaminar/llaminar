@@ -97,13 +97,137 @@ namespace llaminar2
     // ExpertReplicaSet — deterministic per-token dispatch
     // =========================================================================
 
+    bool ExpertReplicaSet::hasLayerReplicaPlacement() const
+    {
+        return !replica_participants_by_layer.empty();
+    }
+
+    bool ExpertReplicaSet::hasReplicaOnParticipant(
+        int layer_idx,
+        int expert_id,
+        int participant_id) const
+    {
+        if (expert_id < 0 || participant_id < 0)
+            return false;
+
+        if (hasLayerReplicaPlacement())
+        {
+            if (layer_idx < 0 ||
+                layer_idx >= static_cast<int>(replica_participants_by_layer.size()))
+                return false;
+            const auto &layer = replica_participants_by_layer[static_cast<size_t>(layer_idx)];
+            if (expert_id >= static_cast<int>(layer.size()))
+                return false;
+            const auto &participants = layer[static_cast<size_t>(expert_id)];
+            return participant_id < static_cast<int>(participants.size()) &&
+                   participants[static_cast<size_t>(participant_id)];
+        }
+
+        return expert_id < static_cast<int>(is_replicated.size()) &&
+               expert_id < static_cast<int>(owner_socket.size()) &&
+               is_replicated[static_cast<size_t>(expert_id)] &&
+               owner_socket[static_cast<size_t>(expert_id)] != participant_id;
+    }
+
+    bool ExpertReplicaSet::isReplicatedForLayer(int layer_idx, int expert_id) const
+    {
+        if (expert_id < 0)
+            return false;
+
+        if (hasLayerReplicaPlacement())
+        {
+            if (layer_idx < 0 ||
+                layer_idx >= static_cast<int>(replica_participants_by_layer.size()))
+                return false;
+            const auto &layer = replica_participants_by_layer[static_cast<size_t>(layer_idx)];
+            if (expert_id >= static_cast<int>(layer.size()))
+                return false;
+            const auto &participants = layer[static_cast<size_t>(expert_id)];
+            return std::any_of(participants.begin(), participants.end(), [](bool resident)
+                               { return resident; });
+        }
+
+        return expert_id < static_cast<int>(is_replicated.size()) &&
+               is_replicated[static_cast<size_t>(expert_id)];
+    }
+
+    void ExpertReplicaSet::setReplicaOnParticipant(
+        int layer_idx,
+        int expert_id,
+        int participant_id,
+        bool enabled)
+    {
+        if (layer_idx < 0 || expert_id < 0 || participant_id < 0)
+            return;
+
+        if (layer_idx >= static_cast<int>(replica_participants_by_layer.size()))
+            replica_participants_by_layer.resize(static_cast<size_t>(layer_idx + 1));
+        auto &layer = replica_participants_by_layer[static_cast<size_t>(layer_idx)];
+        if (expert_id >= static_cast<int>(layer.size()))
+            layer.resize(static_cast<size_t>(expert_id + 1));
+        auto &participants = layer[static_cast<size_t>(expert_id)];
+        if (participant_id >= static_cast<int>(participants.size()))
+            participants.resize(static_cast<size_t>(participant_id + 1), false);
+
+        participants[static_cast<size_t>(participant_id)] = enabled;
+    }
+
+    void ExpertReplicaSet::rebuildAggregateReplicaFlags()
+    {
+        if (!hasLayerReplicaPlacement())
+        {
+            num_replicated = static_cast<int>(
+                std::count(is_replicated.begin(), is_replicated.end(), true));
+            return;
+        }
+
+        size_t num_experts = is_replicated.size();
+        for (const auto &layer : replica_participants_by_layer)
+            num_experts = std::max(num_experts, layer.size());
+
+        is_replicated.assign(num_experts, false);
+        num_replicated = 0;
+        for (size_t layer_idx = 0; layer_idx < replica_participants_by_layer.size(); ++layer_idx)
+        {
+            auto &layer = replica_participants_by_layer[layer_idx];
+            if (layer.size() < num_experts)
+                layer.resize(num_experts);
+
+            for (size_t expert = 0; expert < layer.size(); ++expert)
+            {
+                auto &participants = layer[expert];
+                if (num_sockets > 0 && participants.size() < static_cast<size_t>(num_sockets))
+                    participants.resize(static_cast<size_t>(num_sockets), false);
+
+                for (size_t participant = 0; participant < participants.size(); ++participant)
+                {
+                    if (!participants[participant])
+                        continue;
+
+                    const bool is_owner =
+                        expert < owner_socket.size() &&
+                        owner_socket[expert] == static_cast<int>(participant);
+                    if (is_owner)
+                    {
+                        participants[participant] = false;
+                        continue;
+                    }
+
+                    is_replicated[expert] = true;
+                    ++num_replicated;
+                }
+            }
+        }
+    }
+
     void ExpertReplicaSet::assignForToken(
         const int *expert_indices,
         const float * /*expert_weights*/,
         int top_k,
         int my_socket_id,
         const std::vector<bool> &expert_mask,
-        bool *compute_here) const
+        bool *compute_here,
+        int layer_idx) const
     {
         if (num_replicated == 0)
         {
@@ -113,17 +237,33 @@ namespace llaminar2
             return;
         }
 
-        // Phase 1: Count fixed assignments (non-replicated experts go to owner)
-        int load[8] = {};  // Per-socket load counter (max 8 sockets)
-        bool is_fixed[16]; // Stack-allocated, max top_k
+        int participant_count = num_sockets;
+        if (participant_count <= 0)
+        {
+            for (int owner : owner_socket)
+                participant_count = std::max(participant_count, owner + 1);
+        }
+        participant_count = std::max(participant_count, my_socket_id + 1);
+        if (participant_count <= 0)
+            participant_count = 1;
+
+        // Phase 1: Count fixed assignments (non-replicated experts go to owner).
+        std::vector<int> load(static_cast<size_t>(participant_count), 0);
+        std::vector<bool> is_fixed(static_cast<size_t>(std::max(0, top_k)), false);
 
         for (int k = 0; k < top_k; ++k)
         {
             int e = expert_indices[k];
-            if (!is_replicated[e])
+            const bool replicated = isReplicatedForLayer(layer_idx, e);
+            if (!replicated)
             {
                 is_fixed[k] = true;
-                load[owner_socket[e]]++;
+                const int owner =
+                    e >= 0 && e < static_cast<int>(owner_socket.size())
+                        ? owner_socket[static_cast<size_t>(e)]
+                        : -1;
+                if (owner >= 0 && owner < participant_count)
+                    load[static_cast<size_t>(owner)]++;
             }
             else
             {
@@ -131,7 +271,8 @@ namespace llaminar2
             }
         }
 
-        // Phase 2: Greedily assign replicated experts to least-loaded socket.
+        // Phase 2: Greedily assign replicated experts to the least-loaded
+        // resident participant.
         // Process in index order for determinism (both ranks see same routing).
         for (int k = 0; k < top_k; ++k)
         {
@@ -139,19 +280,38 @@ namespace llaminar2
                 continue;
 
             int e = expert_indices[k];
-            int owner = owner_socket[e];
+            int owner = e >= 0 && e < static_cast<int>(owner_socket.size())
+                            ? owner_socket[static_cast<size_t>(e)]
+                            : 0;
+            if (owner < 0 || owner >= participant_count)
+                owner = 0;
 
-            // Find the socket with the lowest current load.
-            // Break ties: prefer the owner socket (avoids unnecessary replica use).
-            int best = owner;
-            for (int s = 0; s < num_sockets; ++s)
+            std::vector<int> resident_participants;
+            resident_participants.reserve(static_cast<size_t>(participant_count));
+            resident_participants.push_back(owner);
+            for (int participant = 0; participant < participant_count; ++participant)
             {
-                if (load[s] < load[best] || (load[s] == load[best] && s == owner))
-                    best = s;
+                if (participant == owner)
+                    continue;
+                if (hasReplicaOnParticipant(layer_idx, e, participant))
+                    resident_participants.push_back(participant);
             }
 
-            // Assign to chosen socket
-            load[best]++;
+            // Find the resident participant with the lowest current load.
+            // Break ties: prefer the owner participant, then lower id for determinism.
+            int best = owner;
+            for (int participant : resident_participants)
+            {
+                if (participant < 0 || participant >= participant_count)
+                    continue;
+                if (load[static_cast<size_t>(participant)] < load[static_cast<size_t>(best)] ||
+                    (load[static_cast<size_t>(participant)] == load[static_cast<size_t>(best)] &&
+                     (participant == owner || (best != owner && participant < best))))
+                    best = participant;
+            }
+
+            // Assign to the chosen participant.
+            load[static_cast<size_t>(best)]++;
             is_fixed[k] = true; // Mark as assigned
 
             // Store assignment result directly
@@ -162,20 +322,30 @@ namespace llaminar2
         for (int k = 0; k < top_k; ++k)
         {
             int e = expert_indices[k];
-            if (!is_replicated[e])
-                compute_here[k] = (owner_socket[e] == my_socket_id);
+            if (!isReplicatedForLayer(layer_idx, e))
+            {
+                const int owner =
+                    e >= 0 && e < static_cast<int>(owner_socket.size())
+                        ? owner_socket[static_cast<size_t>(e)]
+                        : -1;
+                compute_here[k] = (owner == my_socket_id);
+            }
         }
     }
 
-    void ExpertReplicaSet::buildPrefillMask(int my_socket_id, const std::vector<bool> &expert_mask)
+    void ExpertReplicaSet::buildPrefillMask(
+        int my_socket_id,
+        const std::vector<bool> &expert_mask,
+        int layer_idx)
     {
         prefill_mask.resize(expert_mask.size());
         for (size_t e = 0; e < expert_mask.size(); ++e)
         {
-            // During prefill, only the owner socket processes replicated experts.
+            // During prefill, only the owner participant processes replicated experts.
             // Non-replicated experts use the standard expert_mask.
             prefill_mask[e] = expert_mask[e] &&
-                              (!is_replicated[e] || owner_socket[e] == my_socket_id);
+                              (!isReplicatedForLayer(layer_idx, static_cast<int>(e)) ||
+                               (e < owner_socket.size() && owner_socket[e] == my_socket_id));
         }
     }
 
@@ -185,7 +355,8 @@ namespace llaminar2
                num_replicated == other.num_replicated &&
                num_sockets == other.num_sockets &&
                is_replicated == other.is_replicated &&
-               owner_socket == other.owner_socket;
+               owner_socket == other.owner_socket &&
+               replica_participants_by_layer == other.replica_participants_by_layer;
     }
 
     ExpertReplicaSet ExpertReplicaSet::arrivalsSince(const ExpertReplicaSet &previous) const
@@ -195,6 +366,49 @@ namespace llaminar2
         arrivals.is_replicated.assign(is_replicated.size(), false);
         arrivals.owner_socket = owner_socket;
         arrivals.num_sockets = num_sockets;
+
+        if (hasLayerReplicaPlacement())
+        {
+            arrivals.replica_participants_by_layer.assign(
+                replica_participants_by_layer.size(),
+                std::vector<std::vector<bool>>{});
+
+            for (size_t layer_idx = 0; layer_idx < replica_participants_by_layer.size(); ++layer_idx)
+            {
+                const auto &layer = replica_participants_by_layer[layer_idx];
+                auto &arrival_layer = arrivals.replica_participants_by_layer[layer_idx];
+                arrival_layer.resize(layer.size());
+                for (size_t expert = 0; expert < layer.size(); ++expert)
+                {
+                    const auto &participants = layer[expert];
+                    auto &arrival_participants = arrival_layer[expert];
+                    arrival_participants.assign(participants.size(), false);
+                    for (size_t participant = 0; participant < participants.size(); ++participant)
+                    {
+                        if (!participants[participant])
+                            continue;
+
+                        const bool same_owner =
+                            expert < previous.owner_socket.size() &&
+                            expert < owner_socket.size() &&
+                            previous.owner_socket[expert] == owner_socket[expert];
+                        const bool previously_resident =
+                            previous.num_sockets == num_sockets &&
+                            same_owner &&
+                            previous.hasReplicaOnParticipant(
+                                static_cast<int>(layer_idx),
+                                static_cast<int>(expert),
+                                static_cast<int>(participant));
+
+                        if (!previously_resident)
+                            arrival_participants[participant] = true;
+                    }
+                }
+            }
+
+            arrivals.rebuildAggregateReplicaFlags();
+            return arrivals;
+        }
 
         for (size_t expert = 0; expert < is_replicated.size(); ++expert)
         {
@@ -392,8 +606,15 @@ namespace llaminar2
             {
                 for (int e = 0; e < num_experts; ++e)
                 {
-                    if (current_replicas_.is_replicated[e])
-                        masks[l][e] = true; // Both sockets get this expert
+                    if (current_replicas_.hasLayerReplicaPlacement())
+                    {
+                        if (current_replicas_.hasReplicaOnParticipant(l, e, socket_id))
+                            masks[l][e] = true;
+                    }
+                    else if (current_replicas_.is_replicated[e])
+                    {
+                        masks[l][e] = true; // Legacy aggregate sets replicate to all non-owners.
+                    }
                 }
             }
         }
@@ -660,120 +881,271 @@ namespace llaminar2
         result.owner_socket = current_placement_;
         result.num_replicated = 0;
         result.num_sockets = static_cast<int>(config_.sockets.size());
+        result.replica_participants_by_layer.assign(
+            static_cast<size_t>(std::max(0, config_.num_layers)),
+            std::vector<std::vector<bool>>(
+                static_cast<size_t>(std::max(0, config_.num_experts)),
+                std::vector<bool>(static_cast<size_t>(std::max(0, result.num_sockets)), false)));
 
         if (!histogram_ || max_replicas_per_socket <= 0 || config_.sockets.size() < 2)
             return result;
 
         const int num_experts = config_.num_experts;
+        const int num_layers = config_.num_layers;
         const int num_sockets = result.num_sockets;
 
-        // Aggregate per-expert activation counts across all layers
-        std::vector<uint64_t> total_counts(num_experts, 0);
-        for (int l = 0; l < config_.num_layers; ++l)
+        std::vector<std::vector<uint64_t>> layer_counts(
+            static_cast<size_t>(num_layers),
+            std::vector<uint64_t>(static_cast<size_t>(num_experts), 0));
+
+        uint64_t total_activations = 0;
+        for (int l = 0; l < num_layers; ++l)
         {
-            auto layer_counts = histogram_->layerHistogram(l);
+            auto counts = histogram_->layerHistogram(l);
             for (int e = 0; e < num_experts; ++e)
-                total_counts[e] += layer_counts[e];
+            {
+                layer_counts[static_cast<size_t>(l)][static_cast<size_t>(e)] = counts[e];
+                total_activations += counts[e];
+            }
         }
 
-        const uint64_t total_activations =
-            std::accumulate(total_counts.begin(), total_counts.end(), uint64_t{0});
         if (total_activations == 0 && current_replicas_.num_replicated > 0)
         {
             LOG_DEBUG("[MoERebalanceController] No activation signal; preserving "
-                      << current_replicas_.num_replicated << " existing expert replicas");
+                      << current_replicas_.num_replicated << " existing expert replica slots");
             return current_replicas_;
         }
 
-        // For each socket, find the hottest experts on OTHER sockets to replicate locally.
-        // Keep still-warm existing replicas before filling new slots so short
-        // decode windows do not churn PCIe/NVLink transfers on tiny rank-order
-        // changes. A previous replica must stay within 50% of the current top
-        // candidate for that target.
-        for (int target_socket = 0; target_socket < num_sockets; ++target_socket)
+        std::vector<std::vector<uint64_t>> projected_loads(
+            static_cast<size_t>(num_layers),
+            std::vector<uint64_t>(static_cast<size_t>(num_sockets), 0));
+        for (int l = 0; l < num_layers; ++l)
         {
-            // Collect experts NOT owned by this socket, sorted by count descending
-            std::vector<int> candidates;
             for (int e = 0; e < num_experts; ++e)
             {
-                if (current_placement_[e] != target_socket && total_counts[e] > 0)
-                    candidates.push_back(e);
-            }
-
-            std::sort(candidates.begin(), candidates.end(),
-                      [&](int a, int b)
-                      { return total_counts[a] > total_counts[b]; });
-
-            const uint64_t top_count = candidates.empty() ? 0 : total_counts[candidates.front()];
-
-            // First preserve existing replicas that are still competitive.
-            int replicated = 0;
-            auto is_previous_replica_for_target = [&](int e)
-            {
-                return e >= 0 &&
-                       e < static_cast<int>(current_replicas_.is_replicated.size()) &&
-                       e < static_cast<int>(current_replicas_.owner_socket.size()) &&
-                       current_replicas_.is_replicated[e] &&
-                       current_replicas_.owner_socket[e] == current_placement_[e] &&
-                       current_placement_[e] != target_socket;
-            };
-
-            auto keep_previous = [&](int e)
-            {
-                if (result.is_replicated[e])
-                    return false;
-                result.is_replicated[e] = true;
-                result.num_replicated++;
-                replicated++;
-                return true;
-            };
-
-            for (int e : candidates)
-            {
-                if (replicated >= max_replicas_per_socket)
-                    break;
-                if (!is_previous_replica_for_target(e))
-                    continue;
-                if (top_count > 0 && total_counts[e] * 2 < top_count)
-                    continue;
-                keep_previous(e);
-            }
-
-            // Fill remaining capacity with the hottest new candidates.
-            for (int e : candidates)
-            {
-                if (replicated >= max_replicas_per_socket)
-                    break;
-                if (result.is_replicated[e])
-                    continue; // Already marked by another socket
-                result.is_replicated[e] = true;
-                result.num_replicated++;
-                replicated++;
+                const int owner = current_placement_[static_cast<size_t>(e)];
+                if (owner >= 0 && owner < num_sockets)
+                {
+                    projected_loads[static_cast<size_t>(l)][static_cast<size_t>(owner)] +=
+                        layer_counts[static_cast<size_t>(l)][static_cast<size_t>(e)];
+                }
             }
         }
 
+        auto owner_for = [&](int expert)
+        {
+            if (expert < 0 || expert >= static_cast<int>(current_placement_.size()))
+                return -1;
+            return current_placement_[static_cast<size_t>(expert)];
+        };
+
+        auto projected_shift = [&](int layer, int expert, int target_socket)
+        {
+            const int owner = owner_for(expert);
+            if (owner < 0 || owner >= num_sockets || owner == target_socket)
+                return uint64_t{0};
+
+            const uint64_t count =
+                layer_counts[static_cast<size_t>(layer)][static_cast<size_t>(expert)];
+            if (count == 0)
+                return uint64_t{0};
+
+            const uint64_t owner_load =
+                projected_loads[static_cast<size_t>(layer)][static_cast<size_t>(owner)];
+            const uint64_t target_load =
+                projected_loads[static_cast<size_t>(layer)][static_cast<size_t>(target_socket)];
+            if (owner_load <= target_load)
+                return uint64_t{0};
+
+            const uint64_t equalizing_shift = (owner_load - target_load + 1u) / 2u;
+            return std::min(count, equalizing_shift);
+        };
+
+        const uint64_t minimum_replica_shift = std::max<uint64_t>(
+            2,
+            static_cast<uint64_t>(std::max(1, current_window_size_) / 64));
+
+        auto admissible_projected_shift = [&](int layer, int expert, int target_socket)
+        {
+            const uint64_t shift = projected_shift(layer, expert, target_socket);
+            return shift >= minimum_replica_shift ? shift : uint64_t{0};
+        };
+
+        auto apply_projected_shift = [&](int layer, int expert, int target_socket)
+        {
+            const int owner = owner_for(expert);
+            const uint64_t shift = admissible_projected_shift(layer, expert, target_socket);
+            if (shift == 0 || owner < 0 || owner >= num_sockets)
+                return false;
+
+            result.setReplicaOnParticipant(layer, expert, target_socket, true);
+            auto &layer_loads = projected_loads[static_cast<size_t>(layer)];
+            layer_loads[static_cast<size_t>(owner)] -=
+                std::min(layer_loads[static_cast<size_t>(owner)], shift);
+            layer_loads[static_cast<size_t>(target_socket)] += shift;
+            return true;
+        };
+
+        std::vector<int> replicated_per_target(static_cast<size_t>(num_sockets), 0);
+
+        struct Candidate
+        {
+            int layer = -1;
+            int expert = -1;
+            int target = -1;
+            uint64_t count = 0;
+            uint64_t shift = 0;
+        };
+
+        auto best_count_for_target = [&](int target_socket)
+        {
+            uint64_t best = 0;
+            for (int l = 0; l < num_layers; ++l)
+            {
+                for (int e = 0; e < num_experts; ++e)
+                {
+                    if (owner_for(e) == target_socket)
+                        continue;
+                    if (admissible_projected_shift(l, e, target_socket) == 0)
+                        continue;
+                    best = std::max(
+                        best,
+                        layer_counts[static_cast<size_t>(l)][static_cast<size_t>(e)]);
+                }
+            }
+            return best;
+        };
+
+        // Keep still-warm existing replicas before filling new slots so short
+        // decode windows do not churn PCIe/NVLink transfers on tiny rank-order
+        // changes. A previous replica must stay within 50% of the current top
+        // load-reducing candidate for that target and still reduce projected
+        // per-layer participant load.
+        for (int target_socket = 0; target_socket < num_sockets; ++target_socket)
+        {
+            const uint64_t top_count = best_count_for_target(target_socket);
+            if (top_count == 0)
+                continue;
+
+            std::vector<Candidate> previous_candidates;
+            for (int l = 0; l < num_layers; ++l)
+            {
+                for (int e = 0; e < num_experts; ++e)
+                {
+                    const uint64_t count = layer_counts[static_cast<size_t>(l)][static_cast<size_t>(e)];
+                    const uint64_t shift = admissible_projected_shift(l, e, target_socket);
+                    if (count == 0 || shift == 0)
+                        continue;
+                    if (count * 2u < top_count)
+                        continue;
+                    const int owner = owner_for(e);
+                    if (owner < 0 || owner >= num_sockets || owner == target_socket)
+                        continue;
+                    if (e >= static_cast<int>(current_replicas_.owner_socket.size()) ||
+                        current_replicas_.owner_socket[static_cast<size_t>(e)] != owner ||
+                        !current_replicas_.hasReplicaOnParticipant(l, e, target_socket))
+                    {
+                        continue;
+                    }
+                    previous_candidates.push_back({l, e, target_socket, count, shift});
+                }
+            }
+
+            std::sort(previous_candidates.begin(), previous_candidates.end(),
+                      [](const Candidate &a, const Candidate &b)
+                      {
+                          if (a.shift != b.shift)
+                              return a.shift > b.shift;
+                          if (a.count != b.count)
+                              return a.count > b.count;
+                          if (a.layer != b.layer)
+                              return a.layer < b.layer;
+                          if (a.expert != b.expert)
+                              return a.expert < b.expert;
+                          return a.target < b.target;
+                      });
+
+            for (const Candidate &candidate : previous_candidates)
+            {
+                if (replicated_per_target[static_cast<size_t>(target_socket)] >= max_replicas_per_socket)
+                    break;
+                if (result.hasReplicaOnParticipant(candidate.layer, candidate.expert, target_socket))
+                    continue;
+                if (apply_projected_shift(candidate.layer, candidate.expert, target_socket))
+                    ++replicated_per_target[static_cast<size_t>(target_socket)];
+            }
+        }
+
+        while (true)
+        {
+            Candidate best;
+            for (int target_socket = 0; target_socket < num_sockets; ++target_socket)
+            {
+                if (replicated_per_target[static_cast<size_t>(target_socket)] >= max_replicas_per_socket)
+                    continue;
+                for (int l = 0; l < num_layers; ++l)
+                {
+                    for (int e = 0; e < num_experts; ++e)
+                    {
+                        if (result.hasReplicaOnParticipant(l, e, target_socket))
+                            continue;
+                        const uint64_t shift = admissible_projected_shift(l, e, target_socket);
+                        if (shift == 0)
+                            continue;
+                        const uint64_t count =
+                            layer_counts[static_cast<size_t>(l)][static_cast<size_t>(e)];
+                        Candidate candidate{l, e, target_socket, count, shift};
+                        if (best.layer < 0 ||
+                            candidate.shift > best.shift ||
+                            (candidate.shift == best.shift && candidate.count > best.count) ||
+                            (candidate.shift == best.shift && candidate.count == best.count &&
+                             candidate.layer < best.layer) ||
+                            (candidate.shift == best.shift && candidate.count == best.count &&
+                             candidate.layer == best.layer && candidate.expert < best.expert) ||
+                            (candidate.shift == best.shift && candidate.count == best.count &&
+                             candidate.layer == best.layer && candidate.expert == best.expert &&
+                             candidate.target < best.target))
+                        {
+                            best = candidate;
+                        }
+                    }
+                }
+            }
+
+            if (best.layer < 0)
+                break;
+            if (!apply_projected_shift(best.layer, best.expert, best.target))
+                break;
+            ++replicated_per_target[static_cast<size_t>(best.target)];
+        }
+
+        result.rebuildAggregateReplicaFlags();
         const bool replica_placement_changed = !current_replicas_.sameReplicaPlacement(result);
         current_replicas_ = result;
         if (replica_placement_changed && result.num_replicated > 0)
             ++placement_epoch_;
 
         LOG_DEBUG("[MoERebalanceController] Proposed " << result.num_replicated
-                                                       << " expert replicas (max " << max_replicas_per_socket << " per socket)");
+                                                       << " expert replica slots (max " << max_replicas_per_socket << " per participant)");
+        LOG_DEBUG("[MoERebalanceController] Replica admission minimum projected shift="
+                  << minimum_replica_shift << " assignments/window");
 
-        // Log the top replicas per socket
+        // Log the top replicas per participant.
         for (int s = 0; s < num_sockets; ++s)
         {
             std::ostringstream oss;
-            oss << "  Socket " << s << " gets replicas: ";
+            oss << "  Participant " << s << " gets replicas: ";
             int count = 0;
-            for (int e = 0; e < num_experts; ++e)
+            for (int l = 0; l < num_layers; ++l)
             {
-                // Expert replicated on socket s = expert NOT owned by s but is_replicated
-                if (result.is_replicated[e] && result.owner_socket[e] != s)
+                for (int e = 0; e < num_experts; ++e)
                 {
+                    if (!result.hasReplicaOnParticipant(l, e, s))
+                        continue;
                     if (count > 0)
                         oss << ", ";
-                    oss << "e" << e << "(" << total_counts[e] << ")";
+                    oss << "l" << l << ".e" << e
+                        << "(" << layer_counts[static_cast<size_t>(l)][static_cast<size_t>(e)] << ")";
                     count++;
                 }
             }

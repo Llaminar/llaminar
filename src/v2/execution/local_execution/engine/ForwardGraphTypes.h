@@ -251,6 +251,27 @@ namespace llaminar2
             classifyForwardReplayStateCache(signature));
     }
 
+    inline ForwardReplayStateAction chooseForwardReplayStateAction(
+        ForwardReplayStateMutationKind mutation,
+        const ForwardGraphSignature &signature,
+        bool graph_has_collective_nodes)
+    {
+        if (mutation == ForwardReplayStateMutationKind::RequestBoundaryStateReset &&
+            signature.decode &&
+            graph_has_collective_nodes)
+        {
+            /*
+             * LocalTP/MoE-overlay decode graphs contain stream-ordered collective
+             * rendezvous state in addition to the stable per-stage buffers. Until
+             * multi-device graph capture gives those rendezvous points a first-class
+             * replay contract, request-boundary clear_cache() must recapture instead
+             * of reusing graph executables captured for the previous request.
+             */
+            return ForwardReplayStateAction::ResetReplayState;
+        }
+        return chooseForwardReplayStateAction(mutation, signature);
+    }
+
     /**
      * @brief Latest runtime metadata observed for a prefill graph-cache entry.
      *
@@ -273,6 +294,8 @@ namespace llaminar2
         uint64_t topology_signature = 0;
         std::string capture_phase = "cold";
         std::string recapture_reason = "none";
+        std::string reject_stage_name;
+        std::string reject_stage_type;
     };
 
     /**
@@ -417,32 +440,31 @@ namespace llaminar2
         // allowing us to skip the 339-node graph.reset() since flags are already clear.
         bool phase3_active = false;
 
-        /// Live replay-state epoch that the current segmented capture is safe for.
+        /// Live replay-state epoch that the current cached graph capture is safe for.
         /// Multi-token ordinary decode and multi-row all-position verifier graphs
         /// are invalidated when speculative publication advances live state to a
         /// newer epoch. Single-token decode, including MTP condition decode, is
         /// version-safe: it updates token/position metadata before every launch
         /// and reads stable live-state buffer addresses.
-        uint64_t segmented_capture_live_state_epoch = 0;
+        uint64_t graph_replay_live_state_epoch = 0;
 
         bool requiresLiveStateEpochRecapture(bool live_state_versioned_context,
-                                             bool segmented_capture_allowed,
+                                             bool graph_replay_allowed,
                                              uint64_t live_state_epoch) const
         {
             return live_state_versioned_context &&
-                   segmented_capture_allowed &&
+                   graph_replay_allowed &&
                    segment_cache.initialized &&
                    !segment_cache.needs_capture &&
-                   segmented_capture_live_state_epoch != 0 &&
-                   segmented_capture_live_state_epoch != live_state_epoch;
+                   graph_replay_live_state_epoch != 0 &&
+                   graph_replay_live_state_epoch != live_state_epoch;
         }
 
         /// GPU graph capture/replay for eliminating per-kernel launch overhead
         std::unique_ptr<IGPUGraphCapture> gpu_graph;
 
-        /// Segmented GPU graph cache. Capturable stages, including attention
-        /// when its dynamic launch variant is stable, can live inside one
-        /// segment; non-capturable stages and manual boundaries split it.
+        /// Cached GPU graph replay plan. A fully capturable graph is replayed as
+        /// one unit; non-capturable stages and manual boundaries split it.
         DeviceGraphExecutor::GraphSegmentCache segment_cache;
 
         /// GPU stream (from IWorkerGPUContext::defaultStream()) for kernel dispatch
@@ -476,7 +498,7 @@ namespace llaminar2
          * Hard resets preserve graph topology but discard graph executables.
          * Use this after topology/workspace/live-state mutations whose capture
          * safety is not proven. Request-boundary resets that want served-style
-         * capture reuse should use resetSessionStatePreservingSegmentedReplay().
+         * capture reuse should use resetSessionStatePreservingGraphReplay().
          *
          * The capture stream itself is retained because cached stages store that
          * stream pointer internally. Destroying it here would leave dynamic-param
@@ -493,7 +515,7 @@ namespace llaminar2
             segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
             gpu_graph_update_failures = 0;
             phase3_active = false;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
         }
 
         /**
@@ -539,16 +561,16 @@ namespace llaminar2
          */
         void markReplayStateSafeForLiveEpoch(uint64_t live_state_epoch)
         {
-            segmented_capture_live_state_epoch = live_state_epoch;
+            graph_replay_live_state_epoch = live_state_epoch;
         }
 
         /**
-         * @brief Reset request-scoped stage state while preserving safe segmented replay.
+         * @brief Reset request-scoped stage state while preserving safe graph replay.
          *
          * Request boundaries clear KV/GDN/short-conv live state, token metadata,
          * and backend stream bindings, but single-token decode and all-position
          * verifier captures are designed to read stable device buffers whose
-         * contents are refreshed before every launch.  Keeping those segmented
+         * contents are refreshed before every launch.  Keeping those graph
          * executables hot is the served-inference path we want: warmup captures
          * once, later requests replay after device-state reset.
          *
@@ -560,7 +582,7 @@ namespace llaminar2
          * request-local capture arming does not. Capturing or otherwise invalid
          * entries are still dropped rather than silently reused.
          */
-        void resetSessionStatePreservingSegmentedReplay()
+        void resetSessionStatePreservingGraphReplay()
         {
             if (gpu_graph)
             {
@@ -597,7 +619,7 @@ namespace llaminar2
             markGPUStreamBindingsDirty();
             gpu_graph_update_failures = 0;
             phase3_active = segment_cache.initialized && !segment_cache.needs_capture;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
         }
 
         /**
@@ -609,7 +631,7 @@ namespace llaminar2
          * the next prompt starts from cleared KV/GDN model state.
          *
          * Callers that need reusable prefill graph-cache state should use
-         * resetSessionStatePreservingSegmentedReplay().  That path delegates to
+         * resetSessionStatePreservingGraphReplay().  That path delegates to
          * PrefillGraphCache::prepareEntriesForRequestReset(), which either keeps
          * replay-ready executable graphs or demotes warmup-only entries to
          * Initialized so they can capture against fresh request state.
@@ -635,7 +657,7 @@ namespace llaminar2
             applied_stream = nullptr;
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
         }
 
         void invalidate()
@@ -664,7 +686,7 @@ namespace llaminar2
             gpu_stream = nullptr;
             gpu_ctx = nullptr;
             phase3_active = false;
-            segmented_capture_live_state_epoch = 0;
+            graph_replay_live_state_epoch = 0;
             pp_external_hidden_state = nullptr;
             pp_working_buffer = nullptr;
             pp_copy_bytes = 0;

@@ -761,7 +761,7 @@ namespace
         EXPECT_EQ(kv_cache.lastSeqIdx(), 0);
         EXPECT_EQ(kv_cache.lastAdvanceTokens(), 2);
         EXPECT_EQ(kv_cache.get_cached_tokens(0), 2)
-            << "segmented capture needs logical metadata before downstream captured attention";
+            << "cached graph capture needs logical metadata before downstream captured attention";
     }
 
     TEST_F(Test__PrefillGraphCaptureDynamicParams, IKVCacheBaseDefaultsFailClosed)

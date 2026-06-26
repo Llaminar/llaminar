@@ -34,6 +34,7 @@
 #include "utils/MPIContext.h"
 #include "utils/PerfStatsCollector.h"
 #include "../../../../mocks/MockComputeStage.h"
+#include "../../../../mocks/MockLocalTPContext.h"
 
 using namespace llaminar2;
 using namespace llaminar2::testing;
@@ -384,6 +385,35 @@ TEST_F(Test__TPAllreduceStage, GpuAllreduceFailsFastWithoutExplicitStream)
     EXPECT_FALSE(stage.execute(&cuda_ctx));
 }
 
+TEST_F(Test__TPAllreduceStage, EmptyPrecisionResolvesBeforeOnStreamCollective)
+{
+    llaminar2::test::MockLocalTPContext tp_ctx;
+    tp_ctx.setDevices({cuda0_, cuda1_});
+    tp_ctx.setBackend(CollectiveBackendType::HOST);
+
+    auto *tensor = test_tensor_.get();
+    TPAllreduceStage::Params params;
+    params.device_id = DeviceId::cpu();
+    params.tp_ctx = &tp_ctx;
+    params.tensor = tensor;
+    params.count = 256;
+    params.stage_name = "embedding_allreduce";
+    params.precision = "";
+
+    TPAllreduceStage stage(params);
+    void *explicit_stream = reinterpret_cast<void *>(0x1234);
+    stage.setGPUStream(explicit_stream);
+
+    ASSERT_TRUE(stage.execute(ctx_.get()));
+
+    const auto calls = tp_ctx.getAllreduceCalls();
+    ASSERT_EQ(calls.size(), 1u);
+    EXPECT_EQ(calls.front().stage_name, "embedding_allreduce");
+    EXPECT_EQ(calls.front().count, 256u);
+    EXPECT_EQ(calls.front().stream, explicit_stream);
+    EXPECT_EQ(calls.front().precision, "fp32");
+}
+
 // =============================================================================
 // Dump Info Tests
 // =============================================================================
@@ -556,15 +586,17 @@ TEST_F(Test__TPAllreduceStage, RecordsBillOfMaterialsForMoERoutedAllreduce)
 
     ASSERT_NE(bytes, nullptr);
     EXPECT_EQ(bytes->domain, "tp_allreduce_bom");
-    EXPECT_DOUBLE_EQ(bytes->value, 256.0 * sizeof(std::uint16_t));
+    EXPECT_DOUBLE_EQ(bytes->value, 256.0 * sizeof(float));
     EXPECT_EQ(bytes->tags.at("role"), "moe_routed_expert");
     EXPECT_EQ(bytes->tags.at("stage"), "layer0_moe_expert_overlay_fast_allreduce");
     EXPECT_EQ(bytes->tags.at("elements"), "256");
-    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(std::uint16_t)));
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
     EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
     EXPECT_EQ(bytes->tags.at("tensor_numel"), std::to_string(test_tensor_->numel()));
     EXPECT_EQ(bytes->tags.at("tensor_type"), "FP32");
     EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
     EXPECT_EQ(bytes->tags.at("scope"), "local");
     EXPECT_EQ(bytes->tags.at("degree"), "1");
     EXPECT_EQ(bytes->tags.at("no_op"), "true");
@@ -654,13 +686,15 @@ TEST_F(Test__TPAllreduceStage, GraphReplayRecordsBillOfMaterials)
     }
 
     ASSERT_NE(bytes, nullptr);
-    EXPECT_DOUBLE_EQ(bytes->value, 128.0 * sizeof(std::uint16_t));
+    EXPECT_DOUBLE_EQ(bytes->value, 128.0 * sizeof(float));
     EXPECT_EQ(bytes->tags.at("role"), "moe_combined");
     EXPECT_EQ(bytes->tags.at("stage"), "layer0_moe_combined_allreduce");
     EXPECT_EQ(bytes->tags.at("elements"), "128");
-    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(std::uint16_t)));
+    EXPECT_EQ(bytes->tags.at("element_bytes"), std::to_string(sizeof(float)));
     EXPECT_EQ(bytes->tags.at("tensor_element_bytes"), std::to_string(sizeof(float)));
     EXPECT_EQ(bytes->tags.at("precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("requested_transport_precision"), "fp16");
+    EXPECT_EQ(bytes->tags.at("transport_precision"), "fp32");
     EXPECT_EQ(bytes->tags.at("no_op"), "true");
 
     ASSERT_NE(stages, nullptr);

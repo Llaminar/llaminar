@@ -37,6 +37,7 @@
 #include <stdexcept>
 #include <unordered_set>
 #include <cstdint>
+#include <typeinfo>
 
 namespace llaminar2
 {
@@ -303,11 +304,12 @@ namespace llaminar2
     // Forward declarations for static helpers used by runStage()
     static bool stageChecksumTraceEnabled();
     static bool stageChecksumTraceMatches(const std::string &stage_name);
-    static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info);
+    static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info, void *stream);
     static void traceStageOutputChecksums(
         const std::string &stage_name,
         const IComputeStage *stage,
-        const StageDumpInfo &dump_info);
+        const StageDumpInfo &dump_info,
+        void *stream);
     static void logWatchedPointerProducer(
         const std::string &stage_name,
         const StageDumpInfo &dump_info,
@@ -667,7 +669,7 @@ namespace llaminar2
     }
 
     // executeWithGraphCapture, executeDecodeWithCapturePolicy,
-    // executeWithSegmentedGraphCapture → DeviceGraphExecutor_GraphCapture.cpp
+    // executeWithCachedGraphReplay → DeviceGraphExecutor_GraphCapture.cpp
 
     // =========================================================================
     // Unified Stage Runner: runStages() + runStage()
@@ -700,7 +702,7 @@ namespace llaminar2
         const std::unordered_set<std::string> *collective_nodes)
     {
         // Set GPU device once for the entire pass
-        DeviceGraphCaptureController::prepareDeviceForSegmentedCapture(ctx);
+        DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
         // =====================================================================
         // Build fast schedule (pre-computed flat array of {node*, is_collective})
@@ -800,7 +802,26 @@ namespace llaminar2
             const auto cpu_stage_start =
                 cpu_stage_timing_active ? PerfStatsCollector::Clock::now()
                                         : PerfStatsCollector::Clock::time_point{};
-            if (!runStage(*node, ctx, policy, is_coll))
+            bool stage_ok = false;
+            try
+            {
+                stage_ok = runStage(*node, ctx, policy, is_coll);
+            }
+            catch (const std::exception &e)
+            {
+                const DeviceId stage_device =
+                    node->device.is_valid() ? node->device : node->stage->device();
+                LOG_ERROR("[DeviceGraphExecutor] Exception while running stage '"
+                          << node->name
+                          << "' type=" << computeStageTypeName(node->stage->type())
+                          << " dynamic_type=" << typeid(*node->stage).name()
+                          << " device=" << stage_device.to_string()
+                          << " exception_type=" << typeid(e).name()
+                          << " what=" << e.what());
+                notifyStageFailure(node->name, std::string("stage threw exception: ") + e.what());
+                throw;
+            }
+            if (!stage_ok)
             {
                 LOG_ERROR("[DeviceGraphExecutor] Stage failed: " << node->name);
                 notifyStageFailure(node->name, "stage execution returned false");
@@ -1053,28 +1074,6 @@ namespace llaminar2
         double get_dump_info_ms = 0.0, dump_output_ms = 0.0, verify_ms = 0.0, callback_ms = 0.0;
 
         // =====================================================================
-        // getDumpInfo caching (needed by coherence, dumps, validation, callback)
-        // Skipped entirely in fast decode — zero overhead.
-        // =====================================================================
-        const bool need_dump_info = policy.coherence || policy.stage_dump ||
-                                    policy.pointer_validation || policy.snapshot_callback ||
-                                    (arena_ != nullptr);
-        StageDumpInfo empty_dump_info{};
-        const StageDumpInfo *dump_info_ptr = &empty_dump_info;
-        if (need_dump_info)
-        {
-            if (profiling)
-                phase_start = std::chrono::high_resolution_clock::now();
-            dump_info_ptr = &node.stage->getDumpInfo();
-            if (profiling)
-            {
-                phase_end = std::chrono::high_resolution_clock::now();
-                get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
-            }
-        }
-        const StageDumpInfo &cached_dump_info = *dump_info_ptr;
-
-        // =====================================================================
         // Stage Coherence: arena contract input/output + weight uploads
         // =====================================================================
         // Contract is ALWAYS fetched when we have an arena. mark_dirty (which
@@ -1088,10 +1087,43 @@ namespace llaminar2
             use_contract && fastPolicyRequiresContractCoherence(policy, arena_, contract, target_device);
 
         // Bind GPU stream early so coherence operations (H2D/D2H) run on
-        // the same stream as the stage's compute kernels.
+        // the same stream as the stage's compute kernels. Debug paths that
+        // materialize GPU outputs also require this explicit stream.
         if (!ensureStageGPUStreamBound(node, ctx))
             return false;
         void *stage_stream = node.stage ? node.stage->gpuStream() : nullptr;
+
+        // =====================================================================
+        // Stage Dump: input snapshot setup
+        // =====================================================================
+        StageDumpContext dump_ctx;
+        const bool should_dump = policy.stage_dump && StageDumper::shouldDump(
+                                                          node.stage.get(),
+                                                          node.name,
+                                                          config_.current_layer_idx,
+                                                          config_.current_iteration,
+                                                          config_.mpi_rank);
+
+        // StageBufferContract is the coherence source of truth. Pull dump info
+        // before execute only for consumers that actually inspect it before the
+        // stage runs.
+        const bool need_pre_execute_dump_info =
+            should_dump ||
+            (policy.pointer_validation &&
+             debugEnv().validation.validate_gpu_ptrs &&
+             target_device.is_gpu());
+        StageDumpInfo cached_dump_info{};
+        if (need_pre_execute_dump_info)
+        {
+            if (profiling)
+                phase_start = std::chrono::high_resolution_clock::now();
+            cached_dump_info = node.stage->getDumpInfoSnapshot();
+            if (profiling)
+            {
+                phase_end = std::chrono::high_resolution_clock::now();
+                get_dump_info_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
+            }
+        }
 
         if (policy.coherence || force_contract_coherence)
         {
@@ -1178,7 +1210,7 @@ namespace llaminar2
                 if (profiling)
                     phase_start = std::chrono::high_resolution_clock::now();
 
-                for (const auto &binding : contract.allWrites())
+                for (const auto &binding : contract.writesRequiringPrepare())
                 {
                     if (!arena_->prepareForWrite(binding.id, target_device, stage_stream))
                     {
@@ -1227,14 +1259,6 @@ namespace llaminar2
         // =====================================================================
         // Stage Dump: input snapshots
         // =====================================================================
-        StageDumpContext dump_ctx;
-        const bool should_dump = policy.stage_dump && StageDumper::shouldDump(
-                                                          node.stage.get(),
-                                                          node.name,
-                                                          config_.current_layer_idx,
-                                                          config_.current_iteration,
-                                                          config_.mpi_rank);
-
         if (should_dump)
         {
             if (isGraphCaptureActive())
@@ -1383,17 +1407,24 @@ namespace llaminar2
                 mark_dirty_ms = std::chrono::duration<double, std::milli>(phase_end - phase_start).count();
             }
 
-            logWatchedPointerProducer(
-                node.name,
-                cached_dump_info,
-                tryGetWorkerContext(node.device.is_valid() ? node.device : node.stage->device()));
-            printStageOutputs(node.name, cached_dump_info);
+            const bool needs_post_execute_debug_info =
+                debugEnv().validation.trace_local_tp_pointer ||
+                debugEnv().stage_output_print.shouldPrint(node.name);
+            if (needs_post_execute_debug_info)
+            {
+                StageDumpInfo post_execute_dump_info = node.stage->refreshDumpInfoSnapshot();
+                logWatchedPointerProducer(
+                    node.name,
+                    post_execute_dump_info,
+                    tryGetWorkerContext(node.device.is_valid() ? node.device : node.stage->device()));
+                printStageOutputs(node.name, post_execute_dump_info, node.stage->gpuStream());
+            }
         }
 
         if (success && stageChecksumTraceEnabled() && stageChecksumTraceMatches(node.name))
         {
-            node.stage->invalidateDumpInfoCache();
-            traceStageOutputChecksums(node.name, node.stage.get(), node.stage->getDumpInfo());
+            StageDumpInfo checksum_dump_info = node.stage->refreshDumpInfoSnapshot();
+            traceStageOutputChecksums(node.name, node.stage.get(), checksum_dump_info, node.stage->gpuStream());
         }
 
         // =====================================================================
@@ -1405,16 +1436,13 @@ namespace llaminar2
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
 
-            // Rebuild post-execute dump info before output dumping. Some stages
-            // populate diagnostic outputs during execute(), and async dumping
-            // consumes the StageDumpInfo passed here rather than re-fetching
-            // through StageDumper::dumpOutputs().
-            node.stage->invalidateDumpInfoCache();
-            const StageDumpInfo &output_dump_info = node.stage->getDumpInfo();
-
             if (dump_cfg.async_dump)
             {
-                AsyncStageDumper::enqueueOutputs(dump_ctx, output_dump_info);
+                // Rebuild post-execute dump info before output dumping. Some
+                // stages populate diagnostic outputs during execute(), and the
+                // async dumper consumes the StageDumpInfo passed here.
+                StageDumpInfo output_dump_info = node.stage->refreshDumpInfoSnapshot();
+                AsyncStageDumper::enqueueOutputs(dump_ctx, output_dump_info, node.stage->gpuStream());
             }
             else
             {
@@ -1453,12 +1481,11 @@ namespace llaminar2
         {
             if (profiling)
                 phase_start = std::chrono::high_resolution_clock::now();
-            // Rebuild dump info post-execute. Snapshot consumers need the
-            // runtime output metadata, and stages should not have to self-
-            // invalidate just to make callback snapshots trustworthy.
-            node.stage->invalidateDumpInfoCache();
-            const StageDumpInfo &snapshot_dump_info = node.stage->getDumpInfo();
-            snapshot_dump_info.ensureOutputsOnHost();
+            // Rebuild dump info post-execute. Snapshot consumers need a stable
+            // copy of runtime output metadata, and stages should not have to
+            // self-invalidate just to make callback snapshots trustworthy.
+            StageDumpInfo snapshot_dump_info = node.stage->refreshDumpInfoSnapshot();
+            snapshot_dump_info.ensureOutputsOnHost(node.stage->gpuStream());
             LOG_DEBUG("[DeviceGraphExecutor::runStage] Invoking callback for " << node.name);
             config_.snapshot_callback(node.name, snapshot_dump_info);
             if (profiling)
@@ -1651,7 +1678,8 @@ namespace llaminar2
     static void traceStageOutputChecksums(
         const std::string &stage_name,
         const IComputeStage *stage,
-        const StageDumpInfo &dump_info)
+        const StageDumpInfo &dump_info,
+        void *stream)
     {
         if (!stageChecksumTraceEnabled() || !stageChecksumTraceMatches(stage_name))
             return;
@@ -1664,7 +1692,7 @@ namespace llaminar2
             return;
         }
 
-        dump_info.ensureOutputsOnHost();
+        dump_info.ensureOutputsOnHost(stream);
         for (const auto &output : dump_info.outputs)
         {
             if (!output.data)
@@ -1727,7 +1755,7 @@ namespace llaminar2
      * Called AFTER markOutputsDirty() so GPU→host sync has occurred.
      * Controlled by LLAMINAR_STAGE_OUTPUT_PRINT environment variable.
      */
-    static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info)
+    static void printStageOutputs(const std::string &stage_name, const StageDumpInfo &dump_info, void *stream)
     {
         const auto &config = debugEnv().stage_output_print;
         if (!config.shouldPrint(stage_name))
@@ -1738,6 +1766,8 @@ namespace llaminar2
         const int num_elements = config.num_elements;
         const int num_rows = config.num_rows;
 
+        dump_info.ensureOutputsOnHost(stream);
+
         for (const auto &output : dump_info.outputs)
         {
             if (!output.tensor || !output.data)
@@ -1745,15 +1775,7 @@ namespace llaminar2
                 continue;
             }
 
-            // Get FP32 data - use TensorBase::data() which handles GPU→host sync
-            const float *data = nullptr;
-
-            // Always use TensorBase::data() for coherence-aware access
-            auto *tensor_base = dynamic_cast<TensorBase *>(output.tensor);
-            if (tensor_base)
-            {
-                data = tensor_base->data();
-            }
+            const float *data = static_cast<const float *>(output.data);
 
             if (!data || output.rows == 0 || output.cols == 0)
             {
@@ -1897,7 +1919,7 @@ namespace llaminar2
         }
 
         // Get buffer info from stage's dump info
-        auto dump_info = stage->getDumpInfo();
+        StageDumpInfo dump_info = stage->getDumpInfoSnapshot();
         if (dump_info.inputs.empty() || !dump_info.inputs[0].tensor)
         {
             LOG_ERROR("[DeviceGraphExecutor] AllreduceStage '" << node.name << "' has no input buffer");
@@ -2000,7 +2022,7 @@ namespace llaminar2
         }
 
         // Get buffer info from stage's dump info
-        auto dump_info = stage->getDumpInfo();
+        StageDumpInfo dump_info = stage->getDumpInfoSnapshot();
 
         // AllGather has separate input and output buffers
         ITensor *local_input = nullptr;

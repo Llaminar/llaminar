@@ -17,8 +17,10 @@
 #include "LogitsGatherer.h"
 #include "DeviceSampler.h"
 #include "DeviceGraphOrchestrator.h"
+#include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../mtp/MTPSpecStateContract.h"
 #include "../../factory/InferenceRunnerFactory.h"
+#include "../../moe/GPUExpertTransfer.h"
 #include "../../moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../../collective/ILocalTPContext.h"
@@ -98,23 +100,59 @@ namespace llaminar2
 
             const int expert_limit = std::min(
                 num_experts,
-                static_cast<int>(std::min(arrivals.is_replicated.size(), arrivals.owner_socket.size())));
+                static_cast<int>(arrivals.owner_socket.size()));
+            for (int participant = 0; participant < participants; ++participant)
+            {
+                for (int layer = 0; layer < num_layers; ++layer)
+                {
+                    for (int expert_id = 0; expert_id < expert_limit; ++expert_id)
+                    {
+                        const int owner = arrivals.owner_socket[static_cast<size_t>(expert_id)];
+                        if (owner < 0 || owner >= participants || participant == owner)
+                            continue;
+                        if (arrivals.hasReplicaOnParticipant(layer, expert_id, participant))
+                            masks_by_participant[static_cast<size_t>(participant)][static_cast<size_t>(layer)][static_cast<size_t>(expert_id)] = true;
+                    }
+                }
+            }
+
+            return masks_by_participant;
+        }
+
+        std::vector<std::vector<std::vector<bool>>> buildOwnershipArrivalTransferMasks(
+            const MoERebalanceController &controller,
+            const std::vector<int> &previous_placement)
+        {
+            const int participants = controller.participantCount();
+            const int num_layers = controller.numLayers();
+            const int num_experts = controller.numExperts();
+            std::vector<std::vector<std::vector<bool>>> masks_by_participant(
+                static_cast<size_t>(std::max(0, participants)),
+                std::vector<std::vector<bool>>(
+                    static_cast<size_t>(std::max(0, num_layers)),
+                    std::vector<bool>(static_cast<size_t>(std::max(0, num_experts)), false)));
+
+            if (participants <= 0 || num_layers <= 0 || num_experts <= 0)
+                return masks_by_participant;
+
+            const auto &current_placement = controller.currentParticipantPlacement();
+            const int expert_limit = std::min({
+                num_experts,
+                static_cast<int>(previous_placement.size()),
+                static_cast<int>(current_placement.size())});
+
             for (int expert_id = 0; expert_id < expert_limit; ++expert_id)
             {
-                if (!arrivals.is_replicated[static_cast<size_t>(expert_id)])
-                    continue;
-
-                const int owner = arrivals.owner_socket[static_cast<size_t>(expert_id)];
-                if (owner < 0 || owner >= participants)
-                    continue;
-
-                for (int participant = 0; participant < participants; ++participant)
+                const int previous_owner = previous_placement[static_cast<size_t>(expert_id)];
+                const int current_owner = current_placement[static_cast<size_t>(expert_id)];
+                if (current_owner < 0 || current_owner >= participants ||
+                    previous_owner == current_owner)
                 {
-                    if (participant == owner)
-                        continue;
-                    for (int layer = 0; layer < num_layers; ++layer)
-                        masks_by_participant[static_cast<size_t>(participant)][static_cast<size_t>(layer)][static_cast<size_t>(expert_id)] = true;
+                    continue;
                 }
+
+                for (int layer = 0; layer < num_layers; ++layer)
+                    masks_by_participant[static_cast<size_t>(current_owner)][static_cast<size_t>(layer)][static_cast<size_t>(expert_id)] = true;
             }
 
             return masks_by_participant;
@@ -680,6 +718,8 @@ namespace llaminar2
                 applyLogitsGatherSkipFlags();
             }
         }
+
+        wireLocalTPMoERuntimeHistogramSyncs();
     }
 
     RankOrchestrator::~RankOrchestrator() = default;
@@ -1194,6 +1234,8 @@ namespace llaminar2
                                                           << " compute streams for event-based collective sync");
             }
         }
+
+        wireLocalTPMoERuntimeHistogramSyncs();
     }
 
     // =========================================================================
@@ -1660,6 +1702,13 @@ namespace llaminar2
     // =========================================================================
     // TP Mode Forward Implementation (existing parallel execution)
     // =========================================================================
+    int RankOrchestrator::effectiveTPWorkerCollectTimeoutMs() const
+    {
+        return collective_timeout_policy::effectiveCollectTimeoutMs(
+            debugEnv().tp_collect_timeout_ms,
+            tp_first_forward_completed_);
+    }
+
     bool RankOrchestrator::forwardTP(const int *tokens, int seq_len)
     {
         if (device_runners_.empty())
@@ -1762,6 +1811,52 @@ namespace llaminar2
             auto kv_phase = KVCacheProfiler::getCurrentPhase();
             auto executor_phase = GraphExecutorStats::currentPhase();
 
+            std::vector<DeviceGraphOrchestrator *> pre_execution_rendezvous_runners;
+            std::shared_ptr<ForwardGraphExecutionRendezvous> pre_execution_rendezvous;
+            if (!tp_first_forward_completed_ && device_runners_.size() > 1)
+            {
+                pre_execution_rendezvous_runners.reserve(device_runners_.size());
+                for (auto &runner : device_runners_)
+                {
+                    auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get());
+                    if (dgo)
+                        pre_execution_rendezvous_runners.push_back(dgo);
+                }
+
+                if (pre_execution_rendezvous_runners.size() == device_runners_.size())
+                {
+                    pre_execution_rendezvous =
+                        std::make_shared<ForwardGraphExecutionRendezvous>(
+                            device_runners_.size(),
+                            "rank_tp_first_forward");
+                    for (auto *dgo : pre_execution_rendezvous_runners)
+                        dgo->setForwardGraphExecutionRendezvous(pre_execution_rendezvous);
+                    LOG_DEBUG("RankOrchestrator::forwardTP: armed first-forward pre-execution rendezvous for "
+                              << device_runners_.size() << " TP child graph(s)");
+                }
+                else if (!pre_execution_rendezvous_runners.empty())
+                {
+                    LOG_WARN("RankOrchestrator::forwardTP: skipping first-forward pre-execution rendezvous; "
+                             << pre_execution_rendezvous_runners.size() << "/"
+                             << device_runners_.size()
+                             << " child runners expose DeviceGraphOrchestrator");
+                    pre_execution_rendezvous_runners.clear();
+                }
+            }
+
+            struct ScopedForwardExecutionRendezvousClear
+            {
+                std::vector<DeviceGraphOrchestrator *> runners;
+                ~ScopedForwardExecutionRendezvousClear()
+                {
+                    for (auto *runner : runners)
+                    {
+                        if (runner)
+                            runner->setForwardGraphExecutionRendezvous(nullptr);
+                    }
+                }
+            } rendezvous_clear_guard{pre_execution_rendezvous_runners};
+
             tp_worker_pool_->dispatch(
                 [this, tokens, seq_len, kernel_phase, rocm_phase, cuda_phase, kv_phase, executor_phase](size_t i) -> bool
                 {
@@ -1816,8 +1911,11 @@ namespace llaminar2
 
             // Collect results from all workers. Debug/Integration builds default to
             // a 30s safety net, while Release keeps unlimited waits unless
-            // LLAMINAR_TP_COLLECT_TIMEOUT_MS is set explicitly.
-            auto results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            // LLAMINAR_TP_COLLECT_TIMEOUT_MS is set explicitly. Cold first
+            // materialization gets an extended timeout because runners can reach
+            // the first collective at very different times.
+            const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
+            auto results = tp_worker_pool_->collectAll(collect_timeout_ms);
 
             // Process results with fault-tolerant exception handling.
             // IMPORTANT: Store the FIRST substantive exception. When one device
@@ -1833,11 +1931,11 @@ namespace llaminar2
                               << r.worker_index << " did not complete (stuck)");
                     worker_timeout = true;
                     all_success = false;
-                    if (debugEnv().tp_collect_timeout_ms > 0)
+                    if (collect_timeout_ms > 0)
                     {
                         abortAfterTPWorkerTimeout(
                             "forwardTP",
-                            debugEnv().tp_collect_timeout_ms,
+                            collect_timeout_ms,
                             tp_worker_pool_->completedCount(),
                             tp_worker_pool_->numWorkers());
                     }
@@ -1915,11 +2013,11 @@ namespace llaminar2
                     all_success = false;
                 }
             }
-            if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+            if (worker_timeout && collect_timeout_ms > 0)
             {
                 abortAfterTPWorkerTimeout(
                     "forwardTP",
-                    debugEnv().tp_collect_timeout_ms,
+                    collect_timeout_ms,
                     tp_worker_pool_->completedCount(),
                     tp_worker_pool_->numWorkers());
             }
@@ -2066,6 +2164,9 @@ namespace llaminar2
                 tp_decode_stats_.record(total_ms, dispatch_ms, wait_ms, gather_ms);
             }
         }
+
+        if (all_success)
+            tp_first_forward_completed_ = true;
 
         return all_success;
     }
@@ -2475,6 +2576,7 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         std::vector<TPWorkerPool::WorkerResult> results;
+        const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
         {
             PerfStatsCollector::ScopedTimer collect_timer(
                 "mtp",
@@ -2482,7 +2584,7 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())}});
-            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            results = tp_worker_pool_->collectAll(collect_timeout_ms);
         }
         bool worker_timeout = false;
         for (auto &r : results)
@@ -2493,11 +2595,11 @@ namespace llaminar2
                           << r.worker_index << " did not complete (stuck)");
                 worker_timeout = true;
                 all_success = false;
-                if (debugEnv().tp_collect_timeout_ms > 0)
+                if (collect_timeout_ms > 0)
                 {
                     abortAfterTPWorkerTimeout(
                         "forwardMTP",
-                        debugEnv().tp_collect_timeout_ms,
+                        collect_timeout_ms,
                         tp_worker_pool_->completedCount(),
                         tp_worker_pool_->numWorkers());
                 }
@@ -2527,11 +2629,11 @@ namespace llaminar2
                 all_success = false;
             }
         }
-        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
                 "forwardMTP",
-                debugEnv().tp_collect_timeout_ms,
+                collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
@@ -2694,6 +2796,7 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         std::vector<TPWorkerPool::WorkerResult> results;
+        const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
         {
             PerfStatsCollector::ScopedTimer collect_timer(
                 "mtp",
@@ -2701,7 +2804,7 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())}});
-            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            results = tp_worker_pool_->collectAll(collect_timeout_ms);
         }
 
         bool worker_timeout = false;
@@ -2713,11 +2816,11 @@ namespace llaminar2
                           << r.worker_index << " did not complete (stuck)");
                 worker_timeout = true;
                 all_success = false;
-                if (debugEnv().tp_collect_timeout_ms > 0)
+                if (collect_timeout_ms > 0)
                 {
                     abortAfterTPWorkerTimeout(
                         "forwardMTPFromLastDraft",
-                        debugEnv().tp_collect_timeout_ms,
+                        collect_timeout_ms,
                         tp_worker_pool_->completedCount(),
                         tp_worker_pool_->numWorkers());
                 }
@@ -2748,11 +2851,11 @@ namespace llaminar2
             }
         }
 
-        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
                 "forwardMTPFromLastDraft",
-                debugEnv().tp_collect_timeout_ms,
+                collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
@@ -3005,6 +3108,7 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         std::vector<TPWorkerPool::WorkerResult> results;
+        const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
         {
             PerfStatsCollector::ScopedTimer collect_timer(
                 "mtp",
@@ -3012,7 +3116,7 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())}});
-            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            results = tp_worker_pool_->collectAll(collect_timeout_ms);
         }
 
         bool worker_timeout = false;
@@ -3024,11 +3128,11 @@ namespace llaminar2
                           << r.worker_index << " did not complete (stuck)");
                 worker_timeout = true;
                 all_success = false;
-                if (debugEnv().tp_collect_timeout_ms > 0)
+                if (collect_timeout_ms > 0)
                 {
                     abortAfterTPWorkerTimeout(
                         "commitMTPShiftedRowsFromLastForward",
-                        debugEnv().tp_collect_timeout_ms,
+                        collect_timeout_ms,
                         tp_worker_pool_->completedCount(),
                         tp_worker_pool_->numWorkers());
                 }
@@ -3059,11 +3163,11 @@ namespace llaminar2
             }
         }
 
-        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
                 "commitMTPShiftedRowsFromLastForward",
-                debugEnv().tp_collect_timeout_ms,
+                collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
@@ -3239,6 +3343,7 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         std::vector<TPWorkerPool::WorkerResult> results;
+        const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
         {
             PerfStatsCollector::ScopedTimer collect_timer(
                 "mtp",
@@ -3246,7 +3351,7 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())}});
-            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            results = tp_worker_pool_->collectAll(collect_timeout_ms);
         }
 
         bool worker_timeout = false;
@@ -3258,11 +3363,11 @@ namespace llaminar2
                           << r.worker_index << " did not complete (stuck)");
                 worker_timeout = true;
                 all_success = false;
-                if (debugEnv().tp_collect_timeout_ms > 0)
+                if (collect_timeout_ms > 0)
                 {
                     abortAfterTPWorkerTimeout(
                         "commitMTPShiftedRowFromCurrentTerminalHidden",
-                        debugEnv().tp_collect_timeout_ms,
+                        collect_timeout_ms,
                         tp_worker_pool_->completedCount(),
                         tp_worker_pool_->numWorkers());
                 }
@@ -3293,11 +3398,11 @@ namespace llaminar2
             }
         }
 
-        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
                 "commitMTPShiftedRowFromCurrentTerminalHidden",
-                debugEnv().tp_collect_timeout_ms,
+                collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
@@ -4662,6 +4767,7 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         std::vector<TPWorkerPool::WorkerResult> results;
+        const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
         {
             PerfStatsCollector::ScopedTimer collect_timer(
                 "mtp",
@@ -4669,7 +4775,7 @@ namespace llaminar2
                 "decode",
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())}});
-            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            results = tp_worker_pool_->collectAll(collect_timeout_ms);
         }
 
         bool worker_timeout = false;
@@ -4681,11 +4787,11 @@ namespace llaminar2
                           << r.worker_index << " did not complete (stuck)");
                 worker_timeout = true;
                 all_success = false;
-                if (debugEnv().tp_collect_timeout_ms > 0)
+                if (collect_timeout_ms > 0)
                 {
                     abortAfterTPWorkerTimeout(
                         "publishAcceptedMTPSpecState",
-                        debugEnv().tp_collect_timeout_ms,
+                        collect_timeout_ms,
                         tp_worker_pool_->completedCount(),
                         tp_worker_pool_->numWorkers());
                 }
@@ -4717,11 +4823,11 @@ namespace llaminar2
             }
         }
 
-        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
                 "publishAcceptedMTPSpecState",
-                debugEnv().tp_collect_timeout_ms,
+                collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
@@ -5021,6 +5127,7 @@ namespace llaminar2
         std::exception_ptr first_exception = nullptr;
         size_t first_exception_device = 0;
         std::vector<TPWorkerPool::WorkerResult> results;
+        const int collect_timeout_ms = effectiveTPWorkerCollectTimeoutMs();
         {
             PerfStatsCollector::ScopedTimer collect_timer(
                 "mtp",
@@ -5029,7 +5136,7 @@ namespace llaminar2
                 "rank",
                 {{"participants", std::to_string(device_runners_.size())},
                  {"request_count", std::to_string(plans.request_count)}});
-            results = tp_worker_pool_->collectAll(debugEnv().tp_collect_timeout_ms);
+            results = tp_worker_pool_->collectAll(collect_timeout_ms);
         }
 
         bool worker_timeout = false;
@@ -5041,11 +5148,11 @@ namespace llaminar2
                           << r.worker_index << " did not complete (stuck)");
                 worker_timeout = true;
                 all_success = false;
-                if (debugEnv().tp_collect_timeout_ms > 0)
+                if (collect_timeout_ms > 0)
                 {
                     abortAfterTPWorkerTimeout(
                         "publishAcceptedMTPSpecStateBatch",
-                        debugEnv().tp_collect_timeout_ms,
+                        collect_timeout_ms,
                         tp_worker_pool_->completedCount(),
                         tp_worker_pool_->numWorkers());
                 }
@@ -5077,11 +5184,11 @@ namespace llaminar2
             }
         }
 
-        if (worker_timeout && debugEnv().tp_collect_timeout_ms > 0)
+        if (worker_timeout && collect_timeout_ms > 0)
         {
             abortAfterTPWorkerTimeout(
                 "publishAcceptedMTPSpecStateBatch",
-                debugEnv().tp_collect_timeout_ms,
+                collect_timeout_ms,
                 tp_worker_pool_->completedCount(),
                 tp_worker_pool_->numWorkers());
         }
@@ -5521,6 +5628,123 @@ namespace llaminar2
                 continue;
             runner->setSkipLogitsGatherDecode(skip_logits_gather_decode_);
             runner->setSkipLogitsGatherPrefill(skip_logits_gather_prefill_);
+        }
+    }
+
+    void RankOrchestrator::wireLocalTPMoERuntimeHistogramSyncs()
+    {
+        if (local_tp_moe_histogram_syncs_wired_)
+            return;
+        local_tp_moe_histogram_syncs_wired_ = true;
+
+        if (!tp_ctx_ || tp_ctx_->degree() <= 1 || device_runners_.size() <= 1)
+            return;
+
+        std::vector<MoERebalanceController *> controllers;
+        controllers.reserve(device_runners_.size());
+        for (const auto &runner : device_runners_)
+        {
+            if (!runner)
+                continue;
+            for (auto *controller : runner->moeRebalanceControllers())
+            {
+                if (controller &&
+                    std::find(controllers.begin(), controllers.end(), controller) == controllers.end())
+                {
+                    controllers.push_back(controller);
+                }
+            }
+        }
+
+        auto *active = selectActiveMoERebalanceController(controllers);
+        if (!active || !active->histogram())
+            return;
+
+        DecodeExpertHistogram *active_histogram = active->histogram();
+        const std::string domain_id = active->domainId();
+        const int num_layers = active->numLayers();
+        const int num_experts = active->numExperts();
+        int sibling_count = 0;
+
+        for (auto *source_controller : controllers)
+        {
+            if (!source_controller || source_controller == active)
+                continue;
+            if (source_controller->domainId() != domain_id)
+                continue;
+            if (source_controller->numLayers() != num_layers ||
+                source_controller->numExperts() != num_experts)
+            {
+                LOG_WARN("RankOrchestrator: skipping LocalTP MoE runtime histogram bridge for domain "
+                         << domain_id << " because controller dimensions differ");
+                continue;
+            }
+
+            DecodeExpertHistogram *source_histogram = source_controller->histogram();
+            if (!source_histogram || source_histogram == active_histogram)
+                continue;
+
+            const int source_participant = ++sibling_count;
+            active_histogram->registerRuntimeHistogramSync(
+                [active_histogram,
+                 source_histogram,
+                 domain_id,
+                 num_layers,
+                 num_experts,
+                 source_participant]() -> bool
+                {
+                    if (!source_histogram->syncRuntimeHistograms())
+                        return false;
+
+                    uint64_t activations_merged = 0;
+                    for (int layer = 0; layer < num_layers; ++layer)
+                    {
+                        auto counts = source_histogram->layerHistogram(layer);
+                        for (uint64_t count : counts)
+                            activations_merged += count;
+                        active_histogram->mergeLayerCounts(
+                            layer,
+                            counts.data(),
+                            num_experts,
+                            /*count_window_tokens=*/false);
+                    }
+
+                    source_histogram->resetWindow();
+
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "rank_runtime_histogram_sibling_syncs",
+                        1.0,
+                        "rebalance",
+                        {},
+                        {{"domain_id", domain_id},
+                         {"source_participant", std::to_string(source_participant)}});
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "rank_runtime_histogram_sibling_activations",
+                        static_cast<double>(activations_merged),
+                        "rebalance",
+                        {},
+                        {{"domain_id", domain_id},
+                         {"source_participant", std::to_string(source_participant)}});
+                    return true;
+                });
+
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "rank_runtime_histogram_sibling_sync_registrations",
+                1.0,
+                "rebalance",
+                primaryDeviceId().toString(),
+                {{"domain_id", domain_id},
+                 {"source_participant", std::to_string(source_participant)}});
+        }
+
+        if (sibling_count > 0)
+        {
+            LOG_DEBUG("RankOrchestrator: wired " << sibling_count
+                                                 << " LocalTP sibling MoE runtime histogram sync(s) for domain "
+                                                 << domain_id);
         }
     }
 
@@ -6962,60 +7186,107 @@ namespace llaminar2
         return nullptr;
     }
 
-    void RankOrchestrator::applyMoEExpertMasksForAllDevices(
+    bool RankOrchestrator::applyMoEExpertMasksForAllDevices(
         const MoERebalanceController &controller,
-        const ExpertReplicaSet *replica_arrivals)
+        const ExpertReplicaSet *replica_arrivals,
+        const std::vector<int> *previous_ownership_placement)
     {
+        auto snapshot = snapshotMoEExpertMasksForAllDevices(
+            controller,
+            replica_arrivals,
+            previous_ownership_placement);
+        return applyMoEExpertMasksForAllDevices(
+            snapshot.masks_by_participant,
+            snapshot.domain_id,
+            snapshot.transferMasks());
+    }
+
+    RankOrchestrator::MoEExpertMaskSnapshot RankOrchestrator::snapshotMoEExpertMasksForAllDevices(
+        const MoERebalanceController &controller,
+        const ExpertReplicaSet *replica_arrivals,
+        const std::vector<int> *previous_ownership_placement) const
+    {
+        MoEExpertMaskSnapshot snapshot;
+        snapshot.domain_id = controller.domainId();
+
         const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
         if (gpu_cache_experts > 0)
         {
-            auto masks_by_participant = controller.computeGpuCacheExpertMasks(gpu_cache_experts);
-            applyMoEExpertMasksForAllDevices(masks_by_participant, controller.domainId());
-            return;
+            snapshot.masks_by_participant = controller.computeGpuCacheExpertMasks(gpu_cache_experts);
+            return snapshot;
         }
 
-        std::vector<std::vector<std::vector<bool>>> masks_by_participant;
-        masks_by_participant.reserve(device_runners_.size());
+        snapshot.masks_by_participant.reserve(device_runners_.size());
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
-            masks_by_participant.push_back(controller.computeExpertMasksForParticipant(static_cast<int>(device_idx)));
+            snapshot.masks_by_participant.push_back(controller.computeExpertMasksForParticipant(static_cast<int>(device_idx)));
 
-        std::optional<std::vector<std::vector<std::vector<bool>>>> transfer_masks_by_participant;
         if (replica_arrivals)
         {
-            transfer_masks_by_participant =
+            snapshot.transfer_masks_by_participant =
                 rank_orchestrator_detail::buildReplicaArrivalTransferMasks(
                     controller,
                     *replica_arrivals);
         }
+        else if (previous_ownership_placement)
+        {
+            snapshot.transfer_masks_by_participant =
+                rank_orchestrator_detail::buildOwnershipArrivalTransferMasks(
+                    controller,
+                    *previous_ownership_placement);
+        }
 
-        applyMoEExpertMasksForAllDevices(
-            masks_by_participant,
-            controller.domainId(),
-            transfer_masks_by_participant.has_value()
-                ? &transfer_masks_by_participant.value()
-                : nullptr);
+        return snapshot;
     }
 
-    void RankOrchestrator::applyMoEExpertMasksForAllDevices(
+    RankOrchestrator::PreparedMoEExpertMaskUpdate RankOrchestrator::prepareMoEExpertMaskTransfersForAllDevices(
         const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
         const std::string &domain_id,
         const std::vector<std::vector<std::vector<bool>>> *transfer_masks_by_participant)
     {
-        int applied = 0;
+        using Clock = std::chrono::steady_clock;
+        int direct_transfer_pair_batches = 0;
+        int direct_peer_pair_batches = 0;
+        int direct_host_staged_pair_batches = 0;
+        int serialized_transfer_pair_batches = 0;
+        size_t transfer_mask_entries = 0;
+        const std::string stats_device = primaryDeviceId().is_valid()
+                                             ? primaryDeviceId().toString()
+                                             : std::string{};
+        const PerfStatsCollector::Tags phase_tags{{"domain_id", domain_id}};
+
         std::vector<DeviceGraphOrchestrator *> local_dgos;
         local_dgos.reserve(device_runners_.size());
         for (auto &runner : device_runners_)
             local_dgos.push_back(dynamic_cast<DeviceGraphOrchestrator *>(runner.get()));
+        std::vector<bool> gpu_direct_prepare_ok(local_dgos.size(), true);
+        for (auto *dgo : local_dgos)
+        {
+            if (dgo)
+                dgo->clearPendingGpuDirectExpertTransfers();
+        }
+
+        auto count_mask_entries = [](const std::vector<std::vector<bool>> &masks) -> size_t
+        {
+            size_t count = 0;
+            for (const auto &layer_mask : masks)
+                count += static_cast<size_t>(std::count(layer_mask.begin(), layer_mask.end(), true));
+            return count;
+        };
 
         auto collect_local_transfers = [&](size_t destination_idx,
                                            const std::vector<std::vector<bool>> &destination_masks)
         {
             ReceivedWeightsMap merged;
             auto remaining_masks = destination_masks;
+            bool direct_only_gpu_transfer_attempted = false;
             for (size_t source_idx = 0; source_idx < local_dgos.size(); ++source_idx)
             {
                 if (source_idx == destination_idx || !local_dgos[source_idx])
                     continue;
+
+                const size_t requested_entries = count_mask_entries(remaining_masks);
+                if (requested_entries == 0)
+                    break;
 
                 auto is_same_backend_gpu_pair = [&]()
                 {
@@ -7028,20 +7299,35 @@ namespace llaminar2
                         src_device);
                 };
                 const bool same_backend_gpu_pair = is_same_backend_gpu_pair();
-
-                if (local_dgos[destination_idx])
-                {
-                    remaining_masks =
-                        local_dgos[destination_idx]->transferExpertWeightsDirectForMasksFrom(
-                            *local_dgos[source_idx],
-                            remaining_masks);
-                }
-
-                // Same-backend LocalTP GPU rebalancing is a strict descriptor/P2P
-                // transfer contract. CUDA/ROCm prepared kernels are not CPU-cloneable,
-                // so the old serialized blob fallback is both noisy and invalid here.
                 if (same_backend_gpu_pair)
+                {
+                    ++direct_transfer_pair_batches;
+                    const DeviceId dst_device = local_dgos[destination_idx]->primaryDeviceId();
+                    const DeviceId src_device = local_dgos[source_idx]->primaryDeviceId();
+                    if (GPUExpertTransfer::canAccessPeer(src_device, dst_device))
+                        ++direct_peer_pair_batches;
+                    else
+                        ++direct_host_staged_pair_batches;
+                }
+                else
+                {
+                    ++serialized_transfer_pair_batches;
+                }
+                transfer_mask_entries += requested_entries;
+
+                if (same_backend_gpu_pair)
+                {
+                    direct_only_gpu_transfer_attempted = true;
+                    if (local_dgos[destination_idx])
+                    {
+                        auto prepared_direct =
+                            local_dgos[destination_idx]->prepareExpertWeightsDirectForMasksFrom(
+                                *local_dgos[source_idx],
+                                remaining_masks);
+                        remaining_masks = std::move(prepared_direct.remaining_masks);
+                    }
                     continue;
+                }
 
                 auto source_blobs = local_dgos[source_idx]->collectExpertWeightsForMasks(remaining_masks);
                 for (auto &layer_entry : source_blobs)
@@ -7063,10 +7349,21 @@ namespace llaminar2
                     }
                 }
             }
+            if (direct_only_gpu_transfer_attempted &&
+                count_mask_entries(remaining_masks) > 0 &&
+                destination_idx < gpu_direct_prepare_ok.size())
+            {
+                gpu_direct_prepare_ok[destination_idx] = false;
+                LOG_ERROR("[RankOrchestrator] Same-backend GPU expert transfer prepare left "
+                          << count_mask_entries(remaining_masks)
+                          << " arrival mask entries unsatisfied for participant "
+                          << destination_idx << " domain=" << domain_id);
+            }
             return merged;
         };
 
         std::vector<ReceivedWeightsMap> received_by_device(device_runners_.size());
+        const auto transfer_start = Clock::now();
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
         {
             if (device_idx < masks_by_participant.size() && local_dgos[device_idx])
@@ -7079,17 +7376,157 @@ namespace llaminar2
                 received_by_device[device_idx] = collect_local_transfers(device_idx, transfer_masks);
             }
         }
+        const auto transfer_end = Clock::now();
+
+        PerfStatsCollector::recordTimingNs(
+            "moe_rebalance",
+            "rank_local_transfer_prepare",
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      transfer_end - transfer_start)
+                                      .count()),
+            "rebalance",
+            stats_device,
+            phase_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "rank_local_transfer_mask_entries",
+            static_cast<double>(transfer_mask_entries),
+            "rebalance",
+            stats_device,
+            phase_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "rank_local_direct_transfer_pair_batches",
+            static_cast<double>(direct_transfer_pair_batches),
+            "rebalance",
+            stats_device,
+            phase_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "rank_local_direct_peer_pair_batches",
+            static_cast<double>(direct_peer_pair_batches),
+            "rebalance",
+            stats_device,
+            phase_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "rank_local_direct_host_staged_pair_batches",
+            static_cast<double>(direct_host_staged_pair_batches),
+            "rebalance",
+            stats_device,
+            phase_tags);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "rank_local_serialized_transfer_pair_batches",
+            static_cast<double>(serialized_transfer_pair_batches),
+            "rebalance",
+            stats_device,
+            phase_tags);
+
+        PreparedMoEExpertMaskUpdate prepared;
+        prepared.domain_id = domain_id;
+        prepared.masks_by_participant = masks_by_participant;
+        prepared.received_by_device = std::move(received_by_device);
+        prepared.gpu_direct_prepare_ok_by_device = std::move(gpu_direct_prepare_ok);
+        return prepared;
+    }
+
+    bool RankOrchestrator::publishPreparedMoEExpertMasksForAllDevices(
+        const PreparedMoEExpertMaskUpdate &prepared)
+    {
+        using Clock = std::chrono::steady_clock;
+        int applied = 0;
+        const std::string stats_device = primaryDeviceId().is_valid()
+                                             ? primaryDeviceId().toString()
+                                             : std::string{};
+        const PerfStatsCollector::Tags phase_tags{{"domain_id", prepared.domain_id}};
+
+        std::vector<DeviceGraphOrchestrator *> local_dgos;
+        local_dgos.reserve(device_runners_.size());
+        for (auto &runner : device_runners_)
+            local_dgos.push_back(dynamic_cast<DeviceGraphOrchestrator *>(runner.get()));
+
+        const auto publish_start = Clock::now();
+        for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
+        {
+            if (device_idx >= prepared.masks_by_participant.size())
+                continue;
+            auto *dgo = local_dgos[device_idx];
+            if (!dgo)
+                continue;
+            if (device_idx < prepared.gpu_direct_prepare_ok_by_device.size() &&
+                !prepared.gpu_direct_prepare_ok_by_device[device_idx])
+            {
+                LOG_ERROR("[RankOrchestrator] Aborting MoE expert mask publish for domain="
+                          << prepared.domain_id
+                          << " because same-backend GPU-direct staging was incomplete for participant "
+                          << device_idx);
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "rank_local_mask_publish_aborts",
+                    1.0,
+                    "rebalance",
+                    stats_device,
+                    {{"domain_id", prepared.domain_id},
+                     {"reason", "incomplete_gpu_direct_prepare"}});
+                for (auto *pending_dgo : local_dgos)
+                {
+                    if (pending_dgo)
+                        pending_dgo->clearPendingGpuDirectExpertTransfers();
+                }
+                return false;
+            }
+        }
 
         for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
         {
-            if (device_idx >= masks_by_participant.size())
+            if (device_idx >= prepared.masks_by_participant.size())
+                continue;
+
+            auto *dgo = local_dgos[device_idx];
+            if (!dgo)
+                continue;
+            if (!dgo->activatePendingGpuDirectExpertTransfers())
+            {
+                LOG_ERROR("[RankOrchestrator] Aborting MoE expert mask publish for domain="
+                          << prepared.domain_id
+                          << " because staged GPU-direct activation failed for participant "
+                          << device_idx);
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "rank_local_mask_publish_aborts",
+                    1.0,
+                    "rebalance",
+                    stats_device,
+                    {{"domain_id", prepared.domain_id},
+                     {"reason", "gpu_direct_activation_failed"}});
+                for (auto *pending_dgo : local_dgos)
+                {
+                    if (pending_dgo)
+                        pending_dgo->clearPendingGpuDirectExpertTransfers();
+                }
+                return false;
+            }
+        }
+
+        for (size_t device_idx = 0; device_idx < device_runners_.size(); ++device_idx)
+        {
+            if (device_idx >= prepared.masks_by_participant.size())
                 continue;
 
             auto *dgo = local_dgos[device_idx];
             if (!dgo)
                 continue;
 
-            dgo->applyExpertMasksForDomain(domain_id, masks_by_participant[device_idx], received_by_device[device_idx]);
+            const ReceivedWeightsMap empty_received;
+            const auto &received =
+                device_idx < prepared.received_by_device.size()
+                    ? prepared.received_by_device[device_idx]
+                    : empty_received;
+            dgo->applyExpertMasksForDomain(
+                prepared.domain_id,
+                prepared.masks_by_participant[device_idx],
+                received);
             ++applied;
         }
 
@@ -7099,22 +7536,74 @@ namespace llaminar2
             {
                 if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
                 {
-                    rank->applyMoEExpertMasksForAllDevices(masks_by_participant, domain_id);
+                    if (!rank->applyMoEExpertMasksForAllDevices(
+                        prepared.masks_by_participant,
+                        prepared.domain_id))
+                    {
+                        LOG_ERROR("[RankOrchestrator] Nested LocalTP MoE expert mask publish failed for domain="
+                                  << prepared.domain_id);
+                        return false;
+                    }
                     ++applied;
                     continue;
                 }
                 if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
                 {
-                    if (!masks_by_participant.empty())
+                    if (!prepared.masks_by_participant.empty())
                     {
-                        dgo->applyExpertMasksForDomain(domain_id, masks_by_participant.front(), ReceivedWeightsMap{});
+                        dgo->applyExpertMasksForDomain(
+                            prepared.domain_id,
+                            prepared.masks_by_participant.front(),
+                            ReceivedWeightsMap{});
                         ++applied;
                     }
                 }
             }
         }
+        const auto publish_end = Clock::now();
+        PerfStatsCollector::recordTimingNs(
+            "moe_rebalance",
+            "rank_local_mask_publish",
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      publish_end - publish_start)
+                                      .count()),
+            "rebalance",
+            stats_device,
+            phase_tags);
         LOG_DEBUG("[RankOrchestrator] Applied LocalTP MoE expert masks to "
                   << applied << "/" << device_runners_.size() << " device runners");
+        return true;
+    }
+
+    void RankOrchestrator::clearPendingGpuDirectExpertTransfersForAllDevices()
+    {
+        for (auto &runner : device_runners_)
+        {
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+                dgo->clearPendingGpuDirectExpertTransfers();
+        }
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (auto *rank = dynamic_cast<RankOrchestrator *>(runner.get()))
+            {
+                rank->clearPendingGpuDirectExpertTransfersForAllDevices();
+                continue;
+            }
+            if (auto *dgo = dynamic_cast<DeviceGraphOrchestrator *>(runner.get()))
+                dgo->clearPendingGpuDirectExpertTransfers();
+        }
+    }
+
+    bool RankOrchestrator::applyMoEExpertMasksForAllDevices(
+        const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+        const std::string &domain_id,
+        const std::vector<std::vector<std::vector<bool>>> *transfer_masks_by_participant)
+    {
+        auto prepared = prepareMoEExpertMaskTransfersForAllDevices(
+            masks_by_participant,
+            domain_id,
+            transfer_masks_by_participant);
+        return publishPreparedMoEExpertMasksForAllDevices(prepared);
     }
 
     void RankOrchestrator::setExpertReplicaSetForAllDevices(const ExpertReplicaSet &replicas)

@@ -104,6 +104,32 @@ namespace llaminar2
                                const std::string &precision = "") override;
         bool allreduce(const TensorBase *input, TensorBase *output) override;
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override;
+        bool allgatherRawOnStream(
+            const void *local_send,
+            void *full_recv,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name) override;
+        bool supportsRawAllgatherOnStreamGraphCapture() const override;
+
+        void setBackendForTesting(
+            std::unique_ptr<ICollectiveBackend> backend,
+            CollectiveBackendType backend_type,
+            bool initialized);
+        bool allreduceGroupedOnExplicitStreamsForTesting(
+            void *buffer,
+            size_t effective_count,
+            CollectiveDataType dtype,
+            int device_index,
+            void *stream,
+            const std::string &stage_name,
+            const std::string &precision)
+        {
+            return allreduceGroupedOnExplicitStreams(
+                buffer, effective_count, dtype, device_index, stream, stage_name, precision);
+        }
         bool gatherFromDevices(
             const std::vector<const TensorBase *> &shards,
             TensorBase *output) override;
@@ -240,6 +266,9 @@ namespace llaminar2
             std::string precision;
             uint64_t seen_slots = 0;
             int arrivals = 0;
+            int departures = 0;
+            bool ok = true;
+            std::string error;
         };
 
         static std::atomic<uint64_t> next_context_id_;
@@ -325,11 +354,35 @@ namespace llaminar2
         std::atomic<bool> abort_requested_{false};
 
         // =====================================================================
-        // Collective Contract Trace State
+        // On-stream collective rendezvous and contract state. Device worker
+        // threads must enqueue the same collective generation together; otherwise
+        // NCCL/RCCL can observe asymmetric launch order during first-use setup.
         // =====================================================================
         mutable std::mutex contract_trace_mutex_;
+        std::condition_variable contract_trace_cv_;
         std::vector<uint64_t> onstream_sequence_by_slot_;
         std::unordered_map<uint64_t, OnStreamCollectiveContract> onstream_contracts_;
+        std::atomic<bool> first_onstream_collective_completed_{false};
+
+        // Eager homogeneous GPU allreduce rendezvous. Unlike the graph-capture
+        // path, eager execution launches one grouped NCCL/RCCL collective over
+        // every participant's explicit producer stream from the last arrival.
+        mutable std::mutex grouped_onstream_allreduce_mutex_;
+        std::condition_variable grouped_onstream_allreduce_cv_;
+        uint64_t grouped_onstream_allreduce_generation_{0};
+        int grouped_onstream_allreduce_arrivals_{0};
+        int grouped_onstream_allreduce_departures_{0};
+        bool grouped_onstream_allreduce_ready_{false};
+        bool grouped_onstream_allreduce_result_{false};
+        bool grouped_onstream_allreduce_ok_{true};
+        size_t grouped_onstream_allreduce_count_{0};
+        int grouped_onstream_allreduce_dtype_{-1};
+        std::string grouped_onstream_allreduce_stage_;
+        std::string grouped_onstream_allreduce_precision_;
+        std::string grouped_onstream_allreduce_error_;
+        std::vector<void *> grouped_onstream_allreduce_buffers_;
+        std::vector<void *> grouped_onstream_allreduce_streams_;
+        std::vector<bool> grouped_onstream_allreduce_seen_;
 
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
@@ -365,6 +418,24 @@ namespace llaminar2
         std::vector<void *> small_gpu_allreduce_buffers_;
         std::vector<void *> small_gpu_allreduce_streams_;
         std::vector<void *> small_gpu_allreduce_ready_events_;
+
+        // =====================================================================
+        // Raw Device AllGather Barrier State
+        // =====================================================================
+        // Used by graph-visible live-state handoff stages where the payload is
+        // owned by backend kernels rather than TensorBase instances.
+        mutable std::mutex raw_allgather_mutex_;
+        std::condition_variable raw_allgather_cv_;
+        int raw_allgather_arrivals_{0};
+        int raw_allgather_departures_{0};
+        uint64_t raw_allgather_generation_{0};
+        bool raw_allgather_result_{false};
+        size_t raw_allgather_send_count_{0};
+        CollectiveDataType raw_allgather_dtype_{CollectiveDataType::FLOAT32};
+        std::string raw_allgather_stage_name_;
+        std::vector<const void *> raw_allgather_send_buffers_;
+        std::vector<void *> raw_allgather_recv_buffers_;
+        std::vector<void *> raw_allgather_producer_streams_;
 
         // =====================================================================
         // BAR-Backed Tensor Registry
@@ -415,13 +486,21 @@ namespace llaminar2
          */
         bool allreduceImpl(TensorBase *tensor);
 
-        bool traceOnStreamCollectiveContract(int device_index,
-                                             TensorBase *tensor,
-                                             const std::string &stage_name,
-                                             size_t effective_count,
-                                             CollectiveDataType dtype,
-                                             void *stream,
-                                             const std::string &precision);
+        bool rendezvousOnStreamCollective(int device_index,
+                                          TensorBase *tensor,
+                                          const std::string &stage_name,
+                                          size_t effective_count,
+                                          CollectiveDataType dtype,
+                                          void *stream,
+                                          const std::string &precision);
+
+        bool allreduceGroupedOnExplicitStreams(void *buffer,
+                                               size_t effective_count,
+                                               CollectiveDataType dtype,
+                                               int device_index,
+                                               void *stream,
+                                               const std::string &stage_name,
+                                               const std::string &precision);
 
         bool trySmallGpuAllreduceOnStream(void *buffer,
                                           size_t count,
@@ -453,6 +532,15 @@ namespace llaminar2
          * @return true on success (same result for all participants)
          */
         bool allreduceWithBarrierMultiGpu(TensorBase *tensor, const std::string &stage_name = "", size_t count = 0);
+
+        bool allgatherRawWithBarrierMultiGpu(
+            const void *local_send,
+            void *full_recv,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name);
 
         /**
          * @brief Per-device async allreduce with barrier fallback

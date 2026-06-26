@@ -63,6 +63,9 @@
 #include <optional>
 #include <algorithm>
 #include <array>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include <map>
@@ -76,6 +79,7 @@ namespace llaminar2
 
     // Forward declarations
     class IMPIContext;
+    class GpuExpertTransferStagingPool;
     class IKVCache;
     class IWeightManager;
     class IWeightPlacementMap;
@@ -94,6 +98,28 @@ namespace llaminar2
     struct PrefixBlockHandle;
     class ActivationRotation;
     enum class KVCacheLayoutMode : uint8_t;
+
+    class ForwardGraphExecutionRendezvous
+    {
+    public:
+        explicit ForwardGraphExecutionRendezvous(
+            size_t expected_participants,
+            std::string label = {});
+
+        ForwardGraphExecutionRendezvous(const ForwardGraphExecutionRendezvous &) = delete;
+        ForwardGraphExecutionRendezvous &operator=(const ForwardGraphExecutionRendezvous &) = delete;
+
+        bool arriveAndWait(DeviceId device, int timeout_ms);
+
+    private:
+        const size_t expected_participants_;
+        const std::string label_;
+        size_t arrivals_ = 0;
+        bool released_ = false;
+        bool failed_ = false;
+        std::mutex mutex_;
+        std::condition_variable cv_;
+    };
 
     /**
      * @brief Configuration for graph caching behavior
@@ -558,6 +584,16 @@ namespace llaminar2
         DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept;
         DeviceGraphOrchestrator &operator=(DeviceGraphOrchestrator &&) noexcept;
 
+        /**
+         * @brief Arm or clear a one-shot pre-execution rendezvous for the next forward.
+         *
+         * RankOrchestrator uses this for LocalTP fan-out so all child production
+         * graphs finish cache-miss materialization before any child enters the
+         * first collective. Passing nullptr clears the rendezvous.
+         */
+        void setForwardGraphExecutionRendezvous(
+            std::shared_ptr<ForwardGraphExecutionRendezvous> rendezvous);
+
         // =========================================================================
         // Execution Methods (moved from QwenStandardGraph)
         // =========================================================================
@@ -914,6 +950,41 @@ namespace llaminar2
         std::vector<std::vector<bool>> transferExpertWeightsDirectForMasksFrom(
             DeviceGraphOrchestrator &source,
             const std::vector<std::vector<bool>> &masks);
+
+        struct PendingGpuDirectTransferSlotArrival
+        {
+            MoEExpertComputeStage *destination_stage = nullptr;
+            GpuDirectTransferSlotArrivals arrivals;
+
+            bool empty() const
+            {
+                return destination_stage == nullptr || arrivals.empty();
+            }
+        };
+
+        struct PreparedDirectExpertTransfer
+        {
+            std::vector<std::vector<bool>> remaining_masks;
+            std::vector<PendingGpuDirectTransferSlotArrival> staged_arrivals;
+
+            bool empty() const
+            {
+                return staged_arrivals.empty();
+            }
+        };
+
+        /// Stage same-backend GPU expert arrivals into transfer slots without
+        /// publishing active GEMM engines. Call activatePreparedGpuDirectExpertTransfers()
+        /// before applying masks that depend on these arrivals.
+        PreparedDirectExpertTransfer prepareExpertWeightsDirectForMasksFrom(
+            DeviceGraphOrchestrator &source,
+            const std::vector<std::vector<bool>> &masks);
+
+        bool activatePreparedGpuDirectExpertTransfers(
+            const std::vector<PendingGpuDirectTransferSlotArrival> &staged_arrivals);
+
+        void clearPendingGpuDirectExpertTransfers();
+        bool activatePendingGpuDirectExpertTransfers();
 
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
@@ -2468,14 +2539,14 @@ namespace llaminar2
                 forward_engine_->resetSessionReplayState(
                     /*preserve_replay_safe_segmented_captures=*/true);
             }
-            mtp_sidecar_depth0_cache_.resetSessionStatePreservingSegmentedReplay();
-            mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
-            mtp_sidecar_depth0_chained_cache_.resetSessionStatePreservingSegmentedReplay();
-            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
-            mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingSegmentedReplay();
-            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingSegmentedReplay();
+            mtp_sidecar_depth0_cache_.resetSessionStatePreservingGraphReplay();
+            mtp_sidecar_depth0_device_token_cache_.resetSessionStatePreservingGraphReplay();
+            mtp_sidecar_depth0_chained_cache_.resetSessionStatePreservingGraphReplay();
+            mtp_sidecar_depth0_chained_device_token_cache_.resetSessionStatePreservingGraphReplay();
+            mtp_sidecar_depth0_kv_only_cache_.resetSessionStatePreservingGraphReplay();
+            mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingGraphReplay();
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
-                cache.resetSessionStatePreservingSegmentedReplay();
+                cache.resetSessionStatePreservingGraphReplay();
             mtp_terminal_hidden_row_select_cache_.invalidate();
             mtp_terminal_hidden_rows_select_cache_.invalidate();
             last_pos_offset_ = -1;
@@ -2916,6 +2987,12 @@ namespace llaminar2
             const ForwardInput &input,
             void *execution_stream,
             DeviceId execution_device) override;
+
+        /** Wait at an optional rank-level rendezvous immediately before graph execution. */
+        bool waitBeforeForwardGraphExecution(
+            const ForwardInput &input,
+            DeviceId execution_device,
+            bool cache_miss) override;
 
         /**
          * @brief Materialize pending verifier token IDs on the graph execution stream.
@@ -3614,10 +3691,10 @@ namespace llaminar2
              * MTP sidecar graphs read stable token/position/device-mailbox
              * buffers that are rewritten before every launch.  Request reset
              * must still clear stage-owned dynamic metadata and explicit stream
-             * bindings, but preserving the segmented capture avoids paying
+             * bindings, but preserving the graph replay cache avoids paying
              * warmup/capture again for every served request with the same shape.
              */
-            void resetSessionStatePreservingSegmentedReplay()
+            void resetSessionStatePreservingGraphReplay()
             {
                 if (graph)
                 {
@@ -3829,6 +3906,8 @@ namespace llaminar2
         static const char *pendingLogitsStreamRoleName(PendingLogitsStreamRole role);
 
         std::array<PendingLogitsStreamHandoff, 3> pending_logits_streams_{};
+        std::vector<PendingGpuDirectTransferSlotArrival> pending_gpu_direct_transfer_slot_arrivals_;
+        std::vector<std::shared_ptr<GpuExpertTransferStagingPool>> gpu_direct_transfer_staging_pools_;
         bool defer_next_mtp_main_decode_sync_ = false;
         bool defer_all_position_verifier_sync_ = false;
 
@@ -3952,6 +4031,7 @@ namespace llaminar2
         /// Forward graph execution engine — owns the forward graph cache
         /// and handles cache HIT/MISS dispatch, GPU graph replay, timeline collection.
         std::unique_ptr<ForwardExecutionEngine> forward_engine_;
+        std::shared_ptr<ForwardGraphExecutionRendezvous> forward_execution_rendezvous_;
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;
@@ -4482,6 +4562,11 @@ namespace llaminar2
         ExpertReplicaSet current_expert_replica_set_;
         int current_expert_replica_participant_id_ = -1;
         uint64_t current_expert_replica_epoch_ = 0;
+
+        /// Last applied routed expert ownership/cache masks, used to invalidate
+        /// MoE-sensitive graph cache keys after non-replica ownership changes.
+        std::vector<std::vector<bool>> current_expert_masks_;
+        uint64_t current_expert_mask_epoch_ = 0;
 
         /// Optional expert weight payload provider for metadata-based host retention (owned)
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;

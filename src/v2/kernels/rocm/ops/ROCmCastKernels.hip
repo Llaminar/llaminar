@@ -68,13 +68,19 @@ extern "C"
      * @param fp32_input  Source FP32 device buffer
      * @param fp16_output Destination FP16 device buffer (must have count * 2 bytes)
      * @param count       Number of elements
+     * @param ordinal     GPU device ordinal owning the stream and buffers
      * @param stream      HIP stream (must not be null)
      * @return hipSuccess on success
      */
     hipError_t rocmCastFP32ToFP16(const float *fp32_input, void *fp16_output,
-                                   size_t count, hipStream_t stream)
+                                   size_t count, int ordinal, hipStream_t stream)
     {
         if (count == 0) return hipSuccess;
+        if (!fp32_input || !fp16_output || !stream) return hipErrorInvalidValue;
+
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess) return err;
+        (void)hipGetLastError();
 
         constexpr int BLOCK_SIZE = 256;
         const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -90,13 +96,19 @@ extern "C"
      * @param fp16_input  Source FP16 device buffer
      * @param fp32_output Destination FP32 device buffer (must have count * 4 bytes)
      * @param count       Number of elements
+     * @param ordinal     GPU device ordinal owning the stream and buffers
      * @param stream      HIP stream (must not be null)
      * @return hipSuccess on success
      */
     hipError_t rocmCastFP16ToFP32(const void *fp16_input, float *fp32_output,
-                                   size_t count, hipStream_t stream)
+                                   size_t count, int ordinal, hipStream_t stream)
     {
         if (count == 0) return hipSuccess;
+        if (!fp16_input || !fp32_output || !stream) return hipErrorInvalidValue;
+
+        hipError_t err = hipSetDevice(ordinal);
+        if (err != hipSuccess) return err;
+        (void)hipGetLastError();
 
         constexpr int BLOCK_SIZE = 256;
         const int grid_size = static_cast<int>((count + BLOCK_SIZE - 1) / BLOCK_SIZE);

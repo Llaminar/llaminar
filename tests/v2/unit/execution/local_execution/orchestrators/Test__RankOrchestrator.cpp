@@ -31,7 +31,9 @@
 #include <condition_variable>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <mutex>
+#include <sstream>
 #include <thread>
 #include <vector>
 #include <memory>
@@ -69,6 +71,16 @@ struct ChainedMTPRendezvous
     std::mutex mutex;
     std::condition_variable cv;
 };
+
+std::string readSourceFileForRankOrchestratorTest(const std::string &path)
+{
+    std::ifstream input(path);
+    if (!input.good())
+        return {};
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
 
 // =============================================================================
 // MockDeviceGraphOrchestrator - Mock for per-device runners
@@ -2065,17 +2077,16 @@ TEST_F(Test__RankOrchestrator, ForwardFailsIfAnyDeviceFails)
 
 TEST_F(Test__RankOrchestrator, ForwardTPWorkerTimeoutAbortsInsteadOfHanging)
 {
-    std::vector<std::unique_ptr<IInferenceRunner>> runners;
-
-    auto slow_runner = std::make_unique<MockDeviceGraphOrchestrator>();
-    slow_runner->set_forward_sleep_ms(250);
-    runners.push_back(std::move(slow_runner));
-    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
-
     EXPECT_DEATH(
         {
             setenv("LLAMINAR_TP_COLLECT_TIMEOUT_MS", "10", 1);
             mutableDebugEnv().reload();
+
+            std::vector<std::unique_ptr<IInferenceRunner>> runners;
+            auto slow_runner = std::make_unique<MockDeviceGraphOrchestrator>();
+            auto *slow_runner_ptr = slow_runner.get();
+            runners.push_back(std::move(slow_runner));
+            runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
 
             auto orchestrator = RankOrchestrator::createForTest(
                 llaminar2::test::MockModelContext::createMinimal(),
@@ -2084,6 +2095,8 @@ TEST_F(Test__RankOrchestrator, ForwardTPWorkerTimeoutAbortsInsteadOfHanging)
                 makeRankConfigForRunnerCount(2));
 
             int tokens[] = {1};
+            ASSERT_TRUE(orchestrator->forward(tokens, 1));
+            slow_runner_ptr->set_forward_sleep_ms(250);
             (void)orchestrator->forward(tokens, 1);
         },
         "");
@@ -2183,6 +2196,53 @@ TEST_F(Test__RankOrchestrator, MoERebalanceControllersAreLookupByDomain)
     EXPECT_EQ(orchestrator->moeRebalanceControllerForDomain("missing"), nullptr);
 }
 
+TEST_F(Test__RankOrchestrator, LocalTPActiveMoEHistogramSyncMergesSameDomainSiblings)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_moe_rebalance_controller(makeDomainController("gpu_domain"));
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_moe_rebalance_controller(makeDomainController("gpu_domain"));
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    auto controllers = orchestrator->moeRebalanceControllers();
+    ASSERT_EQ(controllers.size(), 2u);
+    auto *active = orchestrator->moeRebalanceController();
+    ASSERT_NE(active, nullptr);
+    auto *sibling = controllers[0] == active ? controllers[1] : controllers[0];
+    ASSERT_NE(sibling, nullptr);
+
+    int sibling_sync_calls = 0;
+    sibling->histogram()->registerRuntimeHistogramSync([&]()
+    {
+        const int hot_expert = 1;
+        const float weight = 1.0f;
+        sibling->histogram()->record(0, &hot_expert, &weight, 1);
+        ++sibling_sync_calls;
+        return true;
+    });
+
+    ASSERT_TRUE(active->histogram()->syncRuntimeHistograms());
+
+    EXPECT_EQ(sibling_sync_calls, 1);
+    EXPECT_EQ(active->histogram()->activationCount(0, 1), 1u);
+    EXPECT_EQ(sibling->histogram()->activationCount(0, 1), 0u)
+        << "Sibling counts must reset after the root histogram consumes them";
+    EXPECT_EQ(active->histogram()->windowTokenCount(), 0u)
+        << "Sibling participants contribute load distribution, not extra rank decode tokens";
+}
+
 TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferIsDirectOnly)
 {
     using rank_orchestrator_detail::sameBackendGpuExpertTransferIsDirectOnly;
@@ -2193,6 +2253,199 @@ TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferIsDirectOnly)
     EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cuda(0), DeviceId::rocm(0)));
     EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cuda(0), DeviceId::cpu()));
     EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cpu(), DeviceId::cuda(0)));
+}
+
+TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferUsesStagedPrepareAndPublish)
+{
+    const std::string rank_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+    const std::string dgo_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    ASSERT_FALSE(rank_source.empty());
+    ASSERT_FALSE(dgo_source.empty());
+
+    const auto prepare_pos =
+        rank_source.find("prepareExpertWeightsDirectForMasksFrom");
+    const auto publish_pos =
+        rank_source.find("bool RankOrchestrator::publishPreparedMoEExpertMasksForAllDevices");
+    const auto apply_pos =
+        rank_source.find("applyExpertMasksForDomain", publish_pos);
+    const auto abort_pos =
+        rank_source.find("incomplete_gpu_direct_prepare", publish_pos);
+    const auto rolling_activation_pos =
+        dgo_source.find("GPU-direct rolling activation");
+    const auto retire_pos =
+        dgo_source.find("gpu_direct_transfer_staging_wave_retire");
+    const auto stage_capacity_pos =
+        dgo_source.find("staging_pool_capacity");
+    const auto direct_prepare_fn_pos =
+        dgo_source.find("prepareExpertWeightsDirectForMasksFrom");
+    const auto missing_arrivals_pos =
+        dgo_source.find("missingPreparedExpertIds(expert_ids)", direct_prepare_fn_pos);
+    const auto active_arrival_capacity_pos =
+        dgo_source.find("active_arrival_capacity", missing_arrivals_pos);
+    const auto staged_prepare_pos =
+        dgo_source.find("stageExpertsGPUDirectToTransferSlotsFrom", active_arrival_capacity_pos);
+    const auto apply_masks_pos =
+        dgo_source.find("void DeviceGraphOrchestrator::applyExpertMasksForDomain");
+    const auto release_departed_pos =
+        dgo_source.find("releaseDepartedExperts(masks[layer])", apply_masks_pos);
+    const auto rolling_retry_pos =
+        dgo_source.find("while (!stage_pending.empty())");
+    const auto retire_after_empty_wave_pos =
+        dgo_source.find("if (!in_flight_activation_waves.empty())", rolling_retry_pos);
+
+    ASSERT_NE(prepare_pos, std::string::npos)
+        << "same-backend GPU rebalance must prepare direct transfers before publish";
+    ASSERT_NE(publish_pos, std::string::npos);
+    ASSERT_NE(abort_pos, std::string::npos)
+        << "incomplete same-backend GPU prepare must abort the whole mask publish";
+    ASSERT_NE(rolling_activation_pos, std::string::npos)
+        << "prepared GPU-direct arrivals must activate in a rolling DGO wave";
+    ASSERT_NE(retire_pos, std::string::npos)
+        << "rolling staging buffers must be retired by activation completion event";
+    ASSERT_NE(stage_capacity_pos, std::string::npos)
+        << "rolling staging capacity must be explicit and bounded";
+    ASSERT_NE(direct_prepare_fn_pos, std::string::npos);
+    ASSERT_NE(missing_arrivals_pos, std::string::npos)
+        << "active arrival capacity must be based on missing experts, not the whole target mask";
+    ASSERT_NE(active_arrival_capacity_pos, std::string::npos);
+    ASSERT_NE(staged_prepare_pos, std::string::npos);
+    ASSERT_NE(apply_masks_pos, std::string::npos);
+    ASSERT_NE(release_departed_pos, std::string::npos)
+        << "departed experts must still be released during mask application after direct prepares";
+    ASSERT_NE(rolling_retry_pos, std::string::npos)
+        << "rolling transfer staging must retry pending experts after reduced-capacity waves";
+    ASSERT_NE(retire_after_empty_wave_pos, std::string::npos)
+        << "a full reduced-capacity staging pool must retire an in-flight wave before retry";
+    ASSERT_NE(apply_pos, std::string::npos);
+    EXPECT_LT(missing_arrivals_pos, staged_prepare_pos);
+    EXPECT_LT(abort_pos, apply_pos)
+        << "mask publish must be all-or-nothing when GPU-direct prepare is incomplete";
+}
+
+TEST_F(Test__RankOrchestrator, LocalTPMoERebalanceDoesNotUseHostWorkerForGpuTransferStaging)
+{
+    const std::string runner_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(runner_source.empty());
+
+    ASSERT_EQ(runner_source.find("std::async("), std::string::npos)
+        << "GPU transfer staging must not call CUDA/HIP from a separate host worker while graphs/collectives replay";
+    ASSERT_EQ(runner_source.find("pending_moe_rebalance_prepare_"), std::string::npos)
+        << "Deferred publish needs a graph/collective-safe design before it returns to production";
+}
+
+TEST_F(Test__RankOrchestrator, HotReplicaStrategyDoesNotFallbackToOwnershipSwaps)
+{
+    const std::string runner_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(runner_source.empty());
+
+    const auto strategy_pos = runner_source.find("const bool hot_replica_strategy = max_replicas > 0");
+    const auto stable_log_pos = runner_source.find("No beneficial hot expert replicas; keeping base expert ownership stable");
+    const auto ownership_guard_pos = runner_source.find("if (!controller->hasReplicas() && !hot_replica_strategy)");
+    ASSERT_NE(strategy_pos, std::string::npos)
+        << "hot-expert cache mode must be represented as an explicit rebalance strategy";
+    ASSERT_NE(stable_log_pos, std::string::npos)
+        << "empty low-benefit replica proposals should keep base ownership stable";
+    ASSERT_NE(ownership_guard_pos, std::string::npos)
+        << "ownership swaps should run only when hot-replica strategy is disabled";
+}
+
+TEST_F(Test__RankOrchestrator, PreparedMoEExpertMaskUpdateSnapshotsMasksForDelayedPublish)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    std::vector<std::vector<std::vector<bool>>> masks(
+        2,
+        std::vector<std::vector<bool>>(
+            2,
+            std::vector<bool>(3, false)));
+    masks[0][0][0] = true;
+    masks[0][1][1] = true;
+    masks[1][0][2] = true;
+    masks[1][1][0] = true;
+
+    auto prepared = orchestrator->prepareMoEExpertMaskTransfersForAllDevices(
+        masks,
+        "gpu_domain");
+
+    masks[0][0][0] = false;
+    masks[1][1][0] = false;
+
+    ASSERT_FALSE(prepared.empty());
+    EXPECT_EQ(prepared.domain_id, "gpu_domain");
+    ASSERT_EQ(prepared.received_by_device.size(), 2u);
+    EXPECT_TRUE(prepared.received_by_device[0].empty());
+    EXPECT_TRUE(prepared.received_by_device[1].empty());
+    ASSERT_EQ(prepared.gpu_direct_prepare_ok_by_device.size(), 2u);
+    EXPECT_TRUE(prepared.gpu_direct_prepare_ok_by_device[0]);
+    EXPECT_TRUE(prepared.gpu_direct_prepare_ok_by_device[1]);
+    EXPECT_TRUE(prepared.masks_by_participant[0][0][0])
+        << "prepared rebalance publication must own a stable mask snapshot";
+    EXPECT_TRUE(prepared.masks_by_participant[1][1][0])
+        << "callers may keep decoding on the old masks while a prepared update is pending";
+
+    orchestrator->publishPreparedMoEExpertMasksForAllDevices(prepared);
+}
+
+TEST_F(Test__RankOrchestrator, PreparedMoEExpertMaskUpdateKeepsTransferMaskSeparateFromPublishMask)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    std::vector<std::vector<std::vector<bool>>> publish_masks(
+        2,
+        std::vector<std::vector<bool>>(
+            1,
+            std::vector<bool>(4, false)));
+    publish_masks[0][0][0] = true;
+    publish_masks[0][0][1] = true;
+    publish_masks[1][0][2] = true;
+    publish_masks[1][0][3] = true;
+
+    std::vector<std::vector<std::vector<bool>>> transfer_masks(
+        2,
+        std::vector<std::vector<bool>>(
+            1,
+            std::vector<bool>(4, false)));
+    transfer_masks[0][0][1] = true;
+    transfer_masks[1][0][2] = true;
+
+    auto prepared = orchestrator->prepareMoEExpertMaskTransfersForAllDevices(
+        publish_masks,
+        "gpu_domain",
+        &transfer_masks);
+
+    transfer_masks[0][0][1] = false;
+    publish_masks[1][0][3] = false;
+
+    ASSERT_EQ(prepared.masks_by_participant.size(), 2u);
+    EXPECT_TRUE(prepared.masks_by_participant[0][0][0]);
+    EXPECT_TRUE(prepared.masks_by_participant[0][0][1]);
+    EXPECT_TRUE(prepared.masks_by_participant[1][0][2]);
+    EXPECT_TRUE(prepared.masks_by_participant[1][0][3])
+        << "transfer masks restrict only what gets copied; they must not narrow the published active set";
 }
 
 TEST_F(Test__RankOrchestrator, ReplicaArrivalTransferMasksCopyOnlyToNonOwners)
@@ -2248,6 +2501,60 @@ TEST_F(Test__RankOrchestrator, ReplicaArrivalTransferMasksCopyOnlyToNonOwners)
     }
 }
 
+TEST_F(Test__RankOrchestrator, ReplicaArrivalTransferMasksUseLayerParticipantResidency)
+{
+    MoERebalanceController::Config cfg;
+    cfg.domain_id = "gpu";
+    cfg.mode = MoERebalanceMode::OBSERVE;
+    cfg.num_layers = 3;
+    cfg.num_experts = 4;
+    cfg.top_k = 1;
+    cfg.window_size = 4;
+    cfg.sockets = {
+        DeviceId(DeviceType::CPU, 0),
+        DeviceId(DeviceType::CPU, 1),
+        DeviceId(DeviceType::CPU, 2)};
+    cfg.initial_expert_to_socket = {0, 1, 2, 0};
+    MoERebalanceController controller(std::move(cfg));
+
+    ExpertReplicaSet arrivals;
+    arrivals.domain_id = "gpu";
+    arrivals.owner_socket = {0, 1, 2, 0};
+    arrivals.num_sockets = 3;
+    arrivals.is_replicated.assign(4, false);
+    arrivals.replica_participants_by_layer.assign(
+        3,
+        std::vector<std::vector<bool>>(4, std::vector<bool>(3, false)));
+    arrivals.setReplicaOnParticipant(0, 1, 0);
+    arrivals.setReplicaOnParticipant(2, 2, 1);
+    arrivals.rebuildAggregateReplicaFlags();
+    ASSERT_EQ(arrivals.num_replicated, 2);
+
+    auto masks = rank_orchestrator_detail::buildReplicaArrivalTransferMasks(controller, arrivals);
+    ASSERT_EQ(masks.size(), 3u);
+    for (const auto &participant_masks : masks)
+    {
+        ASSERT_EQ(participant_masks.size(), 3u);
+        for (const auto &layer_mask : participant_masks)
+            ASSERT_EQ(layer_mask.size(), 4u);
+    }
+
+    EXPECT_TRUE(masks[0][0][1]);
+    EXPECT_FALSE(masks[1][0][1])
+        << "participant 1 owns expert 1 and must not copy its own replica arrival";
+    EXPECT_FALSE(masks[2][0][1])
+        << "only the resident target participant should copy this arrival";
+    EXPECT_FALSE(masks[0][1][1])
+        << "arrival transfer must stay scoped to the layer that changed";
+
+    EXPECT_FALSE(masks[0][2][2]);
+    EXPECT_TRUE(masks[1][2][2]);
+    EXPECT_FALSE(masks[2][2][2])
+        << "participant 2 owns expert 2 and must not copy its own replica arrival";
+    EXPECT_FALSE(masks[1][0][2])
+        << "arrival transfer must not expand a layer-2 slot to layer 0";
+}
+
 TEST_F(Test__RankOrchestrator, EmptyReplicaArrivalTransferMasksSuppressCopies)
 {
     MoERebalanceController::Config cfg;
@@ -2288,6 +2595,111 @@ TEST_F(Test__RankOrchestrator, EmptyReplicaArrivalTransferMasksSuppressCopies)
             EXPECT_FALSE(layer_mask[1]);
         }
     }
+}
+
+TEST_F(Test__RankOrchestrator, OwnershipArrivalTransferMasksCopyOnlyNewOwners)
+{
+    MoERebalanceController::Config cfg;
+    cfg.domain_id = "gpu";
+    cfg.mode = MoERebalanceMode::OBSERVE;
+    cfg.num_layers = 2;
+    cfg.num_experts = 4;
+    cfg.top_k = 1;
+    cfg.window_size = 4;
+    cfg.sockets = {
+        DeviceId(DeviceType::CPU, 0),
+        DeviceId(DeviceType::CPU, 1),
+        DeviceId(DeviceType::CPU, 2)};
+    cfg.initial_expert_to_socket = {1, 1, 0, 2};
+    MoERebalanceController controller(std::move(cfg));
+
+    const std::vector<int> previous_placement = {0, 1, 2, 0};
+    auto masks = rank_orchestrator_detail::buildOwnershipArrivalTransferMasks(
+        controller,
+        previous_placement);
+
+    ASSERT_EQ(masks.size(), 3u);
+    for (const auto &participant_masks : masks)
+    {
+        ASSERT_EQ(participant_masks.size(), 2u);
+        for (const auto &layer_mask : participant_masks)
+            ASSERT_EQ(layer_mask.size(), 4u);
+    }
+
+    for (int layer = 0; layer < 2; ++layer)
+    {
+        EXPECT_TRUE(masks[1][layer][0])
+            << "expert 0 moved from participant 0 to participant 1";
+        EXPECT_FALSE(masks[0][layer][0]);
+        EXPECT_FALSE(masks[2][layer][0]);
+
+        EXPECT_FALSE(masks[0][layer][1]);
+        EXPECT_FALSE(masks[1][layer][1])
+            << "unchanged ownership must not trigger an arrival transfer";
+        EXPECT_FALSE(masks[2][layer][1]);
+
+        EXPECT_TRUE(masks[0][layer][2])
+            << "expert 2 moved from participant 2 to participant 0";
+        EXPECT_FALSE(masks[1][layer][2]);
+        EXPECT_FALSE(masks[2][layer][2]);
+
+        EXPECT_TRUE(masks[2][layer][3])
+            << "expert 3 moved from participant 0 to participant 2";
+        EXPECT_FALSE(masks[0][layer][3]);
+        EXPECT_FALSE(masks[1][layer][3]);
+    }
+}
+
+TEST_F(Test__RankOrchestrator, OwnershipArrivalSnapshotKeepsTransferMaskSeparateFromPublishMask)
+{
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+    runners.push_back(std::make_unique<MockDeviceGraphOrchestrator>());
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        llaminar2::test::MockModelContext::createMinimal(),
+        std::move(runners),
+        makeTPContextForRunnerCount(2),
+        makeRankConfigForRunnerCount(2));
+
+    MoERebalanceController::Config cfg;
+    cfg.domain_id = "gpu";
+    cfg.mode = MoERebalanceMode::OBSERVE;
+    cfg.num_layers = 1;
+    cfg.num_experts = 4;
+    cfg.top_k = 1;
+    cfg.window_size = 4;
+    cfg.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
+    cfg.initial_expert_to_socket = {0, 0, 1, 1};
+    MoERebalanceController controller(std::move(cfg));
+
+    const std::vector<int> previous_placement = {0, 1, 1, 0};
+    auto snapshot = orchestrator->snapshotMoEExpertMasksForAllDevices(
+        controller,
+        nullptr,
+        &previous_placement);
+
+    ASSERT_EQ(snapshot.masks_by_participant.size(), 2u);
+    ASSERT_EQ(snapshot.masks_by_participant[0].size(), 1u);
+    ASSERT_EQ(snapshot.masks_by_participant[1].size(), 1u);
+    EXPECT_TRUE(snapshot.masks_by_participant[0][0][0]);
+    EXPECT_TRUE(snapshot.masks_by_participant[0][0][1])
+        << "publish masks contain the full active owner set for participant 0";
+    EXPECT_TRUE(snapshot.masks_by_participant[1][0][2]);
+    EXPECT_TRUE(snapshot.masks_by_participant[1][0][3])
+        << "publish masks contain the full active owner set for participant 1";
+
+    ASSERT_NE(snapshot.transferMasks(), nullptr);
+    const auto &transfer_masks = *snapshot.transferMasks();
+    ASSERT_EQ(transfer_masks.size(), 2u);
+    EXPECT_FALSE(transfer_masks[0][0][0])
+        << "unchanged expert 0 is already resident and must not be transferred";
+    EXPECT_TRUE(transfer_masks[0][0][1])
+        << "expert 1 moved from participant 1 to participant 0";
+    EXPECT_FALSE(transfer_masks[1][0][2])
+        << "unchanged expert 2 is already resident and must not be transferred";
+    EXPECT_TRUE(transfer_masks[1][0][3])
+        << "expert 3 moved from participant 0 to participant 1";
 }
 
 TEST_F(Test__RankOrchestrator, PrefixLookupClampsToCommonLocalTPMinimum)

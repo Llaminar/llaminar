@@ -44,6 +44,8 @@ namespace llaminar2
 
     void SnapshotCapture::captureStage(const std::string &name, const StageDumpInfo &dump)
     {
+        std::lock_guard<std::mutex> lock(mutex_);
+
         if (const size_t context_sep = name.find("::"); context_sep != std::string::npos)
         {
             SnapshotCapture scoped_capture;

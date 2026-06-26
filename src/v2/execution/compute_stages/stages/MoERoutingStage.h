@@ -105,6 +105,7 @@ namespace llaminar2
         bool allowsZeroOutput() const override { return false; }
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }

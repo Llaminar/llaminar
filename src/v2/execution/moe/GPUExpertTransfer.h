@@ -41,6 +41,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 namespace llaminar2 {
 
@@ -85,6 +86,12 @@ struct GpuExpertPackedDescriptor {
     {
         return vnni_bytes + scales_bytes + mins_bytes + emins_bytes;
     }
+};
+
+struct GpuExpertStagedActivation
+{
+    GpuExpertPackedDescriptor staged;
+    GpuExpertPackedDescriptor active;
 };
 
 inline GpuExpertPackedDescriptor makeGpuExpertPackedDescriptor(
@@ -170,6 +177,23 @@ public:
         const GpuExpertPackedDescriptor& dst,
         const DeviceId& src_device,
         const DeviceId& dst_device,
+        void* stream);
+
+    /// Activate a staged same-device expert arrival by copying the transfer-slot
+    /// descriptor into its compute-facing active slot on an explicit stream.
+    /// This is intentionally named separately from cross-device transfer because
+    /// the caller may enqueue it later, after a staging event has completed.
+    static bool activateStagedExpert(
+        const GpuExpertPackedDescriptor& staged,
+        const GpuExpertPackedDescriptor& active,
+        const DeviceId& device,
+        void* stream);
+
+    /// Activate a batch of staged same-device expert projections on one explicit
+    /// stream. The call enqueues all copies in order and does not synchronize.
+    static bool activateStagedExperts(
+        const std::vector<GpuExpertStagedActivation>& activations,
+        const DeviceId& device,
         void* stream);
 
     /// Check if peer-to-peer access is available between two same-backend devices.

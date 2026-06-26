@@ -11,6 +11,7 @@
 
 #include "execution/moe/MoEExpertWeightService.h"
 #include "execution/moe/GpuExpertSlotPool.h"
+#include "execution/moe/GpuExpertTransferStagingPool.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "loaders/PreparedWeightStore.h"
 #include "tensors/Tensors.h"
@@ -20,8 +21,13 @@
 #include "backends/BackendManager.h"
 #include "utils/TestTensorFactory.h"
 
+#include <algorithm>
+#include <cstdint>
+#include <fstream>
 #include <memory>
 #include <optional>
+#include <sstream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -99,6 +105,7 @@ namespace
         std::optional<ExpertSlabRef> gate_slab_ref;
         std::optional<ExpertSlabRef> up_slab_ref;
         std::optional<ExpertSlabRef> down_slab_ref;
+        std::shared_ptr<GpuExpertSlotPool> gpu_direct_slot_pool;
 
         // 3D parent tensors (owned — must be shared_ptr for create_view/shared_from_this)
         std::shared_ptr<Q4_0Tensor> gate_3d;
@@ -143,7 +150,9 @@ namespace
                 expert_registry,
                 gate_slab_ref,
                 up_slab_ref,
-                down_slab_ref};
+                down_slab_ref,
+                true,
+                &gpu_direct_slot_pool};
         }
     };
 
@@ -164,6 +173,58 @@ namespace
     ITensorGemm *fakeGemm(int id)
     {
         return reinterpret_cast<ITensorGemm *>(static_cast<uintptr_t>(0x7000 + id * 0x100));
+    }
+
+    std::string readMoEWeightServiceSource()
+    {
+        std::ifstream in("/workspaces/llaminar/src/v2/execution/moe/MoEExpertWeightService.cpp");
+        if (!in)
+            return {};
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    }
+
+    GpuExpertPackedDescriptor fakePackedDesc(uintptr_t base)
+    {
+        GpuExpertPackedDescriptor desc;
+        desc.ptrs.d_vnni = reinterpret_cast<uint8_t *>(base);
+        desc.ptrs.d_scales = reinterpret_cast<void *>(base + 0x1000);
+        desc.ptrs.d_mins = reinterpret_cast<void *>(base + 0x2000);
+        desc.ptrs.d_emins = reinterpret_cast<void *>(base + 0x3000);
+        desc.n = kExpertIntermediate;
+        desc.k = kDModel;
+        desc.blocks_per_row = 1;
+        desc.codebook_id = 4;
+        desc.payload_bytes_per_block = 16;
+        desc.is_asymmetric = true;
+        desc.has_emins = true;
+        desc.vnni_bytes = static_cast<size_t>(desc.n * desc.blocks_per_row * desc.payload_bytes_per_block);
+        desc.scales_bytes = static_cast<size_t>(desc.n * desc.blocks_per_row * sizeof(uint16_t));
+        desc.mins_bytes = desc.scales_bytes;
+        desc.emins_bytes = static_cast<size_t>(desc.n * desc.blocks_per_row * sizeof(uint32_t));
+        return desc;
+    }
+
+    GpuDirectTransferSlotProjection fakeTransferSlotProjection(
+        int expert_id,
+        WeightRole role,
+        uintptr_t base,
+        const std::shared_ptr<void> &lifetime)
+    {
+        GpuDirectTransferSlotProjection projection;
+        projection.expert_id = expert_id;
+        projection.role = role;
+        projection.staged = fakePackedDesc(base);
+        projection.N = projection.staged.n;
+        projection.K = projection.staged.k;
+        projection.blocks_per_row = projection.staged.blocks_per_row;
+        projection.payload_bytes_per_block = projection.staged.payload_bytes_per_block;
+        projection.is_asymmetric = projection.staged.is_asymmetric;
+        projection.has_emins = projection.staged.has_emins;
+        projection.codebook_id = projection.staged.codebook_id;
+        projection.transfer_slot_lifetime = lifetime;
+        return projection;
     }
 
     class OwnedFakeGemm final : public ITensorGemm
@@ -238,8 +299,16 @@ namespace
         desc.num_experts = kNumExperts;
         desc.local_expert_start = 0;
         desc.local_expert_count = kNumExperts;
-        desc.rows_per_expert = kExpertIntermediate;
-        desc.cols_per_expert = kDModel;
+        if (role == WeightRole::MoEExpertDown)
+        {
+            desc.rows_per_expert = kDModel;
+            desc.cols_per_expert = kExpertIntermediate;
+        }
+        else
+        {
+            desc.rows_per_expert = kExpertIntermediate;
+            desc.cols_per_expert = kDModel;
+        }
         return desc;
     }
 
@@ -675,6 +744,29 @@ TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_RemovesRegistryEntries
     EXPECT_FALSE(registry.hasCompleteLayer(owner.device_id, 0, kNumExperts));
 }
 
+TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_DoesNotCallThroughRawSlotBackedEngines)
+{
+    TestWeightContextOwner owner;
+    owner.expert_gate_views.clear();
+    owner.expert_up_views.clear();
+    owner.expert_down_views.clear();
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_gate_gemm[1] = fakeGemm(1);
+    owner.prepared_up_gemm[1] = fakeGemm(101);
+    owner.prepared_down_gemm[1] = fakeGemm(201);
+
+    std::vector<bool> new_mask = {true, false, true, true};
+    auto ctx = owner.buildContext();
+    auto evicted = MoEExpertWeightService::releaseDepartedExperts(ctx, new_mask);
+
+    EXPECT_TRUE(evicted.empty());
+    EXPECT_EQ(owner.prepared_gate_gemm[1], nullptr);
+    EXPECT_EQ(owner.prepared_up_gemm[1], nullptr);
+    EXPECT_EQ(owner.prepared_down_gemm[1], nullptr);
+}
+
 TEST(Test__MoEExpertWeightService, ReleaseDepartedExperts_DropsGraphLocalOwnersForDirectArrivals)
 {
     TestWeightContextOwner owner;
@@ -968,11 +1060,578 @@ TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_ReusesReleasedPhysicalSlot)
     EXPECT_EQ(pool->slotForExpert(13), released_slot);
 }
 
-TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RecommendedCapacityCoversBatchAndTenPercent)
+TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_TransferSlotsAreSurplusAndReleaseIndependently)
 {
-    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 2), 7);
-    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 9), 9);
+    std::vector<GpuExpertSlotPool::ProjectionSpec> specs;
+    for (const char *label : {"gate", "up", "down"})
+    {
+        GpuExpertSlotPool::ProjectionSpec spec;
+        spec.label = label;
+        spec.N = 4;
+        spec.K = 32;
+        spec.payload_bytes_per_block = 16;
+        spec.is_asymmetric = true;
+        spec.has_emins = false;
+        spec.codebook_id = 7;
+        specs.push_back(std::move(spec));
+    }
+
+    auto pool = GpuExpertSlotPool::create(
+        nullptr,
+        DeviceId::cuda(0),
+        /*device_ordinal=*/0,
+        /*layer_idx=*/4,
+        /*active_capacity=*/1,
+        std::move(specs),
+        /*vram_safety_margin_bytes=*/0,
+        /*transfer_capacity=*/1);
+
+    EXPECT_EQ(pool->capacity(), 1u);
+    EXPECT_EQ(pool->activeCapacity(), 1u);
+    EXPECT_EQ(pool->transferCapacity(), 1u);
+    EXPECT_EQ(pool->availableSlots(), 1u);
+    EXPECT_EQ(pool->availableTransferSlots(), 1u);
+
+    auto active = pool->acquire(21);
+    auto transfer = pool->acquireTransferSlot(22);
+    ASSERT_TRUE(active.has_value());
+    ASSERT_TRUE(transfer.has_value());
+    EXPECT_EQ(pool->usedSlots(), 1u);
+    EXPECT_EQ(pool->usedTransferSlots(), 1u);
+    EXPECT_EQ(pool->availableSlots(), 0u);
+    EXPECT_EQ(pool->availableTransferSlots(), 0u);
+    EXPECT_EQ(pool->slotForExpert(21), active->slot_index);
+    EXPECT_EQ(pool->transferSlotForExpert(22), transfer->slot_index);
+
+    EXPECT_FALSE(pool->acquire(23).has_value());
+    EXPECT_FALSE(pool->acquireTransferSlot(24).has_value());
+
+    const int active_slot = active->slot_index;
+    active->lifetime.reset();
+    EXPECT_EQ(pool->usedSlots(), 0u);
+    EXPECT_EQ(pool->usedTransferSlots(), 1u);
+    EXPECT_EQ(pool->availableSlots(), 1u);
+    EXPECT_EQ(pool->availableTransferSlots(), 0u);
+    EXPECT_FALSE(pool->slotForExpert(21).has_value());
+    EXPECT_EQ(pool->transferSlotForExpert(22), transfer->slot_index);
+
+    auto reused_active = pool->acquire(23);
+    ASSERT_TRUE(reused_active.has_value());
+    EXPECT_EQ(reused_active->slot_index, active_slot);
+
+    const int transfer_slot = transfer->slot_index;
+    transfer->lifetime.reset();
+    EXPECT_EQ(pool->usedTransferSlots(), 0u);
+    EXPECT_EQ(pool->availableTransferSlots(), 1u);
+    EXPECT_FALSE(pool->transferSlotForExpert(22).has_value());
+
+    auto reused_transfer = pool->acquireTransferSlot(24);
+    ASSERT_TRUE(reused_transfer.has_value());
+    EXPECT_EQ(reused_transfer->slot_index, transfer_slot);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RecommendedCapacityCoversHotCacheChurnAndBatch)
+{
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 2), 11);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 9), 11);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 20), 20);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(64, 100), 64);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(256, 35), 39);
     EXPECT_EQ(GpuExpertSlotPool::recommendedCapacity(1, 0), 1);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectSlotPool_RecommendedTransferCapacityCoversArrivalBatch)
+{
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(64, 0), 11);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(64, 5), 11);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(64, 20), 20);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(64, 100), 64);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(1, 0), 1);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(0, 5), 0);
+    EXPECT_EQ(GpuExpertSlotPool::recommendedTransferCapacity(256, 25), 39);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferStagingPool_RecommendedCapacityAndLeaseReuse)
+{
+    EXPECT_EQ(GpuExpertTransferStagingPool::recommendedCapacity(64, 32), 32);
+    EXPECT_EQ(GpuExpertTransferStagingPool::recommendedCapacity(64, 100), 64);
+    EXPECT_EQ(GpuExpertTransferStagingPool::recommendedCapacity(1, 0), 1);
+    EXPECT_EQ(GpuExpertTransferStagingPool::recommendedCapacity(0, 8), 0);
+
+    std::vector<GpuExpertTransferStagingPool::ProjectionSpec> specs;
+    for (const char *label : {"gate", "up", "down"})
+    {
+        GpuExpertTransferStagingPool::ProjectionSpec spec;
+        spec.label = label;
+        spec.N = 4;
+        spec.K = 32;
+        spec.payload_bytes_per_block = 16;
+        spec.is_asymmetric = true;
+        spec.has_emins = false;
+        spec.codebook_id = 7;
+        specs.push_back(std::move(spec));
+    }
+
+    auto pool = GpuExpertTransferStagingPool::create(
+        nullptr,
+        DeviceId::cuda(0),
+        /*device_ordinal=*/0,
+        /*capacity=*/2,
+        specs,
+        /*vram_safety_margin_bytes=*/0);
+
+    EXPECT_TRUE(pool->compatibleWith(specs));
+    auto different_specs = specs;
+    different_specs.front().N *= 2;
+    EXPECT_FALSE(pool->compatibleWith(different_specs));
+    EXPECT_EQ(pool->capacity(), 2u);
+    EXPECT_EQ(pool->availableSlots(), 2u);
+
+    auto first = pool->acquire(11);
+    auto second = pool->acquire(11);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+    EXPECT_NE(first->slot_index, second->slot_index)
+        << "the same expert id may be staged concurrently for different layers";
+    EXPECT_EQ(pool->availableSlots(), 0u);
+    EXPECT_FALSE(pool->acquire(13).has_value());
+
+    const int reusable_slot = first->slot_index;
+    first->lifetime.reset();
+    EXPECT_EQ(pool->availableSlots(), 1u);
+    EXPECT_TRUE(pool->slotForExpert(11).has_value());
+    second->lifetime.reset();
+    EXPECT_EQ(pool->availableSlots(), 2u);
+    EXPECT_FALSE(pool->slotForExpert(11).has_value());
+
+    auto reused = pool->acquire(13);
+    ASSERT_TRUE(reused.has_value());
+    EXPECT_EQ(reused->slot_index, reusable_slot);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectStagedArrivalsExposeStableExpertAndActivationMetadata)
+{
+    GpuDirectStagedExpertArrivals arrivals;
+    arrivals.device_id = DeviceId::cuda(0);
+    arrivals.source_device = DeviceId::cuda(1);
+    arrivals.layer_idx = 7;
+
+    GpuDirectStagedExpertProjection gate;
+    gate.expert_id = 3;
+    gate.role = WeightRole::MoEExpertGate;
+    gate.engine = fakeGemm(3);
+    gate.activation = GpuExpertStagedActivation{};
+    arrivals.projections.push_back(gate);
+
+    GpuDirectStagedExpertProjection up;
+    up.expert_id = 1;
+    up.role = WeightRole::MoEExpertUp;
+    up.engine = fakeGemm(11);
+    arrivals.projections.push_back(up);
+
+    GpuDirectStagedExpertProjection down;
+    down.expert_id = 3;
+    down.role = WeightRole::MoEExpertDown;
+    down.engine = fakeGemm(33);
+    down.activation = GpuExpertStagedActivation{};
+    arrivals.projections.push_back(down);
+
+    EXPECT_FALSE(arrivals.empty());
+    EXPECT_EQ(arrivals.projectionCount(), 3u);
+    EXPECT_EQ(arrivals.activationCount(), 2u);
+
+    const auto ids = arrivals.expertIds();
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(ids[0], 1);
+    EXPECT_EQ(ids[1], 3);
+
+    auto activation_batch =
+        MoEExpertWeightService::activationBatchForStagedArrivals(arrivals);
+    EXPECT_EQ(activation_batch.size(), 2u);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotArrivalsExposeScratchOnlyMetadata)
+{
+    auto transfer_lifetime_a = std::shared_ptr<void>(
+        new int(1),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+    auto transfer_lifetime_b = std::shared_ptr<void>(
+        new int(2),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+    auto completion_lifetime = std::shared_ptr<void>(
+        new int(3),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+
+    GpuDirectTransferSlotArrivals arrivals;
+    arrivals.device_id = DeviceId::cuda(0);
+    arrivals.source_device = DeviceId::cuda(1);
+    arrivals.layer_idx = 9;
+    arrivals.projections.push_back(fakeTransferSlotProjection(
+        3, WeightRole::MoEExpertGate, 0x100000, transfer_lifetime_a));
+    arrivals.projections.push_back(fakeTransferSlotProjection(
+        1, WeightRole::MoEExpertUp, 0x200000, transfer_lifetime_b));
+    arrivals.projections.push_back(fakeTransferSlotProjection(
+        3, WeightRole::MoEExpertDown, 0x300000, transfer_lifetime_a));
+    arrivals.completion.transient_lifetimes.push_back(transfer_lifetime_a);
+    arrivals.completion.transient_lifetimes.push_back(completion_lifetime);
+
+    ASSERT_FALSE(arrivals.empty());
+    EXPECT_EQ(arrivals.projectionCount(), 3u);
+    EXPECT_EQ(arrivals.totalBytes(),
+              arrivals.projections[0].bytes() +
+                  arrivals.projections[1].bytes() +
+                  arrivals.projections[2].bytes());
+
+    for (const auto &projection : arrivals.projections)
+        EXPECT_TRUE(projection.valid());
+
+    const auto ids = arrivals.expertIds();
+    ASSERT_EQ(ids.size(), 2u);
+    EXPECT_EQ(ids[0], 1);
+    EXPECT_EQ(ids[1], 3);
+
+    const auto lifetimes = arrivals.transferSlotLifetimes();
+    ASSERT_EQ(lifetimes.size(), 3u);
+    EXPECT_NE(std::find(lifetimes.begin(), lifetimes.end(), transfer_lifetime_a), lifetimes.end());
+    EXPECT_NE(std::find(lifetimes.begin(), lifetimes.end(), transfer_lifetime_b), lifetimes.end());
+    EXPECT_NE(std::find(lifetimes.begin(), lifetimes.end(), completion_lifetime), lifetimes.end());
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotProjectionRequiresScratchLifetime)
+{
+    auto lifetime = std::shared_ptr<void>(
+        new int(1),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+
+    auto projection = fakeTransferSlotProjection(
+        0, WeightRole::MoEExpertGate, 0x400000, lifetime);
+    EXPECT_TRUE(projection.valid());
+
+    projection.transfer_slot_lifetime.reset();
+    EXPECT_FALSE(projection.valid())
+        << "transfer-slot arrivals must pin scratch VRAM until activation completion";
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotActivationRejectsNullStreamBeforePublish)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+    auto ctx = owner.buildContext();
+
+    auto lifetime = std::shared_ptr<void>(
+        new int(1),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+    GpuDirectTransferSlotArrivals arrivals;
+    arrivals.device_id = owner.device_id;
+    arrivals.layer_idx = ctx.layer_idx;
+    arrivals.projections.push_back(fakeTransferSlotProjection(
+        0, WeightRole::MoEExpertGate, 0x500000, lifetime));
+
+    GpuDirectStagedExpertArrivals activated;
+    EXPECT_FALSE(MoEExpertWeightService::activateGpuDirectTransferSlotArrivals(
+        ctx,
+        arrivals,
+        nullptr,
+        &activated));
+    EXPECT_TRUE(activated.empty());
+    EXPECT_EQ(owner.prepared_gate_gemm[0], nullptr);
+    EXPECT_TRUE(owner.moe_owned_kernels.empty());
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotActivationRejectsMissingActivePoolBeforePublish)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+    auto ctx = owner.buildContext();
+
+    auto lifetime = std::shared_ptr<void>(
+        new int(1),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+    GpuDirectTransferSlotArrivals arrivals;
+    arrivals.device_id = owner.device_id;
+    arrivals.layer_idx = ctx.layer_idx;
+    arrivals.projections.push_back(fakeTransferSlotProjection(
+        0, WeightRole::MoEExpertGate, 0x600000, lifetime));
+
+    GpuDirectStagedExpertArrivals activated;
+    void *fake_explicit_stream = reinterpret_cast<void *>(0x1234);
+    EXPECT_FALSE(MoEExpertWeightService::activateGpuDirectTransferSlotArrivals(
+        ctx,
+        arrivals,
+        fake_explicit_stream,
+        &activated));
+    EXPECT_TRUE(activated.empty());
+    EXPECT_EQ(owner.prepared_gate_gemm[0], nullptr);
+    EXPECT_TRUE(owner.moe_owned_kernels.empty());
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingIsTransactionalBeforePublish)
+{
+    const std::string source = readMoEWeightServiceSource();
+    ASSERT_FALSE(source.empty());
+
+    const auto fn_pos =
+        source.find("bool MoEExpertWeightService::stageExpertsGPUDirectToTransferSlots");
+    ASSERT_NE(fn_pos, std::string::npos);
+
+    const auto capacity_reject_pos =
+        source.find("gpu_direct_transfer_staging_pool_capacity_rejects", fn_pos);
+    const auto transfer_begin_pos =
+        source.find("transfer_batch.begin", fn_pos);
+    const auto staged_success_pos =
+        source.find("staged_satisfied.push_back", fn_pos);
+    const auto requested_active_capacity_pos =
+        source.find("requested_active_capacity =\n            std::max(experts_to_stage.size(), active_arrival_capacity)", fn_pos);
+    const auto active_capacity_uses_requested_pos =
+        source.find("recommendedCapacity(\n                dst_ctx.num_experts,\n                requested_active_capacity)", fn_pos);
+    const auto requested_staging_capacity_pos =
+        source.find("requested_staging_capacity =\n            std::max(experts_to_stage.size(), staging_pool_capacity)", fn_pos);
+    const auto staging_capacity_uses_requested_pos =
+        source.find("GpuExpertTransferStagingPool::recommendedCapacity(\n                dst_ctx.num_experts,\n                requested_staging_capacity)", fn_pos);
+    const auto staging_capacity_downshift_pos =
+        source.find("gpu_direct_transfer_staging_pool_capacity_downshifts", fn_pos);
+    const auto staging_wave_trim_pos =
+        source.find("experts_to_copy.resize(available_staging_slots)", fn_pos);
+    const auto compatible_pool_scan_pos =
+        source.find("for (auto &pool : *transfer_staging_pools)", fn_pos);
+    const auto heterogeneous_shape_abort_pos =
+        source.find("heterogeneous GPU expert staging pools are not supported", fn_pos);
+    const auto record_failure_pos =
+        source.find("GPU-direct transfer-slot staging completion event record failed", fn_pos);
+    const auto publish_already_after_record_failure =
+        source.find("publish_already_satisfied();", record_failure_pos);
+    const auto carrier_commit_pos =
+        source.find("*staged_arrivals = std::move(out)", fn_pos);
+    const auto publish_success_pos =
+        source.find("publish_success();", carrier_commit_pos);
+
+    ASSERT_NE(capacity_reject_pos, std::string::npos);
+    ASSERT_NE(transfer_begin_pos, std::string::npos);
+    ASSERT_NE(staged_success_pos, std::string::npos);
+    ASSERT_NE(requested_active_capacity_pos, std::string::npos);
+    ASSERT_NE(active_capacity_uses_requested_pos, std::string::npos);
+    ASSERT_NE(requested_staging_capacity_pos, std::string::npos);
+    ASSERT_NE(staging_capacity_uses_requested_pos, std::string::npos);
+    ASSERT_NE(staging_capacity_downshift_pos, std::string::npos);
+    ASSERT_NE(staging_wave_trim_pos, std::string::npos);
+    ASSERT_NE(compatible_pool_scan_pos, std::string::npos);
+    ASSERT_EQ(heterogeneous_shape_abort_pos, std::string::npos);
+    ASSERT_NE(record_failure_pos, std::string::npos);
+    ASSERT_NE(publish_already_after_record_failure, std::string::npos);
+    ASSERT_NE(carrier_commit_pos, std::string::npos);
+    ASSERT_NE(publish_success_pos, std::string::npos);
+
+    EXPECT_LT(capacity_reject_pos, transfer_begin_pos)
+        << "oversized staging-pool batches should fail before stream/event/copy work";
+    EXPECT_LT(requested_active_capacity_pos, active_capacity_uses_requested_pos)
+        << "active pools must be sized independently from the rolling staging wave";
+    EXPECT_LT(requested_staging_capacity_pos, staging_capacity_uses_requested_pos)
+        << "staging pools must be sized from the explicit rolling-wave budget";
+    EXPECT_LT(staging_capacity_downshift_pos, transfer_begin_pos)
+        << "tight VRAM should downshift staging capacity before stream/event/copy work";
+    EXPECT_LT(staging_wave_trim_pos, transfer_begin_pos)
+        << "reduced-capacity staging pools should trim the wave before enqueue";
+    EXPECT_LT(staged_success_pos, carrier_commit_pos)
+        << "staged experts are only publishable after the arrival carrier is committed";
+    EXPECT_LT(publish_already_after_record_failure, carrier_commit_pos)
+        << "pre-commit failures may report already-resident experts, not partial staged copies";
+    EXPECT_LT(carrier_commit_pos, publish_success_pos)
+        << "new staged experts become satisfied only after the completion carrier is published";
+}
+
+TEST(Test__MoEExpertWeightService, GpuRebalanceResolvesPreparedStoreSlabBeforeRawFallback)
+{
+    const std::string source = readMoEWeightServiceSource();
+    ASSERT_FALSE(source.empty());
+
+    const auto fn_pos =
+        source.find("bool MoEExpertWeightService::registerAndPrepareNewExpertsGPU");
+    ASSERT_NE(fn_pos, std::string::npos);
+
+    const auto slab_fallback_pos =
+        source.find("findExpertSlab(makeExpertSlabDescriptor(ctx, role))", fn_pos);
+    const auto raw_fallback_error_pos =
+        source.find("requires transferred/provider blobs for all gate/up/down weights", fn_pos);
+
+    ASSERT_NE(slab_fallback_pos, std::string::npos)
+        << "GPU rebalance must re-resolve prepared-store slabs when duplicate graph stages have stale refs";
+    ASSERT_NE(raw_fallback_error_pos, std::string::npos);
+    EXPECT_LT(slab_fallback_pos, raw_fallback_error_pos)
+        << "prepared-store arrivals must be checked before hard-failing into the no-raw-fallback path";
+}
+
+TEST(Test__MoEExpertWeightService, ExpertSlabDescriptorsUseRoleSpecificProjectionShape)
+{
+    const std::string source = readMoEWeightServiceSource();
+    ASSERT_FALSE(source.empty());
+
+    const auto helper_pos =
+        source.find("static ExpertSlabDescriptor makeExpertSlabDescriptor");
+    ASSERT_NE(helper_pos, std::string::npos);
+
+    const auto down_branch_pos =
+        source.find("role == WeightRole::MoEExpertDown", helper_pos);
+    const auto down_rows_pos =
+        source.find("desc.rows_per_expert = ctx.d_model", down_branch_pos);
+    const auto down_cols_pos =
+        source.find("desc.cols_per_expert = ctx.expert_intermediate", down_branch_pos);
+    const auto gateup_rows_pos =
+        source.find("desc.rows_per_expert = ctx.expert_intermediate", down_cols_pos);
+    const auto gateup_cols_pos =
+        source.find("desc.cols_per_expert = ctx.d_model", gateup_rows_pos);
+    const auto prepare_lookup_pos =
+        source.find("return makeExpertSlabDescriptor(ctx, role)", helper_pos);
+    const auto initial_register_pos =
+        source.find("ExpertSlabDescriptor desc = makeExpertSlabDescriptor(ctx, role)", prepare_lookup_pos);
+
+    ASSERT_NE(down_branch_pos, std::string::npos)
+        << "down expert slabs must not reuse gate/up descriptor shape";
+    ASSERT_NE(down_rows_pos, std::string::npos);
+    ASSERT_NE(down_cols_pos, std::string::npos);
+    ASSERT_NE(gateup_rows_pos, std::string::npos);
+    ASSERT_NE(gateup_cols_pos, std::string::npos);
+    ASSERT_NE(prepare_lookup_pos, std::string::npos)
+        << "initial store lookup must use the shared descriptor helper";
+    ASSERT_NE(initial_register_pos, std::string::npos)
+        << "initial CPU/GPU slab registration must use the shared descriptor helper";
+
+    EXPECT_LT(down_branch_pos, down_rows_pos);
+    EXPECT_LT(down_rows_pos, down_cols_pos);
+    EXPECT_LT(down_cols_pos, gateup_rows_pos);
+    EXPECT_LT(gateup_rows_pos, gateup_cols_pos);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectStagedArrivalsInstallOnlyWhenActivated)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    owner.expert_mask.assign(kNumExperts, false);
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+
+    PreparedWeightStore store;
+    ExpertGemmRegistry registry;
+    owner.prepared_store = &store;
+    owner.expert_registry = &registry;
+    auto ctx = owner.buildContext();
+
+    const int expert_id = 2;
+    auto gate_owner = std::make_shared<OwnedFakeGemm>(std::make_shared<int>(0));
+    auto up_owner = std::make_shared<OwnedFakeGemm>(std::make_shared<int>(0));
+    auto down_owner = std::make_shared<OwnedFakeGemm>(std::make_shared<int>(0));
+
+    GpuDirectStagedExpertArrivals arrivals;
+    arrivals.device_id = owner.device_id;
+    arrivals.source_device = DeviceId::cuda(1);
+    arrivals.layer_idx = ctx.layer_idx;
+    arrivals.completion.device_id = owner.device_id;
+    arrivals.completion.device_ordinal = 0;
+    arrivals.completion.ready_event = std::shared_ptr<void>(
+        new int(1),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        });
+    arrivals.completion.transient_lifetimes.push_back(std::shared_ptr<void>(
+        new int(2),
+        [](void *ptr)
+        {
+            delete static_cast<int *>(ptr);
+        }));
+
+    auto add_projection = [&](WeightRole role, const std::shared_ptr<ITensorGemm> &engine)
+    {
+        GpuDirectStagedExpertProjection projection;
+        projection.expert_id = expert_id;
+        projection.role = role;
+        projection.engine = engine.get();
+        projection.engine_lifetime = engine;
+        arrivals.projections.push_back(std::move(projection));
+    };
+    add_projection(WeightRole::MoEExpertGate, gate_owner);
+    add_projection(WeightRole::MoEExpertUp, up_owner);
+    add_projection(WeightRole::MoEExpertDown, down_owner);
+
+    EXPECT_EQ(owner.prepared_gate_gemm[expert_id], nullptr)
+        << "staging itself must not publish a live expert engine";
+
+    ASSERT_TRUE(MoEExpertWeightService::installActivatedGpuDirectArrivals(ctx, arrivals));
+
+    EXPECT_EQ(owner.prepared_gate_gemm[expert_id], gate_owner.get());
+    EXPECT_EQ(owner.prepared_up_gemm[expert_id], up_owner.get());
+    EXPECT_EQ(owner.prepared_down_gemm[expert_id], down_owner.get());
+    EXPECT_EQ(owner.moe_owned_kernels.size(), 3u);
+
+    EXPECT_EQ(registry.getEngine(owner.device_id, ctx.layer_idx, expert_id,
+                                 ExpertGemmRegistry::WeightRole::GATE),
+              gate_owner.get());
+    EXPECT_EQ(registry.getEngine(owner.device_id, ctx.layer_idx, expert_id,
+                                 ExpertGemmRegistry::WeightRole::UP),
+              up_owner.get());
+    EXPECT_EQ(registry.getEngine(owner.device_id, ctx.layer_idx, expert_id,
+                                 ExpertGemmRegistry::WeightRole::DOWN),
+              down_owner.get());
+
+    ASSERT_TRUE(ctx.gate_slab_ref.has_value());
+    auto stored_gate = store.expertGemmKernel(*ctx.gate_slab_ref, expert_id);
+    EXPECT_EQ(stored_gate, gate_owner.get());
+    auto stored_completion = store.expertGpuDirectCompletion(*ctx.gate_slab_ref, expert_id);
+    ASSERT_TRUE(stored_completion.has_value());
+    EXPECT_TRUE(stored_completion->valid());
+    EXPECT_TRUE(stored_completion->transient_lifetimes.empty())
+        << "PreparedWeightStore must not pin short-lived transfer slots for whole expert residency";
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectStagedArrivalsRejectMismatchedDeviceBeforeMutation)
+{
+    TestWeightContextOwner owner;
+    owner.device_id = DeviceId::cuda(0);
+    owner.expert_mask.assign(kNumExperts, false);
+    owner.prepared_gate_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_up_gemm.assign(kNumExperts, nullptr);
+    owner.prepared_down_gemm.assign(kNumExperts, nullptr);
+    auto ctx = owner.buildContext();
+
+    auto gate_owner = std::make_shared<OwnedFakeGemm>(std::make_shared<int>(0));
+    GpuDirectStagedExpertArrivals arrivals;
+    arrivals.device_id = DeviceId::cuda(1);
+    arrivals.layer_idx = ctx.layer_idx;
+
+    GpuDirectStagedExpertProjection projection;
+    projection.expert_id = 0;
+    projection.role = WeightRole::MoEExpertGate;
+    projection.engine = gate_owner.get();
+    projection.engine_lifetime = gate_owner;
+    arrivals.projections.push_back(std::move(projection));
+
+    EXPECT_FALSE(MoEExpertWeightService::installActivatedGpuDirectArrivals(ctx, arrivals));
+    EXPECT_EQ(owner.prepared_gate_gemm[0], nullptr);
+    EXPECT_TRUE(owner.moe_owned_kernels.empty());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

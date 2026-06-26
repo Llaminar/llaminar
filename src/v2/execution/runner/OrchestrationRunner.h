@@ -234,7 +234,8 @@ namespace llaminar2
         /// runner is a RankOrchestrator. Returns true if handled.
         bool applyMoEExpertMasksForAllLocalDevices(
             const MoERebalanceController &controller,
-            const ExpertReplicaSet *replica_arrivals = nullptr);
+            const ExpertReplicaSet *replica_arrivals = nullptr,
+            const std::vector<int> *previous_ownership_placement = nullptr);
 
         /// Apply precomputed MoE masks to every local device runner when the
         /// underlying runner is a RankOrchestrator. Returns true if handled.
@@ -489,6 +490,9 @@ namespace llaminar2
             const int *tokens,
             int token_count,
             const std::string &failure_message);
+        void recordMoERebalanceRawExpertRelease(
+            const std::string &domain_id,
+            const std::string &device);
 
         // =====================================================================
         // Error Handling

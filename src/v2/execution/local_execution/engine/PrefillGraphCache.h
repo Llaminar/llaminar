@@ -76,7 +76,7 @@ namespace llaminar2
         SeqLenBelowMinimum,     ///< seq_len < LLAMINAR_PREFILL_GRAPH_MIN_SEQ
         NotGPUDevice,           ///< CPU device
         SnapshotsActive,        ///< ENABLE_PIPELINE_SNAPSHOTS build
-        ActiveMoERebalancing,   ///< Rebalance mode is DYNAMIC or OBSERVE
+        ActiveMoERebalancing,   ///< Dynamic MoE rebalance is active for a padded bucket
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
         StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
@@ -151,7 +151,9 @@ namespace llaminar2
             int real_seq_len = 0,
             int bucket_seq_len = 0,
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
-            bool collectives_graph_capturable = false) const;
+            bool collectives_graph_capturable = false,
+            std::string *reject_stage_name = nullptr,
+            std::string *reject_stage_type = nullptr) const;
 
         /// Mark warmup complete for a key. Transitions Cold → Warmup (arms capture).
         void markWarmedUp(const PrefillGraphCacheKey &key);

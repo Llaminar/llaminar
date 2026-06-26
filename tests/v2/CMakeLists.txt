@@ -847,6 +847,19 @@ add_v2_test(V2_Unit_CacheInfo
     MPI_PROCS 1
 )
 
+# Test: Logger - thread-safe stderr/file tee behavior
+add_executable(v2_test_logger unit/utils/Test__Logger.cpp)
+target_link_libraries(v2_test_logger
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_Logger
+    COMMAND $<TARGET_FILE:v2_test_logger>
+    LABELS "V2;Unit;Utils;Logger"
+    MPI_PROCS 1
+)
+
 # Test: StageDumpConfig - Environment variable parsing and filtering for stage dumps
 add_executable(v2_test_stage_dump_config unit/execution/debug/Test__StageDumpConfig.cpp)
 target_link_libraries(v2_test_stage_dump_config 
@@ -7720,6 +7733,13 @@ add_v2_test(V2_Unit_TPContextFactory
 # sharding queries, and collective operation interfaces.
 add_executable(v2_test_local_tp_context unit/collective/Test__LocalTPContext.cpp)
 target_link_libraries(v2_test_local_tp_context llaminar2_core GTest::gtest GTest::gtest_main)
+target_compile_definitions(v2_test_local_tp_context PRIVATE
+    LLAMINAR_LOCAL_TP_CONTEXT_SOURCE="${CMAKE_SOURCE_DIR}/collective/LocalTPContext.cpp"
+    LLAMINAR_CUDA_CAST_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/cuda/ops/CUDACastKernels.cu"
+    LLAMINAR_ROCM_CAST_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/rocm/ops/ROCmCastKernels.hip"
+    LLAMINAR_CUDA_GDN_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu"
+    LLAMINAR_ROCM_GDN_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip"
+    LLAMINAR_RCCL_COORDINATOR_SOURCE="${CMAKE_SOURCE_DIR}/collective/coordinators/RCCLCoordinator.cpp")
 add_v2_test(V2_Integration_LocalTPContext
     COMMAND $<TARGET_FILE:v2_test_local_tp_context>
     LABELS "V2;Integration;LocalTP;Context;TensorParallel;Heterogeneous;DeviceManagement"
@@ -11357,10 +11377,10 @@ foreach(_prefill_graph_cache_test
 endforeach()
 message(STATUS "V2 Tests: Added PrefillGraphCacheExecution integration tests")
 
-# Test: SegmentedGraphCaptureExecution - Integration test for segmented GPU graph capture/replay
-add_executable(v2_test_segmented_graph_capture_execution integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp)
+# Test: CachedGraphReplayExecution - Integration test for cached GPU graph replay
+add_executable(v2_test_cached_graph_replay_execution integration/execution/graph/Test__SegmentedGraphCaptureExecution.cpp)
 if(LLAMINAR_SHARED_CORE)
-    target_link_libraries(v2_test_segmented_graph_capture_execution PRIVATE
+    target_link_libraries(v2_test_cached_graph_replay_execution PRIVATE
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
@@ -11373,7 +11393,7 @@ elseif(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
     if(HAVE_ROCM)
         list(APPEND _gpu_backends_whole_sgce -Wl,--whole-archive rocm_backend -Wl,--no-whole-archive)
     endif()
-    target_link_libraries(v2_test_segmented_graph_capture_execution PRIVATE
+    target_link_libraries(v2_test_cached_graph_replay_execution PRIVATE
         -Wl,--start-group
         llaminar2_core
         ${_gpu_backends_whole_sgce}
@@ -11382,23 +11402,23 @@ elseif(UNIX AND NOT APPLE AND (HAVE_CUDA OR HAVE_ROCM))
         GTest::gtest_main
     )
 else()
-    target_link_libraries(v2_test_segmented_graph_capture_execution PRIVATE
+    target_link_libraries(v2_test_cached_graph_replay_execution PRIVATE
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
     )
 endif()
-add_v2_test(V2_Integration_SegmentedGraphCaptureExecution
-    COMMAND $<TARGET_FILE:v2_test_segmented_graph_capture_execution>
-    LABELS "V2;Integration;Execution;GraphCapture;Segmented;CUDA;ROCm"
+add_v2_test(V2_Integration_CachedGraphReplayExecution
+    COMMAND $<TARGET_FILE:v2_test_cached_graph_replay_execution>
+    LABELS "V2;Integration;Execution;GraphCapture;CachedReplay;CUDA;ROCm"
     MPI_PROCS 1
 )
 if(NOT V2_PERF_TESTS_ONLY)
-set_tests_properties(V2_Integration_SegmentedGraphCaptureExecution PROPERTIES
+set_tests_properties(V2_Integration_CachedGraphReplayExecution PROPERTIES
     ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0"
 )
 endif()
-message(STATUS "V2 Tests: Added SegmentedGraphCaptureExecution integration tests")
+message(STATUS "V2 Tests: Added CachedGraphReplayExecution integration tests")
 
 # =============================================================================
 # GPU Sampling Kernels Integration Tests (argmaxF32, topKF32)
@@ -11859,6 +11879,9 @@ target_link_libraries(v2_test_qwen35moe_graph
 target_include_directories(v2_test_qwen35moe_graph PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
+target_compile_definitions(v2_test_qwen35moe_graph PRIVATE
+    LLAMINAR_QWEN35_MOE_GRAPH_SOURCE="${CMAKE_SOURCE_DIR}/models/qwen35moe/Qwen35MoEGraph.cpp"
+)
 add_v2_test(V2_Unit_Qwen35MoEGraph
     COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph>
     LABELS "V2;Unit;Qwen35MoE;Graph;MixtureOfExperts;TensorParallel"
@@ -11901,6 +11924,10 @@ target_link_libraries(v2_test_hybrid_allreduce_precision
     llaminar2_core
     GTest::gtest
     GTest::gtest_main
+)
+target_compile_definitions(v2_test_hybrid_allreduce_precision PRIVATE
+    LLAMINAR_QWEN36_MOE_EXPERT_OVERLAY_MATH_PARITY_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity/qwen36/Test__Qwen36MoE_ExpertOverlay_MathParity.cpp"
+    LLAMINAR_QWEN36_MOE_PARITY_BASE_SOURCE="${CMAKE_CURRENT_SOURCE_DIR}/integration/parity/qwen36/Qwen36MoEParityTestBase.h"
 )
 add_v2_test(V2_Unit_HybridAllreducePrecision
     COMMAND $<TARGET_FILE:v2_test_hybrid_allreduce_precision>

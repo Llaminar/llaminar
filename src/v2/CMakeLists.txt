@@ -1322,6 +1322,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/GDNProjectionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
+    execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
     execution/moe/IMoERouter.cpp
@@ -1346,6 +1347,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
     execution/moe/GpuExpertSlotPool.cpp
+    execution/moe/GpuExpertTransferStagingPool.cpp
     execution/moe/MoEExpertWeightService.cpp
     execution/moe/ExpertWeightPayloadProvider.cpp
     execution/moe/GPUExpertTransfer.cpp

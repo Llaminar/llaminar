@@ -758,6 +758,92 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::allreduceMultiOnStreams(const std::vector<void *> &buffers, size_t count,
+                                                  CollectiveDataType dtype, CollectiveOp op,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i])
+            {
+                last_error_ = "Null allreduce buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null allreduce stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        nccl::ncclResult_t r = nccl::ncclGroupStart();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupStart failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+
+            nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[i]);
+            cudaStream_t stream = static_cast<cudaStream_t>(streams[i]);
+            r = nccl::ncclAllReduce(
+                buffers[i], buffers[i], count,
+                toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
+                comm, stream);
+            if (r != nccl::ncclSuccess)
+            {
+                last_error_ = std::string("ncclAllReduce(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              nccl::ncclGetErrorString(r);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = nccl::ncclGroupEnd();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupEnd failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)streams;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
                                                      CollectiveDataType dtype, CollectiveOp op,
                                                      int device_idx)
@@ -930,6 +1016,174 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::allgatherSingleDeviceOnStream(const void *send_buf,
+                                                        void *recv_buf,
+                                                        size_t send_count,
+                                                        CollectiveDataType dtype,
+                                                        int device_idx,
+                                                        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!send_buf || !recv_buf)
+        {
+            last_error_ = "Null allgather buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
+        cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
+
+        static thread_local int tl_last_cuda_device_for_allgather = -1;
+        if (tl_last_cuda_device_for_allgather != ordinal)
+        {
+            cudaError_t err = cudaSetDevice(ordinal);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            tl_last_cuda_device_for_allgather = ordinal;
+        }
+
+        nccl::ncclResult_t r = nccl::ncclAllGather(
+            send_buf,
+            recv_buf,
+            send_count,
+            toNcclDataTypeInt(toDataTypeInt(dtype)),
+            comm,
+            caller_stream);
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclAllGather(on-stream) failed: ") +
+                          nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)send_count;
+        (void)dtype;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::allgatherMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                                  const std::vector<void *> &recv_buffers,
+                                                  size_t send_count,
+                                                  CollectiveDataType dtype,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!send_buffers[i] || !recv_buffers[i])
+            {
+                last_error_ = "Null allgather buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null allgather stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        nccl::ncclResult_t r = nccl::ncclGroupStart();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupStart failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+
+            nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[i]);
+            cudaStream_t stream = static_cast<cudaStream_t>(streams[i]);
+            r = nccl::ncclAllGather(
+                send_buffers[i],
+                recv_buffers[i],
+                send_count,
+                toNcclDataTypeInt(toDataTypeInt(dtype)),
+                comm,
+                stream);
+            if (r != nccl::ncclSuccess)
+            {
+                last_error_ = std::string("ncclAllGather(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              nccl::ncclGetErrorString(r);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = nccl::ncclGroupEnd();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupEnd failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)send_count;
+        (void)dtype;
+        (void)streams;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)
@@ -951,6 +1205,54 @@ namespace llaminar2
         return submitAndWait([&]()
                              { return doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)); });
 #else
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::allgatherMultiWithComputeDeps(
+        const std::vector<const void *> &send_buffers,
+        const std::vector<void *> &recv_buffers,
+        size_t send_count,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer count doesn't match device count";
+            return false;
+        }
+
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            LOG_DEBUG("[NCCLCoordinator] allgatherMultiWithComputeDeps: no compute streams, "
+                      "falling back to synchronous allgather");
+            return submitAndWait([&]()
+                                 {
+                if (!doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)))
+                    return false;
+                return doSynchronizeAll(); });
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+            if (!doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)))
+                return false;
+            return doInsertComputeStreamDeps();
+        }
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)send_count;
+        (void)dtype;
         last_error_ = "NCCL not available";
         return false;
 #endif

@@ -24,6 +24,7 @@
 #include <atomic>
 #include <functional>
 #include <future>
+#include <unordered_map>
 
 namespace llaminar2
 {
@@ -112,6 +113,8 @@ namespace llaminar2
         void *defaultStream() override;
         void *createStream() override;
         void destroyStream(void *stream) override;
+        void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) override;
+        void resetAuxiliaryStreams() override;
 
         // =========================================================================
         // IWorkerGPUContext Interface - Event Access (worker-thread-only)
@@ -202,6 +205,8 @@ namespace llaminar2
         // =========================================================================
 
         cudaStream_t default_stream_ = nullptr;
+        std::unordered_map<std::string, cudaStream_t> auxiliary_streams_;
+        std::mutex auxiliary_streams_mutex_;
         cublasHandle_t cublas_handle_ = nullptr;
         cublasLtHandle_t cublas_lt_handle_ = nullptr;
         void *nccl_comm_ = nullptr;

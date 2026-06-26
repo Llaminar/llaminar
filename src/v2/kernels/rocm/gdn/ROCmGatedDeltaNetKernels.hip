@@ -1093,6 +1093,56 @@ __global__ void rocm_gdn_copy_capture_rows_from_device_indices_kernel(
     }
 }
 
+__global__ void rocm_gdn_compact_modular_conv_state_kernel(
+    const float *__restrict__ gathered,
+    float *__restrict__ full,
+    int degree,
+    int qk_channels,
+    int local_v_channels,
+    int full_v_channels,
+    int history_len)
+{
+    if (!gathered || !full ||
+        degree <= 0 || qk_channels <= 0 ||
+        local_v_channels <= 0 || full_v_channels <= 0 ||
+        history_len <= 0)
+    {
+        return;
+    }
+
+    const int local_channels = qk_channels + local_v_channels;
+    const int full_channels = qk_channels + full_v_channels;
+    const int local_state_size = local_channels * history_len;
+    const int full_state_size = full_channels * history_len;
+    const int stride = blockDim.x * gridDim.x;
+    for (int idx = blockIdx.x * blockDim.x + threadIdx.x;
+         idx < full_state_size;
+         idx += stride)
+    {
+        const int channel = idx / history_len;
+        const int history = idx - channel * history_len;
+        size_t src_idx = 0;
+        if (channel < qk_channels)
+        {
+            src_idx = static_cast<size_t>(channel) * static_cast<size_t>(history_len) +
+                      static_cast<size_t>(history);
+        }
+        else
+        {
+            const int v_channel = channel - qk_channels;
+            const int rank = v_channel / local_v_channels;
+            const int local_v_channel = v_channel - rank * local_v_channels;
+            if (rank < 0 || rank >= degree)
+                continue;
+            src_idx = static_cast<size_t>(rank) * static_cast<size_t>(local_state_size) +
+                      static_cast<size_t>(qk_channels + local_v_channel) *
+                          static_cast<size_t>(history_len) +
+                      static_cast<size_t>(history);
+        }
+        full[idx] = gathered[src_idx];
+    }
+}
+
 } // anonymous namespace (deinterleave kernel)
 
 // =========================================================================
@@ -1239,6 +1289,67 @@ bool rocmGDN_gpu_copy_capture_rows_from_device_indices(
     {
         fprintf(stderr,
                 "[rocmGDN_gpu_copy_capture_rows_from_device_indices] %s\n",
+                hipGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+bool rocmGDN_compact_modular_conv_state(
+    const float *gathered,
+    float *full,
+    int degree,
+    int qk_channels,
+    int local_v_channels,
+    int full_v_channels,
+    int history_len,
+    int device_idx,
+    void *stream)
+{
+    if (!gathered || !full || !stream ||
+        degree <= 0 || qk_channels <= 0 ||
+        local_v_channels <= 0 || full_v_channels <= 0 ||
+        full_v_channels != local_v_channels * degree ||
+        history_len <= 0)
+    {
+        return false;
+    }
+
+    hipError_t set_err = static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device_idx));
+    if (set_err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_compact_modular_conv_state] hipSetDevice(%d) failed: %s\n",
+                device_idx,
+                hipGetErrorString(set_err));
+        return false;
+    }
+    (void)hipGetLastError();
+    const int full_state_size = (qk_channels + full_v_channels) * history_len;
+    constexpr int threads = 256;
+    int blocks = (full_state_size + threads - 1) / threads;
+    if (blocks < 1)
+        blocks = 1;
+    if (blocks > 1024)
+        blocks = 1024;
+    hipLaunchKernelGGL(
+        rocm_gdn_compact_modular_conv_state_kernel,
+        dim3(blocks),
+        dim3(threads),
+        0,
+        (hipStream_t)stream,
+        gathered,
+        full,
+        degree,
+        qk_channels,
+        local_v_channels,
+        full_v_channels,
+        history_len);
+    hipError_t err = hipGetLastError();
+    if (err != hipSuccess)
+    {
+        fprintf(stderr,
+                "[rocmGDN_compact_modular_conv_state] %s\n",
                 hipGetErrorString(err));
         return false;
     }

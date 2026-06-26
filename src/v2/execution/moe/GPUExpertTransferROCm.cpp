@@ -9,10 +9,19 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 
+#include <map>
+#include <mutex>
+#include <utility>
+
 namespace llaminar2::detail
 {
     namespace
     {
+        std::mutex peer_access_mutex;
+        std::map<std::pair<int, int>, bool> peer_access_cache;
+        std::mutex peer_enable_mutex;
+        std::map<std::pair<int, int>, bool> peer_enable_cache;
+
         bool copyArrayPeerAsyncROCm(
             void *dst,
             int dst_ordinal,
@@ -105,12 +114,21 @@ namespace llaminar2::detail
     {
         if (src_device == dst_device)
             return true;
+
+        const auto key = std::make_pair(src_device.rocm_ordinal(), dst_device.rocm_ordinal());
+        std::lock_guard<std::mutex> lock(peer_access_mutex);
+        auto it = peer_access_cache.find(key);
+        if (it != peer_access_cache.end())
+            return it->second;
+
         int can_access = 0;
         hipError_t err = hipDeviceCanAccessPeer(
             &can_access,
             src_device.rocm_ordinal(),
             dst_device.rocm_ordinal());
-        return err == hipSuccess && can_access != 0;
+        const bool result = err == hipSuccess && can_access != 0;
+        peer_access_cache[key] = result;
+        return result;
     }
 
     bool enablePeerAccessROCmBackend(
@@ -120,16 +138,33 @@ namespace llaminar2::detail
         if (current_device == peer_device)
             return true;
 
+        const auto key = std::make_pair(current_device.rocm_ordinal(), peer_device.rocm_ordinal());
+        std::lock_guard<std::mutex> lock(peer_enable_mutex);
+        auto it = peer_enable_cache.find(key);
+        if (it != peer_enable_cache.end())
+            return it->second;
+
+        if (!canAccessPeerROCmBackend(current_device, peer_device))
+        {
+            peer_enable_cache[key] = false;
+            return false;
+        }
+
         int original_device = -1;
         (void)hipGetDevice(&original_device);
         hipError_t set_err = hipSetDevice(current_device.rocm_ordinal());
         if (set_err != hipSuccess)
+        {
+            peer_enable_cache[key] = false;
             return false;
+        }
 
         hipError_t err = hipDeviceEnablePeerAccess(peer_device.rocm_ordinal(), 0);
         if (original_device >= 0)
             (void)hipSetDevice(original_device);
-        return err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled;
+        const bool result = err == hipSuccess || err == hipErrorPeerAccessAlreadyEnabled;
+        peer_enable_cache[key] = result;
+        return result;
     }
 }
 #endif

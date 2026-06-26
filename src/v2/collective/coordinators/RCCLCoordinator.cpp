@@ -24,12 +24,20 @@
 #ifdef HAVE_RCCL
 #include <hip/hip_runtime.h>
 #include "../backends/RCCLDynamicLoader.h"
+#include "../../backends/rocm/HipDeviceGuard.h"
 // Use the dynamically loaded RCCL types and functions
 namespace rccl = llaminar2::rccl_dynamic;
 #endif
 
 namespace llaminar2
 {
+
+#ifdef HAVE_RCCL
+    static hipError_t trackedHipSetDevice(int device_ordinal)
+    {
+        return static_cast<hipError_t>(HipDeviceGuard::forceSetDevice(device_ordinal));
+    }
+#endif
 
     // ============================================================================
     // Helper Macros for Error Checking
@@ -307,7 +315,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 rccl::ncclResult_t r = rccl::ncclCommAbort(
                     static_cast<rccl::ncclComm_t>(comms_[i]));
@@ -404,7 +412,7 @@ namespace llaminar2
             {
                 continue; // Already created
             }
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 LOG_ERROR("[RCCLCoordinator] setComputeStreams: hipSetDevice failed for device "
@@ -542,7 +550,7 @@ namespace llaminar2
         // Step 1: Create per-device streams and events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed for device ") +
@@ -626,7 +634,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
             }
@@ -652,7 +660,7 @@ namespace llaminar2
             bool alloc_ok = true;
             for (int i = 0; i < num_devices_ && alloc_ok; ++i)
             {
-                HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 if (hipMalloc(&prime_bufs[i], sizeof(float)) != hipSuccess)
                 {
                     LOG_WARN("[RCCLCoordinator] hipMalloc for prime buffer failed on device "
@@ -670,7 +678,7 @@ namespace llaminar2
                     bool ops_ok = true;
                     for (int i = 0; i < num_devices_ && ops_ok; ++i)
                     {
-                        HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                        HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         r = rccl::ncclAllReduce(
                             prime_bufs[i], prime_bufs[i], 1,
                             rccl::ncclFloat, rccl::ncclSum,
@@ -690,7 +698,7 @@ namespace llaminar2
                         // Synchronize all streams to ensure the trivial op completes
                         for (int i = 0; i < num_devices_; ++i)
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                             HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
                         }
                         collective_performed_.store(true);
@@ -704,7 +712,7 @@ namespace llaminar2
             {
                 if (prime_bufs[i] != nullptr)
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                     HIP_CHECK_VOID(hipFree(prime_bufs[i]));
                 }
             }
@@ -735,7 +743,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         }
                         rccl::ncclResult_t r = rccl::ncclCommFinalize(static_cast<rccl::ncclComm_t>(comms_[i]));
                         if (r != rccl::ncclSuccess)
@@ -754,7 +762,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         }
                         HIP_CHECK_VOID(hipStreamSynchronize(static_cast<hipStream_t>(streams_[i])));
                     }
@@ -767,7 +775,7 @@ namespace llaminar2
                     {
                         if (i < static_cast<int>(device_ordinals_.size()))
                         {
-                            HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                            HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                         }
                         rccl::ncclResult_t r = rccl::ncclCommDestroy(static_cast<rccl::ncclComm_t>(comms_[i]));
                         if (r != rccl::ncclSuccess)
@@ -810,7 +818,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipEventDestroy(static_cast<hipEvent_t>(completion_events_[i])));
                 completion_events_[i] = nullptr;
@@ -825,7 +833,7 @@ namespace llaminar2
             {
                 if (i < static_cast<int>(device_ordinals_.size()))
                 {
-                    HIP_CHECK_VOID(hipSetDevice(device_ordinals_[i]));
+                    HIP_CHECK_VOID(trackedHipSetDevice(device_ordinals_[i]));
                 }
                 HIP_CHECK_VOID(hipStreamDestroy(static_cast<hipStream_t>(streams_[i])));
                 streams_[i] = nullptr;
@@ -941,6 +949,111 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::allreduceMultiOnStreams(const std::vector<void *> &buffers, size_t count,
+                                                  CollectiveDataType dtype, CollectiveOp op,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i])
+            {
+                last_error_ = "Null allreduce buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null allreduce stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_LAUNCH] thread=" << thread_hash
+                                                                   << " slot=" << i
+                                                                   << " target_device=" << device_ordinals_[i]
+                                                                   << " current_device=" << current_device
+                                                                   << " stream=" << streams[i]
+                                                                   << " buffer=" << buffers[i]
+                                                                   << " count=" << count);
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclAllReduce(
+                buffers[i], buffers[i], count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+                comm, stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclAllReduce(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
                                                      CollectiveDataType dtype, CollectiveOp op,
                                                      int device_idx)
@@ -985,7 +1098,7 @@ namespace llaminar2
         hipError_t err;
 
         // 1. Set device context
-        err = hipSetDevice(ordinal);
+        err = trackedHipSetDevice(ordinal);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1083,7 +1196,7 @@ namespace llaminar2
         static thread_local int tl_last_hip_device = -1;
         if (tl_last_hip_device != ordinal)
         {
-            hipError_t err = hipSetDevice(ordinal);
+            hipError_t err = trackedHipSetDevice(ordinal);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1141,6 +1254,209 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::allgatherSingleDeviceOnStream(const void *send_buf,
+                                                        void *recv_buf,
+                                                        size_t send_count,
+                                                        CollectiveDataType dtype,
+                                                        int device_idx,
+                                                        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!send_buf || !recv_buf)
+        {
+            last_error_ = "Null allgather buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_allgather = -1;
+        if (tl_last_hip_device_for_allgather != ordinal)
+        {
+            hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_allgather = ordinal;
+        }
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_allgather_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " send_buf=" << send_buf
+                     << " recv_buf=" << recv_buf
+                     << " count=" << send_count
+                     << " dtype=" << static_cast<int>(dtype)
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
+
+        rccl::ncclResult_t r = rccl::ncclAllGather(
+            send_buf,
+            recv_buf,
+            send_count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)),
+            comm,
+            caller_stream);
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclAllGather(on-stream) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)send_count;
+        (void)dtype;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allgatherMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                                  const std::vector<void *> &recv_buffers,
+                                                  size_t send_count,
+                                                  CollectiveDataType dtype,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!send_buffers[i] || !recv_buffers[i])
+            {
+                last_error_ = "Null allgather buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null allgather stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_ALLGATHER] thread=" << thread_hash
+                                                                       << " slot=" << i
+                                                                       << " target_device=" << device_ordinals_[i]
+                                                                       << " current_device=" << current_device
+                                                                       << " stream=" << streams[i]
+                                                                       << " send=" << send_buffers[i]
+                                                                       << " recv=" << recv_buffers[i]
+                                                                       << " count=" << send_count);
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclAllGather(
+                send_buffers[i],
+                recv_buffers[i],
+                send_count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)),
+                comm,
+                stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclAllGather(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)send_count;
+        (void)dtype;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allgatherMulti(const std::vector<const void *> &send_buffers,
                                          const std::vector<void *> &recv_buffers,
                                          size_t send_count, CollectiveDataType dtype)
@@ -1162,6 +1478,54 @@ namespace llaminar2
         return submitAndWait([&]()
                              { return doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)); });
 #else
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::allgatherMultiWithComputeDeps(
+        const std::vector<const void *> &send_buffers,
+        const std::vector<void *> &recv_buffers,
+        size_t send_count,
+        CollectiveDataType dtype)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer count doesn't match device count";
+            return false;
+        }
+
+        if (compute_streams_.empty() ||
+            static_cast<int>(compute_streams_.size()) != num_devices_)
+        {
+            LOG_DEBUG("[RCCLCoordinator] allgatherMultiWithComputeDeps: no compute streams, "
+                      "falling back to synchronous allgather");
+            return submitAndWait([&]()
+                                 {
+                if (!doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)))
+                    return false;
+                return doSynchronizeAll(); });
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+            if (!doAllgatherMulti(send_buffers, recv_buffers, send_count, toDataTypeInt(dtype)))
+                return false;
+            return doInsertComputeStreamDeps();
+        }
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)send_count;
+        (void)dtype;
         last_error_ = "RCCL not available";
         return false;
 #endif
@@ -1243,7 +1607,7 @@ namespace llaminar2
 
         return submitAndWait([&]()
                              {
-        hipError_t err = hipSetDevice(device_ordinals_[device_idx]);
+        hipError_t err = trackedHipSetDevice(device_ordinals_[device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1300,7 +1664,7 @@ namespace llaminar2
 #ifdef HAVE_RCCL
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1336,7 +1700,7 @@ namespace llaminar2
         // host thread. The host returns immediately after these API calls.
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed in doInsertComputeStreamDeps: ") +
@@ -1400,7 +1764,7 @@ namespace llaminar2
         {
             return submitAndWait([&]()
                                  {
-            hipError_t err = hipSetDevice(device_ordinals_[src_device_idx]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1473,7 +1837,7 @@ namespace llaminar2
         {
             return submitAndWait([&]()
                                  {
-            hipError_t err = hipSetDevice(device_ordinals_[src_device_idx]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1549,7 +1913,7 @@ namespace llaminar2
                 }
             }
 
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed during pre-allreduce sync: ") + hipGetErrorString(err);
@@ -1619,7 +1983,7 @@ namespace llaminar2
         // Issue allreduce for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1685,7 +2049,7 @@ namespace llaminar2
         // Record completion events for all devices
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -1721,7 +2085,7 @@ namespace llaminar2
                                      static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed during pre-allgather sync: ") + hipGetErrorString(err);
@@ -1770,7 +2134,7 @@ namespace llaminar2
         // Issue allgather for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1803,7 +2167,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -1837,7 +2201,7 @@ namespace llaminar2
                                      static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed during pre-broadcast sync: ") + hipGetErrorString(err);
@@ -1886,7 +2250,7 @@ namespace llaminar2
         // Issue broadcast for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -1920,7 +2284,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -1955,7 +2319,7 @@ namespace llaminar2
                                      static_cast<int>(compute_streams_.size()) == num_devices_;
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed during pre-reducescatter sync: ") + hipGetErrorString(err);
@@ -2004,7 +2368,7 @@ namespace llaminar2
         // Issue reduce-scatter for each device
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
@@ -2038,7 +2402,7 @@ namespace llaminar2
         // Record completion events
         for (int i = 0; i < num_devices_; ++i)
         {
-            hipError_t err = hipSetDevice(device_ordinals_[i]);
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice for event record failed: ") + hipGetErrorString(err);
@@ -2077,7 +2441,7 @@ namespace llaminar2
         }
 
         // Issue send from source device
-        hipError_t err = hipSetDevice(device_ordinals_[src_device_idx]);
+        hipError_t err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice (src) failed: ") + hipGetErrorString(err);
@@ -2098,7 +2462,7 @@ namespace llaminar2
         }
 
         // Issue recv on destination device
-        err = hipSetDevice(device_ordinals_[dst_device_idx]);
+        err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
         if (err != hipSuccess)
         {
             last_error_ = std::string("hipSetDevice (dst) failed: ") + hipGetErrorString(err);
@@ -2129,7 +2493,7 @@ namespace llaminar2
         if (wait_for_completion)
         {
             // Synchronize both streams to ensure copy is complete
-            err = hipSetDevice(device_ordinals_[src_device_idx]);
+            err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice (sync src) failed: ") + hipGetErrorString(err);
@@ -2142,7 +2506,7 @@ namespace llaminar2
                 return false;
             }
 
-            err = hipSetDevice(device_ordinals_[dst_device_idx]);
+            err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
             if (err != hipSuccess)
             {
                 last_error_ = std::string("hipSetDevice (sync dst) failed: ") + hipGetErrorString(err);
@@ -2157,7 +2521,7 @@ namespace llaminar2
         }
 
         // Record completion events (for both sync and async paths)
-        err = hipSetDevice(device_ordinals_[src_device_idx]);
+        err = trackedHipSetDevice(device_ordinals_[src_device_idx]);
         if (err == hipSuccess)
         {
             hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[src_device_idx]), src_stream);
@@ -2166,7 +2530,7 @@ namespace llaminar2
                 LOG_WARN("[RCCLCoordinator] hipEventRecord (src) failed: " << hipGetErrorString(evt_err));
             }
         }
-        err = hipSetDevice(device_ordinals_[dst_device_idx]);
+        err = trackedHipSetDevice(device_ordinals_[dst_device_idx]);
         if (err == hipSuccess)
         {
             hipError_t evt_err = hipEventRecord(static_cast<hipEvent_t>(completion_events_[dst_device_idx]), dst_stream);

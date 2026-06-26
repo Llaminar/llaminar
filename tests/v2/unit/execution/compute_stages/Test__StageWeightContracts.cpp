@@ -22,6 +22,7 @@
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/GatedRMSNormStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
 #include "utils/TestTensorFactory.h"
 #include "memory/BufferId.h"
 #include "memory/StageBufferContract.h"
@@ -260,6 +261,33 @@ TEST_F(Test__StageWeightContracts, RMSNormStage_InPlace_HasInOutBinding)
     EXPECT_EQ(contract.outputs.size(), 0u);
     EXPECT_EQ(contract.inouts.size(), 1u);
     EXPECT_EQ(contract.inouts[0].id, BufferId::HIDDEN_STATE);
+}
+
+TEST_F(Test__StageWeightContracts, TPAllreduceStage_UsesPreallocatedInOutBinding)
+{
+    auto tensor = makeFP32(SEQ_LEN, D_MODEL);
+
+    TPAllreduceStage::Params params{};
+    params.tensor = tensor.get();
+    params.tensor_buffer_id = BufferId::HIDDEN_STATE;
+
+    TPAllreduceStage stage(std::move(params));
+    auto contract = stage.bufferContract();
+
+    EXPECT_TRUE(contract.inputs.empty());
+    EXPECT_TRUE(contract.outputs.empty());
+    ASSERT_EQ(contract.inouts.size(), 1u);
+    EXPECT_EQ(contract.inouts[0].id, BufferId::HIDDEN_STATE);
+    EXPECT_FALSE(contract.inouts[0].prepare_write_storage)
+        << "TP allreduce consumes the producer's existing device buffer and must not "
+           "run prepareForWrite(), which can migrate a shared multi-device tensor before NCCL/RCCL reads it.";
+
+    auto write_preps = contract.writesRequiringPrepare();
+    EXPECT_TRUE(write_preps.empty());
+
+    auto writes = contract.allWrites();
+    ASSERT_EQ(writes.size(), 1u);
+    EXPECT_EQ(writes[0].id, BufferId::HIDDEN_STATE);
 }
 
 // =============================================================================

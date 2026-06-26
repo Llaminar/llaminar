@@ -119,9 +119,56 @@ namespace llaminar2::test
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[2].flags, DeviceMoEExpertFlags::Valid));
         EXPECT_EQ(bank.local_compute_mask[2], 1u);
         EXPECT_EQ(bank.replica_role[2], static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+        EXPECT_EQ(bank.resident_participant_mask[2], 0b11u)
+            << "omitted resident masks synthesize owner plus local participant";
         EXPECT_EQ(bank.experts[2].gate.payload, update.experts[2].gate.payload);
         EXPECT_EQ(bank.experts[2].up.scales, update.experts[2].up.scales);
         EXPECT_EQ(bank.experts[2].down.n, update.experts[2].down.n);
+    }
+
+    TEST(Test__MoERuntimeTable, ExplicitResidentParticipantMasksRoundTripAndValidate)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 2;
+        update.participant_count = 3;
+        update.experts[1].owner_participant = 1;
+        update.resident_participant_mask = {
+            0b101u,
+            0b110u,
+            0b101u,
+            0b110u,
+        };
+
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        const auto &bank = table.hostLayerState(0).banks[1];
+        EXPECT_EQ(bank.resident_participant_mask[0], 0b101u);
+        EXPECT_EQ(bank.resident_participant_mask[1], 0b110u);
+
+        auto wrong_size = updateForEpoch(1, 4);
+        wrong_size.participant_id = 0;
+        wrong_size.participant_count = 2;
+        wrong_size.resident_participant_mask = {0b01u, 0b10u};
+        EXPECT_THROW(table.prepareInactiveBank(0, wrong_size), std::invalid_argument);
+
+        auto outside_domain = updateForEpoch(1, 4);
+        outside_domain.participant_id = 0;
+        outside_domain.participant_count = 2;
+        outside_domain.resident_participant_mask.assign(4, 0b101u);
+        EXPECT_THROW(table.prepareInactiveBank(0, outside_domain), std::invalid_argument);
+
+        auto missing_local = updateForEpoch(1, 4);
+        missing_local.participant_id = 1;
+        missing_local.participant_count = 2;
+        missing_local.resident_participant_mask.assign(4, 0b01u);
+        EXPECT_THROW(table.prepareInactiveBank(0, missing_local), std::invalid_argument);
+
+        auto missing_owner = updateForEpoch(1, 4);
+        missing_owner.participant_id = 0;
+        missing_owner.participant_count = 2;
+        missing_owner.experts[1].owner_participant = 1;
+        missing_owner.resident_participant_mask.assign(4, 0b01u);
+        EXPECT_THROW(table.prepareInactiveBank(0, missing_owner), std::invalid_argument);
     }
 
     TEST(Test__MoERuntimeTable, FlipActiveBankAdvancesEpochWithoutChangingLayerPointer)

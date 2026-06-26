@@ -240,6 +240,12 @@ namespace llaminar2
         return std::make_unique<GDNRecurrenceStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createGDNLiveStateAllGather(
+        const GDNLiveStateAllGatherStage::Params &params)
+    {
+        return std::make_unique<GDNLiveStateAllGatherStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createGatedRMSNorm(
         const GatedRMSNormStage::Params &params)
     {

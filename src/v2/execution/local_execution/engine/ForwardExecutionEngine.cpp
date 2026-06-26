@@ -26,6 +26,7 @@
 #include <cstring>
 #include <iomanip>
 #include <limits>
+#include <mutex>
 #include <unordered_set>
 
 namespace llaminar2
@@ -77,6 +78,12 @@ namespace llaminar2
             if (cache.prefill_capture_stream.stream)
                 return cache.prefill_capture_stream.stream;
             return nullptr;
+        }
+
+        std::mutex &gpuCacheMissGraphMaterializationMutex()
+        {
+            static std::mutex mutex;
+            return mutex;
         }
 
         /// @brief Return the absolute chunk offset for raw server-style inputs.
@@ -215,7 +222,9 @@ namespace llaminar2
             const ForwardInput &input,
             const PrefillGraphCacheKey &key,
             const char *capture_phase,
-            const std::string &recapture_reason)
+            const std::string &recapture_reason,
+            const std::string &reject_stage_name = std::string(),
+            const std::string &reject_stage_type = std::string())
         {
             const int real_count = effectiveRealSeqLen(input);
             const int bucket_len = effectiveBucketSeqLen(input);
@@ -232,6 +241,8 @@ namespace llaminar2
             observation.topology_signature = key.topology_signature;
             observation.capture_phase = capture_phase ? capture_phase : "unknown";
             observation.recapture_reason = recapture_reason.empty() ? "none" : recapture_reason;
+            observation.reject_stage_name = reject_stage_name;
+            observation.reject_stage_type = reject_stage_type;
             return observation;
         }
 
@@ -239,7 +250,7 @@ namespace llaminar2
             const PrefillGraphExecutionObservation &observation,
             const char *cache_phase)
         {
-            return {
+            auto tags = PerfStatsCollector::Tags{
                 {"capture_phase", observation.capture_phase},
                 {"cache_phase", cache_phase ? cache_phase : "unknown"},
                 {"chunk_index", std::to_string(observation.chunk_index)},
@@ -252,6 +263,11 @@ namespace llaminar2
                 {"placement_epoch", std::to_string(observation.placement_epoch)},
                 {"topology_signature", std::to_string(observation.topology_signature)},
                 {"recapture_reason", observation.recapture_reason}};
+            if (!observation.reject_stage_name.empty())
+                tags.emplace("reject_stage_name", observation.reject_stage_name);
+            if (!observation.reject_stage_type.empty())
+                tags.emplace("reject_stage_type", observation.reject_stage_type);
+            return tags;
         }
 
         void publishPrefillGraphObservation(
@@ -260,13 +276,17 @@ namespace llaminar2
             const PrefillGraphCacheKey &key,
             PrefillGraphPhase cache_phase,
             const char *capture_phase,
-            const std::string &recapture_reason)
+            const std::string &recapture_reason,
+            const std::string &reject_stage_name = std::string(),
+            const std::string &reject_stage_type = std::string())
         {
             auto observation = makePrefillGraphObservation(
                 input,
                 key,
                 capture_phase,
-                recapture_reason);
+                recapture_reason,
+                reject_stage_name,
+                reject_stage_type);
             forward_cache.last_prefill_graph_observation = observation;
 
             PerfStatsCollector::addCounter(
@@ -319,8 +339,14 @@ namespace llaminar2
             bool moe_rebalancing_active,
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
             bool collectives_graph_capturable = false,
-            bool host_policy_disabled = false)
+            bool host_policy_disabled = false,
+            std::string *reject_stage_name = nullptr,
+            std::string *reject_stage_type = nullptr)
         {
+            if (reject_stage_name)
+                reject_stage_name->clear();
+            if (reject_stage_type)
+                reject_stage_type->clear();
             if (host_policy_disabled)
                 return PrefillGraphRejectReason::HostPolicyDisabled;
             return cache.preflight(
@@ -332,7 +358,9 @@ namespace llaminar2
                 effectiveRealSeqLen(input),
                 effectiveBucketSeqLen(input),
                 mode,
-                collectives_graph_capturable);
+                collectives_graph_capturable,
+                reject_stage_name,
+                reject_stage_type);
         }
 
         /// @brief Deterministic tie-breaker for bucketed forward-cache LRU victims.
@@ -649,7 +677,8 @@ namespace llaminar2
                 preserve_replay_safe_segmented_captures
                     ? chooseForwardReplayStateAction(
                           ForwardReplayStateMutationKind::RequestBoundaryStateReset,
-                          signature)
+                          signature,
+                          !cache.collective_nodes.empty())
                     : ForwardReplayStateAction::ResetReplayState;
 
             if (action == ForwardReplayStateAction::ResetReplayState)
@@ -662,7 +691,7 @@ namespace llaminar2
                 continue;
             }
 
-            cache.resetSessionStatePreservingSegmentedReplay();
+            cache.resetSessionStatePreservingGraphReplay();
             ++summary.preserved_for_stream_rebind;
             if (cache_class == ForwardReplayStateCacheClass::AllPositionVerifier)
                 ++summary.all_position_verifier_preserved;
@@ -1179,12 +1208,12 @@ namespace llaminar2
             observation.has_capture_stream =
                 cache.segment_cache.capture_stream != nullptr;
             observation.segment_decode_step = cache.segment_cache.decode_step;
-            observation.segmented_capture_live_state_epoch =
-                cache.segmented_capture_live_state_epoch;
+            observation.graph_replay_live_state_epoch =
+                cache.graph_replay_live_state_epoch;
             observation.requires_live_state_epoch_recapture =
                 cache.requiresLiveStateEpochRecapture(
                     isLiveStateVersionedReplayCache(signature),
-                    /*segmented_capture_allowed=*/true,
+                    /*graph_replay_allowed=*/true,
                     live_state_epoch);
             observation.all_position_verifier_recapture_pending =
                 all_position_verifier_recapture_pending_;
@@ -1426,7 +1455,7 @@ namespace llaminar2
                 stream_ctx,
                 forward_cache.segment_cache.consecutive_failures);
 
-            if (early_capture_policy.allow_segmented_capture &&
+            if (early_capture_policy.allow_cached_graph_replay &&
                 forward_cache.segment_cache.consecutive_failures < early_capture_policy.max_segment_failures)
             {
                 if (forward_cache.segment_cache.ensureCaptureStream(
@@ -1593,6 +1622,16 @@ namespace llaminar2
             setup_graph_reset_t1 = Clock::now();
         }
 
+        if (!host.waitBeforeForwardGraphExecution(
+                input,
+                input.device,
+                /*cache_miss=*/false))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Forward graph pre-execution rendezvous failed for "
+                      << input.device.toString());
+            return false;
+        }
+
         output = forward_cache.output;
 
         // Execute with single device context (standard path, no PP)
@@ -1611,7 +1650,7 @@ namespace llaminar2
         // the fixed short-continuation verifier used by greedy MTP. Prompt prefill
         // remains outside this path because prompt shapes vary and capture setup
         // is not amortized.
-        bool used_segmented_capture = false;
+        bool used_graph_replay = false;
         bool requested_deferred_all_position_sync = false;
         bool requested_deferred_main_decode_sync = false;
         bool executed_deferred_all_position_sync = false;
@@ -1711,12 +1750,12 @@ namespace llaminar2
                 !debugEnv().gpu_stage_timing &&
                 !debugEnv().gpu_stage_timing_detail;
 
-            if (capture_policy.allow_segmented_capture &&
+            if (capture_policy.allow_cached_graph_replay &&
                 wants_all_position_sync_defer)
             {
                 capture_policy.defer_final_sync = true;
             }
-            else if (capture_policy.allow_segmented_capture &&
+            else if (capture_policy.allow_cached_graph_replay &&
                      (wants_main_decode_sync_defer ||
                       wants_captured_collective_sync_defer))
             {
@@ -1739,13 +1778,13 @@ namespace llaminar2
                 "decode",
                 input.device.toString(),
                 {{"context", all_position_verifier ? "main_verifier" : "main_decode"},
-                 {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
+                 {"allow_graph_replay", boolTag(capture_policy.allow_cached_graph_replay)},
                  {"defer_final_sync", boolTag(capture_policy.defer_final_sync)},
                  {"has_collectives", boolTag(has_collective_nodes)},
                  {"collective_segmented", boolTag(capture_policy.collective_segmented_enabled)},
                  {"collectives_graph_capturable", boolTag(capture_policy.collectives_graph_capturable)}});
 
-            if (capture_policy.allow_segmented_capture && !forward_cache.gpu_stream)
+            if (capture_policy.allow_cached_graph_replay && !forward_cache.gpu_stream)
             {
                 DeviceId dev_id = ctx->deviceId();
                 if (dev_id.is_gpu())
@@ -1771,17 +1810,17 @@ namespace llaminar2
             const uint64_t live_state_epoch = host.liveReplayStateEpoch();
             if (forward_cache.requiresLiveStateEpochRecapture(
                     live_state_versioned_replay,
-                    capture_policy.allow_segmented_capture,
+                    capture_policy.allow_cached_graph_replay,
                     live_state_epoch))
             {
                 PerfStatsCollector::addCounter(
                     "forward_graph",
-                    "decode_segmented_state_epoch_recapture",
+                    "decode_graph_state_epoch_recapture",
                     1.0,
                     "decode",
                     input.device.toString(),
                     {{"context", all_position_verifier ? "main_verifier" : "main_decode"},
-                     {"old_epoch", std::to_string(forward_cache.segmented_capture_live_state_epoch)},
+                     {"old_epoch", std::to_string(forward_cache.graph_replay_live_state_epoch)},
                      {"new_epoch", std::to_string(live_state_epoch)}});
                 forward_cache.resetReplayState();
             }
@@ -1796,12 +1835,12 @@ namespace llaminar2
                 forward_cache.gpu_ctx,
                 &forward_cache.collective_nodes,
                 capture_policy,
-                &used_segmented_capture);
+                &used_graph_replay);
         }
 
         auto exec_t1 = std::chrono::high_resolution_clock::now();
 
-        if (success && used_segmented_capture &&
+        if (success && used_graph_replay &&
             forward_cache.segment_cache.initialized &&
             !forward_cache.segment_cache.needs_capture)
         {
@@ -1817,7 +1856,7 @@ namespace llaminar2
                     main_decode_replay && input.seq_len > 1;
                 if (live_state_versioned_replay)
                 {
-                    forward_cache.segmented_capture_live_state_epoch =
+                    forward_cache.graph_replay_live_state_epoch =
                         host.liveReplayStateEpoch();
                 }
                 if (all_position_verifier &&
@@ -1896,7 +1935,7 @@ namespace llaminar2
             }
             else
             {
-                if (used_segmented_capture &&
+                if (used_graph_replay &&
                     forward_cache.segment_cache.capture_stream &&
                     forward_cache.gpu_ctx)
                 {
@@ -2025,6 +2064,8 @@ namespace llaminar2
                 .collectives_graph_capturable;
         bool padded_preflight_checked = false;
         PrefillGraphRejectReason padded_preflight_reason = PrefillGraphRejectReason::None;
+        std::string padded_reject_stage_name;
+        std::string padded_reject_stage_type;
 
         auto launchPrefillGraph = [&](IWorkerGPUContext *gpu_ctx,
                                       void *stream,
@@ -2142,13 +2183,19 @@ namespace llaminar2
                 moe_rebalancing_active,
                 PrefillGraphPreflightMode::ColdPaddedSupport,
                 prefill_collectives_graph_capturable,
-                host_prefill_graph_disabled);
+                host_prefill_graph_disabled,
+                &padded_reject_stage_name,
+                &padded_reject_stage_type);
             padded_preflight_checked = true;
 
             if (padded_preflight_reason != PrefillGraphRejectReason::None)
             {
                 LOG_ERROR("[ForwardExecutionEngine] Padded prefill graph rejected by preflight: "
                           << toString(padded_preflight_reason)
+                          << (padded_reject_stage_name.empty() ? "" : " stage=")
+                          << padded_reject_stage_name
+                          << (padded_reject_stage_type.empty() ? "" : " type=")
+                          << padded_reject_stage_type
                           << " real_seq_len=" << real_seq_len
                           << " bucket_seq_len=" << bucket_seq_len);
                 return false;
@@ -2257,6 +2304,8 @@ namespace llaminar2
             phase == PrefillGraphPhase::Warmup ||
             phase == PrefillGraphPhase::Initialized;
         PrefillGraphRejectReason capture_ready_reason = PrefillGraphRejectReason::None;
+        std::string capture_ready_reject_stage_name;
+        std::string capture_ready_reject_stage_type;
         if (can_attempt_capture)
         {
             capture_ready_reason = preflightPrefillGraph(
@@ -2269,7 +2318,9 @@ namespace llaminar2
                 moe_rebalancing_active,
                 PrefillGraphPreflightMode::CaptureReady,
                 prefill_collectives_graph_capturable,
-                host_prefill_graph_disabled);
+                host_prefill_graph_disabled,
+                &capture_ready_reject_stage_name,
+                &capture_ready_reject_stage_type);
         }
 
         if (can_attempt_capture && capture_ready_reason == PrefillGraphRejectReason::None)
@@ -2361,6 +2412,10 @@ namespace llaminar2
             LOG_INFO("[ForwardExecutionEngine] Prefill graph capture readiness failed after "
                      << prefillGraphPhaseName(phase)
                      << ": " << toString(capture_ready_reason)
+                     << (capture_ready_reject_stage_name.empty() ? "" : " stage=")
+                     << capture_ready_reject_stage_name
+                     << (capture_ready_reject_stage_type.empty() ? "" : " type=")
+                     << capture_ready_reject_stage_type
                      << " seq_len=" << input.seq_len
                      << "; running a fresh warmup");
         }
@@ -2368,6 +2423,8 @@ namespace llaminar2
         // === WARMUP/COLD PATH ===
         bool cold_capture_candidate = false;
         PrefillGraphRejectReason cold_reject_reason = PrefillGraphRejectReason::None;
+        std::string cold_reject_stage_name;
+        std::string cold_reject_stage_type;
         if (phase == PrefillGraphPhase::Cold ||
             phase == PrefillGraphPhase::Initialized ||
             phase == PrefillGraphPhase::Warmup)
@@ -2375,6 +2432,8 @@ namespace llaminar2
             if (padded_preflight_checked)
             {
                 cold_reject_reason = padded_preflight_reason;
+                cold_reject_stage_name = padded_reject_stage_name;
+                cold_reject_stage_type = padded_reject_stage_type;
             }
             else
             {
@@ -2390,7 +2449,9 @@ namespace llaminar2
                         ? PrefillGraphPreflightMode::ColdPaddedSupport
                         : PrefillGraphPreflightMode::Default,
                     prefill_collectives_graph_capturable,
-                    host_prefill_graph_disabled);
+                    host_prefill_graph_disabled,
+                    &cold_reject_stage_name,
+                    &cold_reject_stage_type);
             }
             cold_capture_candidate = (cold_reject_reason == PrefillGraphRejectReason::None);
         }
@@ -2452,7 +2513,12 @@ namespace llaminar2
                 if (cache.config().trace)
                 {
                     LOG_INFO("[ForwardExecutionEngine] Prefill graph capture rejected: "
-                             << toString(cold_reject_reason) << " seq_len=" << input.seq_len);
+                             << toString(cold_reject_reason)
+                             << (cold_reject_stage_name.empty() ? "" : " stage=")
+                             << cold_reject_stage_name
+                             << (cold_reject_stage_type.empty() ? "" : " type=")
+                             << cold_reject_stage_type
+                             << " seq_len=" << input.seq_len);
                 }
                 publishPrefillGraphObservation(
                     forward_cache,
@@ -2460,7 +2526,9 @@ namespace llaminar2
                     key,
                     PrefillGraphPhase::Cold,
                     "rejected",
-                    toString(cold_reject_reason));
+                    toString(cold_reject_reason),
+                    cold_reject_stage_name,
+                    cold_reject_stage_type);
             }
             // Rejection is NOT fatal — we just won't use graph capture for this seq_len.
         }
@@ -2484,6 +2552,13 @@ namespace llaminar2
         std::chrono::high_resolution_clock::time_point start)
     {
         // ===== CACHE MISS: Build new graph =====
+
+        std::unique_lock<std::mutex> materialization_lock;
+        if (input_in.device.is_gpu())
+        {
+            materialization_lock = std::unique_lock<std::mutex>(
+                gpuCacheMissGraphMaterializationMutex());
+        }
 
         // Unified PP path currently executes multi-device graphs and does not use
         // this forward cache; clear entries to avoid stale memory growth.
@@ -2544,6 +2619,8 @@ namespace llaminar2
             bucketed_prefill_miss && isPaddedBucketExecution(effective_input);
         bool bucketed_prefill_capture_candidate = false;
         PrefillGraphRejectReason bucketed_prefill_reject_reason = PrefillGraphRejectReason::None;
+        std::string bucketed_prefill_reject_stage_name;
+        std::string bucketed_prefill_reject_stage_type;
 
         if (bucketed_prefill_miss)
         {
@@ -2571,7 +2648,9 @@ namespace llaminar2
                 host.isMoeRebalancingActive(),
                 PrefillGraphPreflightMode::Default,
                 prefill_collectives_graph_capturable,
-                host.prefillGraphCaptureDisabledByHost());
+                host.prefillGraphCaptureDisabledByHost(),
+                &bucketed_prefill_reject_stage_name,
+                &bucketed_prefill_reject_stage_type);
             bucketed_prefill_capture_candidate =
                 (bucketed_prefill_reject_reason == PrefillGraphRejectReason::None);
 
@@ -2579,6 +2658,10 @@ namespace llaminar2
             {
                 LOG_ERROR("[ForwardExecutionEngine] Padded prefill graph rejected by preflight before execution: "
                           << toString(bucketed_prefill_reject_reason)
+                          << (bucketed_prefill_reject_stage_name.empty() ? "" : " stage=")
+                          << bucketed_prefill_reject_stage_name
+                          << (bucketed_prefill_reject_stage_type.empty() ? "" : " type=")
+                          << bucketed_prefill_reject_stage_type
                           << " real_seq_len=" << effectiveRealSeqLen(effective_input)
                           << " bucket_seq_len=" << effectiveBucketSeqLen(effective_input));
                 return false;
@@ -2605,6 +2688,11 @@ namespace llaminar2
             return false;
         }
         const uint64_t workspace_generation = host.workspaceGeneration(effective_input.device);
+
+        if (materialization_lock.owns_lock())
+        {
+            materialization_lock.unlock();
+        }
 
         // Notify host that graph is ready — allows releasing transient resources
         // (e.g., mmap pages) before execution allocates large activation buffers.
@@ -2760,6 +2848,16 @@ namespace llaminar2
                     effective_input.seq_len);
             }
 
+            if (!host.waitBeforeForwardGraphExecution(
+                    effective_input,
+                    ctx->deviceId(),
+                    /*cache_miss=*/true))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Forward graph pre-execution rendezvous failed for "
+                          << ctx->deviceId().toString());
+                return false;
+            }
+
             success = executor_.execute(graph, ctx);
         }
 
@@ -2853,7 +2951,9 @@ namespace llaminar2
                         key,
                         PrefillGraphPhase::Cold,
                         "rejected",
-                        toString(bucketed_prefill_reject_reason));
+                        toString(bucketed_prefill_reject_reason),
+                        bucketed_prefill_reject_stage_name,
+                        bucketed_prefill_reject_stage_type);
                 }
                 enforceBucketedPrefillForwardCapacity(&signature);
             }
@@ -2974,6 +3074,8 @@ namespace llaminar2
         snapshot.topology_signature = key.topology_signature;
         snapshot.capture_phase = "unknown";
         snapshot.recapture_reason = "none";
+        snapshot.reject_stage_name.clear();
+        snapshot.reject_stage_type.clear();
 
         if (forward_cache.last_prefill_graph_observation.valid)
         {
@@ -2990,6 +3092,8 @@ namespace llaminar2
             snapshot.topology_signature = observation.topology_signature;
             snapshot.capture_phase = observation.capture_phase;
             snapshot.recapture_reason = observation.recapture_reason;
+            snapshot.reject_stage_name = observation.reject_stage_name;
+            snapshot.reject_stage_type = observation.reject_stage_type;
         }
 
         if (!forward_cache.prefill_graph_cache)

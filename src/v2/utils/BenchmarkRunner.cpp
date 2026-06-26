@@ -182,6 +182,76 @@ namespace llaminar2
                    : 0.0;
     }
 
+    static const std::vector<std::string> &benchmarkPerfStatFilters()
+    {
+        static const std::vector<std::string> filters{
+            "memory",
+            "moe_overlay",
+            "moe_rebalance",
+            "tp_allreduce_bom",
+            "tp_allreduce_runtime",
+            "tp_allreduce_small_gpu",
+            "forward_graph",
+            "stage_gpu",
+            "transfer"};
+        return filters;
+    }
+
+    static const char *perfStatKindToString(PerfStatRecord::Kind kind)
+    {
+        switch (kind)
+        {
+        case PerfStatRecord::Kind::Counter:
+            return "counter";
+        case PerfStatRecord::Kind::Timer:
+            return "timer";
+        }
+        return "unknown";
+    }
+
+    static nlohmann::json perfStatRecordToJson(const PerfStatRecord &record)
+    {
+        const double total_ms = static_cast<double>(record.total_ns) / 1.0e6;
+        const double avg_us = record.count > 0
+                                  ? (static_cast<double>(record.total_ns) /
+                                     static_cast<double>(record.count)) /
+                                        1.0e3
+                                  : 0.0;
+        const double min_us = static_cast<double>(record.min_ns) / 1.0e3;
+        const double max_us = static_cast<double>(record.max_ns) / 1.0e3;
+
+        return nlohmann::json{
+            {"kind", perfStatKindToString(record.kind)},
+            {"domain", record.domain},
+            {"name", record.name},
+            {"phase", record.phase},
+            {"device", record.device},
+            {"tags", record.tags},
+            {"count", record.count},
+            {"value", record.value},
+            {"total_ns", record.total_ns},
+            {"total_ms", total_ms},
+            {"avg_us", avg_us},
+            {"min_us", min_us},
+            {"max_us", max_us}};
+    }
+
+    static nlohmann::json benchmarkPerfStatsToJson()
+    {
+        const auto &filters = benchmarkPerfStatFilters();
+        const auto records = PerfStatsCollector::snapshot(filters);
+
+        nlohmann::json records_json = nlohmann::json::array();
+        for (const auto &record : records)
+            records_json.push_back(perfStatRecordToJson(record));
+
+        return nlohmann::json{
+            {"schema", "llaminar.perf_stats.v1"},
+            {"enabled", PerfStatsCollector::isEnabled()},
+            {"filters", filters},
+            {"records", std::move(records_json)}};
+    }
+
     static double meanLatencyMs(const std::vector<double> &samples)
     {
         if (samples.empty())
@@ -407,6 +477,7 @@ namespace llaminar2
                                  {"real_tokens", state.prefill_chunk_real_tokens},
                                  {"padded_tokens", state.prefill_chunk_padded_tokens},
                                  {"failures", state.prefill_chunk_failures}}},
+            {"perf_stats", benchmarkPerfStatsToJson()},
         };
 
         if (config)
@@ -1351,9 +1422,9 @@ namespace llaminar2
             ROCmKernelProfiler::reset();
         }
         if (post_warmup_cb_ && n_decode > 0)
-            PerfStatsCollector::resetPreservingDomains({"moe_rebalance"});
+            PerfStatsCollector::resetPreservingDomains({"memory", "moe_rebalance"});
         else
-            PerfStatsCollector::reset();
+            PerfStatsCollector::resetPreservingDomains({"memory"});
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 

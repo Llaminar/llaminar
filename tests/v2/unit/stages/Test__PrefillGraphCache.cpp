@@ -68,6 +68,23 @@ private:
 };
 
 /**
+ * @brief Mock stage with exact-shape prefill support but delayed capture readiness.
+ */
+class ColdLazyPreflightOnlyMockStage : public MockComputeStage
+{
+public:
+    ColdLazyPreflightOnlyMockStage(std::string name, DeviceId dev)
+        : MockComputeStage(ComputeStageType::GEMM, std::move(name), dev) {}
+
+    bool supportsLazyPrefillGraphCapturePreflight() const override { return true; }
+    bool isGraphCapturable() const override { return capture_ready_; }
+    void setCaptureReady(bool ready) { capture_ready_ = ready; }
+
+private:
+    bool capture_ready_ = false;
+};
+
+/**
  * @brief Temporarily override the ROCm grouped-prefill flag for preflight tests.
  */
 class ScopedRocmGroupedPrefillFlag
@@ -169,6 +186,13 @@ public:
         destroyed_stream_ = stream;
         destroy_stream_calls_++;
     }
+    void *getOrCreateAuxiliaryStream(const std::string &, bool *created = nullptr) override
+    {
+        if (created)
+            *created = false;
+        return &auxiliary_stream_;
+    }
+    void resetAuxiliaryStreams() override {}
 
     void *createEvent() override { return nullptr; }
     void destroyEvent(void *) override {}
@@ -206,6 +230,7 @@ public:
 private:
     int default_stream_ = 0;
     int created_stream_ = 0;
+    int auxiliary_stream_ = 0;
 };
 
 // =============================================================================
@@ -702,7 +727,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsSnapshots)
     EXPECT_EQ(reason, PrefillGraphRejectReason::SnapshotsActive);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsMoERebalancing)
+TEST(Test__PrefillGraphCache, Preflight_AllowsExactShapeMoERebalancing)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -711,6 +736,26 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsMoERebalancing)
     auto graph = buildCapturableGraph(key.device_id);
 
     auto reason = cache.preflight(graph, key, nullptr, false, /*moe_rebalancing_active=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketMoERebalancing)
+{
+    PrefillGraphConfig config;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(768);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/true,
+        /*real_seq_len=*/512,
+        /*bucket_seq_len=*/768);
     EXPECT_EQ(reason, PrefillGraphRejectReason::ActiveMoERebalancing);
 }
 
@@ -792,6 +837,54 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsNonCapturableStage)
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
 }
 
+TEST(Test__PrefillGraphCache, Preflight_ExactShapeUsesLazySupportBeforeWarmupReadiness)
+{
+    PrefillGraphConfig config;
+    config.min_seq_len = 1;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(595);
+    ComputeGraph graph;
+    auto stage = std::make_unique<ColdLazyPreflightOnlyMockStage>("lazy_stage", key.device_id);
+    auto *stage_ptr = stage.get();
+    graph.addNode("lazy_stage", std::move(stage), key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/595);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "Exact-shape cold preflight should allow a support-only warmup pass.";
+
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/595,
+        PrefillGraphPreflightMode::CaptureReady);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable)
+        << "Capture itself must still require warmed graph resources.";
+
+    stage_ptr->setCaptureReady(true);
+    reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/false,
+        /*real_seq_len=*/595,
+        /*bucket_seq_len=*/595,
+        PrefillGraphPreflightMode::CaptureReady);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+}
+
 TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupReadiness)
 {
     PrefillGraphConfig config;
@@ -824,7 +917,8 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupR
         /*moe_rebalancing_active=*/false,
         /*real_seq_len=*/595,
         /*bucket_seq_len=*/608);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None)
+        << "Default preflight validates support so a fresh warmup can run.";
 
     const auto reset = cache.prepareEntriesForRequestReset();
     ASSERT_EQ(reset.initialized, 1u);

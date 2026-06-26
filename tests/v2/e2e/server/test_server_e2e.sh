@@ -1730,11 +1730,9 @@ def has_record(name=None, domain=None, tags=None):
 
 decode_graph_captured = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})
-    or has_record("decode_segmented_phase", "forward_graph", {"phase": "capture"})
 )
 decode_graph_replayed = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "replay"})
-    or has_record("decode_segmented_phase", "forward_graph", {"phase": "replay"})
 )
 decode_graph_explicitly_unsupported = has_record(
     "decode_capture_policy",

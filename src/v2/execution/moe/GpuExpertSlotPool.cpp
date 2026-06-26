@@ -18,6 +18,7 @@ namespace llaminar2
         {
             int slot_index = -1;
             int expert_id = -1;
+            bool transfer_slot = false;
             std::shared_ptr<LoadOrchestrator> orchestrator;
             std::weak_ptr<GpuExpertSlotPool> pool;
         };
@@ -28,12 +29,15 @@ namespace llaminar2
         DeviceId device,
         int device_ordinal,
         int layer_idx,
-        int capacity,
+        int active_capacity,
         std::vector<ProjectionSpec> specs,
-        size_t vram_safety_margin_bytes)
+        size_t vram_safety_margin_bytes,
+        int transfer_capacity)
     {
-        if (capacity <= 0)
-            throw std::invalid_argument("GpuExpertSlotPool capacity must be positive");
+        if (active_capacity <= 0)
+            throw std::invalid_argument("GpuExpertSlotPool active capacity must be positive");
+        if (transfer_capacity < 0)
+            throw std::invalid_argument("GpuExpertSlotPool transfer capacity cannot be negative");
         if (specs.empty())
             throw std::invalid_argument("GpuExpertSlotPool requires at least one projection spec");
 
@@ -41,23 +45,40 @@ namespace llaminar2
         orchestrator->setVramPreflightSafetyMarginBytes(vram_safety_margin_bytes);
         orchestrator->addDevice(device_ordinal);
 
-        for (int slot = 0; slot < capacity; ++slot)
+        auto plan_slot_family = [&](int count,
+                                    const auto &slot_name_for)
         {
-            for (const auto &spec : specs)
+            for (int slot = 0; slot < count; ++slot)
             {
-                if (spec.N <= 0 || spec.K <= 0 || spec.payload_bytes_per_block <= 0)
-                    throw std::invalid_argument("GpuExpertSlotPool projection spec has invalid shape");
-                orchestrator->planWeight(
-                    device_ordinal,
-                    slotName(slot, spec.label),
-                    spec.N,
-                    spec.K,
-                    spec.payload_bytes_per_block,
-                    spec.is_asymmetric,
-                    spec.has_emins,
-                    /*raw_gguf_bytes=*/0);
+                for (const auto &spec : specs)
+                {
+                    if (spec.N <= 0 || spec.K <= 0 || spec.payload_bytes_per_block <= 0)
+                        throw std::invalid_argument("GpuExpertSlotPool projection spec has invalid shape");
+                    orchestrator->planWeight(
+                        device_ordinal,
+                        slot_name_for(slot, spec.label),
+                        spec.N,
+                        spec.K,
+                        spec.payload_bytes_per_block,
+                        spec.is_asymmetric,
+                        spec.has_emins,
+                        /*raw_gguf_bytes=*/0);
+                }
             }
-        }
+        };
+
+        plan_slot_family(
+            active_capacity,
+            [](int slot, const std::string &label)
+            {
+                return activeSlotName(slot, label);
+            });
+        plan_slot_family(
+            transfer_capacity,
+            [](int slot, const std::string &label)
+            {
+                return transferSlotName(slot, label);
+            });
 
         orchestrator->allocate(/*pinned_slot_size=*/0, /*num_h2d_streams=*/0);
 
@@ -66,20 +87,23 @@ namespace llaminar2
             device,
             device_ordinal,
             layer_idx,
-            capacity,
+            active_capacity,
+            transfer_capacity,
             std::move(specs),
             std::move(orchestrator)));
 
         logVramBomLine(
             "moe_gpu_expert_slot_pool",
-            "backend=" + std::string(backend ? backend->backendName() : "none") +
-                " device=" + device.to_string() +
-                " device_id=" + std::to_string(device_ordinal) +
-                " layer=" + std::to_string(layer_idx) +
-                " capacity=" + std::to_string(capacity) +
-                " projections_per_slot=" + std::to_string(pool->specs_.size()) +
-                " planned_bytes=" + std::to_string(pool->orchestrator_->getPool(device_ordinal)->totalPlannedBytes()) +
-                " planned_mib=" + vramBomMiB(pool->orchestrator_->getPool(device_ordinal)->totalPlannedBytes()));
+                "backend=" + std::string(backend ? backend->backendName() : "none") +
+                    " device=" + device.to_string() +
+                    " device_id=" + std::to_string(device_ordinal) +
+                    " layer=" + std::to_string(layer_idx) +
+                    " active_capacity=" + std::to_string(active_capacity) +
+                    " transfer_capacity=" + std::to_string(transfer_capacity) +
+                    " total_slots=" + std::to_string(active_capacity + transfer_capacity) +
+                    " projections_per_slot=" + std::to_string(pool->specs_.size()) +
+                    " planned_bytes=" + std::to_string(pool->orchestrator_->getPool(device_ordinal)->totalPlannedBytes()) +
+                    " planned_mib=" + vramBomMiB(pool->orchestrator_->getPool(device_ordinal)->totalPlannedBytes()));
 
         return pool;
     }
@@ -87,27 +111,46 @@ namespace llaminar2
     int GpuExpertSlotPool::recommendedCapacity(int num_experts, size_t arrival_batch_size)
     {
         const int ten_percent = std::max(1, (num_experts + 9) / 10);
+        const int churn_headroom = ten_percent + std::max(1, (ten_percent + 1) / 2);
         const int batch = static_cast<int>(std::min<size_t>(
             arrival_batch_size,
             static_cast<size_t>(std::max(0, num_experts))));
-        return std::max(ten_percent, batch);
+        return std::min(std::max(0, num_experts), std::max(churn_headroom, batch));
+    }
+
+    int GpuExpertSlotPool::recommendedTransferCapacity(int num_experts, size_t arrival_batch_size)
+    {
+        if (num_experts <= 0)
+            return 0;
+        const int batch = static_cast<int>(std::min<size_t>(
+            std::max<size_t>(1, arrival_batch_size),
+            static_cast<size_t>(num_experts)));
+        // Staging can arrive in multiple source-stage groups before a single
+        // publish consumes the transfer slots, so reserve the same bounded churn
+        // headroom as active slots instead of sizing to only the first subbatch.
+        return std::min(
+            std::max(0, num_experts),
+            std::max(batch, recommendedCapacity(num_experts, arrival_batch_size)));
     }
 
     GpuExpertSlotPool::GpuExpertSlotPool(IBackend *backend,
                                          DeviceId device,
                                          int device_ordinal,
                                          int layer_idx,
-                                         int capacity,
+                                         int active_capacity,
+                                         int transfer_capacity,
                                          std::vector<ProjectionSpec> specs,
                                          std::shared_ptr<LoadOrchestrator> orchestrator)
         : backend_(backend),
           device_(device),
           device_ordinal_(device_ordinal),
           layer_idx_(layer_idx),
-          capacity_(capacity),
+          active_capacity_(active_capacity),
+          transfer_capacity_(transfer_capacity),
           specs_(std::move(specs)),
           orchestrator_(std::move(orchestrator)),
-          expert_by_slot_(static_cast<size_t>(capacity), -1)
+          expert_by_slot_(static_cast<size_t>(active_capacity), -1),
+          expert_by_transfer_slot_(static_cast<size_t>(transfer_capacity), -1)
     {
     }
 
@@ -119,7 +162,7 @@ namespace llaminar2
             if (slot_by_expert_.count(expert_id) > 0)
                 return std::nullopt;
 
-            for (int i = 0; i < capacity_; ++i)
+            for (int i = 0; i < active_capacity_; ++i)
             {
                 if (expert_by_slot_[static_cast<size_t>(i)] < 0)
                 {
@@ -147,7 +190,7 @@ namespace llaminar2
         acquired.projections.reserve(specs_.size());
         for (const auto &spec : specs_)
         {
-            auto slot = pool->getSlot(slotName(slot_index, spec.label));
+            auto slot = pool->getSlot(activeSlotName(slot_index, spec.label));
             if (!slot)
             {
                 releaseSlot(slot_index, expert_id);
@@ -164,6 +207,7 @@ namespace llaminar2
         SlotLeaseToken *token = new SlotLeaseToken{
             slot_index,
             expert_id,
+            false,
             orchestrator_,
             weak_from_this()};
         acquired.lifetime = std::shared_ptr<void>(
@@ -172,7 +216,12 @@ namespace llaminar2
             {
                 std::unique_ptr<SlotLeaseToken> owned(static_cast<SlotLeaseToken *>(ptr));
                 if (auto pool = owned->pool.lock())
-                    pool->releaseSlot(owned->slot_index, owned->expert_id);
+                {
+                    if (owned->transfer_slot)
+                        pool->releaseTransferSlot(owned->slot_index, owned->expert_id);
+                    else
+                        pool->releaseSlot(owned->slot_index, owned->expert_id);
+                }
             });
 
         PerfStatsCollector::addCounter(
@@ -186,15 +235,128 @@ namespace llaminar2
         return acquired;
     }
 
+    std::optional<GpuExpertSlotPool::TransferSlot> GpuExpertSlotPool::acquireTransferSlot(int expert_id)
+    {
+        int slot_index = -1;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (transfer_slot_by_expert_.count(expert_id) > 0)
+                return std::nullopt;
+
+            for (int i = 0; i < transfer_capacity_; ++i)
+            {
+                if (expert_by_transfer_slot_[static_cast<size_t>(i)] < 0)
+                {
+                    slot_index = i;
+                    break;
+                }
+            }
+            if (slot_index < 0)
+                return std::nullopt;
+
+            expert_by_transfer_slot_[static_cast<size_t>(slot_index)] = expert_id;
+            transfer_slot_by_expert_[expert_id] = slot_index;
+        }
+
+        auto *pool = orchestrator_ ? orchestrator_->getPool(device_ordinal_) : nullptr;
+        if (!pool)
+        {
+            releaseTransferSlot(slot_index, expert_id);
+            return std::nullopt;
+        }
+
+        TransferSlot acquired;
+        acquired.slot_index = slot_index;
+        acquired.expert_id = expert_id;
+        acquired.projections.reserve(specs_.size());
+        for (const auto &spec : specs_)
+        {
+            auto slot = pool->getSlot(transferSlotName(slot_index, spec.label));
+            if (!slot)
+            {
+                releaseTransferSlot(slot_index, expert_id);
+                return std::nullopt;
+            }
+
+            ProjectionSlot projection;
+            projection.spec = spec;
+            projection.slot = *slot;
+            projection.blocks_per_row = static_cast<uint32_t>(spec.K / 32);
+            acquired.projections.push_back(std::move(projection));
+        }
+
+        SlotLeaseToken *token = new SlotLeaseToken{
+            slot_index,
+            expert_id,
+            true,
+            orchestrator_,
+            weak_from_this()};
+        acquired.lifetime = std::shared_ptr<void>(
+            token,
+            [](void *ptr)
+            {
+                std::unique_ptr<SlotLeaseToken> owned(static_cast<SlotLeaseToken *>(ptr));
+                if (auto pool = owned->pool.lock())
+                {
+                    if (owned->transfer_slot)
+                        pool->releaseTransferSlot(owned->slot_index, owned->expert_id);
+                    else
+                        pool->releaseSlot(owned->slot_index, owned->expert_id);
+                }
+            });
+
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "gpu_direct_transfer_slot_acquire",
+            1.0,
+            "rebalance",
+            device_.to_string(),
+            {{"layer", std::to_string(layer_idx_)},
+             {"slot", std::to_string(slot_index)}});
+        return acquired;
+    }
+
+    size_t GpuExpertSlotPool::activeCapacity() const
+    {
+        return static_cast<size_t>(std::max(0, active_capacity_));
+    }
+
+    size_t GpuExpertSlotPool::transferCapacity() const
+    {
+        return static_cast<size_t>(std::max(0, transfer_capacity_));
+    }
+
     size_t GpuExpertSlotPool::capacity() const
     {
-        return static_cast<size_t>(std::max(0, capacity_));
+        return activeCapacity();
     }
 
     size_t GpuExpertSlotPool::usedSlots() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return slot_by_expert_.size();
+    }
+
+    size_t GpuExpertSlotPool::usedTransferSlots() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return transfer_slot_by_expert_.size();
+    }
+
+    size_t GpuExpertSlotPool::availableSlots() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t capacity = activeCapacity();
+        const size_t used = slot_by_expert_.size();
+        return used < capacity ? capacity - used : 0;
+    }
+
+    size_t GpuExpertSlotPool::availableTransferSlots() const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        const size_t capacity = transferCapacity();
+        const size_t used = transfer_slot_by_expert_.size();
+        return used < capacity ? capacity - used : 0;
     }
 
     std::optional<int> GpuExpertSlotPool::slotForExpert(int expert_id) const
@@ -206,9 +368,23 @@ namespace llaminar2
         return it->second;
     }
 
-    std::string GpuExpertSlotPool::slotName(int slot_index, const std::string &label)
+    std::optional<int> GpuExpertSlotPool::transferSlotForExpert(int expert_id) const
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = transfer_slot_by_expert_.find(expert_id);
+        if (it == transfer_slot_by_expert_.end())
+            return std::nullopt;
+        return it->second;
+    }
+
+    std::string GpuExpertSlotPool::activeSlotName(int slot_index, const std::string &label)
     {
         return "expert_slot_" + std::to_string(slot_index) + "_" + label;
+    }
+
+    std::string GpuExpertSlotPool::transferSlotName(int slot_index, const std::string &label)
+    {
+        return "expert_transfer_slot_" + std::to_string(slot_index) + "_" + label;
     }
 
     void GpuExpertSlotPool::releaseSlot(int slot_index, int expert_id)
@@ -216,7 +392,7 @@ namespace llaminar2
         bool released = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (slot_index < 0 || slot_index >= capacity_)
+            if (slot_index < 0 || slot_index >= active_capacity_)
                 return;
 
             auto &assigned = expert_by_slot_[static_cast<size_t>(slot_index)];
@@ -233,6 +409,36 @@ namespace llaminar2
             PerfStatsCollector::addCounter(
                 "moe_rebalance",
                 "gpu_direct_slot_pool_release",
+                1.0,
+                "rebalance",
+                device_.to_string(),
+                {{"layer", std::to_string(layer_idx_)},
+                 {"slot", std::to_string(slot_index)}});
+        }
+    }
+
+    void GpuExpertSlotPool::releaseTransferSlot(int slot_index, int expert_id)
+    {
+        bool released = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (slot_index < 0 || slot_index >= transfer_capacity_)
+                return;
+
+            auto &assigned = expert_by_transfer_slot_[static_cast<size_t>(slot_index)];
+            if (assigned != expert_id)
+                return;
+
+            assigned = -1;
+            transfer_slot_by_expert_.erase(expert_id);
+            released = true;
+        }
+
+        if (released)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_transfer_slot_release",
                 1.0,
                 "rebalance",
                 device_.to_string(),

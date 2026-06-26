@@ -12,6 +12,7 @@
 #include "../../utils/Logger.h"
 #include "../../kernels/KernelFactory.h"
 #include <chrono>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -137,6 +138,8 @@ namespace llaminar2
             return "SHORT_CONV1D";
         case ComputeStageType::GDN_RECURRENCE:
             return "GDN_RECURRENCE";
+        case ComputeStageType::GDN_LIVE_STATE_ALLGATHER:
+            return "GDN_LIVE_STATE_ALLGATHER";
         case ComputeStageType::Q_GATE_SPLIT:
             return "Q_GATE_SPLIT";
         case ComputeStageType::MTP_CONCAT:
@@ -625,7 +628,7 @@ namespace llaminar2
         return *this;
     }
 
-    void StageDumpInfo::ensureOutputsOnHost() const
+    void StageDumpInfo::ensureOutputsOnHost(void *stream) const
     {
         // Sync all output tensors from GPU to host.
         // Call this BEFORE reading output.data for verification/dumping.
@@ -650,8 +653,29 @@ namespace llaminar2
                                                                              << " rows=" << output.rows << " cols=" << output.cols);
                     }
 
+                    if (!stream && cpu_tensor->deviceValid() && !cpu_tensor->hostValid())
+                    {
+                        std::ostringstream oss;
+                        oss << "[StageDumpInfo::ensureOutputsOnHost] GPU output '"
+                            << (output.name ? output.name : "<unnamed>")
+                            << "' requires an explicit producer stream before host publication"
+                            << " (device="
+                            << (cpu_tensor->current_device() ? cpu_tensor->current_device()->to_string() : "unknown")
+                            << ")";
+                        LOG_ERROR(oss.str());
+                        throw std::runtime_error(oss.str());
+                    }
+
                     auto t0 = std::chrono::high_resolution_clock::now();
-                    cpu_tensor->ensureOnHost();
+                    if (!cpu_tensor->ensureOnHost(stream))
+                    {
+                        std::ostringstream oss;
+                        oss << "[StageDumpInfo::ensureOutputsOnHost] Failed to sync output '"
+                            << (output.name ? output.name : "<unnamed>")
+                            << "' to host";
+                        LOG_ERROR(oss.str());
+                        throw std::runtime_error(oss.str());
+                    }
                     auto t1 = std::chrono::high_resolution_clock::now();
                     auto elapsed_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
                     if (elapsed_ms > 1.0)

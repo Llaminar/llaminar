@@ -3402,6 +3402,12 @@ namespace llaminar2
             /// Routed experts per layer to cache on GPU in mixed CPU/GPU MoE domains.
             /// 0 disables cross-domain GPU-cache placement. (from LLAMINAR_MOE_GPU_EXPERT_CACHE)
             int gpu_cache_experts_per_layer = 0;
+            /// Experts per rolling GPU-direct transfer wave.
+            /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS)
+            int gpu_direct_transfer_wave_experts = 16;
+            /// Number of transfer staging waves to reserve. 2 enables double buffering.
+            /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS)
+            int gpu_direct_transfer_buffers = 2;
             /// Release raw expert weight data after eager packed-weight preparation.
             /// Enabled by default; set LLAMINAR_MOE_RELEASE_RAW_WEIGHTS=0 to opt out.
             bool release_raw_weights = true;
@@ -3463,10 +3469,10 @@ namespace llaminar2
 
         /// Minimum element count required before an FP32 tensor requested as FP16
         /// actually takes the cast-to-FP16 collective path.
-        /// (env: LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS, default: 0)
+        /// (env: LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS, default: 8192)
         /// Tiny decode reductions can be faster in FP32 because the two cast kernels
         /// cost more than the bandwidth savings.
-        size_t allreduce_fp16_min_elements = 0;
+        size_t allreduce_fp16_min_elements = 8192;
 
         /// Experimental LocalTP fast path for tiny two-GPU FP32/SUM allreduces.
         /// (env: LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE, default: disabled)
@@ -3601,7 +3607,7 @@ namespace llaminar2
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
                 allreduce_precision = ar_prec;
-            allreduce_fp16_min_elements = 0;
+            allreduce_fp16_min_elements = 8192;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
             localtp_small_gpu_allreduce = isTruthyEnvValue(std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"));
@@ -3648,6 +3654,10 @@ namespace llaminar2
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
             if (moe_gpu_cache)
                 moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
+            if (const char *moe_wave = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS"))
+                moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
+            if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
+                moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
             const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release_ctor)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
@@ -3672,7 +3682,7 @@ namespace llaminar2
             const char *ar_prec = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
             if (ar_prec)
                 allreduce_precision = ar_prec;
-            allreduce_fp16_min_elements = 0;
+            allreduce_fp16_min_elements = 8192;
             if (const char *ar_fp16_min = std::getenv("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS"))
                 allreduce_fp16_min_elements = static_cast<size_t>(std::max(0, std::atoi(ar_fp16_min)));
             localtp_small_gpu_allreduce = isTruthyEnvValue(std::getenv("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE"));
@@ -3727,6 +3737,12 @@ namespace llaminar2
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
             if (moe_gpu_cache)
                 moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
+            moe_rebalance.gpu_direct_transfer_wave_experts = 16;
+            if (const char *moe_wave = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS"))
+                moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
+            moe_rebalance.gpu_direct_transfer_buffers = 2;
+            if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
+                moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
             moe_rebalance.release_raw_weights = true;
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)

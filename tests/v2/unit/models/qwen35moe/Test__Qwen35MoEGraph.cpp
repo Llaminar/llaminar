@@ -7,6 +7,7 @@
 
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
@@ -18,7 +19,9 @@
 #include "utils/TestTensorFactory.h"
 
 #include <algorithm>
+#include <fstream>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 using namespace llaminar2;
@@ -422,6 +425,17 @@ namespace
         return config;
     }
 
+    GraphConfig makeGDNTPModularConfig(ITPContext *tp_ctx)
+    {
+        GraphConfig config = makeGDNTPConfig(tp_ctx);
+        config.n_heads = 4;
+        config.local_n_heads = 2;
+        config.gdn.inner_size = 8;
+        config.gdn.group_count = 2;
+        config.gdn.time_step_rank = 4;
+        return config;
+    }
+
     HybridKVCacheConfig makeGDNTPHybridConfig(const GraphConfig &config)
     {
         HybridKVCacheConfig hybrid;
@@ -465,6 +479,38 @@ namespace
         return layer;
     }
 
+    LayerWeights makeGDNTPModularLayerWeights(
+        TensorArena &arena,
+        const GraphConfig &config,
+        int key_heads,
+        int value_heads,
+        bool row_parallel_out)
+    {
+        const size_t d = static_cast<size_t>(config.d_model);
+        const size_t d_state = static_cast<size_t>(config.gdn.state_size);
+        const size_t k_heads = static_cast<size_t>(key_heads);
+        const size_t v_heads = static_cast<size_t>(value_heads);
+        const size_t qk_dim = 2 * k_heads * d_state;
+        const size_t value_dim = v_heads * d_state;
+        const size_t qkv_dim = qk_dim + value_dim;
+        const size_t kernel = static_cast<size_t>(config.gdn.conv_kernel_size);
+
+        LayerWeights layer;
+        layer.attn_norm = arena.fp32({d});
+        layer.attn_qkv = arena.fp32({qkv_dim, d});
+        layer.attn_gate = arena.fp32({value_dim, d});
+        layer.ssm_alpha = arena.fp32({v_heads, d});
+        layer.ssm_beta = arena.fp32({v_heads, d});
+        layer.ssm_conv1d = arena.fp32({kernel, qkv_dim});
+        layer.ssm_dt_bias = arena.fp32({v_heads});
+        layer.ssm_a = arena.fp32({v_heads});
+        layer.ssm_norm = arena.fp32({d_state});
+        layer.ssm_out = row_parallel_out
+                            ? static_cast<TensorBase *>(arena.rowParallelFP32({d, value_dim}))
+                            : static_cast<TensorBase *>(arena.fp32({d, value_dim}));
+        return layer;
+    }
+
     ActivationBuffers makeGDNTPActivationBuffers(
         TensorArena &arena,
         int tokens,
@@ -477,6 +523,33 @@ namespace
         const size_t v_heads = static_cast<size_t>(value_heads);
         const size_t value_dim = v_heads * d_state;
         const size_t qkv_dim = 2 * v_heads * d_state + value_dim;
+
+        ActivationBuffers buffers;
+        buffers.current_hidden = arena.fp32({rows, d});
+        buffers.normalized = arena.fp32({rows, d});
+        buffers.attn_output = arena.fp32({rows, value_dim});
+        buffers.attn_proj = arena.fp32({rows, d});
+        buffers.extensions[BufferId::GDN_QKV] = arena.fp32({rows, qkv_dim});
+        buffers.extensions[BufferId::GDN_Z] = arena.fp32({rows, value_dim});
+        buffers.extensions[BufferId::GDN_ALPHA] = arena.fp32({rows, v_heads});
+        buffers.extensions[BufferId::GDN_BETA] = arena.fp32({rows, v_heads});
+        return buffers;
+    }
+
+    ActivationBuffers makeGDNTPModularActivationBuffers(
+        TensorArena &arena,
+        int tokens,
+        const GraphConfig &config,
+        int key_heads,
+        int value_heads)
+    {
+        const size_t rows = static_cast<size_t>(tokens);
+        const size_t d = static_cast<size_t>(config.d_model);
+        const size_t d_state = static_cast<size_t>(config.gdn.state_size);
+        const size_t k_heads = static_cast<size_t>(key_heads);
+        const size_t v_heads = static_cast<size_t>(value_heads);
+        const size_t value_dim = v_heads * d_state;
+        const size_t qkv_dim = 2 * k_heads * d_state + value_dim;
 
         ActivationBuffers buffers;
         buffers.current_hidden = arena.fp32({rows, d});
@@ -1092,6 +1165,264 @@ TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedKeepsStatefulGDNDecodeTPLocal)
     EXPECT_TRUE(hasDependency(graph, "layer0_gdn_wo_allreduce", "layer0_gdn_out_proj"));
 }
 
+TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherWhenAvailable)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+
+    GraphConfig config = makeGDNTPConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.tp_device_idx = 0;
+
+    TensorArena arena;
+    LayerWeights base_layer = makeGDNTPLayerWeights(
+        arena, config, /*value_heads=*/1, /*row_parallel_out=*/true);
+    LayerWeights decode_layer = makeGDNTPLayerWeights(
+        arena, config, /*value_heads=*/2, /*row_parallel_out=*/false);
+
+    WeightBinding base_attn_norm = makeTestBinding(base_layer.attn_norm);
+    WeightBinding base_qkv = makeTestBinding(base_layer.attn_qkv);
+    WeightBinding base_gate = makeTestBinding(base_layer.attn_gate);
+    WeightBinding base_alpha = makeTestBinding(base_layer.ssm_alpha);
+    WeightBinding base_beta = makeTestBinding(base_layer.ssm_beta);
+    WeightBinding base_conv = makeTestBinding(base_layer.ssm_conv1d);
+    WeightBinding base_dt = makeTestBinding(base_layer.ssm_dt_bias);
+    WeightBinding base_a = makeTestBinding(base_layer.ssm_a);
+    WeightBinding base_norm = makeTestBinding(base_layer.ssm_norm);
+    WeightBinding base_out = makeTestBinding(base_layer.ssm_out);
+
+    WeightBinding decode_attn_norm = makeTestBinding(decode_layer.attn_norm);
+    WeightBinding decode_qkv = makeTestBinding(decode_layer.attn_qkv);
+    WeightBinding decode_gate = makeTestBinding(decode_layer.attn_gate);
+    WeightBinding decode_alpha = makeTestBinding(decode_layer.ssm_alpha);
+    WeightBinding decode_beta = makeTestBinding(decode_layer.ssm_beta);
+    WeightBinding decode_conv = makeTestBinding(decode_layer.ssm_conv1d);
+    WeightBinding decode_dt = makeTestBinding(decode_layer.ssm_dt_bias);
+    WeightBinding decode_a = makeTestBinding(decode_layer.ssm_a);
+    WeightBinding decode_norm = makeTestBinding(decode_layer.ssm_norm);
+    WeightBinding decode_out = makeTestBinding(decode_layer.ssm_out);
+
+    ModelWeightBindings base_bindings;
+    base_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &base_attn_norm;
+        layer.attn_qkv = &base_qkv;
+        layer.attn_gate = &base_gate;
+        layer.ssm_alpha = &base_alpha;
+        layer.ssm_beta = &base_beta;
+        layer.ssm_conv1d = &base_conv;
+        layer.ssm_dt_bias = &base_dt;
+        layer.ssm_a = &base_a;
+        layer.ssm_norm = &base_norm;
+        layer.ssm_out = &base_out;
+        return layer;
+    };
+
+    ModelWeightBindings decode_bindings;
+    decode_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &decode_attn_norm;
+        layer.attn_qkv = &decode_qkv;
+        layer.attn_gate = &decode_gate;
+        layer.ssm_alpha = &decode_alpha;
+        layer.ssm_beta = &decode_beta;
+        layer.ssm_conv1d = &decode_conv;
+        layer.ssm_dt_bias = &decode_dt;
+        layer.ssm_a = &decode_a;
+        layer.ssm_norm = &decode_norm;
+        layer.ssm_out = &decode_out;
+        return layer;
+    };
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeightBindings(base_bindings);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    CPUHybridRingKVCacheFP32 cache(
+        makeGDNTPHybridConfig(config),
+        *mpi,
+        config.n_layers,
+        /*batch_size=*/1,
+        config.max_seq_len,
+        config.n_kv_heads,
+        config.head_dim,
+        DeviceId::cpu());
+
+    ActivationBuffers prefill_buffers = makeGDNTPActivationBuffers(
+        arena, /*tokens=*/2, config, /*value_heads=*/1);
+    int position_ids[2] = {0, 1};
+    ComputeGraph prefill_graph = graph_builder.buildAttentionGraphForTokenCount(
+        base_layer,
+        prefill_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        &cache,
+        position_ids,
+        DeviceId::cuda(0));
+
+    EXPECT_NE(prefill_graph.getNode("layer0_gdn_live_state_allgather"), nullptr);
+    EXPECT_TRUE(hasDependency(prefill_graph, "layer0_gdn_live_state_allgather", "layer0_gdn_recurrence"));
+    EXPECT_TRUE(hasDependency(prefill_graph, "layer0_gated_norm", "layer0_gdn_live_state_allgather"));
+
+    ActivationBuffers decode_buffers = makeGDNTPActivationBuffers(
+        arena, /*tokens=*/1, config, /*value_heads=*/2);
+    int position_id = 0;
+    ComputeGraph decode_graph = graph_builder.buildAttentionGraphForTokenCount(
+        decode_layer,
+        decode_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        &cache,
+        &position_id,
+        DeviceId::cuda(0));
+
+    EXPECT_EQ(decode_graph.getNode("layer0_gdn_wo_allreduce"), nullptr)
+        << "A valid GDN live-state handoff lets replicated dense decode avoid the tiny GDN output allreduce.";
+}
+
+TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedUsesGDNLiveStateAllGatherForModularRepeat)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+
+    GraphConfig config = makeGDNTPModularConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.tp_device_idx = 0;
+
+    TensorArena arena;
+    LayerWeights base_layer = makeGDNTPModularLayerWeights(
+        arena, config, /*key_heads=*/2, /*value_heads=*/2, /*row_parallel_out=*/true);
+    LayerWeights decode_layer = makeGDNTPModularLayerWeights(
+        arena, config, /*key_heads=*/2, /*value_heads=*/4, /*row_parallel_out=*/false);
+
+    WeightBinding base_attn_norm = makeTestBinding(base_layer.attn_norm);
+    WeightBinding base_qkv = makeTestBinding(base_layer.attn_qkv);
+    WeightBinding base_gate = makeTestBinding(base_layer.attn_gate);
+    WeightBinding base_alpha = makeTestBinding(base_layer.ssm_alpha);
+    WeightBinding base_beta = makeTestBinding(base_layer.ssm_beta);
+    WeightBinding base_conv = makeTestBinding(base_layer.ssm_conv1d);
+    WeightBinding base_dt = makeTestBinding(base_layer.ssm_dt_bias);
+    WeightBinding base_a = makeTestBinding(base_layer.ssm_a);
+    WeightBinding base_norm = makeTestBinding(base_layer.ssm_norm);
+    WeightBinding base_out = makeTestBinding(base_layer.ssm_out);
+
+    WeightBinding decode_attn_norm = makeTestBinding(decode_layer.attn_norm);
+    WeightBinding decode_qkv = makeTestBinding(decode_layer.attn_qkv);
+    WeightBinding decode_gate = makeTestBinding(decode_layer.attn_gate);
+    WeightBinding decode_alpha = makeTestBinding(decode_layer.ssm_alpha);
+    WeightBinding decode_beta = makeTestBinding(decode_layer.ssm_beta);
+    WeightBinding decode_conv = makeTestBinding(decode_layer.ssm_conv1d);
+    WeightBinding decode_dt = makeTestBinding(decode_layer.ssm_dt_bias);
+    WeightBinding decode_a = makeTestBinding(decode_layer.ssm_a);
+    WeightBinding decode_norm = makeTestBinding(decode_layer.ssm_norm);
+    WeightBinding decode_out = makeTestBinding(decode_layer.ssm_out);
+
+    ModelWeightBindings base_bindings;
+    base_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &base_attn_norm;
+        layer.attn_qkv = &base_qkv;
+        layer.attn_gate = &base_gate;
+        layer.ssm_alpha = &base_alpha;
+        layer.ssm_beta = &base_beta;
+        layer.ssm_conv1d = &base_conv;
+        layer.ssm_dt_bias = &base_dt;
+        layer.ssm_a = &base_a;
+        layer.ssm_norm = &base_norm;
+        layer.ssm_out = &base_out;
+        return layer;
+    };
+
+    ModelWeightBindings decode_bindings;
+    decode_bindings.get_layer_weights = [&](int)
+    {
+        LayerWeightBindings layer;
+        layer.attn_norm = &decode_attn_norm;
+        layer.attn_qkv = &decode_qkv;
+        layer.attn_gate = &decode_gate;
+        layer.ssm_alpha = &decode_alpha;
+        layer.ssm_beta = &decode_beta;
+        layer.ssm_conv1d = &decode_conv;
+        layer.ssm_dt_bias = &decode_dt;
+        layer.ssm_a = &decode_a;
+        layer.ssm_norm = &decode_norm;
+        layer.ssm_out = &decode_out;
+        return layer;
+    };
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setWeightBindings(base_bindings);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(decode_bindings);
+
+    auto mpi = std::make_shared<MockMPIContext>(0, 1);
+    CPUHybridRingKVCacheFP32 cache(
+        makeGDNTPHybridConfig(config),
+        *mpi,
+        config.n_layers,
+        /*batch_size=*/1,
+        config.max_seq_len,
+        config.n_kv_heads,
+        config.head_dim,
+        DeviceId::cpu());
+
+    ActivationBuffers prefill_buffers = makeGDNTPModularActivationBuffers(
+        arena, /*tokens=*/2, config, /*key_heads=*/2, /*value_heads=*/2);
+    int position_ids[2] = {0, 1};
+    ComputeGraph prefill_graph = graph_builder.buildAttentionGraphForTokenCount(
+        base_layer,
+        prefill_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/2,
+        /*batch_size=*/1,
+        &cache,
+        position_ids,
+        DeviceId::cuda(0));
+
+    const auto *handoff_node = prefill_graph.getNode("layer0_gdn_live_state_allgather");
+    ASSERT_NE(handoff_node, nullptr);
+    const auto *handoff =
+        dynamic_cast<const GDNLiveStateAllGatherStage *>(handoff_node->stage.get());
+    ASSERT_NE(handoff, nullptr);
+    const auto &params = handoff->getParams();
+    EXPECT_TRUE(params.modular_conv_state);
+    EXPECT_EQ(params.local_conv_state_floats, 36);
+    EXPECT_EQ(params.full_conv_state_floats, 48);
+    EXPECT_EQ(params.conv_history_len, 3);
+    EXPECT_EQ(params.conv_qk_channels, 8);
+    EXPECT_EQ(params.conv_local_v_channels, 4);
+    EXPECT_EQ(params.conv_full_v_channels, 8);
+    EXPECT_EQ(params.local_recurrence_state_floats, 8);
+    EXPECT_EQ(params.full_recurrence_state_floats, 16);
+
+    ActivationBuffers decode_buffers = makeGDNTPModularActivationBuffers(
+        arena, /*tokens=*/1, config, /*key_heads=*/2, /*value_heads=*/4);
+    int position_id = 0;
+    ComputeGraph decode_graph = graph_builder.buildAttentionGraphForTokenCount(
+        decode_layer,
+        decode_buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        &cache,
+        &position_id,
+        DeviceId::cuda(0));
+
+    EXPECT_EQ(decode_graph.getNode("layer0_gdn_wo_allreduce"), nullptr)
+        << "Modular-repeat GDN handoff should compact Q/K plus gathered V state and avoid decode allreduce.";
+}
+
 TEST(Test__Qwen35MoEGraph, DenseDecodeReplicatedPrefillKeepsAttentionTPAllreduce)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
@@ -1362,4 +1693,78 @@ TEST(Test__Qwen35MoEGraph, ReusedRuntimeTableRegistersDecodeHistogramAfterLateCo
     EXPECT_EQ(histogram.activationCount(0, 0), 3u);
     EXPECT_EQ(histogram.activationCount(0, 2), 2u);
     EXPECT_EQ(histogram.activationCount(0, 3), 1u);
+}
+
+TEST(Test__Qwen35MoEGraph, PrefillRuntimeTableDoesNotRegisterDecodeHistogramSync)
+{
+    GraphConfig config = makeMoEConfig();
+    config.n_layers = 1;
+    config.total_n_layers = 1;
+    config.moe.num_experts = 4;
+    config.moe.top_k = 2;
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+
+    DecodeExpertHistogramConfig hist_config;
+    hist_config.num_layers = 1;
+    hist_config.num_experts = 4;
+    hist_config.top_k = 2;
+    hist_config.window_size = 1;
+    hist_config.sockets = {DeviceId(DeviceType::CPU, 0), DeviceId(DeviceType::CPU, 1)};
+    hist_config.expert_to_socket = {0, 1, 0, 1};
+    DecodeExpertHistogram histogram(hist_config);
+    graph_builder.setDecodeHistogramForTesting(&histogram);
+
+    FakeRuntimeTable prefill_only_table;
+    prefill_only_table.counts = {7, 0, 0, 0};
+    graph_builder.registerRuntimeTableHistogramSyncForTesting(
+        "cuda:0#prefill", &prefill_only_table, /*enabled=*/false);
+
+    histogram.recordTokenBoundary(0);
+    ASSERT_TRUE(histogram.windowFull());
+    EXPECT_TRUE(histogram.syncRuntimeHistograms())
+        << "Prefill-only runtime tables must not become decode histogram sync sources";
+    EXPECT_EQ(prefill_only_table.sync_calls, 0);
+    EXPECT_EQ(histogram.activationCount(0, 0), 0u);
+
+    FakeRuntimeTable decode_table_without_stream;
+    graph_builder.registerRuntimeTableHistogramSyncForTesting(
+        "cuda:0#decode", &decode_table_without_stream, /*enabled=*/true);
+    EXPECT_THROW(
+        (void)histogram.syncRuntimeHistograms(),
+        std::runtime_error)
+        << "Decode runtime-table sync should fail fast when no producer stream was recorded";
+}
+
+TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t decode_branch = source.find("if (total_tokens == 1 &&");
+    ASSERT_NE(decode_branch, std::string::npos);
+    const size_t prefill_branch = source.find("else if (total_tokens > 1", decode_branch);
+    ASSERT_NE(prefill_branch, std::string::npos);
+
+    const size_t decode_call = source.find("moeRuntimeTableForDevice(", decode_branch);
+    ASSERT_NE(decode_call, std::string::npos);
+    ASSERT_LT(decode_call, prefill_branch);
+    const size_t decode_call_end = source.find(");", decode_call);
+    ASSERT_NE(decode_call_end, std::string::npos);
+    const std::string decode_call_text =
+        source.substr(decode_call, decode_call_end - decode_call);
+    EXPECT_NE(decode_call_text.find("register_runtime_histogram"), std::string::npos)
+        << "Decode runtime tables are the only runtime-table decode histogram producers";
+    EXPECT_EQ(decode_call_text.find("register_decode_histogram=*/false"), std::string::npos);
+
+    const size_t prefill_call = source.find("moeRuntimeTableForDevice(", prefill_branch);
+    ASSERT_NE(prefill_call, std::string::npos);
+    const size_t prefill_call_end = source.find(");", prefill_call);
+    ASSERT_NE(prefill_call_end, std::string::npos);
+    const std::string prefill_call_text =
+        source.substr(prefill_call, prefill_call_end - prefill_call);
+    EXPECT_NE(prefill_call_text.find("/*register_decode_histogram=*/false"), std::string::npos)
+        << "Prefill runtime tables must not register stale decode histogram sync callbacks";
 }

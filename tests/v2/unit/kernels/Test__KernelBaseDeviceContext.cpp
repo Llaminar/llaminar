@@ -57,6 +57,13 @@ public:
     void *defaultStream() override { return mock_stream_; }
     void *createStream() override { return mock_stream_; }
     void destroyStream(void * /*stream*/) override {}
+    void *getOrCreateAuxiliaryStream(const std::string & /*name*/, bool *created = nullptr) override
+    {
+        if (created)
+            *created = false;
+        return mock_auxiliary_stream_;
+    }
+    void resetAuxiliaryStreams() override {}
 
     // Event Access - return mock pointers
     void *createEvent() override { return mock_event_; }
@@ -93,6 +100,7 @@ private:
     int device_ordinal_;
     bool initialized_;
     void *mock_stream_ = reinterpret_cast<void *>(0xDEADBEEF);
+    void *mock_auxiliary_stream_ = reinterpret_cast<void *>(0xDEADCAFE);
     void *mock_event_ = reinterpret_cast<void *>(0xCAFEBABE);
     void *mock_blas_handle_ = reinterpret_cast<void *>(0x12345678);
     void *mock_blas_lt_handle_ = reinterpret_cast<void *>(0x87654321);

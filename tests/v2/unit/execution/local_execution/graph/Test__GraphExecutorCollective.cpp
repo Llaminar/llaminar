@@ -61,6 +61,13 @@ namespace
         void *defaultStream() override { return default_stream_; }
         void *createStream() override { return default_stream_; }
         void destroyStream(void * /*stream*/) override {}
+        void *getOrCreateAuxiliaryStream(const std::string & /*name*/, bool *created = nullptr) override
+        {
+            if (created)
+                *created = false;
+            return default_stream_;
+        }
+        void resetAuxiliaryStreams() override {}
 
         void *createEvent() override { return reinterpret_cast<void *>(0xCAFEBABE); }
         void destroyEvent(void * /*event*/) override {}

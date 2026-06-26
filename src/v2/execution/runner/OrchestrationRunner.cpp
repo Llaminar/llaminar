@@ -60,6 +60,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -13199,14 +13200,17 @@ namespace llaminar2
 
     bool OrchestrationRunner::applyMoEExpertMasksForAllLocalDevices(
         const MoERebalanceController &controller,
-        const ExpertReplicaSet *replica_arrivals)
+        const ExpertReplicaSet *replica_arrivals,
+        const std::vector<int> *previous_ownership_placement)
     {
         if (!runner_)
             return false;
         if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
-            rank->applyMoEExpertMasksForAllDevices(controller, replica_arrivals);
-            return true;
+            return rank->applyMoEExpertMasksForAllDevices(
+                controller,
+                replica_arrivals,
+                previous_ownership_placement);
         }
         return false;
     }
@@ -13219,8 +13223,7 @@ namespace llaminar2
             return false;
         if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
         {
-            rank->applyMoEExpertMasksForAllDevices(masks_by_participant, domain_id);
-            return true;
+            return rank->applyMoEExpertMasksForAllDevices(masks_by_participant, domain_id);
         }
         return false;
     }
@@ -13239,6 +13242,25 @@ namespace llaminar2
                 rank->setExpertReplicaSetForAllDevices(replicas);
             }
         }
+    }
+
+    void OrchestrationRunner::recordMoERebalanceRawExpertRelease(
+        const std::string &domain_id,
+        const std::string &device)
+    {
+        if (!(config_.moe_rebalance.release_raw_expert_weights || debugEnv().moe_rebalance.release_raw_weights))
+            return;
+
+        const size_t freed = releaseRawExpertWeights();
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "released_raw_expert_weight_bytes",
+            static_cast<double>(freed),
+            "rebalance",
+            device,
+            {{"domain_id", domain_id}});
+        if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
+            LOG_DEBUG("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
     }
 
     bool OrchestrationRunner::applyMoERebalanceWithReplicas(bool log_histogram_summary)
@@ -13291,6 +13313,7 @@ namespace llaminar2
         bool replica_state_changed = false;
 
         const int max_replicas = controller->maxReplicasPerSocket();
+        const bool hot_replica_strategy = max_replicas > 0;
         PerfStatsCollector::addCounter(
             "moe_rebalance",
             "max_replicas_per_participant",
@@ -13298,7 +13321,7 @@ namespace llaminar2
             "rebalance",
             device,
             {{"domain_id", domain_id}});
-        if (max_replicas > 0)
+        if (hot_replica_strategy)
         {
             controller->proposeReplicasForParticipants(max_replicas);
             if (controller->hasReplicas())
@@ -13311,7 +13334,7 @@ namespace llaminar2
                 {
                     LOG_DEBUG("[MoE] Expert replication: "
                               << current_replicas.num_replicated
-                              << " experts replicated (cap=" << max_replicas
+                              << " replica slots resident (cap=" << max_replicas
                               << " per rank/device, hot_cache="
                               << config_.moe_hot_expert_cache.toString() << ")");
                     LOG_DEBUG("[MoE] Keeping base expert ownership stable while applying hot-expert replicas");
@@ -13322,7 +13345,7 @@ namespace llaminar2
                     else if (replica_arrivals.num_replicated < current_replicas.num_replicated)
                     {
                         LOG_DEBUG("[MoE] Transferring " << replica_arrivals.num_replicated
-                                                        << " newly-arrived hot replicas; "
+                                                        << " newly-arrived hot replica slots; "
                                                         << (current_replicas.num_replicated - replica_arrivals.num_replicated)
                                                         << " already resident");
                     }
@@ -13336,9 +13359,15 @@ namespace llaminar2
                 if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
                     LOG_DEBUG("[MoE] Hot expert replica set is now empty; releasing previous replicas");
             }
+            else
+            {
+                controller->resetRebalanceWindow();
+                if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
+                    LOG_DEBUG("[MoE] No beneficial hot expert replicas; keeping base expert ownership stable");
+            }
         }
 
-        if (!controller->hasReplicas())
+        if (!controller->hasReplicas() && !hot_replica_strategy)
         {
             new_placement = controller->rebalance();
             controller->syncReplicaPlacement();
@@ -13422,14 +13451,21 @@ namespace llaminar2
         {
             if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant, controller->domainId()))
             {
+                if (local_tp_runner)
+                    return setError("LocalTP MoE expert mask publish failed");
                 if (participant_id >= 0 && participant_id < static_cast<int>(gpu_cache_masks_by_participant.size()))
                     applyMoEExpertMasks(gpu_cache_masks_by_participant[participant_id], received, controller->domainId());
             }
         }
         else if (!applyMoEExpertMasksForAllLocalDevices(
                      *controller,
-                     local_tp_runner && replica_mask_update ? &replica_arrivals : nullptr))
+                     local_tp_runner && replica_mask_update ? &replica_arrivals : nullptr,
+                     local_tp_runner && !replica_mask_update && !new_placement.empty()
+                         ? &old_placement
+                         : nullptr))
         {
+            if (local_tp_runner)
+                return setError("LocalTP MoE expert mask publish failed");
             auto masks = controller->computeExpertMasksForParticipant(participant_id);
             applyMoEExpertMasks(masks, received, controller->domainId());
         }
@@ -13439,19 +13475,7 @@ namespace llaminar2
         else if (had_replicas && replica_state_changed)
             setExpertReplicaSet(controller->currentReplicas(), participant_id);
 
-        if (config_.moe_rebalance.release_raw_expert_weights || debugEnv().moe_rebalance.release_raw_weights)
-        {
-            const size_t freed = releaseRawExpertWeights();
-            PerfStatsCollector::addCounter(
-                "moe_rebalance",
-                "released_raw_expert_weight_bytes",
-                static_cast<double>(freed),
-                "rebalance",
-                device,
-                {{"domain_id", domain_id}});
-            if (!mpi_ctx_ || mpi_ctx_->rank() == 0)
-                LOG_DEBUG("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
-        }
+        recordMoERebalanceRawExpertRelease(domain_id, device);
 
         return true;
     }

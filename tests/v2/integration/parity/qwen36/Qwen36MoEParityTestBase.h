@@ -796,7 +796,7 @@ namespace llaminar2::test::parity::qwen36
                 GlobalDeviceAddress::cuda(1),
             };
             test_case.required_cuda_devices = 2;
-            test_case.tp_allreduce_precision_override = "fp16";
+            test_case.tp_allreduce_precision_override = "schema";
             test_case.moe_expert_parallel_plan =
                 qwen36MoEOverlayPlanCuda2TPHotOnly();
             break;
@@ -806,7 +806,7 @@ namespace llaminar2::test::parity::qwen36
                 GlobalDeviceAddress::rocm(1),
             };
             test_case.required_rocm_devices = 2;
-            test_case.tp_allreduce_precision_override = "fp16";
+            test_case.tp_allreduce_precision_override = "schema";
             test_case.moe_expert_parallel_plan =
                 qwen36MoEOverlayPlanRocm2TPHotOnly();
             break;

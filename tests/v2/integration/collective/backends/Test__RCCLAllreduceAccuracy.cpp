@@ -648,11 +648,9 @@ namespace llaminar2
                     start_cv.wait(lock, [&]() { return start_signal; });
                 }
 
-                const std::string stage_name =
-                    "OnStreamFP16Scratch_gpu" + std::to_string(i);
                 const bool ok = tp_ctx_->allreduceOnStream(
                     tensors[i].get(),
-                    stage_name,
+                    "OnStreamFP16Scratch",
                     count,
                     streams[i],
                     "fp16");
@@ -709,6 +707,159 @@ namespace llaminar2
                 ASSERT_EQ(hipStreamDestroy(streams[i]), hipSuccess);
                 streams[i] = nullptr;
             }
+        }
+    }
+
+    /**
+     * @brief Regress graph-captured grouped RCCL allreduce on participant streams.
+     *
+     * Prefill/decode captured collective graphs put every LocalTP participant
+     * stream into HIP graph capture, then rely on LocalTPContext to enqueue one
+     * grouped RCCL allreduce across those explicit streams. This small test
+     * exercises that capture contract without loading a model.
+     */
+    TEST_F(RCCLAllreduceAccuracyTest, ViaLocalTPContext_GraphCapturedGroupedOnStreamAllreduce)
+    {
+        std::cout << "\n--- Test: ViaLocalTPContext_GraphCapturedGroupedOnStreamAllreduce ---" << std::endl;
+
+        const int num_gpus = device_count_;
+        const size_t count = QWEN2_HIDDEN_DIM;
+        const float expected_value =
+            static_cast<float>((num_gpus * (num_gpus + 1)) / 2);
+
+        std::vector<std::unique_ptr<FP32Tensor>> tensors(num_gpus);
+        std::vector<hipStream_t> streams(num_gpus, nullptr);
+        std::vector<hipGraph_t> graphs(num_gpus, nullptr);
+        std::vector<hipGraphExec_t> execs(num_gpus, nullptr);
+        std::vector<void *> scratch(num_gpus, nullptr);
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            ASSERT_EQ(hipStreamCreateWithFlags(&streams[i], hipStreamNonBlocking), hipSuccess)
+                << "Failed to create capture stream for ROCm GPU " << i;
+            ASSERT_EQ(hipMalloc(&scratch[i], 4), hipSuccess)
+                << "Failed to allocate captured pre-collective scratch for ROCm GPU " << i;
+
+            std::vector<float> host_values(count, static_cast<float>(i + 1));
+            tensors[i] = std::make_unique<FP32Tensor>(std::vector<size_t>{count});
+            std::memcpy(tensors[i]->mutable_data(), host_values.data(),
+                        count * sizeof(float));
+            ASSERT_TRUE(tensors[i]->ensureOnDevice(DeviceId::rocm(i)))
+                << "Failed to upload tensor to ROCm GPU " << i;
+            ASSERT_EQ(hipDeviceSynchronize(), hipSuccess)
+                << "Failed to drain upload before capture for ROCm GPU " << i;
+        }
+
+        std::atomic<int> threads_ready{0};
+        std::atomic<bool> all_success{true};
+        std::mutex start_mutex;
+        std::condition_variable start_cv;
+        bool start_signal = false;
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            threads.emplace_back([&, i]()
+                                 {
+                if (hipSetDevice(i) != hipSuccess)
+                {
+                    all_success.store(false, std::memory_order_release);
+                    return;
+                }
+                if (hipStreamBeginCapture(streams[i], hipStreamCaptureModeRelaxed) != hipSuccess)
+                {
+                    all_success.store(false, std::memory_order_release);
+                    return;
+                }
+                if (hipMemsetAsync(scratch[i], 0, 4, streams[i]) != hipSuccess)
+                {
+                    all_success.store(false, std::memory_order_release);
+                    return;
+                }
+                threads_ready.fetch_add(1, std::memory_order_release);
+
+                {
+                    std::unique_lock<std::mutex> lock(start_mutex);
+                    start_cv.wait(lock, [&]() { return start_signal; });
+                }
+
+                const bool ok = tp_ctx_->allreduceOnStream(
+                    tensors[i].get(),
+                    "GraphCapturedGroupedOnStream",
+                    count,
+                    streams[i],
+                    "fp32");
+                if (!ok)
+                {
+                    all_success.store(false, std::memory_order_release);
+                }
+
+                if (hipStreamEndCapture(streams[i], &graphs[i]) != hipSuccess || !graphs[i])
+                {
+                    all_success.store(false, std::memory_order_release);
+                } });
+        }
+
+        while (threads_ready.load(std::memory_order_acquire) < num_gpus)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(start_mutex);
+            start_signal = true;
+        }
+        start_cv.notify_all();
+
+        for (auto &thread : threads)
+        {
+            thread.join();
+        }
+
+        ASSERT_TRUE(all_success.load(std::memory_order_acquire))
+            << "Graph-captured grouped on-stream allreduce capture failed";
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            ASSERT_NE(graphs[i], nullptr);
+            ASSERT_EQ(hipGraphInstantiate(&execs[i], graphs[i], nullptr, nullptr, 0), hipSuccess)
+                << "Failed to instantiate captured allreduce graph for ROCm GPU " << i;
+        }
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            ASSERT_EQ(hipGraphLaunch(execs[i], streams[i]), hipSuccess)
+                << "Failed to launch captured allreduce graph for ROCm GPU " << i;
+        }
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(streams[i]), hipSuccess)
+                << "Captured allreduce stream sync failed for ROCm GPU " << i;
+
+            const float *data = tensors[i]->data();
+            for (size_t j = 0; j < count; ++j)
+            {
+                ASSERT_NEAR(data[j], expected_value, 0.0f)
+                    << "GPU " << i << " mismatch at element " << j;
+            }
+        }
+
+        for (int i = 0; i < num_gpus; ++i)
+        {
+            ASSERT_EQ(hipSetDevice(i), hipSuccess);
+            if (execs[i])
+                ASSERT_EQ(hipGraphExecDestroy(execs[i]), hipSuccess);
+            if (graphs[i])
+                ASSERT_EQ(hipGraphDestroy(graphs[i]), hipSuccess);
+            if (streams[i])
+                ASSERT_EQ(hipStreamDestroy(streams[i]), hipSuccess);
+            if (scratch[i])
+                ASSERT_EQ(hipFree(scratch[i]), hipSuccess);
         }
     }
 

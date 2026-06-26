@@ -51,10 +51,12 @@
 #include "../../../config/OrchestrationConfig.h"
 #include "../../../collective/ILocalPPContext.h"
 #include "../../moe/MoERebalanceController.h"
+#include "../../moe/ExpertWeightTransfer.h"
 #include "../../config/RuntimeConfig.h"
 #include "../../debug/TPSnapshot.h"
 #include "../../factory/FactoryPPStageConfig.h" // For FactoryPPStageConfig (circular-dependency-safe)
 #include <memory>
+#include <optional>
 #include <vector>
 #include <string>
 
@@ -87,6 +89,10 @@ namespace llaminar2
         std::vector<std::vector<std::vector<bool>>> buildReplicaArrivalTransferMasks(
             const MoERebalanceController &controller,
             const ExpertReplicaSet &arrivals);
+
+        std::vector<std::vector<std::vector<bool>>> buildOwnershipArrivalTransferMasks(
+            const MoERebalanceController &controller,
+            const std::vector<int> &previous_placement);
     }
 
     /**
@@ -1015,10 +1021,73 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
-        void applyMoEExpertMasksForAllDevices(
+
+        struct MoEExpertMaskSnapshot
+        {
+            std::string domain_id;
+            std::vector<std::vector<std::vector<bool>>> masks_by_participant;
+            std::optional<std::vector<std::vector<std::vector<bool>>>> transfer_masks_by_participant;
+
+            bool empty() const
+            {
+                return masks_by_participant.empty();
+            }
+
+            const std::vector<std::vector<std::vector<bool>>> *transferMasks() const
+            {
+                return transfer_masks_by_participant.has_value()
+                           ? &transfer_masks_by_participant.value()
+                           : nullptr;
+            }
+        };
+
+        struct PreparedMoEExpertMaskUpdate
+        {
+            std::string domain_id;
+            std::vector<std::vector<std::vector<bool>>> masks_by_participant;
+            std::vector<ReceivedWeightsMap> received_by_device;
+            std::vector<bool> gpu_direct_prepare_ok_by_device;
+
+            bool empty() const
+            {
+                return masks_by_participant.empty();
+            }
+        };
+
+        /**
+         * Snapshot active and transfer masks from a controller on the caller thread.
+         *
+         * Async prepare must not read controller state while decode continues to
+         * update runtime histograms, so callers freeze the masks first and pass
+         * the snapshot to prepareMoEExpertMaskTransfersForAllDevices().
+         */
+        MoEExpertMaskSnapshot snapshotMoEExpertMasksForAllDevices(
             const MoERebalanceController &controller,
-            const ExpertReplicaSet *replica_arrivals = nullptr);
-        void applyMoEExpertMasksForAllDevices(
+            const ExpertReplicaSet *replica_arrivals = nullptr,
+            const std::vector<int> *previous_ownership_placement = nullptr) const;
+
+        /**
+         * Prepare local expert arrivals for a future mask publication.
+         *
+         * This snapshots the publish masks and gathers/stages received weights.
+         * Same-backend GPU arrivals are staged into transfer slots only; active
+         * GEMM tables and masks are mutated later by publishPreparedMoEExpertMasksForAllDevices().
+         */
+        PreparedMoEExpertMaskUpdate prepareMoEExpertMaskTransfersForAllDevices(
+            const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
+            const std::string &domain_id = {},
+            const std::vector<std::vector<std::vector<bool>>> *transfer_masks_by_participant = nullptr);
+
+        /// Publish a previously-prepared mask update. This is the only phase
+        /// that should mutate active MoE masks once async staging is enabled.
+        bool publishPreparedMoEExpertMasksForAllDevices(
+            const PreparedMoEExpertMaskUpdate &prepared);
+        void clearPendingGpuDirectExpertTransfersForAllDevices();
+        bool applyMoEExpertMasksForAllDevices(
+            const MoERebalanceController &controller,
+            const ExpertReplicaSet *replica_arrivals = nullptr,
+            const std::vector<int> *previous_ownership_placement = nullptr);
+        bool applyMoEExpertMasksForAllDevices(
             const std::vector<std::vector<std::vector<bool>>> &masks_by_participant,
             const std::string &domain_id = {},
             const std::vector<std::vector<std::vector<bool>>> *transfer_masks_by_participant = nullptr);
@@ -1088,6 +1157,15 @@ namespace llaminar2
         bool forwardPP(const int *tokens, int seq_len);
 
         /**
+         * @brief Worker watchdog timeout for the current TP lifecycle phase.
+         *
+         * The first TP forward can spend a long time lazily materializing per-device
+         * graphs and GPU workspaces before every participant reaches its first
+         * collective. Steady-state forwards keep the configured fail-fast timeout.
+         */
+        int effectiveTPWorkerCollectTimeoutMs() const;
+
+        /**
          * @brief Return the PP stage that owns MTP sidecar execution.
          *
          * In pipeline-parallel decode the normal verifier/replay path still
@@ -1119,6 +1197,18 @@ namespace llaminar2
          * policy.
          */
         void applyLogitsGatherSkipFlags();
+
+        /**
+         * @brief Forward same-domain LocalTP child runtime histograms into the
+         *        selected rebalance controller.
+         *
+         * Each DeviceGraphOrchestrator owns its runtime MoE table and registers
+         * histogram sync callbacks against its local controller.  Rank-level
+         * rebalancing, however, runs through a single selected controller per
+         * domain.  This bridge keeps that selected controller's host view
+         * representative of every LocalTP participant.
+         */
+        void wireLocalTPMoERuntimeHistogramSyncs();
 
         // =====================================================================
         // Member Variables
@@ -1199,6 +1289,10 @@ namespace llaminar2
         /// Eliminates per-decode thread creation/destruction overhead (~100-150µs).
         /// Lazy-initialized on first TP forward call.
         std::unique_ptr<TPWorkerPool> tp_worker_pool_;
+        bool tp_first_forward_completed_ = false;
+
+        /// Guard against registering duplicate sibling histogram callbacks.
+        bool local_tp_moe_histogram_syncs_wired_ = false;
 
         // =====================================================================
         // TP Decode Profiling

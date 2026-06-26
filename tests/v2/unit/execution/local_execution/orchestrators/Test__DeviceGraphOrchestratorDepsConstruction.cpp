@@ -218,7 +218,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DoesNo
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
-    EXPECT_FALSE(policy.allow_segmented_capture);
+    EXPECT_FALSE(policy.allow_cached_graph_replay);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesDenseDecodeReplicatedWithCollectiveOptIn)
@@ -252,7 +252,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
-    EXPECT_TRUE(policy.allow_segmented_capture)
+    EXPECT_TRUE(policy.allow_cached_graph_replay)
         << "Phase-split dense decode builds a decode-only graph with replicated dense bindings; "
            "homogeneous LocalTP captured collectives remain the gating contract.";
 }
@@ -286,7 +286,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
-    EXPECT_TRUE(policy.allow_segmented_capture);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesForOptInHomogeneousRocmLocalTP)
@@ -318,7 +318,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Captur
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_TRUE(policy.collectives_graph_capturable);
-    EXPECT_TRUE(policy.allow_segmented_capture);
+    EXPECT_TRUE(policy.allow_cached_graph_replay);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_RejectsCapturedCollectivesForMixedLocalTP)
@@ -350,7 +350,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_Reject
     EXPECT_TRUE(policy.allow_fast_decode);
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
-    EXPECT_FALSE(policy.allow_segmented_capture);
+    EXPECT_FALSE(policy.allow_cached_graph_replay);
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, ExecutorAccessible)

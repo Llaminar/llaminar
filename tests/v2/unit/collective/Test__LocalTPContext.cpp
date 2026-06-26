@@ -27,10 +27,16 @@
 #include <cstring>
 #include <thread>
 #include <atomic>
+#include <chrono>
+#include <future>
+#include <fstream>
+#include <sstream>
 
 #include "collective/LocalTPContext.h"
+#include "collective/CollectiveTimeoutPolicy.h"
 #include "collective/ICollectiveBackend.h"
 #include "collective/DeviceGroup.h"
+#include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "backends/GlobalDeviceAddress.h"
 #include "config/OrchestrationConfig.h"
 #include "tensors/Tensors.h"
@@ -71,6 +77,17 @@ namespace
         std::string name_;
         std::optional<std::string> previous_;
     };
+
+    std::string readTextFile(const char *path)
+    {
+        std::ifstream input(path);
+        if (!input)
+            return {};
+
+        std::ostringstream contents;
+        contents << input.rdbuf();
+        return contents.str();
+    }
 }
 
 // =============================================================================
@@ -208,6 +225,205 @@ TEST_F(Test__LocalTPContext, AllreduceOnStreamRejectsNullStream)
     EXPECT_THROW(
         ctx->allreduceOnStream(tensor.get(), "unit_null_stream_allreduce", tensor->numel(), nullptr, "fp16"),
         std::invalid_argument);
+}
+
+TEST_F(Test__LocalTPContext, OnStreamGpuCollectivesStayGroupedDuringGraphCapture)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t grouped_decl = source.find("const bool grouped_explicit_streams");
+    ASSERT_NE(grouped_decl, std::string::npos);
+    const size_t grouped_branch = source.find("if (grouped_explicit_streams)", grouped_decl);
+    ASSERT_NE(grouped_branch, std::string::npos);
+
+    const std::string grouped_policy = source.substr(grouped_decl, grouped_branch - grouped_decl);
+    EXPECT_NE(grouped_policy.find("CollectiveBackendType::NCCL"), std::string::npos);
+    EXPECT_NE(grouped_policy.find("CollectiveBackendType::RCCL"), std::string::npos);
+    EXPECT_EQ(grouped_policy.find("isGraphCaptureActive"), std::string::npos)
+        << "NCCL/RCCL graph-captured on-stream allreduces must use the grouped "
+           "explicit-stream launcher, not independent per-device captures.";
+}
+
+TEST_F(Test__LocalTPContext, CollectTimeoutPolicyExtendsOnlyColdStart)
+{
+    using collective_timeout_policy::effectiveCollectTimeoutMs;
+    using collective_timeout_policy::kColdStartCollectTimeoutMs;
+
+    EXPECT_EQ(effectiveCollectTimeoutMs(0, false), 0);
+    EXPECT_EQ(effectiveCollectTimeoutMs(30000, false), kColdStartCollectTimeoutMs);
+    EXPECT_EQ(effectiveCollectTimeoutMs(450000, false), 450000);
+    EXPECT_EQ(effectiveCollectTimeoutMs(30000, true), 30000);
+}
+
+TEST_F(Test__LocalTPContext, FP16TransportFailuresFailBeforeFP32GroupedAllreduce)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t fp32_path = source.find("Standard FP32 allreduce path");
+    ASSERT_NE(fp32_path, std::string::npos);
+
+    auto expectHardFailBeforeFP32Path = [&](const char *marker)
+    {
+        const size_t marker_pos = source.find(marker);
+        ASSERT_NE(marker_pos, std::string::npos) << marker;
+        ASSERT_LT(marker_pos, fp32_path) << marker;
+
+        const std::string block = source.substr(marker_pos, fp32_path - marker_pos);
+        EXPECT_NE(block.find("requestAbort();"), std::string::npos) << marker;
+        EXPECT_NE(block.find("return false;"), std::string::npos) << marker;
+        EXPECT_EQ(block.find("fall through"), std::string::npos) << marker;
+        EXPECT_EQ(block.find("falling back"), std::string::npos) << marker;
+    };
+
+    expectHardFailBeforeFP32Path("FP16 scratch alloc failed");
+    expectHardFailBeforeFP32Path("FP32->FP16 cast failed");
+    expectHardFailBeforeFP32Path("FP16 allreduce failed");
+    expectHardFailBeforeFP32Path("FP16->FP32 cast-back failed");
+}
+
+TEST_F(Test__LocalTPContext, FP16CastWrappersBindParticipantOrdinalBeforeLaunch)
+{
+    const std::string local_tp = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    const std::string cuda_cast = readTextFile(LLAMINAR_CUDA_CAST_KERNELS_SOURCE);
+    const std::string rocm_cast = readTextFile(LLAMINAR_ROCM_CAST_KERNELS_SOURCE);
+    ASSERT_FALSE(local_tp.empty());
+    ASSERT_FALSE(cuda_cast.empty());
+    ASSERT_FALSE(rocm_cast.empty());
+
+    const size_t ordinal_decl = local_tp.find("const int ordinal = devices_[device_index].device_ordinal");
+    ASSERT_NE(ordinal_decl, std::string::npos);
+
+    auto expectLocalCallPassesOrdinal = [&](const char *call_name)
+    {
+        const size_t call_pos = local_tp.find(call_name, ordinal_decl);
+        ASSERT_NE(call_pos, std::string::npos) << call_name;
+        const size_t call_end = local_tp.find(") == 0", call_pos);
+        ASSERT_NE(call_end, std::string::npos) << call_name;
+        const std::string call = local_tp.substr(call_pos, call_end - call_pos);
+        EXPECT_NE(call.find("ordinal"), std::string::npos) << call_name;
+    };
+
+    expectLocalCallPassesOrdinal("cudaCastFP32ToFP16(");
+    expectLocalCallPassesOrdinal("rocmCastFP32ToFP16(");
+    expectLocalCallPassesOrdinal("cudaCastFP16ToFP32(");
+    expectLocalCallPassesOrdinal("rocmCastFP16ToFP32(");
+
+    auto expectWrapperBindsDevice = [](const std::string &source,
+                                       const char *signature,
+                                       const char *set_device,
+                                       const char *null_guard)
+    {
+        const size_t sig_pos = source.find(signature);
+        ASSERT_NE(sig_pos, std::string::npos) << signature;
+        const size_t next_wrapper = source.find("extern \"C\"", sig_pos + 1);
+        const std::string body = source.substr(sig_pos, next_wrapper == std::string::npos
+                                                            ? std::string::npos
+                                                            : next_wrapper - sig_pos);
+        EXPECT_NE(body.find("int ordinal"), std::string::npos) << signature;
+        EXPECT_NE(body.find(null_guard), std::string::npos) << signature;
+        EXPECT_NE(body.find(set_device), std::string::npos) << signature;
+    };
+
+    expectWrapperBindsDevice(cuda_cast, "cudaCastFP32ToFP16(", "cudaSetDevice(ordinal)",
+                             "!fp32_input || !fp16_output || !stream");
+    expectWrapperBindsDevice(cuda_cast, "cudaCastFP16ToFP32(", "cudaSetDevice(ordinal)",
+                             "!fp16_input || !fp32_output || !stream");
+    expectWrapperBindsDevice(rocm_cast, "rocmCastFP32ToFP16(", "hipSetDevice(ordinal)",
+                             "!fp32_input || !fp16_output || !stream");
+    expectWrapperBindsDevice(rocm_cast, "rocmCastFP16ToFP32(", "hipSetDevice(ordinal)",
+                             "!fp16_input || !fp32_output || !stream");
+}
+
+TEST_F(Test__LocalTPContext, GDNCompactWrappersFailFastOnDeviceBindAndClearLaunchState)
+{
+    const std::string cuda_gdn = readTextFile(LLAMINAR_CUDA_GDN_KERNELS_SOURCE);
+    const std::string rocm_gdn = readTextFile(LLAMINAR_ROCM_GDN_KERNELS_SOURCE);
+    ASSERT_FALSE(cuda_gdn.empty());
+    ASSERT_FALSE(rocm_gdn.empty());
+
+    auto extractWrapper = [](const std::string &source, const char *signature)
+    {
+        const size_t sig_pos = source.find(signature);
+        EXPECT_NE(sig_pos, std::string::npos) << signature;
+        if (sig_pos == std::string::npos)
+            return std::string();
+        const size_t next_wrapper = source.find("extern \"C\"", sig_pos + 1);
+        return source.substr(sig_pos, next_wrapper == std::string::npos
+                                          ? std::string::npos
+                                          : next_wrapper - sig_pos);
+    };
+
+    const std::string cuda_body = extractWrapper(cuda_gdn, "cudaGDN_compact_modular_conv_state(");
+    const std::string rocm_body = extractWrapper(rocm_gdn, "rocmGDN_compact_modular_conv_state(");
+    ASSERT_FALSE(cuda_body.empty());
+    ASSERT_FALSE(rocm_body.empty());
+
+    auto expectStrictLaunchWrapper = [](const std::string &body,
+                                        const char *set_device,
+                                        const char *set_failure,
+                                        const char *clear_error,
+                                        const char *launch)
+    {
+        const size_t set_pos = body.find(set_device);
+        const size_t failure_pos = body.find(set_failure);
+        const size_t clear_pos = body.find(clear_error);
+        const size_t launch_pos = body.find(launch);
+        ASSERT_NE(set_pos, std::string::npos) << set_device;
+        ASSERT_NE(failure_pos, std::string::npos) << set_failure;
+        ASSERT_NE(clear_pos, std::string::npos) << clear_error;
+        ASSERT_NE(launch_pos, std::string::npos) << launch;
+        EXPECT_LT(set_pos, failure_pos);
+        EXPECT_LT(failure_pos, clear_pos);
+        EXPECT_LT(clear_pos, launch_pos)
+            << "stale launch errors must be cleared immediately before the compaction launch";
+    };
+
+    expectStrictLaunchWrapper(cuda_body,
+                              "cudaSetDevice(device_idx)",
+                              "set_err != cudaSuccess",
+                              "cudaGetLastError()",
+                              "cuda_gdn_compact_modular_conv_state_kernel<<<");
+    expectStrictLaunchWrapper(rocm_body,
+                              "HipDeviceGuard::setDevice(device_idx)",
+                              "set_err != hipSuccess",
+                              "hipGetLastError()",
+                              "hipLaunchKernelGGL");
+}
+
+TEST_F(Test__LocalTPContext, RCCLCoordinatorKeepsHipDeviceGuardTrackingInSync)
+{
+    const std::string source = readTextFile(LLAMINAR_RCCL_COORDINATOR_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    EXPECT_NE(source.find("trackedHipSetDevice("), std::string::npos);
+    EXPECT_NE(source.find("HipDeviceGuard::forceSetDevice(device_ordinal)"), std::string::npos);
+    EXPECT_EQ(source.find("hipSetDevice("), std::string::npos)
+        << "RCCL coordinator runs direct grouped collectives on worker threads; "
+           "raw hipSetDevice leaves HipDeviceGuard's thread-local cache stale and "
+           "can make the next kernel launch use a stream from the wrong device.";
+}
+
+TEST_F(Test__LocalTPContext, RawAllgatherUsesParticipantProducerStreams)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t fn = source.find("bool LocalTPContext::allgatherRawWithBarrierMultiGpu(");
+    ASSERT_NE(fn, std::string::npos);
+    const size_t next_fn = source.find("bool LocalTPContext::gatherFromDevices(", fn);
+    ASSERT_NE(next_fn, std::string::npos);
+
+    const std::string block = source.substr(fn, next_fn - fn);
+    EXPECT_NE(block.find("raw_allgather_producer_streams_"), std::string::npos);
+    EXPECT_NE(block.find("backend_impl_->allgatherMultiOnStreams("), std::string::npos);
+    EXPECT_EQ(block.find("backend_impl_->allgatherMultiWithComputeDeps("), std::string::npos)
+        << "raw allgather must use the caller's producer streams, not globally "
+           "registered compute streams";
+    EXPECT_EQ(block.find("backend_impl_->allgatherMulti("), std::string::npos)
+        << "raw allgather must not continue on producer streams before collective "
+           "completion is ordered on those same streams";
 }
 
 /**
@@ -606,8 +822,11 @@ public:
     std::atomic<int> shutdown_call_count{0};
     std::atomic<int> allreduce_call_count{0};
     std::atomic<int> allreduce_multi_call_count{0};
+    std::atomic<int> allreduce_multi_on_streams_call_count{0};
     std::atomic<int> allgather_call_count{0};
     std::atomic<int> allgather_multi_call_count{0};
+    std::atomic<int> allgather_multi_on_streams_call_count{0};
+    std::atomic<int> allgather_on_stream_call_count{0};
     std::atomic<int> reduce_scatter_call_count{0};
     std::atomic<int> synchronize_call_count{0};
     std::atomic<int> broadcast_call_count{0};
@@ -618,6 +837,7 @@ public:
     bool should_fail_allgather = false;
     bool should_fail_reduce_scatter = false;
     bool multi_gpu_mode = true;
+    bool supports_allgather_on_stream = true;
 
     // Captured parameters from last call (for verification)
     size_t last_allreduce_count = 0;
@@ -626,6 +846,10 @@ public:
     CollectiveDataType last_dtype = CollectiveDataType::FLOAT32;
     CollectiveOp last_op = CollectiveOp::ALLREDUCE_SUM;
     std::vector<void *> last_multi_buffers;
+    std::vector<void *> last_allreduce_multi_streams;
+    std::vector<void *> last_allgather_multi_streams;
+    int last_allgather_on_stream_device_idx = -1;
+    void *last_allgather_on_stream_stream = nullptr;
 
     // =========================================================================
     // Identity
@@ -755,6 +979,27 @@ public:
         return !should_fail_allreduce;
     }
 
+    bool allreduceMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<void *> &streams) override
+    {
+        allreduce_multi_on_streams_call_count++;
+        last_multi_buffers = buffers;
+        last_allreduce_count = count;
+        last_dtype = dtype;
+        last_op = op;
+        last_allreduce_multi_streams = streams;
+        return !should_fail_allreduce;
+    }
+
+    bool supportsAllreduceMultiOnStreams() const override
+    {
+        return multi_gpu_mode;
+    }
+
     bool allgatherMulti(const std::vector<const void *> &send_bufs,
                         const std::vector<void *> &recv_bufs,
                         size_t send_count, CollectiveDataType dtype) override
@@ -767,6 +1012,50 @@ public:
         return !should_fail_allgather;
     }
 
+    bool allgatherMultiOnStreams(
+        const std::vector<const void *> &send_bufs,
+        const std::vector<void *> &recv_bufs,
+        size_t send_count,
+        CollectiveDataType dtype,
+        const std::vector<void *> &streams) override
+    {
+        allgather_multi_on_streams_call_count++;
+        last_allgather_count = send_count;
+        last_dtype = dtype;
+        last_allgather_multi_streams = streams;
+        (void)send_bufs;
+        (void)recv_bufs;
+        return !should_fail_allgather;
+    }
+
+    bool supportsAllgatherMultiOnStreams() const override
+    {
+        return multi_gpu_mode;
+    }
+
+    bool allgatherSingleDeviceOnStream(
+        const void *send_buf,
+        void *recv_buf,
+        size_t send_count,
+        CollectiveDataType dtype,
+        int device_idx,
+        void *stream) override
+    {
+        allgather_on_stream_call_count++;
+        last_allgather_count = send_count;
+        last_dtype = dtype;
+        last_allgather_on_stream_device_idx = device_idx;
+        last_allgather_on_stream_stream = stream;
+        (void)send_buf;
+        (void)recv_buf;
+        return supports_allgather_on_stream && !should_fail_allgather;
+    }
+
+    bool supportsAllgatherSingleDeviceOnStream() const override
+    {
+        return supports_allgather_on_stream;
+    }
+
     std::string lastError() const override { return last_error_; }
 
     // Helper to reset all counters
@@ -776,8 +1065,11 @@ public:
         shutdown_call_count = 0;
         allreduce_call_count = 0;
         allreduce_multi_call_count = 0;
+        allreduce_multi_on_streams_call_count = 0;
         allgather_call_count = 0;
         allgather_multi_call_count = 0;
+        allgather_multi_on_streams_call_count = 0;
+        allgather_on_stream_call_count = 0;
         reduce_scatter_call_count = 0;
         synchronize_call_count = 0;
         broadcast_call_count = 0;
@@ -786,7 +1078,12 @@ public:
         should_fail_allgather = false;
         should_fail_reduce_scatter = false;
         multi_gpu_mode = true;
+        supports_allgather_on_stream = true;
         last_multi_buffers.clear();
+        last_allreduce_multi_streams.clear();
+        last_allgather_multi_streams.clear();
+        last_allgather_on_stream_device_idx = -1;
+        last_allgather_on_stream_stream = nullptr;
     }
 
 private:
@@ -828,6 +1125,314 @@ TEST_F(Test__LocalTPContext, HostBackendAlwaysAvailable)
 
     EXPECT_EQ(ctx->backend(), CollectiveBackendType::HOST);
     EXPECT_EQ(ctx->degree(), 2);
+}
+
+TEST_F(Test__LocalTPContext, RawAllgatherUsesOnStreamPathDuringGraphCapture)
+{
+    auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    backend_raw->supports_allgather_on_stream = true;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::NCCL,
+        /*initialized=*/true);
+
+    EXPECT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    int send = 7;
+    int recv[2] = {};
+    void *stream = reinterpret_cast<void *>(0x1234);
+
+    {
+        GraphCaptureGuard guard;
+        EXPECT_TRUE(ctx->allgatherRawOnStream(
+            &send,
+            recv,
+            1,
+            CollectiveDataType::INT32,
+            0,
+            stream,
+            "captured_raw_stage"));
+    }
+
+    EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 1);
+    EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0)
+        << "Graph capture must not enter the host-synchronized raw allgather barrier.";
+    EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 0)
+        << "Graph capture must stay participant-local instead of using eager grouped launch.";
+    EXPECT_EQ(backend_raw->last_allgather_on_stream_device_idx, 0);
+    EXPECT_EQ(backend_raw->last_allgather_on_stream_stream, stream);
+}
+
+TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport)
+{
+    auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    backend_raw->supports_allgather_on_stream = false;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::NCCL,
+        /*initialized=*/true);
+
+    EXPECT_FALSE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+
+    int send = 7;
+    int recv[2] = {};
+    void *stream = reinterpret_cast<void *>(0x1234);
+
+    {
+        GraphCaptureGuard guard;
+        EXPECT_FALSE(ctx->allgatherRawOnStream(
+            &send,
+            recv,
+            1,
+            CollectiveDataType::INT32,
+            0,
+            stream,
+            "captured_raw_stage"));
+    }
+
+    EXPECT_EQ(backend_raw->allgather_on_stream_call_count.load(), 0);
+    EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0)
+        << "Unsupported graph-captured raw allgather must fail, not fall back.";
+    EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 0)
+        << "Unsupported graph-captured raw allgather must fail, not enter eager grouped launch.";
+}
+
+TEST_F(Test__LocalTPContext, RawAllgatherResultSurvivesBackToBackGenerations)
+{
+    auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::NCCL,
+        /*initialized=*/true);
+
+    int send0_gen0 = 1;
+    int send1_gen0 = 2;
+    int recv0_gen0[2] = {};
+    int recv1_gen0[2] = {};
+    int send0_gen1 = 3;
+    int send1_gen1 = 4;
+    int recv0_gen1[2] = {};
+    int recv1_gen1[2] = {};
+    void *slot0_stream = reinterpret_cast<void *>(0x1234);
+    void *slot1_stream = reinterpret_cast<void *>(0x5678);
+
+    std::promise<void> release_second_generation;
+    auto release_second_generation_future = release_second_generation.get_future().share();
+    std::atomic<bool> slot0_first_returned{false};
+    std::atomic<bool> slot1_entering_second{false};
+    std::atomic<bool> slot0_first_result{false};
+    std::atomic<bool> slot1_first_result{false};
+    std::atomic<bool> slot0_second_result{false};
+    std::atomic<bool> slot1_second_result{false};
+
+    std::thread slot0([&]()
+                      {
+                          const bool first = ctx->allgatherRawOnStream(
+                              &send0_gen0,
+                              recv0_gen0,
+                              1,
+                              CollectiveDataType::INT32,
+                              0,
+                              slot0_stream,
+                              "raw_stage_0");
+                          slot0_first_result.store(first, std::memory_order_release);
+                          slot0_first_returned.store(true, std::memory_order_release);
+                          release_second_generation_future.wait();
+                          const bool second = ctx->allgatherRawOnStream(
+                              &send0_gen1,
+                              recv0_gen1,
+                              1,
+                              CollectiveDataType::INT32,
+                              0,
+                              slot0_stream,
+                              "raw_stage_1");
+                          slot0_second_result.store(second, std::memory_order_release);
+                      });
+
+    std::thread slot1([&]()
+                      {
+                          const bool first = ctx->allgatherRawOnStream(
+                              &send1_gen0,
+                              recv1_gen0,
+                              1,
+                              CollectiveDataType::INT32,
+                              1,
+                              slot1_stream,
+                              "raw_stage_0");
+                          slot1_first_result.store(first, std::memory_order_release);
+                          slot1_entering_second.store(true, std::memory_order_release);
+                          const bool second = ctx->allgatherRawOnStream(
+                              &send1_gen1,
+                              recv1_gen1,
+                              1,
+                              CollectiveDataType::INT32,
+                              1,
+                              slot1_stream,
+                              "raw_stage_1");
+                          slot1_second_result.store(second, std::memory_order_release);
+                      });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!slot0_first_returned.load(std::memory_order_acquire) ||
+            !slot1_entering_second.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const bool saw_slot0_first_return =
+        slot0_first_returned.load(std::memory_order_acquire);
+    const bool saw_slot1_second_entry =
+        slot1_entering_second.load(std::memory_order_acquire);
+    const int launches_before_release = backend_raw->allgather_multi_on_streams_call_count.load();
+
+    release_second_generation.set_value();
+    slot0.join();
+    slot1.join();
+
+    EXPECT_TRUE(saw_slot0_first_return);
+    EXPECT_TRUE(saw_slot1_second_entry);
+    EXPECT_EQ(launches_before_release, 1)
+        << "The second raw allgather must not launch before both participants have "
+           "observed the first generation result.";
+    EXPECT_TRUE(slot0_first_result.load(std::memory_order_acquire));
+    EXPECT_TRUE(slot1_first_result.load(std::memory_order_acquire));
+    EXPECT_TRUE(slot0_second_result.load(std::memory_order_acquire));
+    EXPECT_TRUE(slot1_second_result.load(std::memory_order_acquire));
+    EXPECT_EQ(backend_raw->allgather_multi_call_count.load(), 0);
+    EXPECT_EQ(backend_raw->allgather_multi_on_streams_call_count.load(), 2);
+    ASSERT_EQ(backend_raw->last_allgather_multi_streams.size(), 2u);
+    EXPECT_EQ(backend_raw->last_allgather_multi_streams[0], slot0_stream);
+    EXPECT_EQ(backend_raw->last_allgather_multi_streams[1], slot1_stream);
+}
+
+TEST_F(Test__LocalTPContext, GroupedOnStreamAllreduceResultSurvivesBackToBackGenerations)
+{
+    auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::NCCL,
+        /*initialized=*/true);
+
+    int slot0_gen0 = 1;
+    int slot1_gen0 = 2;
+    int slot0_gen1 = 3;
+    int slot1_gen1 = 4;
+    void *slot0_stream = reinterpret_cast<void *>(0x1234);
+    void *slot1_stream = reinterpret_cast<void *>(0x5678);
+
+    std::promise<void> release_second_generation;
+    auto release_second_generation_future = release_second_generation.get_future().share();
+    std::atomic<bool> slot0_first_returned{false};
+    std::atomic<bool> slot1_entering_second{false};
+    std::atomic<bool> slot0_first_result{false};
+    std::atomic<bool> slot1_first_result{false};
+    std::atomic<bool> slot0_second_result{false};
+    std::atomic<bool> slot1_second_result{false};
+
+    std::thread slot0([&]()
+                      {
+                          const bool first = ctx->allreduceGroupedOnExplicitStreamsForTesting(
+                              &slot0_gen0,
+                              1,
+                              CollectiveDataType::INT32,
+                              0,
+                              slot0_stream,
+                              "allreduce_stage_0",
+                              "fp32");
+                          slot0_first_result.store(first, std::memory_order_release);
+                          slot0_first_returned.store(true, std::memory_order_release);
+                          release_second_generation_future.wait();
+                          const bool second = ctx->allreduceGroupedOnExplicitStreamsForTesting(
+                              &slot0_gen1,
+                              1,
+                              CollectiveDataType::INT32,
+                              0,
+                              slot0_stream,
+                              "allreduce_stage_1",
+                              "fp32");
+                          slot0_second_result.store(second, std::memory_order_release);
+                      });
+
+    std::thread slot1([&]()
+                      {
+                          const bool first = ctx->allreduceGroupedOnExplicitStreamsForTesting(
+                              &slot1_gen0,
+                              1,
+                              CollectiveDataType::INT32,
+                              1,
+                              slot1_stream,
+                              "allreduce_stage_0",
+                              "fp32");
+                          slot1_first_result.store(first, std::memory_order_release);
+                          slot1_entering_second.store(true, std::memory_order_release);
+                          const bool second = ctx->allreduceGroupedOnExplicitStreamsForTesting(
+                              &slot1_gen1,
+                              1,
+                              CollectiveDataType::INT32,
+                              1,
+                              slot1_stream,
+                              "allreduce_stage_1",
+                              "fp32");
+                          slot1_second_result.store(second, std::memory_order_release);
+                      });
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((!slot0_first_returned.load(std::memory_order_acquire) ||
+            !slot1_entering_second.load(std::memory_order_acquire)) &&
+           std::chrono::steady_clock::now() < deadline)
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const bool saw_slot0_first_return =
+        slot0_first_returned.load(std::memory_order_acquire);
+    const bool saw_slot1_second_entry =
+        slot1_entering_second.load(std::memory_order_acquire);
+    const int launches_before_release = backend_raw->allreduce_multi_on_streams_call_count.load();
+
+    release_second_generation.set_value();
+    slot0.join();
+    slot1.join();
+
+    EXPECT_TRUE(saw_slot0_first_return);
+    EXPECT_TRUE(saw_slot1_second_entry);
+    EXPECT_EQ(launches_before_release, 1)
+        << "The second grouped allreduce must not launch before all participants "
+           "have observed the first generation result.";
+    EXPECT_TRUE(slot0_first_result.load(std::memory_order_acquire));
+    EXPECT_TRUE(slot1_first_result.load(std::memory_order_acquire));
+    EXPECT_TRUE(slot0_second_result.load(std::memory_order_acquire));
+    EXPECT_TRUE(slot1_second_result.load(std::memory_order_acquire));
+    EXPECT_EQ(backend_raw->allreduce_multi_call_count.load(), 0);
+    EXPECT_EQ(backend_raw->allreduce_multi_on_streams_call_count.load(), 2);
+    ASSERT_EQ(backend_raw->last_allreduce_multi_streams.size(), 2u);
+    EXPECT_EQ(backend_raw->last_allreduce_multi_streams[0], slot0_stream);
+    EXPECT_EQ(backend_raw->last_allreduce_multi_streams[1], slot1_stream);
 }
 
 /**

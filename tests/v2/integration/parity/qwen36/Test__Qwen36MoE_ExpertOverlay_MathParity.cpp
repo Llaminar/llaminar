@@ -299,7 +299,9 @@ protected:
         inf_config.force_graph = true;
         inf_config.activation_precision = GetParam().activation_precision;
         inf_config.kv_cache_precision = GetParam().kv_cache_precision;
-        inf_config.tp_allreduce_precision_override = "fp16";
+        // Preserve Qwen35Graph's hybrid schema policy: early GDN layers and all
+        // FA layers use FP32 allreduce, later GDN layers use FP16 transport.
+        inf_config.tp_allreduce_precision_override = "schema";
         inf_config.use_mapped_memory = true;
         inf_config.moe_expert_parallel_plan = overlay_plan_;
         inf_config.moe_expert_overlay_mpi_ctx = mpi_ctx_;

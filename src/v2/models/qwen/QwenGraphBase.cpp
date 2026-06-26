@@ -324,25 +324,34 @@ namespace llaminar2
 
     bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
     {
+        const int max_decode_like_rows =
+            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_replicated &&
-               total_tokens == 1 &&
+               total_tokens > 0 &&
+               total_tokens <= max_decode_like_rows &&
                hasDecodeReplicatedDenseWeightSource();
     }
 
     bool QwenGraphBase::denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const
     {
+        const int max_decode_like_rows =
+            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_mirrored_embedding &&
-               total_tokens == 1 &&
+               total_tokens > 0 &&
+               total_tokens <= max_decode_like_rows &&
                hasDecodeMirroredEmbeddingWeightSource();
     }
 
     bool QwenGraphBase::replicatedAttentionStateActiveForTokens(int total_tokens) const
     {
+        const int max_decode_like_rows =
+            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_replicated &&
-               total_tokens == 1 &&
+               total_tokens > 0 &&
+               total_tokens <= max_decode_like_rows &&
                hasDecodeReplicatedDenseWeightSource();
     }
 

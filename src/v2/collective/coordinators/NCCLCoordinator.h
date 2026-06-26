@@ -179,6 +179,17 @@ namespace llaminar2
                                            CollectiveDataType dtype, CollectiveOp op);
 
         /**
+         * @brief In-place allreduce across local GPUs on explicit producer streams.
+         *
+         * Enqueues one grouped NCCL collective over the supplied streams and
+         * returns after launch. The caller owns any subsequent stream waits or
+         * tensor coherence events.
+         */
+        bool allreduceMultiOnStreams(const std::vector<void *> &buffers, size_t count,
+                                     CollectiveDataType dtype, CollectiveOp op,
+                                     const std::vector<void *> &streams);
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Each device thread calls this independently. NCCL internally matches
@@ -213,6 +224,26 @@ namespace llaminar2
                                            CollectiveDataType dtype, CollectiveOp op,
                                            int device_idx, void *stream);
 
+        bool allgatherSingleDeviceOnStream(const void *send_buf,
+                                           void *recv_buf,
+                                           size_t send_count,
+                                           CollectiveDataType dtype,
+                                           int device_idx,
+                                           void *stream);
+
+        /**
+         * @brief Allgather across local GPUs on explicit producer streams.
+         *
+         * Enqueues one grouped NCCL allgather over the supplied streams and
+         * returns after launch. The caller's streams provide producer and
+         * consumer ordering.
+         */
+        bool allgatherMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                     const std::vector<void *> &recv_buffers,
+                                     size_t send_count,
+                                     CollectiveDataType dtype,
+                                     const std::vector<void *> &streams);
+
         /**
          * @brief Allgather across all local GPUs
          *
@@ -228,6 +259,20 @@ namespace llaminar2
         bool allgatherMulti(const std::vector<const void *> &send_buffers,
                             const std::vector<void *> &recv_buffers,
                             size_t send_count, CollectiveDataType dtype);
+
+        /**
+         * @brief Allgather with GPU stream dependency insertion.
+         *
+         * Enqueues the grouped NCCL allgather and inserts
+         * cudaStreamWaitEvent(compute_stream, completion_event) for each device
+         * so later compute-stream work observes the gathered receive buffers
+         * without blocking the host.
+         */
+        bool allgatherMultiWithComputeDeps(
+            const std::vector<const void *> &send_buffers,
+            const std::vector<void *> &recv_buffers,
+            size_t send_count,
+            CollectiveDataType dtype);
 
         /**
          * @brief Broadcast from root to all local GPUs

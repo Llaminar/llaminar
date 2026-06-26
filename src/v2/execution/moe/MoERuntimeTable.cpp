@@ -166,6 +166,41 @@ namespace llaminar2
             return static_cast<uint32_t>(route_capacity);
         }
 
+        uint32_t participantBit(uint32_t participant)
+        {
+            return 1u << participant;
+        }
+
+        uint32_t participantMaskLimit(uint32_t participant_count)
+        {
+            return (1u << participant_count) - 1u;
+        }
+
+        uint32_t synthesizedResidentParticipantMask(
+            const MoEPlacementUpdate &update,
+            uint32_t expert)
+        {
+            uint32_t mask = 0;
+            const auto &desc = update.experts[expert];
+            if (desc.owner_participant >= 0 &&
+                desc.owner_participant < static_cast<int32_t>(update.participant_count))
+            {
+                mask |= participantBit(static_cast<uint32_t>(desc.owner_participant));
+            }
+            if (update.local_compute_mask[expert] != 0u)
+                mask |= participantBit(update.participant_id);
+            return mask;
+        }
+
+        uint32_t residentParticipantMaskForUpdate(
+            const MoEPlacementUpdate &update,
+            uint32_t expert)
+        {
+            if (!update.resident_participant_mask.empty())
+                return update.resident_participant_mask[expert];
+            return synthesizedResidentParticipantMask(update, expert);
+        }
+
     } // namespace
 
     DeviceMoERuntimeTable::DeviceMoERuntimeTable(Config config)
@@ -516,6 +551,7 @@ namespace llaminar2
             bank.experts[expert] = update.experts[expert];
             bank.local_compute_mask[expert] = update.local_compute_mask[expert];
             bank.replica_role[expert] = update.replica_role[expert];
+            bank.resident_participant_mask[expert] = residentParticipantMaskForUpdate(update, expert);
         }
 
         return true;
@@ -566,11 +602,14 @@ namespace llaminar2
             throw std::invalid_argument(layerPrefix(layer_idx) + "participant_id must be less than participant_count");
         if (update.experts.size() != update.expert_count ||
             update.local_compute_mask.size() != update.expert_count ||
-            update.replica_role.size() != update.expert_count)
+            update.replica_role.size() != update.expert_count ||
+            (!update.resident_participant_mask.empty() &&
+             update.resident_participant_mask.size() != update.expert_count))
         {
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update vectors must match expert_count");
         }
 
+        const uint32_t valid_participant_mask = participantMaskLimit(update.participant_count);
         for (uint32_t expert = 0; expert < update.expert_count; ++expert)
         {
             const auto &desc = update.experts[expert];
@@ -582,6 +621,21 @@ namespace llaminar2
                 throw std::invalid_argument(layerPrefix(layer_idx) + "local_compute_mask entries must be 0 or 1");
             if (update.replica_role[expert] > static_cast<uint8_t>(DeviceMoEReplicaRole::PreferredReplica))
                 throw std::invalid_argument(layerPrefix(layer_idx) + "replica_role entries must be valid DeviceMoEReplicaRole values");
+
+            const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
+            if ((resident_mask & ~valid_participant_mask) != 0u)
+                throw std::invalid_argument(layerPrefix(layer_idx) + "resident_participant_mask names a participant outside participant_count");
+            if (update.local_compute_mask[expert] != 0u &&
+                (resident_mask & participantBit(update.participant_id)) == 0u)
+            {
+                throw std::invalid_argument(layerPrefix(layer_idx) + "resident_participant_mask must include local participant for local compute");
+            }
+            if (desc.owner_participant >= 0 &&
+                desc.owner_participant < static_cast<int32_t>(update.participant_count) &&
+                (resident_mask & participantBit(static_cast<uint32_t>(desc.owner_participant))) == 0u)
+            {
+                throw std::invalid_argument(layerPrefix(layer_idx) + "resident_participant_mask must include the owner participant");
+            }
 
             if (descriptorRequiresReadyPayload(desc, update.local_compute_mask[expert]))
             {

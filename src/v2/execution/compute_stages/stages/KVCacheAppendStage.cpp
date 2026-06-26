@@ -345,7 +345,7 @@ namespace llaminar2
                 isGraphCaptureHostBookkeepingActive() &&
                 params_.kv_cache->isGraphCaptureReady())
             {
-                // Segmented decode capture records GPU append kernels, but the
+                // Cached decode graph capture records GPU append kernels, but the
                 // immediate launch-after-capture deliberately skips
                 // onGraphReplayed(). Advance host metadata during recording so
                 // subsequent captured stages see the appended token in

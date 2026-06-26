@@ -30,6 +30,7 @@
 #include "backends/ComputeBackend.h"
 #include "../../../../mocks/MockModelContext.h"
 #include "../../../../mocks/MockModelLoader.h"
+#include "../../../../mocks/MockLocalTPContext.h"
 #include "utils/Logger.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -1822,6 +1823,25 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesGlobalTPDomainI
         << "Prefill graph observations must use the same domain-local participant id.";
 }
 
+TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceParticipantUsesLocalTPDeviceIndex)
+{
+    auto local_tp = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    local_tp->setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+    local_tp->setBackend(CollectiveBackendType::RCCL);
+
+    GraphConfig local_config = config_;
+    local_config.tp_ctx = local_tp.get();
+    local_config.tp_device_idx = 1;
+    auto local_graph = std::make_shared<QwenStandardGraph>(local_config, nullptr);
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(local_graph, nullptr);
+
+    EXPECT_EQ(orchestrator->moeRebalanceParticipantId(), 1)
+        << "LocalTP rebalance must use the domain-local device index, not MPI rank 0";
+    IForwardExecutionHost &host = *orchestrator;
+    EXPECT_EQ(host.prefillGraphParticipantId(), 1)
+        << "Prefill graph observations must report the LocalTP participant id.";
+}
+
 TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutation)
 {
     auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
@@ -1850,6 +1870,31 @@ TEST_F(Test__DeviceGraphOrchestrator, MoERebalanceDomainMismatchFailsBeforeMutat
     replicas.domain_id = "single_cpu_moe";
     EXPECT_NO_THROW(
         orchestrator->setExpertReplicaSetForParticipant(replicas, /*participant_id=*/0));
+}
+
+TEST_F(Test__DeviceGraphOrchestrator, ApplyExpertMasksAdvancesMoEPlacementEpochOnMaskChange)
+{
+    auto orchestrator = std::make_unique<DeviceGraphOrchestrator>(graph_builder_, nullptr);
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), 0u);
+
+    const std::vector<std::vector<bool>> first_masks = {
+        {true, false, true, false},
+        {false, true, false, true}};
+    EXPECT_NO_THROW(orchestrator->applyExpertMasksForDomain({}, first_masks, ReceivedWeightsMap{}));
+    const uint64_t first_epoch = orchestrator->moePlacementEpoch();
+    EXPECT_GT(first_epoch, 0u)
+        << "Ownership-mask publication must invalidate MoE-sensitive forward graph cache keys";
+
+    EXPECT_NO_THROW(orchestrator->applyExpertMasksForDomain({}, first_masks, ReceivedWeightsMap{}));
+    EXPECT_EQ(orchestrator->moePlacementEpoch(), first_epoch)
+        << "Publishing identical masks should not cause avoidable graph recapture churn";
+
+    const std::vector<std::vector<bool>> second_masks = {
+        {false, true, true, false},
+        {false, true, true, false}};
+    EXPECT_NO_THROW(orchestrator->applyExpertMasksForDomain({}, second_masks, ReceivedWeightsMap{}));
+    EXPECT_GT(orchestrator->moePlacementEpoch(), first_epoch)
+        << "Ownership swaps without replicas still need a fresh graph-cache epoch";
 }
 
 TEST_F(Test__DeviceGraphOrchestrator, PrefillChunkMaintenanceStateDefaultsSafeWithoutMoE)

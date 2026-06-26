@@ -39,6 +39,7 @@ namespace llaminar2
     class PreparedWeightStore;
     class ExpertGemmRegistry;
     class GpuExpertSlotPool;
+    class GpuExpertTransferStagingPool;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -92,11 +93,12 @@ namespace llaminar2
 
             /// Expert replication for per-token dynamic dispatch.
             /// When set (num_replicated > 0), replicated experts are assigned
-            /// to sockets per-token to balance load. Both sockets have GEMM
-            /// engines for replicated experts; only one computes each per token.
+            /// to participants per-token to balance load. Resident participants
+            /// have GEMM engines for replicated experts; only one computes each
+            /// per token.
             ExpertReplicaSet replica_set;
 
-            /// This rank's socket ID (for per-token replica dispatch).
+            /// This rank's participant ID (for per-token replica dispatch).
             int my_socket_id = 0;
 
             // Per-expert 2D tensor views — used by GPU path
@@ -224,10 +226,13 @@ namespace llaminar2
         void setReplicaSet(const ExpertReplicaSet &replicas, int socket_id)
         {
             params_.replica_set = replicas;
+            params_.replica_set.rebuildAggregateReplicaFlags();
             params_.my_socket_id = socket_id;
             // Pre-build prefill mask: single-lookup replaces multi-branch check
             if (replicas.num_replicated > 0 && !params_.expert_mask.empty())
-                params_.replica_set.buildPrefillMask(socket_id, params_.expert_mask);
+                params_.replica_set.buildPrefillMask(socket_id, params_.expert_mask, params_.layer_idx);
+            else
+                params_.replica_set.prefill_mask.clear();
             grouped_gateup_desc_table_id_ = -1;
             grouped_gateup_desc_table_num_experts_ = 0;
             grouped_gateup_desc_table_d_model_ = 0;
@@ -248,7 +253,7 @@ namespace llaminar2
 
         /// Serialize packed weights for an expert without detaching.
         /// The owner keeps its GEMM engines intact. Used for replica transfers
-        /// where both sockets need the weights.
+        /// where both owner and replica participants need the weights.
         ExpertWeightBlobs serializeExpert(int expert_id) const;
 
         /// Directly copy same-backend GPU packed expert weights from a sibling
@@ -258,6 +263,31 @@ namespace llaminar2
             MoEExpertComputeStage &source,
             const std::vector<int> &expert_ids,
             void *source_producer_stream);
+
+        /// Return requested experts that do not currently have all prepared
+        /// gate/up/down GEMM engines on this stage.
+        std::vector<int> missingPreparedExpertIds(
+            const std::vector<int> &expert_ids) const;
+
+        /// Stage same-backend GPU expert weights from a sibling stage into this
+        /// stage's transfer slots without publishing active GEMM engines.
+        std::vector<int> stageExpertsGPUDirectToTransferSlotsFrom(
+            MoEExpertComputeStage &source,
+            const std::vector<int> &expert_ids,
+            void *source_producer_stream,
+            GpuDirectTransferSlotArrivals *staged_arrivals,
+            size_t active_arrival_capacity = 0,
+            size_t staging_pool_capacity = 0,
+            std::vector<std::shared_ptr<GpuExpertTransferStagingPool>>* transfer_staging_pools = nullptr);
+
+        /// Activate previously staged GPU-direct transfer-slot arrivals into
+        /// active expert slots and publish their GEMM engines. Must run on the
+        /// runner thread with an explicit destination stream.
+        std::vector<int> activateGpuDirectTransferSlotArrivals(
+            const GpuDirectTransferSlotArrivals &arrivals,
+            void *activation_stream,
+            GpuDirectTransferCompletion *completion_out = nullptr,
+            bool retain_pending_completion = true);
 
         // ── Phased rebalance API (used by DeviceGraphOrchestrator) ───────
         //
@@ -284,6 +314,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         /**
          * @brief Drop per-request fused decode warmup state.
@@ -622,6 +653,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         /**
          * @brief Drop per-request grouped decode warmup state.
@@ -797,6 +829,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillRealLengthContract() const override;
         bool hasPrefillReplayParams() const override { return params_.device_id.is_gpu() && params_.seq_len > 1; }

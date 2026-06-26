@@ -687,6 +687,40 @@ namespace llaminar2
         }
 
         /**
+         * @brief Multi-GPU AllReduce on caller-provided producer streams.
+         *
+         * Each buffers[i] is reduced in-place on streams[i], where streams[i]
+         * is the explicit producer stream for device i. Implementations should
+         * enqueue one grouped backend collective covering all participants and
+         * return after launch, without synchronizing the host.
+         *
+         * This is the eager LocalTP path for homogeneous single-process GPU
+         * domains. GPU graph capture still uses per-device on-stream collectives
+         * because capture records participant-local work on each thread.
+         *
+         * @return true if the grouped collective was enqueued
+         */
+        virtual bool allreduceMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether allreduceMultiOnStreams is available.
+         */
+        virtual bool supportsAllreduceMultiOnStreams() const { return false; }
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Called independently by each device thread. RCCL/NCCL internally
@@ -749,6 +783,78 @@ namespace llaminar2
         }
 
         /**
+         * @brief Per-device all-gather on a caller-provided stream (graph-capturable)
+         *
+         * Like allreduceSingleDeviceOnStream(), this records the collective
+         * directly onto the caller's explicit GPU stream. Each participant calls
+         * independently with its own send/recv buffers; the NCCL/RCCL backend
+         * matches the collective across devices. No host-side stream sync or
+         * completion wait is performed.
+         *
+         * @param send_buf Local contribution on device_idx.
+         * @param recv_buf Full receive buffer on device_idx.
+         * @param send_count Elements contributed by each participant.
+         * @param dtype Element type.
+         * @param device_idx Device index (0 to num_gpus-1).
+         * @param stream GPU stream (cudaStream_t/hipStream_t cast to void*).
+         * @return true on success, false if not supported.
+         */
+        virtual bool allgatherSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_idx,
+            void *stream)
+        {
+            (void)send_buf;
+            (void)recv_buf;
+            (void)send_count;
+            (void)dtype;
+            (void)device_idx;
+            (void)stream;
+            return false; // Not supported by default
+        }
+
+        /**
+         * @brief Whether allgatherSingleDeviceOnStream is implemented for the
+         * current backend instance.
+         */
+        virtual bool supportsAllgatherSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Multi-GPU AllGather on caller-provided producer streams.
+         *
+         * Enqueues one grouped backend collective over streams[i], where
+         * send_bufs[i] and recv_bufs[i] live on device i. Stream ordering then
+         * provides the full dependency chain:
+         * producer kernels -> allgather -> consumers on the same stream.
+         *
+         * This is the eager LocalTP path for raw graph-visible handoffs. GPU
+         * graph capture still uses allgatherSingleDeviceOnStream() because
+         * each participant records its own graph work independently.
+         */
+        virtual bool allgatherMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype,
+            const std::vector<void *> &streams)
+        {
+            (void)send_bufs;
+            (void)recv_bufs;
+            (void)send_count;
+            (void)dtype;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether allgatherMultiOnStreams is available.
+         */
+        virtual bool supportsAllgatherMultiOnStreams() const { return false; }
+
+        /**
          * @brief Multi-GPU AllGather (single process)
          *
          * Each send_bufs[i] on GPU i contributes send_count elements.
@@ -771,6 +877,25 @@ namespace llaminar2
             (void)send_count;
             (void)dtype;
             return false; // Not supported by default
+        }
+
+        /**
+         * @brief Multi-GPU AllGather with compute stream dependency insertion.
+         *
+         * Queues the allgather and makes each registered compute stream wait for
+         * the collective completion event before subsequent kernels consume the
+         * receive buffers. NCCL/RCCL override this with GPU-side event waits.
+         * Backends without event handoff fall back to a conservative synchronize.
+         */
+        virtual bool allgatherMultiWithComputeDeps(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype)
+        {
+            if (!allgatherMulti(send_bufs, recv_bufs, send_count, dtype))
+                return false;
+            return synchronize();
         }
 
         /**

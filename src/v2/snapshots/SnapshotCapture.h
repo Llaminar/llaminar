@@ -10,6 +10,7 @@
 #pragma once
 
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -41,13 +42,40 @@ namespace llaminar2
      * - FP32 extraction from quantized formats (Q8_1, Q16_1, BF16, FP16)
      * - Stage name → snapshot key conversion
      *
-     * Thread safety: NOT thread-safe. Must be called from a single thread
-     * (the executor callback thread).
+     * Thread safety: capture/clear are safe for concurrent executor callbacks.
+     * Accessors returning raw pointers/references should be used after capture
+     * callbacks have quiesced.
      */
     class SnapshotCapture
     {
     public:
         SnapshotCapture() = default;
+        SnapshotCapture(const SnapshotCapture &other)
+        {
+            std::lock_guard<std::mutex> lock(other.mutex_);
+            snapshots_ = other.snapshots_;
+        }
+        SnapshotCapture &operator=(const SnapshotCapture &other)
+        {
+            if (this == &other)
+                return *this;
+            std::scoped_lock lock(mutex_, other.mutex_);
+            snapshots_ = other.snapshots_;
+            return *this;
+        }
+        SnapshotCapture(SnapshotCapture &&other) noexcept
+        {
+            std::lock_guard<std::mutex> lock(other.mutex_);
+            snapshots_ = std::move(other.snapshots_);
+        }
+        SnapshotCapture &operator=(SnapshotCapture &&other) noexcept
+        {
+            if (this == &other)
+                return *this;
+            std::scoped_lock lock(mutex_, other.mutex_);
+            snapshots_ = std::move(other.snapshots_);
+            return *this;
+        }
 
         /**
          * @brief Process a stage callback and store snapshot(s)
@@ -60,7 +88,11 @@ namespace llaminar2
         /**
          * @brief Clear all stored snapshots
          */
-        void clear() { snapshots_.clear(); }
+        void clear()
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshots_.clear();
+        }
 
         /**
          * @brief Retrieve a snapshot by key
@@ -69,6 +101,7 @@ namespace llaminar2
          */
         const StoredSnapshot *get(const std::string &key) const
         {
+            std::lock_guard<std::mutex> lock(mutex_);
             auto it = snapshots_.find(key);
             return it != snapshots_.end() ? &it->second : nullptr;
         }
@@ -83,6 +116,7 @@ namespace llaminar2
          */
         std::vector<std::string> keys() const
         {
+            std::lock_guard<std::mutex> lock(mutex_);
             std::vector<std::string> result;
             result.reserve(snapshots_.size());
             for (const auto &p : snapshots_)
@@ -108,6 +142,7 @@ namespace llaminar2
     private:
         void storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out);
 
+        mutable std::mutex mutex_;
         std::unordered_map<std::string, StoredSnapshot> snapshots_;
     };
 

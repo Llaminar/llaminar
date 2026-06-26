@@ -25,12 +25,16 @@
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <cmath>
 #include <random>
+#include <stdexcept>
+#include <thread>
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
 
+#include "backends/BackendManager.h"
 #include "utils/MPIContext.h"
 #include "../../../utils/TestTensorFactory.h"
 
@@ -110,6 +114,129 @@ protected:
 
     std::mt19937 rng_{42};
 };
+
+namespace
+{
+    class CountingDumpInfoStage final : public IComputeStage
+    {
+    public:
+        CountingDumpInfoStage() : IComputeStage(DeviceId::cpu()) {}
+
+        bool execute(IDeviceContext *) override { return true; }
+        ComputeStageType type() const override { return ComputeStageType::COPY; }
+        bool supportsBackend(ComputeBackendType) const override { return true; }
+
+        int buildCount() const { return build_count_.load(std::memory_order_relaxed); }
+
+    protected:
+        StageDumpInfo buildDumpInfoImpl() const override
+        {
+            const int build = build_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+            StageDumpInfo info;
+            info.addScalarInt("build", build);
+            return info;
+        }
+
+    private:
+        mutable std::atomic<int> build_count_{0};
+    };
+}
+
+TEST_F(StageDumpInfoTest, DumpInfoSnapshotRemainsStableAcrossRefresh)
+{
+    CountingDumpInfoStage stage;
+
+    StageDumpInfo first = stage.getDumpInfoSnapshot();
+    EXPECT_EQ(getScalarInt(first, "build"), 1);
+
+    StageDumpInfo second = stage.refreshDumpInfoSnapshot();
+    EXPECT_EQ(getScalarInt(first, "build"), 1);
+    EXPECT_EQ(getScalarInt(second, "build"), 2);
+
+    StageDumpInfo third = stage.getDumpInfoSnapshot();
+    EXPECT_EQ(getScalarInt(third, "build"), 2);
+}
+
+TEST_F(StageDumpInfoTest, DumpInfoCacheAllowsConcurrentSnapshotsAndInvalidation)
+{
+    CountingDumpInfoStage stage;
+    std::atomic<bool> start{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> threads;
+
+    for (int t = 0; t < 6; ++t)
+    {
+        threads.emplace_back([&]()
+                             {
+                                 while (!start.load(std::memory_order_acquire))
+                                 {
+                                 }
+                                 for (int i = 0; i < 1000; ++i)
+                                 {
+                                     StageDumpInfo info = stage.getDumpInfoSnapshot();
+                                     if (info.scalars.empty() || std::string(info.scalars.front().name) != "build")
+                                     {
+                                         failures.fetch_add(1, std::memory_order_relaxed);
+                                     }
+                                 } });
+    }
+
+    for (int t = 0; t < 2; ++t)
+    {
+        threads.emplace_back([&]()
+                             {
+                                 while (!start.load(std::memory_order_acquire))
+                                 {
+                                 }
+                                 for (int i = 0; i < 1000; ++i)
+                                 {
+                                     stage.invalidateDumpInfoCache();
+                                 } });
+    }
+
+    start.store(true, std::memory_order_release);
+    for (auto &thread : threads)
+    {
+        thread.join();
+    }
+
+    EXPECT_EQ(failures.load(std::memory_order_relaxed), 0);
+    EXPECT_GT(stage.buildCount(), 0);
+}
+
+TEST_F(StageDumpInfoTest, EnsureOutputsOnHostRejectsGpuOutputWithoutExplicitStream)
+{
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+    DeviceId device = DeviceId::invalid();
+#ifdef HAVE_CUDA
+    if (getCUDABackend() != nullptr)
+    {
+        device = DeviceId::cuda(0);
+    }
+#endif
+#ifdef HAVE_ROCM
+    if (!device.is_valid() && getROCmBackend() != nullptr)
+    {
+        device = DeviceId::rocm(0);
+    }
+#endif
+    if (!device.is_valid())
+    {
+        GTEST_SKIP() << "No GPU backend available";
+    }
+
+    auto output = TestTensorFactory::createFP32({2, 2});
+    ASSERT_TRUE(output->ensureOnDevice(device));
+    output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE, device);
+
+    StageDumpInfo info;
+    info.addOutput("gpu_output", output.get(), 2, 2);
+
+    EXPECT_THROW(info.ensureOutputsOnHost(), std::runtime_error);
+#else
+    GTEST_SKIP() << "No GPU backend linked";
+#endif
+}
 
 // =============================================================================
 // GEMMStage Tests

@@ -22,8 +22,10 @@
 #include "../../../collective/ILocalPPContext.h" // createLocalPPContext(), HierarchicalPPConfig
 #include "../../../collective/PPStage.h"         // PPStage variant type
 #include "../../../collective/BackendRouter.h"   // GlobalBackendRouter for PP copy
+#include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../../backends/GPUDeviceContextPool.h"
 #include "../graph/GraphCaptureGuard.h"
+#include "../graph/DeviceGraphCaptureController.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/MPIContext.h"
@@ -40,6 +42,7 @@
 #include "../../mtp/MTPSpecStatePublisher.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
+#include "../../moe/GpuExpertTransferStagingPool.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightPlan.h"
 #include "../../../backends/BackendManager.h"
@@ -1359,6 +1362,77 @@ namespace llaminar2
         }
     };
 
+    ForwardGraphExecutionRendezvous::ForwardGraphExecutionRendezvous(
+        size_t expected_participants,
+        std::string label)
+        : expected_participants_(std::max<size_t>(1, expected_participants)),
+          label_(std::move(label))
+    {
+    }
+
+    bool ForwardGraphExecutionRendezvous::arriveAndWait(
+        DeviceId device,
+        int timeout_ms)
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (failed_)
+            return false;
+        if (released_)
+            return true;
+
+        ++arrivals_;
+        if (arrivals_ > expected_participants_)
+        {
+            failed_ = true;
+            cv_.notify_all();
+            LOG_ERROR("[ForwardGraphExecutionRendezvous] too many arrivals"
+                      << " label=" << label_
+                      << " expected=" << expected_participants_
+                      << " device=" << device.toString());
+            return false;
+        }
+
+        if (arrivals_ == expected_participants_)
+        {
+            released_ = true;
+            cv_.notify_all();
+            return true;
+        }
+
+        const auto predicate = [this]()
+        {
+            return released_ || failed_;
+        };
+
+        bool ok = true;
+        if (timeout_ms > 0)
+        {
+            ok = cv_.wait_for(
+                lock,
+                std::chrono::milliseconds(timeout_ms),
+                predicate);
+        }
+        else
+        {
+            cv_.wait(lock, predicate);
+        }
+
+        if (!ok)
+        {
+            failed_ = true;
+            cv_.notify_all();
+            LOG_ERROR("[ForwardGraphExecutionRendezvous] timeout"
+                      << " label=" << label_
+                      << " expected=" << expected_participants_
+                      << " arrivals=" << arrivals_
+                      << " timeout_ms=" << timeout_ms
+                      << " device=" << device.toString());
+            return false;
+        }
+
+        return released_ && !failed_;
+    }
+
     // =========================================================================
     // Shared Executor Configuration
     // =========================================================================
@@ -1528,6 +1602,36 @@ namespace llaminar2
     DeviceGraphOrchestrator::DeviceGraphOrchestrator(DeviceGraphOrchestrator &&) noexcept = default;
     DeviceGraphOrchestrator &DeviceGraphOrchestrator::operator=(DeviceGraphOrchestrator &&) noexcept = default;
 
+    void DeviceGraphOrchestrator::setForwardGraphExecutionRendezvous(
+        std::shared_ptr<ForwardGraphExecutionRendezvous> rendezvous)
+    {
+        forward_execution_rendezvous_ = std::move(rendezvous);
+    }
+
+    bool DeviceGraphOrchestrator::waitBeforeForwardGraphExecution(
+        const ForwardInput &input,
+        DeviceId execution_device,
+        bool cache_miss)
+    {
+        (void)input;
+        (void)cache_miss;
+        auto rendezvous = forward_execution_rendezvous_;
+        if (!rendezvous)
+            return true;
+
+        const int timeout_ms =
+            collective_timeout_policy::effectiveCollectTimeoutMs(
+                debugEnv().tp_collect_timeout_ms,
+                /*cold_start_completed=*/false);
+        const bool ok = rendezvous->arriveAndWait(execution_device, timeout_ms);
+        if (!ok)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Forward graph pre-execution rendezvous failed on "
+                      << execution_device.toString());
+        }
+        return ok;
+    }
+
     // =========================================================================
     // Device Context Management
     // =========================================================================
@@ -1569,7 +1673,7 @@ namespace llaminar2
 
     uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const
     {
-        uint64_t epoch = current_expert_replica_epoch_;
+        uint64_t epoch = std::max(current_expert_replica_epoch_, current_expert_mask_epoch_);
         if (!moe_rebalance_controller_)
             return epoch;
         return std::max(epoch, moe_rebalance_controller_->placementEpoch());
@@ -3047,10 +3151,10 @@ namespace llaminar2
         // When profiling is enabled (LLAMINAR_PROFILING=1), disable GPU graph
         // capture/replay so decode runs through executeFastDecode(). This ensures
         // StageTimeline GPU events are recorded for every stage on every iteration,
-        // giving accurate per-stage-type GPU timing. Without this, segmented replay
+        // giving accurate per-stage-type GPU timing. Without this, GPU graph replay
         // runs hipGraphLaunch() which bypasses per-stage event recording, causing
         // the accumulated timeline to report ~0 GPU time for Phase 3 iterations.
-        policy.allow_segmented_capture =
+        policy.allow_cached_graph_replay =
             env.execution.gpu_graphs &&
             !env.execution.executor_profiling &&
             ctx && ctx->isGPU() &&
@@ -3084,7 +3188,7 @@ namespace llaminar2
         // DeviceGraphOrchestrator may not have an injected_collective_ctx_
         // because the RankOrchestrator owns the LocalTPContext.
         // The collective stages (TPAllreduceStage) execute as manual segments
-        // between graph-captured compute segments, so segmented replay is safe
+        // between graph-captured compute segments, so cached graph replay is safe
         // as long as the backend supports stream-ordered collectives.
         const bool single_rank_collectives =
             (injected_collective_ctx_ && injected_collective_ctx_->worldSize() == 1) ||
@@ -6951,7 +7055,7 @@ namespace llaminar2
                  {"kv_cache_only", boolTag(kv_cache_only)},
                  {"seq_len", std::to_string(token_count)}});
 
-            bool used_segmented_capture = false;
+            bool used_graph_replay = false;
             const bool can_defer_sidecar_sync =
                 defer_final_sync &&
                 try_gpu_graph_capture &&
@@ -7011,7 +7115,7 @@ namespace llaminar2
                     device_key,
                     {{"context", sidecar_cache.segment_cache.perf_context},
                      {"seq_len", std::to_string(token_count)},
-                     {"allow_segmented", boolTag(capture_policy.allow_segmented_capture)},
+                     {"allow_graph_replay", boolTag(capture_policy.allow_cached_graph_replay)},
                      {"force_recapture", boolTag(capture_policy.force_recapture)},
                      {"defer_final_sync", boolTag(capture_policy.defer_final_sync)},
                      {"has_collectives", boolTag(has_sidecar_collectives)},
@@ -7025,9 +7129,9 @@ namespace llaminar2
                     sidecar_gpu_ctx,
                     has_sidecar_collectives ? &sidecar_cache.collective_nodes : nullptr,
                     capture_policy,
-                    &used_segmented_capture);
+                    &used_graph_replay);
                 deferred_kv_completion =
-                    ok && used_segmented_capture &&
+                    ok && used_graph_replay &&
                     kv_cache_only && capture_policy.defer_final_sync;
                 if (!kv_cache_only)
                 {
@@ -7080,7 +7184,9 @@ namespace llaminar2
                  {"device_tokens", boolTag(use_device_condition_tokens)},
                  {"kv_cache_only", boolTag(kv_cache_only)},
                  {"seq_len", std::to_string(token_count)},
-                 {"path", used_segmented_capture ? "segmented" : (rebuilt_graph ? "plain_after_build" : "plain")}});
+                 {"path", used_graph_replay
+                              ? DeviceGraphCaptureController::replayModeName(sidecar_cache.segment_cache)
+                              : (rebuilt_graph ? "plain_after_build" : "plain")}});
         }
         const bool plain_sidecar_execution = !used_capture_policy || rebuilt_graph;
         if (ok &&
@@ -7093,7 +7199,7 @@ namespace llaminar2
         {
             /*
              * The first use of a sidecar graph executes as an ordinary graph
-             * before segmented replay exists.  It is still stream ordered: every
+             * before cached graph replay exists.  It is still stream ordered: every
              * stage was bound to sidecar_dynamic_stream above.  Publish that
              * stream instead of synchronizing here, so the immediate sampler or
              * distribution-builder becomes the synchronization point.
@@ -8629,7 +8735,7 @@ namespace llaminar2
         {
             /*
              * Queue a device-side dependency instead of synchronizing the
-             * producer stream on the CPU.  This mirrors the segmented graph
+             * producer stream on the CPU.  This mirrors the cached graph-replay
              * collective handoff: the verifier graph can launch immediately,
              * but GPU execution waits until all sidecar work already enqueued
              * on the producer stream is complete.
@@ -13718,7 +13824,7 @@ namespace llaminar2
 
         /*
          * This accessor is a host publication boundary for tests, diagnostics,
-         * and non-device samplers.  If segmented replay deferred verifier sync,
+         * and non-device samplers.  If cached graph replay deferred verifier sync,
          * consume that producer stream here and let TransferEngine publish the
          * exact all-position tensor the graph wrote.  Falling through to
          * fp32_data() without an explicit stream can use backend default-stream
@@ -15511,6 +15617,23 @@ namespace llaminar2
                     {
                         material.moe.push_back({prefix + ".owner_participant",
                                                 std::to_string(replicas.owner_socket[expert])});
+                    }
+                }
+                for (size_t layer = 0; layer < replicas.replica_participants_by_layer.size(); ++layer)
+                {
+                    const auto &layer_replicas = replicas.replica_participants_by_layer[layer];
+                    for (size_t expert = 0; expert < layer_replicas.size(); ++expert)
+                    {
+                        const auto &participants = layer_replicas[expert];
+                        for (size_t participant = 0; participant < participants.size(); ++participant)
+                        {
+                            if (!participants[participant])
+                                continue;
+                            material.moe.push_back({"controller.replica.layer." + std::to_string(layer) +
+                                                        ".expert." + std::to_string(expert) +
+                                                        ".participant." + std::to_string(participant),
+                                                    "1"});
+                        }
                     }
                 }
             }
@@ -21148,6 +21271,12 @@ namespace llaminar2
     {
         if (const auto *global_ctx = globalTPContextForMTPCoordination())
             return global_ctx->myIndex();
+        if (graph_builder_ && graph_builder_->config().tp_ctx &&
+            graph_builder_->config().tp_ctx->isLocal() &&
+            graph_builder_->config().tp_device_idx >= 0)
+        {
+            return graph_builder_->config().tp_device_idx;
+        }
         if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
             return mpi_ctx_->rank();
         return 0;
@@ -21600,8 +21729,24 @@ namespace llaminar2
         for (auto &[stage, layer] : moe_stages)
             stage->applyExpertMask(masks[layer]);
 
+        const bool mask_placement_changed = current_expert_masks_ != masks;
+        if (mask_placement_changed)
+        {
+            current_expert_masks_ = masks;
+            ++current_expert_mask_epoch_;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_mask_placement_epoch",
+                static_cast<double>(current_expert_mask_epoch_),
+                "rebalance",
+                primaryDeviceId().is_valid() ? primaryDeviceId().toString() : std::string{},
+                {{"domain_id", domain_id.empty() ? "default" : domain_id}});
+        }
+
         LOG_DEBUG("[DGO] Applied expert masks to " << applied.load()
-                                                   << " MoEExpertComputeStages across " << masks.size() << " layers");
+                                                   << " MoEExpertComputeStages across " << masks.size()
+                                                   << " layers mask_epoch=" << current_expert_mask_epoch_
+                                                   << " changed=" << (mask_placement_changed ? "true" : "false"));
 
         auto t_end = std::chrono::high_resolution_clock::now();
         double prep_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
@@ -21647,6 +21792,425 @@ namespace llaminar2
         }
 
         return result;
+    }
+
+    DeviceGraphOrchestrator::PreparedDirectExpertTransfer
+    DeviceGraphOrchestrator::prepareExpertWeightsDirectForMasksFrom(
+        DeviceGraphOrchestrator &source,
+        const std::vector<std::vector<bool>> &masks)
+    {
+        PreparedDirectExpertTransfer prepared;
+        prepared.remaining_masks = masks;
+        if (&source == this)
+            return prepared;
+
+        auto collect_moe_stages = [](DeviceGraphOrchestrator &orchestrator)
+        {
+            std::unordered_map<int, std::vector<MoEExpertComputeStage *>> by_layer;
+
+            if (orchestrator.forward_engine_)
+            {
+                orchestrator.forward_engine_->forEachCachedStage(
+                    ComputeStageType::MOE_EXPERT_FFN,
+                    [&](IComputeStage *stage)
+                    {
+                        auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(stage);
+                        if (moe_stage && moe_stage->layerIndex() >= 0)
+                            by_layer[moe_stage->layerIndex()].push_back(moe_stage);
+                    });
+            }
+
+            if (by_layer.empty())
+            {
+                for (size_t layer = 0; layer < orchestrator.layer_graph_cache_.size(); ++layer)
+                {
+                    auto &cache = orchestrator.layer_graph_cache_[layer];
+                    if (!cache.valid || !cache.ffn_decode)
+                        continue;
+                    for (const auto &node_name : cache.ffn_decode->getExecutionOrder())
+                    {
+                        auto *node = cache.ffn_decode->getNode(node_name);
+                        if (!node || !node->stage ||
+                            node->stage->type() != ComputeStageType::MOE_EXPERT_FFN)
+                        {
+                            continue;
+                        }
+                        auto *moe_stage = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
+                        if (moe_stage && moe_stage->layerIndex() >= 0)
+                            by_layer[moe_stage->layerIndex()].push_back(moe_stage);
+                    }
+                }
+            }
+
+            return by_layer;
+        };
+
+        auto src_by_layer = collect_moe_stages(source);
+        auto dst_by_layer = collect_moe_stages(*this);
+        if (src_by_layer.empty() || dst_by_layer.empty())
+            return prepared;
+
+        const size_t wave_experts = static_cast<size_t>(
+            std::max(1, debugEnv().moe_rebalance.gpu_direct_transfer_wave_experts));
+        const size_t staging_buffers = static_cast<size_t>(
+            std::max(1, debugEnv().moe_rebalance.gpu_direct_transfer_buffers));
+        const size_t staging_pool_capacity = wave_experts * staging_buffers;
+        std::deque<GpuDirectTransferCompletion> in_flight_activation_waves;
+        void *activation_stream = nullptr;
+
+        auto abort_prepared = [&]() -> PreparedDirectExpertTransfer
+        {
+            prepared.remaining_masks = masks;
+            prepared.staged_arrivals.clear();
+            pending_gpu_direct_transfer_slot_arrivals_.clear();
+            return prepared;
+        };
+
+        auto retire_one_activation_wave = [&]() -> bool
+        {
+            if (in_flight_activation_waves.empty())
+                return true;
+
+            GpuDirectTransferCompletion completion =
+                std::move(in_flight_activation_waves.front());
+            in_flight_activation_waves.pop_front();
+            if (!completion.valid())
+                return true;
+
+            IBackend *backend = getBackendFor(completion.device_id);
+            if (!backend)
+            {
+                LOG_ERROR("[DGO] Cannot retire GPU-direct staging wave without backend for "
+                          << completion.device_id.to_string());
+                return false;
+            }
+
+            const auto wait_start = std::chrono::steady_clock::now();
+            if (!backend->waitForEvent(completion.ready_event.get(), completion.device_ordinal))
+            {
+                LOG_ERROR("[DGO] GPU-direct staging wave retirement failed on "
+                          << completion.device_id.to_string());
+                return false;
+            }
+            PerfStatsCollector::recordTimingNs(
+                "moe_rebalance",
+                "gpu_direct_transfer_staging_wave_retire",
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - wait_start)
+                                          .count()),
+                "rebalance",
+                completion.device_id.to_string(),
+                {});
+            return true;
+        };
+
+        auto retire_until_wave_capacity = [&]() -> bool
+        {
+            while (in_flight_activation_waves.size() >= staging_buffers &&
+                   !in_flight_activation_waves.empty())
+            {
+                if (!retire_one_activation_wave())
+                    return false;
+            }
+            return in_flight_activation_waves.size() < staging_buffers;
+        };
+
+        auto retire_all_activation_waves = [&]() -> bool
+        {
+            while (!in_flight_activation_waves.empty())
+            {
+                if (!retire_one_activation_wave())
+                    return false;
+            }
+            return true;
+        };
+
+        int staged_layers = 0;
+        int staged_experts = 0;
+        int staged_stage_arrivals = 0;
+        for (size_t layer_idx = 0; layer_idx < prepared.remaining_masks.size(); ++layer_idx)
+        {
+            auto src_it = src_by_layer.find(static_cast<int>(layer_idx));
+            auto dst_it = dst_by_layer.find(static_cast<int>(layer_idx));
+            if (src_it == src_by_layer.end() || dst_it == dst_by_layer.end())
+                continue;
+
+            std::vector<int> expert_ids;
+            const auto &layer_mask = prepared.remaining_masks[layer_idx];
+            for (size_t expert_idx = 0; expert_idx < layer_mask.size(); ++expert_idx)
+            {
+                if (layer_mask[expert_idx])
+                    expert_ids.push_back(static_cast<int>(expert_idx));
+            }
+            if (expert_ids.empty())
+                continue;
+
+            std::vector<int> satisfied_counts(prepared.remaining_masks[layer_idx].size(), 0);
+            auto dst_stage_it = std::find_if(
+                dst_it->second.begin(),
+                dst_it->second.end(),
+                [](MoEExpertComputeStage *stage)
+                {
+                    return stage != nullptr;
+                });
+            if (dst_stage_it == dst_it->second.end())
+                continue;
+            auto *dst_stage = *dst_stage_it;
+
+            std::vector<int> stage_pending = dst_stage->missingPreparedExpertIds(expert_ids);
+            const size_t active_arrival_capacity = stage_pending.size();
+            for (int expert_id : expert_ids)
+            {
+                if (std::find(stage_pending.begin(), stage_pending.end(), expert_id) != stage_pending.end())
+                    continue;
+                if (expert_id >= 0 &&
+                    expert_id < static_cast<int>(satisfied_counts.size()))
+                {
+                    ++satisfied_counts[static_cast<size_t>(expert_id)];
+                }
+            }
+            if (stage_pending.empty())
+                continue;
+
+            for (auto *src_stage : src_it->second)
+            {
+                if (!src_stage || stage_pending.empty())
+                    continue;
+
+                void *source_producer_stream = src_stage->gpuStream();
+                if (!source_producer_stream && source.primaryDeviceId().is_gpu())
+                {
+                    source_producer_stream =
+                        source.explicitGPUStreamForOperation("moe_gpu_direct_transfer_source");
+                }
+                if (!source_producer_stream)
+                    continue;
+
+                std::vector<int> source_satisfied;
+                while (!stage_pending.empty())
+                {
+                    const size_t wave_count = std::min(stage_pending.size(), wave_experts);
+                    std::vector<int> wave_expert_ids;
+                    wave_expert_ids.reserve(wave_count);
+                    for (size_t wave_idx = 0; wave_idx < wave_count; ++wave_idx)
+                        wave_expert_ids.push_back(stage_pending[wave_idx]);
+                    if (wave_expert_ids.empty())
+                        continue;
+
+                    if (!retire_until_wave_capacity())
+                    {
+                        LOG_ERROR("[DGO] GPU-direct rolling transfer wave could not retire enough in-flight waves"
+                                  << " on " << primaryDeviceId().to_string()
+                                  << " in_flight=" << in_flight_activation_waves.size()
+                                  << " buffers=" << staging_buffers
+                                  << " staging_pool_capacity=" << staging_pool_capacity);
+                        (void)retire_all_activation_waves();
+                        return abort_prepared();
+                    }
+
+                    GpuDirectTransferSlotArrivals stage_arrivals;
+                    auto satisfied_experts =
+                        dst_stage->stageExpertsGPUDirectToTransferSlotsFrom(
+                            *src_stage,
+                            wave_expert_ids,
+                            source_producer_stream,
+                            &stage_arrivals,
+                            active_arrival_capacity,
+                            staging_pool_capacity,
+                            &gpu_direct_transfer_staging_pools_);
+                    if (satisfied_experts.empty())
+                    {
+                        if (!in_flight_activation_waves.empty())
+                        {
+                            if (!retire_one_activation_wave())
+                                return abort_prepared();
+                            continue;
+                        }
+                        break;
+                    }
+
+                    if (!stage_arrivals.empty())
+                    {
+                        if (!activation_stream)
+                            activation_stream = explicitGPUStreamForOperation("moe_gpu_direct_transfer_activation");
+                        if (!activation_stream)
+                        {
+                            LOG_ERROR("[DGO] GPU-direct rolling activation requires an explicit stream on "
+                                      << primaryDeviceId().to_string());
+                            (void)retire_all_activation_waves();
+                            return abort_prepared();
+                        }
+
+                        const auto expected_experts = stage_arrivals.expertIds();
+                        GpuDirectTransferCompletion activation_completion;
+                        auto activated =
+                            dst_stage->activateGpuDirectTransferSlotArrivals(
+                                stage_arrivals,
+                                activation_stream,
+                                &activation_completion,
+                                /*retain_pending_completion=*/false);
+                        std::sort(activated.begin(), activated.end());
+                        activated.erase(std::unique(activated.begin(), activated.end()), activated.end());
+                        if (activated != expected_experts || !activation_completion.valid())
+                        {
+                            LOG_ERROR("[DGO] GPU-direct rolling activation mismatch on "
+                                      << primaryDeviceId().to_string()
+                                      << " expected=" << expected_experts.size()
+                                      << " activated=" << activated.size()
+                                      << " completion_valid=" << (activation_completion.valid() ? "true" : "false"));
+                            (void)retire_all_activation_waves();
+                            return abort_prepared();
+                        }
+                        in_flight_activation_waves.push_back(std::move(activation_completion));
+                        ++staged_stage_arrivals;
+                    }
+
+                    source_satisfied.insert(
+                        source_satisfied.end(),
+                        satisfied_experts.begin(),
+                        satisfied_experts.end());
+
+                    std::sort(satisfied_experts.begin(), satisfied_experts.end());
+                    satisfied_experts.erase(
+                        std::unique(satisfied_experts.begin(), satisfied_experts.end()),
+                        satisfied_experts.end());
+                    stage_pending.erase(
+                        std::remove_if(stage_pending.begin(),
+                                       stage_pending.end(),
+                                       [&](int expert_id)
+                                       {
+                                           return std::find(satisfied_experts.begin(),
+                                                            satisfied_experts.end(),
+                                                            expert_id) != satisfied_experts.end();
+                                       }),
+                        stage_pending.end());
+
+                    while (in_flight_activation_waves.size() > staging_buffers)
+                    {
+                        if (!retire_one_activation_wave())
+                            return abort_prepared();
+                    }
+                }
+
+                if (source_satisfied.empty())
+                    continue;
+                std::sort(source_satisfied.begin(), source_satisfied.end());
+                source_satisfied.erase(
+                    std::unique(source_satisfied.begin(), source_satisfied.end()),
+                    source_satisfied.end());
+                for (int expert_id : source_satisfied)
+                {
+                    if (expert_id >= 0 &&
+                        expert_id < static_cast<int>(satisfied_counts.size()))
+                    {
+                        ++satisfied_counts[static_cast<size_t>(expert_id)];
+                    }
+                }
+            }
+
+            bool any_layer_staged = false;
+            for (int expert_id : expert_ids)
+            {
+                if (expert_id >= 0 &&
+                    expert_id < static_cast<int>(prepared.remaining_masks[layer_idx].size()) &&
+                    prepared.remaining_masks[layer_idx][static_cast<size_t>(expert_id)] &&
+                    expert_id < static_cast<int>(satisfied_counts.size()) &&
+                    satisfied_counts[static_cast<size_t>(expert_id)] > 0)
+                {
+                    prepared.remaining_masks[layer_idx][static_cast<size_t>(expert_id)] = false;
+                    ++staged_experts;
+                    any_layer_staged = true;
+                }
+            }
+            if (any_layer_staged)
+                ++staged_layers;
+        }
+
+        if (staged_experts > 0)
+        {
+            LOG_DEBUG("[DGO] GPU-direct/local staged " << staged_experts
+                                                       << " expert arrival mask entries across "
+                                                       << staged_layers << " layer(s) from sibling orchestrator"
+                                                       << " in " << staged_stage_arrivals
+                                                       << " rolling activation wave(s)");
+        }
+
+        if (!retire_all_activation_waves())
+            return abort_prepared();
+
+        return prepared;
+    }
+
+    bool DeviceGraphOrchestrator::activatePreparedGpuDirectExpertTransfers(
+        const std::vector<PendingGpuDirectTransferSlotArrival> &staged_arrivals)
+    {
+        if (staged_arrivals.empty())
+            return true;
+
+        void *activation_stream = explicitGPUStreamForOperation("moe_gpu_direct_transfer_activation");
+        if (!activation_stream)
+        {
+            LOG_ERROR("[DGO] GPU-direct staged expert activation requires an explicit stream on "
+                      << primaryDeviceId().to_string());
+            return false;
+        }
+
+        int activated_batches = 0;
+        int activated_experts = 0;
+        for (const auto &pending : staged_arrivals)
+        {
+            if (pending.empty())
+                continue;
+
+            auto expected_experts = pending.arrivals.expertIds();
+            auto activated =
+                pending.destination_stage->activateGpuDirectTransferSlotArrivals(
+                    pending.arrivals,
+                    activation_stream);
+            std::sort(activated.begin(), activated.end());
+            activated.erase(std::unique(activated.begin(), activated.end()), activated.end());
+            if (activated != expected_experts)
+            {
+                LOG_ERROR("[DGO] GPU-direct staged expert activation mismatch on "
+                          << primaryDeviceId().to_string()
+                          << " expected=" << expected_experts.size()
+                          << " activated=" << activated.size());
+                return false;
+            }
+            ++activated_batches;
+            activated_experts += static_cast<int>(activated.size());
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "gpu_direct_transfer_slot_publish_batches",
+            static_cast<double>(activated_batches),
+            "rebalance",
+            primaryDeviceId().to_string(),
+            {});
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "gpu_direct_transfer_slot_publish_experts",
+            static_cast<double>(activated_experts),
+            "rebalance",
+            primaryDeviceId().to_string(),
+            {});
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::clearPendingGpuDirectExpertTransfers()
+    {
+        pending_gpu_direct_transfer_slot_arrivals_.clear();
+    }
+
+    bool DeviceGraphOrchestrator::activatePendingGpuDirectExpertTransfers()
+    {
+        std::vector<PendingGpuDirectTransferSlotArrival> pending;
+        pending.swap(pending_gpu_direct_transfer_slot_arrivals_);
+        const bool ok = activatePreparedGpuDirectExpertTransfers(pending);
+        if (!ok)
+            pending_gpu_direct_transfer_slot_arrivals_.clear();
+        return ok;
     }
 
     std::vector<std::vector<bool>> DeviceGraphOrchestrator::transferExpertWeightsDirectForMasksFrom(
@@ -21806,12 +22370,14 @@ namespace llaminar2
     void DeviceGraphOrchestrator::setExpertReplicaSetForParticipant(
         const ExpertReplicaSet &replicas, int participant_id)
     {
-        validateMoERebalanceDomain(*this, replicas.domain_id, "setExpertReplicaSetForParticipant");
+        ExpertReplicaSet normalized_replicas = replicas;
+        normalized_replicas.rebuildAggregateReplicaFlags();
+        validateMoERebalanceDomain(*this, normalized_replicas.domain_id, "setExpertReplicaSetForParticipant");
 
         const bool replica_placement_changed =
             current_expert_replica_participant_id_ != participant_id ||
-            !replicas.sameReplicaPlacement(current_expert_replica_set_);
-        current_expert_replica_set_ = replicas;
+            !normalized_replicas.sameReplicaPlacement(current_expert_replica_set_);
+        current_expert_replica_set_ = normalized_replicas;
         current_expert_replica_participant_id_ = participant_id;
         if (replica_placement_changed)
             ++current_expert_replica_epoch_;
@@ -21826,7 +22392,7 @@ namespace llaminar2
                     auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                     if (moe)
                     {
-                        moe->setReplicaSet(replicas, participant_id);
+                        moe->setReplicaSet(normalized_replicas, participant_id);
                         count++;
                     }
                 });
@@ -21840,14 +22406,14 @@ namespace llaminar2
             static_cast<double>(count),
             "rebalance",
             device,
-            {{"domain_id", replicas.domain_id},
+            {{"domain_id", normalized_replicas.domain_id},
              {"participant", std::to_string(participant_id)},
-             {"replicas", std::to_string(replicas.num_replicated)},
+             {"replicas", std::to_string(normalized_replicas.num_replicated)},
              {"replica_epoch", std::to_string(current_expert_replica_epoch_)},
              {"placement_changed", replica_placement_changed ? "true" : "false"},
              {"forward_engine", forward_engine_ ? "true" : "false"}});
 
-        LOG_DEBUG("[DGO] Set expert replica info (" << replicas.num_replicated
+        LOG_DEBUG("[DGO] Set expert replica info (" << normalized_replicas.num_replicated
                                                     << " replicas) on " << count
                                                     << " MoE stages (participant " << participant_id << ")");
     }
@@ -21973,6 +22539,14 @@ namespace llaminar2
             return false;
         }
 
+        if (!ensureDeviceWorkspaceAllocated(result.graph(), seq_len))
+        {
+            LOG_ERROR("[DGO] Eager forward graph workspace materialization failed for "
+                      << (graph_builder_ ? graph_builder_->architectureName() : std::string("unknown"))
+                      << " shape=[batch=" << batch_size << ", seq=" << seq_len << "]");
+            return false;
+        }
+
         const size_t stage_count = result.graph().size();
         LOG_DEBUG("[DGO] Eagerly materialized forward graph for "
                   << (graph_builder_ ? graph_builder_->architectureName() : std::string("unknown"))
@@ -22053,8 +22627,10 @@ namespace llaminar2
         int world_size = mpi_ctx_->world_size();
         MPI_Comm comm = mpi_ctx_->communicator();
 
-        // Build manifest: for each replicated expert, the owner sends to all
-        // non-owner ranks. With 2 sockets this is a simple bidirectional exchange.
+        // Legacy cross-rank path: aggregate replica sets send each replicated
+        // expert from its owner to all non-owner ranks across every layer.
+        // LocalTP same-backend GPU domains use RankOrchestrator's layer-aware
+        // transfer masks instead of this manifest.
         std::vector<ExpertMigration> manifest;
         for (int e = 0; e < static_cast<int>(replicas.is_replicated.size()); ++e)
         {

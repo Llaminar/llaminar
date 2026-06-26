@@ -242,6 +242,14 @@ namespace llaminar2
             CollectiveDataType dtype,
             CollectiveOp op) override;
 
+        bool allreduceMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<void *> &streams) override;
+        bool supportsAllreduceMultiOnStreams() const override;
+
         bool allreduceSingleDeviceAsync(
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
@@ -252,7 +260,30 @@ namespace llaminar2
             CollectiveDataType dtype, CollectiveOp op,
             int device_idx, void *stream) override;
 
+        bool allgatherSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_idx,
+            void *stream) override;
+        bool supportsAllgatherSingleDeviceOnStream() const override;
+
+        bool allgatherMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype,
+            const std::vector<void *> &streams) override;
+        bool supportsAllgatherMultiOnStreams() const override;
+
         bool allgatherMulti(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t send_count,
+            CollectiveDataType dtype) override;
+
+        bool allgatherMultiWithComputeDeps(
             const std::vector<const void *> &send_bufs,
             const std::vector<void *> &recv_bufs,
             size_t send_count,

@@ -100,6 +100,25 @@ namespace llaminar2
          */
         virtual void onFirstGraphReady() {}
 
+        /**
+         * @brief Optional rendezvous immediately before graph execution.
+         *
+         * LocalTP first forwards can materialize graph/workspace state at
+         * different speeds. Hosts may use this hook to let every participant
+         * finish production graph preparation before any one participant enters
+         * the first collective.
+         */
+        virtual bool waitBeforeForwardGraphExecution(
+            const ForwardInput &input,
+            DeviceId execution_device,
+            bool cache_miss)
+        {
+            (void)input;
+            (void)execution_device;
+            (void)cache_miss;
+            return true;
+        }
+
         // ----- Logits Synchronization -----
 
         /** Sync GPU stream and mark logits as host-readable. */
@@ -455,7 +474,7 @@ namespace llaminar2
             bool gpu_stream_bindings_applied = false;
             bool has_capture_stream = false;
             uint64_t segment_decode_step = 0;
-            uint64_t segmented_capture_live_state_epoch = 0;
+            uint64_t graph_replay_live_state_epoch = 0;
             bool requires_live_state_epoch_recapture = false;
             bool all_position_verifier_recapture_pending = false;
         };
@@ -667,6 +686,8 @@ namespace llaminar2
             uint64_t topology_signature = 0;                   ///< Topology signature associated with this graph observation.
             std::string capture_phase;                         ///< cold, warmup, capture, replay, or rejected.
             std::string recapture_reason;                      ///< none or a structured reason for recapture/rejection.
+            std::string reject_stage_name;                     ///< First stage that blocked graph capture, if any.
+            std::string reject_stage_type;                     ///< Type of the first stage that blocked graph capture, if any.
         };
 
         /**

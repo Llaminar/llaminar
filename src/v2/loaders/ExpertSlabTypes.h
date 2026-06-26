@@ -24,6 +24,7 @@ namespace llaminar2
         std::shared_ptr<void> ready_event;
         std::shared_ptr<void> source_ready_event;
         std::shared_ptr<void> transfer_stream;
+        std::vector<std::shared_ptr<void>> transient_lifetimes;
 
         bool valid() const
         {

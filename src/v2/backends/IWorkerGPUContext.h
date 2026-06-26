@@ -187,6 +187,29 @@ namespace llaminar2
          */
         virtual void destroyStream(void *stream) = 0;
 
+        /**
+         * @brief Get or create a named context-owned auxiliary stream.
+         *
+         * Auxiliary streams are explicit, non-default streams owned by the
+         * device context and reused across higher-level services such as
+         * GPU-direct expert transfers.  The returned stream remains valid until
+         * the device context is shut down or resetAuxiliaryStreams() is called.
+         *
+         * @param name Stable stream purpose/name.
+         * @param created Optional output set true when this call created the stream.
+         * @return Platform-specific stream handle, or nullptr on failure.
+         * @thread_safety Thread-safe, can be called from any thread.
+         */
+        virtual void *getOrCreateAuxiliaryStream(const std::string &name, bool *created = nullptr) = 0;
+
+        /**
+         * @brief Destroy all named auxiliary streams owned by this context.
+         *
+         * Primarily used during context cleanup and tests.
+         * @thread_safety Thread-safe, can be called from any thread.
+         */
+        virtual void resetAuxiliaryStreams() = 0;
+
         // =========================================================================
         // Event Access (worker-thread-only)
         // =========================================================================

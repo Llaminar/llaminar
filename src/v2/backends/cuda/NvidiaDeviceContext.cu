@@ -290,6 +290,8 @@ namespace llaminar2
             cublas_handle_ = nullptr;
         }
 
+        resetAuxiliaryStreams();
+
         // Destroy default stream (ignore cudaErrorCudartUnloading during shutdown)
         if (default_stream_ != nullptr)
         {
@@ -398,6 +400,62 @@ namespace llaminar2
         }
 
         CUDA_CHECK_VOID(cudaStreamDestroy(cuda_stream));
+    }
+
+    void *NvidiaDeviceContext::getOrCreateAuxiliaryStream(const std::string &name, bool *created)
+    {
+        if (created)
+            *created = false;
+        if (name.empty())
+        {
+            LOG_ERROR("[NvidiaDeviceContext] Auxiliary stream name must not be empty");
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        auto it = auxiliary_streams_.find(name);
+        if (it != auxiliary_streams_.end() && it->second)
+            return static_cast<void *>(it->second);
+
+        auto *stream = static_cast<cudaStream_t>(createStream());
+        if (!stream)
+            return nullptr;
+        auxiliary_streams_[name] = stream;
+        if (created)
+            *created = true;
+        return static_cast<void *>(stream);
+    }
+
+    void NvidiaDeviceContext::resetAuxiliaryStreams()
+    {
+        std::lock_guard<std::mutex> lock(auxiliary_streams_mutex_);
+        cudaError_t set_err = cudaSetDevice(device_ordinal_);
+        if (set_err != cudaSuccess)
+        {
+            if (set_err == cudaErrorCudartUnloading)
+            {
+                auxiliary_streams_.clear();
+                return;
+            }
+            LOG_ERROR("[NvidiaDeviceContext] cudaSetDevice(" << device_ordinal_
+                                                             << ") failed in resetAuxiliaryStreams: "
+                                                             << cudaGetErrorString(set_err));
+            return;
+        }
+        for (auto &[name, stream] : auxiliary_streams_)
+        {
+            (void)name;
+            if (stream && stream != default_stream_)
+            {
+                cudaError_t err = cudaStreamDestroy(stream);
+                if (err != cudaSuccess && err != cudaErrorCudartUnloading)
+                {
+                    LOG_ERROR("[NvidiaDeviceContext] cudaStreamDestroy(auxiliary) failed: "
+                              << cudaGetErrorString(err));
+                }
+            }
+        }
+        auxiliary_streams_.clear();
     }
 
     // ============================================================================

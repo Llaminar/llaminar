@@ -20,6 +20,7 @@
 #include "../backends/GlobalDeviceAddress.h"
 #include "../config/OrchestrationConfig.h"
 #include "../tensors/ITensor.h"
+#include "ICollectiveBackend.h"
 #include "ITPContext.h"
 #include <memory>
 #include <string>
@@ -155,6 +156,52 @@ namespace llaminar2
          * @return true on success, false on error
          */
         bool allgather(const TensorBase *local_shard, TensorBase *global_tensor) override = 0;
+
+        /**
+         * @brief All-gather raw device buffers across LOCAL devices.
+         *
+         * This is for graph-visible state handoffs that operate on backend-owned
+         * device allocations rather than TensorBase instances. It requires a
+         * non-null producer stream so callers cannot accidentally order GPU
+         * state transfers through the legacy default stream. Unsupported
+         * contexts must fail loudly by returning false.
+         *
+         * @param local_send Device buffer contributed by this participant.
+         * @param full_recv Device buffer receiving all participants' slices.
+         * @param send_count Elements contributed by each participant.
+         * @param dtype Element type for the collective.
+         * @param device_index Participant index in devices().
+         * @param producer_stream Explicit stream that produced local_send.
+         * @param stage_name Stage identifier for diagnostics.
+         * @return true on success, false when unsupported or failed.
+         */
+        virtual bool allgatherRawOnStream(
+            const void *local_send,
+            void *full_recv,
+            size_t send_count,
+            CollectiveDataType dtype,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)local_send;
+            (void)full_recv;
+            (void)send_count;
+            (void)dtype;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief True when raw all-gather handoffs can be captured into a GPU graph.
+         *
+         * This requires a homogeneous GPU LocalTP backend that implements
+         * all-gather directly on the caller's explicit stream, without host
+         * synchronization or a coordinator-thread wait.
+         */
+        virtual bool supportsRawAllgatherOnStreamGraphCapture() const { return false; }
 
         /**
          * @brief Gather shards from multiple devices into a single output tensor

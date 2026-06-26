@@ -198,8 +198,15 @@ namespace llaminar2
         int real_seq_len,
         int bucket_seq_len,
         PrefillGraphPreflightMode mode,
-        bool collectives_graph_capturable) const
+        bool collectives_graph_capturable,
+        std::string *reject_stage_name,
+        std::string *reject_stage_type) const
     {
+        if (reject_stage_name)
+            reject_stage_name->clear();
+        if (reject_stage_type)
+            reject_stage_type->clear();
+
         if (!config_.enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
 
@@ -212,20 +219,19 @@ namespace llaminar2
         if (snapshots_active)
             return PrefillGraphRejectReason::SnapshotsActive;
 
-        if (moe_rebalancing_active)
+        const bool padded_bucket =
+            real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
+        const bool support_only_preflight = mode != PrefillGraphPreflightMode::CaptureReady;
+        const bool cold_padded_preflight =
+            padded_bucket && support_only_preflight;
+        if (padded_bucket && !config_.buckets_enabled)
+            return PrefillGraphRejectReason::FeatureDisabled;
+
+        if (moe_rebalancing_active && padded_bucket)
             return PrefillGraphRejectReason::ActiveMoERebalancing;
 
         if (collective_nodes && !collective_nodes->empty() && !collectives_graph_capturable)
             return PrefillGraphRejectReason::CollectiveNodesPresent;
-
-        const bool padded_bucket =
-            real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
-        const bool cold_padded_preflight =
-            padded_bucket &&
-            (mode == PrefillGraphPreflightMode::ColdPaddedSupport ||
-             (mode == PrefillGraphPreflightMode::Default && phase(key) == PrefillGraphPhase::Cold));
-        if (padded_bucket && !config_.buckets_enabled)
-            return PrefillGraphRejectReason::FeatureDisabled;
 
         if (padded_bucket && containsPaddedBucketUnsafeGDNStage(graph))
         {
@@ -247,11 +253,17 @@ namespace llaminar2
             if (!node || !node->stage)
                 continue;
             const bool stage_ok =
-                (mode != PrefillGraphPreflightMode::CaptureReady && cold_padded_preflight)
+                cold_padded_preflight
                     ? node->stage->supportsPaddedPrefillGraphCapturePreflight()
+                : support_only_preflight
+                    ? node->stage->supportsLazyPrefillGraphCapturePreflight()
                     : node->stage->isGraphCapturable();
             if (!stage_ok)
             {
+                if (reject_stage_name)
+                    *reject_stage_name = name;
+                if (reject_stage_type)
+                    *reject_stage_type = computeStageTypeName(node->stage->type());
                 if (config_.trace)
                 {
                     LOG_INFO("[PrefillGraphCache] Stage '" << name << "' "

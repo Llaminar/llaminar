@@ -99,11 +99,9 @@ namespace llaminar2
 
             // MoE dynamic rebalancing rejects padded bucketed prefill graphs during
             // preflight (PrefillGraphRejectReason::ActiveMoERebalancing): a captured
-            // padded-bucket graph would embed expert-placement pointers that a
-            // rebalance could invalidate. Auto-enabling padded buckets in that case
-            // makes warmup prefill fail hard, so leave bucketing disabled and run the
-            // exact prefill length (the fixed benchmark prompt is still graph-captured
-            // at its exact shape, so no replay benefit is lost).
+            // padded-bucket graph could outlive the exact placement state it was
+            // warmed with. Exact-shape prefill graphs are keyed by placement epoch
+            // and can still be captured, so leave bucketing disabled in this case.
             const bool moe_rebalancing_active = benchmarkHasDynamicMoERebalance(runner);
             const BenchmarkPrefillBucketDisableReason disable_reason =
                 benchmarkPrefillBucketDisableReason(uses_collectives, moe_rebalancing_active);

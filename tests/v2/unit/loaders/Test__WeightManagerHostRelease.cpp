@@ -19,6 +19,8 @@
 #include <gtest/gtest.h>
 #include <memory>
 
+#include "config/TensorParallelConfig.h"
+#include "execution/local_execution/graph/GraphSchema.h"
 #include "loaders/WeightManager.h"
 #include "tensors/Tensors.h"
 #include "mocks/MockModelLoader.h"
@@ -258,4 +260,43 @@ TEST_F(Test__WeightManagerHostRelease, ReleaseHostResident_ReturnsZeroWhenNoneHo
     size_t released = wm.releaseHostResidentWeightData();
 
     EXPECT_EQ(released, 0);
+}
+
+TEST_F(Test__WeightManagerHostRelease, ReleaseHostResident_SkipsBorrowedTensorSliceViews)
+{
+    constexpr const char *kWeightName = "blk.0.ffn_gate.weight";
+    mock_loader_->addFP32RandomTensor(kWeightName, {64, 16});
+
+    TestableWeightManager wm(*mock_loader_);
+
+    WeightShardingConfig sharding;
+    sharding.exact_matches[kWeightName] = WeightShardingMode::ColumnParallel;
+    sharding.exact_dimension_matches[kWeightName] = WeightDimensionType::FFNHidden;
+    wm.setWeightShardingConfig(sharding);
+
+    const std::vector<DeviceId> devices = {DeviceId::cuda(0), DeviceId::cuda(1)};
+    auto tp_config = std::make_shared<TensorParallelConfig>(
+        TensorParallelConfig::equalSplit(
+            2,
+            4,
+            2,
+            64,
+            128,
+            devices));
+    wm.setTensorParallelConfig(tp_config);
+
+    const auto &assignment = tp_config->forDevice(DeviceId::cuda(1));
+    auto slice = wm.getShardedWeightForAssignment(kWeightName, DeviceId::cuda(1), assignment, 0);
+    ASSERT_NE(slice, nullptr);
+    ASSERT_TRUE(slice->is_view());
+
+    slice->setHostResident();
+    ASSERT_TRUE(slice->isHostResident());
+    ASSERT_FALSE(slice->is_raw_data_released());
+
+    size_t released = wm.releaseHostResidentWeightData();
+
+    EXPECT_EQ(released, 0);
+    EXPECT_FALSE(slice->is_raw_data_released())
+        << "Borrowed TensorSlice views must not release their wrapped storage during the broad host-resident sweep";
 }

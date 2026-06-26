@@ -32,10 +32,14 @@ namespace llaminar2::test
         TensorBase *tensor = nullptr;
         std::string stage_name;
         size_t count = 0;
+        void *stream = nullptr;
+        std::string precision;
 
         AllreduceCall() = default;
         AllreduceCall(TensorBase *t, const std::string &name = "", size_t c = 0)
             : tensor(t), stage_name(name), count(c) {}
+        AllreduceCall(TensorBase *t, const std::string &name, size_t c, void *s, std::string p)
+            : tensor(t), stage_name(name), count(c), stream(s), precision(std::move(p)) {}
     };
 
     /**
@@ -91,6 +95,11 @@ namespace llaminar2::test
             broadcast_should_fail_ = fail;
         }
 
+        void setRawAllgatherGraphCaptureSupported(bool supported)
+        {
+            raw_allgather_graph_capture_supported_ = supported;
+        }
+
         // =====================================================================
         // ILocalTPContext Interface
         // =====================================================================
@@ -141,6 +150,18 @@ namespace llaminar2::test
             return !allreduce_should_fail_;
         }
 
+        bool allreduceOnStream(TensorBase *tensor, const std::string &stage_name,
+                               size_t count, void *stream,
+                               const std::string &precision = "") override
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                allreduce_calls_.emplace_back(tensor, stage_name, count, stream, precision);
+            }
+            ++allreduce_call_count_;
+            return !allreduce_should_fail_;
+        }
+
         bool allreduce(const TensorBase *input, TensorBase *output) override
         {
             {
@@ -155,6 +176,11 @@ namespace llaminar2::test
         {
             ++allgather_call_count_;
             return true;
+        }
+
+        bool supportsRawAllgatherOnStreamGraphCapture() const override
+        {
+            return raw_allgather_graph_capture_supported_;
         }
 
         bool gatherFromDevices(
@@ -394,6 +420,7 @@ namespace llaminar2::test
         std::atomic<int> synchronize_call_count_{0};
         bool allreduce_should_fail_ = false;
         bool broadcast_should_fail_ = false;
+        bool raw_allgather_graph_capture_supported_ = false;
     };
 
 } // namespace llaminar2::test

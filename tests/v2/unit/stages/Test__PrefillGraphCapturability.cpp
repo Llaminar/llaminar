@@ -17,11 +17,13 @@
 #include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorKernels.h"
 #include "kernels/IMoEKernel.h"
 #include "mocks/MockComputeStage.h"
+#include "mocks/MockLocalTPContext.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/DebugEnv.h"
 
@@ -913,7 +915,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
         << "Fused runtime decode must be warmed on the first post-reset token, "
            "not deferred until after an avoidable capture failure.";
     EXPECT_TRUE(stage.isGraphCapturable())
-        << "After the first warmup token, segmented capture should be armed "
+        << "After the first warmup token, cached graph capture should be armed "
            "without requiring a fallback decode step.";
 #else
     GTEST_SKIP() << "Release GPU graph-capture path is disabled in this build";
@@ -1690,10 +1692,13 @@ TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightAllowsCompiledGPUWhenRe
     GDNRecurrenceStage stage(params);
 
 #if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.supportsLazyPrefillGraphCapturePreflight())
+        << "Exact-shape cold preflight should validate ROCm GDN support without requiring warmed GPU state";
     EXPECT_TRUE(stage.supportsPaddedPrefillRealLengthContract());
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
         << "Cold padded preflight should validate ROCm GDN support without requiring warmed GPU state";
 #else
+    EXPECT_FALSE(stage.supportsLazyPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
 #endif
     EXPECT_FALSE(stage.isGraphCapturable())
@@ -1703,6 +1708,8 @@ TEST_F(GDNPrefillGraphCapture, ColdPaddedPrefillPreflightAllowsCompiledGPUWhenRe
     auto cuda_params = makeValidPrefillParams(&not_ready_kernel);
     cuda_params.device_id = DeviceId::cuda(0);
     GDNRecurrenceStage cuda_stage(cuda_params);
+    EXPECT_TRUE(cuda_stage.supportsLazyPrefillGraphCapturePreflight())
+        << "Exact-shape cold preflight should validate CUDA GDN support without requiring warmed GPU state";
     EXPECT_TRUE(cuda_stage.supportsPaddedPrefillGraphCapturePreflight())
         << "Cold padded preflight should validate CUDA GDN support without requiring warmed GPU state";
     EXPECT_FALSE(cuda_stage.isGraphCapturable())
@@ -1818,5 +1825,46 @@ TEST_F(GDNPrefillGraphCapture, DecodeAlwaysCapturableRegardlessOfState)
         << "Decode GDN should be capturable regardless of GPU state";
 #else
     EXPECT_FALSE(stage.isGraphCapturable());
+#endif
+}
+
+TEST_F(GDNPrefillGraphCapture, LiveStateAllGatherCapturableRequiresRawAllgatherGraphCaptureSupport)
+{
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+    MockLocalTPContext tp_ctx;
+#if defined(HAVE_CUDA)
+    const DeviceId device = DeviceId::cuda(0);
+    tp_ctx.setDevices({GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::cuda(1, 0)});
+    tp_ctx.setBackend(CollectiveBackendType::NCCL);
+#else
+    const DeviceId device = DeviceId::rocm(0);
+    tp_ctx.setDevices({GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)});
+    tp_ctx.setBackend(CollectiveBackendType::RCCL);
+#endif
+    tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+
+    StubGDNKernel recurrence_kernel(true, 8);
+    GDNLiveStateAllGatherStage::Params params;
+    params.device_id = device;
+    params.tp_ctx = &tp_ctx;
+    params.recurrence_kernel = &recurrence_kernel;
+    params.layer_idx = 0;
+    params.tp_device_idx = 0;
+    params.local_conv_state_floats = 0;
+    params.full_conv_state_floats = 0;
+    params.local_recurrence_state_floats = 4;
+    params.full_recurrence_state_floats = 8;
+    params.stage_name = "gdn_live_state_allgather";
+
+    GDNLiveStateAllGatherStage supported(params);
+    EXPECT_TRUE(supported.isGraphCapturable())
+        << "GDN live-state handoff should be capturable when LocalTP can record raw allgather on the capture stream.";
+
+    tp_ctx.setRawAllgatherGraphCaptureSupported(false);
+    GDNLiveStateAllGatherStage unsupported(params);
+    EXPECT_FALSE(unsupported.isGraphCapturable())
+        << "GDN live-state handoff must not use prefill graph capture without a graph-capturable raw allgather.";
+#else
+    GTEST_SKIP() << "GPU backend not compiled";
 #endif
 }

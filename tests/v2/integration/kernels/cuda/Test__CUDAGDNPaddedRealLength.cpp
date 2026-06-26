@@ -450,6 +450,107 @@ class Test__CUDAGDNPaddedRealLength : public CUDATestBase
 
 #ifdef HAVE_CUDA
 
+TEST_F(Test__CUDAGDNPaddedRealLength, StateBankSwitchesLocalAndFullSlotsUnderCaptureGuard)
+{
+    SKIP_IF_NO_CUDA();
+    checkCuda(cudaSetDevice(cuda_ordinal_), "cudaSetDevice");
+
+    CudaStreamHandle stream;
+
+    constexpr int local_heads = 1;
+    constexpr int full_heads = 2;
+    constexpr int d_k = 64;
+    constexpr int d_v = 64;
+    constexpr int seq_len = 2;
+    constexpr int local_recurrence_state = local_heads * d_k * d_v;
+    constexpr int full_recurrence_state = full_heads * d_k * d_v;
+    constexpr int full_qk_stride = full_heads * d_k;
+    constexpr int full_v_stride = full_heads * d_v;
+
+    CUDAGatedDeltaNet recurrence(cuda_ordinal_);
+    recurrence.setGPUStream(stream.stream);
+    recurrence.allocateGPUState(local_recurrence_state);
+    ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state));
+    recurrence.allocateGPUState(full_recurrence_state);
+    ASSERT_TRUE(recurrence.isGPUStateReady(full_recurrence_state));
+    ASSERT_TRUE(recurrence.isGPUStateReady(local_recurrence_state))
+        << "Full decode-state handoff must not discard the local prefill state slot";
+    ASSERT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+
+    CudaFloatBuffer d_q(static_cast<size_t>(seq_len) * full_qk_stride, 0.01f);
+    CudaFloatBuffer d_kbuf(static_cast<size_t>(seq_len) * full_qk_stride, 0.02f);
+    CudaFloatBuffer d_vbuf(static_cast<size_t>(seq_len) * full_v_stride, 0.03f);
+    CudaFloatBuffer d_alpha(static_cast<size_t>(seq_len) * full_heads, 0.2f);
+    CudaFloatBuffer d_beta(static_cast<size_t>(seq_len) * full_heads, -0.1f);
+    CudaFloatBuffer d_A_log(static_cast<size_t>(full_heads), -0.5f);
+    CudaFloatBuffer d_dt_bias(static_cast<size_t>(full_heads), 0.1f);
+    CudaFloatBuffer d_recurrence_out(static_cast<size_t>(seq_len) * full_v_stride, 0.0f);
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(recurrence.chunk_forward(
+            d_q.ptr, d_kbuf.ptr, d_vbuf.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_recurrence_out.ptr, nullptr,
+            seq_len, local_heads, d_k, d_v,
+            /*chunk_size=*/64, /*use_qk_l2norm=*/false));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(local recurrence slot)");
+    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(local_recurrence_state) * sizeof(float));
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(recurrence.recurrent_step(
+            d_q.ptr, d_kbuf.ptr, d_vbuf.ptr, d_alpha.ptr, d_beta.ptr, d_A_log.ptr, d_dt_bias.ptr,
+            d_recurrence_out.ptr, nullptr,
+            full_heads, d_k, d_v,
+            /*use_qk_l2norm=*/false));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(full recurrence slot)");
+    EXPECT_EQ(recurrence.stateBytes(), static_cast<size_t>(full_recurrence_state) * sizeof(float));
+
+    constexpr int local_channels = 64;
+    constexpr int full_channels = 128;
+    constexpr int kernel_size = 4;
+    constexpr int local_conv_state = local_channels * (kernel_size - 1);
+    constexpr int full_conv_state = full_channels * (kernel_size - 1);
+
+    CUDAShortConvolution conv(cuda_ordinal_);
+    conv.setGPUStream(stream.stream);
+    conv.allocateGPUState(local_conv_state);
+    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
+    conv.allocateGPUState(full_conv_state);
+    ASSERT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+
+    const auto weights = makeShortConvWeights(full_channels, kernel_size);
+    const auto bias = makeBias(full_channels);
+    CudaFloatBuffer d_input(static_cast<size_t>(seq_len) * full_channels, 0.04f);
+    CudaFloatBuffer d_weight(weights);
+    CudaFloatBuffer d_bias(bias);
+    CudaFloatBuffer d_conv_out(static_cast<size_t>(seq_len) * full_channels, 0.0f);
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(conv.forward(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_conv_out.ptr, nullptr,
+            seq_len, local_channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(local short-conv slot)");
+    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(local_conv_state) * sizeof(float));
+
+    {
+        GraphCaptureGuard guard;
+        ASSERT_TRUE(conv.forward(
+            d_input.ptr, d_weight.ptr, d_bias.ptr,
+            d_conv_out.ptr, nullptr,
+            seq_len, full_channels, kernel_size,
+            /*apply_silu=*/true));
+    }
+    checkCuda(cudaStreamSynchronize(stream.stream), "cudaStreamSynchronize(full short-conv slot)");
+    EXPECT_EQ(conv.stateBytes(), static_cast<size_t>(full_conv_state) * sizeof(float));
+}
+
 TEST_F(Test__CUDAGDNPaddedRealLength, RecurrenceEffectivePrefillMatchesUnpaddedDecode)
 {
     SKIP_IF_NO_CUDA();
