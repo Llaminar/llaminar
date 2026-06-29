@@ -298,6 +298,7 @@ namespace llaminar2
         MOE_SPARSE_DISPATCH,        ///< Graph-native sparse MoE payload dispatch
         MOE_LOCAL_EXPERT,           ///< Participant-local sparse MoE expert compute
         MOE_SPARSE_RETURN_REDUCE,   ///< Graph-native sparse MoE return reduce
+        MOE_DEVICE_REBALANCE,       ///< Graph-captured device-side MoE rebalance publish/apply
 
         // Collective
         ALLREDUCE,
@@ -652,6 +653,15 @@ namespace llaminar2
          * then hard-fails if isGraphCapturable() is still false.
          */
         virtual bool supportsWarmupDependentGraphCapture() const { return false; }
+
+        /**
+         * @brief Human-readable readiness details when warmup-dependent capture fails.
+         *
+         * Returned text is diagnostic only.  It must not allocate device memory or
+         * mutate stage state, because callers may use it from graph-capture
+         * fallback paths.
+         */
+        virtual std::string graphCaptureReadinessDebugString() const { return {}; }
 
         /**
          * @brief Whether a capturable stage must start a fresh graph segment.

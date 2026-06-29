@@ -2255,7 +2255,7 @@ TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferIsDirectOnly)
     EXPECT_FALSE(sameBackendGpuExpertTransferIsDirectOnly(DeviceId::cpu(), DeviceId::cuda(0)));
 }
 
-TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferUsesStagedPrepareAndPublish)
+TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferStagesAsyncAndPublishesLater)
 {
     const std::string rank_source =
         readSourceFileForRankOrchestratorTest(
@@ -2268,62 +2268,335 @@ TEST_F(Test__RankOrchestrator, SameBackendGpuExpertTransferUsesStagedPrepareAndP
 
     const auto prepare_pos =
         rank_source.find("prepareExpertWeightsDirectForMasksFrom");
+    const auto target_masks_pos =
+        rank_source.find("const std::vector<std::vector<bool>> &target_masks");
+    const auto transfer_masks_pos =
+        rank_source.find("const std::vector<std::vector<bool>> &transfer_masks");
+    const auto direct_remaining_pos =
+        rank_source.find("direct_remaining_masks = transfer_masks");
+    const auto serialized_remaining_pos =
+        rank_source.find("serialized_remaining_masks = transfer_masks");
+    const auto direct_mask_call_pos =
+        rank_source.find("prepareExpertWeightsDirectForMasksFrom");
+    const auto serialized_mask_call_pos =
+        rank_source.find("collectExpertWeightsForMasks");
     const auto publish_pos =
         rank_source.find("bool RankOrchestrator::publishPreparedMoEExpertMasksForAllDevices");
+    const auto pending_publish_pos =
+        rank_source.find("activatePendingGpuDirectExpertTransfers", publish_pos);
     const auto apply_pos =
         rank_source.find("applyExpertMasksForDomain", publish_pos);
     const auto abort_pos =
         rank_source.find("incomplete_gpu_direct_prepare", publish_pos);
-    const auto rolling_activation_pos =
-        dgo_source.find("GPU-direct rolling activation");
-    const auto retire_pos =
-        dgo_source.find("gpu_direct_transfer_staging_wave_retire");
+    const auto deferred_activation_pos =
+        dgo_source.find("activation is deferred until publish");
+    const auto pending_arrival_pos =
+        dgo_source.find("pending_gpu_direct_transfer_slot_arrivals_.push_back");
     const auto stage_capacity_pos =
         dgo_source.find("staging_pool_capacity");
     const auto direct_prepare_fn_pos =
         dgo_source.find("prepareExpertWeightsDirectForMasksFrom");
+    const auto direct_publish_fn_pos =
+        dgo_source.find("bool DeviceGraphOrchestrator::activatePreparedGpuDirectExpertTransfers");
+    const auto direct_publish_fn_end =
+        dgo_source.find("void DeviceGraphOrchestrator::clearPendingGpuDirectExpertTransfers",
+                        direct_publish_fn_pos);
+    const auto activation_completion_store_pos =
+        dgo_source.find("pending_gpu_direct_activation_completions_.push_back", direct_publish_fn_pos);
+    const auto retain_stage_pending_false_pos =
+        dgo_source.find("!graph_stable_gpu_rebalance", direct_publish_fn_pos);
+    const auto retire_before_prepare_pos =
+        dgo_source.find("retireCompletedGpuDirectActivationCompletions();", direct_prepare_fn_pos);
+    const auto retire_fn_pos =
+        dgo_source.find("void DeviceGraphOrchestrator::retireCompletedGpuDirectActivationCompletions");
+    const auto nonblocking_query_pos =
+        dgo_source.find("queryEventChecked", retire_fn_pos);
     const auto missing_arrivals_pos =
         dgo_source.find("missingPreparedExpertIds(expert_ids)", direct_prepare_fn_pos);
     const auto active_arrival_capacity_pos =
         dgo_source.find("active_arrival_capacity", missing_arrivals_pos);
     const auto staged_prepare_pos =
         dgo_source.find("stageExpertsGPUDirectToTransferSlotsFrom", active_arrival_capacity_pos);
+    const auto host_wait_in_prepare_pos =
+        dgo_source.find("waitForEvent", direct_prepare_fn_pos);
+    const auto activate_in_prepare_pos =
+        dgo_source.find("activateGpuDirectTransferSlotArrivals", direct_prepare_fn_pos);
     const auto apply_masks_pos =
         dgo_source.find("void DeviceGraphOrchestrator::applyExpertMasksForDomain");
     const auto release_departed_pos =
         dgo_source.find("releaseDepartedExperts(masks[layer])", apply_masks_pos);
     const auto rolling_retry_pos =
         dgo_source.find("while (!stage_pending.empty())");
-    const auto retire_after_empty_wave_pos =
-        dgo_source.find("if (!in_flight_activation_waves.empty())", rolling_retry_pos);
+    const auto requested_arrival_entries_pos =
+        dgo_source.find("requested_arrival_entries", direct_prepare_fn_pos);
 
     ASSERT_NE(prepare_pos, std::string::npos)
         << "same-backend GPU rebalance must prepare direct transfers before publish";
+    ASSERT_NE(target_masks_pos, std::string::npos);
+    ASSERT_NE(transfer_masks_pos, std::string::npos);
+    ASSERT_NE(direct_remaining_pos, std::string::npos)
+        << "same-backend GPU-direct prepare must verify only logical arrival deltas";
+    ASSERT_NE(serialized_remaining_pos, std::string::npos)
+        << "serialized fallback should still use the smaller transfer delta";
+    ASSERT_NE(direct_mask_call_pos, std::string::npos);
+    ASSERT_NE(serialized_mask_call_pos, std::string::npos);
+    EXPECT_LT(direct_remaining_pos, direct_mask_call_pos);
+    EXPECT_LT(serialized_remaining_pos, serialized_mask_call_pos);
     ASSERT_NE(publish_pos, std::string::npos);
+    ASSERT_NE(pending_publish_pos, std::string::npos)
+        << "rank publish must activate prepared GPU-direct transfer-slot arrivals";
     ASSERT_NE(abort_pos, std::string::npos)
         << "incomplete same-backend GPU prepare must abort the whole mask publish";
-    ASSERT_NE(rolling_activation_pos, std::string::npos)
-        << "prepared GPU-direct arrivals must activate in a rolling DGO wave";
-    ASSERT_NE(retire_pos, std::string::npos)
-        << "rolling staging buffers must be retired by activation completion event";
+    ASSERT_NE(deferred_activation_pos, std::string::npos)
+        << "GPU-direct prepare must leave activation for the publish phase";
+    ASSERT_NE(pending_arrival_pos, std::string::npos)
+        << "prepared transfer-slot arrivals must be retained for publish";
     ASSERT_NE(stage_capacity_pos, std::string::npos)
         << "rolling staging capacity must be explicit and bounded";
     ASSERT_NE(direct_prepare_fn_pos, std::string::npos);
+    ASSERT_NE(direct_publish_fn_pos, std::string::npos);
+    ASSERT_NE(direct_publish_fn_end, std::string::npos);
+    ASSERT_NE(activation_completion_store_pos, std::string::npos)
+        << "graph-stable publish must retain activation completions on the DGO, not on cached stages";
+    ASSERT_NE(retain_stage_pending_false_pos, std::string::npos)
+        << "graph-stable replay cannot drain MoEExpertComputeStage pending completions after capture";
+    ASSERT_NE(retire_before_prepare_pos, std::string::npos)
+        << "completed activation events must release transfer staging slots before the next prepare wave";
+    ASSERT_NE(retire_fn_pos, std::string::npos);
+    ASSERT_NE(nonblocking_query_pos, std::string::npos)
+        << "retiring graph-stable activation completions should be nonblocking";
     ASSERT_NE(missing_arrivals_pos, std::string::npos)
         << "active arrival capacity must be based on missing experts, not the whole target mask";
     ASSERT_NE(active_arrival_capacity_pos, std::string::npos);
     ASSERT_NE(staged_prepare_pos, std::string::npos);
+    ASSERT_NE(requested_arrival_entries_pos, std::string::npos)
+        << "async prepare must reserve enough transfer-slot staging for the pending publication";
     ASSERT_NE(apply_masks_pos, std::string::npos);
     ASSERT_NE(release_departed_pos, std::string::npos)
         << "departed experts must still be released during mask application after direct prepares";
     ASSERT_NE(rolling_retry_pos, std::string::npos)
         << "rolling transfer staging must retry pending experts after reduced-capacity waves";
-    ASSERT_NE(retire_after_empty_wave_pos, std::string::npos)
-        << "a full reduced-capacity staging pool must retire an in-flight wave before retry";
     ASSERT_NE(apply_pos, std::string::npos);
     EXPECT_LT(missing_arrivals_pos, staged_prepare_pos);
+    EXPECT_TRUE(host_wait_in_prepare_pos == std::string::npos ||
+                host_wait_in_prepare_pos > direct_publish_fn_pos)
+        << "same-backend GPU prepare must not CPU-wait for transfer or activation events";
+    EXPECT_TRUE(activate_in_prepare_pos == std::string::npos ||
+                activate_in_prepare_pos > direct_publish_fn_pos)
+        << "same-backend GPU prepare must not publish active GEMM tables";
+    EXPECT_LT(retire_before_prepare_pos, staged_prepare_pos);
+    EXPECT_LT(activation_completion_store_pos, direct_publish_fn_end);
+    const auto host_wait_in_publish_pos =
+        dgo_source.find("waitForEvent", direct_publish_fn_pos);
+    EXPECT_TRUE(host_wait_in_publish_pos == std::string::npos ||
+                host_wait_in_publish_pos > direct_publish_fn_end)
+        << "GPU transfer-slot publish must chain events on streams, not CPU-wait before activation";
     EXPECT_LT(abort_pos, apply_pos)
         << "mask publish must be all-or-nothing when GPU-direct prepare is incomplete";
+    EXPECT_LT(pending_publish_pos, apply_pos)
+        << "activation must be enqueued before masks can expose the arrived experts";
+}
+
+TEST_F(Test__RankOrchestrator, GpuDynamicMoERebalanceRefreshesStableGraphTables)
+{
+    const std::string dgo_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const std::string stage_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp");
+    const std::string stage_header =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/compute_stages/stages/MoEExpertComputeStage.h");
+    const std::string forward_engine_header =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/engine/ForwardExecutionEngine.h");
+    const std::string forward_engine_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/engine/ForwardExecutionEngine.cpp");
+    const std::string kernel_iface =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/kernels/IMoEKernel.h");
+    const std::string cuda_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp");
+    const std::string rocm_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp");
+    ASSERT_FALSE(dgo_source.empty());
+    ASSERT_FALSE(stage_source.empty());
+    ASSERT_FALSE(stage_header.empty());
+    ASSERT_FALSE(forward_engine_header.empty());
+    ASSERT_FALSE(forward_engine_source.empty());
+    ASSERT_FALSE(kernel_iface.empty());
+    ASSERT_FALSE(cuda_source.empty());
+    ASSERT_FALSE(rocm_source.empty());
+
+    const auto epoch_fn_pos =
+        dgo_source.find("uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const");
+    const auto gpu_stable_guard_pos =
+        dgo_source.find("usesGraphStableGpuMoERebalance()", epoch_fn_pos);
+    const auto gpu_stable_return_pos =
+        dgo_source.find("return 0;", gpu_stable_guard_pos);
+    const auto mask_epoch_pos =
+        dgo_source.find("current_expert_mask_epoch_", epoch_fn_pos);
+    ASSERT_NE(epoch_fn_pos, std::string::npos);
+    ASSERT_NE(gpu_stable_guard_pos, std::string::npos)
+        << "GPU dynamic MoE placement must be graph-table data, not a forward graph key";
+    ASSERT_NE(gpu_stable_return_pos, std::string::npos);
+    ASSERT_NE(mask_epoch_pos, std::string::npos);
+    EXPECT_LT(gpu_stable_return_pos, mask_epoch_pos)
+        << "GPU dynamic MoE must bypass placement epochs before graph-cache signature materialization";
+
+    const auto stable_predicate_pos =
+        dgo_source.find("bool DeviceGraphOrchestrator::usesGraphStableGpuMoERebalance() const");
+    ASSERT_NE(stable_predicate_pos, std::string::npos);
+    const auto stable_predicate_end =
+        dgo_source.find("uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const", stable_predicate_pos);
+    ASSERT_NE(stable_predicate_end, std::string::npos);
+    const std::string stable_predicate_body =
+        dgo_source.substr(stable_predicate_pos, stable_predicate_end - stable_predicate_pos);
+    EXPECT_NE(stable_predicate_body.find("ExpertDomainKind::LocalTP"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("ExpertDomainComputeKind::ApportionedExperts"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("domain.participants.size() < 2"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("participant.isGPU()"), std::string::npos);
+    EXPECT_NE(stable_predicate_body.find("participant.device_type != participant_type"), std::string::npos);
+
+    const auto prepare_direct_pos =
+        dgo_source.find("DeviceGraphOrchestrator::prepareExpertWeightsDirectForMasksFrom");
+    const auto activate_direct_pos =
+        dgo_source.find("bool DeviceGraphOrchestrator::activatePreparedGpuDirectExpertTransfers", prepare_direct_pos);
+    ASSERT_NE(prepare_direct_pos, std::string::npos);
+    ASSERT_NE(activate_direct_pos, std::string::npos);
+    const std::string prepare_direct_body =
+        dgo_source.substr(prepare_direct_pos, activate_direct_pos - prepare_direct_pos);
+    const auto missing_prepared_pos =
+        prepare_direct_body.find("missingPreparedExpertIds");
+    const auto already_resident_count_pos =
+        prepare_direct_body.find("std::find(stage_pending.begin()", missing_prepared_pos);
+    const auto no_transfer_needed_pos =
+        prepare_direct_body.find("if (stage_pending.empty())", already_resident_count_pos);
+    ASSERT_NE(missing_prepared_pos, std::string::npos);
+    ASSERT_NE(already_resident_count_pos, std::string::npos);
+    ASSERT_NE(no_transfer_needed_pos, std::string::npos);
+    EXPECT_LT(already_resident_count_pos, no_transfer_needed_pos)
+        << "Already-resident arrivals must be counted before skipping an empty transfer wave";
+    EXPECT_NE(prepare_direct_body.find("select_rebalance_destination_stages"), std::string::npos)
+        << "GPU-direct prepare must use the same destination stage class that mask publication updates";
+    EXPECT_NE(prepare_direct_body.find("usesGraphStableMoEPlacement"), std::string::npos)
+        << "Graph-stable GPU rebalancing must target stages that can consume placement by data mutation";
+    EXPECT_NE(prepare_direct_body.find("required_stage_count"), std::string::npos)
+        << "Arrival mask bits may only clear after every selected destination stage is satisfied";
+    EXPECT_NE(prepare_direct_body.find(">= required_stage_count"), std::string::npos);
+
+    const auto apply_masks_pos =
+        dgo_source.find("void DeviceGraphOrchestrator::applyExpertMasksForDomain");
+    const auto collect_weights_pos =
+        dgo_source.find("ReceivedWeightsMap DeviceGraphOrchestrator::collectExpertWeightsForMasks",
+                        apply_masks_pos);
+    ASSERT_NE(apply_masks_pos, std::string::npos);
+    ASSERT_NE(collect_weights_pos, std::string::npos);
+    const std::string apply_masks_body =
+        dgo_source.substr(apply_masks_pos, collect_weights_pos - apply_masks_pos);
+    EXPECT_NE(apply_masks_body.find("invalidateMoEPlacementSensitiveGraphsForStablePlacement"),
+              std::string::npos)
+        << "Stable rebalance must not leave placement-sensitive verifier/multi-token graphs reusable";
+    EXPECT_NE(apply_masks_body.find("usesGraphStableMoEPlacement"), std::string::npos)
+        << "Mask publication must be scoped to graph-stable MoE stages in GPU mode";
+    EXPECT_NE(apply_masks_body.find("requires cached graph-stable MoE stages"), std::string::npos)
+        << "Graph-stable GPU rebalance should fail fast when no runtime decode stage can be updated";
+    EXPECT_NE(apply_masks_body.find("moe_expert_mask_publish"), std::string::npos)
+        << "Mask publication must acquire an explicit non-null stream outside normal stage execution";
+    const auto mask_publish_stream_bind_pos =
+        apply_masks_body.find("stage->setGPUStream(publication_stream)");
+    EXPECT_NE(mask_publish_stream_bind_pos, std::string::npos)
+        << "Mask publication must bind the explicit stream before graph-stable descriptor refresh";
+    const auto pre_adopt_release_guard_pos =
+        apply_masks_body.find("if (!graph_stable_gpu_rebalance)");
+    const auto register_prepare_pos =
+        apply_masks_body.find("registerAndPrepareNewExperts");
+    const auto post_adopt_release_guard_pos =
+        apply_masks_body.find("if (graph_stable_gpu_rebalance)", register_prepare_pos);
+    ASSERT_NE(pre_adopt_release_guard_pos, std::string::npos);
+    ASSERT_NE(register_prepare_pos, std::string::npos);
+    ASSERT_NE(post_adopt_release_guard_pos, std::string::npos);
+    ASSERT_NE(mask_publish_stream_bind_pos, std::string::npos);
+    EXPECT_LT(mask_publish_stream_bind_pos, register_prepare_pos)
+        << "Newly prepared expert engines must not be rebound to a null stream";
+    EXPECT_LT(pre_adopt_release_guard_pos, register_prepare_pos)
+        << "Legacy rebalance should still release departures before heavy prepare";
+    EXPECT_LT(register_prepare_pos, post_adopt_release_guard_pos)
+        << "Graph-stable GPU rebalance must adopt GPU-direct arrivals before releasing shared store departures";
+
+    EXPECT_NE(stage_header.find("usesGraphStableRuntimeDecodePlacement"), std::string::npos);
+    EXPECT_NE(stage_header.find("usesGraphStableFixedTopologyPrefillPlacement"), std::string::npos);
+    EXPECT_NE(stage_header.find("usesGraphStableMoEPlacement"), std::string::npos);
+    EXPECT_NE(stage_source.find("bool MoEExpertComputeStage::usesGraphStableRuntimeDecodePlacement() const"),
+              std::string::npos);
+    EXPECT_NE(stage_source.find("bool MoEExpertComputeStage::usesGraphStableFixedTopologyPrefillPlacement() const"),
+              std::string::npos);
+    EXPECT_NE(stage_source.find("bool MoEExpertComputeStage::refreshFixedTopologyGroupedPrefillPlacement()"),
+              std::string::npos);
+    EXPECT_NE(stage_source.find("!params_.force_grouped_verifier_prefill_for_decode"), std::string::npos)
+        << "Verifier replay stages are not the graph-stable placement owner";
+    EXPECT_NE(stage_source.find("updateGroupedPrefillExpertMask"), std::string::npos)
+        << "Fixed-topology prefill must refresh the persistent device mask instead of recapturing";
+    EXPECT_NE(forward_engine_header.find("invalidateMoEPlacementSensitiveGraphsForStablePlacement"),
+              std::string::npos);
+    EXPECT_NE(forward_engine_source.find("ForwardExecutionEngine::invalidateMoEPlacementSensitiveGraphsForStablePlacement"),
+              std::string::npos);
+    EXPECT_NE(forward_engine_source.find("signature.decode"), std::string::npos);
+    EXPECT_NE(forward_engine_source.find("!signature.all_position_logits"), std::string::npos);
+    EXPECT_NE(forward_engine_source.find("signature.seq_len == 1"), std::string::npos);
+    EXPECT_NE(forward_engine_source.find("graph_stable_fixed_prefill"), std::string::npos);
+    EXPECT_NE(forward_engine_source.find("cache.markGPUStreamBindingsDirty()"), std::string::npos)
+        << "Preserved decode graphs must still rebind explicit streams after transfer publication";
+
+    const auto apply_mask_pos =
+        stage_source.find("void MoEExpertComputeStage::applyExpertMask");
+    const auto build_context_pos =
+        stage_source.find("MoEWeightContext MoEExpertComputeStage::buildWeightContext", apply_mask_pos);
+    ASSERT_NE(apply_mask_pos, std::string::npos);
+    ASSERT_NE(build_context_pos, std::string::npos);
+    const std::string apply_mask_body =
+        stage_source.substr(apply_mask_pos, build_context_pos - apply_mask_pos);
+    EXPECT_EQ(apply_mask_body.find("grouped_gateup_desc_table_id_ = -1"), std::string::npos)
+        << "Mask publish must not destroy captured descriptor table identity";
+    EXPECT_EQ(apply_mask_body.find("grouped_down_desc_table_id_ = -1"), std::string::npos)
+        << "Mask publish must not destroy captured descriptor table identity";
+    EXPECT_NE(apply_mask_body.find("grouped_gateup_desc_table_dirty_ = true"), std::string::npos);
+    EXPECT_NE(apply_mask_body.find("refreshGraphStablePlacement"), std::string::npos);
+    EXPECT_NE(apply_mask_body.find("throw std::runtime_error"), std::string::npos)
+        << "Graph-stable placement refresh failures must fail fast";
+
+    EXPECT_NE(kernel_iface.find("updateGroupedExpertGateUpDescriptorTables"), std::string::npos);
+    EXPECT_NE(kernel_iface.find("updateGroupedExpertDownDescriptorTable"), std::string::npos);
+    EXPECT_NE(kernel_iface.find("updateGroupedPrefillExpertMask"), std::string::npos);
+    EXPECT_NE(cuda_source.find("CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables"), std::string::npos);
+    EXPECT_NE(cuda_source.find("CUDAMoEKernel::updateGroupedExpertDownDescriptorTable"), std::string::npos);
+    EXPECT_NE(cuda_source.find("CUDAMoEKernel::updateGroupedPrefillExpertMask"), std::string::npos);
+    EXPECT_NE(rocm_source.find("ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables"), std::string::npos);
+    EXPECT_NE(rocm_source.find("ROCmMoEKernel::updateGroupedExpertDownDescriptorTable"), std::string::npos);
+    EXPECT_NE(rocm_source.find("ROCmMoEKernel::updateGroupedPrefillExpertMask"), std::string::npos);
+
+    const auto replica_publish_pos =
+        dgo_source.find("void DeviceGraphOrchestrator::setExpertReplicaSetForParticipant");
+    const auto release_raw_pos =
+        dgo_source.find("size_t DeviceGraphOrchestrator::releaseRawExpertWeights", replica_publish_pos);
+    ASSERT_NE(replica_publish_pos, std::string::npos);
+    ASSERT_NE(release_raw_pos, std::string::npos);
+    const std::string replica_publish_body =
+        dgo_source.substr(replica_publish_pos, release_raw_pos - replica_publish_pos);
+    EXPECT_NE(replica_publish_body.find("moe_replica_set_publish"), std::string::npos)
+        << "Hot-replica publication uses the same graph-stable refresh path as masks";
+    const auto replica_stream_bind_pos =
+        replica_publish_body.find("moe->setGPUStream(ensure_replica_publication_stream())");
+    const auto replica_set_call_pos =
+        replica_publish_body.find("moe->setReplicaSet(normalized_replicas, participant_id)");
+    ASSERT_NE(replica_stream_bind_pos, std::string::npos);
+    ASSERT_NE(replica_set_call_pos, std::string::npos);
+    EXPECT_LT(replica_stream_bind_pos, replica_set_call_pos)
+        << "Replica publication must bind an explicit stream before refreshing GPU placement tables";
 }
 
 TEST_F(Test__RankOrchestrator, LocalTPMoERebalanceDoesNotUseHostWorkerForGpuTransferStaging)
@@ -2335,8 +2608,167 @@ TEST_F(Test__RankOrchestrator, LocalTPMoERebalanceDoesNotUseHostWorkerForGpuTran
 
     ASSERT_EQ(runner_source.find("std::async("), std::string::npos)
         << "GPU transfer staging must not call CUDA/HIP from a separate host worker while graphs/collectives replay";
-    ASSERT_EQ(runner_source.find("pending_moe_rebalance_prepare_"), std::string::npos)
-        << "Deferred publish needs a graph/collective-safe design before it returns to production";
+    ASSERT_NE(runner_source.find("pending_moe_rebalance_prepare_"), std::string::npos)
+        << "LocalTP GPU transfer staging should use a first-class delayed publish state, not a host worker";
+    ASSERT_NE(runner_source.find("publishPendingMoERebalanceUpdate"), std::string::npos)
+        << "delayed LocalTP MoE publishes need an explicit runner-owned drain point";
+}
+
+TEST_F(Test__RankOrchestrator, ClearCacheDrainsPendingMoERebalanceBeforeDroppingTransfers)
+{
+    const std::string runner_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(runner_source.empty());
+
+    auto count_occurrences = [](const std::string &haystack, const std::string &needle)
+    {
+        size_t count = 0;
+        size_t pos = 0;
+        while ((pos = haystack.find(needle, pos)) != std::string::npos)
+        {
+            ++count;
+            pos += needle.size();
+        }
+        return count;
+    };
+
+    const auto clear_pos = runner_source.find("void OrchestrationRunner::clearCache()");
+    ASSERT_NE(clear_pos, std::string::npos);
+    const auto clear_end = runner_source.find("PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe", clear_pos);
+    ASSERT_NE(clear_end, std::string::npos);
+    const std::string clear_body = runner_source.substr(clear_pos, clear_end - clear_pos);
+
+    const auto request_reset_pos =
+        clear_body.find("clearUnderlyingRunnerCacheAfterMoEPublish(\"request-clear-cache\")");
+    ASSERT_NE(request_reset_pos, std::string::npos)
+        << "request/session cache reset must publish prepared MoE rebalances before resetting runtime state";
+    EXPECT_EQ(clear_body.find("pending_moe_rebalance_prepare_.reset()"), std::string::npos)
+        << "clearCache() must never silently erase a prepared MoE publish";
+    EXPECT_EQ(clear_body.find("runner_->clear_cache()"), std::string::npos)
+        << "clearCache() must go through the MoE-publish-aware reset helper";
+
+    const auto drain_fn = runner_source.find("void OrchestrationRunner::drainPendingMoERebalanceBeforeCacheClear()");
+    ASSERT_NE(drain_fn, std::string::npos);
+    const auto helper_fn =
+        runner_source.find("void OrchestrationRunner::clearUnderlyingRunnerCacheAfterMoEPublish", drain_fn);
+    ASSERT_NE(helper_fn, std::string::npos);
+    const std::string drain_body = runner_source.substr(drain_fn, helper_fn - drain_fn);
+    EXPECT_NE(drain_body.find("publishPendingMoERebalanceUpdate()"), std::string::npos);
+    EXPECT_NE(drain_body.find("throw std::runtime_error"), std::string::npos)
+        << "failed cache-boundary drains must fail fast instead of falling through";
+
+    const auto apply_fn = runner_source.find("bool OrchestrationRunner::applyMoERebalanceWithReplicas", helper_fn);
+    ASSERT_NE(apply_fn, std::string::npos);
+    const std::string helper_body = runner_source.substr(helper_fn, apply_fn - helper_fn);
+    const auto helper_drain_pos = helper_body.find("drainPendingMoERebalanceBeforeCacheClear()");
+    const auto clear_transfers_pos = helper_body.find("clearPendingGpuDirectExpertTransfersForAllDevices()");
+    const auto runner_clear_pos = helper_body.find("runner_->clear_cache()");
+    ASSERT_NE(helper_drain_pos, std::string::npos);
+    ASSERT_NE(clear_transfers_pos, std::string::npos);
+    ASSERT_NE(runner_clear_pos, std::string::npos);
+    EXPECT_LT(helper_drain_pos, clear_transfers_pos)
+        << "shared cache reset must not discard staged GPU-direct transfers before the pending publish drains";
+    EXPECT_LT(helper_drain_pos, runner_clear_pos)
+        << "shared cache reset must not reset graph/cache state before the pending MoE publish applies masks";
+
+    EXPECT_EQ(count_occurrences(runner_source, "runner_->clear_cache()"), 1u)
+        << "All OrchestrationRunner cache resets, including prefix-cache and shutdown paths, "
+           "must funnel through clearUnderlyingRunnerCacheAfterMoEPublish().";
+    for (const char *reason : {
+             "prefix-cache-initial-reset",
+             "prefix-cache-populate-fallback",
+             "prefix-cache-terminal-recompute",
+             "prefix-cache-terminal-populate-fallback",
+             "request-clear-cache",
+         })
+    {
+        EXPECT_NE(runner_source.find(std::string("clearUnderlyingRunnerCacheAfterMoEPublish(\"") +
+                                     reason + "\")"),
+                  std::string::npos)
+            << "Missing MoE-publish-aware cache reset reason " << reason;
+    }
+}
+
+TEST_F(Test__RankOrchestrator, DeviceSideMoERebalanceSkipsHostRuntimeHistogramBridge)
+{
+    const std::string source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/local_execution/orchestrators/RankOrchestrator.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const auto wire_pos = source.find("void RankOrchestrator::wireLocalTPMoERuntimeHistogramSyncs()");
+    ASSERT_NE(wire_pos, std::string::npos);
+    const auto device_side_gate_pos =
+        source.find("usesDeviceSideMoERebalanceController()", wire_pos);
+    const auto register_pos =
+        source.find("active_histogram->registerRuntimeHistogramSync", wire_pos);
+    ASSERT_NE(device_side_gate_pos, std::string::npos)
+        << "Device-side graph rebalance gathers histograms on-device and must not wire host sync callbacks.";
+    ASSERT_NE(register_pos, std::string::npos);
+    EXPECT_LT(device_side_gate_pos, register_pos)
+        << "The host runtime histogram bridge must be bypassed before callback registration in device-side mode.";
+    EXPECT_NE(source.find("device-side graph rebalance owns histogram allgather"), std::string::npos);
+}
+
+TEST_F(Test__RankOrchestrator, LocalTPMoERebalancePublishesPendingUpdateBeforeNewProposal)
+{
+    const std::string runner_source =
+        readSourceFileForRankOrchestratorTest(
+            "/workspaces/llaminar/src/v2/execution/runner/OrchestrationRunner.cpp");
+    ASSERT_FALSE(runner_source.empty());
+
+    const auto maybe_pos = runner_source.find("bool OrchestrationRunner::maybeApplyMoERebalance()");
+    const auto publish_pos = runner_source.find("publishPendingMoERebalanceUpdate()", maybe_pos);
+    const auto controller_pos = runner_source.find("auto *controller = moeRebalanceController()", maybe_pos);
+    const auto device_side_gate_pos = runner_source.find("usesDeviceSideMoERebalanceController()", maybe_pos);
+    const auto decision_pos = runner_source.find("controller->rebalanceDecision()", maybe_pos);
+    const auto delayed_prepare_pos = runner_source.find("local_tp_delayed_publish");
+    const auto mpi_guard_pos = runner_source.find("local_tp_runner && !mpi_coordinated_world", delayed_prepare_pos);
+    const auto prepare_pos = runner_source.find("prepareMoEExpertMaskTransfersForAllDevices", delayed_prepare_pos);
+    const auto pre_forward_helper_pos =
+        runner_source.find("bool OrchestrationRunner::publishPendingMoERebalanceBeforeForward");
+    const auto helper_publish_pos =
+        runner_source.find("publishPendingMoERebalanceUpdate()", pre_forward_helper_pos);
+
+    ASSERT_NE(maybe_pos, std::string::npos);
+    ASSERT_NE(publish_pos, std::string::npos)
+        << "a pending host async rebalance must be published after one compute interval";
+    ASSERT_NE(controller_pos, std::string::npos);
+    ASSERT_NE(device_side_gate_pos, std::string::npos)
+        << "device-side graph rebalance must bypass host delayed-publish maintenance";
+    ASSERT_NE(decision_pos, std::string::npos);
+    ASSERT_NE(delayed_prepare_pos, std::string::npos);
+    ASSERT_NE(mpi_guard_pos, std::string::npos)
+        << "delayed publish is currently safe only for single-process LocalTP domains";
+    ASSERT_NE(prepare_pos, std::string::npos)
+        << "LocalTP delayed publish must prepare transfer slots without publishing masks immediately";
+    ASSERT_NE(pre_forward_helper_pos, std::string::npos);
+    ASSERT_NE(helper_publish_pos, std::string::npos)
+        << "A prepared LocalTP publish must be drained before the next collective-bearing forward.";
+    EXPECT_LT(device_side_gate_pos, publish_pos)
+        << "device-side graph rebalance must not drain a host-prepared publish first";
+    EXPECT_LT(publish_pos, decision_pos);
+
+    const auto decode_pos = runner_source.find("GenerationResult OrchestrationRunner::decodeStep()");
+    const auto decode_helper_pos =
+        runner_source.find("publishPendingMoERebalanceBeforeForward(\"decode_step\")", decode_pos);
+    const auto decode_forward_pos = runner_source.find("runner_->forward(&last_token_, 1)", decode_pos);
+    ASSERT_NE(decode_pos, std::string::npos);
+    ASSERT_NE(decode_helper_pos, std::string::npos);
+    ASSERT_NE(decode_forward_pos, std::string::npos);
+    EXPECT_LT(decode_helper_pos, decode_forward_pos)
+        << "Pending LocalTP rebalance publishes must be applied symmetrically before decode launches TP collectives.";
+
+    const auto force_pos = runner_source.find("GenerationResult OrchestrationRunner::forceDecodeToken");
+    const auto force_helper_pos =
+        runner_source.find("publishPendingMoERebalanceBeforeForward(\"force_decode_token\")", force_pos);
+    const auto force_forward_pos = runner_source.find("runner_->forward(&last_token_, 1)", force_pos);
+    ASSERT_NE(force_pos, std::string::npos);
+    ASSERT_NE(force_helper_pos, std::string::npos);
+    ASSERT_NE(force_forward_pos, std::string::npos);
+    EXPECT_LT(force_helper_pos, force_forward_pos)
+        << "Forced-token decode also advances TP collectives and must drain prepared publishes first.";
 }
 
 TEST_F(Test__RankOrchestrator, HotReplicaStrategyDoesNotFallbackToOwnershipSwaps)

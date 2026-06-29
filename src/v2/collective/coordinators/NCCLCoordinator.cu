@@ -844,6 +844,206 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::allreduceWithSidebandsMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i])
+            {
+                last_error_ = "Null anchor allreduce buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null grouped bundle stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        for (size_t sideband_idx = 0; sideband_idx < sidebands.size(); ++sideband_idx)
+        {
+            const auto &sideband = sidebands[sideband_idx];
+            if (sideband.count == 0)
+            {
+                last_error_ = "Zero-count grouped sideband " + std::to_string(sideband_idx);
+                return false;
+            }
+            if (sideband.kind == CollectiveSidebandOp::Broadcast &&
+                (sideband.root < 0 || sideband.root >= num_devices_))
+            {
+                last_error_ = "Invalid grouped sideband broadcast root " +
+                              std::to_string(sideband.root);
+                return false;
+            }
+            if (sideband.recv_buffers.size() != static_cast<size_t>(num_devices_))
+            {
+                last_error_ = "Grouped sideband recv buffer count mismatch at index " +
+                              std::to_string(sideband_idx);
+                return false;
+            }
+            if ((sideband.kind == CollectiveSidebandOp::Allgather ||
+                 sideband.kind == CollectiveSidebandOp::Broadcast) &&
+                sideband.send_buffers.size() != static_cast<size_t>(num_devices_))
+            {
+                last_error_ = "Grouped sideband send buffer count mismatch at index " +
+                              std::to_string(sideband_idx);
+                return false;
+            }
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                if (!sideband.recv_buffers[static_cast<size_t>(i)])
+                {
+                    last_error_ = "Null grouped sideband recv buffer at sideband " +
+                                  std::to_string(sideband_idx) + " device " + std::to_string(i);
+                    return false;
+                }
+                if ((sideband.kind == CollectiveSidebandOp::Allgather ||
+                     sideband.kind == CollectiveSidebandOp::Broadcast) &&
+                    !sideband.send_buffers[static_cast<size_t>(i)])
+                {
+                    last_error_ = "Null grouped sideband send buffer at sideband " +
+                                  std::to_string(sideband_idx) + " device " + std::to_string(i);
+                    return false;
+                }
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        nccl::ncclResult_t r = nccl::ncclGroupStart();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupStart failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+
+            nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[i]);
+            cudaStream_t stream = static_cast<cudaStream_t>(streams[i]);
+            r = nccl::ncclAllReduce(
+                buffers[i], buffers[i], count,
+                toNcclDataTypeInt(toDataTypeInt(dtype)), toNcclRedOpInt(toOpInt(op)),
+                comm, stream);
+            if (r != nccl::ncclSuccess)
+            {
+                last_error_ = std::string("ncclAllReduce(grouped bundle anchor) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              nccl::ncclGetErrorString(r);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        for (size_t sideband_idx = 0; sideband_idx < sidebands.size(); ++sideband_idx)
+        {
+            const auto &sideband = sidebands[sideband_idx];
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+                if (err != cudaSuccess)
+                {
+                    last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                    nccl::ncclGroupEnd();
+                    return false;
+                }
+
+                nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[i]);
+                cudaStream_t stream = static_cast<cudaStream_t>(streams[i]);
+                const auto nccl_dtype = toNcclDataTypeInt(toDataTypeInt(sideband.dtype));
+                switch (sideband.kind)
+                {
+                case CollectiveSidebandOp::AllreduceSum:
+                    r = nccl::ncclAllReduce(
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        nccl_dtype,
+                        nccl::ncclSum,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Allgather:
+                    r = nccl::ncclAllGather(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        nccl_dtype,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Broadcast:
+                    r = nccl::ncclBroadcast(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        nccl_dtype,
+                        sideband.root,
+                        comm,
+                        stream);
+                    break;
+                }
+
+                if (r != nccl::ncclSuccess)
+                {
+                    last_error_ = std::string("NCCL grouped sideband failed at sideband ") +
+                                  std::to_string(sideband_idx) + " device " +
+                                  std::to_string(device_ordinals_[i]) + ": " +
+                                  nccl::ncclGetErrorString(r);
+                    nccl::ncclGroupEnd();
+                    return false;
+                }
+            }
+        }
+
+        r = nccl::ncclGroupEnd();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupEnd failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
                                                      CollectiveDataType dtype, CollectiveOp op,
                                                      int device_idx)
@@ -1092,6 +1292,209 @@ namespace llaminar2
 #endif
     }
 
+    bool NCCLCoordinator::broadcastSingleDeviceOnStream(const void *send_buf,
+                                                        void *recv_buf,
+                                                        size_t count,
+                                                        CollectiveDataType dtype,
+                                                        int root,
+                                                        int device_idx,
+                                                        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid broadcast root " + std::to_string(root) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!send_buf || !recv_buf)
+        {
+            last_error_ = "Null broadcast buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
+        cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
+
+        static thread_local int tl_last_cuda_device_for_broadcast = -1;
+        if (tl_last_cuda_device_for_broadcast != ordinal)
+        {
+            cudaError_t err = cudaSetDevice(ordinal);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            tl_last_cuda_device_for_broadcast = ordinal;
+        }
+
+        nccl::ncclResult_t r = nccl::ncclBroadcast(
+            send_buf,
+            recv_buf,
+            count,
+            toNcclDataTypeInt(toDataTypeInt(dtype)),
+            root,
+            comm,
+            caller_stream);
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclBroadcast(on-stream) failed: ") +
+                          nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::groupedP2PSingleDeviceOnStream(
+        const std::vector<CollectiveP2POp> &ops,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (!stream)
+        {
+            last_error_ = "Null stream for grouped P2P device " + std::to_string(device_idx);
+            return false;
+        }
+        if (ops.empty())
+            return true;
+
+        const int ordinal = device_ordinals_[device_idx];
+        nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[device_idx]);
+        cudaStream_t caller_stream = static_cast<cudaStream_t>(stream);
+
+        static thread_local int tl_last_cuda_device_for_grouped_p2p = -1;
+        if (tl_last_cuda_device_for_grouped_p2p != ordinal)
+        {
+            cudaError_t err = cudaSetDevice(ordinal);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                return false;
+            }
+            tl_last_cuda_device_for_grouped_p2p = ordinal;
+        }
+
+        nccl::ncclResult_t r = nccl::ncclGroupStart();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupStart(grouped P2P) failed: ") +
+                          nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (const auto &op : ops)
+        {
+            if (op.peer < 0 || op.peer >= num_devices_ || op.peer == device_idx)
+            {
+                last_error_ = "Invalid grouped P2P peer " + std::to_string(op.peer) +
+                              " for device " + std::to_string(device_idx);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+            const auto dtype_int = toNcclDataTypeInt(toDataTypeInt(op.dtype));
+            if (op.kind == CollectiveP2POpKind::Send)
+            {
+                if (!op.send_buffer || op.count == 0)
+                {
+                    last_error_ = "Invalid grouped P2P send buffer/count";
+                    nccl::ncclGroupEnd();
+                    return false;
+                }
+                r = nccl::ncclSend(
+                    op.send_buffer,
+                    op.count,
+                    dtype_int,
+                    op.peer,
+                    comm,
+                    caller_stream);
+            }
+            else
+            {
+                if (!op.recv_buffer || op.count == 0)
+                {
+                    last_error_ = "Invalid grouped P2P recv buffer/count";
+                    nccl::ncclGroupEnd();
+                    return false;
+                }
+                r = nccl::ncclRecv(
+                    op.recv_buffer,
+                    op.count,
+                    dtype_int,
+                    op.peer,
+                    comm,
+                    caller_stream);
+            }
+            if (r != nccl::ncclSuccess)
+            {
+                last_error_ = std::string("nccl grouped P2P op failed: ") +
+                              nccl::ncclGetErrorString(r);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = nccl::ncclGroupEnd();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupEnd(grouped P2P) failed: ") +
+                          nccl::ncclGetErrorString(r);
+            return false;
+        }
+        return true;
+#else
+        (void)ops;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
     bool NCCLCoordinator::allgatherMultiOnStreams(const std::vector<const void *> &send_buffers,
                                                   const std::vector<void *> &recv_buffers,
                                                   size_t send_count,
@@ -1178,6 +1581,107 @@ namespace llaminar2
         (void)recv_buffers;
         (void)send_count;
         (void)dtype;
+        (void)streams;
+        last_error_ = "NCCL not available";
+        return false;
+#endif
+    }
+
+    bool NCCLCoordinator::broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                                  const std::vector<void *> &recv_buffers,
+                                                  size_t count,
+                                                  CollectiveDataType dtype,
+                                                  int root,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_NCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "NCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid broadcast root " + std::to_string(root);
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!send_buffers[i] || !recv_buffers[i])
+            {
+                last_error_ = "Null broadcast buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null broadcast stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        nccl::ncclResult_t r = nccl::ncclGroupStart();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupStart failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            cudaError_t err = cudaSetDevice(device_ordinals_[i]);
+            if (err != cudaSuccess)
+            {
+                last_error_ = std::string("cudaSetDevice failed: ") + cudaGetErrorString(err);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+
+            nccl::ncclComm_t comm = static_cast<nccl::ncclComm_t>(comms_[i]);
+            cudaStream_t stream = static_cast<cudaStream_t>(streams[i]);
+            r = nccl::ncclBroadcast(
+                send_buffers[i],
+                recv_buffers[i],
+                count,
+                toNcclDataTypeInt(toDataTypeInt(dtype)),
+                root,
+                comm,
+                stream);
+            if (r != nccl::ncclSuccess)
+            {
+                last_error_ = std::string("ncclBroadcast(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              nccl::ncclGetErrorString(r);
+                nccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = nccl::ncclGroupEnd();
+        if (r != nccl::ncclSuccess)
+        {
+            last_error_ = std::string("ncclGroupEnd failed: ") + nccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)count;
+        (void)dtype;
+        (void)root;
         (void)streams;
         last_error_ = "NCCL not available";
         return false;

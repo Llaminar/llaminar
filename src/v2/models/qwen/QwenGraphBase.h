@@ -34,6 +34,7 @@
 #include "../GraphTypes.h"
 #include "../../execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "../../execution/compute_stages/ComputeStages.h"
+#include "../../execution/compute_stages/stages/TPAllreduceStage.h"
 #include "../../execution/local_execution/device/DeviceContext.h"
 #include "../../execution/config/ExecutionPolicy.h"
 #include "../../memory/BufferArena.h"
@@ -431,7 +432,8 @@ namespace llaminar2
             int layer_idx,
             bool is_attention,
             const std::string &stage_name = "",
-            std::optional<BufferId> tensor_buffer_id = std::nullopt) const;
+            std::optional<BufferId> tensor_buffer_id = std::nullopt,
+            std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings = {}) const;
 
         // =====================================================================
         // Shared Attention Building Blocks

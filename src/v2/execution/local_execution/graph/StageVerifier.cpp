@@ -268,7 +268,7 @@ namespace llaminar2
                     auto device_opt = base_tensor->current_device();
                     if (device_opt.has_value())
                     {
-                        ITensorValidator *validator = getTensorValidator(device_opt->type);
+                        ITensorValidator *validator = getTensorValidator(device_opt->type, device_opt->ordinal);
                         if (validator)
                         {
                             const void *device_ptr = base_tensor->gpu_data_ptr();

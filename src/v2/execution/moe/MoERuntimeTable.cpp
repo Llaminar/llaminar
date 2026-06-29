@@ -11,6 +11,7 @@
 #include "../../utils/PerfStatsCollector.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -176,6 +177,17 @@ namespace llaminar2
             return (1u << participant_count) - 1u;
         }
 
+        uint32_t participantMaskCount(uint32_t mask) noexcept
+        {
+            uint32_t count = 0;
+            while (mask != 0u)
+            {
+                mask &= (mask - 1u);
+                ++count;
+            }
+            return count;
+        }
+
         uint32_t synthesizedResidentParticipantMask(
             const MoEPlacementUpdate &update,
             uint32_t expert)
@@ -199,6 +211,20 @@ namespace llaminar2
             if (!update.resident_participant_mask.empty())
                 return update.resident_participant_mask[expert];
             return synthesizedResidentParticipantMask(update, expert);
+        }
+
+        void resetRouterHotCacheCounters(DeviceMoELayerRuntime &state) noexcept
+        {
+            state.router_hot_cache_eligible_dispatches = 0;
+            state.router_hot_cache_used_dispatches = 0;
+            state.router_hot_cache_improved_dispatches = 0;
+            state.router_hot_cache_default_load_spread_total = 0;
+            state.router_hot_cache_actual_load_spread_total = 0;
+            state.router_hot_cache_load_spread_improvement_total = 0;
+            state.router_hot_cache_active_dispatches = 0;
+            state.router_hot_cache_miss_dispatches = 0;
+            state.router_hot_cache_selected_expert_slots = 0;
+            state.router_hot_cache_replicated_selected_expert_slots = 0;
         }
 
     } // namespace
@@ -423,10 +449,14 @@ namespace llaminar2
         {
             std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
             std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts_, 0ULL);
+            resetRouterHotCacheCounters(state);
         }
 
         if (mirror_to_device_)
         {
+            const size_t counters_offset = offsetof(DeviceMoELayerRuntime, router_hot_cache_eligible_dispatches);
+            const size_t counters_bytes =
+                offsetof(DeviceMoELayerRuntime, route_expert_ids) - counters_offset;
             for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
             {
                 auto *dst = device_layers_[layer_idx].decode_histogram;
@@ -439,6 +469,12 @@ namespace llaminar2
                              static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                              stream,
                              layerPrefix(layer_idx) + "decode local histogram reset");
+                auto *counter_dst =
+                    reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
+                memsetMirror(device_id_, counter_dst, 0,
+                             counters_bytes,
+                             stream,
+                             layerPrefix(layer_idx) + "router hot-cache counter reset");
             }
             synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram reset sync");
         }
@@ -452,11 +488,15 @@ namespace llaminar2
         {
             std::fill(state.decode_histogram, state.decode_histogram + num_experts_, 0ULL);
             std::fill(state.decode_local_histogram, state.decode_local_histogram + num_experts_, 0ULL);
+            resetRouterHotCacheCounters(state);
         }
 
         if (!mirror_to_device_)
             return;
 
+        const size_t counters_offset = offsetof(DeviceMoELayerRuntime, router_hot_cache_eligible_dispatches);
+        const size_t counters_bytes =
+            offsetof(DeviceMoELayerRuntime, route_expert_ids) - counters_offset;
         for (int layer_idx = 0; layer_idx < num_layers_; ++layer_idx)
         {
             auto *dst = device_layers_[layer_idx].decode_histogram;
@@ -469,6 +509,12 @@ namespace llaminar2
                          static_cast<size_t>(num_experts_) * sizeof(uint64_t),
                          stream,
                          layerPrefix(layer_idx) + "decode local histogram reset");
+            auto *counter_dst =
+                reinterpret_cast<std::byte *>(device_layers_ + layer_idx) + counters_offset;
+            memsetMirror(device_id_, counter_dst, 0,
+                         counters_bytes,
+                         stream,
+                         layerPrefix(layer_idx) + "router hot-cache counter reset");
         }
         synchronizeMirror(device_id_, stream, "[MoERuntimeTable] decode histogram reset sync");
     }
@@ -551,7 +597,10 @@ namespace llaminar2
             bank.experts[expert] = update.experts[expert];
             bank.local_compute_mask[expert] = update.local_compute_mask[expert];
             bank.replica_role[expert] = update.replica_role[expert];
-            bank.resident_participant_mask[expert] = residentParticipantMaskForUpdate(update, expert);
+            const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
+            bank.resident_participant_mask[expert] = resident_mask;
+            if (participantMaskCount(resident_mask) > 1u)
+                ++bank.reserved[0];
         }
 
         return true;

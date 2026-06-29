@@ -130,6 +130,26 @@ namespace llaminar2
             bool write_legacy_outputs,
             bool update_runtime_histogram) override;
 
+        bool decodeRouteSelectWithReadyRebalanceApply(
+            DeviceMoELayerRuntime *runtime_layers,
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *gate_weights,
+            int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            bool write_legacy_outputs,
+            bool update_runtime_histogram,
+            const DeviceMoERebalancePlanEntry *rebalance_plan_entries,
+            uint32_t rebalance_plan_capacity,
+            DeviceMoERebalanceCommandBufferHeader *rebalance_command_header,
+            const DeviceMoEExpertDirectoryEntry *rebalance_local_transfer_slots,
+            uint32_t rebalance_local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &rebalance_config,
+            DeviceMoERebalanceApplyStatus *rebalance_apply_status,
+            DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
+            int rebalance_target_layer,
+            uint32_t rebalance_command_buffer_count) override;
+
         void zeroBuffer(ITensor *tensor, size_t bytes) override;
 
         void gatherTokenBatchFromTensors(
@@ -198,6 +218,21 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        bool updateGroupedExpertDownDescriptorTable(
+            int descriptor_table_id,
+            const DeviceNativeVNNIMatrixDesc *down_descs,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
+        bool updateGroupedExpertGateUpDescriptorTables(
+            int descriptor_table_id,
+            const DeviceNativeVNNIMatrixDesc *gate_descs,
+            const DeviceNativeVNNIMatrixDesc *up_descs,
+            int num_experts,
+            int d_model,
+            int intermediate) override;
+
         bool groupedExpertGateUpDecodeFromTable(
             const TensorBase *input,
             const int *expert_ids,
@@ -244,7 +279,9 @@ namespace llaminar2
             int top_k,
             ITensor *output,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::RuntimePlacementTable) override;
 
         bool groupedExpertDownDecodeFromTable(
             ITensor *const *gate_tensors,
@@ -277,6 +314,133 @@ namespace llaminar2
             ITensor *output,
             int d_model,
             int intermediate) override;
+
+        bool runDeviceRebalanceController(
+            DeviceMoELayerRuntime *runtime_layers,
+            const uint64_t *gathered_histograms,
+            DeviceMoERebalanceStatus *status,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalancePlanEntry *plan_entries = nullptr,
+            uint32_t *plan_count = nullptr,
+            uint32_t plan_capacity = 0,
+            uint32_t payload_slot_capacity = 0,
+            DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
+            DeviceMoERebalanceWaveState *wave_state = nullptr,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1) override;
+
+        bool packDeviceRebalanceHistograms(
+            DeviceMoELayerRuntime *runtime_layers,
+            uint64_t *local_histograms,
+            const DeviceMoERebalanceConfig &config,
+            const DeviceMoERebalanceWaveState *wave_state = nullptr,
+            const DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1) override;
+
+        bool packDeviceRebalanceDirectory(
+            DeviceMoELayerRuntime *runtime_layers,
+            DeviceMoEExpertDirectoryEntry *local_directory,
+            const DeviceMoERebalanceConfig &config) override;
+
+        bool packDeviceRebalanceSourceDescriptors(
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *command_headers,
+            uint32_t plan_capacity,
+            DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1) override;
+
+        bool projectDeviceRebalanceDomainCommands(
+            const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+            uint32_t plan_capacity,
+            DeviceMoERebalancePlanEntry *local_plan_entries,
+            DeviceMoERebalanceCommandBufferHeader *local_command_headers,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceStatus *status = nullptr,
+            uint32_t payload_slot_capacity = 0,
+            uint32_t command_buffer_count = 1) override;
+
+        bool packDeviceRebalanceCompactPayloads(
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *command_headers,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+            uint8_t *local_payload,
+            uint32_t local_payload_slot_count,
+            uint64_t payload_slot_bytes,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1) override;
+
+        bool packDeviceRebalanceCollectivePayloads(
+            const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_directory,
+            uint8_t *local_payload,
+            uint32_t local_payload_slot_count,
+            uint64_t payload_slot_bytes,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1) override;
+
+        bool unpackDeviceRebalanceCollectivePayloads(
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const uint32_t *plan_count,
+            uint32_t plan_capacity,
+            const DeviceMoERebalanceCommandBufferHeader *command_header,
+            const uint8_t *gathered_payload,
+            uint32_t local_payload_slot_count,
+            uint64_t payload_slot_bytes,
+            DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1) override;
+
+        bool initializeDeviceRebalanceGraphController(
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            const DeviceMoERebalanceConfig &config) override;
+
+        bool publishDeviceRebalanceTransferComplete(
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            const DeviceMoERebalanceCommandBufferHeader *command_header,
+            const DeviceMoERebalanceWaveState *wave_state,
+            const DeviceMoERebalanceApplyStatus *copy_status,
+            const DeviceMoERebalanceConfig &config,
+            uint32_t command_buffer_count = 1) override;
+
+        bool applyReadyDeviceRebalanceWave(
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const uint32_t *plan_count,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
+            int target_layer = -1,
+            uint32_t command_buffer_count = 1) override;
+
+        bool applyDeviceRebalanceArrivals(
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const uint32_t *plan_count,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            const DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
+            int target_layer = -1) override;
 
         // =================================================================
         // Phase 2: Device-resident histogram + expert mask
@@ -355,6 +519,10 @@ namespace llaminar2
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k,
             const uint8_t *expert_mask) override;
+
+        bool updateGroupedPrefillExpertMask(
+            const uint8_t *expert_mask,
+            int num_experts) override;
 
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 

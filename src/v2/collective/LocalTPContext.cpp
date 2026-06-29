@@ -65,6 +65,16 @@ extern "C"
 #endif
 
 #ifdef HAVE_ROCM
+namespace llaminar2
+{
+    namespace rccl_backend_detail
+    {
+        bool hipSetDeviceOrdinal(int device_ordinal);
+        bool hipMemcpyAsyncSameDevice(void *dst, const void *src, size_t bytes, int device_ordinal, void *stream);
+        bool hipMemsetAsyncDevice(void *dst, int value, size_t bytes, int device_ordinal, void *stream);
+    }
+}
+
 extern "C"
 {
     int rocmCastFP32ToFP16(const float *fp32_input, void *fp16_output,
@@ -171,6 +181,121 @@ namespace llaminar2
                 device.toString(),
                 std::move(tags));
         }
+
+        size_t sidebandResultElements(
+            LocalTPCollectiveSidebandKind kind,
+            size_t element_count,
+            size_t degree)
+        {
+            if (kind == LocalTPCollectiveSidebandKind::Allgather)
+                return element_count * degree;
+            return element_count;
+        }
+
+        CollectiveSidebandOp toBackendSidebandOp(LocalTPCollectiveSidebandKind kind)
+        {
+            switch (kind)
+            {
+            case LocalTPCollectiveSidebandKind::AllreduceSum:
+                return CollectiveSidebandOp::AllreduceSum;
+            case LocalTPCollectiveSidebandKind::Allgather:
+                return CollectiveSidebandOp::Allgather;
+            case LocalTPCollectiveSidebandKind::Broadcast:
+                return CollectiveSidebandOp::Broadcast;
+            }
+            return CollectiveSidebandOp::AllreduceSum;
+        }
+
+        const char *backendSidebandPrimitiveName(LocalTPCollectiveSidebandKind kind)
+        {
+            switch (kind)
+            {
+            case LocalTPCollectiveSidebandKind::AllreduceSum:
+                return "allreduceWithSidebandsMultiOnStreams/allreduce";
+            case LocalTPCollectiveSidebandKind::Allgather:
+                return "allreduceWithSidebandsMultiOnStreams/allgather";
+            case LocalTPCollectiveSidebandKind::Broadcast:
+                return "allreduceWithSidebandsMultiOnStreams/broadcast";
+            }
+            return "allreduceWithSidebandsMultiOnStreams/unknown";
+        }
+
+        void recordLocalTPRuntimeGroupedSidebands(
+            const DeviceGroup &device_group,
+            CollectiveBackendType backend,
+            const DeviceId &device,
+            const std::string &stage_name,
+            size_t degree,
+            int device_index,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            for (const auto &sideband : sidebands)
+            {
+                const size_t element_bytes = collectiveDataTypeBytes(sideband.dtype);
+                const size_t local_bytes = sideband.element_count * element_bytes;
+                const size_t result_bytes =
+                    sidebandResultElements(sideband.kind, sideband.element_count, degree) *
+                    element_bytes;
+                PerfStatsCollector::Tags tags{
+                    {"stage", stage_name.empty() ? "unnamed" : stage_name},
+                    {"anchor_stage", stage_name.empty() ? "unnamed" : stage_name},
+                    {"anchor_collective", "allreduce"},
+                    {"backend", collectiveBackendTypeToString(backend)},
+                    {"scope", "local"},
+                    {"degree", std::to_string(degree)},
+                    {"sideband", sideband.name.empty() ? "unnamed" : sideband.name},
+                    {"kind", toString(sideband.kind)},
+                    {"dtype", collectiveDataTypeName(sideband.dtype)},
+                    {"element_bytes", std::to_string(element_bytes)},
+                    {"elements", std::to_string(sideband.element_count)},
+                    {"result_elements", std::to_string(sidebandResultElements(
+                                            sideband.kind, sideband.element_count, degree))},
+                    {"root_device_index", std::to_string(sideband.root_device_index)},
+                    {"device_index", std::to_string(device_index)},
+                    {"backend_primitive", backendSidebandPrimitiveName(sideband.kind)},
+                    {"path", "allreduce_with_sidebands_grouped_on_streams"},
+                    {"launch_relation", "same_group_as_anchor"},
+                    {"fused_with_anchor", "true"},
+                    {"physical_fusion", "grouped_with_anchor_collective"},
+                    {"homogeneous", device_group.is_homogeneous ? "true" : "false"}};
+
+                PerfStatsCollector::addCounter(
+                    "tp_allreduce_runtime",
+                    "sideband_backend_collective_calls",
+                    1.0,
+                    {},
+                    device.toString(),
+                    tags);
+                PerfStatsCollector::addCounter(
+                    "tp_allreduce_runtime",
+                    "sideband_grouped_with_anchor_collective_calls",
+                    1.0,
+                    {},
+                    device.toString(),
+                    tags);
+
+                PerfStatsCollector::Tags local_byte_tags = tags;
+                PerfStatsCollector::addCounter(
+                    "tp_allreduce_runtime",
+                    "sideband_local_bytes",
+                    static_cast<double>(local_bytes),
+                    {},
+                    device.toString(),
+                    std::move(local_byte_tags));
+
+                PerfStatsCollector::Tags result_byte_tags = tags;
+                PerfStatsCollector::addCounter(
+                    "tp_allreduce_runtime",
+                    "sideband_result_bytes",
+                    static_cast<double>(result_bytes),
+                    {},
+                    device.toString(),
+                    std::move(result_byte_tags));
+            }
+        }
     } // namespace
 
     bool LocalTPContext::isLocalTPGpuGraphPolicySupported(
@@ -225,7 +350,7 @@ namespace llaminar2
         return false;
     }
 
-    bool LocalTPContext::isLocalTPNCCLGraphPolicySupported(std::string *reason_out) const
+    bool LocalTPContext::isLocalTPGpuGraphPolicySupported(std::string *reason_out) const
     {
         return isLocalTPGpuGraphPolicySupported(backend_, reason_out);
     }
@@ -2670,10 +2795,10 @@ namespace llaminar2
             // support, we fail fast with a clear marker instead of attempting an
             // undefined collective scheduling path.
             if (backend_ == CollectiveBackendType::NCCL ||
-                (backend_ == CollectiveBackendType::RCCL && debugEnv().execution.gpu_graph_collective_segmented))
+                backend_ == CollectiveBackendType::RCCL)
             {
                 std::string graph_policy_reason;
-                const bool graph_supported = isLocalTPNCCLGraphPolicySupported(&graph_policy_reason);
+                const bool graph_supported = isLocalTPGpuGraphPolicySupported(&graph_policy_reason);
                 if (!graph_supported)
                 {
                     if (!logged_graph_policy_reject_marker_.exchange(true))
@@ -3079,7 +3204,552 @@ namespace llaminar2
             return false;
         if (!backend_impl_->isMultiGpuSingleProcess())
             return false;
+#ifdef HAVE_ROCM
+        if (backend_ == CollectiveBackendType::RCCL)
+            return backend_impl_->supportsAllreduceSingleDeviceOnStream();
+#endif
         return backend_impl_->supportsAllgatherSingleDeviceOnStream();
+    }
+
+    bool LocalTPContext::supportsCollectiveSidebandOnStreamGraphCapture() const
+    {
+        if (degree() <= 1 || !backend_initialized_ || !backend_impl_)
+            return false;
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+            return false;
+        if (!backend_impl_->isMultiGpuSingleProcess())
+            return false;
+        return backend_impl_->supportsAllreduceWithSidebandsMultiOnStreams();
+    }
+
+    bool LocalTPContext::allreduceWithSidebandsOnStream(
+        TensorBase *tensor,
+        const std::string &stage_name,
+        size_t count,
+        void *producer_stream,
+        const std::string &precision,
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+        int device_index)
+    {
+        if (!producer_stream)
+            throw std::invalid_argument("LocalTPContext::allreduceWithSidebandsOnStream requires a non-null GPU stream");
+
+        if (sidebands.empty())
+            return allreduceOnStream(tensor, stage_name, count, producer_stream, precision);
+
+        if (!tensor)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: null tensor"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: invalid device_index="
+                      << device_index << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (degree() <= 1)
+            return allreduceOnStream(tensor, stage_name, count, producer_stream, precision);
+
+        if (!backend_initialized_ || !backend_impl_)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: backend is not initialized"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: only homogeneous NCCL/RCCL domains are supported"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            return false;
+        }
+
+        if (!backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: backend is not in multi-GPU single-process mode"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+
+        if (!backend_impl_->supportsAllreduceWithSidebandsMultiOnStreams())
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: backend does not support grouped allreduce sideband bundles"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            requestAbort();
+            return false;
+        }
+
+        auto tensor_device = tensor->current_device();
+        if (!tensor_device.has_value() ||
+            devices_[static_cast<size_t>(device_index)].toLocalDeviceId() != *tensor_device)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: tensor device mismatch"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " slot=" << device_index
+                      << " expected=" << devices_[static_cast<size_t>(device_index)].toLocalDeviceId().toString()
+                      << " actual=" << (tensor_device.has_value() ? tensor_device->toString() : "none"));
+            requestAbort();
+            return false;
+        }
+
+        void *buffer = tensor->gpu_data_ptr();
+        if (!buffer)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: null GPU buffer for slot "
+                      << device_index << " stage="
+                      << (stage_name.empty() ? "(none)" : stage_name));
+            requestAbort();
+            return false;
+        }
+
+        const size_t effective_count = (count > 0) ? count : tensor->numel();
+        if (effective_count == 0)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: zero allreduce count"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            requestAbort();
+            return false;
+        }
+
+        for (const auto &sideband : sidebands)
+        {
+            if (sideband.element_count == 0)
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: zero sideband element_count"
+                          << " sideband=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                requestAbort();
+                return false;
+            }
+            if (sideband.root_device_index < 0 || sideband.root_device_index >= degree())
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: invalid sideband root_device_index="
+                          << sideband.root_device_index << " degree=" << degree()
+                          << " sideband=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                requestAbort();
+                return false;
+            }
+        }
+
+        CollectiveDataType dtype = tensorDTypeToCollective(tensor);
+        const std::string effective_precision =
+            precision.empty() ? std::string(kDefaultAllreducePrecision) : precision;
+        const bool use_fp16_allreduce =
+            effective_precision == "fp16" &&
+            dtype == CollectiveDataType::FLOAT32 &&
+            effective_count >= debugEnv().allreduce_fp16_min_elements;
+
+        void *collective_buffer = buffer;
+        CollectiveDataType collective_dtype = dtype;
+        const int ordinal = devices_[static_cast<size_t>(device_index)].device_ordinal;
+
+        if (use_fp16_allreduce)
+        {
+            constexpr size_t kFP16ScratchGuardBytes = 4096;
+            if (fp16_scratch_buffers_.size() != devices_.size() ||
+                fp16_scratch_counts_.size() != devices_.size())
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: FP16 scratch metadata invariant broken"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                requestAbort();
+                return false;
+            }
+
+            if (fp16_scratch_counts_[static_cast<size_t>(device_index)] < effective_count)
+            {
+                const size_t live_bytes = effective_count * sizeof(uint16_t);
+                const size_t alloc_bytes = live_bytes + kFP16ScratchGuardBytes;
+                if (fp16_scratch_buffers_[static_cast<size_t>(device_index)])
+                {
+#ifdef HAVE_CUDA
+                    if (device_group_.allCUDA())
+                        cudaFP16ScratchFree(fp16_scratch_buffers_[static_cast<size_t>(device_index)], ordinal);
+#endif
+#ifdef HAVE_ROCM
+                    if (device_group_.allROCm())
+                        rocmFP16ScratchFree(fp16_scratch_buffers_[static_cast<size_t>(device_index)], ordinal);
+#endif
+                    fp16_scratch_buffers_[static_cast<size_t>(device_index)] = nullptr;
+                }
+
+                bool alloc_ok = false;
+#ifdef HAVE_CUDA
+                if (device_group_.allCUDA())
+                    alloc_ok = (cudaFP16ScratchAlloc(
+                                    &fp16_scratch_buffers_[static_cast<size_t>(device_index)],
+                                    alloc_bytes,
+                                    ordinal) == 0);
+#endif
+#ifdef HAVE_ROCM
+                if (device_group_.allROCm())
+                    alloc_ok = (rocmFP16ScratchAlloc(
+                                    &fp16_scratch_buffers_[static_cast<size_t>(device_index)],
+                                    alloc_bytes,
+                                    ordinal) == 0);
+#endif
+                if (!alloc_ok)
+                {
+                    LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: FP16 scratch alloc failed"
+                              << " bytes=" << alloc_bytes
+                              << " ordinal=" << ordinal
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                    requestAbort();
+                    return false;
+                }
+                fp16_scratch_counts_[static_cast<size_t>(device_index)] = effective_count;
+            }
+
+            collective_buffer = fp16_scratch_buffers_[static_cast<size_t>(device_index)];
+            collective_dtype = CollectiveDataType::FLOAT16;
+            bool cast_ok = false;
+#ifdef HAVE_CUDA
+            if (device_group_.allCUDA())
+            {
+                cast_ok = (cudaCastFP32ToFP16(
+                               static_cast<const float *>(buffer),
+                               collective_buffer,
+                               effective_count,
+                               ordinal,
+                               static_cast<cudaStream_t>(producer_stream)) == 0);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device_group_.allROCm())
+            {
+                cast_ok = (rocmCastFP32ToFP16(
+                               static_cast<const float *>(buffer),
+                               collective_buffer,
+                               effective_count,
+                               ordinal,
+                               producer_stream) == 0);
+            }
+#endif
+            if (!cast_ok)
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: FP32->FP16 cast failed"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                requestAbort();
+                return false;
+            }
+        }
+
+        const bool grouped_ok = allreduceGroupedOnExplicitStreams(
+            collective_buffer,
+            effective_count,
+            collective_dtype,
+            device_index,
+            producer_stream,
+            stage_name,
+            effective_precision,
+            &sidebands);
+        if (!grouped_ok)
+        {
+            LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: grouped allreduce sideband bundle failed"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_)
+                      << " error=" << (backend_impl_ ? backend_impl_->lastError() : "missing backend"));
+            requestAbort();
+            return false;
+        }
+
+        if (use_fp16_allreduce)
+        {
+            bool back_ok = false;
+#ifdef HAVE_CUDA
+            if (device_group_.allCUDA())
+            {
+                back_ok = (cudaCastFP16ToFP32(
+                               collective_buffer,
+                               static_cast<float *>(buffer),
+                               effective_count,
+                               ordinal,
+                               static_cast<cudaStream_t>(producer_stream)) == 0);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device_group_.allROCm())
+            {
+                back_ok = (rocmCastFP16ToFP32(
+                               collective_buffer,
+                               static_cast<float *>(buffer),
+                               effective_count,
+                               ordinal,
+                               producer_stream) == 0);
+            }
+#endif
+            if (!back_ok)
+            {
+                LOG_ERROR("LocalTPContext::allreduceWithSidebandsOnStream: FP16->FP32 cast-back failed"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                requestAbort();
+                return false;
+            }
+        }
+
+        recordLocalTPRuntimeAllreduce(
+            device_group_, backend_, devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
+            stage_name, static_cast<size_t>(degree()), effective_count,
+            collective_dtype, "on_stream_grouped_with_sidebands", effective_precision);
+        recordLocalTPRuntimeGroupedSidebands(
+            device_group_, backend_, devices_[static_cast<size_t>(device_index)].toLocalDeviceId(),
+            stage_name, static_cast<size_t>(degree()), device_index, sidebands);
+
+        tensor->transitionToWithEvent(
+            TensorCoherenceState::DEVICE_AUTHORITATIVE,
+            std::nullopt,
+            producer_stream);
+        return true;
+    }
+
+    bool LocalTPContext::collectiveSidebandOnStream(
+        const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+        int device_index,
+        void *producer_stream,
+        const std::string &anchor_stage_name)
+    {
+        if (!producer_stream)
+            throw std::invalid_argument("LocalTPContext::collectiveSidebandOnStream requires a non-null GPU stream");
+
+        if (sidebands.empty())
+            return true;
+
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: invalid device_index="
+                      << device_index << " degree=" << degree()
+                      << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name));
+            return false;
+        }
+
+        if (degree() <= 1)
+            return true;
+
+        if (!backend_initialized_ || !backend_impl_)
+        {
+            LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: backend is not initialized"
+                      << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name));
+            return false;
+        }
+
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+        {
+            LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: only homogeneous NCCL/RCCL domains are supported"
+                      << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            return false;
+        }
+
+        if (!backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: backend is not in multi-GPU single-process mode"
+                      << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name));
+            return false;
+        }
+
+        auto fail_backend = [&](const LocalTPCollectiveSidebandBuffer &sideband,
+                                const std::string &op_name) -> bool
+        {
+            LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: " << op_name
+                      << " failed"
+                      << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                      << " kind=" << toString(sideband.kind)
+                      << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name)
+                      << " backend_error=" << backend_impl_->lastError());
+            requestAbort();
+            return false;
+        };
+
+        auto record_sideband_runtime = [&](
+                                           const LocalTPCollectiveSidebandBuffer &sideband,
+                                           const char *backend_primitive)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const size_t element_bytes = collectiveDataTypeBytes(sideband.dtype);
+            const size_t local_bytes = sideband.element_count * element_bytes;
+            const size_t result_bytes =
+                sidebandResultElements(
+                    sideband.kind,
+                    sideband.element_count,
+                    static_cast<size_t>(degree())) *
+                element_bytes;
+            const std::string device_label =
+                (device_index >= 0 && device_index < static_cast<int>(devices_.size()))
+                    ? devices_[static_cast<size_t>(device_index)].toLocalDeviceId().toString()
+                    : std::string{};
+
+            PerfStatsCollector::Tags tags{
+                {"stage", anchor_stage_name.empty() ? "unnamed" : anchor_stage_name},
+                {"anchor_stage", anchor_stage_name.empty() ? "unnamed" : anchor_stage_name},
+                {"anchor_collective", "allreduce"},
+                {"backend", collectiveBackendTypeToString(backend_)},
+                {"scope", "local"},
+                {"degree", std::to_string(degree())},
+                {"sideband", sideband.name.empty() ? "unnamed" : sideband.name},
+                {"kind", toString(sideband.kind)},
+                {"dtype", collectiveDataTypeName(sideband.dtype)},
+                {"element_bytes", std::to_string(element_bytes)},
+                {"elements", std::to_string(sideband.element_count)},
+                {"result_elements", std::to_string(sidebandResultElements(
+                                        sideband.kind,
+                                        sideband.element_count,
+                                        static_cast<size_t>(degree())))},
+                {"root_device_index", std::to_string(sideband.root_device_index)},
+                {"device_index", std::to_string(device_index)},
+                {"backend_primitive", backend_primitive ? backend_primitive : "unknown"},
+                {"path", "collective_sideband_on_stream"},
+                {"launch_relation", "same_stream_after_anchor"},
+                {"fused_with_anchor", "false"},
+                {"physical_fusion", "separate_backend_collective"},
+                {"homogeneous", device_group_.is_homogeneous ? "true" : "false"}};
+
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_runtime",
+                "sideband_backend_collective_calls",
+                1.0,
+                {},
+                device_label,
+                tags);
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_runtime",
+                "sideband_separate_backend_collective_calls",
+                1.0,
+                {},
+                device_label,
+                tags);
+
+            PerfStatsCollector::Tags local_byte_tags = tags;
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_runtime",
+                "sideband_local_bytes",
+                static_cast<double>(local_bytes),
+                {},
+                device_label,
+                std::move(local_byte_tags));
+
+            PerfStatsCollector::Tags result_byte_tags = tags;
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_runtime",
+                "sideband_result_bytes",
+                static_cast<double>(result_bytes),
+                {},
+                device_label,
+                std::move(result_byte_tags));
+        };
+
+        for (const auto &sideband : sidebands)
+        {
+            if (sideband.element_count == 0)
+            {
+                LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: zero element_count"
+                          << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                          << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name));
+                return false;
+            }
+            if (sideband.root_device_index < 0 || sideband.root_device_index >= degree())
+            {
+                LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: invalid root_device_index="
+                          << sideband.root_device_index << " degree=" << degree()
+                          << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                          << " anchor=" << (anchor_stage_name.empty() ? "(none)" : anchor_stage_name));
+                return false;
+            }
+
+            switch (sideband.kind)
+            {
+            case LocalTPCollectiveSidebandKind::AllreduceSum:
+                if (!sideband.recv_buffer)
+                {
+                    LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: AllreduceSum requires recv_buffer"
+                              << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name));
+                    return false;
+                }
+                if (sideband.send_buffer && sideband.send_buffer != sideband.recv_buffer)
+                {
+                    LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: AllreduceSum is currently in-place only"
+                              << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name));
+                    return false;
+                }
+                if (!backend_impl_->allreduceSingleDeviceOnStream(
+                        sideband.recv_buffer,
+                        sideband.element_count,
+                        sideband.dtype,
+                        CollectiveOp::ALLREDUCE_SUM,
+                        device_index,
+                        producer_stream))
+                    return fail_backend(sideband, "allreduce sideband");
+                record_sideband_runtime(sideband, "allreduceSingleDeviceOnStream");
+                break;
+
+            case LocalTPCollectiveSidebandKind::Allgather:
+                if (!sideband.send_buffer || !sideband.recv_buffer)
+                {
+                    LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: Allgather requires send_buffer and recv_buffer"
+                              << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name));
+                    return false;
+                }
+                if (!backend_impl_->supportsAllgatherSingleDeviceOnStream())
+                {
+                    LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: backend does not support on-stream allgather sidebands"
+                              << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                              << " backend=" << collectiveBackendTypeToString(backend_));
+                    return false;
+                }
+                if (!backend_impl_->allgatherSingleDeviceOnStream(
+                        sideband.send_buffer,
+                        sideband.recv_buffer,
+                        sideband.element_count,
+                        sideband.dtype,
+                        device_index,
+                        producer_stream))
+                    return fail_backend(sideband, "allgather sideband");
+                record_sideband_runtime(sideband, "allgatherSingleDeviceOnStream");
+                break;
+
+            case LocalTPCollectiveSidebandKind::Broadcast:
+            {
+                if (!sideband.recv_buffer)
+                {
+                    LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: Broadcast requires recv_buffer"
+                              << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name));
+                    return false;
+                }
+                if (!backend_impl_->supportsBroadcastSingleDeviceOnStream())
+                {
+                    LOG_ERROR("LocalTPContext::collectiveSidebandOnStream: backend does not support on-stream broadcast sidebands"
+                              << " name=" << (sideband.name.empty() ? "(unnamed)" : sideband.name)
+                              << " backend=" << collectiveBackendTypeToString(backend_));
+                    return false;
+                }
+                const void *send_buffer = sideband.send_buffer ? sideband.send_buffer : sideband.recv_buffer;
+                if (!backend_impl_->broadcastSingleDeviceOnStream(
+                        send_buffer,
+                        sideband.recv_buffer,
+                        sideband.element_count,
+                        sideband.dtype,
+                        sideband.root_device_index,
+                        device_index,
+                        producer_stream))
+                    return fail_backend(sideband, "broadcast sideband");
+                record_sideband_runtime(sideband, "broadcastSingleDeviceOnStream");
+                break;
+            }
+            }
+        }
+
+        return true;
     }
 
     bool LocalTPContext::allgatherRawOnStream(
@@ -3157,6 +3827,82 @@ namespace llaminar2
                           << " backend=" << collectiveBackendTypeToString(backend_));
                 return false;
             }
+#ifdef HAVE_ROCM
+            if (backend_ == CollectiveBackendType::RCCL)
+            {
+                /*
+                 * RCCL allgather can report successful capture on this stack
+                 * while replaying as a no-op. Emulate allgather with captured
+                 * allreduce over a full receive buffer: every participant
+                 * zeros the full buffer, copies its local payload into its own
+                 * disjoint slice, then sums all slices. This is graph-safe
+                 * because captured RCCL allreduce is the validated primitive.
+                 */
+                const size_t element_bytes = collectiveDataTypeBytes(dtype);
+                const size_t local_bytes = send_count * element_bytes;
+                const size_t full_count = send_count * static_cast<size_t>(degree());
+                const size_t full_bytes = full_count * element_bytes;
+                auto *recv_bytes = static_cast<unsigned char *>(full_recv);
+                const auto *send_bytes = static_cast<const unsigned char *>(local_send);
+                const auto *recv_begin = recv_bytes;
+                const auto *recv_end = recv_bytes + full_bytes;
+                const auto *send_begin = send_bytes;
+                const auto *send_end = send_bytes + local_bytes;
+                if (send_begin < recv_end && recv_begin < send_end)
+                {
+                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: RCCL graph-captured allreduce emulation requires non-overlapping send/recv buffers"
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                    return false;
+                }
+
+                const int ordinal = devices_[static_cast<size_t>(device_index)].device_ordinal;
+                if (!rccl_backend_detail::hipSetDeviceOrdinal(ordinal))
+                {
+                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: hipSetDevice failed for RCCL allgather emulation"
+                              << " ordinal=" << ordinal
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                    return false;
+                }
+                if (!rccl_backend_detail::hipMemsetAsyncDevice(
+                        full_recv,
+                        0,
+                        full_bytes,
+                        ordinal,
+                        producer_stream))
+                {
+                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: hipMemsetAsync failed for RCCL allgather emulation"
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                    return false;
+                }
+                void *slice =
+                    recv_bytes + static_cast<size_t>(device_index) * local_bytes;
+                if (!rccl_backend_detail::hipMemcpyAsyncSameDevice(
+                        slice,
+                        local_send,
+                        local_bytes,
+                        ordinal,
+                        producer_stream))
+                {
+                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: hipMemcpyAsync failed for RCCL allgather emulation"
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                    return false;
+                }
+                if (!backend_impl_->allreduceSingleDeviceOnStream(
+                        full_recv,
+                        full_count,
+                        dtype,
+                        CollectiveOp::ALLREDUCE_SUM,
+                        device_index,
+                        producer_stream))
+                {
+                    LOG_ERROR("LocalTPContext::allgatherRawOnStream: RCCL allreduce-backed allgather emulation failed"
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                              << " backend_error=" << backend_impl_->lastError());
+                    return false;
+                }
+                return true;
+            }
+#endif
             if (!backend_impl_->allgatherSingleDeviceOnStream(
                     local_send,
                     full_recv,
@@ -3181,6 +3927,108 @@ namespace llaminar2
             device_index,
             producer_stream,
             stage_name);
+    }
+
+    bool LocalTPContext::groupedP2PRawOnStream(
+        const std::vector<CollectiveP2POp> &ops,
+        int device_index,
+        void *producer_stream,
+        const std::string &stage_name)
+    {
+        if (device_index < 0 || device_index >= degree())
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: invalid device_index="
+                      << device_index << " degree=" << degree()
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (!producer_stream)
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: explicit non-null producer stream is required"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " device_index=" << device_index);
+            return false;
+        }
+        if (ops.empty())
+            return true;
+
+        if (degree() == 1)
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: single-device raw P2P is not a valid handoff"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (!backend_initialized_ || !backend_impl_)
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: backend is not initialized"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (backend_ != CollectiveBackendType::NCCL &&
+            backend_ != CollectiveBackendType::RCCL)
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: only homogeneous NCCL/RCCL domains are supported"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            return false;
+        }
+        if (!backend_impl_->isMultiGpuSingleProcess())
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: backend does not support multi-GPU single-process P2P"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+            return false;
+        }
+        if (!backend_impl_->supportsGroupedP2PSingleDeviceOnStream())
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: backend cannot capture grouped raw P2P on explicit stream"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend=" << collectiveBackendTypeToString(backend_));
+            return false;
+        }
+
+        for (const auto &op : ops)
+        {
+            if (op.count == 0)
+            {
+                LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: zero-count P2P op"
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
+            }
+            if (op.peer < 0 || op.peer >= degree() || op.peer == device_index)
+            {
+                LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: invalid peer="
+                          << op.peer << " device_index=" << device_index
+                          << " degree=" << degree()
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
+            }
+            if (op.kind == CollectiveP2POpKind::Send && !op.send_buffer)
+            {
+                LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: null send buffer"
+                          << " peer=" << op.peer
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
+            }
+            if (op.kind == CollectiveP2POpKind::Recv && !op.recv_buffer)
+            {
+                LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: null recv buffer"
+                          << " peer=" << op.peer
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name));
+                return false;
+            }
+        }
+
+        if (!backend_impl_->groupedP2PSingleDeviceOnStream(
+                ops,
+                device_index,
+                producer_stream))
+        {
+            LOG_ERROR("LocalTPContext::groupedP2PRawOnStream: grouped on-stream P2P failed"
+                      << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                      << " backend_error=" << backend_impl_->lastError());
+            return false;
+        }
+        return true;
     }
 
     bool LocalTPContext::allgatherRawWithBarrierMultiGpu(
@@ -3643,10 +4491,14 @@ namespace llaminar2
                                                            int device_index,
                                                            void *stream,
                                                            const std::string &stage_name,
-                                                           const std::string &precision)
+                                                           const std::string &precision,
+                                                           const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands)
     {
         if (degree() <= 1)
             return true;
+
+        const size_t sideband_count = sidebands ? sidebands->size() : 0;
+        const bool graph_capture_active = isGraphCaptureActive();
 
         if (!buffer || !stream)
         {
@@ -3683,6 +4535,10 @@ namespace llaminar2
             grouped_onstream_allreduce_buffers_.clear();
             grouped_onstream_allreduce_streams_.clear();
             grouped_onstream_allreduce_seen_.clear();
+            grouped_onstream_allreduce_graph_capture_active_ = false;
+            grouped_onstream_allreduce_sideband_count_ = 0;
+            grouped_onstream_allreduce_reference_sidebands_.clear();
+            grouped_onstream_allreduce_sidebands_.clear();
             grouped_onstream_allreduce_generation_++;
         };
 
@@ -3709,10 +4565,13 @@ namespace llaminar2
             grouped_onstream_allreduce_cv_.notify_all();
         };
 
-        auto depart_generation = [&]() -> bool
+        auto depart_generation = [&](bool participant_result = true) -> bool
         {
+            if (!participant_result)
+                grouped_onstream_allreduce_result_ = false;
             const bool result = grouped_onstream_allreduce_ready_ &&
                                 grouped_onstream_allreduce_result_ &&
+                                participant_result &&
                                 !abort_requested_.load(std::memory_order_acquire);
             grouped_onstream_allreduce_departures_++;
             if (grouped_onstream_allreduce_departures_ >= degree())
@@ -3744,6 +4603,13 @@ namespace llaminar2
             grouped_onstream_allreduce_buffers_.assign(static_cast<size_t>(degree()), nullptr);
             grouped_onstream_allreduce_streams_.assign(static_cast<size_t>(degree()), nullptr);
             grouped_onstream_allreduce_seen_.assign(static_cast<size_t>(degree()), false);
+            grouped_onstream_allreduce_graph_capture_active_ = graph_capture_active;
+            grouped_onstream_allreduce_sideband_count_ = sideband_count;
+            grouped_onstream_allreduce_reference_sidebands_ =
+                sidebands ? *sidebands : std::vector<LocalTPCollectiveSidebandBuffer>{};
+            grouped_onstream_allreduce_sidebands_.assign(
+                static_cast<size_t>(degree()),
+                std::vector<LocalTPCollectiveSidebandBuffer>{});
         }
         else
         {
@@ -3775,6 +4641,37 @@ namespace llaminar2
                                 " actual=" + (precision.empty() ? std::string("(default)") : precision));
                 return false;
             }
+            if (grouped_onstream_allreduce_sideband_count_ != sideband_count)
+            {
+                fail_generation("sideband count mismatch expected=" +
+                                std::to_string(grouped_onstream_allreduce_sideband_count_) +
+                                " actual=" + std::to_string(sideband_count));
+                return false;
+            }
+            if (grouped_onstream_allreduce_graph_capture_active_ != graph_capture_active)
+            {
+                fail_generation("graph capture state mismatch expected=" +
+                                std::string(grouped_onstream_allreduce_graph_capture_active_ ? "active" : "inactive") +
+                                " actual=" + (graph_capture_active ? "active" : "inactive") +
+                                " stage=" + (stage_name.empty() ? std::string("(none)") : stage_name));
+                return false;
+            }
+            for (size_t sideband_index = 0; sideband_index < sideband_count; ++sideband_index)
+            {
+                const auto &expected =
+                    grouped_onstream_allreduce_reference_sidebands_[sideband_index];
+                const auto &actual = (*sidebands)[sideband_index];
+                if (expected.kind != actual.kind ||
+                    expected.element_count != actual.element_count ||
+                    expected.dtype != actual.dtype ||
+                    expected.root_device_index != actual.root_device_index)
+                {
+                    fail_generation("sideband descriptor mismatch index=" +
+                                    std::to_string(sideband_index) +
+                                    " stage=" + (stage_name.empty() ? std::string("(none)") : stage_name));
+                    return false;
+                }
+            }
         }
 
         if (grouped_onstream_allreduce_seen_[static_cast<size_t>(device_index)])
@@ -3787,6 +4684,8 @@ namespace llaminar2
         grouped_onstream_allreduce_seen_[static_cast<size_t>(device_index)] = true;
         grouped_onstream_allreduce_buffers_[static_cast<size_t>(device_index)] = buffer;
         grouped_onstream_allreduce_streams_[static_cast<size_t>(device_index)] = stream;
+        if (sideband_count > 0)
+            grouped_onstream_allreduce_sidebands_[static_cast<size_t>(device_index)] = *sidebands;
 
         if (debugEnv().tp_collective_contract_trace)
         {
@@ -3802,6 +4701,7 @@ namespace llaminar2
                       << " count=" << effective_count
                       << " dtype=" << static_cast<int>(dtype)
                       << " precision=" << (precision.empty() ? "(default)" : precision)
+                      << " sidebands=" << sideband_count
                       << " stream=" << stream
                       << " buffer=" << buffer);
         }
@@ -3847,6 +4747,38 @@ namespace llaminar2
                 return false;
             }
 
+            if (grouped_onstream_allreduce_graph_capture_active_)
+            {
+                const bool ready_to_enqueue =
+                    grouped_onstream_allreduce_ready_ &&
+                    grouped_onstream_allreduce_result_ &&
+                    !abort_requested_.load(std::memory_order_acquire);
+                lock.unlock();
+
+                bool enqueue_ok = false;
+                if (ready_to_enqueue && backend_impl_)
+                {
+                    enqueue_ok = backend_impl_->allreduceSingleDeviceOnStream(
+                        buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
+                        device_index, stream);
+                }
+
+                lock.lock();
+                if (!enqueue_ok)
+                {
+                    grouped_onstream_allreduce_result_ = false;
+                    grouped_onstream_allreduce_error_ =
+                        backend_impl_ ? backend_impl_->lastError() : std::string("missing backend");
+                    abort_requested_.store(true, std::memory_order_release);
+                    LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: graph-captured participant launch failed"
+                              << " backend=" << collectiveBackendTypeToString(backend_)
+                              << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                              << " slot=" << device_index
+                              << " error=" << grouped_onstream_allreduce_error_);
+                }
+                return depart_generation(enqueue_ok);
+            }
+
             return depart_generation();
         }
 
@@ -3855,7 +4787,10 @@ namespace llaminar2
             if (i >= static_cast<int>(grouped_onstream_allreduce_seen_.size()) ||
                 !grouped_onstream_allreduce_seen_[static_cast<size_t>(i)] ||
                 !grouped_onstream_allreduce_buffers_[static_cast<size_t>(i)] ||
-                !grouped_onstream_allreduce_streams_[static_cast<size_t>(i)])
+                !grouped_onstream_allreduce_streams_[static_cast<size_t>(i)] ||
+                (grouped_onstream_allreduce_sideband_count_ > 0 &&
+                 grouped_onstream_allreduce_sidebands_[static_cast<size_t>(i)].size() !=
+                     grouped_onstream_allreduce_sideband_count_))
             {
                 fail_generation("missing grouped on-stream participant slot=" +
                                 std::to_string(i) +
@@ -3864,19 +4799,168 @@ namespace llaminar2
             }
         }
 
-        if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+        if (grouped_onstream_allreduce_sideband_count_ > 0)
+        {
+            if (grouped_onstream_allreduce_graph_capture_active_)
+            {
+                fail_generation("graph-captured grouped allreduce sidebands require participant-local sideband capture stage=" +
+                                (stage_name.empty() ? std::string("(none)") : stage_name));
+                return false;
+            }
+            if (!backend_impl_ || !backend_impl_->supportsAllreduceWithSidebandsMultiOnStreams())
+            {
+                fail_generation(std::string("backend does not support grouped allreduce sideband bundles backend=") +
+                                collectiveBackendTypeToString(backend_));
+                return false;
+            }
+        }
+        else if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
+        {
+            if (!grouped_onstream_allreduce_graph_capture_active_ ||
+                !backend_impl_ ||
+                !backend_impl_->supportsAllreduceSingleDeviceOnStream())
+            {
+                fail_generation(std::string("backend does not support grouped explicit-stream allreduce backend=") +
+                                collectiveBackendTypeToString(backend_));
+                return false;
+            }
+        }
+
+        if (grouped_onstream_allreduce_graph_capture_active_)
+        {
+            if (!backend_impl_ || !backend_impl_->supportsAllreduceSingleDeviceOnStream())
+            {
+                fail_generation(std::string("backend does not support graph-captured participant-local allreduce backend=") +
+                                collectiveBackendTypeToString(backend_));
+                return false;
+            }
+
+            grouped_onstream_allreduce_result_ = true;
+            grouped_onstream_allreduce_ready_ = true;
+            grouped_onstream_allreduce_cv_.notify_all();
+            lock.unlock();
+
+            const bool enqueue_ok = backend_impl_->allreduceSingleDeviceOnStream(
+                buffer, effective_count, dtype, CollectiveOp::ALLREDUCE_SUM,
+                device_index, stream);
+
+            lock.lock();
+            if (!enqueue_ok)
+            {
+                grouped_onstream_allreduce_result_ = false;
+                grouped_onstream_allreduce_error_ =
+                    backend_impl_ ? backend_impl_->lastError() : std::string("missing backend");
+                abort_requested_.store(true, std::memory_order_release);
+                LOG_ERROR("LocalTPContext::allreduceGroupedOnExplicitStreams: graph-captured participant launch failed"
+                          << " backend=" << collectiveBackendTypeToString(backend_)
+                          << " stage=" << (stage_name.empty() ? "(none)" : stage_name)
+                          << " slot=" << device_index
+                          << " error=" << grouped_onstream_allreduce_error_);
+            }
+            return depart_generation(enqueue_ok);
+        }
+
+        else if (!backend_impl_ || !backend_impl_->supportsAllreduceMultiOnStreams())
         {
             fail_generation(std::string("backend does not support grouped explicit-stream allreduce backend=") +
                             collectiveBackendTypeToString(backend_));
             return false;
         }
 
-        const bool success = backend_impl_->allreduceMultiOnStreams(
-            grouped_onstream_allreduce_buffers_,
-            effective_count,
-            dtype,
-            CollectiveOp::ALLREDUCE_SUM,
-            grouped_onstream_allreduce_streams_);
+        std::vector<CollectiveSidebandMultiOnStreamsOp> backend_sidebands;
+        if (grouped_onstream_allreduce_sideband_count_ > 0)
+        {
+            backend_sidebands.reserve(grouped_onstream_allreduce_sideband_count_);
+            for (size_t sideband_index = 0;
+                 sideband_index < grouped_onstream_allreduce_sideband_count_;
+                 ++sideband_index)
+            {
+                const auto &reference =
+                    grouped_onstream_allreduce_reference_sidebands_[sideband_index];
+                CollectiveSidebandMultiOnStreamsOp backend_sideband;
+                backend_sideband.kind = toBackendSidebandOp(reference.kind);
+                backend_sideband.count = reference.element_count;
+                backend_sideband.dtype = reference.dtype;
+                backend_sideband.root = reference.root_device_index;
+                backend_sideband.recv_buffers.assign(static_cast<size_t>(degree()), nullptr);
+                if (reference.kind == LocalTPCollectiveSidebandKind::Allgather ||
+                    reference.kind == LocalTPCollectiveSidebandKind::Broadcast)
+                {
+                    backend_sideband.send_buffers.assign(static_cast<size_t>(degree()), nullptr);
+                }
+
+                for (int i = 0; i < degree(); ++i)
+                {
+                    const auto &participant =
+                        grouped_onstream_allreduce_sidebands_[static_cast<size_t>(i)][sideband_index];
+                    switch (participant.kind)
+                    {
+                    case LocalTPCollectiveSidebandKind::AllreduceSum:
+                        if (!participant.recv_buffer)
+                        {
+                            fail_generation("AllreduceSum sideband missing recv buffer slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        if (participant.send_buffer &&
+                            participant.send_buffer != participant.recv_buffer)
+                        {
+                            fail_generation("AllreduceSum sideband is currently in-place only slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
+                            participant.recv_buffer;
+                        break;
+                    case LocalTPCollectiveSidebandKind::Allgather:
+                        if (!participant.send_buffer || !participant.recv_buffer)
+                        {
+                            fail_generation("Allgather sideband missing buffer slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        backend_sideband.send_buffers[static_cast<size_t>(i)] =
+                            participant.send_buffer;
+                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
+                            participant.recv_buffer;
+                        break;
+                    case LocalTPCollectiveSidebandKind::Broadcast:
+                        if (!participant.recv_buffer)
+                        {
+                            fail_generation("Broadcast sideband missing recv buffer slot=" +
+                                            std::to_string(i) + " sideband=" +
+                                            std::to_string(sideband_index));
+                            return false;
+                        }
+                        backend_sideband.send_buffers[static_cast<size_t>(i)] =
+                            participant.send_buffer ? participant.send_buffer : participant.recv_buffer;
+                        backend_sideband.recv_buffers[static_cast<size_t>(i)] =
+                            participant.recv_buffer;
+                        break;
+                    }
+                }
+                backend_sidebands.push_back(std::move(backend_sideband));
+            }
+        }
+
+        const bool success =
+            grouped_onstream_allreduce_sideband_count_ > 0
+                ? backend_impl_->allreduceWithSidebandsMultiOnStreams(
+                      grouped_onstream_allreduce_buffers_,
+                      effective_count,
+                      dtype,
+                      CollectiveOp::ALLREDUCE_SUM,
+                      backend_sidebands,
+                      grouped_onstream_allreduce_streams_)
+                : backend_impl_->allreduceMultiOnStreams(
+                      grouped_onstream_allreduce_buffers_,
+                      effective_count,
+                      dtype,
+                      CollectiveOp::ALLREDUCE_SUM,
+                      grouped_onstream_allreduce_streams_);
 
         grouped_onstream_allreduce_result_ = success;
         grouped_onstream_allreduce_ready_ = true;

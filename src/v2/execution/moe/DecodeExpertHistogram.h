@@ -28,6 +28,9 @@ namespace llaminar2
         int num_experts = 0;
         int top_k = 0;
         int window_size = 256; ///< Decode tokens per window epoch
+        /// Layer index that advances the decode-token window. A negative value
+        /// falls back to num_layers - 1 for dense/all-routed legacy configs.
+        int token_boundary_layer_idx = -1;
         std::vector<DeviceId> sockets;
         /// Map expert_id -> socket index (index into sockets vector).
         /// Updated when placement changes.
@@ -60,6 +63,20 @@ namespace llaminar2
         std::string error;
 
         explicit operator bool() const { return ok; }
+    };
+
+    struct ExpertLoadImbalanceStats
+    {
+        bool valid = false;                    ///< At least one active routed layer contributed.
+        int layer_count = 0;                   ///< Total routed layers examined.
+        int active_layer_count = 0;            ///< Layers with non-zero routed activations.
+        int infinite_ratio_layers = 0;         ///< Active layers where min participant load is zero.
+        int worst_layer = -1;                  ///< Layer with the largest normalized spread.
+        uint64_t total_activations = 0;        ///< Total routed expert assignments in the scored window.
+        double average_ratio = 1.0;            ///< Mean max/min load ratio over active layers.
+        double worst_ratio = 1.0;              ///< Worst max/min ratio; infinity if any active layer has min zero.
+        double average_spread = 0.0;           ///< Mean (max-min)/max over active layers, finite [0,1].
+        double worst_spread = 0.0;             ///< Worst normalized spread, finite [0,1].
     };
 
     class DecodeExpertHistogram
@@ -134,6 +151,13 @@ namespace llaminar2
         /// Average socket imbalance across all layers
         float averageSocketImbalance() const;
 
+        /// Score the current window for an arbitrary expert-to-participant placement.
+        ExpertLoadImbalanceStats placementImbalance(
+            const std::vector<int> &expert_to_socket) const;
+
+        /// Score the current window using the histogram's active placement.
+        ExpertLoadImbalanceStats currentPlacementImbalance() const;
+
         /// Total tokens recorded in current window
         uint64_t windowTokenCount() const;
 
@@ -167,6 +191,8 @@ namespace llaminar2
         const DecodeExpertHistogramConfig &config() const { return config_; }
 
     private:
+        bool isTokenBoundaryLayer(int layer_idx) const;
+
         DecodeExpertHistogramConfig config_;
 
         struct LayerData

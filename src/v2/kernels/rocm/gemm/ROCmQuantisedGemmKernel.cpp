@@ -914,16 +914,18 @@ namespace llaminar2
                         }
                         else
                         {
-                            LOG_WARN("[" << log_scope << "] hipHostMalloc failed for startup staging (" << tensor_name
+                            LOG_ERROR("[" << log_scope << "] hipHostMalloc failed for startup staging (" << tensor_name
                                          << ", bytes=" << bytes << "): " << hipGetErrorString(alloc_err)
-                                         << ". Falling back to pageable host source.");
+                                         << ". Refusing pageable-host fallback.");
+                            return alloc_err;
                         }
                     }
                     return hipMemcpyAsync(dst, copy_src, bytes, hipMemcpyHostToDevice, reinterpret_cast<hipStream_t>(stream));
                 }
 
-                // Synchronous fallback (only used when stream creation fails)
-                return hipMemcpy(dst, src, bytes, hipMemcpyHostToDevice);
+                LOG_ERROR("[" << log_scope << "] explicit H2D stream is required for startup upload ("
+                              << tensor_name << ", bytes=" << bytes << ")");
+                return hipErrorInvalidValue;
 #else
                 (void)dst;
                 (void)src;
@@ -960,6 +962,8 @@ namespace llaminar2
                         (void)hipFree(upload.d_native_vnni_scales);
                     if (upload.d_native_vnni_mins)
                         (void)hipFree(upload.d_native_vnni_mins);
+                    if (upload.d_native_vnni_emins)
+                        (void)hipFree(upload.d_native_vnni_emins);
                     freeStartupPinnedStaging(upload);
                     if (upload.startup_h2d_stream)
                         (void)hipStreamDestroy(reinterpret_cast<hipStream_t>(upload.startup_h2d_stream));
@@ -1412,8 +1416,9 @@ namespace llaminar2
         /**
          * @brief Try native M>1 prefill execution for INT8 VNNI or ratio-VNNI formats.
          *
-         * A false return means neither INT8-VNNI nor native-VNNI prefill could
-         * execute. The caller will error unless LLAMINAR_ROCM_FORCE_CK=1 is set.
+         * A false return means the selected INT8-VNNI or native-VNNI prefill
+         * path could not execute. There is no retired CK fallback path; callers
+         * must fail the operation instead of silently switching implementations.
          */
         bool ROCmQuantisedGemmKernel::tryPrefillNativeGemm(
             const int8_t *d_A_int8,
@@ -1996,9 +2001,11 @@ namespace llaminar2
                     }
                     if (!native_ok)
                     {
-                        static std::once_flag wide_tile_fallback_once;
-                        std::call_once(wide_tile_fallback_once, [&]()
-                                       { LOG_WARN("[" << callsite << "] Wide-tile kernel failed; falling back to grid-kpar/baseline"); });
+                        static std::once_flag wide_tile_failure_once;
+                        std::call_once(wide_tile_failure_once, [&]()
+                                       { LOG_ERROR("[" << callsite << "] Wide-tile INT8 prefill kernel failed; refusing fallback"); });
+                        logFallback("launch_error");
+                        return false;
                     }
                 }
 
@@ -2129,9 +2136,11 @@ namespace llaminar2
 
                         if (!native_ok)
                         {
-                            static std::once_flag grid_kpar_fallback_once;
-                            std::call_once(grid_kpar_fallback_once, [&]()
-                                           { LOG_WARN("[" << callsite << "] INT8 prefill grid-kpar launch failed once; falling back to baseline prefill kernel"); });
+                            static std::once_flag grid_kpar_failure_once;
+                            std::call_once(grid_kpar_failure_once, [&]()
+                                           { LOG_ERROR("[" << callsite << "] INT8 prefill grid-kpar launch failed; refusing baseline fallback"); });
+                            logFallback("launch_error");
+                            return false;
                         }
                     }
 
@@ -3288,10 +3297,9 @@ namespace llaminar2
                             }
                             return true;
                         }
-                        static std::once_flag nvnni_gemm_tensor_fallback;
-                        std::call_once(nvnni_gemm_tensor_fallback, [&]()
-                                       { LOG_WARN("[ROCmQuantisedGemmKernel::multiply_tensor] "
-                                                  "Native-VNNI GEMM failed; falling back to INT8 GEMM"); });
+                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] "
+                                  "Native-VNNI GEMM failed; refusing INT8 GEMM fallback");
+                        return false;
                     }
                 }
 
@@ -5216,8 +5224,9 @@ namespace llaminar2
                         }
                         else
                         {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] Failed to create H2D stream: "
-                                     << hipGetErrorString(stream_err) << "; falling back to sync uploads");
+                            throw std::runtime_error(
+                                std::string("[ROCmQuantisedGemmKernel] Failed to create explicit H2D stream: ") +
+                                hipGetErrorString(stream_err));
                         }
                     }
 #endif
@@ -5232,6 +5241,41 @@ namespace llaminar2
                         }
                         upload.startup_h2d_stream = nullptr;
                         h2d_upload_stream = nullptr;
+#endif
+                    };
+                    auto cleanup_startup_device_upload = [&upload, this]()
+                    {
+                        if (upload.d_int8_data_vnni)
+                        {
+                            rocmQuantGemm_freeDevice(upload.d_int8_data_vnni, rocm_device_id_);
+                            upload.d_int8_data_vnni = nullptr;
+                        }
+                        if (upload.d_scales)
+                        {
+                            rocmQuantGemm_freeDevice(upload.d_scales, rocm_device_id_);
+                            upload.d_scales = nullptr;
+                        }
+                        if (upload.d_native_vnni_payload)
+                        {
+                            rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, rocm_device_id_);
+                            upload.d_native_vnni_payload = nullptr;
+                        }
+#ifdef HAVE_ROCM
+                        if (upload.d_native_vnni_scales)
+                        {
+                            (void)hipFree(upload.d_native_vnni_scales);
+                            upload.d_native_vnni_scales = nullptr;
+                        }
+                        if (upload.d_native_vnni_mins)
+                        {
+                            (void)hipFree(upload.d_native_vnni_mins);
+                            upload.d_native_vnni_mins = nullptr;
+                        }
+                        if (upload.d_native_vnni_emins)
+                        {
+                            (void)hipFree(upload.d_native_vnni_emins);
+                            upload.d_native_vnni_emins = nullptr;
+                        }
 #endif
                     };
 
@@ -5327,8 +5371,10 @@ namespace llaminar2
                                                          packed_->native_vnni_payload.size(),
                                                          rocm_device_id_))
                             {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI payload");
-                                // Don't return — fall through, GEMV will use INT8-VNNI fallback
+                                LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI payload; refusing alternate GEMM path");
+                                cleanup_startup_device_upload();
+                                cleanup_startup_async_resources();
+                                return;
                             }
                             else
                             {
@@ -5343,10 +5389,12 @@ namespace llaminar2
                                     "native_vnni_payload");
                                 if (err != hipSuccess)
                                 {
-                                    rocmQuantGemm_freeDevice(upload.d_native_vnni_payload, rocm_device_id_);
-                                    upload.d_native_vnni_payload = nullptr;
-                                    LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI payload: "
-                                             << hipGetErrorString(err));
+                                    LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI payload: "
+                                              << hipGetErrorString(err)
+                                              << "; refusing alternate GEMM path");
+                                    cleanup_startup_device_upload();
+                                    cleanup_startup_async_resources();
+                                    return;
                                 }
                             }
 
@@ -5361,7 +5409,9 @@ namespace llaminar2
                                 {
                                     LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI scales: "
                                               << hipGetErrorString(alloc_err));
-                                    d_scales_tmp = nullptr;
+                                    cleanup_startup_device_upload();
+                                    cleanup_startup_async_resources();
+                                    return;
                                 }
 #endif
                                 upload.d_native_vnni_scales = d_scales_tmp;
@@ -5378,12 +5428,12 @@ namespace llaminar2
                                         "native_vnni_scales");
                                     if (err != hipSuccess)
                                     {
-#ifdef HAVE_ROCM
-                                        (void)hipFree(d_scales_tmp);
-#endif
-                                        upload.d_native_vnni_scales = nullptr;
-                                        LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
-                                                 << hipGetErrorString(err));
+                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI scales: "
+                                                  << hipGetErrorString(err)
+                                                  << "; refusing alternate GEMM path");
+                                        cleanup_startup_device_upload();
+                                        cleanup_startup_async_resources();
+                                        return;
                                     }
                                 }
                             }
@@ -5406,7 +5456,9 @@ namespace llaminar2
                                 {
                                     LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI mins: "
                                               << hipGetErrorString(alloc_err));
-                                    d_mins_tmp = nullptr;
+                                    cleanup_startup_device_upload();
+                                    cleanup_startup_async_resources();
+                                    return;
                                 }
 #endif
                                 upload.d_native_vnni_mins = d_mins_tmp;
@@ -5423,12 +5475,12 @@ namespace llaminar2
                                         "native_vnni_mins");
                                     if (err != hipSuccess)
                                     {
-#ifdef HAVE_ROCM
-                                        (void)hipFree(d_mins_tmp);
-#endif
-                                        upload.d_native_vnni_mins = nullptr;
-                                        LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
-                                                 << hipGetErrorString(err));
+                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI mins: "
+                                                  << hipGetErrorString(err)
+                                                  << "; refusing alternate GEMM path");
+                                        cleanup_startup_device_upload();
+                                        cleanup_startup_async_resources();
+                                        return;
                                     }
                                     else
                                     {
@@ -5449,7 +5501,9 @@ namespace llaminar2
                                 {
                                     LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to alloc native-VNNI emins: "
                                               << hipGetErrorString(alloc_err));
-                                    d_emins_tmp = nullptr;
+                                    cleanup_startup_device_upload();
+                                    cleanup_startup_async_resources();
+                                    return;
                                 }
 #endif
                                 upload.d_native_vnni_emins = d_emins_tmp;
@@ -5466,12 +5520,12 @@ namespace llaminar2
                                         "native_vnni_emins");
                                     if (err != hipSuccess)
                                     {
-#ifdef HAVE_ROCM
-                                        (void)hipFree(d_emins_tmp);
-#endif
-                                        upload.d_native_vnni_emins = nullptr;
-                                        LOG_WARN("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
-                                                 << hipGetErrorString(err));
+                                        LOG_ERROR("[ROCmQuantisedGemmKernel] Failed to upload native-VNNI emins: "
+                                                  << hipGetErrorString(err)
+                                                  << "; refusing alternate GEMM path");
+                                        cleanup_startup_device_upload();
+                                        cleanup_startup_async_resources();
+                                        return;
                                     }
                                     else
                                     {
@@ -5484,8 +5538,10 @@ namespace llaminar2
 
                         if (packed_->int8_data_vnni.empty() && packed_->native_vnni_payload.empty())
                         {
-                            LOG_WARN("[ROCmQuantisedGemmKernel] No VNNI layout available. "
-                                     "ROCm GEMV prefill paths may not work.");
+                            LOG_ERROR("[ROCmQuantisedGemmKernel] No VNNI layout available; refusing implicit CPU or alternate packing path.");
+                            cleanup_startup_device_upload();
+                            cleanup_startup_async_resources();
+                            return;
                         }
 
                         // Synchronize and destroy the per-weight H2D stream.
@@ -6391,10 +6447,9 @@ namespace llaminar2
                     }
                     return true;
                 }
-                static std::once_flag nvnni_gemm_bias_fallback_once;
-                std::call_once(nvnni_gemm_bias_fallback_once, [&]()
-                               { LOG_WARN("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
-                                          "Native-VNNI GEMM failed; falling back to INT8 GEMM"); });
+                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_fp32_to_fp32_with_bias] "
+                          "Native-VNNI GEMM failed; refusing INT8 GEMM fallback");
+                return false;
             }
 
             if (m > 1 && tryPrefillNativeGemm(

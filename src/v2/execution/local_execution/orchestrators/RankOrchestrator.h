@@ -797,6 +797,7 @@ namespace llaminar2
          * prepared weights, workspaces, and device contexts.
          */
         void clear_cache() override;
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
 
         /**
          * @brief Get current position in cache
@@ -1021,6 +1022,7 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
+        bool usesDeviceSideMoERebalanceController() const override;
 
         struct MoEExpertMaskSnapshot
         {

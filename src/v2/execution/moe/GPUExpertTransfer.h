@@ -1,9 +1,9 @@
 /**
  * @file GPUExpertTransfer.h
- * @brief GPU↔GPU direct expert weight transfer for MoE rebalancing.
+ * @brief Same-backend GPU expert weight transfer for MoE rebalancing.
  *
- * Provides peer-to-peer (P2P) or host-staged device-to-device transfer
- * of packed MoE expert weights between GPU devices. This is ~50x faster
+ * Provides explicit-stream device-to-device transfer of packed MoE expert
+ * weights between same-backend GPU devices. This is ~50x faster
  * than the serialize → MPI → deserialize → repack path for intra-node
  * GPU↔GPU transfers since both devices use identical packed weight format.
  *
@@ -141,10 +141,9 @@ inline bool gpuExpertPackedDescriptorsCompatible(
            src.emins_bytes == dst.emins_bytes;
 }
 
-/// Transfer expert weights between GPU devices via peer DMA or host-staged copy.
+/// Transfer expert weights between same-backend GPU devices on an explicit stream.
 ///
-/// Works for ROCm↔ROCm (hipMemcpyPeer). Both source and destination must use
-/// the same packed weight format (MoEBatchPackedWeightsROCm or CUDA equivalent).
+/// Both source and destination must use the same packed NativeVNNI layout.
 class GPUExpertTransfer {
 public:
     /// Transfer one expert's packed weights from src to dst device.
@@ -196,17 +195,6 @@ public:
         const DeviceId& device,
         void* stream);
 
-    /// Check if peer-to-peer access is available between two same-backend devices.
-    static bool canAccessPeer(const DeviceId& src_device, const DeviceId& dst_device);
-
-    /// Enable peer access for a same-backend device pair.
-    static bool enablePeerAccess(const DeviceId& current_device, const DeviceId& peer_device);
-
-    /// Legacy ROCm ordinal helper retained for existing tests.
-    static bool canAccessPeer(int src_ordinal, int dst_ordinal);
-
-    /// Legacy ROCm ordinal helper retained for existing tests.
-    static bool enablePeerAccess(int peer_ordinal);
 };
 
 } // namespace llaminar2

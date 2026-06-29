@@ -3,11 +3,10 @@
  * @brief Integration tests for cross-domain MoE expert weight transfer paths.
  *
  * Validates the three primary transfer mechanisms:
- *   1. GPU↔GPU P2P (peer DMA) via GPUExpertTransfer — data integrity + device context
- *   2. GPU↔GPU host-staged fallback — data integrity when P2P unavailable
- *   3. CPU→GPU cross-domain via CrossDomainTransfer — activation transfer for PP transitions
- *   4. computeGpuCacheExpertMasks — GPU preference placement logic
- *   5. Full rebalance cycle: mask change → release departed → register new experts
+ *   1. Same-backend GPU↔GPU transfer via GPUExpertTransfer — data integrity + device context
+ *   2. CPU→GPU cross-domain via CrossDomainTransfer — activation transfer for PP transitions
+ *   3. computeGpuCacheExpertMasks — GPU preference placement logic
+ *   4. Full rebalance cycle: mask change → release departed → register new experts
  *
  * Requires: HAVE_ROCM and at least 1 GPU. Multi-GPU tests require 2+ GPUs.
  */
@@ -73,12 +72,12 @@ protected:
 };
 
 // ===========================================================================
-// 1. GPU↔GPU P2P transfer — large payload integrity
+// 1. GPU↔GPU same-backend transfer — large payload integrity
 // ===========================================================================
 
 #ifdef HAVE_ROCM
 
-TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
+TEST_F(Test__CrossDomainExpertTransfer, GPUD2D_LargePayload_DataIntegrity)
 {
     // Simulate a realistic expert transfer: ~2.8MB VNNI + ~88KB scales
     // Matches Qwen3.5 expert gate: N=2560, K=2048, Q4_0 packed
@@ -139,9 +138,9 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
     ASSERT_EQ(hipMemcpy(result_scales.data(), d_dst_scales, scales_bytes, hipMemcpyDeviceToHost), hipSuccess);
     ASSERT_EQ(hipMemcpy(result_mins.data(), d_dst_mins, mins_bytes, hipMemcpyDeviceToHost), hipSuccess);
 
-    EXPECT_EQ(pattern_vnni, result_vnni) << "VNNI payload corrupted during P2P transfer";
-    EXPECT_EQ(pattern_scales, result_scales) << "Scales corrupted during P2P transfer";
-    EXPECT_EQ(pattern_mins, result_mins) << "Mins corrupted during P2P transfer";
+    EXPECT_EQ(pattern_vnni, result_vnni) << "VNNI payload corrupted during GPU transfer";
+    EXPECT_EQ(pattern_scales, result_scales) << "Scales corrupted during GPU transfer";
+    EXPECT_EQ(pattern_mins, result_mins) << "Mins corrupted during GPU transfer";
 
     hipStreamDestroy(stream);
     hipFree(d_src_vnni); hipFree(d_dst_vnni);
@@ -149,7 +148,7 @@ TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_LargePayload_DataIntegrity)
     hipFree(d_src_mins); hipFree(d_dst_mins);
 }
 
-TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_CrossDevice_DataIntegrity)
+TEST_F(Test__CrossDomainExpertTransfer, GPUD2D_CrossDevice_DataIntegrity)
 {
     if (gpu_count_ < 2) {
         GTEST_SKIP() << "Need 2+ GPUs for cross-device transfer test";
@@ -512,7 +511,7 @@ TEST_F(Test__CrossDomainExpertTransfer, CPURebalanceCycle_ReleaseAndRegister)
 // 5. GPU↔GPU transfer with stream synchronization
 // ===========================================================================
 
-TEST_F(Test__CrossDomainExpertTransfer, GPUP2P_StreamAsync_DataIntegrity)
+TEST_F(Test__CrossDomainExpertTransfer, GPUD2D_StreamAsync_DataIntegrity)
 {
     // Test with an explicit stream to validate async transfer + sync
     const size_t bytes = 512 * 1024; // 512KB

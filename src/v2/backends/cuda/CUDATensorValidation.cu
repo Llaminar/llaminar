@@ -377,6 +377,13 @@ namespace llaminar2
             if (!d_result_ || !device_ptr || num_elements == 0)
                 return false;
 
+            if (device_id != device_id_)
+            {
+                LOG_WARN("[CUDATensorValidator] Device mismatch: validator for device " << device_id_
+                         << " but asked to validate on device " << device_id);
+                return false;
+            }
+
             cudaError_t err = cudaSetDevice(device_id);
             if (err != cudaSuccess)
                 return false;
@@ -408,6 +415,13 @@ namespace llaminar2
             if (!d_result_ || !device_ptr || num_elements == 0)
                 return false;
 
+            if (device_id != device_id_)
+            {
+                LOG_WARN("[CUDATensorValidator] Device mismatch: validator for device " << device_id_
+                         << " but asked to validate on device " << device_id);
+                return false;
+            }
+
             cudaError_t err = cudaSetDevice(device_id);
             if (err != cudaSuccess)
                 return false;
@@ -437,7 +451,11 @@ namespace llaminar2
             if (!d_result_)
                 return false;
 
-            cudaError_t err = cudaDeviceSynchronize();
+            cudaError_t err = cudaSetDevice(device_id_);
+            if (err != cudaSuccess)
+                return false;
+
+            err = cudaDeviceSynchronize();
             if (err != cudaSuccess)
                 return false;
 
@@ -473,6 +491,28 @@ namespace llaminar2
     static std::mutex g_cuda_validator_mutex;
     static std::unordered_map<int, std::unique_ptr<CUDATensorValidator>> g_cuda_validators;
 
+    ITensorValidator *getCUDATensorValidator(int device_id)
+    {
+        if (device_id < 0)
+        {
+            LOG_ERROR("[getCUDATensorValidator] Invalid device ordinal " << device_id);
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> lock(g_cuda_validator_mutex);
+
+        auto it = g_cuda_validators.find(device_id);
+        if (it == g_cuda_validators.end())
+        {
+            auto validator = std::make_unique<CUDATensorValidator>(device_id);
+            auto *ptr = validator.get();
+            g_cuda_validators[device_id] = std::move(validator);
+            LOG_DEBUG("[getCUDATensorValidator] Created validator for device " << device_id);
+            return ptr;
+        }
+        return it->second.get();
+    }
+
     ITensorValidator *getCUDATensorValidator()
     {
         // Get current device
@@ -484,19 +524,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        std::lock_guard<std::mutex> lock(g_cuda_validator_mutex);
-
-        auto it = g_cuda_validators.find(device_id);
-        if (it == g_cuda_validators.end())
-        {
-            // Create a new validator for this device
-            auto validator = std::make_unique<CUDATensorValidator>(device_id);
-            auto* ptr = validator.get();
-            g_cuda_validators[device_id] = std::move(validator);
-            LOG_DEBUG("[getCUDATensorValidator] Created validator for device " << device_id);
-            return ptr;
-        }
-        return it->second.get();
+        return getCUDATensorValidator(device_id);
     }
 
 } // namespace llaminar2
@@ -505,4 +533,9 @@ namespace llaminar2
 extern "C" llaminar2::ITensorValidator *llaminar2_getCUDATensorValidator()
 {
     return llaminar2::getCUDATensorValidator();
+}
+
+extern "C" llaminar2::ITensorValidator *llaminar2_getCUDATensorValidatorForDevice(int device_id)
+{
+    return llaminar2::getCUDATensorValidator(device_id);
 }

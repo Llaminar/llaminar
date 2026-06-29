@@ -38,6 +38,7 @@
 #include "../../../kernels/HybridKVCacheConfig.h"
 #include "../../../kernels/IHybridKVCache.h"
 #include "../../compute_stages/stages/MoEExpertComputeStage.h"
+#include "../../compute_stages/stages/MoEDeviceRebalanceStage.h"
 #include "../../mtp/MTPSpecKVPublisher.h"
 #include "../../mtp/MTPSpecStatePublisher.h"
 #include "../../moe/ExpertWeightTransfer.h"
@@ -64,9 +65,11 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iomanip>
 #include <initializer_list>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -81,6 +84,519 @@ namespace llaminar2
         constexpr size_t kStochasticTopKSmallKThreads = 64;
         constexpr size_t kMinStochasticTargetRows = 4; // verifier M=2..4 includes terminal row
         constexpr size_t kMinStochasticDraftRows = 3;  // --mtp-draft-tokens max for scalar lanes
+
+        bool tryLaunchCapturedMoERebalanceMaintenanceGraphDirect(
+            DeviceGraphExecutor::GraphSegmentCache &segment_cache,
+            IDeviceContext *ctx,
+            IWorkerGPUContext *gpu_ctx,
+            const std::string &device_key,
+            const PerfStatsCollector::Tags &tags)
+        {
+            if (!ctx ||
+                !gpu_ctx ||
+                !segment_cache.initialized ||
+                segment_cache.needs_capture ||
+                !segment_cache.capture_stream ||
+                segment_cache.consecutive_failures >= DeviceGraphExecutor::GraphSegmentCache::kMaxFailures ||
+                segment_cache.segments.empty())
+            {
+                return false;
+            }
+
+            for (const auto &segment : segment_cache.segments)
+            {
+                if (!segment.capturable ||
+                    !segment.capture ||
+                    !segment.capture->hasExecutable() ||
+                    !segment.replay_callbacks.empty() ||
+                    !segment.cached_arena_writes.empty())
+                {
+                    return false;
+                }
+            }
+
+            DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
+            const uint64_t replay_step = ++segment_cache.decode_step;
+            PerfStatsCollector::addCounter(
+                "forward_graph",
+                "decode_graph_phase",
+                1.0,
+                "decode",
+                device_key,
+                {{"context", segment_cache.perf_context},
+                 {"phase", "replay_direct"}});
+
+            for (auto &segment : segment_cache.segments)
+            {
+                auto launch_tags = tags;
+                launch_tags["context"] = segment_cache.perf_context;
+                launch_tags["stage_count"] = std::to_string(segment.stage_names.size());
+                launch_tags["first_stage"] =
+                    segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.front();
+                launch_tags["last_stage"] =
+                    segment.stage_names.empty() ? std::string("<empty>") : segment.stage_names.back();
+                PerfStatsCollector::ScopedTimer launch_timer(
+                    "moe_rebalance",
+                    "device_maintenance_graph_direct_launch",
+                    "decode",
+                    device_key,
+                    launch_tags);
+                if (!segment.capture->launch())
+                {
+                    LOG_WARN("[DGO] Direct MoE rebalance maintenance graph launch failed on "
+                             << device_key << "; falling back to generic graph replay");
+                    ++segment_cache.consecutive_failures;
+                    return false;
+                }
+                segment.last_executed_step = replay_step;
+            }
+
+            segment_cache.consecutive_failures = 0;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_maintenance_graph_direct_replay",
+                1.0,
+                "decode",
+                device_key,
+                tags);
+            return true;
+        }
+
+        void recordMoERebalanceTransferStreamPaths(
+            const ComputeGraph *graph,
+            DeviceId device_id,
+            const std::string &device_key,
+            const PerfStatsCollector::Tags &base_tags)
+        {
+            if (!PerfStatsCollector::isEnabled() || !graph)
+                return;
+
+            for (const auto &node_name : graph->getExecutionOrder())
+            {
+                const ComputeNode *node = graph->getNode(node_name);
+                if (!node || !node->stage)
+                    continue;
+
+                const auto *rebalance_stage =
+                    dynamic_cast<const MoEDeviceRebalanceStage *>(node->stage.get());
+                if (!rebalance_stage)
+                    continue;
+
+                const auto &params = rebalance_stage->getParams();
+                const bool uses_transfer_slots =
+                    deviceMoERebalanceModeUsesTransferSlots(params.transfer_mode) &&
+                    params.local_transfer_slots != nullptr &&
+                    params.local_transfer_slot_count > 0;
+                if (!uses_transfer_slots)
+                    continue;
+
+                auto tags = base_tags;
+                tags["stage"] = params.stage_name.empty() ? node_name : params.stage_name;
+                tags["phase"] = std::to_string(static_cast<uint32_t>(params.phase));
+                tags["transfer_mode"] = std::to_string(static_cast<uint32_t>(params.transfer_mode));
+                tags["path"] = device_id.is_rocm()
+                                   ? "stage_stream_fallback"
+                                   : "auxiliary_stream";
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_rebalance_transfer_stream_path",
+                    1.0,
+                    "decode",
+                    device_key,
+                    std::move(tags));
+            }
+        }
+
+        std::string normalizedTraceEnvValue(const char *value)
+        {
+            if (!value)
+                return {};
+            std::string normalized(value);
+            normalized.erase(
+                normalized.begin(),
+                std::find_if(normalized.begin(), normalized.end(), [](unsigned char ch)
+                             { return !std::isspace(ch); }));
+            normalized.erase(
+                std::find_if(normalized.rbegin(), normalized.rend(), [](unsigned char ch)
+                             { return !std::isspace(ch); })
+                    .base(),
+                normalized.end());
+            std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch)
+                           { return static_cast<char>(std::tolower(ch)); });
+            return normalized;
+        }
+
+        bool traceEnvIsFalsey(const char *value)
+        {
+            const std::string normalized = normalizedTraceEnvValue(value);
+            return normalized.empty() || normalized == "0" || normalized == "false" ||
+                   normalized == "off" || normalized == "no";
+        }
+
+        bool traceEnvIsTruthy(const char *value)
+        {
+            const std::string normalized = normalizedTraceEnvValue(value);
+            if (!normalized.empty() &&
+                std::all_of(normalized.begin(), normalized.end(), [](unsigned char ch)
+                            { return std::isdigit(ch) != 0; }))
+            {
+                return std::atoi(normalized.c_str()) != 0;
+            }
+            return normalized == "1" || normalized == "true" ||
+                   normalized == "on" || normalized == "yes";
+        }
+
+        std::string deviceMoERebalanceTracePathFromEnv()
+        {
+            const char *value = DebugEnv::envValue("LLAMINAR_MOE_REBALANCE_TRACE_JSONL");
+            if (!value || traceEnvIsFalsey(value))
+                return {};
+            if (traceEnvIsTruthy(value))
+                return "/tmp/llaminar_moe_rebalance_trace.jsonl";
+            return value;
+        }
+
+        std::string jsonEscapeLocal(const std::string &value)
+        {
+            std::ostringstream out;
+            for (char ch : value)
+            {
+                switch (ch)
+                {
+                case '\\':
+                    out << "\\\\";
+                    break;
+                case '"':
+                    out << "\\\"";
+                    break;
+                case '\n':
+                    out << "\\n";
+                    break;
+                case '\r':
+                    out << "\\r";
+                    break;
+                case '\t':
+                    out << "\\t";
+                    break;
+                default:
+                    out << ch;
+                    break;
+                }
+            }
+            return out.str();
+        }
+
+        void appendJsonStringField(
+            std::ostringstream &out,
+            bool &first,
+            const char *name,
+            const std::string &value)
+        {
+            if (!first)
+                out << ',';
+            first = false;
+            out << '"' << name << "\":\"" << jsonEscapeLocal(value) << '"';
+        }
+
+        template <typename T>
+        void appendJsonNumberField(
+            std::ostringstream &out,
+            bool &first,
+            const char *name,
+            T value)
+        {
+            if (!first)
+                out << ',';
+            first = false;
+            out << '"' << name << "\":" << value;
+        }
+
+        void appendJsonTagsObject(
+            std::ostringstream &out,
+            const PerfStatsCollector::Tags &tags)
+        {
+            out << '{';
+            bool first = true;
+            for (const auto &[key, value] : tags)
+                appendJsonStringField(out, first, key.c_str(), value);
+            out << '}';
+        }
+
+        bool appendDeviceMoERebalanceTraceJsonl(
+            const std::string &path,
+            const std::string &device_key,
+            const PerfStatsCollector::Tags &maintenance_tags,
+            const std::string &workspace_name,
+            const MoEDeviceRebalanceStage::Params &params,
+            const DeviceMoERebalanceStatus &status,
+            const DeviceMoERebalanceGraphControllerState &controller_state,
+            const DeviceMoERebalanceApplyStatus &apply_status,
+            const std::vector<DeviceMoERebalanceCommandBufferHeader> &command_headers,
+            const std::vector<DeviceMoERebalanceWaveState> &wave_states,
+            const std::vector<uint32_t> &plan_counts,
+            const std::vector<DeviceMoERebalancePlanEntry> &plan_entries,
+            uint32_t plan_capacity,
+            const DeviceMoERebalanceTransferCostEstimate &transfer_cost,
+            uint32_t transfer_copied_arrivals,
+            uint32_t transfer_applied_arrivals,
+            uint32_t transfer_payload_bucket_slots,
+            uint64_t transfer_payload_edge_mask)
+        {
+            static std::mutex trace_mutex;
+            std::ostringstream out;
+            out << '{';
+            bool first = true;
+            appendJsonStringField(out, first, "schema", "llaminar.moe_rebalance.trace.v1");
+            appendJsonStringField(out, first, "event", "maintenance_export");
+            appendJsonStringField(out, first, "device", device_key);
+            appendJsonStringField(out, first, "workspace", workspace_name);
+            appendJsonStringField(out, first, "stage", params.stage_name);
+            appendJsonNumberField(out, first, "transfer_mode", static_cast<uint32_t>(params.transfer_mode));
+            appendJsonNumberField(out, first, "phase", static_cast<uint32_t>(params.phase));
+            appendJsonNumberField(out, first, "local_transfer_slot_count", params.local_transfer_slot_count);
+            appendJsonNumberField(out, first, "collective_payload_slot_capacity", params.collective_payload_slot_capacity);
+            appendJsonNumberField(out, first, "collective_payload_slot_bytes", params.collective_payload_slot_bytes);
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"tags\":";
+            appendJsonTagsObject(out, maintenance_tags);
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"config\":{";
+            bool config_first = true;
+            appendJsonNumberField(out, config_first, "num_layers", params.config.num_layers);
+            appendJsonNumberField(out, config_first, "num_experts", params.config.num_experts);
+            appendJsonNumberField(out, config_first, "top_k", params.config.top_k);
+            appendJsonNumberField(out, config_first, "participant_id", params.config.participant_id);
+            appendJsonNumberField(out, config_first, "participant_count", params.config.participant_count);
+            appendJsonNumberField(out, config_first, "root_participant", params.config.root_participant);
+            appendJsonNumberField(out, config_first, "window_size_tokens", params.config.window_size_tokens);
+            appendJsonNumberField(out, config_first, "max_hot_replicas_per_participant", params.config.max_hot_replicas_per_participant);
+            appendJsonNumberField(out, config_first, "layer_window_start", params.config.layer_window_start);
+            appendJsonNumberField(out, config_first, "layer_window_count", params.config.layer_window_count);
+            appendJsonNumberField(out, config_first, "layer_wave_count", params.config.layer_wave_count);
+            appendJsonNumberField(out, config_first, "flags", params.config.flags);
+            appendJsonNumberField(out, config_first, "min_load_spread_improvement", params.config.min_load_spread_improvement);
+            appendJsonNumberField(out, config_first, "min_load_spread_improvement_divisor", params.config.min_load_spread_improvement_divisor);
+            appendJsonNumberField(out, config_first, "min_wave_spread_improvement_per_payload_slot", params.config.min_wave_spread_improvement_per_payload_slot);
+            appendJsonNumberField(out, config_first, "min_router_spread_improvement_per_payload_slot", params.config.min_router_spread_improvement_per_payload_slot);
+            out << '}';
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"status\":{";
+            bool status_first = true;
+            appendJsonNumberField(out, status_first, "status_code", status.status_code);
+            appendJsonNumberField(out, status_first, "last_epoch", status.last_epoch);
+            appendJsonNumberField(out, status_first, "windows_observed", status.windows_observed);
+            appendJsonNumberField(out, status_first, "windows_applied", status.windows_applied);
+            appendJsonNumberField(out, status_first, "changed_layers", status.changed_layers);
+            appendJsonNumberField(out, status_first, "selected_replicas", status.selected_replicas);
+            appendJsonNumberField(out, status_first, "planned_arrivals", status.planned_arrivals);
+            appendJsonNumberField(out, status_first, "candidate_arrivals_considered", status.candidate_arrivals_considered);
+            appendJsonNumberField(out, status_first, "candidate_arrivals_below_floor", status.candidate_arrivals_below_floor);
+            appendJsonNumberField(out, status_first, "candidate_arrivals_pruned_by_count_bound", status.candidate_arrivals_pruned_by_count_bound);
+            appendJsonNumberField(out, status_first, "candidate_load_spread_improvement_total", status.candidate_load_spread_improvement_total);
+            appendJsonNumberField(out, status_first, "candidate_load_spread_improvement_max", status.candidate_load_spread_improvement_max);
+            appendJsonNumberField(out, status_first, "accepted_load_spread_improvement_total", status.accepted_load_spread_improvement_total);
+            appendJsonNumberField(out, status_first, "accepted_load_spread_improvement_max", status.accepted_load_spread_improvement_max);
+            appendJsonNumberField(out, status_first, "router_hot_cache_eligible_dispatches", status.router_hot_cache_eligible_dispatches);
+            appendJsonNumberField(out, status_first, "router_hot_cache_used_dispatches", status.router_hot_cache_used_dispatches);
+            appendJsonNumberField(out, status_first, "router_hot_cache_improved_dispatches", status.router_hot_cache_improved_dispatches);
+            appendJsonNumberField(out, status_first, "router_hot_cache_default_load_spread_total", status.router_hot_cache_default_load_spread_total);
+            appendJsonNumberField(out, status_first, "router_hot_cache_actual_load_spread_total", status.router_hot_cache_actual_load_spread_total);
+            appendJsonNumberField(out, status_first, "router_hot_cache_load_spread_improvement_total", status.router_hot_cache_load_spread_improvement_total);
+            appendJsonNumberField(out, status_first, "pre_policy_load_total", status.pre_policy_load_total);
+            appendJsonNumberField(out, status_first, "pre_policy_load_min", status.pre_policy_load_min);
+            appendJsonNumberField(out, status_first, "pre_policy_load_max", status.pre_policy_load_max);
+            appendJsonNumberField(out, status_first, "post_policy_load_total", status.post_policy_load_total);
+            appendJsonNumberField(out, status_first, "post_policy_load_min", status.post_policy_load_min);
+            appendJsonNumberField(out, status_first, "post_policy_load_max", status.post_policy_load_max);
+            appendJsonNumberField(out, status_first, "window_ready_slots", status.window_ready_slots);
+            appendJsonNumberField(out, status_first, "window_required_slots", status.window_required_slots);
+            appendJsonNumberField(out, status_first, "payload_bucket_requested_slots", status.payload_bucket_requested_slots);
+            appendJsonNumberField(out, status_first, "payload_bucket_slots", status.payload_bucket_slots);
+            appendJsonNumberField(out, status_first, "payload_edge_mask", status.payload_edge_mask);
+            out << '}';
+
+            auto append_load_array = [&](const char *name, const uint64_t *values)
+            {
+                if (!first)
+                    out << ',';
+                first = false;
+                out << '"' << name << "\":[";
+                const uint32_t participant_count =
+                    std::min<uint32_t>(params.config.participant_count, kDeviceMoEMaxParticipants);
+                for (uint32_t participant = 0; participant < participant_count; ++participant)
+                {
+                    if (participant != 0)
+                        out << ',';
+                    out << values[participant];
+                }
+                out << ']';
+            };
+            append_load_array("pre_policy_participant_load", status.pre_policy_participant_load);
+            append_load_array("post_policy_participant_load", status.post_policy_participant_load);
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"controller\":{";
+            bool controller_first = true;
+            appendJsonNumberField(out, controller_first, "participant_id", controller_state.participant_id);
+            appendJsonNumberField(out, controller_first, "participant_count", controller_state.participant_count);
+            appendJsonNumberField(out, controller_first, "next_epoch", controller_state.next_epoch);
+            appendJsonNumberField(out, controller_first, "active_wave", controller_state.active_wave);
+            appendJsonNumberField(out, controller_first, "wave_count", controller_state.wave_count);
+            appendJsonNumberField(out, controller_first, "maintenance_launches", controller_state.maintenance_launches);
+            appendJsonNumberField(out, controller_first, "decode_apply_polls", controller_state.decode_apply_polls);
+            appendJsonNumberField(out, controller_first, "decode_apply_hits", controller_state.decode_apply_hits);
+            appendJsonNumberField(out, controller_first, "last_error_code", controller_state.last_error_code);
+            out << '}';
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"transfer\":{";
+            bool transfer_first = true;
+            appendJsonNumberField(out, transfer_first, "copied_arrivals", transfer_copied_arrivals);
+            appendJsonNumberField(out, transfer_first, "applied_arrivals", transfer_applied_arrivals);
+            appendJsonNumberField(out, transfer_first, "payload_bucket_slots", transfer_payload_bucket_slots);
+            appendJsonNumberField(out, transfer_first, "payload_edge_mask", transfer_payload_edge_mask);
+            appendJsonNumberField(out, transfer_first, "selected_payload_gathered_capacity_bytes", transfer_cost.selected_payload_gathered_capacity_bytes);
+            appendJsonNumberField(out, transfer_first, "selected_payload_transport_capacity_bytes", transfer_cost.selected_payload_transport_capacity_bytes);
+            appendJsonNumberField(out, transfer_first, "useful_payload_bytes", transfer_cost.useful_payload_bytes);
+            appendJsonNumberField(out, transfer_first, "wasted_payload_capacity_bytes", transfer_cost.wasted_payload_capacity_bytes);
+            out << '}';
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"apply_status\":{";
+            bool apply_first = true;
+            appendJsonNumberField(out, apply_first, "status_code", apply_status.status_code);
+            appendJsonNumberField(out, apply_first, "plan_entries_seen", apply_status.plan_entries_seen);
+            appendJsonNumberField(out, apply_first, "applied_arrivals", apply_status.applied_arrivals);
+            appendJsonNumberField(out, apply_first, "copied_arrivals", apply_status.copied_arrivals);
+            appendJsonNumberField(out, apply_first, "copy_incomplete", apply_status.copy_incomplete);
+            appendJsonNumberField(out, apply_first, "changed_layers", apply_status.changed_layers);
+            out << '}';
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"waves\":[";
+            const uint32_t wave_count = std::min<uint32_t>(controller_state.wave_count, 2u);
+            for (uint32_t i = 0; i < wave_count; ++i)
+            {
+                if (i != 0)
+                    out << ',';
+                const auto &wave = controller_state.waves[i];
+                out << '{';
+                bool wave_first = true;
+                appendJsonNumberField(out, wave_first, "wave", i);
+                appendJsonNumberField(out, wave_first, "epoch", wave.epoch);
+                appendJsonNumberField(out, wave_first, "state", wave.state);
+                appendJsonNumberField(out, wave_first, "planned_start_layer", wave.planned_start_layer);
+                appendJsonNumberField(out, wave_first, "planned_layer_count", wave.planned_layer_count);
+                appendJsonNumberField(out, wave_first, "command_count", wave.command_count);
+                appendJsonNumberField(out, wave_first, "copied_arrivals", wave.copied_arrivals);
+                appendJsonNumberField(out, wave_first, "applied_arrivals", wave.applied_arrivals);
+                appendJsonNumberField(out, wave_first, "requested_payload_slots", wave.requested_payload_slots);
+                appendJsonNumberField(out, wave_first, "payload_bucket_slots", wave.payload_bucket_slots);
+                appendJsonNumberField(out, wave_first, "error_code", wave.error_code);
+                out << '}';
+            }
+            out << ']';
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"command_buffers\":[";
+            for (uint32_t i = 0; i < command_headers.size(); ++i)
+            {
+                if (i != 0)
+                    out << ',';
+                out << '{';
+                bool buffer_first = true;
+                appendJsonNumberField(out, buffer_first, "buffer_slot", i);
+                appendJsonNumberField(out, buffer_first, "epoch", command_headers[i].epoch);
+                appendJsonNumberField(out, buffer_first, "command_count", command_headers[i].command_count);
+                appendJsonNumberField(out, buffer_first, "command_capacity", command_headers[i].command_capacity);
+                appendJsonNumberField(out, buffer_first, "plan_count", i < plan_counts.size() ? plan_counts[i] : 0u);
+                appendJsonNumberField(out, buffer_first, "wave_epoch", i < wave_states.size() ? wave_states[i].epoch : 0u);
+                appendJsonNumberField(out, buffer_first, "wave_planned_start_layer", i < wave_states.size() ? wave_states[i].planned_start_layer : 0u);
+                appendJsonNumberField(out, buffer_first, "wave_planned_layer_count", i < wave_states.size() ? wave_states[i].planned_layer_count : 0u);
+                out << '}';
+            }
+            out << ']';
+
+            if (!first)
+                out << ',';
+            first = false;
+            out << "\"commands\":[";
+            bool first_command = true;
+            for (uint32_t buffer = 0; buffer < command_headers.size(); ++buffer)
+            {
+                const uint32_t header_count = command_headers[buffer].command_count;
+                const uint32_t plan_count = buffer < plan_counts.size() ? plan_counts[buffer] : 0u;
+                const uint32_t wave_count_for_buffer =
+                    buffer < wave_count ? controller_state.waves[buffer].command_count : 0u;
+                const uint32_t command_count =
+                    std::min<uint32_t>(
+                        std::max({header_count, plan_count, wave_count_for_buffer}),
+                        plan_capacity);
+                for (uint32_t entry_index = 0; entry_index < command_count; ++entry_index)
+                {
+                    const size_t flat_index =
+                        static_cast<size_t>(buffer) * static_cast<size_t>(plan_capacity) +
+                        static_cast<size_t>(entry_index);
+                    if (flat_index >= plan_entries.size())
+                        break;
+                    const auto &entry = plan_entries[flat_index];
+                    if (!first_command)
+                        out << ',';
+                    first_command = false;
+                    out << '{';
+                    bool command_first = true;
+                    appendJsonNumberField(out, command_first, "buffer_slot", buffer);
+                    appendJsonNumberField(out, command_first, "entry_index", entry_index);
+                    appendJsonNumberField(out, command_first, "op", entry.op);
+                    appendJsonNumberField(out, command_first, "layer", entry.layer);
+                    appendJsonNumberField(out, command_first, "expert", entry.expert);
+                    appendJsonNumberField(out, command_first, "source_participant", entry.source_participant);
+                    appendJsonNumberField(out, command_first, "destination_participant", entry.destination_participant);
+                    appendJsonNumberField(out, command_first, "source_resident_mask", entry.source_resident_mask);
+                    appendJsonNumberField(out, command_first, "flags", entry.flags);
+                    appendJsonNumberField(out, command_first, "destination_slot", entry.destination_slot);
+                    appendJsonNumberField(out, command_first, "payload_slot", entry.payload_slot);
+                    out << '}';
+                }
+            }
+            out << ']';
+            out << "}\n";
+
+            std::lock_guard<std::mutex> lock(trace_mutex);
+            std::ofstream file(path, std::ios::out | std::ios::app);
+            if (!file)
+            {
+                LOG_ERROR("[DGO] Failed to open MoE rebalance trace JSONL at " << path);
+                return false;
+            }
+            file << out.str();
+            if (!file)
+            {
+                LOG_ERROR("[DGO] Failed to append MoE rebalance trace JSONL at " << path);
+                return false;
+            }
+            return true;
+        }
+
         /**
          * @brief Logical perf/capture lane for publishing accepted shifted MTP KV rows.
          *
@@ -101,6 +617,45 @@ namespace llaminar2
          * while another capture stream is still consuming it.
          */
         constexpr int kMTPSidecarConditionTokenSlotCount = 10;
+
+        void ensureGraphStableMoERebalanceTransferOrThrow(
+            const ILocalTPContext &local_tp,
+            const DeviceId &primary_device)
+        {
+            const auto &moe_env = debugEnv().moe_rebalance;
+            if (moe_env.device_rebalance_payload_sideband ||
+                moe_env.allow_legacy_collective_rebalance_transfer)
+            {
+                throw std::runtime_error(
+                    "Device-side MoE rebalance payload migration is disabled for " +
+                    primary_device.to_string() +
+                    " because fixed-size collective payload arenas move empty expert slots. "
+                    "Use CompactTransferSlots maintenance for non-empty transfer-slot arrivals.");
+            }
+
+            if (debugEnv().moe_rebalance.device_rebalance_maintenance_graph)
+            {
+                if (local_tp.supportsRawAllgatherOnStreamGraphCapture())
+                {
+                    LOG_DEBUG("[DeviceGraphOrchestrator] Device-side MoE rebalance will collect "
+                              "histogram state on an async maintenance graph for "
+                              << primary_device.to_string()
+                              << " using graph-capturable raw NCCL/RCCL allgather");
+                    return;
+                }
+
+                throw std::runtime_error(
+                    "Device-side MoE rebalance maintenance requires graph-capturable raw NCCL/RCCL allgather on " +
+                    primary_device.to_string() +
+                    "; host publish/apply fallback is refused");
+            }
+
+            throw std::runtime_error(
+                "Device-side MoE rebalance requires LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH=1 "
+                "so histogram state moves on the async rolling-wave maintenance lane for " +
+                primary_device.to_string() +
+                "; host publish/apply fallback is refused");
+        }
 
         uint64_t stableLegacyGraphBindingId(
             ModelContextId model_id,
@@ -486,9 +1041,21 @@ namespace llaminar2
             return value ? "true" : "false";
         }
 
-        const char *capturedCollectiveRejectReason(bool supported)
+        const char *deviceMoERebalanceTransferModeTag(DeviceMoERebalanceTransferMode mode)
         {
-            return supported ? "supported" : "unsupported";
+            switch (mode)
+            {
+            case DeviceMoERebalanceTransferMode::ResidentOnly:
+                return "resident_only";
+            case DeviceMoERebalanceTransferMode::CompactTransferSlots:
+                return "compact_transfer_slots";
+            case DeviceMoERebalanceTransferMode::CollectiveSidebandPayload:
+                return "collective_sideband_payload";
+            case DeviceMoERebalanceTransferMode::LegacyCollectiveAllGather:
+                return "legacy_collective_allgather";
+            default:
+                return "unknown";
+            }
         }
 
         size_t fp32LogitsRowBytes(const TensorBase *tensor)
@@ -932,6 +1499,32 @@ namespace llaminar2
             layout.mtp_kv_bytes = mtp_layout.faKVBytes();
             layout.includes_mtp_state = layout.mtp_kv_bytes > 0;
             return layout.includes_mtp_state;
+        }
+
+        void copyMTPPayloadLayoutFields(const PrefixPayloadLayout &src,
+                                        PrefixPayloadLayout &dst)
+        {
+            dst.mtp_layers = src.mtp_layers;
+            dst.mtp_local_kv_heads = src.mtp_local_kv_heads;
+            dst.mtp_kv_head_start = src.mtp_kv_head_start;
+            dst.mtp_head_dim = src.mtp_head_dim;
+            dst.mtp_k_precision = src.mtp_k_precision;
+            dst.mtp_v_precision = src.mtp_v_precision;
+            dst.mtp_kv_layout = src.mtp_kv_layout;
+            dst.bytes_per_mtp_layer_k = src.bytes_per_mtp_layer_k;
+            dst.bytes_per_mtp_layer_v = src.bytes_per_mtp_layer_v;
+            dst.mtp_kv_bytes = src.mtp_kv_bytes;
+            dst.includes_mtp_state = src.includes_mtp_state;
+        }
+
+        bool samePrefixPayloadShape(const PrefixPayloadLayout &lhs,
+                                    const PrefixPayloadLayout &rhs)
+        {
+            return lhs.compatiblePayloadShape(rhs) &&
+                   lhs.includes_hybrid_state == rhs.includes_hybrid_state &&
+                   lhs.includes_terminal_hidden == rhs.includes_terminal_hidden &&
+                   lhs.includes_terminal_logits == rhs.includes_terminal_logits &&
+                   lhs.totalBytes() == rhs.totalBytes();
         }
 
         int mtpTokenStartForPrefixBlock(const PrefixCacheKey &key)
@@ -1671,8 +2264,178 @@ namespace llaminar2
         return false;
     }
 
+    bool DeviceGraphOrchestrator::usesGraphStableGpuMoERebalance() const
+    {
+        const DeviceId primary_device = primaryDeviceId();
+        if (!primary_device.is_gpu() ||
+            !isMoeRebalancingActive() ||
+            !cache_config_.enabled ||
+            !graph_builder_)
+        {
+            return false;
+        }
+
+        if (pp_stage_config_.has_value() ||
+            (pipeline_config_ && pipeline_config_->hasPP()) ||
+            (domain_config_ && domain_config_->hasCrossRankTP()))
+        {
+            return false;
+        }
+
+        const auto &config = graph_builder_->config();
+        if (!config.isMoE() ||
+            config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC ||
+            debugEnv().moe_rebalance.gpu_cache_experts_per_layer > 0)
+        {
+            return false;
+        }
+
+        std::shared_ptr<const MoEExpertParallelPlan> source_plan;
+        if (config.moe.expert_overlay_runtime_plan)
+            source_plan = config.moe.expert_overlay_runtime_plan->sourcePlanPtr();
+        else
+            source_plan = config.moe.expert_parallel_plan;
+
+        if (!source_plan ||
+            !source_plan->isTieredOverlay() ||
+            source_plan->routed_tiers.size() != 1 ||
+            source_plan->continuation_domain != source_plan->routed_tiers.front().domain)
+        {
+            return false;
+        }
+
+        const std::string &routed_domain_name = source_plan->routed_tiers.front().domain;
+        const auto domain_it = std::find_if(
+            source_plan->domains.begin(),
+            source_plan->domains.end(),
+            [&](const ExpertComputeDomain &domain)
+            {
+                return domain.name == routed_domain_name;
+            });
+        if (domain_it == source_plan->domains.end())
+            return false;
+
+        const ExpertComputeDomain &domain = *domain_it;
+        if (domain.kind != ExpertDomainKind::LocalTP ||
+            domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts ||
+            domain.participants.size() < 2)
+        {
+            return false;
+        }
+
+        bool contains_primary = false;
+        DeviceType participant_type = DeviceType::CPU;
+        bool have_participant_type = false;
+        for (const auto &participant : domain.participants)
+        {
+            if (!participant.isGPU())
+                return false;
+            if (!have_participant_type)
+            {
+                participant_type = participant.device_type;
+                have_participant_type = true;
+            }
+            else if (participant.device_type != participant_type)
+            {
+                return false;
+            }
+
+            const DeviceId local_device = participant.toLocalDeviceId();
+            if (local_device.is_valid() &&
+                local_device.type == primary_device.type &&
+                local_device.ordinal == primary_device.ordinal)
+            {
+                contains_primary = true;
+            }
+        }
+
+        /*
+         * This matches Qwen35MoEGraph's graph-stable masked LocalTP decode
+         * fast path: captured graphs bind persistent MoERuntimeTable banks and
+         * backend-owned descriptor table allocations. Dynamic ownership changes
+         * are published by mutating those tables and swapping transfer slots in
+         * place, so placement is not part of the graph topology key.
+         */
+        return contains_primary &&
+               ((primary_device.is_cuda() && participant_type == DeviceType::CUDA) ||
+                (primary_device.is_rocm() && participant_type == DeviceType::ROCm));
+    }
+
+    bool DeviceGraphOrchestrator::usesDeviceSideMoERebalanceController() const
+    {
+        const auto &env = debugEnv();
+        if (!env.moe_rebalance.device_rebalance_graph_controller)
+            return false;
+
+        if (!usesGraphStableGpuMoERebalance() || !graph_builder_)
+            return false;
+
+        const DeviceId primary_device = primaryDeviceId();
+        const auto &config = graph_builder_->config();
+        if (!config.isMoE() ||
+            config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC)
+        {
+            return false;
+        }
+
+        const auto *local_tp = dynamic_cast<const ILocalTPContext *>(config.tp_ctx);
+        if (!local_tp ||
+            local_tp->degree() <= 1 ||
+            config.tp_device_idx < 0 ||
+            config.tp_device_idx >= local_tp->degree() ||
+            !local_tp->supportsRawAllgatherOnStreamGraphCapture())
+        {
+            return false;
+        }
+
+        const CollectiveBackendType backend = local_tp->backend();
+        if ((primary_device.is_cuda() && backend != CollectiveBackendType::NCCL) ||
+            (primary_device.is_rocm() && backend != CollectiveBackendType::RCCL))
+        {
+            return false;
+        }
+
+        const auto &devices = local_tp->devices();
+        if (static_cast<int>(devices.size()) != local_tp->degree())
+        {
+            return false;
+        }
+
+        const auto &local_participant = devices[static_cast<size_t>(config.tp_device_idx)];
+        if (!local_participant.isLocal() ||
+            local_participant.toLocalDeviceId() != primary_device)
+        {
+            return false;
+        }
+
+        const DeviceType expected_type =
+            primary_device.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
+        for (const auto &participant : devices)
+        {
+            if (!participant.isLocal() ||
+                !participant.isGPU() ||
+                participant.device_type != expected_type)
+            {
+                return false;
+            }
+        }
+
+        ensureGraphStableMoERebalanceTransferOrThrow(*local_tp, primary_device);
+        return true;
+    }
+
     uint64_t DeviceGraphOrchestrator::moePlacementEpoch() const
     {
+        /*
+         * Graph-stable GPU MoE rebalance publishes into persistent runtime
+         * descriptor tables and transfer slots. Captured decode graphs record
+         * those table pointers, so changing expert ownership is data mutation,
+         * not graph topology. CPU or non-runtime-table GPU rebalancing keeps the
+         * epoch in the graph key and must recapture when placement changes.
+         */
+        if (usesGraphStableGpuMoERebalance())
+            return 0;
+
         uint64_t epoch = std::max(current_expert_replica_epoch_, current_expert_mask_epoch_);
         if (!moe_rebalance_controller_)
             return epoch;
@@ -1777,6 +2540,15 @@ namespace llaminar2
             mtp_terminal_hidden_rows_select_cache_.invalidate();
             for (auto &cache : layer_graph_cache_)
                 cache.invalidate();
+            device_moe_rebalance_maintenance_graph_.invalidate();
+            for (auto &[edge_mask, cache] :
+                 device_moe_rebalance_maintenance_payload_graphs_)
+            {
+                (void)edge_mask;
+                cache.invalidate();
+            }
+            device_moe_rebalance_maintenance_payload_graphs_.clear();
+            device_moe_rebalance_decode_tokens_seen_ = 0;
             resetKernelDynamicState();
         }
         catch (const std::exception &e)
@@ -2705,6 +3477,15 @@ namespace llaminar2
             arena_.reset();
             LOG_DEBUG("[DeviceGraphOrchestrator] BufferArena released");
         }
+        device_moe_rebalance_maintenance_graph_.invalidate();
+        for (auto &[edge_mask, cache] :
+             device_moe_rebalance_maintenance_payload_graphs_)
+        {
+            (void)edge_mask;
+            cache.invalidate();
+        }
+        device_moe_rebalance_maintenance_payload_graphs_.clear();
+        device_moe_rebalance_decode_tokens_seen_ = 0;
 
         owned_buffers_.clear();
 
@@ -2814,7 +3595,1740 @@ namespace llaminar2
         ensureForwardEngine();
 
         // Delegate to ForwardExecutionEngine
-        return forward_engine_->execute(effective_input, output, *this);
+        const bool success = forward_engine_->execute(effective_input, output, *this);
+        if (!success)
+            return false;
+
+        return maybeRunDeviceMoERebalanceMaintenanceGraph(effective_input);
+    }
+
+    bool DeviceGraphOrchestrator::exportCompletedDeviceMoERebalanceMaintenanceStats(
+        DeviceMoERebalanceMaintenanceGraphCache &cache,
+        void *maintenance_stream,
+        const std::string &device_key,
+        const std::map<std::string, std::string> &maintenance_tags,
+        DeviceMoERebalanceMaintenanceOutcome *outcome)
+    {
+        const std::string trace_path = deviceMoERebalanceTracePathFromEnv();
+        const bool export_trace = !trace_path.empty();
+        if (!PerfStatsCollector::isEnabled() && !outcome && !export_trace)
+            return true;
+
+        if (!cache.graph || !workspace_allocator_)
+            return true;
+
+        if (!maintenance_stream)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance diagnostic export requires an explicit non-null maintenance stream");
+            return false;
+        }
+
+        const MoEDeviceRebalanceStage *rebalance_stage = nullptr;
+        for (const auto &node_name : cache.graph->getExecutionOrder())
+        {
+            const ComputeNode *node = cache.graph->getNode(node_name);
+            if (!node || !node->stage)
+                continue;
+
+            auto *candidate =
+                dynamic_cast<const MoEDeviceRebalanceStage *>(node->stage.get());
+            if (!candidate)
+                continue;
+
+            const auto phase = candidate->getParams().phase;
+            if (phase == DeviceMoERebalanceStagePhase::PlanAndCopy ||
+                phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
+                phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband ||
+                phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload ||
+                phase == DeviceMoERebalanceStagePhase::PlanCopyApply)
+            {
+                rebalance_stage = candidate;
+                break;
+            }
+        }
+
+        if (!rebalance_stage)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance diagnostic export could not find maintenance stage");
+            return false;
+        }
+
+        DeviceWorkspaceManager *workspace =
+            workspace_allocator_->getDeviceWorkspace(state_.device_id);
+        if (!workspace)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance diagnostic export missing device workspace for "
+                      << device_key);
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance diagnostic export could not resolve backend for "
+                      << device_key);
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+
+        const auto &params = rebalance_stage->getParams();
+        const std::string &workspace_name = params.workspace_name.empty()
+                                                ? params.stage_name
+                                                : params.workspace_name;
+        const uint32_t command_buffer_count =
+            params.local_transfer_slot_count > 0 ? 2u : 1u;
+        const uint32_t trace_plan_capacity =
+            export_trace
+                ? static_cast<uint32_t>(std::min<uint64_t>(
+                      deviceMoERebalanceCommandPlanCapacity(params.config, params.transfer_mode),
+                      static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())))
+                : 0u;
+
+        auto buffer_name = [&](const char *base)
+        {
+            return MoEDeviceRebalanceStage::workspaceBufferName(base, workspace_name);
+        };
+
+        auto copy_required =
+            [&](void *dst, const std::string &name, size_t bytes) -> bool
+        {
+            void *src = workspace->getBuffer(name);
+            if (!src)
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance diagnostic export missing workspace buffer "
+                          << name << " on " << device_key);
+                return false;
+            }
+            if (!backend->deviceToHostOnStream(
+                    dst,
+                    src,
+                    bytes,
+                    device_ordinal,
+                    maintenance_stream))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance diagnostic export failed to enqueue D2H for "
+                          << name << " on " << device_key);
+                return false;
+            }
+            return true;
+        };
+
+        auto copy_optional =
+            [&](void *dst, const std::string &name, size_t bytes) -> bool
+        {
+            void *src = workspace->getBuffer(name);
+            if (!src)
+                return true;
+            if (!backend->deviceToHostOnStream(
+                    dst,
+                    src,
+                    bytes,
+                    device_ordinal,
+                    maintenance_stream))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance diagnostic export failed to enqueue optional D2H for "
+                          << name << " on " << device_key);
+                return false;
+            }
+            return true;
+        };
+
+        DeviceMoERebalanceStatus status{};
+        DeviceMoERebalanceGraphControllerState controller_state{};
+        DeviceMoERebalanceApplyStatus apply_status{};
+        std::vector<DeviceMoERebalanceCommandBufferHeader> command_headers(command_buffer_count);
+        std::vector<DeviceMoERebalanceWaveState> wave_states(command_buffer_count);
+        std::vector<uint32_t> plan_counts(command_buffer_count, 0);
+        std::vector<DeviceMoERebalancePlanEntry> trace_plan_entries(
+            static_cast<size_t>(command_buffer_count) *
+            static_cast<size_t>(trace_plan_capacity));
+
+        if (!copy_required(&status,
+                           buffer_name(MoEDeviceRebalanceStage::WS_STATUS),
+                           sizeof(status)))
+        {
+            return false;
+        }
+
+        const bool export_perfstats = PerfStatsCollector::isEnabled();
+        const bool export_diagnostics = export_perfstats || export_trace;
+        if (export_diagnostics)
+        {
+            if (!copy_required(&controller_state,
+                               buffer_name(MoEDeviceRebalanceStage::WS_CONTROLLER_STATE),
+                               sizeof(controller_state)) ||
+                !copy_required(command_headers.data(),
+                               buffer_name(MoEDeviceRebalanceStage::WS_COMMAND_HEADER),
+                               command_headers.size() * sizeof(command_headers.front())) ||
+                !copy_required(wave_states.data(),
+                               buffer_name(MoEDeviceRebalanceStage::WS_WAVE_STATE),
+                               wave_states.size() * sizeof(wave_states.front())) ||
+                !copy_required(plan_counts.data(),
+                               buffer_name(MoEDeviceRebalanceStage::WS_TRANSFER_PLAN_COUNT),
+                               plan_counts.size() * sizeof(plan_counts.front())) ||
+                !copy_optional(&apply_status,
+                               buffer_name(MoEDeviceRebalanceStage::WS_APPLY_STATUS),
+                               sizeof(apply_status)))
+            {
+                return false;
+            }
+            if (export_trace && trace_plan_capacity > 0u)
+            {
+                if (!copy_required(trace_plan_entries.data(),
+                                   buffer_name(MoEDeviceRebalanceStage::WS_TRANSFER_PLAN),
+                                   trace_plan_entries.size() * sizeof(trace_plan_entries.front())))
+                {
+                    return false;
+                }
+            }
+        }
+
+        {
+            PerfStatsCollector::ScopedTimer readback_timer(
+                "moe_rebalance",
+                "device_rebalance_status_readback",
+                "decode",
+                device_key,
+                maintenance_tags);
+            if (!backend->synchronizeStream(maintenance_stream, device_ordinal))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance diagnostic export failed to synchronize readback stream for "
+                          << device_key);
+                return false;
+            }
+        }
+        if (outcome)
+        {
+            outcome->valid =
+                status.magic == kDeviceMoERebalanceMagic &&
+                status.version == kDeviceMoERebalanceVersion;
+            outcome->status_code = status.status_code;
+            outcome->windows_applied = status.windows_applied;
+            outcome->selected_replicas = status.selected_replicas;
+            outcome->planned_arrivals = status.planned_arrivals;
+            outcome->payload_bucket_slots = status.payload_bucket_slots;
+            outcome->payload_source_participant_mask =
+                status.payload_source_participant_mask;
+            outcome->payload_destination_participant_mask =
+                status.payload_destination_participant_mask;
+            outcome->payload_edge_mask = status.payload_edge_mask;
+            outcome->useful_work =
+                outcome->valid &&
+                status.status_code ==
+                    static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
+                (status.windows_applied != 0u ||
+                 status.selected_replicas != 0u ||
+                 status.planned_arrivals != 0u ||
+                 status.payload_bucket_slots != 0u);
+        }
+        if (!export_diagnostics)
+            return true;
+
+        if (export_perfstats && cache.timing_start_event && cache.timing_stop_event)
+        {
+            float elapsed_ms = 0.0f;
+            if (backend->eventElapsedTimeMs(
+                    cache.timing_start_event.get(),
+                    cache.timing_stop_event.get(),
+                    device_ordinal,
+                    &elapsed_ms))
+            {
+                const double clamped_ms =
+                    std::max(0.0, static_cast<double>(elapsed_ms));
+                PerfStatsCollector::recordTimingNs(
+                    "moe_rebalance",
+                    "device_maintenance_graph_gpu_elapsed",
+                    static_cast<uint64_t>(clamped_ms * 1000000.0),
+                    "decode",
+                    device_key,
+                    cache.timing_tags);
+            }
+            else
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_maintenance_graph_gpu_timing_read_failures",
+                    1.0,
+                    "decode",
+                    device_key,
+                    cache.timing_tags);
+            }
+            cache.timing_start_event.reset();
+            cache.timing_stop_event.reset();
+            cache.timing_tags.clear();
+        }
+
+        auto tags = maintenance_tags;
+        tags["workspace"] = workspace_name;
+        tags["stage"] = params.stage_name;
+        tags["launch_count"] = std::to_string(cache.launch_count);
+        tags["status_epoch"] = std::to_string(status.last_epoch);
+        tags["status_code"] = std::to_string(status.status_code);
+        tags["transfer_mode"] = deviceMoERebalanceTransferModeTag(params.transfer_mode);
+        tags["participant_count"] = std::to_string(params.config.participant_count);
+        tags["local_transfer_slot_count"] = std::to_string(params.local_transfer_slot_count);
+        tags["collective_payload_slot_capacity"] =
+            std::to_string(params.collective_payload_slot_capacity);
+        tags["collective_payload_slot_bytes"] =
+            std::to_string(params.collective_payload_slot_bytes);
+        tags["load_stats_enabled"] =
+            boolTag(hasDeviceMoERebalanceFlag(
+                params.config.flags,
+                DeviceMoERebalanceFlags::CollectLoadStats));
+        tags["min_load_spread_improvement"] =
+            std::to_string(params.config.min_load_spread_improvement);
+        tags["min_load_spread_improvement_divisor"] =
+            std::to_string(params.config.min_load_spread_improvement_divisor);
+        tags["min_wave_spread_improvement_per_payload_slot"] =
+            std::to_string(params.config.min_wave_spread_improvement_per_payload_slot);
+        tags["min_router_spread_improvement_per_payload_slot"] =
+            std::to_string(params.config.min_router_spread_improvement_per_payload_slot);
+
+        auto emit_u64 = [&](const std::string &name, uint64_t value)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                name,
+                static_cast<double>(value),
+                "decode",
+                device_key,
+                tags);
+        };
+        auto emit_u32 = [&](const std::string &name, uint32_t value)
+        {
+            emit_u64(name, static_cast<uint64_t>(value));
+        };
+        auto emit_double = [&](const std::string &name, double value)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                name,
+                value,
+                "decode",
+                device_key,
+                tags);
+        };
+        auto safe_ratio = [](uint64_t numerator, uint64_t denominator) -> double
+        {
+            return denominator == 0 ? 0.0
+                                    : static_cast<double>(numerator) /
+                                          static_cast<double>(denominator);
+        };
+        auto popcount_u64 = [](uint64_t value) -> uint32_t
+        {
+            uint32_t count = 0;
+            while (value != 0)
+            {
+                count += static_cast<uint32_t>(value & 1ULL);
+                value >>= 1u;
+            }
+            return count;
+        };
+
+        emit_u32("device_rebalance_status_code", status.status_code);
+        emit_u32("device_rebalance_windows_observed", status.windows_observed);
+        emit_u32("device_rebalance_windows_applied", status.windows_applied);
+        emit_u32("device_rebalance_changed_layers", status.changed_layers);
+        emit_u32("device_rebalance_selected_replicas", status.selected_replicas);
+        emit_u32("device_rebalance_skipped_not_ready", status.skipped_not_ready);
+        emit_u32("device_rebalance_skipped_busy_wave", status.skipped_busy_wave);
+        emit_u32("device_rebalance_skipped_histogram_not_ready",
+                 status.status_code ==
+                         static_cast<uint32_t>(DeviceMoERebalanceStatusCode::WindowNotReady) &&
+                         status.skipped_not_ready != 0u &&
+                         status.skipped_busy_wave == 0u
+                     ? 1u
+                     : 0u);
+        emit_u32("device_rebalance_window_ready_slots", status.window_ready_slots);
+        emit_u32("device_rebalance_window_required_slots", status.window_required_slots);
+        emit_u32("device_rebalance_skipped_no_resident", status.skipped_no_resident);
+        emit_u32("device_rebalance_skipped_no_improvement", status.skipped_no_improvement);
+        emit_u32("device_rebalance_skipped_wave_cost_floor",
+                 status.skipped_wave_cost_floor);
+        emit_u32("device_rebalance_skipped_low_router_benefit",
+                 status.skipped_low_router_benefit);
+        emit_u32("device_rebalance_candidate_arrivals_considered",
+                 status.candidate_arrivals_considered);
+        emit_u32("device_rebalance_candidate_arrivals_below_floor",
+                 status.candidate_arrivals_below_floor);
+        emit_u32("device_rebalance_candidate_arrivals_pruned_by_count_bound",
+                 status.candidate_arrivals_pruned_by_count_bound);
+        emit_u64("device_rebalance_candidate_load_spread_improvement_total",
+                 status.candidate_load_spread_improvement_total);
+        emit_u64("device_rebalance_candidate_load_spread_improvement_max",
+                 status.candidate_load_spread_improvement_max);
+        emit_u64("device_rebalance_accepted_load_spread_improvement_total",
+                 status.accepted_load_spread_improvement_total);
+        emit_u64("device_rebalance_accepted_load_spread_improvement_max",
+                 status.accepted_load_spread_improvement_max);
+        emit_u64("device_rebalance_router_hot_cache_eligible_dispatches",
+                 status.router_hot_cache_eligible_dispatches);
+        emit_u64("device_rebalance_router_hot_cache_used_dispatches",
+                 status.router_hot_cache_used_dispatches);
+        emit_u64("device_rebalance_router_hot_cache_improved_dispatches",
+                 status.router_hot_cache_improved_dispatches);
+        emit_u64("device_rebalance_router_hot_cache_default_load_spread_total",
+                 status.router_hot_cache_default_load_spread_total);
+        emit_u64("device_rebalance_router_hot_cache_actual_load_spread_total",
+                 status.router_hot_cache_actual_load_spread_total);
+        emit_u64("device_rebalance_router_hot_cache_load_spread_improvement_total",
+                 status.router_hot_cache_load_spread_improvement_total);
+        emit_u64("device_rebalance_router_hot_cache_active_dispatches",
+                 status.router_hot_cache_active_dispatches);
+        emit_u64("device_rebalance_router_hot_cache_miss_dispatches",
+                 status.router_hot_cache_miss_dispatches);
+        emit_u64("device_rebalance_router_hot_cache_selected_expert_slots",
+                 status.router_hot_cache_selected_expert_slots);
+        emit_u64("device_rebalance_router_hot_cache_replicated_selected_expert_slots",
+                 status.router_hot_cache_replicated_selected_expert_slots);
+        emit_u32("device_rebalance_invalid_runtime_layers", status.invalid_runtime_layers);
+        emit_u32("device_rebalance_planned_arrivals", status.planned_arrivals);
+        emit_u32("device_rebalance_plan_overflow", status.plan_overflow);
+        emit_u32("device_rebalance_payload_bucket_requested_slots",
+                 status.payload_bucket_requested_slots);
+        emit_u32("device_rebalance_payload_bucket_slots",
+                 status.payload_bucket_slots);
+        emit_u32("device_rebalance_payload_bucket_index",
+                 status.payload_bucket_index);
+        emit_u32("device_rebalance_payload_bucket_overflow",
+                 status.payload_bucket_overflow);
+        emit_u32("device_rebalance_payload_source_participant_mask",
+                 status.payload_source_participant_mask);
+        emit_u32("device_rebalance_payload_destination_participant_mask",
+                 status.payload_destination_participant_mask);
+        emit_u32("device_rebalance_payload_edge_mask_low32",
+                 static_cast<uint32_t>(status.payload_edge_mask & 0xffffffffULL));
+        emit_u32("device_rebalance_payload_edge_mask_high32",
+                 static_cast<uint32_t>(status.payload_edge_mask >> 32u));
+        emit_u32("device_rebalance_payload_active_edge_count",
+                 popcount_u64(status.payload_edge_mask));
+
+        uint64_t wave_command_count_total = 0;
+        uint64_t wave_copied_arrivals_total = 0;
+        uint64_t wave_applied_arrivals_total = 0;
+        uint64_t wave_applied_layer_count_total = 0;
+        for (uint32_t i = 0; i < controller_state.wave_count && i < 2u; ++i)
+        {
+            const auto &wave = controller_state.waves[i];
+            wave_command_count_total += wave.command_count;
+            wave_copied_arrivals_total += wave.copied_arrivals;
+            wave_applied_arrivals_total += wave.applied_arrivals;
+            wave_applied_layer_count_total += wave.applied_layer_count;
+        }
+        uint32_t transfer_copied_arrivals = 0;
+        bool transfer_wave_matched = false;
+        uint32_t transfer_wave_index = 0;
+        uint32_t transfer_command_epoch = 0;
+        uint32_t transfer_wave_epoch = 0;
+        uint32_t transfer_wave_state = static_cast<uint32_t>(DeviceMoERebalanceWaveLifecycle::Idle);
+        uint32_t transfer_command_count = 0;
+        uint32_t transfer_applied_arrivals = 0;
+        uint32_t transfer_applied_layer_count = 0;
+        uint32_t transfer_requested_payload_slots = status.payload_bucket_requested_slots;
+        uint32_t transfer_payload_bucket_slots = status.payload_bucket_slots;
+        uint32_t transfer_payload_bucket_index = status.payload_bucket_index;
+        uint32_t transfer_payload_bucket_overflow = status.payload_bucket_overflow;
+        uint32_t transfer_payload_source_participant_mask =
+            status.payload_source_participant_mask;
+        uint32_t transfer_payload_destination_participant_mask =
+            status.payload_destination_participant_mask;
+        uint64_t transfer_payload_edge_mask = status.payload_edge_mask;
+        if (status.status_code == static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
+            status.windows_applied != 0u &&
+            status.last_epoch != 0u)
+        {
+            const uint32_t wave_limit =
+                std::min<uint32_t>(std::min<uint32_t>(controller_state.wave_count, 2u),
+                                   command_buffer_count);
+            for (uint32_t i = 0; i < wave_limit; ++i)
+            {
+                const auto &header = command_headers[i];
+                const auto &wave = controller_state.waves[i];
+                const uint32_t header_count =
+                    std::min<uint32_t>(header.command_count, header.command_capacity);
+                const uint32_t command_capacity =
+                    header.command_capacity != 0u ? header.command_capacity : wave.command_count;
+                const uint32_t wave_count =
+                    std::min<uint32_t>(wave.command_count, command_capacity);
+                if (wave.epoch == 0u ||
+                    wave.epoch != status.last_epoch ||
+                    wave_count == 0u)
+                {
+                    continue;
+                }
+
+                transfer_wave_matched = true;
+                transfer_wave_index = i;
+                transfer_command_epoch = header.epoch != 0u ? header.epoch : wave.epoch;
+                transfer_wave_epoch = wave.epoch;
+                transfer_wave_state = wave.state;
+                transfer_command_count = header_count != 0u ? header_count : wave_count;
+                transfer_applied_arrivals =
+                    std::min<uint32_t>(wave.applied_arrivals, wave_count);
+                transfer_applied_layer_count =
+                    std::min<uint32_t>(wave.applied_layer_count,
+                                       params.config.num_layers);
+                transfer_requested_payload_slots = wave.requested_payload_slots;
+                transfer_payload_bucket_slots = wave.payload_bucket_slots;
+                transfer_payload_bucket_index = wave.payload_bucket_index;
+                transfer_payload_bucket_overflow = wave.payload_bucket_overflow;
+                if (wave.state >=
+                        static_cast<uint32_t>(DeviceMoERebalanceWaveLifecycle::TransferInFlight) &&
+                    wave.state <=
+                        static_cast<uint32_t>(DeviceMoERebalanceWaveLifecycle::Applied))
+                {
+                    transfer_copied_arrivals =
+                        std::min<uint32_t>(wave.copied_arrivals, wave_count);
+                }
+                break;
+            }
+        }
+
+        const auto transfer_cost =
+            estimateDeviceMoERebalanceTransferCost(
+                params.config,
+                params.transfer_mode,
+                params.local_transfer_slot_count,
+                params.collective_payload_slot_bytes,
+                transfer_copied_arrivals,
+                params.collective_payload_slot_capacity,
+                transfer_payload_bucket_slots,
+                transfer_payload_edge_mask != 0ULL
+                    ? popcount_u64(transfer_payload_edge_mask)
+                    : std::numeric_limits<uint32_t>::max());
+        if (transfer_cost.transfer_plan_capacity > 0 ||
+            params.local_transfer_slot_count > 0 ||
+            params.collective_payload_slot_bytes > 0)
+        {
+            emit_u32("device_rebalance_transfer_current_copied_arrivals",
+                     transfer_copied_arrivals);
+            emit_u32("device_rebalance_transfer_current_wave_index",
+                     transfer_wave_index);
+            emit_u32("device_rebalance_transfer_current_wave_matched",
+                     transfer_wave_matched ? 1u : 0u);
+            emit_u32("device_rebalance_transfer_current_command_epoch",
+                     transfer_command_epoch);
+            emit_u32("device_rebalance_transfer_current_wave_epoch",
+                     transfer_wave_epoch);
+            emit_u32("device_rebalance_transfer_current_wave_state",
+                     transfer_wave_state);
+            emit_u32("device_rebalance_transfer_current_command_count",
+                     transfer_command_count);
+            emit_u32("device_rebalance_transfer_current_applied_arrivals",
+                     transfer_applied_arrivals);
+            emit_u32("device_rebalance_transfer_current_applied_layer_count",
+                     transfer_applied_layer_count);
+            emit_u32("device_rebalance_transfer_current_requested_payload_slots",
+                     transfer_requested_payload_slots);
+            emit_u32("device_rebalance_transfer_current_payload_bucket_slots",
+                     transfer_payload_bucket_slots);
+            emit_u32("device_rebalance_transfer_current_payload_bucket_index",
+                     transfer_payload_bucket_index);
+            emit_u32("device_rebalance_transfer_current_payload_bucket_overflow",
+                     transfer_payload_bucket_overflow);
+            emit_u32("device_rebalance_transfer_current_payload_source_participant_mask",
+                     transfer_payload_source_participant_mask);
+            emit_u32("device_rebalance_transfer_current_payload_destination_participant_mask",
+                     transfer_payload_destination_participant_mask);
+            emit_u32("device_rebalance_transfer_current_payload_edge_mask_low32",
+                     static_cast<uint32_t>(transfer_payload_edge_mask & 0xffffffffULL));
+            emit_u32("device_rebalance_transfer_current_payload_edge_mask_high32",
+                     static_cast<uint32_t>(transfer_payload_edge_mask >> 32u));
+            emit_u32("device_rebalance_transfer_current_payload_active_edge_count",
+                     popcount_u64(transfer_payload_edge_mask));
+            emit_u64("device_rebalance_transfer_command_buffer_count",
+                     transfer_cost.command_buffer_count);
+            emit_u64("device_rebalance_transfer_plan_capacity",
+                     transfer_cost.transfer_plan_capacity);
+            emit_u64("device_rebalance_transfer_payload_slot_capacity",
+                     transfer_cost.payload_slot_capacity);
+            emit_u64("device_rebalance_transfer_payload_slot_count",
+                     transfer_cost.payload_slot_count);
+            emit_u64("device_rebalance_transfer_slot_payload_bytes",
+                     transfer_cost.slot_payload_bytes);
+            emit_u64("device_rebalance_transfer_plan_local_bytes",
+                     transfer_cost.plan_local_bytes);
+            emit_u64("device_rebalance_transfer_plan_gathered_bytes",
+                     transfer_cost.plan_gathered_bytes);
+            emit_u64("device_rebalance_transfer_header_local_bytes",
+                     transfer_cost.header_local_bytes);
+            emit_u64("device_rebalance_transfer_header_gathered_bytes",
+                     transfer_cost.header_gathered_bytes);
+            emit_u64("device_rebalance_transfer_source_descriptor_local_bytes",
+                     transfer_cost.source_descriptor_local_bytes);
+            emit_u64("device_rebalance_transfer_source_descriptor_gathered_bytes",
+                     transfer_cost.source_descriptor_gathered_bytes);
+            emit_u64("device_rebalance_transfer_selected_payload_bucket_slots",
+                     transfer_cost.selected_payload_bucket_slots);
+            emit_u64("device_rebalance_transfer_selected_payload_slot_count",
+                     transfer_cost.selected_payload_slot_count);
+            emit_u64("device_rebalance_transfer_selected_payload_local_capacity_bytes",
+                     transfer_cost.selected_payload_local_capacity_bytes);
+            emit_u64("device_rebalance_transfer_selected_payload_gathered_capacity_bytes",
+                     transfer_cost.selected_payload_gathered_capacity_bytes);
+            emit_u64("device_rebalance_transfer_selected_payload_transport_edge_count",
+                     transfer_cost.selected_payload_transport_edge_count);
+            emit_u64("device_rebalance_transfer_selected_payload_transport_capacity_bytes",
+                     transfer_cost.selected_payload_transport_capacity_bytes);
+            emit_u64("device_rebalance_transfer_payload_local_capacity_bytes",
+                     transfer_cost.payload_local_capacity_bytes);
+            emit_u64("device_rebalance_transfer_payload_gathered_capacity_bytes",
+                     transfer_cost.payload_gathered_capacity_bytes);
+            emit_u64("device_rebalance_transfer_captured_payload_slack_bytes",
+                     transfer_cost.captured_payload_slack_bytes);
+            emit_u64("device_rebalance_transfer_useful_payload_bytes",
+                     transfer_cost.useful_payload_bytes);
+            emit_u64("device_rebalance_transfer_wasted_payload_capacity_bytes",
+                     transfer_cost.wasted_payload_capacity_bytes);
+            emit_u64("device_rebalance_transfer_wasted_payload_transport_capacity_bytes",
+                     transfer_cost.wasted_payload_transport_capacity_bytes);
+            emit_double("device_rebalance_transfer_payload_local_utilization_ratio",
+                        safe_ratio(transfer_cost.useful_payload_bytes,
+                                   transfer_cost.payload_local_capacity_bytes));
+            emit_double("device_rebalance_transfer_payload_collective_utilization_ratio",
+                        safe_ratio(transfer_cost.useful_payload_bytes,
+                                   transfer_cost.payload_gathered_capacity_bytes));
+            emit_double("device_rebalance_transfer_selected_payload_utilization_ratio",
+                        safe_ratio(transfer_cost.useful_payload_bytes,
+                                   transfer_cost.selected_payload_gathered_capacity_bytes));
+            emit_double("device_rebalance_transfer_selected_payload_transport_utilization_ratio",
+                        safe_ratio(transfer_cost.useful_payload_bytes,
+                                   transfer_cost.selected_payload_transport_capacity_bytes));
+            emit_double("device_rebalance_transfer_useful_bytes_per_accepted_spread_unit",
+                        safe_ratio(transfer_cost.useful_payload_bytes,
+                                   status.accepted_load_spread_improvement_total));
+            emit_double("device_rebalance_transfer_collective_bytes_per_accepted_spread_unit",
+                        safe_ratio(transfer_cost.selected_payload_gathered_capacity_bytes,
+                                   status.accepted_load_spread_improvement_total));
+            emit_double("device_rebalance_transfer_transport_bytes_per_accepted_spread_unit",
+                        safe_ratio(transfer_cost.selected_payload_transport_capacity_bytes,
+                                   status.accepted_load_spread_improvement_total));
+        }
+
+        auto ratio = [](uint64_t numerator, uint64_t denominator) -> double
+        {
+            return denominator == 0 ? 0.0
+                                    : static_cast<double>(numerator) /
+                                          static_cast<double>(denominator);
+        };
+        const double pre_ratio =
+            ratio(status.pre_policy_imbalance_numerator,
+                  status.pre_policy_imbalance_denominator);
+        const double post_ratio =
+            ratio(status.post_policy_imbalance_numerator,
+                  status.post_policy_imbalance_denominator);
+        const uint64_t pre_spread =
+            deviceMoELoadSpread(status.pre_policy_load_min,
+                                status.pre_policy_load_max);
+        const uint64_t post_spread =
+            deviceMoELoadSpread(status.post_policy_load_min,
+                                status.post_policy_load_max);
+        const uint64_t spread_improvement =
+            pre_spread > post_spread ? pre_spread - post_spread : 0;
+
+        auto emit_ratio =
+            [&](const char *phase,
+                double value,
+                uint64_t total,
+                uint64_t min_load,
+                uint64_t max_load,
+                uint64_t numerator,
+                uint64_t denominator)
+        {
+            auto ratio_tags = tags;
+            ratio_tags["policy_phase"] = phase;
+            ratio_tags["load_total"] = std::to_string(total);
+            ratio_tags["load_min"] = std::to_string(min_load);
+            ratio_tags["load_max"] = std::to_string(max_load);
+            ratio_tags["imbalance_numerator"] = std::to_string(numerator);
+            ratio_tags["imbalance_denominator"] = std::to_string(denominator);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_policy_load_imbalance_ratio",
+                value,
+                "decode",
+                device_key,
+                std::move(ratio_tags));
+        };
+        emit_ratio("pre",
+                   pre_ratio,
+                   status.pre_policy_load_total,
+                   status.pre_policy_load_min,
+                   status.pre_policy_load_max,
+                   status.pre_policy_imbalance_numerator,
+                   status.pre_policy_imbalance_denominator);
+        emit_ratio("post",
+                   post_ratio,
+                   status.post_policy_load_total,
+                   status.post_policy_load_min,
+                   status.post_policy_load_max,
+                   status.post_policy_imbalance_numerator,
+                   status.post_policy_imbalance_denominator);
+        auto emit_spread =
+            [&](const char *phase, uint64_t value)
+        {
+            auto spread_tags = tags;
+            spread_tags["policy_phase"] = phase;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_policy_load_spread_units",
+                static_cast<double>(value),
+                "decode",
+                device_key,
+                std::move(spread_tags));
+        };
+        emit_spread("pre", pre_spread);
+        emit_spread("post", post_spread);
+        emit_spread("delta", spread_improvement);
+        emit_double("device_rebalance_policy_load_spread_delta_units",
+                    static_cast<double>(spread_improvement));
+        emit_double("device_rebalance_policy_accepted_spread_improvement_per_arrival",
+                    safe_ratio(status.accepted_load_spread_improvement_total,
+                               std::max<uint32_t>(1u, status.planned_arrivals)));
+        emit_double("device_rebalance_router_hot_cache_spread_improvement_ratio",
+                    safe_ratio(status.router_hot_cache_load_spread_improvement_total,
+                               status.router_hot_cache_default_load_spread_total));
+        emit_double("device_rebalance_router_hot_cache_avg_spread_improvement_per_used_dispatch",
+                    safe_ratio(status.router_hot_cache_load_spread_improvement_total,
+                               status.router_hot_cache_used_dispatches));
+        emit_double("device_rebalance_router_hot_cache_spread_improvement_per_requested_payload_slot",
+                    safe_ratio(status.router_hot_cache_load_spread_improvement_total,
+                               status.payload_bucket_requested_slots));
+        emit_double("device_rebalance_router_hot_cache_miss_ratio",
+                    safe_ratio(status.router_hot_cache_miss_dispatches,
+                               status.router_hot_cache_active_dispatches));
+        emit_double("device_rebalance_router_hot_cache_selected_replica_slot_ratio",
+                    safe_ratio(status.router_hot_cache_replicated_selected_expert_slots,
+                               status.router_hot_cache_selected_expert_slots));
+        const uint32_t participant_count =
+            std::min<uint32_t>(params.config.participant_count,
+                               kDeviceMoEMaxParticipants);
+        for (uint32_t participant = 0; participant < participant_count; ++participant)
+        {
+            auto load_tags = tags;
+            load_tags["participant"] = std::to_string(participant);
+            load_tags["policy_phase"] = "pre";
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_policy_participant_load",
+                static_cast<double>(
+                    status.pre_policy_participant_load[participant]),
+                "decode",
+                device_key,
+                load_tags);
+
+            load_tags["policy_phase"] = "post";
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_policy_participant_load",
+                static_cast<double>(
+                    status.post_policy_participant_load[participant]),
+                "decode",
+                device_key,
+                load_tags);
+
+            load_tags["policy_phase"] = "delta";
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_policy_participant_load_delta",
+                static_cast<double>(
+                    status.post_policy_participant_load[participant]) -
+                    static_cast<double>(
+                        status.pre_policy_participant_load[participant]),
+                "decode",
+                device_key,
+                load_tags);
+        }
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "device_rebalance_policy_load_imbalance_delta",
+            pre_ratio - post_ratio,
+            "decode",
+            device_key,
+            tags);
+
+        if (export_trace)
+        {
+            if (!appendDeviceMoERebalanceTraceJsonl(
+                    trace_path,
+                    device_key,
+                    maintenance_tags,
+                    workspace_name,
+                    params,
+                    status,
+                    controller_state,
+                    apply_status,
+                    command_headers,
+                    wave_states,
+                    plan_counts,
+                    trace_plan_entries,
+                    trace_plan_capacity,
+                    transfer_cost,
+                    transfer_copied_arrivals,
+                    transfer_applied_arrivals,
+                    transfer_payload_bucket_slots,
+                    transfer_payload_edge_mask))
+            {
+                return false;
+            }
+        }
+
+        if (!export_perfstats)
+            return true;
+
+        emit_u32("device_rebalance_apply_status_code", apply_status.status_code);
+        emit_u32("device_rebalance_apply_plan_entries_seen", apply_status.plan_entries_seen);
+        emit_u32("device_rebalance_apply_applied_arrivals", apply_status.applied_arrivals);
+        emit_u32("device_rebalance_apply_changed_layers", apply_status.changed_layers);
+        emit_u32("device_rebalance_apply_copied_arrivals", apply_status.copied_arrivals);
+        emit_u32("device_rebalance_apply_copy_incomplete", apply_status.copy_incomplete);
+        emit_u32("device_rebalance_apply_missing_source_descriptors",
+                 apply_status.missing_source_descriptors);
+        emit_u32("device_rebalance_apply_missing_destination_slots",
+                 apply_status.missing_destination_slots);
+        emit_u32("device_rebalance_apply_descriptor_mismatches",
+                 apply_status.descriptor_mismatches);
+
+        emit_u32("device_rebalance_controller_maintenance_launches",
+                 controller_state.maintenance_launches);
+        emit_u32("device_rebalance_controller_decode_apply_polls",
+                 controller_state.decode_apply_polls);
+        emit_u32("device_rebalance_controller_decode_apply_hits",
+                 controller_state.decode_apply_hits);
+        emit_u32("device_rebalance_controller_last_error_code",
+                 controller_state.last_error_code);
+
+        for (uint32_t i = 0; i < command_buffer_count; ++i)
+        {
+            auto slot_tags = tags;
+            slot_tags["buffer_slot"] = std::to_string(i);
+            slot_tags["command_epoch"] = std::to_string(command_headers[i].epoch);
+            slot_tags["command_capacity"] =
+                std::to_string(command_headers[i].command_capacity);
+            slot_tags["wave_epoch"] = std::to_string(wave_states[i].epoch);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_command_count",
+                static_cast<double>(command_headers[i].command_count),
+                "decode",
+                device_key,
+                slot_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_plan_count",
+                static_cast<double>(plan_counts[i]),
+                "decode",
+                device_key,
+                slot_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_planned_layer_count",
+                static_cast<double>(wave_states[i].planned_layer_count),
+                "decode",
+                device_key,
+                slot_tags);
+        }
+
+        for (uint32_t i = 0; i < controller_state.wave_count && i < 2u; ++i)
+        {
+            const auto &wave = controller_state.waves[i];
+            auto wave_tags = tags;
+            wave_tags["wave"] = std::to_string(i);
+            wave_tags["wave_epoch"] = std::to_string(wave.epoch);
+            wave_tags["wave_state"] = std::to_string(wave.state);
+            wave_tags["wave_error_code"] = std::to_string(wave.error_code);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_command_count",
+                static_cast<double>(wave.command_count),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_copied_arrivals",
+                static_cast<double>(wave.copied_arrivals),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_applied_arrivals",
+                static_cast<double>(wave.applied_arrivals),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_applied_layer_count",
+                static_cast<double>(wave.applied_layer_count),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_payload_bucket_requested_slots",
+                static_cast<double>(wave.requested_payload_slots),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_payload_bucket_slots",
+                static_cast<double>(wave.payload_bucket_slots),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_payload_bucket_index",
+                static_cast<double>(wave.payload_bucket_index),
+                "decode",
+                device_key,
+                wave_tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_wave_payload_bucket_overflow",
+                static_cast<double>(wave.payload_bucket_overflow),
+                "decode",
+                device_key,
+                wave_tags);
+        }
+        emit_u64("device_rebalance_wave_command_count_total",
+                 wave_command_count_total);
+        emit_u64("device_rebalance_wave_copied_arrivals_total",
+                 wave_copied_arrivals_total);
+        emit_u64("device_rebalance_wave_applied_arrivals_total",
+                 wave_applied_arrivals_total);
+        emit_u64("device_rebalance_wave_applied_layer_count_total",
+                 wave_applied_layer_count_total);
+
+        return true;
+    }
+
+    void DeviceGraphOrchestrator::drainCompletedDeviceMoERebalanceMaintenanceForRequestReset()
+    {
+        auto &cache = device_moe_rebalance_maintenance_graph_;
+        const bool has_inflight_payload =
+            std::any_of(
+                device_moe_rebalance_maintenance_payload_graphs_.begin(),
+                device_moe_rebalance_maintenance_payload_graphs_.end(),
+                [](const auto &entry)
+                {
+                    return entry.second.completion_event_in_flight;
+                });
+        if (!cache.completion_event_in_flight && !has_inflight_payload)
+            return;
+
+        if (!PerfStatsCollector::isEnabled() &&
+            deviceMoERebalanceTracePathFromEnv().empty())
+        {
+            cache.completion_event_in_flight = false;
+            cache.skipped_inflight_count = 0;
+            for (auto &[edge_mask, payload_cache] :
+                 device_moe_rebalance_maintenance_payload_graphs_)
+            {
+                (void)edge_mask;
+                payload_cache.completion_event_in_flight = false;
+                payload_cache.skipped_inflight_count = 0;
+            }
+            return;
+        }
+
+        const std::string device_key = state_.device_id.toString();
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(state_.device_id);
+        }
+        catch (const std::exception &e)
+        {
+            throw std::runtime_error(
+                "Device MoE rebalance request reset could not resolve GPU context for " +
+                device_key + ": " + e.what());
+        }
+        if (!gpu_ctx)
+        {
+            throw std::runtime_error(
+                "Device MoE rebalance request reset resolved a null GPU context for " +
+                device_key);
+        }
+
+        const PerfStatsCollector::Tags reset_tags = {
+            {"window", "request_reset"},
+            {"decode_tokens_seen",
+             std::to_string(device_moe_rebalance_decode_tokens_seen_)},
+            {"reset", "clear_cache"}};
+
+        auto drain_one =
+            [&](DeviceMoERebalanceMaintenanceGraphCache &target_cache,
+                const char *kind,
+                uint64_t payload_edge_mask = 0)
+        {
+            if (!target_cache.completion_event_in_flight)
+                return;
+            if (!target_cache.graph)
+            {
+                throw std::runtime_error(
+                    std::string("Device MoE rebalance request reset found an in-flight ") +
+                    kind + " maintenance event without a graph on " + device_key);
+            }
+            if (!target_cache.completion_event)
+            {
+                throw std::runtime_error(
+                    std::string("Device MoE rebalance request reset found in-flight ") +
+                    kind + " maintenance without a completion event on " + device_key);
+            }
+            void *maintenance_stream = target_cache.segment_cache.capture_stream;
+            if (!maintenance_stream)
+            {
+                throw std::runtime_error(
+                    std::string("Device MoE rebalance request reset requires an explicit ") +
+                    kind + " maintenance stream on " + device_key);
+            }
+
+            bool ready = false;
+            if (!gpu_ctx->queryEventChecked(target_cache.completion_event.get(), ready))
+            {
+                throw std::runtime_error(
+                    std::string("Device MoE rebalance request reset failed to query ") +
+                    kind + " maintenance completion event on " + device_key);
+            }
+            if (!ready)
+            {
+                throw std::runtime_error(
+                    std::string("Device MoE rebalance request reset reached an unfinished ") +
+                    kind + " maintenance event after device synchronization on " + device_key);
+            }
+
+            auto tags = reset_tags;
+            tags["maintenance_graph_kind"] = kind;
+            if (payload_edge_mask != 0ULL)
+            {
+                tags["payload_edge_mask_low32"] =
+                    std::to_string(static_cast<uint32_t>(
+                        payload_edge_mask & 0xffffffffULL));
+                tags["payload_edge_mask_high32"] =
+                    std::to_string(static_cast<uint32_t>(
+                        payload_edge_mask >> 32u));
+            }
+            if (!exportCompletedDeviceMoERebalanceMaintenanceStats(
+                    target_cache,
+                    maintenance_stream,
+                    device_key,
+                    tags))
+            {
+                throw std::runtime_error(
+                    std::string("Device MoE rebalance request reset failed to export ") +
+                    kind + " maintenance diagnostics on " + device_key);
+            }
+
+            target_cache.completion_event_in_flight = false;
+            target_cache.skipped_inflight_count = 0;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_maintenance_graph_request_reset_exports",
+                1.0,
+                "decode",
+                device_key,
+                tags);
+        };
+
+        drain_one(cache, "plan");
+        for (auto &[edge_mask, payload_cache] :
+             device_moe_rebalance_maintenance_payload_graphs_)
+        {
+            drain_one(payload_cache, "payload", edge_mask);
+        }
+    }
+
+    bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(
+        const ForwardInput &input)
+    {
+        const auto &env = debugEnv();
+        if (!env.moe_rebalance.device_rebalance_maintenance_graph)
+            return true;
+
+        if (!isMoeRebalancingActive())
+            return true;
+
+        if (!state_.device_id.is_gpu() ||
+            compute_all_position_logits_ ||
+            !graph_builder_ ||
+            input.batch_size > 1 ||
+            input.seq_len != 1)
+        {
+            return true;
+        }
+
+        const int first_position =
+            input.position_ids ? input.position_ids[0] : input.position_offset;
+        if (first_position <= 0)
+            return true;
+
+        if (!usesDeviceSideMoERebalanceController())
+            return true;
+
+        const auto &graph_config = graph_builder_->config();
+        const int configured_window = graph_config.moe.rebalance_config.window_size > 0
+                                          ? graph_config.moe.rebalance_config.window_size
+                                          : env.moe_rebalance.window_size;
+        const int window = std::max(1, configured_window);
+        const int maintenance_slack =
+            std::max(0, env.moe_rebalance.device_rebalance_maintenance_slack_tokens);
+        const int requested_launch_period = std::max(1, window + maintenance_slack);
+        const int min_maintenance_period =
+            std::max(0, env.moe_rebalance.device_rebalance_min_maintenance_period_tokens);
+        const int launch_period =
+            min_maintenance_period > 0
+                ? std::max(requested_launch_period, min_maintenance_period)
+                : requested_launch_period;
+        const int initial_maintenance_period =
+            std::max(0, env.moe_rebalance.device_rebalance_initial_maintenance_period_tokens);
+        ++device_moe_rebalance_decode_tokens_seen_;
+        const uint64_t decode_tokens_seen = device_moe_rebalance_decode_tokens_seen_;
+        bool should_launch = false;
+        if (initial_maintenance_period > 0 &&
+            decode_tokens_seen == static_cast<uint64_t>(initial_maintenance_period))
+        {
+            should_launch = true;
+        }
+        else if (initial_maintenance_period > 0 &&
+                 decode_tokens_seen > static_cast<uint64_t>(initial_maintenance_period))
+        {
+            should_launch =
+                ((decode_tokens_seen - static_cast<uint64_t>(initial_maintenance_period)) %
+                 static_cast<uint64_t>(launch_period)) == 0;
+        }
+        else
+        {
+            should_launch =
+                (decode_tokens_seen % static_cast<uint64_t>(launch_period)) == 0;
+        }
+
+        const std::string device_key = state_.device_id.toString();
+        auto &cache = device_moe_rebalance_maintenance_graph_;
+        auto has_inflight_payload =
+            [&]() -> bool
+        {
+            return std::any_of(
+                device_moe_rebalance_maintenance_payload_graphs_.begin(),
+                device_moe_rebalance_maintenance_payload_graphs_.end(),
+                [](const auto &entry)
+                {
+                    return entry.second.completion_event_in_flight;
+                });
+        };
+        const bool has_inflight_maintenance =
+            cache.completion_event_in_flight || has_inflight_payload();
+        if (!should_launch && !has_inflight_maintenance)
+        {
+            return true;
+        }
+
+        const PerfStatsCollector::Tags maintenance_tags = {
+            {"window", std::to_string(window)},
+            {"maintenance_slack_tokens", std::to_string(maintenance_slack)},
+            {"requested_launch_period", std::to_string(requested_launch_period)},
+            {"min_maintenance_period_tokens", std::to_string(min_maintenance_period)},
+            {"initial_maintenance_period_tokens", std::to_string(initial_maintenance_period)},
+            {"launch_period", std::to_string(launch_period)},
+            {"scheduled_plan_launch", boolTag(should_launch)},
+            {"decode_tokens_seen",
+             std::to_string(decode_tokens_seen)}};
+
+        PerfStatsCollector::ScopedTimer maintenance_timer(
+            "moe_rebalance",
+            "device_maintenance_graph_host_window",
+            "decode",
+            device_key,
+            maintenance_tags);
+
+        IDeviceContext *ctx = getDeviceContext(state_.device_id);
+        if (!ctx)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance maintenance graph could not resolve context for "
+                      << device_key);
+            return false;
+        }
+
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(state_.device_id);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance maintenance graph could not resolve GPU worker context for "
+                      << device_key << ": " << e.what());
+            return false;
+        }
+        if (!gpu_ctx)
+            return false;
+
+        for (auto &[edge_mask, payload_cache] :
+             device_moe_rebalance_maintenance_payload_graphs_)
+        {
+            if (!payload_cache.completion_event_in_flight)
+                continue;
+            if (!payload_cache.completion_event)
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance payload maintenance graph marked in-flight without a completion event");
+                return false;
+            }
+
+            bool previous_payload_ready = false;
+            {
+                PerfStatsCollector::ScopedTimer query_timer(
+                    "moe_rebalance",
+                    "device_maintenance_payload_graph_event_query",
+                    "decode",
+                    device_key,
+                    maintenance_tags);
+                if (!gpu_ctx->queryEventChecked(payload_cache.completion_event.get(), previous_payload_ready))
+                {
+                    LOG_ERROR("[DGO] Device MoE rebalance payload maintenance graph completion query failed for "
+                              << device_key);
+                    return false;
+                }
+            }
+            if (!previous_payload_ready)
+            {
+                ++payload_cache.skipped_inflight_count;
+                PerfStatsCollector::Tags skip_tags;
+                skip_tags["window"] = std::to_string(window);
+                skip_tags["launch_count"] = std::to_string(payload_cache.launch_count);
+                skip_tags["payload_edge_mask_low32"] =
+                    std::to_string(static_cast<uint32_t>(
+                        edge_mask & 0xffffffffULL));
+                skip_tags["payload_edge_mask_high32"] =
+                    std::to_string(static_cast<uint32_t>(edge_mask >> 32u));
+                skip_tags["skipped_inflight_count"] =
+                    std::to_string(payload_cache.skipped_inflight_count);
+                skip_tags["maintenance_graph_kind"] = "payload";
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_maintenance_payload_graph_skipped_inflight",
+                    1.0,
+                    "decode",
+                    device_key,
+                    std::move(skip_tags));
+                return true;
+            }
+
+            payload_cache.completion_event_in_flight = false;
+            auto payload_tags = maintenance_tags;
+            payload_tags["maintenance_graph_kind"] = "payload";
+            payload_tags["payload_edge_mask_low32"] =
+                std::to_string(static_cast<uint32_t>(
+                    edge_mask & 0xffffffffULL));
+            payload_tags["payload_edge_mask_high32"] =
+                std::to_string(static_cast<uint32_t>(edge_mask >> 32u));
+            if (!exportCompletedDeviceMoERebalanceMaintenanceStats(
+                    payload_cache,
+                    payload_cache.segment_cache.capture_stream,
+                    device_key,
+                    payload_tags))
+            {
+                return false;
+            }
+        }
+
+        bool launch_payload_graph = false;
+        uint64_t pending_payload_edge_mask = 0;
+        if (cache.completion_event_in_flight)
+        {
+            if (!cache.completion_event)
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance maintenance graph marked in-flight without a completion event");
+                return false;
+            }
+
+            bool previous_wave_ready = false;
+            {
+                PerfStatsCollector::ScopedTimer query_timer(
+                    "moe_rebalance",
+                    "device_maintenance_graph_event_query",
+                    "decode",
+                    device_key,
+                    maintenance_tags);
+                if (!gpu_ctx->queryEventChecked(cache.completion_event.get(), previous_wave_ready))
+                {
+                    LOG_ERROR("[DGO] Device MoE rebalance maintenance graph completion query failed for "
+                              << device_key);
+                    return false;
+                }
+            }
+            if (!previous_wave_ready)
+            {
+                ++cache.skipped_inflight_count;
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_maintenance_graph_skipped_inflight",
+                    1.0,
+                    "decode",
+                    device_key,
+                    {{"window", std::to_string(window)},
+                     {"launch_count", std::to_string(cache.launch_count)},
+                     {"skipped_inflight_count", std::to_string(cache.skipped_inflight_count)}});
+                return true;
+            }
+
+            cache.completion_event_in_flight = false;
+            DeviceMoERebalanceMaintenanceOutcome outcome{};
+            auto plan_tags = maintenance_tags;
+            plan_tags["maintenance_graph_kind"] = "plan";
+            if (!exportCompletedDeviceMoERebalanceMaintenanceStats(
+                    cache,
+                    cache.segment_cache.capture_stream,
+                    device_key,
+                    plan_tags,
+                    &outcome))
+            {
+                return false;
+            }
+            launch_payload_graph =
+                outcome.valid &&
+                outcome.status_code ==
+                    static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
+                outcome.payload_bucket_slots != 0u;
+            pending_payload_edge_mask = launch_payload_graph
+                                            ? outcome.payload_edge_mask
+                                            : 0ULL;
+            if (outcome.valid && !outcome.useful_work)
+            {
+                ++cache.no_work_backoff_streak;
+                const int configured_backoff =
+                    std::max(0, env.moe_rebalance.device_rebalance_no_work_backoff_periods);
+                cache.no_work_backoff_remaining =
+                    static_cast<uint64_t>(configured_backoff);
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_maintenance_graph_no_work_completions",
+                    1.0,
+                    "decode",
+                    device_key,
+                    {{"window", std::to_string(window)},
+                     {"launch_count", std::to_string(cache.launch_count)},
+                     {"no_work_backoff_periods", std::to_string(configured_backoff)},
+                     {"no_work_backoff_streak", std::to_string(cache.no_work_backoff_streak)},
+                     {"status_code", std::to_string(outcome.status_code)},
+                     {"windows_applied", std::to_string(outcome.windows_applied)},
+                     {"selected_replicas", std::to_string(outcome.selected_replicas)},
+                     {"planned_arrivals", std::to_string(outcome.planned_arrivals)},
+                     {"payload_bucket_slots", std::to_string(outcome.payload_bucket_slots)}});
+            }
+            else if (outcome.valid)
+            {
+                cache.no_work_backoff_streak = 0;
+                cache.no_work_backoff_remaining = 0;
+            }
+        }
+
+        if (!launch_payload_graph && !should_launch)
+        {
+            return true;
+        }
+
+        if (!launch_payload_graph && cache.no_work_backoff_remaining > 0)
+        {
+            --cache.no_work_backoff_remaining;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_maintenance_graph_skipped_no_work_backoff",
+                1.0,
+                "decode",
+                device_key,
+                {{"window", std::to_string(window)},
+                 {"launch_count", std::to_string(cache.launch_count)},
+                 {"no_work_backoff_remaining", std::to_string(cache.no_work_backoff_remaining)},
+                 {"no_work_backoff_streak", std::to_string(cache.no_work_backoff_streak)}});
+            return true;
+        }
+
+        auto *active_cache_ptr = &cache;
+        if (launch_payload_graph)
+        {
+            auto [it, inserted] =
+                device_moe_rebalance_maintenance_payload_graphs_.try_emplace(
+                    pending_payload_edge_mask);
+            active_cache_ptr = &it->second;
+            if (inserted)
+                active_cache_ptr->payload_edge_mask = pending_payload_edge_mask;
+        }
+        auto &active_cache = *active_cache_ptr;
+        const auto active_kind = launch_payload_graph
+                                     ? DeviceMoERebalanceMaintenanceGraphKind::Payload
+                                     : DeviceMoERebalanceMaintenanceGraphKind::Plan;
+        const char *active_kind_name = launch_payload_graph ? "payload" : "plan";
+
+        if (!active_cache.graph)
+        {
+            ComputeGraph graph;
+            {
+                auto tags = maintenance_tags;
+                tags["path"] = "build";
+                tags["maintenance_graph_kind"] = active_kind_name;
+                PerfStatsCollector::ScopedTimer build_timer(
+                    "moe_rebalance",
+                    "device_maintenance_graph_build_or_rebind",
+                    "decode",
+                    device_key,
+                    std::move(tags));
+                graph = graph_builder_->buildDeviceMoERebalanceMaintenanceGraph(
+                    state_.device_id,
+                    active_kind,
+                    launch_payload_graph ? pending_payload_edge_mask : 0ULL);
+            }
+            if (graph.size() == 0)
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance maintenance graph was not available for "
+                          << device_key
+                          << " at rebalance window boundary. The steady decode graph "
+                             "contains only apply stages, so this is a graph-binding bug.");
+                return false;
+            }
+
+            active_cache.graph = std::make_unique<ComputeGraph>(std::move(graph));
+            {
+                auto tags = maintenance_tags;
+                tags["path"] = "initial_workspace";
+                tags["maintenance_graph_kind"] = active_kind_name;
+                PerfStatsCollector::ScopedTimer workspace_timer(
+                    "moe_rebalance",
+                    "device_maintenance_graph_workspace",
+                    "decode",
+                    device_key,
+                    std::move(tags));
+                if (!ensureDeviceWorkspaceAllocated(*active_cache.graph, 1))
+                {
+                    LOG_ERROR("[DGO] Failed to allocate device MoE rebalance maintenance workspace for "
+                              << device_key);
+                    active_cache.invalidate();
+                    return false;
+                }
+            }
+            active_cache.workspace_generation = workspaceGeneration(state_.device_id);
+            active_cache.payload_edge_mask =
+                launch_payload_graph ? pending_payload_edge_mask : 0ULL;
+        }
+        else
+        {
+            const uint64_t current_generation = workspaceGeneration(state_.device_id);
+            if (active_cache.workspace_generation != current_generation)
+            {
+                auto tags = maintenance_tags;
+                tags["path"] = "rebind_workspace";
+                tags["maintenance_graph_kind"] = active_kind_name;
+                PerfStatsCollector::ScopedTimer workspace_timer(
+                    "moe_rebalance",
+                    "device_maintenance_graph_workspace",
+                    "decode",
+                    device_key,
+                    std::move(tags));
+                if (!ensureDeviceWorkspaceAllocated(*active_cache.graph, 1))
+                {
+                    LOG_ERROR("[DGO] Failed to rebind device MoE rebalance maintenance workspace for "
+                              << device_key);
+                    active_cache.invalidate();
+                    return false;
+                }
+                const uint64_t new_generation = workspaceGeneration(state_.device_id);
+                if (new_generation != active_cache.workspace_generation)
+                {
+                    active_cache.resetReplayState();
+                    active_cache.workspace_generation = new_generation;
+                }
+            }
+        }
+
+        if (!active_cache.segment_cache.ensureCaptureStream(gpu_ctx, state_.device_id))
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance maintenance graph could not create an explicit capture stream for "
+                      << device_key);
+            return false;
+        }
+        void *maintenance_stream = active_cache.segment_cache.capture_stream;
+        if (!maintenance_stream)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance maintenance graph requires an explicit non-null stream");
+            return false;
+        }
+
+        IBackend *backend = getBackendFor(state_.device_id);
+        if (!backend)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance maintenance graph could not resolve backend for "
+                      << device_key);
+            return false;
+        }
+        const int device_ordinal = state_.device_id.gpu_ordinal();
+
+        void *producer_stream =
+            peekPendingLogitsStream(PendingLogitsStreamRole::MainDecode);
+        if (producer_stream && producer_stream != maintenance_stream)
+        {
+            PerfStatsCollector::ScopedTimer dependency_timer(
+                "moe_rebalance",
+                "device_maintenance_graph_stream_dependency",
+                "decode",
+                device_key,
+                maintenance_tags);
+            gpu_ctx->insertStreamDependency(maintenance_stream, producer_stream);
+        }
+
+        recordMoERebalanceTransferStreamPaths(
+            active_cache.graph.get(),
+            state_.device_id,
+            device_key,
+            maintenance_tags);
+
+        std::shared_ptr<void> timing_start_event;
+        std::shared_ptr<void> timing_stop_event;
+        PerfStatsCollector::Tags timing_tags;
+        bool timing_active = false;
+        if (PerfStatsCollector::isEnabled())
+        {
+            auto make_timing_event =
+                [&]() -> std::shared_ptr<void>
+            {
+                void *raw_event = backend->createTimingEvent(device_ordinal);
+                if (!raw_event)
+                    return {};
+                return std::shared_ptr<void>(
+                    raw_event,
+                    [backend, device_ordinal](void *event)
+                    {
+                        if (event)
+                            backend->destroyEvent(event, device_ordinal);
+                    });
+            };
+            timing_start_event = make_timing_event();
+            timing_stop_event = make_timing_event();
+            timing_tags = maintenance_tags;
+            timing_tags["launch_count"] = std::to_string(active_cache.launch_count + 1u);
+            timing_tags["timed_region"] = "maintenance_graph_replay";
+            timing_tags["maintenance_graph_kind"] = active_kind_name;
+            if (timing_start_event &&
+                timing_stop_event &&
+                backend->recordEvent(
+                    timing_start_event.get(),
+                    device_ordinal,
+                    maintenance_stream))
+            {
+                timing_active = true;
+            }
+            else
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_maintenance_graph_gpu_timing_record_failures",
+                    1.0,
+                    "decode",
+                    device_key,
+                    {{"event", "start"}});
+                timing_start_event.reset();
+                timing_stop_event.reset();
+            }
+        }
+
+        DeviceGraphExecutor::DecodeCapturePolicy policy =
+            buildDecodeCapturePolicy(
+                /*has_collective_nodes=*/false,
+                ctx,
+                active_cache.segment_cache.consecutive_failures);
+        policy.defer_final_sync = true;
+        active_cache.segment_cache.perf_context =
+            launch_payload_graph ? "moe_rebalance_maintenance_payload"
+                                 : "moe_rebalance_maintenance_plan";
+
+        bool used_graph_replay = false;
+        bool ok = false;
+        {
+            PerfStatsCollector::ScopedTimer replay_timer(
+                "moe_rebalance",
+                "device_maintenance_graph_replay_enqueue",
+                "decode",
+                device_key,
+                maintenance_tags);
+            ok = tryLaunchCapturedMoERebalanceMaintenanceGraphDirect(
+                active_cache.segment_cache,
+                ctx,
+                gpu_ctx,
+                device_key,
+                maintenance_tags);
+            if (ok)
+            {
+                used_graph_replay = true;
+            }
+            else
+            {
+                ok = executor_.executeDecodeWithCapturePolicy(
+                    *active_cache.graph,
+                    ctx,
+                    &active_cache.segment_cache,
+                    maintenance_stream,
+                    gpu_ctx,
+                    nullptr,
+                    policy,
+                    &used_graph_replay);
+            }
+        }
+        if (!ok)
+        {
+            LOG_ERROR("[DGO] Device MoE rebalance maintenance graph launch failed for "
+                      << device_key);
+            return false;
+        }
+
+        if (!active_cache.completion_event)
+        {
+            void *raw_event = backend->createEvent(device_ordinal);
+            if (!raw_event)
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance maintenance graph could not create completion event for "
+                          << device_key);
+                return false;
+            }
+
+            active_cache.completion_event.reset(
+                raw_event,
+                [backend, device_ordinal](void *event)
+                {
+                    if (event)
+                        backend->destroyEvent(event, device_ordinal);
+                });
+        }
+
+        if (timing_active)
+        {
+            if (backend->recordEvent(
+                    timing_stop_event.get(),
+                    device_ordinal,
+                    maintenance_stream))
+            {
+                active_cache.timing_start_event = std::move(timing_start_event);
+                active_cache.timing_stop_event = std::move(timing_stop_event);
+                active_cache.timing_tags = std::move(timing_tags);
+            }
+            else
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_maintenance_graph_gpu_timing_record_failures",
+                    1.0,
+                    "decode",
+                    device_key,
+                    {{"event", "stop"}});
+            }
+        }
+
+        {
+            PerfStatsCollector::ScopedTimer record_timer(
+                "moe_rebalance",
+                "device_maintenance_graph_completion_record",
+                "decode",
+                device_key,
+                maintenance_tags);
+            if (!gpu_ctx->recordEventChecked(active_cache.completion_event.get(), maintenance_stream))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance maintenance graph failed to record completion event for "
+                          << device_key);
+                active_cache.timing_start_event.reset();
+                active_cache.timing_stop_event.reset();
+                active_cache.timing_tags.clear();
+                return false;
+            }
+        }
+
+        ++active_cache.launch_count;
+        const ILocalTPContext *decode_collective_lane =
+            graph_builder_
+                ? dynamic_cast<const ILocalTPContext *>(graph_builder_->config().tp_ctx)
+                : nullptr;
+        auto maintenance_graph_uses_decode_collective_lane =
+            [&]() -> bool
+        {
+            if (!active_cache.graph || !decode_collective_lane)
+                return false;
+            for (const auto &node_name : active_cache.graph->getExecutionOrder())
+            {
+                const ComputeNode *node = active_cache.graph->getNode(node_name);
+                if (!node || !node->stage)
+                    continue;
+                const auto *rebalance_stage =
+                    dynamic_cast<const MoEDeviceRebalanceStage *>(node->stage.get());
+                if (!rebalance_stage)
+                    continue;
+                if (rebalance_stage->getParams().tp_ctx == decode_collective_lane)
+                    return true;
+            }
+            return false;
+        };
+        const bool same_communicator_collective_lane =
+            state_.device_id.is_gpu() &&
+            usesDeviceSideMoERebalanceController() &&
+            maintenance_graph_uses_decode_collective_lane();
+        if (same_communicator_collective_lane)
+        {
+            /*
+             * Shared-communicator maintenance graphs must finish before the
+             * next decode replay may enqueue collectives on that same LocalTP
+             * communicator. Dedicated maintenance lanes skip this guard and
+             * are allowed to overlap decode compute/collectives asynchronously.
+             */
+            PerfStatsCollector::ScopedTimer sync_timer(
+                "moe_rebalance",
+                "device_maintenance_graph_same_communicator_sync",
+                "decode",
+                device_key,
+                maintenance_tags);
+            LOG_DEBUG("[DGO] Device MoE rebalance maintenance graph synchronizing shared collective lane for "
+                      << device_key << " after launch_count=" << active_cache.launch_count);
+            if (!gpu_ctx->synchronizeStreamChecked(maintenance_stream))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance maintenance graph shared-communicator sync failed for "
+                          << device_key);
+                active_cache.timing_start_event.reset();
+                active_cache.timing_stop_event.reset();
+                active_cache.timing_tags.clear();
+                return false;
+            }
+            active_cache.completion_event_in_flight = false;
+            auto sync_tags = maintenance_tags;
+            sync_tags["maintenance_graph_kind"] = active_kind_name;
+            if (!exportCompletedDeviceMoERebalanceMaintenanceStats(
+                    active_cache,
+                    maintenance_stream,
+                    device_key,
+                    sync_tags))
+            {
+                return false;
+            }
+        }
+        else
+        {
+            active_cache.completion_event_in_flight = true;
+        }
+        PerfStatsCollector::Tags launch_tags;
+        launch_tags["used_graph_replay"] = boolTag(used_graph_replay);
+        launch_tags["window"] = std::to_string(window);
+        launch_tags["maintenance_slack_tokens"] = std::to_string(maintenance_slack);
+        launch_tags["requested_launch_period"] = std::to_string(requested_launch_period);
+        launch_tags["min_maintenance_period_tokens"] = std::to_string(min_maintenance_period);
+        launch_tags["launch_period"] = std::to_string(launch_period);
+        launch_tags["launch_count"] = std::to_string(active_cache.launch_count);
+        launch_tags["maintenance_graph_kind"] = active_kind_name;
+        launch_tags["dedicated_collective_lane"] = boolTag(!same_communicator_collective_lane);
+        launch_tags["has_main_decode_producer_stream"] = boolTag(producer_stream != nullptr);
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "device_maintenance_graph_launches",
+            1.0,
+            "decode",
+            device_key,
+            std::move(launch_tags));
+        return true;
     }
 
     // =====================================================================
@@ -2945,6 +5459,20 @@ namespace llaminar2
             return;
 
         int count = 0;
+        void *publication_stream = nullptr;
+        auto ensure_graph_replica_publication_stream = [&]() -> void *
+        {
+            if (publication_stream)
+                return publication_stream;
+            publication_stream = explicitGPUStreamForOperation("moe_current_replica_graph_publish");
+            if (!publication_stream)
+            {
+                throw std::runtime_error(
+                    "MoE current replica graph publication requires an explicit non-null GPU stream");
+            }
+            return publication_stream;
+        };
+
         for (const auto &node_name : graph.getExecutionOrder())
         {
             ComputeNode *node = graph.getNode(node_name);
@@ -2955,6 +5483,10 @@ namespace llaminar2
             if (!moe)
                 continue;
 
+            if (moe->device().is_gpu())
+            {
+                moe->setGPUStream(ensure_graph_replica_publication_stream());
+            }
             moe->setReplicaSet(current_expert_replica_set_,
                                current_expert_replica_participant_id_);
             ++count;
@@ -3125,9 +5657,12 @@ namespace llaminar2
         }
 
         bool captured_collectives_backend_supported = false;
+        std::string captured_collectives_reason =
+            has_collective_nodes ? "capture_collectives_not_requested" : "no_collective_nodes";
         if (has_collective_nodes && env.execution.gpu_graph_capture_collectives)
         {
-            captured_collectives_backend_supported = collectivesSupportCapturedGraph();
+            captured_collectives_backend_supported =
+                collectivesSupportCapturedGraph(&captured_collectives_reason);
         }
 
         policy.collective_segmented_enabled =
@@ -3135,9 +5670,10 @@ namespace llaminar2
             allow_collective_segmented &&
             collective_segmented_backend_supported;
 
-        // Capturing TP collectives directly into HIP/CUDA graphs is still an
-        // experimental Tier-2 collective-capture project. It is off by default
-        // and only admitted for homogeneous same-rank LocalTP NCCL/RCCL domains.
+        // Capture TP collectives directly into HIP/CUDA graphs for homogeneous
+        // same-rank LocalTP NCCL/RCCL domains. Unsupported or explicitly
+        // disabled domains fall back to segmented replay only when that
+        // diagnostic fallback is enabled.
         policy.collectives_graph_capturable =
             has_collective_nodes &&
             env.execution.gpu_graph_capture_collectives &&
@@ -3171,10 +5707,10 @@ namespace llaminar2
                 1.0,
                 "decode",
                 ctx ? ctx->deviceId().toString() : std::string{},
-                {{"requested", "true"},
-                 {"allowed", boolTag(policy.collectives_graph_capturable)},
-                 {"backend_supported", boolTag(captured_collectives_backend_supported)},
-                 {"reason", capturedCollectiveRejectReason(captured_collectives_backend_supported)}});
+	                {{"requested", "true"},
+	                 {"allowed", boolTag(policy.collectives_graph_capturable)},
+	                 {"backend_supported", boolTag(captured_collectives_backend_supported)},
+	                 {"reason", captured_collectives_reason}});
         }
         return policy;
     }
@@ -3213,37 +5749,60 @@ namespace llaminar2
         return supported;
     }
 
-    bool DeviceGraphOrchestrator::collectivesSupportCapturedGraph() const
+    bool DeviceGraphOrchestrator::collectivesSupportCapturedGraph(std::string *reason_out) const
     {
+        auto reject = [&](const char *reason, const std::string &message) -> bool
+        {
+            if (reason_out)
+            {
+                *reason_out = reason;
+            }
+            LOG_DEBUG(message);
+            return false;
+        };
+
+        auto accept = [&]() -> bool
+        {
+            if (reason_out)
+            {
+                *reason_out = "supported";
+            }
+            return true;
+        };
+
         const auto &graph_cfg = graph_builder_->config();
         const ITPContext *tp_ctx = graph_cfg.tp_ctx;
         if (!tp_ctx || !tp_ctx->isLocal() || tp_ctx->degree() <= 1)
         {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for non-local or single-device TP");
-            return false;
+            return reject(
+                "non_local_or_single_device_tp",
+                "[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for non-local or single-device TP");
         }
 
         const auto backend = tp_ctx->backend();
         if (backend != CollectiveBackendType::NCCL &&
             backend != CollectiveBackendType::RCCL)
         {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for backend "
-                      << collectiveBackendTypeToString(backend));
-            return false;
+            return reject(
+                "unsupported_backend",
+                std::string("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for backend ") +
+                    collectiveBackendTypeToString(backend));
         }
 
         const auto *local_tp = dynamic_cast<const ILocalTPContext *>(tp_ctx);
         if (!local_tp)
         {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs because LOCAL TP context lacks local device list");
-            return false;
+            return reject(
+                "missing_local_device_list",
+                "[DeviceGraphOrchestrator] Disabling captured collective GPU graphs because LOCAL TP context lacks local device list");
         }
 
         const auto &devices = local_tp->devices();
         if (static_cast<int>(devices.size()) != tp_ctx->degree() || devices.empty())
         {
-            LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs because device list does not match TP degree");
-            return false;
+            return reject(
+                "device_list_degree_mismatch",
+                "[DeviceGraphOrchestrator] Disabling captured collective GPU graphs because device list does not match TP degree");
         }
 
         const DeviceType expected_type =
@@ -3252,13 +5811,14 @@ namespace llaminar2
         {
             if (!device.isLocal() || !device.isGPU() || device.device_type != expected_type)
             {
-                LOG_DEBUG("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for non-homogeneous LocalTP device "
-                          << device.toString());
-                return false;
+                return reject(
+                    "non_homogeneous_local_tp_device",
+                    std::string("[DeviceGraphOrchestrator] Disabling captured collective GPU graphs for non-homogeneous LocalTP device ") +
+                        device.toString());
             }
         }
 
-        return true;
+        return accept();
     }
 
     bool DeviceGraphOrchestrator::execute(ComputeGraph &graph, IDeviceContext *ctx)
@@ -3743,6 +6303,15 @@ namespace llaminar2
             cache.invalidate();
         mtp_terminal_hidden_row_select_cache_.invalidate();
         mtp_terminal_hidden_rows_select_cache_.invalidate();
+        device_moe_rebalance_maintenance_graph_.invalidate();
+        for (auto &[edge_mask, cache] :
+             device_moe_rebalance_maintenance_payload_graphs_)
+        {
+            (void)edge_mask;
+            cache.invalidate();
+        }
+        device_moe_rebalance_maintenance_payload_graphs_.clear();
+        device_moe_rebalance_decode_tokens_seen_ = 0;
 
         // Clear device contexts
         device_contexts_.clear();
@@ -15008,6 +17577,61 @@ namespace llaminar2
                 probe_stream));
         }
 
+        if (forward_engine_)
+        {
+            auto phase_name = [](PrefillGraphPhase phase) -> const char *
+            {
+                switch (phase)
+                {
+                case PrefillGraphPhase::Disabled:
+                    return "disabled";
+                case PrefillGraphPhase::Cold:
+                    return "cold";
+                case PrefillGraphPhase::Initialized:
+                    return "initialized";
+                case PrefillGraphPhase::Warmup:
+                    return "warmup";
+                case PrefillGraphPhase::Capturing:
+                    return "capturing";
+                case PrefillGraphPhase::Ready:
+                    return "ready";
+                }
+                return "unknown";
+            };
+
+            const auto prefill_snapshots = forward_engine_->prefillGraphCacheSnapshots();
+            snapshot.prefill_graphs.reserve(prefill_snapshots.size());
+            for (const auto &entry : prefill_snapshots)
+            {
+                PrefillGraphRuntimeProbe probe;
+                probe.forward_cache_valid = entry.forward_cache_valid;
+                probe.prefill_cache_initialized = entry.prefill_cache_initialized;
+                probe.phase = phase_name(entry.phase);
+                probe.cache_size = entry.cache_size;
+                probe.node_count = entry.node_count;
+                probe.replay_count = entry.replay_count;
+                probe.warmup_count = entry.warmup_count;
+                probe.initialized_count = entry.initialized_count;
+                probe.capture_count = entry.capture_count;
+                probe.eviction_count = entry.eviction_count;
+                probe.observation_valid = entry.observation_valid;
+                probe.chunk_index = entry.chunk_index;
+                probe.bucket_seq_len = entry.bucket_seq_len;
+                probe.real_token_start = entry.real_token_start;
+                probe.real_token_count = entry.real_token_count;
+                probe.real_token_end = entry.real_token_end;
+                probe.domain_id = entry.domain_id;
+                probe.participant_id = entry.participant_id;
+                probe.placement_epoch = entry.placement_epoch;
+                probe.topology_signature = entry.topology_signature;
+                probe.capture_phase = entry.capture_phase;
+                probe.recapture_reason = entry.recapture_reason;
+                probe.reject_stage_name = entry.reject_stage_name;
+                probe.reject_stage_type = entry.reject_stage_type;
+                snapshot.prefill_graphs.push_back(std::move(probe));
+            }
+        }
+
         return snapshot;
     }
 
@@ -15797,6 +18421,66 @@ namespace llaminar2
         return true;
     }
 
+    bool DeviceGraphOrchestrator::refreshPrefixPayloadLayoutForLiveHybridState(const char *operation)
+    {
+        if (!prefix_cache_ || !state_.kv_cache)
+        {
+            return false;
+        }
+        if (!dynamic_cast<const IHybridKVCache *>(state_.kv_cache.get()))
+        {
+            return true;
+        }
+
+        PrefixPayloadLayout live_layout = buildDensePrefixPayloadLayout(
+            *state_.kv_cache,
+            state_.device_id,
+            prefix_layout_.block_size,
+            prefix_layout_.terminal_hidden_bytes,
+            prefix_layout_.terminal_logits_bytes);
+        copyMTPPayloadLayoutFields(prefix_layout_, live_layout);
+
+        if (samePrefixPayloadShape(live_layout, prefix_layout_))
+        {
+            return true;
+        }
+        if (live_layout.fa_layers <= 0 || live_layout.faKVBytes() == 0)
+        {
+            disablePrefixCacheForRunner("live hybrid prefix layout does not expose restorable KV payloads");
+            return false;
+        }
+
+        const auto &prefix_config = graph_builder_->config().prefix_cache;
+        const size_t live_block_bytes = live_layout.totalBytes();
+        if (live_block_bytes == 0 || prefix_config.ram_budget_bytes < live_block_bytes)
+        {
+            disablePrefixCacheForRunner("RAM budget cannot hold one live hybrid prefix block");
+            return false;
+        }
+
+        const auto stats = prefix_cache_->stats();
+        const bool has_cached_entries =
+            prefix_cache_->size() > 0 ||
+            stats.device_hot_bytes > 0 ||
+            stats.disk_bytes > 0;
+        if (has_cached_entries && !prefix_cache_->clear())
+        {
+            disablePrefixCacheForRunner("live hybrid prefix layout changed while entries were retained");
+            return false;
+        }
+
+        LOG_INFO("[DeviceGraphOrchestrator] Prefix cache live hybrid layout refreshed"
+                 << " operation=" << (operation ? operation : "<unknown>")
+                 << " old_hybrid_host_bytes=" << prefix_layout_.hybrid_host_state_bytes
+                 << " old_hybrid_device_bytes=" << prefix_layout_.hybrid_device_state_bytes
+                 << " new_hybrid_host_bytes=" << live_layout.hybrid_host_state_bytes
+                 << " new_hybrid_device_bytes=" << live_layout.hybrid_device_state_bytes
+                 << " block_bytes=" << live_block_bytes
+                 << " invalidated_entries=" << (has_cached_entries ? "yes" : "no"));
+        prefix_layout_ = live_layout;
+        return true;
+    }
+
     PrefixCacheKey DeviceGraphOrchestrator::makePrefixKeyForBlock(
         const std::vector<int32_t> &tokens,
         int block_index,
@@ -16160,6 +18844,11 @@ namespace llaminar2
 
         void *stream = explicitGPUStreamForOperation("harvestPrefix");
         if (state_.device_id.is_gpu() && !stream)
+        {
+            return false;
+        }
+
+        if (!refreshPrefixPayloadLayoutForLiveHybridState("harvestPrefix"))
         {
             return false;
         }
@@ -21145,6 +23834,14 @@ namespace llaminar2
             cache.resetSessionState();
         mtp_terminal_hidden_row_select_cache_.invalidate();
         mtp_terminal_hidden_rows_select_cache_.invalidate();
+        device_moe_rebalance_maintenance_graph_.resetSessionState();
+        for (auto &[edge_mask, cache] :
+             device_moe_rebalance_maintenance_payload_graphs_)
+        {
+            (void)edge_mask;
+            cache.resetSessionState();
+        }
+        device_moe_rebalance_decode_tokens_seen_ = 0;
         defer_next_mtp_main_decode_sync_ = false;
         defer_all_position_verifier_sync_ = false;
         clearAllPendingLogitsStreams("clearInferenceState");
@@ -21649,12 +24346,39 @@ namespace llaminar2
         }
 
         // ── Step 1: Collect all MoE stages ──────────────────────────────
+        const bool graph_stable_gpu_rebalance = usesGraphStableGpuMoERebalance();
+        if (graph_stable_gpu_rebalance && forward_engine_)
+        {
+            const size_t invalidated =
+                forward_engine_->invalidateMoEPlacementSensitiveGraphsForStablePlacement();
+            if (invalidated > 0)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "graph_stable_placement_cache_invalidations",
+                    static_cast<double>(invalidated),
+                    "rebalance",
+                    primaryDeviceId().is_valid() ? primaryDeviceId().toString() : std::string{},
+                    {{"domain_id", domain_id.empty() ? "default" : domain_id}});
+                LOG_DEBUG("[DGO] Invalidated " << invalidated
+                                               << " MoE placement-sensitive cached graph(s); "
+                                               << "fixed prefill and single-token decode remain graph-stable");
+            }
+        }
+
         struct StageInfo
         {
             MoEExpertComputeStage *stage;
             int layer;
         };
         std::vector<StageInfo> moe_stages;
+        auto accepts_moe_rebalance_stage = [&](MoEExpertComputeStage *stage)
+        {
+            if (!stage)
+                return false;
+            return !graph_stable_gpu_rebalance ||
+                   stage->usesGraphStableMoEPlacement();
+        };
 
         if (forward_engine_)
             if (prepared_weight_store_)
@@ -21664,7 +24388,7 @@ namespace llaminar2
                     [&](IComputeStage *s)
                     {
                         auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
-                        if (!moe)
+                        if (!accepts_moe_rebalance_stage(moe))
                             return;
                         int layer = moe->layerIndex();
                         if (layer >= 0 && static_cast<size_t>(layer) < masks.size())
@@ -21688,20 +24412,78 @@ namespace llaminar2
                     if (node->stage->type() == ComputeStageType::MOE_EXPERT_FFN)
                     {
                         auto *moe = dynamic_cast<MoEExpertComputeStage *>(node->stage.get());
-                        if (moe)
+                        if (accepts_moe_rebalance_stage(moe))
                             moe_stages.push_back({moe, static_cast<int>(layer)});
                     }
                 }
             }
         }
 
-        // ── Step 2: Phase 1 — release departed experts ─────────────────
-        for (auto &[stage, layer] : moe_stages)
+        if (graph_stable_gpu_rebalance && !masks.empty() && moe_stages.empty())
         {
-            (void)stage->releaseDepartedExperts(masks[layer]);
+            throw std::runtime_error(
+                "GPU graph-stable MoE rebalance requires cached graph-stable MoE stages");
         }
 
-        // ── Step 3: Phase 2 — register + prepare (parallel across stages)
+        const bool has_gpu_publish_stage =
+            std::any_of(moe_stages.begin(),
+                        moe_stages.end(),
+                        [](const StageInfo &info)
+                        {
+                            return info.stage && info.stage->device().is_gpu();
+                        });
+        void *publication_stream = nullptr;
+        if (has_gpu_publish_stage)
+        {
+            /*
+             * Mask publication mutates graph-stable device tables outside a
+             * normal stage execution pass. Cached stages may have had their
+             * execution stream cleared at a request boundary, so bind an
+             * orchestrator-owned explicit stream before any register/refresh path
+             * reaches backend kernels.
+             */
+            publication_stream = explicitGPUStreamForOperation("moe_expert_mask_publish");
+            if (!publication_stream)
+            {
+                throw std::runtime_error(
+                    "MoE expert mask publication requires an explicit non-null GPU stream");
+            }
+        }
+
+        auto bind_publication_stream = [&](MoEExpertComputeStage *stage)
+        {
+            if (stage && stage->device().is_gpu())
+                stage->setGPUStream(publication_stream);
+        };
+
+        for (auto &[stage, layer] : moe_stages)
+        {
+            (void)layer;
+            bind_publication_stream(stage);
+        }
+
+        auto release_departed = [&]()
+        {
+            for (auto &[stage, layer] : moe_stages)
+            {
+                (void)stage->releaseDepartedExperts(masks[layer]);
+            }
+        };
+
+        /*
+         * Graph-stable GPU rebalance may have several cached MoE stages for the
+         * same layer: fixed-topology prefill, single-token decode, and any other
+         * preserved graph-stable owners. GPU-direct activation publishes arrivals
+         * to the shared PreparedWeightStore before mask application. If one stage
+         * releases departures from that store before sibling stages adopt their
+         * newly-arrived engines, those siblings can incorrectly fall through to
+         * the forbidden host/raw fallback. Adopt first in graph-stable mode, then
+         * release once every selected stage has local GEMM handles.
+         */
+        if (!graph_stable_gpu_rebalance)
+            release_departed();
+
+        // ── Step 2: register + prepare (parallel across stages) ─────────
         std::atomic<int> applied{0};
         const int n = static_cast<int>(moe_stages.size());
 
@@ -21725,7 +24507,10 @@ namespace llaminar2
             throw std::runtime_error("MoE expert mask application failed: missing prepared expert weights");
         }
 
-        // ── Step 5: Phase 3 — apply masks (fast, no heavy ops) ─────────
+        if (graph_stable_gpu_rebalance)
+            release_departed();
+
+        // ── Step 3: apply masks (fast, no heavy ops) ───────────────────
         for (auto &[stage, layer] : moe_stages)
             stage->applyExpertMask(masks[layer]);
 
@@ -21801,6 +24586,7 @@ namespace llaminar2
     {
         PreparedDirectExpertTransfer prepared;
         prepared.remaining_masks = masks;
+        retireCompletedGpuDirectActivationCompletions();
         if (&source == this)
             return prepared;
 
@@ -21850,13 +24636,61 @@ namespace llaminar2
         if (src_by_layer.empty() || dst_by_layer.empty())
             return prepared;
 
+        const bool graph_stable_gpu_rebalance = usesGraphStableGpuMoERebalance();
+        auto select_rebalance_destination_stages =
+            [&](const std::vector<MoEExpertComputeStage *> &candidates)
+        {
+            std::vector<MoEExpertComputeStage *> selected;
+            selected.reserve(candidates.size());
+            for (auto *stage : candidates)
+            {
+                if (!stage)
+                    continue;
+                if (graph_stable_gpu_rebalance &&
+                    !stage->usesGraphStableMoEPlacement())
+                {
+                    continue;
+                }
+                selected.push_back(stage);
+            }
+            return selected;
+        };
+
         const size_t wave_experts = static_cast<size_t>(
             std::max(1, debugEnv().moe_rebalance.gpu_direct_transfer_wave_experts));
         const size_t staging_buffers = static_cast<size_t>(
             std::max(1, debugEnv().moe_rebalance.gpu_direct_transfer_buffers));
-        const size_t staging_pool_capacity = wave_experts * staging_buffers;
-        std::deque<GpuDirectTransferCompletion> in_flight_activation_waves;
-        void *activation_stream = nullptr;
+        size_t requested_arrival_entries = 0;
+        for (size_t layer_idx = 0; layer_idx < masks.size(); ++layer_idx)
+        {
+            auto dst_it = dst_by_layer.find(static_cast<int>(layer_idx));
+            if (dst_it == dst_by_layer.end())
+                continue;
+
+            std::vector<int> expert_ids;
+            const auto &layer_mask = masks[layer_idx];
+            expert_ids.reserve(static_cast<size_t>(
+                std::count(layer_mask.begin(), layer_mask.end(), true)));
+            for (size_t expert_idx = 0; expert_idx < layer_mask.size(); ++expert_idx)
+            {
+                if (layer_mask[expert_idx])
+                    expert_ids.push_back(static_cast<int>(expert_idx));
+            }
+            if (expert_ids.empty())
+                continue;
+
+            const auto dst_stages =
+                select_rebalance_destination_stages(dst_it->second);
+            for (auto *dst_stage : dst_stages)
+            {
+                if (!dst_stage)
+                    continue;
+                requested_arrival_entries +=
+                    dst_stage->missingPreparedExpertIds(expert_ids).size();
+            }
+        }
+        const size_t staging_pool_capacity =
+            std::max(wave_experts * staging_buffers, requested_arrival_entries);
 
         auto abort_prepared = [&]() -> PreparedDirectExpertTransfer
         {
@@ -21864,65 +24698,6 @@ namespace llaminar2
             prepared.staged_arrivals.clear();
             pending_gpu_direct_transfer_slot_arrivals_.clear();
             return prepared;
-        };
-
-        auto retire_one_activation_wave = [&]() -> bool
-        {
-            if (in_flight_activation_waves.empty())
-                return true;
-
-            GpuDirectTransferCompletion completion =
-                std::move(in_flight_activation_waves.front());
-            in_flight_activation_waves.pop_front();
-            if (!completion.valid())
-                return true;
-
-            IBackend *backend = getBackendFor(completion.device_id);
-            if (!backend)
-            {
-                LOG_ERROR("[DGO] Cannot retire GPU-direct staging wave without backend for "
-                          << completion.device_id.to_string());
-                return false;
-            }
-
-            const auto wait_start = std::chrono::steady_clock::now();
-            if (!backend->waitForEvent(completion.ready_event.get(), completion.device_ordinal))
-            {
-                LOG_ERROR("[DGO] GPU-direct staging wave retirement failed on "
-                          << completion.device_id.to_string());
-                return false;
-            }
-            PerfStatsCollector::recordTimingNs(
-                "moe_rebalance",
-                "gpu_direct_transfer_staging_wave_retire",
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - wait_start)
-                                          .count()),
-                "rebalance",
-                completion.device_id.to_string(),
-                {});
-            return true;
-        };
-
-        auto retire_until_wave_capacity = [&]() -> bool
-        {
-            while (in_flight_activation_waves.size() >= staging_buffers &&
-                   !in_flight_activation_waves.empty())
-            {
-                if (!retire_one_activation_wave())
-                    return false;
-            }
-            return in_flight_activation_waves.size() < staging_buffers;
-        };
-
-        auto retire_all_activation_waves = [&]() -> bool
-        {
-            while (!in_flight_activation_waves.empty())
-            {
-                if (!retire_one_activation_wave())
-                    return false;
-            }
-            return true;
         };
 
         int staged_layers = 0;
@@ -21946,167 +24721,119 @@ namespace llaminar2
                 continue;
 
             std::vector<int> satisfied_counts(prepared.remaining_masks[layer_idx].size(), 0);
-            auto dst_stage_it = std::find_if(
-                dst_it->second.begin(),
-                dst_it->second.end(),
-                [](MoEExpertComputeStage *stage)
-                {
-                    return stage != nullptr;
-                });
-            if (dst_stage_it == dst_it->second.end())
-                continue;
-            auto *dst_stage = *dst_stage_it;
-
-            std::vector<int> stage_pending = dst_stage->missingPreparedExpertIds(expert_ids);
-            const size_t active_arrival_capacity = stage_pending.size();
-            for (int expert_id : expert_ids)
-            {
-                if (std::find(stage_pending.begin(), stage_pending.end(), expert_id) != stage_pending.end())
-                    continue;
-                if (expert_id >= 0 &&
-                    expert_id < static_cast<int>(satisfied_counts.size()))
-                {
-                    ++satisfied_counts[static_cast<size_t>(expert_id)];
-                }
-            }
-            if (stage_pending.empty())
+            const auto dst_stages =
+                select_rebalance_destination_stages(dst_it->second);
+            if (dst_stages.empty())
                 continue;
 
-            for (auto *src_stage : src_it->second)
+            int required_stage_count = 0;
+            for (auto *dst_stage : dst_stages)
             {
-                if (!src_stage || stage_pending.empty())
-                    continue;
-
-                void *source_producer_stream = src_stage->gpuStream();
-                if (!source_producer_stream && source.primaryDeviceId().is_gpu())
+                ++required_stage_count;
+                std::vector<int> stage_pending = dst_stage->missingPreparedExpertIds(expert_ids);
+                const size_t active_arrival_capacity = stage_pending.size();
+                for (int expert_id : expert_ids)
                 {
-                    source_producer_stream =
-                        source.explicitGPUStreamForOperation("moe_gpu_direct_transfer_source");
-                }
-                if (!source_producer_stream)
-                    continue;
-
-                std::vector<int> source_satisfied;
-                while (!stage_pending.empty())
-                {
-                    const size_t wave_count = std::min(stage_pending.size(), wave_experts);
-                    std::vector<int> wave_expert_ids;
-                    wave_expert_ids.reserve(wave_count);
-                    for (size_t wave_idx = 0; wave_idx < wave_count; ++wave_idx)
-                        wave_expert_ids.push_back(stage_pending[wave_idx]);
-                    if (wave_expert_ids.empty())
+                    if (std::find(stage_pending.begin(), stage_pending.end(), expert_id) != stage_pending.end())
                         continue;
-
-                    if (!retire_until_wave_capacity())
-                    {
-                        LOG_ERROR("[DGO] GPU-direct rolling transfer wave could not retire enough in-flight waves"
-                                  << " on " << primaryDeviceId().to_string()
-                                  << " in_flight=" << in_flight_activation_waves.size()
-                                  << " buffers=" << staging_buffers
-                                  << " staging_pool_capacity=" << staging_pool_capacity);
-                        (void)retire_all_activation_waves();
-                        return abort_prepared();
-                    }
-
-                    GpuDirectTransferSlotArrivals stage_arrivals;
-                    auto satisfied_experts =
-                        dst_stage->stageExpertsGPUDirectToTransferSlotsFrom(
-                            *src_stage,
-                            wave_expert_ids,
-                            source_producer_stream,
-                            &stage_arrivals,
-                            active_arrival_capacity,
-                            staging_pool_capacity,
-                            &gpu_direct_transfer_staging_pools_);
-                    if (satisfied_experts.empty())
-                    {
-                        if (!in_flight_activation_waves.empty())
-                        {
-                            if (!retire_one_activation_wave())
-                                return abort_prepared();
-                            continue;
-                        }
-                        break;
-                    }
-
-                    if (!stage_arrivals.empty())
-                    {
-                        if (!activation_stream)
-                            activation_stream = explicitGPUStreamForOperation("moe_gpu_direct_transfer_activation");
-                        if (!activation_stream)
-                        {
-                            LOG_ERROR("[DGO] GPU-direct rolling activation requires an explicit stream on "
-                                      << primaryDeviceId().to_string());
-                            (void)retire_all_activation_waves();
-                            return abort_prepared();
-                        }
-
-                        const auto expected_experts = stage_arrivals.expertIds();
-                        GpuDirectTransferCompletion activation_completion;
-                        auto activated =
-                            dst_stage->activateGpuDirectTransferSlotArrivals(
-                                stage_arrivals,
-                                activation_stream,
-                                &activation_completion,
-                                /*retain_pending_completion=*/false);
-                        std::sort(activated.begin(), activated.end());
-                        activated.erase(std::unique(activated.begin(), activated.end()), activated.end());
-                        if (activated != expected_experts || !activation_completion.valid())
-                        {
-                            LOG_ERROR("[DGO] GPU-direct rolling activation mismatch on "
-                                      << primaryDeviceId().to_string()
-                                      << " expected=" << expected_experts.size()
-                                      << " activated=" << activated.size()
-                                      << " completion_valid=" << (activation_completion.valid() ? "true" : "false"));
-                            (void)retire_all_activation_waves();
-                            return abort_prepared();
-                        }
-                        in_flight_activation_waves.push_back(std::move(activation_completion));
-                        ++staged_stage_arrivals;
-                    }
-
-                    source_satisfied.insert(
-                        source_satisfied.end(),
-                        satisfied_experts.begin(),
-                        satisfied_experts.end());
-
-                    std::sort(satisfied_experts.begin(), satisfied_experts.end());
-                    satisfied_experts.erase(
-                        std::unique(satisfied_experts.begin(), satisfied_experts.end()),
-                        satisfied_experts.end());
-                    stage_pending.erase(
-                        std::remove_if(stage_pending.begin(),
-                                       stage_pending.end(),
-                                       [&](int expert_id)
-                                       {
-                                           return std::find(satisfied_experts.begin(),
-                                                            satisfied_experts.end(),
-                                                            expert_id) != satisfied_experts.end();
-                                       }),
-                        stage_pending.end());
-
-                    while (in_flight_activation_waves.size() > staging_buffers)
-                    {
-                        if (!retire_one_activation_wave())
-                            return abort_prepared();
-                    }
-                }
-
-                if (source_satisfied.empty())
-                    continue;
-                std::sort(source_satisfied.begin(), source_satisfied.end());
-                source_satisfied.erase(
-                    std::unique(source_satisfied.begin(), source_satisfied.end()),
-                    source_satisfied.end());
-                for (int expert_id : source_satisfied)
-                {
                     if (expert_id >= 0 &&
                         expert_id < static_cast<int>(satisfied_counts.size()))
                     {
                         ++satisfied_counts[static_cast<size_t>(expert_id)];
                     }
                 }
+
+                if (stage_pending.empty())
+                    continue;
+
+                for (auto *src_stage : src_it->second)
+                {
+                    if (!src_stage || stage_pending.empty())
+                        continue;
+
+                    void *source_producer_stream = src_stage->gpuStream();
+                    if (!source_producer_stream && source.primaryDeviceId().is_gpu())
+                    {
+                        source_producer_stream =
+                            source.explicitGPUStreamForOperation("moe_gpu_direct_transfer_source");
+                    }
+                    if (!source_producer_stream)
+                        continue;
+
+                    std::vector<int> source_satisfied;
+                    while (!stage_pending.empty())
+                    {
+                        const size_t wave_count = std::min(stage_pending.size(), wave_experts);
+                        std::vector<int> wave_expert_ids;
+                        wave_expert_ids.reserve(wave_count);
+                        for (size_t wave_idx = 0; wave_idx < wave_count; ++wave_idx)
+                            wave_expert_ids.push_back(stage_pending[wave_idx]);
+                        if (wave_expert_ids.empty())
+                            continue;
+
+                        GpuDirectTransferSlotArrivals stage_arrivals;
+                        auto satisfied_experts =
+                            dst_stage->stageExpertsGPUDirectToTransferSlotsFrom(
+                                *src_stage,
+                                wave_expert_ids,
+                                source_producer_stream,
+                                &stage_arrivals,
+                                active_arrival_capacity,
+                                staging_pool_capacity,
+                                &gpu_direct_transfer_staging_pools_);
+                        if (satisfied_experts.empty())
+                            break;
+
+                        if (!stage_arrivals.empty())
+                        {
+                            PendingGpuDirectTransferSlotArrival pending;
+                            pending.destination_stage = dst_stage;
+                            pending.arrivals = std::move(stage_arrivals);
+                            prepared.staged_arrivals.push_back(pending);
+                            pending_gpu_direct_transfer_slot_arrivals_.push_back(std::move(pending));
+                            ++staged_stage_arrivals;
+                        }
+
+                        source_satisfied.insert(
+                            source_satisfied.end(),
+                            satisfied_experts.begin(),
+                            satisfied_experts.end());
+
+                        std::sort(satisfied_experts.begin(), satisfied_experts.end());
+                        satisfied_experts.erase(
+                            std::unique(satisfied_experts.begin(), satisfied_experts.end()),
+                            satisfied_experts.end());
+                        stage_pending.erase(
+                            std::remove_if(stage_pending.begin(),
+                                           stage_pending.end(),
+                                           [&](int expert_id)
+                                           {
+                                               return std::find(satisfied_experts.begin(),
+                                                                satisfied_experts.end(),
+                                                                expert_id) != satisfied_experts.end();
+                                           }),
+                            stage_pending.end());
+                    }
+
+                    if (source_satisfied.empty())
+                        continue;
+                    std::sort(source_satisfied.begin(), source_satisfied.end());
+                    source_satisfied.erase(
+                        std::unique(source_satisfied.begin(), source_satisfied.end()),
+                        source_satisfied.end());
+                    for (int expert_id : source_satisfied)
+                    {
+                        if (expert_id >= 0 &&
+                            expert_id < static_cast<int>(satisfied_counts.size()))
+                        {
+                            ++satisfied_counts[static_cast<size_t>(expert_id)];
+                        }
+                    }
+                }
             }
+
+            if (required_stage_count == 0)
+                continue;
 
             bool any_layer_staged = false;
             for (int expert_id : expert_ids)
@@ -22115,7 +24842,7 @@ namespace llaminar2
                     expert_id < static_cast<int>(prepared.remaining_masks[layer_idx].size()) &&
                     prepared.remaining_masks[layer_idx][static_cast<size_t>(expert_id)] &&
                     expert_id < static_cast<int>(satisfied_counts.size()) &&
-                    satisfied_counts[static_cast<size_t>(expert_id)] > 0)
+                    satisfied_counts[static_cast<size_t>(expert_id)] >= required_stage_count)
                 {
                     prepared.remaining_masks[layer_idx][static_cast<size_t>(expert_id)] = false;
                     ++staged_experts;
@@ -22132,11 +24859,15 @@ namespace llaminar2
                                                        << " expert arrival mask entries across "
                                                        << staged_layers << " layer(s) from sibling orchestrator"
                                                        << " in " << staged_stage_arrivals
-                                                       << " rolling activation wave(s)");
+                                                       << " async transfer-slot wave(s); activation is deferred until publish");
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_transfer_slot_prepare_pending_batches",
+                static_cast<double>(staged_stage_arrivals),
+                "rebalance",
+                primaryDeviceId().to_string(),
+                {});
         }
-
-        if (!retire_all_activation_waves())
-            return abort_prepared();
 
         return prepared;
     }
@@ -22157,16 +24888,20 @@ namespace llaminar2
 
         int activated_batches = 0;
         int activated_experts = 0;
+        const bool graph_stable_gpu_rebalance = usesGraphStableGpuMoERebalance();
         for (const auto &pending : staged_arrivals)
         {
             if (pending.empty())
                 continue;
 
             auto expected_experts = pending.arrivals.expertIds();
+            GpuDirectTransferCompletion activation_completion;
             auto activated =
                 pending.destination_stage->activateGpuDirectTransferSlotArrivals(
                     pending.arrivals,
-                    activation_stream);
+                    activation_stream,
+                    graph_stable_gpu_rebalance ? &activation_completion : nullptr,
+                    !graph_stable_gpu_rebalance);
             std::sort(activated.begin(), activated.end());
             activated.erase(std::unique(activated.begin(), activated.end()), activated.end());
             if (activated != expected_experts)
@@ -22177,6 +24912,8 @@ namespace llaminar2
                           << " activated=" << activated.size());
                 return false;
             }
+            if (graph_stable_gpu_rebalance && activation_completion.valid())
+                pending_gpu_direct_activation_completions_.push_back(std::move(activation_completion));
             ++activated_batches;
             activated_experts += static_cast<int>(activated.size());
         }
@@ -22201,10 +24938,59 @@ namespace llaminar2
     void DeviceGraphOrchestrator::clearPendingGpuDirectExpertTransfers()
     {
         pending_gpu_direct_transfer_slot_arrivals_.clear();
+        pending_gpu_direct_activation_completions_.clear();
+    }
+
+    void DeviceGraphOrchestrator::retireCompletedGpuDirectActivationCompletions()
+    {
+        if (pending_gpu_direct_activation_completions_.empty())
+            return;
+
+        std::vector<GpuDirectTransferCompletion> still_pending;
+        still_pending.reserve(pending_gpu_direct_activation_completions_.size());
+        int retired = 0;
+        for (auto &completion : pending_gpu_direct_activation_completions_)
+        {
+            if (!completion.valid())
+                continue;
+
+            bool ready = false;
+            bool queried = false;
+            try
+            {
+                auto &gpu_ctx = GPUDeviceContextPool::instance().getContext(completion.device_id);
+                queried = gpu_ctx.queryEventChecked(completion.ready_event.get(), ready);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_DEBUG("[DGO] Could not query graph-stable GPU-direct activation completion on "
+                          << completion.device_id.to_string() << ": " << e.what());
+            }
+
+            if (queried && ready)
+            {
+                ++retired;
+                continue;
+            }
+            still_pending.push_back(std::move(completion));
+        }
+
+        pending_gpu_direct_activation_completions_.swap(still_pending);
+        if (retired > 0)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "gpu_direct_activation_completions_retired",
+                static_cast<double>(retired),
+                "rebalance",
+                primaryDeviceId().to_string(),
+                {});
+        }
     }
 
     bool DeviceGraphOrchestrator::activatePendingGpuDirectExpertTransfers()
     {
+        retireCompletedGpuDirectActivationCompletions();
         std::vector<PendingGpuDirectTransferSlotArrival> pending;
         pending.swap(pending_gpu_direct_transfer_slot_arrivals_);
         const bool ok = activatePreparedGpuDirectExpertTransfers(pending);
@@ -22383,6 +25169,20 @@ namespace llaminar2
             ++current_expert_replica_epoch_;
 
         int count = 0;
+        void *publication_stream = nullptr;
+        auto ensure_replica_publication_stream = [&]() -> void *
+        {
+            if (publication_stream)
+                return publication_stream;
+            publication_stream = explicitGPUStreamForOperation("moe_replica_set_publish");
+            if (!publication_stream)
+            {
+                throw std::runtime_error(
+                    "MoE replica set publication requires an explicit non-null GPU stream");
+            }
+            return publication_stream;
+        };
+
         if (forward_engine_)
         {
             forward_engine_->forEachCachedStage(
@@ -22392,6 +25192,8 @@ namespace llaminar2
                     auto *moe = dynamic_cast<MoEExpertComputeStage *>(s);
                     if (moe)
                     {
+                        if (moe->device().is_gpu())
+                            moe->setGPUStream(ensure_replica_publication_stream());
                         moe->setReplicaSet(normalized_replicas, participant_id);
                         count++;
                     }

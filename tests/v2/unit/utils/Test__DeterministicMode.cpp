@@ -67,6 +67,8 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicCudaAndRocmRoutes)
         {"LLAMINAR_CUDA_CONCURRENT_DECODE", "1"},
         {"LLAMINAR_CUDA_MOE_GATEUP_KPART_DECODE", "1"},
         {"LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE", "1"},
+        {"LLAMINAR_CUDA_MOE_ROUTER_Q8", "1"},
+        {"LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN", "1"},
         {"LLAMINAR_ROCM_NVNNI_ATOMIC_REDUCE", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_PREFILL", "1"},
         {"LLAMINAR_ROCM_CONCURRENT_DECODE", "1"},
@@ -87,6 +89,8 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicCudaAndRocmRoutes)
     EXPECT_FALSE(env_snapshot.gemm.cuda_concurrent_decode);
     EXPECT_FALSE(env_snapshot.gemm.cuda_moe_gateup_kpart_decode);
     EXPECT_FALSE(env_snapshot.gemm.cuda_moe_down_kpart_decode);
+    EXPECT_FALSE(env_snapshot.gemm.cuda_moe_router_q8);
+    EXPECT_FALSE(env_snapshot.gemm.cuda_moe_reuse_router_q8_hidden);
 
     EXPECT_FALSE(env_snapshot.rocm.nvnni_atomic_reduce);
     EXPECT_FALSE(env_snapshot.rocm.concurrent_prefill);
@@ -101,6 +105,30 @@ TEST(Test__DeterministicMode, DebugEnvDisablesNondeterministicCudaAndRocmRoutes)
     EXPECT_FALSE(env_snapshot.rocm.moe_gateup_kpart_decode);
 }
 
+TEST(Test__DeterministicMode, GpuMoEGroupedPrefillDefaultsOn)
+{
+    const char *name = "LLAMINAR_GPU_MOE_GROUPED_PREFILL";
+    const char *previous = std::getenv(name);
+    const bool had_previous = previous != nullptr;
+    const std::string previous_value = previous ? previous : "";
+
+    unsetenv(name);
+    mutableDebugEnv().reload();
+    EXPECT_TRUE(debugEnv().gpu_moe.grouped_prefill)
+        << "Fixed-topology grouped GPU MoE prefill is the default graph-capturable path";
+
+    setenv(name, "0", 1);
+    mutableDebugEnv().reload();
+    EXPECT_FALSE(debugEnv().gpu_moe.grouped_prefill)
+        << "The default-on path must still have an explicit diagnostic opt-out";
+
+    if (had_previous)
+        setenv(name, previous_value.c_str(), 1);
+    else
+        unsetenv(name);
+    mutableDebugEnv().reload();
+}
+
 TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsCleared)
 {
     {
@@ -108,11 +136,15 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
             {"LLAMINAR_DETERMINISTIC", "1"},
             {"LLAMINAR_CUDA_CONCURRENT_PREFILL", "1"},
             {"LLAMINAR_CUDA_CONCURRENT_DECODE", "1"},
+            {"LLAMINAR_CUDA_MOE_ROUTER_Q8", "1"},
+            {"LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_PREFILL", "1"},
             {"LLAMINAR_ROCM_CONCURRENT_DECODE", "1"},
         });
         EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_prefill);
         EXPECT_FALSE(debugEnv().gemm.cuda_concurrent_decode);
+        EXPECT_FALSE(debugEnv().gemm.cuda_moe_router_q8);
+        EXPECT_FALSE(debugEnv().gemm.cuda_moe_reuse_router_q8_hidden);
         EXPECT_FALSE(debugEnv().rocm.concurrent_prefill);
         EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
         EXPECT_FALSE(debugEnv().rocm.gdn_concurrent_decode);
@@ -121,6 +153,8 @@ TEST(Test__DeterministicMode, ConcurrentRoutesReturnToDefaultsWhenDeterminismIsC
     EXPECT_FALSE(debugEnv().gemm.deterministic);
     EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_prefill);
     EXPECT_TRUE(debugEnv().gemm.cuda_concurrent_decode);
+    EXPECT_TRUE(debugEnv().gemm.cuda_moe_router_q8);
+    EXPECT_TRUE(debugEnv().gemm.cuda_moe_reuse_router_q8_hidden);
     EXPECT_TRUE(debugEnv().rocm.concurrent_prefill);
     EXPECT_FALSE(debugEnv().rocm.concurrent_decode);
     EXPECT_TRUE(debugEnv().rocm.gdn_concurrent_decode);

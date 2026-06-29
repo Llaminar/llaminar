@@ -1316,6 +1316,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/MoELocalExpertStage.cpp
     execution/compute_stages/stages/MoESparseDispatchStage.cpp
     execution/compute_stages/stages/MoESparseReturnReduceStage.cpp
+    execution/compute_stages/stages/MoEDeviceRebalanceStage.cpp
     execution/compute_stages/stages/MoERoutingStage.cpp
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
@@ -1346,6 +1347,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
+    execution/moe/DeviceMoETransferSlotDirectory.cpp
     execution/moe/GpuExpertSlotPool.cpp
     execution/moe/GpuExpertTransferStagingPool.cpp
     execution/moe/MoEExpertWeightService.cpp

@@ -28,6 +28,7 @@ namespace llaminar2
         bool retain(const PrefixCacheKey &key);
         bool release(const PrefixCacheKey &key);
         bool erase(const PrefixCacheKey &key);
+        bool clear();
         bool reserveRam(size_t incoming_bytes);
         void recordRequestLookup(int requested_tokens,
                                  int matched_tokens,

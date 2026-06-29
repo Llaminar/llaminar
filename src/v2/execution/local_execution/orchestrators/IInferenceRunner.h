@@ -1986,6 +1986,16 @@ namespace llaminar2
         virtual bool maybeApplyDecodeBoundaryMaintenance() { return true; }
 
         /**
+         * @brief Drain completed decode-boundary maintenance diagnostics.
+         *
+         * Benchmark and serving request epilogues use this to retire
+         * asynchronous maintenance events after measured decode has finished,
+         * without forcing a full request reset or pushing diagnostics into the
+         * next request.
+         */
+        virtual void drainCompletedDecodeBoundaryMaintenanceDiagnostics() {}
+
+        /**
          * @brief Apply sparse logit penalties on device (GPU-side)
          *
          * Uploads a sparse penalty map to the GPU and applies it in-place to the
@@ -3138,6 +3148,16 @@ namespace llaminar2
             (void)domain_id;
             return nullptr;
         }
+
+        /**
+         * @brief True when graph execution owns the MoE rebalance publish/apply loop.
+         *
+         * Homogeneous GPU LocalTP domains can keep decode histograms, replica
+         * selection, and runtime-table bank flips on device. Runners reporting
+         * this capability must not also run the legacy host histogram sync +
+         * apply path at decode boundaries.
+         */
+        virtual bool usesDeviceSideMoERebalanceController() const { return false; }
 
         /**
          * @brief Participant index used for domain-scoped MoE rebalance actions.

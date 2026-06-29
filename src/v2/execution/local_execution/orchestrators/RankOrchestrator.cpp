@@ -20,7 +20,6 @@
 #include "../../../collective/CollectiveTimeoutPolicy.h"
 #include "../../mtp/MTPSpecStateContract.h"
 #include "../../factory/InferenceRunnerFactory.h"
-#include "../../moe/GPUExpertTransfer.h"
 #include "../../moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../prefix_cache/PrefixCacheCoordinator.h"
 #include "../../../collective/ILocalTPContext.h"
@@ -5639,6 +5638,12 @@ namespace llaminar2
 
         if (!tp_ctx_ || tp_ctx_->degree() <= 1 || device_runners_.size() <= 1)
             return;
+        if (usesDeviceSideMoERebalanceController())
+        {
+            LOG_DEBUG("RankOrchestrator: skipping host MoE runtime histogram bridge; "
+                      "device-side graph rebalance owns histogram allgather");
+            return;
+        }
 
         std::vector<MoERebalanceController *> controllers;
         controllers.reserve(device_runners_.size());
@@ -5912,6 +5917,20 @@ namespace llaminar2
 
         current_position_ = 0;
         stats_dirty_ = true;
+    }
+
+    void RankOrchestrator::drainCompletedDecodeBoundaryMaintenanceDiagnostics()
+    {
+        for (auto &runner : device_runners_)
+        {
+            if (runner)
+                runner->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+        }
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+                runner->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+        }
     }
 
     int RankOrchestrator::get_position() const
@@ -6469,6 +6488,9 @@ namespace llaminar2
                                           child.mtp_kv_caches.begin(),
                                           child.mtp_kv_caches.end());
             snapshot.gdn_layers.insert(snapshot.gdn_layers.end(), child.gdn_layers.begin(), child.gdn_layers.end());
+            snapshot.prefill_graphs.insert(snapshot.prefill_graphs.end(),
+                                           child.prefill_graphs.begin(),
+                                           child.prefill_graphs.end());
         };
 
         bool saw_child = false;
@@ -7186,6 +7208,22 @@ namespace llaminar2
         return nullptr;
     }
 
+    bool RankOrchestrator::usesDeviceSideMoERebalanceController() const
+    {
+        const auto &runners = pp_stage_runners_.empty()
+                                  ? device_runners_
+                                  : pp_stage_runners_;
+        if (runners.empty())
+            return false;
+
+        for (const auto &runner : runners)
+        {
+            if (!runner || !runner->usesDeviceSideMoERebalanceController())
+                return false;
+        }
+        return true;
+    }
+
     bool RankOrchestrator::applyMoEExpertMasksForAllDevices(
         const MoERebalanceController &controller,
         const ExpertReplicaSet *replica_arrivals,
@@ -7245,8 +7283,6 @@ namespace llaminar2
     {
         using Clock = std::chrono::steady_clock;
         int direct_transfer_pair_batches = 0;
-        int direct_peer_pair_batches = 0;
-        int direct_host_staged_pair_batches = 0;
         int serialized_transfer_pair_batches = 0;
         size_t transfer_mask_entries = 0;
         const std::string stats_device = primaryDeviceId().is_valid()
@@ -7274,19 +7310,18 @@ namespace llaminar2
         };
 
         auto collect_local_transfers = [&](size_t destination_idx,
-                                           const std::vector<std::vector<bool>> &destination_masks)
+                                           const std::vector<std::vector<bool>> &target_masks,
+                                           const std::vector<std::vector<bool>> &transfer_masks)
         {
             ReceivedWeightsMap merged;
-            auto remaining_masks = destination_masks;
+            (void)target_masks;
+            auto direct_remaining_masks = transfer_masks;
+            auto serialized_remaining_masks = transfer_masks;
             bool direct_only_gpu_transfer_attempted = false;
             for (size_t source_idx = 0; source_idx < local_dgos.size(); ++source_idx)
             {
                 if (source_idx == destination_idx || !local_dgos[source_idx])
                     continue;
-
-                const size_t requested_entries = count_mask_entries(remaining_masks);
-                if (requested_entries == 0)
-                    break;
 
                 auto is_same_backend_gpu_pair = [&]()
                 {
@@ -7299,15 +7334,15 @@ namespace llaminar2
                         src_device);
                 };
                 const bool same_backend_gpu_pair = is_same_backend_gpu_pair();
+                auto &remaining_masks =
+                    same_backend_gpu_pair ? direct_remaining_masks : serialized_remaining_masks;
+                const size_t requested_entries = count_mask_entries(remaining_masks);
+                if (requested_entries == 0)
+                    continue;
+
                 if (same_backend_gpu_pair)
                 {
                     ++direct_transfer_pair_batches;
-                    const DeviceId dst_device = local_dgos[destination_idx]->primaryDeviceId();
-                    const DeviceId src_device = local_dgos[source_idx]->primaryDeviceId();
-                    if (GPUExpertTransfer::canAccessPeer(src_device, dst_device))
-                        ++direct_peer_pair_batches;
-                    else
-                        ++direct_host_staged_pair_batches;
                 }
                 else
                 {
@@ -7350,12 +7385,12 @@ namespace llaminar2
                 }
             }
             if (direct_only_gpu_transfer_attempted &&
-                count_mask_entries(remaining_masks) > 0 &&
+                count_mask_entries(direct_remaining_masks) > 0 &&
                 destination_idx < gpu_direct_prepare_ok.size())
             {
                 gpu_direct_prepare_ok[destination_idx] = false;
                 LOG_ERROR("[RankOrchestrator] Same-backend GPU expert transfer prepare left "
-                          << count_mask_entries(remaining_masks)
+                          << count_mask_entries(direct_remaining_masks)
                           << " arrival mask entries unsatisfied for participant "
                           << destination_idx << " domain=" << domain_id);
             }
@@ -7373,7 +7408,11 @@ namespace llaminar2
                      device_idx < transfer_masks_by_participant->size())
                         ? (*transfer_masks_by_participant)[device_idx]
                         : masks_by_participant[device_idx];
-                received_by_device[device_idx] = collect_local_transfers(device_idx, transfer_masks);
+                received_by_device[device_idx] =
+                    collect_local_transfers(
+                        device_idx,
+                        masks_by_participant[device_idx],
+                        transfer_masks);
             }
         }
         const auto transfer_end = Clock::now();
@@ -7398,20 +7437,6 @@ namespace llaminar2
             "moe_rebalance",
             "rank_local_direct_transfer_pair_batches",
             static_cast<double>(direct_transfer_pair_batches),
-            "rebalance",
-            stats_device,
-            phase_tags);
-        PerfStatsCollector::addCounter(
-            "moe_rebalance",
-            "rank_local_direct_peer_pair_batches",
-            static_cast<double>(direct_peer_pair_batches),
-            "rebalance",
-            stats_device,
-            phase_tags);
-        PerfStatsCollector::addCounter(
-            "moe_rebalance",
-            "rank_local_direct_host_staged_pair_batches",
-            static_cast<double>(direct_host_staged_pair_batches),
             "rebalance",
             stats_device,
             phase_tags);

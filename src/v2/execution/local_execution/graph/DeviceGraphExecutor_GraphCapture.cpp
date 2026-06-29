@@ -672,6 +672,16 @@ namespace llaminar2
 
         DeviceGraphCaptureController::prepareDeviceForGraphCapture(ctx);
 
+        auto is_collective_node = [&](const ComputeNode &node) -> bool
+        {
+            if (collective_nodes && collective_nodes->find(node.name) != collective_nodes->end())
+                return true;
+            return node.stage &&
+                   (node.stage->type() == ComputeStageType::ALLREDUCE ||
+                    node.stage->type() == ComputeStageType::ALLGATHER ||
+                    node.stage->type() == ComputeStageType::ALLGATHER_V);
+        };
+
         DeviceGraphCaptureController::ReplayHooks replay_hooks{
             [&](const GraphSegment &segment)
             {
@@ -690,9 +700,13 @@ namespace llaminar2
         // onGraphReplayed() callbacks. During capture, execute() already ran
         // host-side bookkeeping; calling onGraphReplayed() would double-advance
         // KV cache head positions and corrupt subsequent decode steps.
+        const StageRunPolicy capture_phase_policy = StageRunPolicy::capturePhase();
         DeviceGraphCaptureController::ReplayHooks capture_hooks{
             replay_hooks.cohere_inputs,
-            replay_hooks.execute_node,
+            [&](ComputeNode &node)
+            {
+                return runStage(node, ctx, capture_phase_policy, is_collective_node(node));
+            },
             [&](GraphSegment &segment, void *stream)
             {
                 DeviceGraphCaptureController::postCapturedSegmentLaunch(

@@ -171,6 +171,12 @@ namespace llaminar2
         return orch_runner_ ? orch_runner_->maybeApplyMoERebalance() : false;
     }
 
+    void InferenceRunnerAdapter::drainCompletedDecodeBoundaryMaintenanceDiagnostics()
+    {
+        if (orch_runner_)
+            orch_runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
+    }
+
     void InferenceRunnerAdapter::setSkipLogitsGatherDecode(bool skip)
     {
         orch_runner_->setSkipLogitsGatherDecode(skip);

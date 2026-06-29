@@ -4,10 +4,9 @@
  *
  * Tests:
  *   1. Device context preservation after GPU transfer
- *   2. P2P transfer data integrity (if multi-GPU available)
- *   3. Host-staged fallback correctness
- *   4. Transfer with asymmetric weights (mins array present)
- *   5. Zero-size array handling (emins_bytes=0)
+ *   2. Same-backend transfer data integrity
+ *   3. Transfer with asymmetric weights (mins array present)
+ *   4. Zero-size array handling (emins_bytes=0)
  *
  * Requires: HAVE_ROCM or HAVE_CUDA and at least 1 GPU.
  * Multi-GPU tests are skipped if only 1 device is available.
@@ -88,7 +87,7 @@ TEST_F(Test__GPUExpertTransferIntegration, DeviceContextPreserved_SingleGPU)
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
-    // Transfer (self-device — always P2P since same device)
+    // Transfer on an explicit non-default stream.
     bool ok = GPUExpertTransfer::transferExpert(
         src_ptrs, dst_ptrs,
         DeviceId::rocm(0), DeviceId::rocm(0),
@@ -230,15 +229,4 @@ TEST_F(Test__GPUExpertTransferIntegration, NonROCmDeviceRejected)
     EXPECT_FALSE(ok) << "Mixed device types must be rejected";
 }
 
-TEST_F(Test__GPUExpertTransferIntegration, PeerAccessQuery)
-{
-    // canAccessPeer(0, 0) should always return true (same device)
-    EXPECT_TRUE(GPUExpertTransfer::canAccessPeer(0, 0));
-
-    if (gpu_count_ >= 2) {
-        // P2P between different devices may or may not work — just verify no crash
-        bool can = GPUExpertTransfer::canAccessPeer(0, 1);
-        (void)can; // Result depends on hardware topology
-    }
-}
 #endif // HAVE_ROCM

@@ -499,6 +499,26 @@ namespace llaminar2
         CUDA_CHECK_VOID(cudaEventRecord(cuda_event, cuda_stream));
     }
 
+    bool NvidiaDeviceContext::recordEventChecked(void *event, void *stream)
+    {
+        if (!event || !stream)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] recordEventChecked requires non-null event and stream");
+            return false;
+        }
+
+        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        cudaError_t err = cudaEventRecord(cuda_event, cuda_stream);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaEventRecord failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
     void NvidiaDeviceContext::waitEvent(void *event, void *stream)
     {
         if (event == nullptr)
@@ -512,6 +532,52 @@ namespace llaminar2
 
         // Make the stream wait for the event (GPU-side wait, not CPU blocking)
         CUDA_CHECK_VOID(cudaStreamWaitEvent(cuda_stream, cuda_event, 0));
+    }
+
+    bool NvidiaDeviceContext::waitEventChecked(void *event, void *stream)
+    {
+        if (!event || !stream)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] waitEventChecked requires non-null event and stream");
+            return false;
+        }
+
+        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        cudaError_t err = cudaStreamWaitEvent(cuda_stream, cuda_event, 0);
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] cudaStreamWaitEvent failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool NvidiaDeviceContext::queryEventChecked(void *event, bool &ready)
+    {
+        ready = false;
+        if (!event)
+        {
+            LOG_ERROR("[NvidiaDeviceContext] queryEventChecked requires non-null event");
+            return false;
+        }
+
+        cudaEvent_t cuda_event = static_cast<cudaEvent_t>(event);
+        cudaError_t err = cudaEventQuery(cuda_event);
+        if (err == cudaSuccess)
+        {
+            ready = true;
+            return true;
+        }
+        if (err == cudaErrorNotReady)
+        {
+            return true;
+        }
+
+        LOG_ERROR("[NvidiaDeviceContext] cudaEventQuery failed: "
+                  << cudaGetErrorString(err));
+        return false;
     }
 
     void NvidiaDeviceContext::synchronizeEvent(void *event)

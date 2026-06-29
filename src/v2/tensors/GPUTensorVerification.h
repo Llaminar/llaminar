@@ -138,9 +138,12 @@ namespace llaminar2
      * @return Pointer to validator, or nullptr if not available
      */
     ITensorValidator *getTensorValidator(DeviceType device_type);
+    ITensorValidator *getTensorValidator(DeviceType device_type, int device_id);
 
     // Backend-specific factory functions (defined in CUDA/ROCm compilation units)
     ITensorValidator *getCUDATensorValidator();
+    ITensorValidator *getCUDATensorValidator(int device_id);
     ITensorValidator *getROCmTensorValidator();
+    ITensorValidator *getROCmTensorValidator(int device_id);
 
 } // namespace llaminar2

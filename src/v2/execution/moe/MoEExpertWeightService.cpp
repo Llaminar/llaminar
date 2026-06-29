@@ -11,6 +11,7 @@
 #include "GPUExpertTransfer.h"
 #include "GpuExpertSlotPool.h"
 #include "GpuExpertTransferStagingPool.h"
+#include "DeviceMoERebalanceController.h"
 #include "../../tensors/Tensors.h"
 #include "../../tensors/BlockStructures.h"
 #include "../../kernels/KernelFactory.h"
@@ -3141,6 +3142,49 @@ namespace llaminar2
             return unpackable ? unpackable->vnniFormatInfo() : nullptr;
         };
 
+        auto validate_optional_destination_view =
+            [&](const WeightGroup &grp,
+                int expert_id,
+                const DeviceNativeVNNIMatrixDesc &src_desc,
+                uint8_t payload_bytes_per_block,
+                uint8_t is_asymmetric,
+                uint8_t has_emins) -> bool
+        {
+            if (expert_id < 0 || expert_id >= static_cast<int>(grp.dst_views.size()) ||
+                !grp.dst_views[static_cast<size_t>(expert_id)])
+            {
+                return true;
+            }
+
+            const auto &view = grp.dst_views[static_cast<size_t>(expert_id)];
+            const int N = static_cast<int>(view->rows());
+            const int K = static_cast<int>(view->cols());
+            const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
+            if (src_desc.n != N ||
+                src_desc.k != K ||
+                src_desc.blocks_per_row != blocks_per_row)
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: descriptor mismatch for "
+                          << grp.label << " expert " << expert_id
+                          << " layer " << layer_idx);
+                return false;
+            }
+
+            if (const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
+                vnni &&
+                (src_desc.codebook_id != vnni->codebook_id ||
+                 payload_bytes_per_block != static_cast<uint8_t>(vnni->payload_bytes) ||
+                 (is_asymmetric != 0) != vnni->is_asymmetric ||
+                 (has_emins != 0) != vnni->has_emins))
+            {
+                LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: destination "
+                          << grp.label << " view format disagrees with source descriptor for expert "
+                          << expert_id << " layer " << layer_idx);
+                return false;
+            }
+            return true;
+        };
+
         std::vector<int> experts_to_copy;
         experts_to_copy.reserve(experts_to_stage.size());
         for (int expert_id : experts_to_stage)
@@ -3155,28 +3199,31 @@ namespace llaminar2
                     break;
                 }
 
-                const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
-                if (!vnni)
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        src_desc,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
                 {
-                    LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: destination "
-                              << grp.label << " view for expert " << expert_id
+                    LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: source "
+                              << grp.label << " descriptor for expert " << expert_id
                               << " layer " << layer_idx
-                              << " has no NativeVNNI format info");
+                              << " has unsupported NativeVNNI codebook");
                     can_copy = false;
                     break;
                 }
 
-                const int N = static_cast<int>(grp.dst_views[expert_id]->rows());
-                const int K = static_cast<int>(grp.dst_views[expert_id]->cols());
-                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
-                if (src_desc.n != N ||
-                    src_desc.k != K ||
-                    src_desc.blocks_per_row != blocks_per_row ||
-                    src_desc.codebook_id != vnni->codebook_id)
+                if (!validate_optional_destination_view(
+                        grp,
+                        expert_id,
+                        src_desc,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
                 {
-                    LOG_DEBUG("[MoEWeightService] GPU-direct transfer-slot staging: descriptor mismatch for "
-                              << grp.label << " expert " << expert_id
-                              << " layer " << layer_idx);
                     can_copy = false;
                     break;
                 }
@@ -3198,17 +3245,44 @@ namespace llaminar2
             specs.reserve(group_count);
             for (const auto &grp : groups)
             {
-                const NativeVnniFormatInfo *vnni = vnni_info_for(grp, sample_expert);
-                if (!vnni)
+                if (sample_expert < 0 || sample_expert >= dst_ctx.num_experts)
                     return std::nullopt;
+
+                DeviceNativeVNNIMatrixDesc src_desc{};
+                if (!source_descriptor_for(grp, sample_expert, src_desc))
+                    return std::nullopt;
+
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        src_desc,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    return std::nullopt;
+                }
+
+                if (!validate_optional_destination_view(
+                        grp,
+                        sample_expert,
+                        src_desc,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
+                {
+                    return std::nullopt;
+                }
+
                 GpuExpertSlotPool::ProjectionSpec spec;
                 spec.label = grp.label;
-                spec.N = static_cast<int>(grp.dst_views[sample_expert]->rows());
-                spec.K = static_cast<int>(grp.dst_views[sample_expert]->cols());
-                spec.payload_bytes_per_block = vnni->payload_bytes;
-                spec.is_asymmetric = vnni->is_asymmetric;
-                spec.has_emins = vnni->has_emins;
-                spec.codebook_id = vnni->codebook_id;
+                spec.N = src_desc.n;
+                spec.K = src_desc.k;
+                spec.payload_bytes_per_block = static_cast<int>(payload_bytes_per_block);
+                spec.is_asymmetric = is_asymmetric != 0;
+                spec.has_emins = has_emins != 0;
+                spec.codebook_id = src_desc.codebook_id;
                 specs.push_back(std::move(spec));
             }
             return specs;
@@ -3467,7 +3541,7 @@ namespace llaminar2
 
         uint64_t transfer_stream_create_ns = 0;
         uint64_t transfer_stream_event_ns = 0;
-        uint64_t peer_enqueue_ns = 0;
+        uint64_t transfer_enqueue_ns = 0;
         size_t staged_bytes = 0;
         int transfer_stream_creation_count = 0;
         int transfer_stream_reuse_count = 0;
@@ -3587,30 +3661,33 @@ namespace llaminar2
                     return false;
                 }
 
-                const NativeVnniFormatInfo *vnni = vnni_info_for(grp, expert_id);
-                if (!vnni)
+                uint8_t payload_bytes_per_block = 0;
+                uint8_t is_asymmetric = 0;
+                uint8_t has_emins = 0;
+                if (!deviceMoEProjectionFormat(
+                        src_matrix,
+                        payload_bytes_per_block,
+                        is_asymmetric,
+                        has_emins))
                 {
                     publish_already_satisfied();
                     return false;
                 }
 
-                const int N = static_cast<int>(grp.dst_views[expert_id]->rows());
-                const int K = static_cast<int>(grp.dst_views[expert_id]->cols());
-                const uint32_t blocks_per_row = static_cast<uint32_t>(K / 32);
                 auto src_desc = makeGpuExpertPackedDescriptor(
                     src_matrix,
-                    vnni->payload_bytes,
-                    vnni->is_asymmetric,
-                    vnni->has_emins);
+                    payload_bytes_per_block,
+                    is_asymmetric != 0,
+                    has_emins != 0);
                 auto dst_desc = packedDescFromSlot(
                     staging_lease->projections[group_index].slot,
-                    N,
-                    K,
-                    blocks_per_row,
-                    vnni->codebook_id,
-                    vnni->payload_bytes,
-                    vnni->is_asymmetric,
-                    vnni->has_emins);
+                    src_matrix.n,
+                    src_matrix.k,
+                    src_matrix.blocks_per_row,
+                    src_matrix.codebook_id,
+                    payload_bytes_per_block,
+                    is_asymmetric != 0,
+                    has_emins != 0);
 
                 const auto copy_start = Clock::now();
                 transfer_batch.markEnqueueAttempted();
@@ -3629,21 +3706,21 @@ namespace llaminar2
                     publish_already_satisfied();
                     return false;
                 }
-                peer_enqueue_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                             Clock::now() - copy_start)
-                                                             .count());
+                transfer_enqueue_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 Clock::now() - copy_start)
+                                                                 .count());
 
                 GpuDirectTransferSlotProjection projection;
                 projection.expert_id = expert_id;
                 projection.role = grp.role;
                 projection.staged = dst_desc;
-                projection.N = N;
-                projection.K = K;
-                projection.blocks_per_row = blocks_per_row;
-                projection.payload_bytes_per_block = vnni->payload_bytes;
-                projection.is_asymmetric = vnni->is_asymmetric;
-                projection.has_emins = vnni->has_emins;
-                projection.codebook_id = vnni->codebook_id;
+                projection.N = src_matrix.n;
+                projection.K = src_matrix.k;
+                projection.blocks_per_row = src_matrix.blocks_per_row;
+                projection.payload_bytes_per_block = payload_bytes_per_block;
+                projection.is_asymmetric = is_asymmetric != 0;
+                projection.has_emins = has_emins != 0;
+                projection.codebook_id = src_matrix.codebook_id;
                 projection.transfer_slot_lifetime = staging_lease->lifetime;
                 out.projections.push_back(std::move(projection));
                 staged_bytes += src_desc.totalBytes();
@@ -3693,7 +3770,7 @@ namespace llaminar2
                                            transfer_stream_event_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
         PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_stage_enqueue",
-                                           peer_enqueue_ns,
+                                           transfer_enqueue_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
         PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_stage",
                                            elapsed_ns,
@@ -3763,9 +3840,6 @@ namespace llaminar2
         const int src_gpu_ordinal = src_ctx.device_id.is_cuda()
                                         ? src_ctx.device_id.cuda_ordinal()
                                         : src_ctx.device_id.rocm_ordinal();
-        const bool peer_access_available =
-            GPUExpertTransfer::canAccessPeer(src_ctx.device_id, dst_ctx.device_id);
-
         struct WeightGroup
         {
             const char *label;
@@ -4149,8 +4223,8 @@ namespace llaminar2
         int unpooled_experts = 0;
         int transfer_slot_experts = 0;
         uint64_t allocation_ns = 0;
-        uint64_t peer_enqueue_ns = 0;
-        uint64_t peer_wait_ns = 0;
+        uint64_t transfer_enqueue_ns = 0;
+        uint64_t transfer_wait_ns = 0;
         uint64_t transfer_slot_activation_ns = 0;
         uint64_t transfer_stream_create_ns = 0;
         uint64_t transfer_stream_event_ns = 0;
@@ -4477,9 +4551,9 @@ namespace llaminar2
                     src_ctx.device_id,
                     dst_ctx.device_id,
                     transfer_batch.stream);
-                peer_enqueue_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                                             Clock::now() - copy_start)
-                                                             .count());
+                transfer_enqueue_ns += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                 Clock::now() - copy_start)
+                                                                 .count());
                 if (!copied)
                 {
                     LOG_ERROR("[MoEWeightService] GPU-direct transfer failed for "
@@ -4627,7 +4701,7 @@ namespace llaminar2
             completion->transient_lifetimes = transient_transfer_lifetimes;
             transfer_completion_event_count = 1;
         }
-        else if (!transfer_batch.finish(peer_wait_ns))
+        else if (!transfer_batch.finish(transfer_wait_ns))
         {
             LOG_ERROR("[MoEWeightService] GPU-direct transfer stream synchronization failed for layer "
                       << layer_idx << " on " << dst_ctx.device_id.to_string());
@@ -4676,12 +4750,6 @@ namespace llaminar2
         PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_transfer_bytes",
                                        static_cast<double>(transferred_bytes),
                                        "rebalance", dst_ctx.device_id.to_string(), tags);
-        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_peer_access_available",
-                                       peer_access_available ? 1.0 : 0.0,
-                                       "rebalance", dst_ctx.device_id.to_string(), tags);
-        PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_host_staged_transfer_batches",
-                                       peer_access_available ? 0.0 : 1.0,
-                                       "rebalance", dst_ctx.device_id.to_string(), tags);
         PerfStatsCollector::addCounter("moe_rebalance", "gpu_direct_slot_pool_experts",
                                        static_cast<double>(pooled_experts),
                                        "rebalance", dst_ctx.device_id.to_string(), tags);
@@ -4727,17 +4795,17 @@ namespace llaminar2
         PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_stream_event_wait",
                                            transfer_stream_event_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
-        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_peer_enqueue",
-                                           peer_enqueue_ns,
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_enqueue",
+                                           transfer_enqueue_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
-        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_peer_wait",
-                                           peer_wait_ns,
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_wait",
+                                           transfer_wait_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
         PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_slot_activation_copy",
                                            transfer_slot_activation_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
-        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_peer_copy",
-                                           peer_enqueue_ns + peer_wait_ns,
+        PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_transfer_copy",
+                                           transfer_enqueue_ns + transfer_wait_ns,
                                            "rebalance", dst_ctx.device_id.to_string(), tags);
         PerfStatsCollector::recordTimingNs("moe_rebalance", "gpu_direct_arrival_wrap",
                                            wrapper_ns,

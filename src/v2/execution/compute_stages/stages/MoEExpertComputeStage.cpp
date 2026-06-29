@@ -47,6 +47,7 @@
 #include <iterator>
 #include <limits>
 #include <numeric>
+#include <sstream>
 #include <typeindex>
 #include <unordered_set>
 #include <vector>
@@ -140,7 +141,7 @@ namespace llaminar2
             (void)device;
             return false;
 #else
-            if (!debugEnv().rocm.moe_grouped_prefill)
+            if (!debugEnv().gpu_moe.grouped_prefill)
                 return false;
 #if defined(HAVE_ROCM)
             if (device.is_rocm())
@@ -156,12 +157,7 @@ namespace llaminar2
 
         bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
         {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-            (void)device;
-            return false;
-#else
             return supportsGroupedPrefillExecutionBackend(device);
-#endif
         }
 
         bool supportsDeviceRoutedDecodeGraphCaptureBackend(DeviceId device)
@@ -281,6 +277,16 @@ namespace llaminar2
             return false;
 #endif
         }
+
+        bool supportsSharedExpertGroupedDecodeGraphCaptureBackend(DeviceId device)
+        {
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
+            (void)device;
+            return false;
+#else
+            return shouldUseSharedExpertGroupedDecode(device);
+#endif
+        }
     } // anonymous namespace
 
     // =========================================================================
@@ -304,6 +310,31 @@ namespace llaminar2
                 moe_runtime_table_initialized_ = runtimeTableHasActiveGroupedDecodeBank();
             }
         }
+    }
+
+    bool MoEExpertComputeStage::usesGraphStableRuntimeDecodePlacement() const
+    {
+        return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
+               params_.seq_len == 1 &&
+               !params_.force_grouped_verifier_prefill_for_decode &&
+               params_.moe_runtime_table != nullptr &&
+               params_.layer_idx >= 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0;
+    }
+
+    bool MoEExpertComputeStage::usesGraphStableFixedTopologyPrefillPlacement() const
+    {
+        return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
+               params_.seq_len > 1 &&
+               !params_.force_grouped_verifier_prefill_for_decode &&
+               canUseFixedTopologyGroupedPrefill();
+    }
+
+    bool MoEExpertComputeStage::usesGraphStableMoEPlacement() const
+    {
+        return usesGraphStableRuntimeDecodePlacement() ||
+               usesGraphStableFixedTopologyPrefillPlacement();
     }
 
     bool MoEExpertComputeStage::validatePreparedWeights(std::string *error) const
@@ -373,17 +404,10 @@ namespace llaminar2
             params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask, params_.layer_idx);
         else
             params_.replica_set.prefill_mask.clear();
-        grouped_gateup_desc_table_id_ = -1;
-        grouped_gateup_desc_table_num_experts_ = 0;
-        grouped_gateup_desc_table_d_model_ = 0;
-        grouped_gateup_desc_table_intermediate_ = 0;
-        grouped_down_desc_table_id_ = -1;
-        grouped_down_desc_table_num_experts_ = 0;
-        grouped_down_desc_table_d_model_ = 0;
-        grouped_down_desc_table_intermediate_ = 0;
+        grouped_gateup_desc_table_dirty_ = true;
+        grouped_down_desc_table_dirty_ = true;
         moe_runtime_table_initialized_ = false;
-        runtime_grouped_decode_warmed_ = false;
-        return true;
+        return refreshGraphStablePlacement(/*preserve_capture_ready=*/true);
     }
 
     ExpertWeightBlobs MoEExpertComputeStage::detachAndSerializeExpert(int expert_id)
@@ -433,16 +457,9 @@ namespace llaminar2
             cached_gate_gemm_ = params_.prepared_gate_gemm;
             cached_up_gemm_ = params_.prepared_up_gemm;
             cached_down_gemm_ = params_.prepared_down_gemm;
-            grouped_gateup_desc_table_id_ = -1;
-            grouped_gateup_desc_table_num_experts_ = 0;
-            grouped_gateup_desc_table_d_model_ = 0;
-            grouped_gateup_desc_table_intermediate_ = 0;
-            grouped_down_desc_table_id_ = -1;
-            grouped_down_desc_table_num_experts_ = 0;
-            grouped_down_desc_table_d_model_ = 0;
-            grouped_down_desc_table_intermediate_ = 0;
+            grouped_gateup_desc_table_dirty_ = true;
+            grouped_down_desc_table_dirty_ = true;
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
         }
         if (!ok && satisfied_expert_ids.empty())
         {
@@ -585,16 +602,9 @@ namespace llaminar2
             cached_gate_gemm_ = params_.prepared_gate_gemm;
             cached_up_gemm_ = params_.prepared_up_gemm;
             cached_down_gemm_ = params_.prepared_down_gemm;
-            grouped_gateup_desc_table_id_ = -1;
-            grouped_gateup_desc_table_num_experts_ = 0;
-            grouped_gateup_desc_table_d_model_ = 0;
-            grouped_gateup_desc_table_intermediate_ = 0;
-            grouped_down_desc_table_id_ = -1;
-            grouped_down_desc_table_num_experts_ = 0;
-            grouped_down_desc_table_d_model_ = 0;
-            grouped_down_desc_table_intermediate_ = 0;
+            grouped_gateup_desc_table_dirty_ = true;
+            grouped_down_desc_table_dirty_ = true;
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
         }
         return activated_expert_ids;
     }
@@ -709,16 +719,9 @@ namespace llaminar2
             cached_gate_gemm_ = params_.prepared_gate_gemm;
             cached_up_gemm_ = params_.prepared_up_gemm;
             cached_down_gemm_ = params_.prepared_down_gemm;
-            grouped_gateup_desc_table_id_ = -1;
-            grouped_gateup_desc_table_num_experts_ = 0;
-            grouped_gateup_desc_table_d_model_ = 0;
-            grouped_gateup_desc_table_intermediate_ = 0;
-            grouped_down_desc_table_id_ = -1;
-            grouped_down_desc_table_num_experts_ = 0;
-            grouped_down_desc_table_d_model_ = 0;
-            grouped_down_desc_table_intermediate_ = 0;
+            grouped_gateup_desc_table_dirty_ = true;
+            grouped_down_desc_table_dirty_ = true;
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
         }
         return ok;
     }
@@ -730,19 +733,17 @@ namespace llaminar2
             params_.replica_set.buildPrefillMask(params_.my_socket_id, params_.expert_mask, params_.layer_idx);
         else
             params_.replica_set.prefill_mask.clear();
-        cached_gate_gemm_.clear();
-        cached_up_gemm_.clear();
-        cached_down_gemm_.clear();
-        grouped_gateup_desc_table_id_ = -1;
-        grouped_gateup_desc_table_num_experts_ = 0;
-        grouped_gateup_desc_table_d_model_ = 0;
-        grouped_gateup_desc_table_intermediate_ = 0;
-        grouped_down_desc_table_id_ = -1;
-        grouped_down_desc_table_num_experts_ = 0;
-        grouped_down_desc_table_d_model_ = 0;
-        grouped_down_desc_table_intermediate_ = 0;
+        cached_gate_gemm_ = params_.prepared_gate_gemm;
+        cached_up_gemm_ = params_.prepared_up_gemm;
+        cached_down_gemm_ = params_.prepared_down_gemm;
+        grouped_gateup_desc_table_dirty_ = true;
+        grouped_down_desc_table_dirty_ = true;
         moe_runtime_table_initialized_ = false;
-        runtime_grouped_decode_warmed_ = false;
+        if (!refreshGraphStablePlacement(/*preserve_capture_ready=*/true))
+        {
+            throw std::runtime_error(
+                "MoE expert mask publication failed to refresh graph-stable runtime tables");
+        }
     }
 
     MoEWeightContext MoEExpertComputeStage::buildWeightContext()
@@ -867,6 +868,116 @@ namespace llaminar2
                 {{"layer", std::to_string(params_.layer_idx)}});
         }
         pending_gpu_direct_transfers_.clear();
+        return true;
+    }
+
+    bool MoEExpertComputeStage::refreshGraphStablePlacement(bool preserve_capture_ready)
+    {
+        return refreshRuntimeGroupedDecodePlacement(preserve_capture_ready) &&
+               refreshFixedTopologyGroupedPrefillPlacement();
+    }
+
+    bool MoEExpertComputeStage::refreshRuntimeGroupedDecodePlacement(bool preserve_capture_ready)
+    {
+        if (!supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) ||
+            params_.seq_len != 1 ||
+            !params_.moe_runtime_table ||
+            params_.layer_idx < 0 ||
+            params_.d_model <= 0 ||
+            params_.expert_intermediate <= 0 ||
+            params_.num_experts <= 0)
+        {
+            runtime_grouped_decode_warmed_ = false;
+            return true;
+        }
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Refusing to refresh MoE runtime placement during graph capture"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            runtime_grouped_decode_warmed_ = false;
+            return false;
+        }
+
+        const bool was_capture_ready = runtime_grouped_decode_warmed_;
+        IMoEKernel *kernel = ensureMoEKernel();
+        if (!kernel)
+        {
+            runtime_grouped_decode_warmed_ = false;
+            return false;
+        }
+
+        all_expert_ids_.clear();
+        all_expert_ids_.reserve(static_cast<size_t>(params_.num_experts));
+        for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
+        {
+            if (expertComputesLocally(expert_id))
+                all_expert_ids_.push_back(expert_id);
+        }
+
+        if (all_expert_ids_.empty() ||
+            !ensureGemmEnginesForExperts(all_expert_ids_) ||
+            !ensureGroupedGateUpDescriptorTable(kernel, params_.d_model, params_.expert_intermediate) ||
+            !ensureGroupedDownDescriptorTable(kernel, params_.d_model, params_.expert_intermediate) ||
+            !initializeMoERuntimeTableForGroupedDecode())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Failed to refresh graph-stable MoE runtime placement"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            runtime_grouped_decode_warmed_ = false;
+            return false;
+        }
+
+        runtime_grouped_decode_warmed_ =
+            preserve_capture_ready && was_capture_ready &&
+            grouped_gateup_desc_table_id_ >= 0 &&
+            grouped_down_desc_table_id_ >= 0 &&
+            runtimeTableHasActiveGroupedDecodeBank();
+        return true;
+    }
+
+    bool MoEExpertComputeStage::refreshFixedTopologyGroupedPrefillPlacement()
+    {
+        if (!usesGraphStableFixedTopologyPrefillPlacement())
+            return true;
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Refusing to refresh fixed-topology MoE prefill placement during graph capture"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        IMoEKernel *kernel = ensureMoEKernel();
+        if (!kernel)
+            return false;
+
+        const std::vector<int> active_expert_ids = fixedTopologyPrefillExpertIds();
+        if (active_expert_ids.empty() ||
+            !ensureGemmEnginesForExperts(active_expert_ids) ||
+            !ensureGroupedGateUpDescriptorTable(kernel, params_.d_model, params_.expert_intermediate) ||
+            !ensureGroupedDownDescriptorTable(kernel, params_.d_model, params_.expert_intermediate))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Failed to refresh graph-stable fixed-topology prefill placement"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        if (usesMaskedFixedTopologyPrefill())
+        {
+            const std::vector<uint8_t> mask = fixedTopologyPrefillExpertMaskBytes();
+            if (!kernel->updateGroupedPrefillExpertMask(mask.data(), params_.num_experts))
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Failed to refresh grouped prefill expert mask"
+                          << " layer=" << params_.layer_idx
+                          << " device=" << params_.device_id.to_string());
+                return false;
+            }
+        }
+
         return true;
     }
 
@@ -1034,7 +1145,7 @@ namespace llaminar2
                       "prefill for seq_len=1 inside graph capture, but the fixed-topology grouped path "
                       "is unavailable: "
                       "device=" << params_.device_id.to_string()
-                                << ", moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                                << ", gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
                                 << ", fullOwnership=" << hasFullLocalExpertOwnership()
                                 << ", allEnabled=" << expertMaskAllEnabled()
                                 << ", replicas=" << params_.replica_set.num_replicated
@@ -1042,18 +1153,18 @@ namespace llaminar2
             return false;
         }
 
-        // ROCm graph capture requires the fixed-topology grouped path. Ordinary
+        // GPU graph capture requires the fixed-topology grouped path. Ordinary
         // stream execution can still run graph-native overlay subsets through the
         // device-grouped gather/scatter path below.
-        if (params_.device_id.is_rocm() && params_.seq_len > 1 && isGraphCaptureActive())
+        if (params_.device_id.is_gpu() && params_.seq_len > 1 && isGraphCaptureActive())
         {
-            LOG_ERROR("[MoEExpertComputeStage] ROCm graph-captured prefill (seq_len=" << params_.seq_len
-                                                                                      << ") requires fixed-topology grouped prefill but conditions not met: "
-                                                                       << "moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
-                                                                       << ", fullOwnership=" << hasFullLocalExpertOwnership()
-                                                                       << ", allEnabled=" << expertMaskAllEnabled()
-                                                                       << ", replicas=" << params_.replica_set.num_replicated
-                                                                       << ", layer=" << params_.layer_idx);
+            LOG_ERROR("[MoEExpertComputeStage] GPU graph-captured prefill (seq_len=" << params_.seq_len
+                                                                                     << ") requires fixed-topology grouped prefill but conditions not met: "
+                                                                      << "gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
+                                                                      << ", fullOwnership=" << hasFullLocalExpertOwnership()
+                                                                      << ", allEnabled=" << expertMaskAllEnabled()
+                                                                      << ", replicas=" << params_.replica_set.num_replicated
+                                                                      << ", layer=" << params_.layer_idx);
             return false;
         }
 
@@ -1189,7 +1300,7 @@ namespace llaminar2
             LOG_ERROR("[MoEExpertComputeStage] MTP verifier correction replay could not use "
                       "the required device grouped path for seq_len=1: "
                       "device=" << params_.device_id.to_string()
-                                << ", moe_grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                                << ", gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
                                 << ", fullOwnership=" << hasFullLocalExpertOwnership()
                                 << ", allEnabled=" << expertMaskAllEnabled()
                                 << ", replicas=" << params_.replica_set.num_replicated
@@ -1500,6 +1611,8 @@ namespace llaminar2
                  {"runtime_layer", perfBool(moe_runtime_layer_ != nullptr)},
                  {"initialized", perfBool(moe_runtime_table_initialized_)},
                  {"active_bank", perfBool(runtime_decode_bank_active_for_expert_stage)},
+                 {"descriptor_source",
+                  params_.runtime_decode_uses_mutable_descriptors ? "runtime" : "static_table"},
                  {"top_k", std::to_string(top_k)},
                  {"replicas", std::to_string(params_.replica_set.num_replicated)}});
         }
@@ -1507,6 +1620,10 @@ namespace llaminar2
         if (can_try_device_routed_decode)
         {
             bool device_routed_done = false;
+            const MoEDecodeDescriptorSource descriptor_source =
+                params_.runtime_decode_uses_mutable_descriptors
+                    ? MoEDecodeDescriptorSource::RuntimePlacementTable
+                    : MoEDecodeDescriptorSource::StaticDescriptorTable;
             const bool have_grouped_tables =
                 grouped_gateup_desc_table_id_ >= 0 &&
                 grouped_gateup_desc_table_num_experts_ == num_experts &&
@@ -1590,7 +1707,8 @@ namespace llaminar2
                         top_k,
                         params_.output,
                         d_model,
-                        intermediate);
+                        intermediate,
+                        descriptor_source);
 
                     if (!device_routed_done && isGraphCaptureActive())
                     {
@@ -2655,9 +2773,17 @@ namespace llaminar2
         if (grouped_gateup_desc_table_id_ >= 0 &&
             grouped_gateup_desc_table_num_experts_ == params_.num_experts &&
             grouped_gateup_desc_table_d_model_ == d_model &&
-            grouped_gateup_desc_table_intermediate_ == intermediate)
+            grouped_gateup_desc_table_intermediate_ == intermediate &&
+            !grouped_gateup_desc_table_dirty_)
         {
             return true;
+        }
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Grouped gate/up descriptor table is dirty during graph capture"
+                      << " layer=" << params_.layer_idx);
+            return false;
         }
 
         std::vector<DeviceNativeVNNIMatrixDesc> gate_descs(static_cast<size_t>(params_.num_experts));
@@ -2693,7 +2819,23 @@ namespace llaminar2
         if (valid_descs == 0)
             return false;
 
-        const int table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
+        int table_id = grouped_gateup_desc_table_id_;
+        if (table_id >= 0 &&
+            grouped_gateup_desc_table_num_experts_ == params_.num_experts &&
+            grouped_gateup_desc_table_d_model_ == d_model &&
+            grouped_gateup_desc_table_intermediate_ == intermediate)
+        {
+            if (!kernel->updateGroupedExpertGateUpDescriptorTables(
+                    table_id, gate_descs.data(), up_descs.data(),
+                    params_.num_experts, d_model, intermediate))
+            {
+                return false;
+            }
+            grouped_gateup_desc_table_dirty_ = false;
+            return true;
+        }
+
+        table_id = kernel->uploadGroupedExpertGateUpDescriptorTables(
             gate_descs.data(), up_descs.data(), params_.num_experts, d_model, intermediate);
         if (table_id < 0)
             return false;
@@ -2702,6 +2844,7 @@ namespace llaminar2
         grouped_gateup_desc_table_num_experts_ = params_.num_experts;
         grouped_gateup_desc_table_d_model_ = d_model;
         grouped_gateup_desc_table_intermediate_ = intermediate;
+        grouped_gateup_desc_table_dirty_ = false;
         runtime_grouped_decode_warmed_ = false;
         return true;
     }
@@ -2715,9 +2858,17 @@ namespace llaminar2
         if (grouped_down_desc_table_id_ >= 0 &&
             grouped_down_desc_table_num_experts_ == params_.num_experts &&
             grouped_down_desc_table_d_model_ == d_model &&
-            grouped_down_desc_table_intermediate_ == intermediate)
+            grouped_down_desc_table_intermediate_ == intermediate &&
+            !grouped_down_desc_table_dirty_)
         {
             return true;
+        }
+
+        if (isGraphCaptureActive())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Grouped down descriptor table is dirty during graph capture"
+                      << " layer=" << params_.layer_idx);
+            return false;
         }
 
         std::vector<DeviceNativeVNNIMatrixDesc> down_descs(static_cast<size_t>(params_.num_experts));
@@ -2746,7 +2897,23 @@ namespace llaminar2
         if (valid_descs == 0)
             return false;
 
-        const int table_id = kernel->uploadGroupedExpertDownDescriptorTable(
+        int table_id = grouped_down_desc_table_id_;
+        if (table_id >= 0 &&
+            grouped_down_desc_table_num_experts_ == params_.num_experts &&
+            grouped_down_desc_table_d_model_ == d_model &&
+            grouped_down_desc_table_intermediate_ == intermediate)
+        {
+            if (!kernel->updateGroupedExpertDownDescriptorTable(
+                    table_id, down_descs.data(),
+                    params_.num_experts, d_model, intermediate))
+            {
+                return false;
+            }
+            grouped_down_desc_table_dirty_ = false;
+            return true;
+        }
+
+        table_id = kernel->uploadGroupedExpertDownDescriptorTable(
             down_descs.data(), params_.num_experts, d_model, intermediate);
         if (table_id < 0)
             return false;
@@ -2755,6 +2922,7 @@ namespace llaminar2
         grouped_down_desc_table_num_experts_ = params_.num_experts;
         grouped_down_desc_table_d_model_ = d_model;
         grouped_down_desc_table_intermediate_ = intermediate;
+        grouped_down_desc_table_dirty_ = false;
         runtime_grouped_decode_warmed_ = false;
         return true;
     }
@@ -2874,7 +3042,9 @@ namespace llaminar2
                 return false;
             }
 
-            int participant_count = has_replicas ? params_.replica_set.num_sockets : 0;
+            int participant_count = params_.participant_count;
+            if (participant_count <= 0 && has_replicas)
+                participant_count = params_.replica_set.num_sockets;
             if (participant_count <= 0 && has_replicas)
             {
                 for (int owner : params_.replica_set.owner_socket)
@@ -3017,6 +3187,22 @@ namespace llaminar2
         const DeviceMoEPlacementBank *bank = activeRuntimePlacementBank();
         if (!bank || !moe_runtime_layer_)
             return false;
+
+        try
+        {
+            const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+            if (state.participant_id != static_cast<uint32_t>(params_.my_socket_id))
+                return false;
+            if (params_.participant_count > 0 &&
+                state.participant_count != static_cast<uint32_t>(params_.participant_count))
+            {
+                return false;
+            }
+        }
+        catch (...)
+        {
+            return false;
+        }
 
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
@@ -3718,17 +3904,19 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
         if (params_.force_grouped_verifier_prefill_for_decode)
             return isFixedTopologyPrefillGraphCapturable();
 
+#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
         // Device-routed grouped decode path: after warmup, all descriptor tables
         // are built and execution is pure kernel launches reading routing info
         // from the device-resident MoE runtime table.
         if (isDeviceRoutedDecodeGraphCapturable())
             return true;
+#endif
 
         // Fixed-topology grouped prefill path
         return isFixedTopologyPrefillGraphCapturable();
@@ -3737,10 +3925,12 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::supportsWarmupDependentGraphCapture() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        const bool decode_supported =
+        bool decode_supported = false;
+#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
+        decode_supported =
             !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.seq_len == 1 &&
@@ -3754,6 +3944,7 @@ namespace llaminar2
             params_.output &&
             params_.moe_runtime_table &&
             params_.layer_idx >= 0;
+#endif
 
         return decode_supported || supportsFixedTopologyPrefillGraphCapturePreflight();
 #endif
@@ -3832,6 +4023,8 @@ namespace llaminar2
         info.addScalarInt("expert_intermediate", params_.expert_intermediate);
         info.addScalarInt("local_expert_start", params_.local_expert_start);
         info.addScalarInt("local_expert_count", params_.local_expert_count);
+        info.addScalarInt("participant_id", params_.my_socket_id);
+        info.addScalarInt("participant_count", params_.participant_count);
         return info;
     }
 
@@ -4638,10 +4831,10 @@ namespace llaminar2
 
     bool SharedExpertFFNStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id))
+        if (!params_.device_id.is_gpu())
             return false;
 
         /*
@@ -4652,7 +4845,11 @@ namespace llaminar2
          * same graph-capturable contract as M=2..4 verifier rows.
          */
         if (shouldUseGroupedVerifierPrefillRoute())
+        {
+            if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id))
+                return false;
             return scratch_seq_len_ >= params_.seq_len && moe_kernel_ != nullptr;
+        }
 
         /*
          * Normal grouped decode bakes device-side pointer arrays into CUDA graph
@@ -4663,12 +4860,18 @@ namespace llaminar2
         if (params_.seq_len == 1)
         {
             if (shouldUseGroupedDecodeRoute())
+            {
+                if (!supportsSharedExpertGroupedDecodeGraphCaptureBackend(params_.device_id))
+                    return false;
                 return grouped_decode_warmed_ && scratch_seq_len_ >= 1 && moe_kernel_ != nullptr;
+            }
             return scratch_seq_len_ >= 1;
         }
 
         // Prefill capture is safe only after warmup has allocated scratch and
         // resolved the MoE kernel used by fused SwiGLU/down.
+        if (!supportsGroupedPrefillGraphCaptureBackend(params_.device_id))
+            return false;
         return scratch_seq_len_ >= params_.seq_len && moe_kernel_ != nullptr;
 #endif
     }
@@ -4679,6 +4882,7 @@ namespace llaminar2
             return true;
 
         return shouldUseGroupedDecodeRoute() &&
+               supportsSharedExpertGroupedDecodeGraphCaptureBackend(params_.device_id) &&
                params_.d_model > 0 &&
                params_.intermediate > 0 &&
                params_.input &&
@@ -4686,6 +4890,42 @@ namespace llaminar2
                params_.up_w &&
                params_.down_w &&
                params_.output;
+    }
+
+    std::string SharedExpertFFNStage::graphCaptureReadinessDebugString() const
+    {
+        std::ostringstream out;
+        const bool prefill_graph_backend =
+            supportsGroupedPrefillGraphCaptureBackend(params_.device_id);
+        const bool decode_graph_backend =
+            supportsSharedExpertGroupedDecodeGraphCaptureBackend(params_.device_id);
+        const bool verifier_route = shouldUseGroupedVerifierPrefillRoute();
+        const bool decode_equivalent_route = shouldUseDecodeEquivalentVerifierPrefill();
+        const bool grouped_decode_route = shouldUseGroupedDecodeRoute();
+
+        out << "device=" << params_.device_id.toString()
+            << " seq_len=" << params_.seq_len
+            << " d_model=" << params_.d_model
+            << " intermediate=" << params_.intermediate
+            << " prefill_graph_backend=" << perfBool(prefill_graph_backend)
+            << " decode_graph_backend=" << perfBool(decode_graph_backend)
+            << " verifier_route=" << perfBool(verifier_route)
+            << " decode_equivalent_route=" << perfBool(decode_equivalent_route)
+            << " grouped_decode_route=" << perfBool(grouped_decode_route)
+            << " scratch_seq_len=" << scratch_seq_len_
+            << " scratch_ready=" << perfBool(scratch_seq_len_ >= std::max(1, params_.seq_len))
+            << " moe_kernel=" << perfBool(moe_kernel_ != nullptr)
+            << " grouped_decode_warmed=" << perfBool(grouped_decode_warmed_)
+            << " workspace_bound=" << perfBool(bound_workspace_ != nullptr)
+            << " gate_gemm=" << perfBool(cached_gate_gemm_ != nullptr)
+            << " up_gemm=" << perfBool(cached_up_gemm_ != nullptr)
+            << " down_gemm=" << perfBool(cached_down_gemm_ != nullptr)
+            << " input=" << perfBool(params_.input != nullptr)
+            << " gate_w=" << perfBool(params_.gate_w != nullptr)
+            << " up_w=" << perfBool(params_.up_w != nullptr)
+            << " down_w=" << perfBool(params_.down_w != nullptr)
+            << " output=" << perfBool(params_.output != nullptr);
+        return out.str();
     }
 
     bool SharedExpertFFNStage::supportsLazyPrefillGraphCapturePreflight() const
@@ -5298,9 +5538,15 @@ namespace llaminar2
 
     bool SharedExpertGateStage::isGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
+        if (params_.seq_len <= 1)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+            return false;
+#endif
+        }
         // Single kernel call (sigmoid gating) — pure kernel launch after warmup.
         // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on supported GPU backends
         // because the stage is just a kernel launch with stable device pointers.
@@ -5313,9 +5559,15 @@ namespace llaminar2
 
     bool SharedExpertGateStage::supportsWarmupDependentGraphCapture() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
+        if (params_.seq_len <= 1)
+        {
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+            return false;
+#endif
+        }
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 0 &&
                params_.d_model > 0 &&

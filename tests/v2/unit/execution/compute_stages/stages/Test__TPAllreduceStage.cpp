@@ -19,7 +19,9 @@
 #include <gtest/gtest.h>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -70,6 +72,17 @@ namespace
         std::string name_;
         std::optional<std::string> old_value_;
     };
+
+    std::string readTextFile(const char *path)
+    {
+        std::ifstream input(path);
+        if (!input)
+            return {};
+
+        std::ostringstream buffer;
+        buffer << input.rdbuf();
+        return buffer.str();
+    }
 } // namespace
 
 // =============================================================================
@@ -171,6 +184,38 @@ TEST_F(Test__TPAllreduceStage, CoherencePolicyIsOutput)
     auto stage = std::make_unique<TPAllreduceStage>(params);
 
     EXPECT_EQ(stage->coherencePolicy(), CoherencePolicy::OUTPUT);
+}
+
+TEST_F(Test__TPAllreduceStage, SidebandsExecuteOnSameExplicitStreamAfterPrimaryAllreduce)
+{
+    const std::string source = readTextFile(LLAMINAR_TP_ALLREDUCE_STAGE_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t execute_fn = source.find("bool TPAllreduceStage::execute(");
+    ASSERT_NE(execute_fn, std::string::npos);
+    const size_t replay_fn = source.find("void TPAllreduceStage::onGraphReplayed()", execute_fn);
+    ASSERT_NE(replay_fn, std::string::npos);
+    const std::string body = source.substr(execute_fn, replay_fn - execute_fn);
+
+    EXPECT_NE(body.find("params_.sidebands"), std::string::npos);
+    EXPECT_NE(body.find("params_.sideband_workspace_bindings"), std::string::npos);
+    EXPECT_NE(body.find("bound_workspace_->getBuffer"), std::string::npos)
+        << "Workspace-backed sidebands must resolve buffers at capture/execution time.";
+    EXPECT_NE(body.find("workspace sidebands require a bound workspace"), std::string::npos);
+    EXPECT_NE(body.find("missing sideband send workspace buffer"), std::string::npos);
+    EXPECT_NE(body.find("missing sideband recv workspace buffer"), std::string::npos);
+    EXPECT_NE(body.find("dynamic_cast<ILocalTPContext *>"), std::string::npos);
+    EXPECT_NE(body.find("allreduceWithSidebandsOnStream"), std::string::npos);
+    EXPECT_EQ(body.find("collectiveSidebandOnStream"), std::string::npos)
+        << "Production TP sidebands must be grouped with the anchor allreduce, not launched after it.";
+    EXPECT_NE(body.find("stage_stream"), std::string::npos);
+    EXPECT_NE(body.find("params_.sideband_device_index"), std::string::npos);
+    EXPECT_NE(body.find("recordAllreduceSidebandBillOfMaterials(params_, sidebands, true)"), std::string::npos)
+        << "Sideband attachment must be visible in tp_allreduce_bom perfstats.";
+    EXPECT_NE(source.find("sideband_grouped_with_anchor_collective_calls"), std::string::npos);
+    EXPECT_NE(source.find("\"fused_with_anchor\", grouped_with_anchor ? \"true\" : \"false\""), std::string::npos);
+    EXPECT_NE(source.find("\"physical_fusion\", grouped_with_anchor ? \"grouped_with_anchor_collective\" : \"separate_backend_collective\""), std::string::npos);
+    EXPECT_NE(source.find("\"launch_relation\", grouped_with_anchor ? \"same_group_as_anchor\" : \"same_stream_after_anchor\""), std::string::npos);
 }
 
 /**

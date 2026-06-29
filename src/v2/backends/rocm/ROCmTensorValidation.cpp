@@ -402,6 +402,13 @@ namespace llaminar2
             if (!d_result_ || !device_ptr || num_elements == 0)
                 return false;
 
+            if (device_id != device_id_)
+            {
+                LOG_WARN("[ROCmTensorValidator] Device mismatch: validator for device " << device_id_
+                         << " but asked to validate on device " << device_id);
+                return false;
+            }
+
             hipError_t err = hipSetDevice(device_id);
             if (err != hipSuccess)
                 return false;
@@ -433,6 +440,13 @@ namespace llaminar2
             if (!d_result_ || !device_ptr || num_elements == 0)
                 return false;
 
+            if (device_id != device_id_)
+            {
+                LOG_WARN("[ROCmTensorValidator] Device mismatch: validator for device " << device_id_
+                         << " but asked to validate on device " << device_id);
+                return false;
+            }
+
             hipError_t err = hipSetDevice(device_id);
             if (err != hipSuccess)
                 return false;
@@ -463,7 +477,11 @@ namespace llaminar2
                 return false;
 
             // Synchronize and copy result
-            hipError_t err = hipDeviceSynchronize();
+            hipError_t err = hipSetDevice(device_id_);
+            if (err != hipSuccess)
+                return false;
+
+            err = hipDeviceSynchronize();
             if (err != hipSuccess)
                 return false;
 
@@ -500,6 +518,28 @@ namespace llaminar2
     static std::mutex g_rocm_validator_mutex;
     static std::unordered_map<int, std::unique_ptr<ROCmTensorValidator>> g_rocm_validators;
 
+    ITensorValidator *getROCmTensorValidator(int device_id)
+    {
+        if (device_id < 0)
+        {
+            LOG_ERROR("[getROCmTensorValidator] Invalid device ordinal " << device_id);
+            return nullptr;
+        }
+
+        std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
+
+        auto it = g_rocm_validators.find(device_id);
+        if (it == g_rocm_validators.end())
+        {
+            auto validator = std::make_unique<ROCmTensorValidator>(device_id);
+            auto *ptr = validator.get();
+            g_rocm_validators[device_id] = std::move(validator);
+            LOG_DEBUG("[getROCmTensorValidator] Created validator for device " << device_id);
+            return ptr;
+        }
+        return it->second.get();
+    }
+
     ITensorValidator *getROCmTensorValidator()
     {
         // Get current device
@@ -511,19 +551,7 @@ namespace llaminar2
             return nullptr;
         }
 
-        std::lock_guard<std::mutex> lock(g_rocm_validator_mutex);
-
-        auto it = g_rocm_validators.find(device_id);
-        if (it == g_rocm_validators.end())
-        {
-            // Create a new validator for this device
-            auto validator = std::make_unique<ROCmTensorValidator>(device_id);
-            auto* ptr = validator.get();
-            g_rocm_validators[device_id] = std::move(validator);
-            LOG_DEBUG("[getROCmTensorValidator] Created validator for device " << device_id);
-            return ptr;
-        }
-        return it->second.get();
+        return getROCmTensorValidator(device_id);
     }
 
 } // namespace llaminar2
@@ -532,4 +560,9 @@ namespace llaminar2
 extern "C" llaminar2::ITensorValidator *llaminar2_getROCmTensorValidator()
 {
     return llaminar2::getROCmTensorValidator();
+}
+
+extern "C" llaminar2::ITensorValidator *llaminar2_getROCmTensorValidatorForDevice(int device_id)
+{
+    return llaminar2::getROCmTensorValidator(device_id);
 }

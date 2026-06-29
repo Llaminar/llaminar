@@ -32,6 +32,7 @@
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoEDeviceRebalanceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/QKNormStage.h"
 #include "stages/FusedResidualNormStage.h"
@@ -217,6 +218,9 @@ namespace llaminar2
 
         static std::unique_ptr<IComputeStage> createMoESparseReturnReduce(
             const MoESparseReturnReduceStage::Params &params);
+
+        static std::unique_ptr<IComputeStage> createMoEDeviceRebalance(
+            const MoEDeviceRebalanceStage::Params &params);
 
         /**
          * @brief Create a shared expert FFN stage (always-active dense SwiGLU)

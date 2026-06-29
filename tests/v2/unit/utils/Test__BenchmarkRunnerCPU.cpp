@@ -14,6 +14,7 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <utility>
 
 #include "utils/BenchmarkRunner.h"
 #include "utils/DebugEnv.h"
@@ -184,11 +185,18 @@ namespace
         ExecutionPath executionPath() const override { return ExecutionPath::GRAPH; }
         const char *architecture() const override { return "mock_gpu"; }
         int get_position() const override { return 0; }
+        PrefixRuntimeStateSnapshot prefixStateProbe() const override { return snapshot_; }
+
+        void setPrefixRuntimeState(PrefixRuntimeStateSnapshot snapshot)
+        {
+            snapshot_ = std::move(snapshot);
+        }
 
         bool skipLogitsGatherDecodeWasEnabled() const { return skip_logits_gather_decode_; }
 
     private:
         std::vector<float> logits_;
+        PrefixRuntimeStateSnapshot snapshot_;
         bool skip_logits_gather_decode_ = false;
         bool device_argmax_available_ = true;
     };
@@ -300,6 +308,40 @@ namespace
 
     private:
         std::vector<std::string> events_;
+    };
+
+    class MockPerfStatsMaintenanceRunner : public MockOrchestratedDecodeRunner
+    {
+    public:
+        bool maybeApplyDecodeBoundaryMaintenance() override
+        {
+            ++maintenance_calls_;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "measured_decode_maintenance_marker",
+                1.0,
+                "decode",
+                "cpu");
+            return true;
+        }
+
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override
+        {
+            ++drain_calls_;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "epilogue_drain_marker",
+                1.0,
+                "decode",
+                "cpu");
+        }
+
+        int maintenanceCalls() const { return maintenance_calls_; }
+        int drainCalls() const { return drain_calls_; }
+
+    private:
+        int maintenance_calls_ = 0;
+        int drain_calls_ = 0;
     };
 
     class MockBatchedOrchestratedDecodeRunner : public MockCPUInferenceRunner
@@ -556,6 +598,24 @@ namespace
         bool previous_ = false;
     };
 
+    class ScopedPrefillGraphRequiredSetting
+    {
+    public:
+        explicit ScopedPrefillGraphRequiredSetting(bool required)
+            : previous_(mutableDebugEnv().execution.prefill_graph_required)
+        {
+            mutableDebugEnv().execution.prefill_graph_required = required;
+        }
+
+        ~ScopedPrefillGraphRequiredSetting()
+        {
+            mutableDebugEnv().execution.prefill_graph_required = previous_;
+        }
+
+    private:
+        bool previous_ = false;
+    };
+
 } // namespace
 
 // =============================================================================
@@ -664,6 +724,59 @@ TEST(Test__BenchmarkRunnerCPU, GPUDecodeSucceedsWithDeviceArgmax)
         << "GPU benchmark must succeed using device-side argmax";
     EXPECT_TRUE(result.decode_success)
         << "GPU decode phase must succeed";
+}
+
+TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureFailsWhenProbeNeverCaptures)
+{
+    ScopedGpuGraphsSetting force_gpu_graphs(true);
+    ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+
+    auto result = bench.run(config);
+
+    EXPECT_FALSE(result.success);
+    EXPECT_NE(result.failure_reason.find("required prefill graph capture/replay was not observed"),
+              std::string::npos);
+}
+
+TEST(Test__BenchmarkRunnerCPU, RequiredPrefillGraphCaptureAcceptsCapturedProbe)
+{
+    ScopedGpuGraphsSetting force_gpu_graphs(true);
+    ScopedPrefillGraphRequiredSetting require_prefill_graph(true);
+    auto runner = std::make_shared<MockGPUInferenceRunner>();
+    PrefixRuntimeStateSnapshot snapshot;
+    PrefillGraphRuntimeProbe graph;
+    graph.phase = "ready";
+    graph.capture_phase = "capture";
+    graph.capture_count = 1;
+    graph.node_count = 42;
+    graph.domain_id = "mock_tp";
+    snapshot.prefill_graphs.push_back(graph);
+    runner->setPrefixRuntimeState(snapshot);
+
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 0;
+
+    auto result = bench.run(config);
+
+    EXPECT_TRUE(result.success) << result.failure_reason;
+    ASSERT_EQ(result.prefix_state.prefill_graphs.size(), 1u);
+    EXPECT_EQ(result.prefix_state.prefill_graphs[0].capture_count, 1u);
+    EXPECT_EQ(result.prefix_state.prefill_graphs[0].domain_id, "mock_tp");
 }
 
 TEST(Test__BenchmarkRunnerCPU, GPUDecodeFailsHardWhenDeviceArgmaxFails)
@@ -822,6 +935,60 @@ TEST(Test__BenchmarkRunnerCPU, PostWarmupCallbackSeesDecodeHistogramBeforePrefil
            "warmup prefill before post-warmup rebalance; otherwise measured 2-card prefill "
            "can pay warmup/capture instead of replaying."
         << ::testing::PrintToString(events);
+}
+
+TEST(Test__BenchmarkRunnerCPU, PerfStatsResetDropsPostWarmupMoEStatsBeforeMeasuredIterations)
+{
+    ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+
+    auto runner = std::make_shared<MockPerfStatsMaintenanceRunner>();
+    auto tokenizer = createMockTokenizer();
+    auto mpi = std::make_shared<MockMPIContext>(/*rank=*/0, /*world_size=*/1);
+
+    BenchmarkRunner bench(runner, tokenizer, mpi);
+    bench.setPostWarmupCallback([]() {
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "post_warmup_setup_marker",
+            1.0,
+            "warmup",
+            "cpu");
+    });
+
+    OrchestrationConfig config;
+    config.prompt = "Hello world";
+    config.n_predict = 3;
+    config.mtp.enabled = true;
+
+    auto result = bench.run(config);
+
+    ASSERT_TRUE(result.success) << result.failure_reason;
+    EXPECT_GT(runner->maintenanceCalls(), 0);
+    EXPECT_GT(runner->drainCalls(), 0);
+
+    const auto records = PerfStatsCollector::snapshot({"moe_rebalance"});
+    bool saw_post_warmup_marker = false;
+    bool saw_measured_maintenance_marker = false;
+    bool saw_epilogue_drain_marker = false;
+    for (const auto &record : records)
+    {
+        if (record.name == "post_warmup_setup_marker")
+            saw_post_warmup_marker = true;
+        if (record.name == "measured_decode_maintenance_marker")
+            saw_measured_maintenance_marker = true;
+        if (record.name == "epilogue_drain_marker")
+            saw_epilogue_drain_marker = true;
+    }
+
+    EXPECT_FALSE(saw_post_warmup_marker)
+        << "MoE setup/warmup counters should not pollute measured benchmark perfstats.";
+    EXPECT_TRUE(saw_measured_maintenance_marker)
+        << "Measured decode maintenance counters should remain after the pre-iteration reset.";
+    EXPECT_TRUE(saw_epilogue_drain_marker)
+        << "Benchmark epilogue should drain completed async maintenance diagnostics before JSON export.";
+
+    PerfStatsCollector::reset();
 }
 
 TEST(Test__BenchmarkRunnerCPU, StaticWarmupRearmsPrefillGraphAfterDecodeWorkspaceGrowth)
@@ -1282,6 +1449,7 @@ TEST(Test__BenchmarkRunnerCPU, CapturesPrefixAndMTPStats)
  */
 TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
 {
+    ScopedPrefillGraphRequiredSetting prefill_graph_not_required(false);
     ScopedEnv perf_stats_enabled("LLAMINAR_PERF_STATS_JSON", "1");
     PerfStatsCollector::reset();
     PerfStatsCollector::addCounter(
@@ -1389,6 +1557,23 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     snapshot.prefill_chunks = 5;
     snapshot.prefill_chunk_real_tokens = 1024;
     snapshot.prefill_chunk_padded_tokens = 64;
+    PrefillGraphRuntimeProbe prefill_graph;
+    prefill_graph.forward_cache_valid = true;
+    prefill_graph.prefill_cache_initialized = true;
+    prefill_graph.phase = "ready";
+    prefill_graph.cache_size = 1;
+    prefill_graph.node_count = 1234;
+    prefill_graph.replay_count = 2;
+    prefill_graph.warmup_count = 3;
+    prefill_graph.capture_count = 1;
+    prefill_graph.observation_valid = true;
+    prefill_graph.bucket_seq_len = 1024;
+    prefill_graph.real_token_count = 1000;
+    prefill_graph.domain_id = "qwen36_moe_cuda_hot";
+    prefill_graph.participant_id = 1;
+    prefill_graph.capture_phase = "replay";
+    prefill_graph.recapture_reason = "none";
+    snapshot.prefill_graphs.push_back(prefill_graph);
 
     OrchestrationConfig config;
     config.benchmark_mode = true;
@@ -1453,6 +1638,18 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
 
     EXPECT_EQ(doc.at("prefill_chunks").at("chunks"), 5);
     EXPECT_EQ(doc.at("prefill_chunks").at("padded_tokens"), 64);
+    const auto &prefill_graphs = doc.at("prefill_graphs");
+    EXPECT_FALSE(prefill_graphs.at("required").get<bool>());
+    EXPECT_TRUE(prefill_graphs.at("captured_or_replayed").get<bool>());
+    EXPECT_EQ(prefill_graphs.at("entries"), 1);
+    EXPECT_EQ(prefill_graphs.at("ready_entries"), 1);
+    EXPECT_EQ(prefill_graphs.at("warmups"), 3);
+    EXPECT_EQ(prefill_graphs.at("captures"), 1);
+    EXPECT_EQ(prefill_graphs.at("replays"), 2);
+    ASSERT_EQ(prefill_graphs.at("probes").size(), 1u);
+    EXPECT_EQ(prefill_graphs.at("probes")[0].at("domain_id"), "qwen36_moe_cuda_hot");
+    EXPECT_EQ(prefill_graphs.at("probes")[0].at("capture_phase"), "replay");
+    EXPECT_EQ(prefill_graphs.at("probes")[0].at("node_count"), 1234);
     EXPECT_TRUE(doc.at("config").at("prefix_cache_enabled").get<bool>());
     EXPECT_TRUE(doc.at("config").at("mtp_enabled").get<bool>());
     EXPECT_EQ(doc.at("config").at("mtp_draft_tokens"), 3);

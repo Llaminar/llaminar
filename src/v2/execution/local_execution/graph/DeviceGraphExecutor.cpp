@@ -1389,7 +1389,7 @@ namespace llaminar2
 
             const bool need_event = node.is_final_output || (policy.snapshot_callback && config_.snapshot_callback)
 #if LLAMINAR_ASSERTIONS_ACTIVE
-                                    || debugEnv().validation.validate_buffers
+                                    || (policy.validation && debugEnv().validation.validate_buffers)
 #endif
                 ;
 

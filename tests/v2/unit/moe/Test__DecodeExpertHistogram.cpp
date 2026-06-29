@@ -133,6 +133,32 @@ TEST(Test__DecodeExpertHistogram, MultipleRecords_DifferentLayers)
     EXPECT_EQ(hist.windowTokenCount(), 3u);
 }
 
+TEST(Test__DecodeExpertHistogram, TokenBoundaryCanBeBeforeNonRoutedTailLayer)
+{
+    auto cfg = makeConfig(3, 8, 2, 2);
+    cfg.token_boundary_layer_idx = 1;
+    DecodeExpertHistogram hist(cfg);
+
+    int idx[] = {0, 1};
+    float weights[] = {0.5f, 0.5f};
+
+    hist.record(0, idx, weights, 2);
+    EXPECT_EQ(hist.windowTokenCount(), 0u);
+
+    hist.record(1, idx, weights, 2);
+    EXPECT_EQ(hist.windowTokenCount(), 1u);
+    EXPECT_FALSE(hist.windowFull());
+
+    hist.record(0, idx, weights, 2);
+    hist.record(1, idx, weights, 2);
+    EXPECT_EQ(hist.windowTokenCount(), 2u);
+    EXPECT_TRUE(hist.windowFull());
+
+    hist.recordTokenBoundary(2);
+    EXPECT_EQ(hist.windowTokenCount(), 2u)
+        << "Non-routed tail layers must not advance the routed decode window.";
+}
+
 TEST(Test__DecodeExpertHistogram, SocketLoads_BalancedPlacement)
 {
     // 8 experts, round-robin across 2 sockets:
@@ -455,6 +481,46 @@ TEST(Test__DecodeExpertHistogram, AverageSocketImbalance)
     }
 
     EXPECT_FLOAT_EQ(hist.averageSocketImbalance(), 1.0f);
+}
+
+TEST(Test__DecodeExpertHistogram, PlacementImbalanceScoresArbitraryPlacement)
+{
+    auto cfg = makeConfig(1, 4, 1, 256, 2);
+    DecodeExpertHistogram hist(cfg);
+
+    const uint64_t counts[] = {10, 8, 1, 1};
+    hist.mergeLayerCounts(0, counts, 4);
+
+    const auto overloaded = hist.placementImbalance({0, 0, 1, 1});
+    const auto balanced = hist.placementImbalance({0, 1, 1, 0});
+
+    ASSERT_TRUE(overloaded.valid);
+    ASSERT_TRUE(balanced.valid);
+    EXPECT_EQ(overloaded.layer_count, 1);
+    EXPECT_EQ(overloaded.active_layer_count, 1);
+    EXPECT_EQ(overloaded.total_activations, 20u);
+    EXPECT_EQ(overloaded.worst_layer, 0);
+    EXPECT_NEAR(overloaded.average_spread, 16.0 / 18.0, 1e-9);
+    EXPECT_NEAR(balanced.average_spread, 2.0 / 11.0, 1e-9);
+    EXPECT_GT(overloaded.average_spread, balanced.average_spread);
+}
+
+TEST(Test__DecodeExpertHistogram, CurrentPlacementImbalanceFollowsPlacementUpdates)
+{
+    auto cfg = makeConfig(1, 4, 1, 256, 2);
+    DecodeExpertHistogram hist(cfg);
+
+    const uint64_t counts[] = {10, 8, 1, 1};
+    hist.mergeLayerCounts(0, counts, 4);
+
+    const auto initial = hist.currentPlacementImbalance();
+    hist.updatePlacement({0, 0, 1, 1});
+    const auto overloaded = hist.currentPlacementImbalance();
+
+    ASSERT_TRUE(initial.valid);
+    ASSERT_TRUE(overloaded.valid);
+    EXPECT_LT(initial.average_spread, overloaded.average_spread);
+    EXPECT_EQ(overloaded.worst_layer, 0);
 }
 
 TEST(Test__DecodeExpertHistogram, LayerSummary_Format)

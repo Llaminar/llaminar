@@ -293,6 +293,15 @@ namespace llaminar2
          */
         virtual bool maybeApplyMoERebalance() { return true; }
 
+        /**
+         * @brief True when MoE rebalance publish/apply is owned by captured device graph stages.
+         *
+         * Callers that drive decodeStep() directly should skip per-token host
+         * decode-boundary rebalance maintenance when this returns true. The
+         * graph itself runs histogram collection, policy, transfer, and apply.
+         */
+        virtual bool usesDeviceSideMoERebalanceController() const { return false; }
+
         // =====================================================================
         // Configuration
         // =====================================================================
@@ -360,6 +369,16 @@ namespace llaminar2
          * workspace lifetime change.
          */
         virtual void clearCache() = 0;
+
+        /**
+         * @brief Drain completed decode-boundary maintenance diagnostics.
+         *
+         * This is an epilogue hook, not a request reset. Implementations should
+         * export already-completed async maintenance diagnostics without
+         * mutating live decode state beyond retiring diagnostic event
+         * bookkeeping.
+         */
+        virtual void drainCompletedDecodeBoundaryMaintenanceDiagnostics() {}
 
         /**
          * @brief Read-only runtime state probe for prefix-cache/MTP development.

@@ -18,6 +18,7 @@
 #include "../../moe/MoERuntimeTable.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 namespace llaminar2
 {
@@ -56,6 +57,18 @@ namespace llaminar2
             DecodeExpertHistogram *decode_histogram = nullptr;
             IMoERuntimeTable *moe_runtime_table = nullptr;
             bool force_grouped_verifier_prefill_for_decode = false;
+
+            // Optional graph-capturable decode rebalance apply piggyback.
+            // When enabled, the route kernel applies any ready device-side
+            // rebalance wave before publishing this token's top-k/local masks.
+            bool device_rebalance_route_apply = false;
+            std::string device_rebalance_workspace_name;
+            DeviceMoERebalanceConfig device_rebalance_config;
+            DeviceMoEExpertDirectoryEntry *device_rebalance_local_transfer_slots = nullptr;
+            uint32_t device_rebalance_local_transfer_slot_count = 0;
+            uint32_t device_rebalance_plan_capacity = 0;
+            uint32_t device_rebalance_command_buffer_count = 1;
+            int device_rebalance_apply_layer_idx = -2;
 
             /**
              * @brief Permit eager GPU routeWithTensors() for partial expert owners.

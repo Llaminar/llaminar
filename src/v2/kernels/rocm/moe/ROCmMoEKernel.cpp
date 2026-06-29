@@ -429,6 +429,17 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        void *runtime_layers,
+        const void *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        void *rebalance_command_header,
+        const void *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const void *rebalance_config,
+        void *rebalance_apply_status,
+        void *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count,
         int device_idx, void *stream);
 
     bool hipMoE_softmax_topk_decode_runtime_wave64(
@@ -440,6 +451,17 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        void *runtime_layers,
+        const void *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        void *rebalance_command_header,
+        const void *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const void *rebalance_config,
+        void *rebalance_apply_status,
+        void *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count,
         int device_idx, void *stream);
 
     bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
@@ -451,6 +473,17 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        void *runtime_layers,
+        const void *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        void *rebalance_command_header,
+        const void *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const void *rebalance_config,
+        void *rebalance_apply_status,
+        void *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count,
         int device_idx, void *stream);
 
     bool hipMoE_decode_route_select_runtime(
@@ -463,6 +496,157 @@ extern "C"
         bool write_legacy_outputs,
         bool update_runtime_histogram,
         int device_idx, void *stream);
+
+    bool hipMoE_device_rebalance_controller(
+        void *runtime_layers,
+        const unsigned long long *gathered_histograms,
+        void *status,
+        const void *config,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        void *command_header,
+        void *wave_state,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_pack_rebalance_histograms(
+        void *runtime_layers,
+        unsigned long long *local_histograms,
+        const void *config,
+        const void *wave_state,
+        const void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_pack_rebalance_directory(
+        void *runtime_layers,
+        void *local_directory,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_pack_rebalance_source_descriptors(
+        void *runtime_layers,
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_source_descriptors,
+        const void *config,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_project_rebalance_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        void *local_command_headers,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_pack_rebalance_compact_payloads(
+        const void *plan_entries,
+        const void *command_headers,
+        uint32_t plan_capacity,
+        const void *local_source_descriptors,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_pack_rebalance_collective_payloads(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        const void *local_directory,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_unpack_rebalance_collective_payloads(
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *gathered_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_init_rebalance_graph_controller_state(
+        void *controller_state,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_publish_rebalance_transfer_complete(
+        void *controller_state,
+        const void *command_header,
+        const void *wave_state,
+        const void *copy_status,
+        const void *config,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_apply_ready_rebalance_wave(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        int target_layer,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool hipMoE_apply_rebalance_arrivals(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        int target_layer,
+        int device_idx,
+        void *stream);
 
     bool hipMoE_gather_tokens(
         const float *hidden, float *batch_buffer,
@@ -552,6 +736,11 @@ extern "C"
     bool hipMoE_exclusive_scan(
         int *expert_counts, int *expert_offsets,
         int num_experts,
+        int device_idx, void *stream);
+
+    bool hipMoE_build_active_expert_list(
+        const int *expert_counts, int *active_expert_ids,
+        int num_experts, int max_active_experts,
         int device_idx, void *stream);
 
     bool hipMoE_max_expert_count(
@@ -692,6 +881,23 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
     bool rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
         const float *d_hidden,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_gate_desc_table,
@@ -707,6 +913,26 @@ extern "C"
         int num_active,
         int N,
         int K,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream);
+
+    bool rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
         uint8_t codebook_id,
         int k_partitions,
         int device_idx,
@@ -732,6 +958,26 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream);
+
     bool rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
@@ -745,6 +991,41 @@ extern "C"
         int num_active,
         int N,
         int K,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
+    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_output,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
+    bool rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        bool swiglu_prequantized,
+        float *d_output,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
         uint8_t codebook_id,
         int device_idx,
         void *stream);
@@ -1489,7 +1770,14 @@ namespace llaminar2
         if (!debugEnv().rocm.moe_router_q8)
             return nullptr;
         if (!gate_weights || !gate_device_ptr || d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] invalid Q8 router gate request "
+                      "(gate_weights=" << gate_weights
+                      << " gate_device_ptr=" << static_cast<const void *>(gate_device_ptr)
+                      << " d_model=" << d_model
+                      << " num_experts=" << num_experts << ")");
             return nullptr;
+        }
 
         const auto tensor_key = reinterpret_cast<std::uintptr_t>(gate_weights);
         const auto device_ptr_key = reinterpret_cast<std::uintptr_t>(gate_device_ptr);
@@ -1517,7 +1805,12 @@ namespace llaminar2
         }
         if (capture_active || capture_status == hipStreamCaptureStatusActive)
         {
-            LOG_DEBUG("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] cache miss during graph capture; falling back to non-Q8 router");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] Q8 router cache miss during graph capture");
+            return nullptr;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] explicit HIP stream is required");
             return nullptr;
         }
 
@@ -1525,7 +1818,7 @@ namespace llaminar2
         const size_t experts_sz = static_cast<size_t>(num_experts);
         if (d_model_sz > std::numeric_limits<size_t>::max() / experts_sz)
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] router gate size overflow");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] router gate size overflow");
             return nullptr;
         }
         const size_t element_count = d_model_sz * experts_sz;
@@ -1563,8 +1856,8 @@ namespace llaminar2
         }
         if (err != hipSuccess)
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] hipMalloc Q8 router gate failed: "
-                     << hipGetErrorString(err));
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] hipMalloc Q8 router gate failed: "
+                      << hipGetErrorString(err));
             if (d_gate_weights_q8)
                 (void)hipFree(d_gate_weights_q8);
             return nullptr;
@@ -1572,9 +1865,9 @@ namespace llaminar2
 
         if (!hipMoE_quantize_router_gate_q8(gate_device_ptr, d_gate_weights_q8, d_gate_scales,
                                             d_model, num_experts,
-                                            device_ordinal_, getStream()))
+                                            device_ordinal_, stream))
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] FP32->Q8 router gate conversion launch failed; falling back to non-Q8 router");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] FP32->Q8 router gate conversion launch failed");
             (void)hipFree(d_gate_weights_q8);
             (void)hipFree(d_gate_scales);
             return nullptr;
@@ -2291,6 +2584,16 @@ namespace llaminar2
                                    device_ordinal_, getStream()))
         {
             LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] exclusive_scan failed");
+            return false;
+        }
+
+        if (d_group_active_expert_ids_ &&
+            !hipMoE_build_active_expert_list(
+                d_expert_counts, d_group_active_expert_ids_,
+                num_experts, std::min(total_slots, num_experts),
+                device_ordinal_, getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] active expert list failed");
             return false;
         }
 
@@ -3094,38 +3397,43 @@ namespace llaminar2
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         router_q8_hidden_source_ = nullptr;
         router_q8_hidden_valid_ = false;
-        if (gate_is_fp32 && rocm_env.moe_router_q8)
+        const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
         {
-            if ((d_model % 32) == 0 && ensureRouterQ8HiddenScratchCapacity(d_model))
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router requires d_model to be a multiple of 32, got "
+                      << d_model);
+            return false;
+        }
+        if (q8_router_requested)
+        {
+            if (!ensureRouterQ8HiddenScratchCapacity(d_model))
             {
-                if (const auto *q8_gate = getOrCreateQ8RouterGateCache(
-                        gate_weights, static_cast<const float *>(g), d_model, num_experts))
-                {
-                    logits_ready = hipMoE_gate_logits_single_token_q8_weights(
-                        h, d_router_q8_hidden_, d_router_q8_hidden_scales_,
-                        q8_gate->d_gate_weights_q8, q8_gate->d_gate_scales,
-                        d_route_logits_, d_model, num_experts,
-                        device_ordinal_, getStream());
-                    if (!logits_ready)
-                    {
-                        LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] Q8 router logits kernel failed; falling back to K-part/FP16/default router");
-                    }
-                    else
-                    {
-                        router_q8_hidden_source_ = h;
-                        router_q8_hidden_valid_ = true;
-                    }
-                }
-                else
-                {
-                    LOG_DEBUG("[ROCmMoEKernel::decodeRouteSelect] Q8 router cache unavailable; falling back to K-part/FP16/default router");
-                }
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router hidden scratch unavailable for d_model="
+                          << d_model);
+                return false;
             }
-            else
+            const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+            if (!q8_gate)
             {
-                LOG_DEBUG("[ROCmMoEKernel::decodeRouteSelect] Q8 router unsupported or scratch unavailable for d_model="
-                          << d_model << "; falling back to K-part/FP16/default router");
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router gate cache unavailable");
+                return false;
             }
+            void *stream = requireStream("ROCmMoEKernel::decodeRouteSelect Q8 router");
+            if (!stream)
+                return false;
+            logits_ready = hipMoE_gate_logits_single_token_q8_weights(
+                h, d_router_q8_hidden_, d_router_q8_hidden_scales_,
+                q8_gate->d_gate_weights_q8, q8_gate->d_gate_scales,
+                d_route_logits_, d_model, num_experts,
+                device_ordinal_, stream);
+            if (!logits_ready)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router logits kernel failed");
+                return false;
+            }
+            router_q8_hidden_source_ = h;
+            router_q8_hidden_valid_ = true;
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -3151,6 +3459,17 @@ namespace llaminar2
                         normalize_weights,
                         write_legacy_outputs,
                         update_runtime_histogram,
+                        nullptr,
+                        nullptr,
+                        0u,
+                        nullptr,
+                        nullptr,
+                        0u,
+                        nullptr,
+                        nullptr,
+                        nullptr,
+                        -1,
+                        1u,
                         device_ordinal_,
                         getStream());
                     if (!runtime_ready)
@@ -3207,6 +3526,17 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
+                nullptr,
+                nullptr,
+                0u,
+                nullptr,
+                nullptr,
+                0u,
+                nullptr,
+                nullptr,
+                nullptr,
+                -1,
+                1u,
                 device_ordinal_,
                 getStream());
             if (!runtime_ready)
@@ -3225,6 +3555,17 @@ namespace llaminar2
                                   normalize_weights,
                                   write_legacy_outputs,
                                   update_runtime_histogram,
+                                  nullptr,
+                                  nullptr,
+                                  0u,
+                                  nullptr,
+                                  nullptr,
+                                  0u,
+                                  nullptr,
+                                  nullptr,
+                                  nullptr,
+                                  -1,
+                                  1u,
                                   device_ordinal_,
                                   getStream()))
         {
@@ -3240,6 +3581,776 @@ namespace llaminar2
         }
 
         return true;
+    }
+
+    bool ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply(
+        DeviceMoELayerRuntime *runtime_layers,
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *hidden, ITensor *gate_weights,
+        int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        const DeviceMoERebalancePlanEntry *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *rebalance_command_header,
+        const DeviceMoEExpertDirectoryEntry *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &rebalance_config,
+        DeviceMoERebalanceApplyStatus *rebalance_apply_status,
+        DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layers || !runtime_layer || !hidden || !gate_weights ||
+            !rebalance_plan_entries || rebalance_plan_capacity == 0 ||
+            !rebalance_command_header || !rebalance_apply_status ||
+            !rebalance_controller_state ||
+            !validateDeviceMoERebalanceConfig(rebalance_config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] invalid runtime or rebalance binding");
+            return false;
+        }
+        if (d_model <= 0 || num_experts <= 0 || top_k <= 0 || top_k > num_experts)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] invalid dimensions d_model=" << d_model
+                                                                                                               << " num_experts=" << num_experts
+                                                                                                               << " top_k=" << top_k);
+            return false;
+        }
+
+        const DeviceId device = DeviceId::rocm(device_ordinal_);
+        if (!ensureTensorOnDevice(hidden, device, getStream(), "hidden", "decodeRouteSelectWithReadyRebalanceApply") ||
+            !ensureTensorOnDevice(gate_weights, device, getStream(), "gate_weights", "decodeRouteSelectWithReadyRebalanceApply"))
+        {
+            return false;
+        }
+
+        const float *h = static_cast<const float *>(hidden->gpu_data_ptr());
+        const void *g = gate_weights->gpu_data_ptr();
+        const TensorType gate_type = gate_weights->native_type();
+        if (!h || !g)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] null device pointer "
+                      "(hidden="
+                      << (const void *)h << " gate=" << (const void *)g << ")");
+            return false;
+        }
+
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), /*topk_count=*/0))
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] route logits scratch allocation failed");
+            return false;
+        }
+
+        float *legacy_indices = nullptr;
+        float *legacy_weights = nullptr;
+        if (write_legacy_outputs)
+        {
+            if (!output_indices || !output_weights ||
+                !ensureOutputOnDevice(output_indices, device, getStream(), "output_indices", "decodeRouteSelectWithReadyRebalanceApply") ||
+                !ensureOutputOnDevice(output_weights, device, getStream(), "output_weights", "decodeRouteSelectWithReadyRebalanceApply"))
+            {
+                return false;
+            }
+
+            legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
+            legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
+            if (!legacy_indices || !legacy_weights)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] legacy output tensors have no device allocation");
+                return false;
+            }
+        }
+
+        bool logits_ready = false;
+        bool runtime_ready = false;
+        const auto &rocm_env = debugEnv().rocm;
+        const bool gate_is_fp32 = (gate_type == TensorType::FP32);
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
+        const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router requires d_model to be a multiple of 32, got "
+                      << d_model);
+            return false;
+        }
+        if (q8_router_requested)
+        {
+            if (!ensureRouterQ8HiddenScratchCapacity(d_model))
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router hidden scratch unavailable for d_model="
+                          << d_model);
+                return false;
+            }
+            const auto *q8_gate = getOrCreateQ8RouterGateCache(
+                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+            if (!q8_gate)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router gate cache unavailable");
+                return false;
+            }
+            void *stream = requireStream("ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply Q8 router");
+            if (!stream)
+                return false;
+            logits_ready = hipMoE_gate_logits_single_token_q8_weights(
+                h, d_router_q8_hidden_, d_router_q8_hidden_scales_,
+                q8_gate->d_gate_weights_q8, q8_gate->d_gate_scales,
+                d_route_logits_, d_model, num_experts,
+                device_ordinal_, stream);
+            if (!logits_ready)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router logits kernel failed");
+                return false;
+            }
+            router_q8_hidden_source_ = h;
+            router_q8_hidden_valid_ = true;
+        }
+
+        if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
+        {
+            const int k_partitions = rocm_env.moe_router_kparts;
+            const size_t partial_count = static_cast<size_t>(num_experts) * static_cast<size_t>(k_partitions);
+            if (ensureRouteLogitsPartialsCapacity(partial_count))
+            {
+                const bool partials_ready = hipMoE_gate_logits_single_token_kpart_partials(
+                    h, static_cast<const float *>(g), d_route_logits_partials_,
+                    d_model, num_experts, k_partitions,
+                    device_ordinal_, getStream());
+                if (partials_ready)
+                {
+                    runtime_ready = hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
+                        d_route_logits_partials_,
+                        static_cast<void *>(runtime_layer),
+                        legacy_indices,
+                        legacy_weights,
+                        num_experts,
+                        k_partitions,
+                        top_k,
+                        normalize_weights,
+                        write_legacy_outputs,
+                        update_runtime_histogram,
+                        runtime_layers,
+                        rebalance_plan_entries,
+                        rebalance_plan_capacity,
+                        rebalance_command_header,
+                        rebalance_local_transfer_slots,
+                        rebalance_local_transfer_slot_count,
+                        &rebalance_config,
+                        rebalance_apply_status,
+                        rebalance_controller_state,
+                        rebalance_target_layer,
+                        rebalance_command_buffer_count,
+                        device_ordinal_,
+                        getStream());
+                    if (!runtime_ready)
+                    {
+                        LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] fused K-part router runtime kernel failed; falling back to FP16/default router");
+                    }
+                }
+                else
+                {
+                    LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] K-part router logits kernel failed; falling back to FP16/default router");
+                }
+            }
+            else
+            {
+                LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] K-part router scratch unavailable; falling back to FP16/default router");
+            }
+        }
+
+        if (!runtime_ready && !logits_ready && gate_is_fp32)
+        {
+            if (const void *g_fp16 = getOrCreateFP16RouterGateCache(
+                    gate_weights, static_cast<const float *>(g), d_model, num_experts))
+            {
+                logits_ready = hipMoE_gate_logits_single_token_fp16_weights(
+                    h, g_fp16, d_route_logits_,
+                    d_model, num_experts,
+                    device_ordinal_, getStream());
+                if (!logits_ready)
+                {
+                    LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router logits kernel failed; falling back to FP32 router");
+                }
+            }
+        }
+
+        if (!runtime_ready && !logits_ready &&
+            !launchDecodeGateLogitsForGateType(
+                h, g, gate_type, d_route_logits_,
+                d_model, num_experts,
+                device_ordinal_, getStream(),
+                "ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply"))
+        {
+            return false;
+        }
+
+        if (!runtime_ready && rocm_env.moe_router_wave_topk && num_experts <= 256)
+        {
+            runtime_ready = hipMoE_softmax_topk_decode_runtime_wave64(
+                d_route_logits_,
+                static_cast<void *>(runtime_layer),
+                legacy_indices,
+                legacy_weights,
+                num_experts,
+                top_k,
+                normalize_weights,
+                write_legacy_outputs,
+                update_runtime_histogram,
+                runtime_layers,
+                rebalance_plan_entries,
+                rebalance_plan_capacity,
+                rebalance_command_header,
+                rebalance_local_transfer_slots,
+                rebalance_local_transfer_slot_count,
+                &rebalance_config,
+                rebalance_apply_status,
+                rebalance_controller_state,
+                rebalance_target_layer,
+                rebalance_command_buffer_count,
+                device_ordinal_,
+                getStream());
+            if (!runtime_ready)
+            {
+                LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] wave64 decode softmax/top-k runtime kernel failed; falling back to default runtime top-k");
+            }
+        }
+
+        if (!runtime_ready && !hipMoE_softmax_topk_decode_runtime(
+                                  d_route_logits_,
+                                  static_cast<void *>(runtime_layer),
+                                  legacy_indices,
+                                  legacy_weights,
+                                  num_experts,
+                                  top_k,
+                                  normalize_weights,
+                                  write_legacy_outputs,
+                                  update_runtime_histogram,
+                                  runtime_layers,
+                                  rebalance_plan_entries,
+                                  rebalance_plan_capacity,
+                                  rebalance_command_header,
+                                  rebalance_local_transfer_slots,
+                                  rebalance_local_transfer_slot_count,
+                                  &rebalance_config,
+                                  rebalance_apply_status,
+                                  rebalance_controller_state,
+                                  rebalance_target_layer,
+                                  rebalance_command_buffer_count,
+                                  device_ordinal_,
+                                  getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] decode softmax/top-k runtime kernel failed");
+            return false;
+        }
+
+        if (write_legacy_outputs)
+        {
+            markDeviceWritten(output_indices, device, getStream());
+            markDeviceWritten(output_weights, device, getStream());
+        }
+
+        return true;
+    }
+
+    bool ROCmMoEKernel::runDeviceRebalanceController(
+        DeviceMoELayerRuntime *runtime_layers,
+        const uint64_t *gathered_histograms,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceWaveState *wave_state,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !gathered_histograms || !status)
+        {
+            LOG_ERROR("[ROCmMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::runDeviceRebalanceController");
+        if (!setMoEDevice(device_ordinal_, "runDeviceRebalanceController"))
+            return false;
+
+        return hipMoE_device_rebalance_controller(
+            runtime_layers,
+            reinterpret_cast<const unsigned long long *>(gathered_histograms),
+            status,
+            &config,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            payload_slot_capacity,
+            command_header,
+            wave_state,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::packDeviceRebalanceHistograms(
+        DeviceMoELayerRuntime *runtime_layers,
+        uint64_t *local_histograms,
+        const DeviceMoERebalanceConfig &config,
+        const DeviceMoERebalanceWaveState *wave_state,
+        const DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !local_histograms)
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceHistograms] runtime layers and local histograms must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceHistograms");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceHistograms"))
+            return false;
+
+        return hipMoE_pack_rebalance_histograms(
+            runtime_layers,
+            reinterpret_cast<unsigned long long *>(local_histograms),
+            &config,
+            wave_state,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::packDeviceRebalanceDirectory(
+        DeviceMoELayerRuntime *runtime_layers,
+        DeviceMoEExpertDirectoryEntry *local_directory,
+        const DeviceMoERebalanceConfig &config)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceDirectory] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !local_directory)
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceDirectory] runtime layers and local directory must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceDirectory");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceDirectory"))
+            return false;
+
+        return hipMoE_pack_rebalance_directory(
+            runtime_layers,
+            local_directory,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::packDeviceRebalanceSourceDescriptors(
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *command_headers,
+        uint32_t plan_capacity,
+        DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceSourceDescriptors] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || !command_headers ||
+            !local_source_descriptors)
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceSourceDescriptors] runtime, projected plans, headers, and source descriptor output must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceSourceDescriptors");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceSourceDescriptors"))
+            return false;
+
+        return hipMoE_pack_rebalance_source_descriptors(
+            runtime_layers,
+            plan_entries,
+            command_headers,
+            plan_capacity,
+            local_source_descriptors,
+            &config,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::projectDeviceRebalanceDomainCommands(
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntry *local_plan_entries,
+        DeviceMoERebalanceCommandBufferHeader *local_command_headers,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceStatus *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::projectDeviceRebalanceDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_plan_entries || !local_command_headers ||
+            plan_capacity == 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::projectDeviceRebalanceDomainCommands] gathered and local command buffers must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::projectDeviceRebalanceDomainCommands");
+        if (!setMoEDevice(device_ordinal_, "projectDeviceRebalanceDomainCommands"))
+            return false;
+
+        return hipMoE_project_rebalance_domain_commands(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_plan_entries,
+            local_command_headers,
+            &config,
+            status,
+            payload_slot_capacity,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::packDeviceRebalanceCompactPayloads(
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCompactPayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!plan_entries || !command_headers ||
+            !local_source_descriptors || !local_payload || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCompactPayloads] plans, headers, source descriptors, payload, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceCompactPayloads");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCompactPayloads"))
+            return false;
+
+        return hipMoE_pack_rebalance_compact_payloads(
+            plan_entries,
+            command_headers,
+            plan_capacity,
+            local_source_descriptors,
+            local_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::applyDeviceRebalanceArrivals(
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        int target_layer)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::applyDeviceRebalanceArrivals] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !local_transfer_slots || !status)
+        {
+            LOG_ERROR("[ROCmMoEKernel::applyDeviceRebalanceArrivals] runtime, plan, transfer slots, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::applyDeviceRebalanceArrivals");
+        if (!setMoEDevice(device_ordinal_, "applyDeviceRebalanceArrivals"))
+            return false;
+
+        return hipMoE_apply_rebalance_arrivals(
+            runtime_layers,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            target_layer,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::packDeviceRebalanceCollectivePayloads(
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_directory,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCollectivePayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_directory || !local_payload || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes == 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::packDeviceRebalanceCollectivePayloads] gathered plans, headers, local directory, payload, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::packDeviceRebalanceCollectivePayloads");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCollectivePayloads"))
+            return false;
+
+        return hipMoE_pack_rebalance_collective_payloads(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_directory,
+            local_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads(
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        const uint8_t *gathered_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!plan_entries || (!plan_count && !command_header) ||
+            !gathered_payload || !local_transfer_slots || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
+        {
+            LOG_ERROR("[ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads] plan, gathered payload, transfer slots, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::unpackDeviceRebalanceCollectivePayloads");
+        if (!setMoEDevice(device_ordinal_, "unpackDeviceRebalanceCollectivePayloads"))
+            return false;
+
+        return hipMoE_unpack_rebalance_collective_payloads(
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            gathered_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::initializeDeviceRebalanceGraphController(
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        const DeviceMoERebalanceConfig &config)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::initializeDeviceRebalanceGraphController] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state)
+        {
+            LOG_ERROR("[ROCmMoEKernel::initializeDeviceRebalanceGraphController] controller state must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::initializeDeviceRebalanceGraphController");
+        if (!setMoEDevice(device_ordinal_, "initializeDeviceRebalanceGraphController"))
+            return false;
+
+        return hipMoE_init_rebalance_graph_controller_state(
+            controller_state,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::publishDeviceRebalanceTransferComplete(
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        const DeviceMoERebalanceWaveState *wave_state,
+        const DeviceMoERebalanceApplyStatus *copy_status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state || !command_header || !wave_state || !copy_status)
+        {
+            LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] controller state, command header, wave state, and copy status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::publishDeviceRebalanceTransferComplete");
+        if (!setMoEDevice(device_ordinal_, "publishDeviceRebalanceTransferComplete"))
+            return false;
+
+        return hipMoE_publish_rebalance_transfer_complete(
+            controller_state,
+            command_header,
+            wave_state,
+            copy_status,
+            &config,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::applyReadyDeviceRebalanceWave(
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        int target_layer,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::applyReadyDeviceRebalanceWave] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !status || !controller_state)
+        {
+            LOG_ERROR("[ROCmMoEKernel::applyReadyDeviceRebalanceWave] runtime, plan, status, controller state, and command ABI must be non-null");
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::applyReadyDeviceRebalanceWave");
+        if (!setMoEDevice(device_ordinal_, "applyReadyDeviceRebalanceWave"))
+            return false;
+
+        return hipMoE_apply_ready_rebalance_wave(
+            runtime_layers,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            controller_state,
+            target_layer,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
     }
 
     void ROCmMoEKernel::zeroBuffer(ITensor *tensor, size_t bytes)
@@ -3816,6 +4927,160 @@ namespace llaminar2
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
     }
 
+    bool ROCmMoEKernel::updateGroupedExpertDownDescriptorTable(
+        int descriptor_table_id,
+        const DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!down_descs || descriptor_table_id < 0 ||
+            descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 ||
+            intermediate <= 0 || (intermediate % 32) != 0)
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "updateGroupedExpertDownDescriptorTable"))
+            return false;
+
+        auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid || !table.device_descs ||
+            table.num_experts != num_experts ||
+            table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        uint8_t codebook_id = 0;
+        uint32_t codebook_mask = 0;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &desc = down_descs[expert_id];
+            if (isBlankGroupedDesc(desc))
+                continue;
+            if (!desc.valid() || !validateGroupedDownDesc(desc, d_model, intermediate))
+                return false;
+            codebook_mask |= groupedPrefillCodebookBit(desc.codebook_id);
+            if (codebook_id == 0)
+                codebook_id = desc.codebook_id;
+        }
+        if (codebook_mask == 0)
+            return false;
+        if (codebook_mask & (codebook_mask - 1u))
+            codebook_id = kROCmMoEMixedCodebookSentinel;
+        if (table.codebook_id != codebook_id ||
+            table.codebook_mask != codebook_mask)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertDownDescriptorTable] refusing in-place update "
+                      "with changed codebook semantics");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        hipError_t err = hipMemcpyAsync(table.device_descs, down_descs,
+                                        desc_bytes,
+                                        hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertDownDescriptorTable] descriptor refresh failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        table.host_descs.assign(down_descs, down_descs + num_experts);
+        return true;
+    }
+
+    bool ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables(
+        int descriptor_table_id,
+        const DeviceNativeVNNIMatrixDesc *gate_descs,
+        const DeviceNativeVNNIMatrixDesc *up_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!gate_descs || !up_descs || descriptor_table_id < 0 ||
+            descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 ||
+            intermediate <= 0 || (d_model % 32) != 0)
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "updateGroupedExpertGateUpDescriptorTables"))
+            return false;
+
+        auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
+            table.num_experts != num_experts ||
+            table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        uint8_t codebook_id = 0;
+        uint32_t codebook_mask = 0;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &gate_desc = gate_descs[expert_id];
+            const auto &up_desc = up_descs[expert_id];
+            const bool gate_blank = isBlankGroupedDesc(gate_desc);
+            const bool up_blank = isBlankGroupedDesc(up_desc);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                return false;
+            }
+            if (!gate_desc.valid() || !up_desc.valid() ||
+                gate_desc.codebook_id != up_desc.codebook_id ||
+                !validateGroupedGateUpDesc(gate_desc, d_model, intermediate) ||
+                !validateGroupedGateUpDesc(up_desc, d_model, intermediate))
+            {
+                return false;
+            }
+            codebook_mask |= groupedPrefillCodebookBit(gate_desc.codebook_id);
+            if (codebook_id == 0)
+                codebook_id = gate_desc.codebook_id;
+        }
+        if (codebook_mask == 0)
+            return false;
+        if (codebook_mask & (codebook_mask - 1u))
+            codebook_id = kROCmMoEMixedCodebookSentinel;
+        if (table.codebook_id != codebook_id ||
+            table.codebook_mask != codebook_mask)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] refusing in-place update "
+                      "with changed codebook semantics");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        hipError_t err = hipMemcpyAsync(table.device_gate_descs, gate_descs,
+                                        desc_bytes,
+                                        hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(table.device_up_descs, up_descs,
+                                 desc_bytes,
+                                 hipMemcpyHostToDevice, stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedExpertGateUpDescriptorTables] descriptor refresh failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        table.host_gate_descs.assign(gate_descs, gate_descs + num_experts);
+        table.host_up_descs.assign(up_descs, up_descs + num_experts);
+        return true;
+    }
+
     bool ROCmMoEKernel::groupedExpertGateUpDecodeFromTable(
         const TensorBase *input,
         const int *expert_ids,
@@ -4153,10 +5418,9 @@ namespace llaminar2
         bool ok = false;
         if (use_kpart_gateup)
         {
-            ok = rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+            ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
                 d_hidden,
-                table.device_gate_descs,
-                table.device_up_descs,
+                runtime_layer,
                 d_expert_ids,
                 d_gate_output_ptrs,
                 d_up_output_ptrs,
@@ -4168,6 +5432,7 @@ namespace llaminar2
                 top_k,
                 intermediate,
                 d_model,
+                table.num_experts,
                 table.codebook_id,
                 k_partitions,
                 device_ordinal_,
@@ -4180,10 +5445,9 @@ namespace llaminar2
 
         if (!ok)
         {
-            ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
+            ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
                 d_hidden,
-                table.device_gate_descs,
-                table.device_up_descs,
+                runtime_layer,
                 d_expert_ids,
                 d_gate_output_ptrs,
                 d_up_output_ptrs,
@@ -4193,6 +5457,7 @@ namespace llaminar2
                 top_k,
                 intermediate,
                 d_model,
+                table.num_experts,
                 table.codebook_id,
                 device_ordinal_,
                 getStream());
@@ -4217,7 +5482,8 @@ namespace llaminar2
         int top_k,
         ITensor *output,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
 
@@ -4336,6 +5602,8 @@ namespace llaminar2
             d_router_q8_hidden_scales_;
         int8_t *gateup_hidden_int8 = reuse_router_q8_hidden ? d_router_q8_hidden_ : d_grouped_hidden_int8_;
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
+        const bool use_runtime_descriptors =
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
         const bool use_parallel_down =
             debugEnv().rocm.moe_parallel_down_decode &&
             top_k > 1 &&
@@ -4351,25 +5619,45 @@ namespace llaminar2
         bool swiglu_prequantized = false;
         if (use_gateup_swiglu_quant_fused)
         {
-            gateup_ok = rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
-                d_hidden,
-                gateup_table.device_gate_descs,
-                gateup_table.device_up_descs,
-                d_expert_ids,
-                gateup_hidden_int8,
-                gateup_hidden_scales,
-                reuse_router_q8_hidden,
-                d_grouped_gateup_gate_partials_,
-                d_grouped_gateup_up_partials_,
-                d_grouped_swiglu_int8_,
-                d_grouped_swiglu_scales_,
-                top_k,
-                intermediate,
-                d_model,
-                gateup_table.codebook_id,
-                gateup_k_partitions,
-                device_ordinal_,
-                stream);
+            gateup_ok = use_runtime_descriptors
+                            ? rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_runtime_kpart(
+                                  d_hidden,
+                                  runtime_layer,
+                                  d_expert_ids,
+                                  gateup_hidden_int8,
+                                  gateup_hidden_scales,
+                                  reuse_router_q8_hidden,
+                                  d_grouped_gateup_gate_partials_,
+                                  d_grouped_gateup_up_partials_,
+                                  d_grouped_swiglu_int8_,
+                                  d_grouped_swiglu_scales_,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  gateup_table.num_experts,
+                                  gateup_table.codebook_id,
+                                  gateup_k_partitions,
+                                  device_ordinal_,
+                                  stream)
+                            : rocmMoE_grouped_gate_up_swiglu_quant_native_vnni_decode_table_kpart(
+                                  d_hidden,
+                                  gateup_table.device_gate_descs,
+                                  gateup_table.device_up_descs,
+                                  d_expert_ids,
+                                  gateup_hidden_int8,
+                                  gateup_hidden_scales,
+                                  reuse_router_q8_hidden,
+                                  d_grouped_gateup_gate_partials_,
+                                  d_grouped_gateup_up_partials_,
+                                  d_grouped_swiglu_int8_,
+                                  d_grouped_swiglu_scales_,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  gateup_table.codebook_id,
+                                  gateup_k_partitions,
+                                  device_ordinal_,
+                                  stream);
             swiglu_prequantized = gateup_ok;
             if (!gateup_ok)
             {
@@ -4380,25 +5668,45 @@ namespace llaminar2
 
         if (!gateup_ok && use_gateup_kpart)
         {
-            gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                d_hidden,
-                gateup_table.device_gate_descs,
-                gateup_table.device_up_descs,
-                d_expert_ids,
-                d_gate_ptrs,
-                d_up_ptrs,
-                gateup_hidden_int8,
-                gateup_hidden_scales,
-                reuse_router_q8_hidden,
-                d_grouped_gateup_gate_partials_,
-                d_grouped_gateup_up_partials_,
-                top_k,
-                intermediate,
-                d_model,
-                gateup_table.codebook_id,
-                gateup_k_partitions,
-                device_ordinal_,
-                stream);
+            gateup_ok = use_runtime_descriptors
+                            ? rocmMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+                                  d_hidden,
+                                  runtime_layer,
+                                  d_expert_ids,
+                                  d_gate_ptrs,
+                                  d_up_ptrs,
+                                  gateup_hidden_int8,
+                                  gateup_hidden_scales,
+                                  reuse_router_q8_hidden,
+                                  d_grouped_gateup_gate_partials_,
+                                  d_grouped_gateup_up_partials_,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  gateup_table.num_experts,
+                                  gateup_table.codebook_id,
+                                  gateup_k_partitions,
+                                  device_ordinal_,
+                                  stream)
+                            : rocmMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                                  d_hidden,
+                                  gateup_table.device_gate_descs,
+                                  gateup_table.device_up_descs,
+                                  d_expert_ids,
+                                  d_gate_ptrs,
+                                  d_up_ptrs,
+                                  gateup_hidden_int8,
+                                  gateup_hidden_scales,
+                                  reuse_router_q8_hidden,
+                                  d_grouped_gateup_gate_partials_,
+                                  d_grouped_gateup_up_partials_,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  gateup_table.codebook_id,
+                                  gateup_k_partitions,
+                                  device_ordinal_,
+                                  stream);
             if (!gateup_ok)
             {
                 LOG_DEBUG("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
@@ -4408,22 +5716,39 @@ namespace llaminar2
 
         if (!gateup_ok)
         {
-            gateup_ok = rocmMoE_grouped_gate_up_native_vnni_decode_table(
-                d_hidden,
-                gateup_table.device_gate_descs,
-                gateup_table.device_up_descs,
-                d_expert_ids,
-                d_gate_ptrs,
-                d_up_ptrs,
-                gateup_hidden_int8,
-                gateup_hidden_scales,
-                reuse_router_q8_hidden,
-                top_k,
-                intermediate,
-                d_model,
-                gateup_table.codebook_id,
-                device_ordinal_,
-                stream);
+            gateup_ok = use_runtime_descriptors
+                            ? rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
+                                  d_hidden,
+                                  runtime_layer,
+                                  d_expert_ids,
+                                  d_gate_ptrs,
+                                  d_up_ptrs,
+                                  gateup_hidden_int8,
+                                  gateup_hidden_scales,
+                                  reuse_router_q8_hidden,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  gateup_table.num_experts,
+                                  gateup_table.codebook_id,
+                                  device_ordinal_,
+                                  stream)
+                            : rocmMoE_grouped_gate_up_native_vnni_decode_table(
+                                  d_hidden,
+                                  gateup_table.device_gate_descs,
+                                  gateup_table.device_up_descs,
+                                  d_expert_ids,
+                                  d_gate_ptrs,
+                                  d_up_ptrs,
+                                  gateup_hidden_int8,
+                                  gateup_hidden_scales,
+                                  reuse_router_q8_hidden,
+                                  top_k,
+                                  intermediate,
+                                  d_model,
+                                  gateup_table.codebook_id,
+                                  device_ordinal_,
+                                  stream);
         }
         if (!gateup_ok)
             return false;
@@ -4438,45 +5763,81 @@ namespace llaminar2
             return false;
         }
 
-        const bool down_ok = use_parallel_down
-                                 ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_grouped_swiglu_int8_,
-                                       d_grouped_swiglu_scales_,
-                                       swiglu_prequantized,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.codebook_id,
-                                       device_ordinal_,
-                                       stream)
-                                 : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_grouped_swiglu_int8_,
-                                       d_grouped_swiglu_scales_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.codebook_id,
-                                       device_ordinal_,
-                                       stream);
+        const bool down_ok = use_runtime_descriptors
+                                 ? (use_parallel_down
+                                        ? rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              runtime_layer,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_grouped_swiglu_int8_,
+                                              d_grouped_swiglu_scales_,
+                                              swiglu_prequantized,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.num_experts,
+                                              down_table.codebook_id,
+                                              device_ordinal_,
+                                              stream)
+                                        : rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              runtime_layer,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_grouped_swiglu_int8_,
+                                              d_grouped_swiglu_scales_,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.num_experts,
+                                              down_table.codebook_id,
+                                              device_ordinal_,
+                                              stream))
+                                 : (use_parallel_down
+                                        ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              down_table.device_descs,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_grouped_swiglu_int8_,
+                                              d_grouped_swiglu_scales_,
+                                              swiglu_prequantized,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.codebook_id,
+                                              device_ordinal_,
+                                              stream)
+                                        : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              down_table.device_descs,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_grouped_swiglu_int8_,
+                                              d_grouped_swiglu_scales_,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.codebook_id,
+                                              device_ordinal_,
+                                              stream));
         if (!down_ok)
             return false;
 
         markDeviceWritten(output, device, stream);
         recordGroupedDecodeCounter(
-            "rocm_moe_grouped_decode_fused_calls", "runtime", top_k,
-            d_model, intermediate,
+            "rocm_moe_grouped_decode_fused_calls",
+            use_runtime_descriptors ? "runtime" : "runtime_static_table",
+            top_k, d_model, intermediate,
             use_parallel_down ? "fused_parallel_down" : "fused_serial_down");
         return true;
     }
@@ -4780,10 +6141,10 @@ namespace llaminar2
             groupedDecodeSupportsCodebook(table.codebook_id);
 
         const bool ok = use_parallel_down
-                            ? rocmMoE_grouped_swiglu_down_native_vnni_decode_table_parallel(
+                            ? rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
                                   d_gate_ptrs,
                                   d_up_ptrs,
-                                  table.device_descs,
+                                  runtime_layer,
                                   d_expert_ids,
                                   d_weights,
                                   d_grouped_swiglu_int8_,
@@ -4793,13 +6154,14 @@ namespace llaminar2
                                   top_k,
                                   d_model,
                                   intermediate,
+                                  table.num_experts,
                                   table.codebook_id,
                                   device_ordinal_,
                                   getStream())
-                            : rocmMoE_grouped_swiglu_down_native_vnni_decode_table(
+                            : rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime(
                                   d_gate_ptrs,
                                   d_up_ptrs,
-                                  table.device_descs,
+                                  runtime_layer,
                                   d_expert_ids,
                                   d_weights,
                                   d_grouped_swiglu_int8_,
@@ -4808,6 +6170,7 @@ namespace llaminar2
                                   top_k,
                                   d_model,
                                   intermediate,
+                                  table.num_experts,
                                   table.codebook_id,
                                   device_ordinal_,
                                   getStream());
@@ -5399,6 +6762,7 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] groupTokensByExpertDevice failed");
             return false;
         }
+        group_active_expert_slots_ = std::min(total_slots, num_experts);
 
         // Launch device-side max-reduction over expert counts (async, no sync).
         // Result in d_group_max_tokens_ — consumed by GEMM grid early-exit.
@@ -5570,6 +6934,7 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsyncMasked] groupTokensByExpertDevice failed");
             return false;
         }
+        group_active_expert_slots_ = std::min(total_slots, num_experts);
 
         if (!hipMoE_max_expert_count(d_group_counts_, d_group_max_tokens_,
                                      num_experts, device_ordinal_, getStream()))
@@ -5579,6 +6944,61 @@ namespace llaminar2
         }
 
         prepared_num_experts_ = num_experts;
+        return true;
+    }
+
+    bool ROCmMoEKernel::updateGroupedPrefillExpertMask(
+        const uint8_t *expert_mask,
+        int num_experts)
+    {
+        if (num_experts <= 0 || !expert_mask)
+            return false;
+
+        if (!setMoEDevice(device_ordinal_, "updateGroupedPrefillExpertMask"))
+            return false;
+
+        uint64_t mask_hash = 1469598103934665603ull;
+        for (int i = 0; i < num_experts; ++i)
+        {
+            mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
+            mask_hash *= 1099511628211ull;
+        }
+        mask_hash ^= static_cast<uint64_t>(num_experts);
+        mask_hash *= 1099511628211ull;
+
+        if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
+        {
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_group_expert_mask_),
+                                     MoEWorkspaceBuffers::GROUP_EXPERT_MASK,
+                                     static_cast<size_t>(num_experts) * sizeof(uint8_t),
+                                     "updateGroupedPrefillExpertMask(group_expert_mask)"))
+            {
+                d_group_expert_mask_ = nullptr;
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_hash_ = 0;
+                return false;
+            }
+            group_expert_mask_cap_ = num_experts;
+            group_expert_mask_hash_ = 0;
+        }
+
+        if (group_expert_mask_hash_ == mask_hash)
+            return true;
+
+        hipError_t err = hipMemcpyAsync(
+            d_group_expert_mask_,
+            expert_mask,
+            static_cast<size_t>(num_experts) * sizeof(uint8_t),
+            hipMemcpyHostToDevice,
+            static_cast<hipStream_t>(getStream()));
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateGroupedPrefillExpertMask] H2D mask copy failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+
+        group_expert_mask_hash_ = mask_hash;
         return true;
     }
 
@@ -5845,7 +7265,7 @@ namespace llaminar2
          * captured graph node per verifier MoE layer in the normal small-M path.
          */
         const bool ordered_scatter_overwrites_output =
-            d_group_original_to_grouped_ != nullptr;
+            active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
         hipStream_t stream = static_cast<hipStream_t>(getStream());
         if (!ordered_scatter_overwrites_output)
         {

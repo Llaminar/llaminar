@@ -210,6 +210,59 @@ namespace llaminar2
         return removeDiskEntry(key) || erased;
     }
 
+    bool PrefixStateCache::clear()
+    {
+        for (const auto &[key, entry] : entries_)
+        {
+            (void)key;
+            if (entry.block.ref_count > 0)
+            {
+                return false;
+            }
+        }
+
+        for (auto &[key, entry] : entries_)
+        {
+            (void)key;
+            subtractResidentStats(entry.block.handle);
+            if (ram_backend_)
+            {
+                ram_backend_->release(entry.block.handle);
+            }
+        }
+        entries_.clear();
+        lru_.clear();
+        used_bytes_ = 0;
+        stats_.ram_bytes = 0;
+        stats_.hybrid_state_bytes = 0;
+        stats_.mtp_state_bytes = 0;
+
+        for (auto &[key, handle] : device_hot_entries_)
+        {
+            (void)key;
+            if (device_hot_backend_)
+            {
+                device_hot_backend_->release(handle);
+            }
+        }
+        device_hot_entries_.clear();
+        device_hot_lru_.clear();
+        stats_.device_hot_bytes = 0;
+        stats_.device_bytes = 0;
+
+        for (auto &[key, handle] : disk_entries_)
+        {
+            (void)key;
+            if (disk_backend_)
+            {
+                disk_backend_->release(handle);
+            }
+        }
+        disk_entries_.clear();
+        stats_.disk_bytes = 0;
+        return true;
+    }
+
     bool PrefixStateCache::reserveRam(size_t incoming_bytes)
     {
         return evictUntilFits(incoming_bytes);

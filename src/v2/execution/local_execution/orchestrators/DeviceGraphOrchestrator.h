@@ -923,6 +923,7 @@ namespace llaminar2
         std::vector<MoERebalanceController *> moeRebalanceControllers() const override;
         MoERebalanceController *moeRebalanceControllerForDomain(
             const std::string &domain_id) const override;
+        bool usesDeviceSideMoERebalanceController() const override;
         int moeRebalanceParticipantId() const override;
 
         /// Apply expert masks to all MoEExpertComputeStages in cached FFN graphs.
@@ -985,6 +986,7 @@ namespace llaminar2
 
         void clearPendingGpuDirectExpertTransfers();
         bool activatePendingGpuDirectExpertTransfers();
+        void retireCompletedGpuDirectActivationCompletions();
 
         /// Set expert replica info on all MoE stages for per-token dispatch.
         /// Call after applyExpertMasks() so GEMM engines are already prepared.
@@ -2530,6 +2532,7 @@ namespace llaminar2
                 if (ctx && dev.is_gpu())
                     ctx->synchronize();
             }
+            drainCompletedDeviceMoERebalanceMaintenanceForRequestReset();
             for (auto &entry : layer_graph_cache_)
             {
                 entry.resetSessionState();
@@ -2547,6 +2550,13 @@ namespace llaminar2
             mtp_sidecar_depth0_kv_only_device_token_cache_.resetSessionStatePreservingGraphReplay();
             for (auto &cache : mtp_sidecar_depth0_kv_only_batch_caches_)
                 cache.resetSessionStatePreservingGraphReplay();
+            device_moe_rebalance_maintenance_graph_.resetSessionStatePreservingGraphReplay();
+            for (auto &[edge_mask, cache] : device_moe_rebalance_maintenance_payload_graphs_)
+            {
+                (void)edge_mask;
+                cache.resetSessionStatePreservingGraphReplay();
+            }
+            device_moe_rebalance_decode_tokens_seen_ = 0;
             mtp_terminal_hidden_row_select_cache_.invalidate();
             mtp_terminal_hidden_rows_select_cache_.invalidate();
             last_pos_offset_ = -1;
@@ -2609,6 +2619,11 @@ namespace llaminar2
             ++session_epoch_;
             recordLivePrefixSessionReset("clear_cache",
                                          /*preserve_gpu_replay_state=*/true);
+        }
+
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override
+        {
+            drainCompletedDeviceMoERebalanceMaintenanceForRequestReset();
         }
 
         /**
@@ -2843,6 +2858,7 @@ namespace llaminar2
         size_t localLogitsVocabColumns(const TensorBase *tensor) const;
         size_t localLogitsRowStrideColumns(const TensorBase *tensor) const;
         bool activeMainLogitsAreColumnParallel() const;
+        bool usesGraphStableGpuMoERebalance() const;
 
         /**
          * @brief Update dynamic parameters in a cached graph
@@ -2919,7 +2935,7 @@ namespace llaminar2
         /**
          * @brief Check whether LocalTP collectives may be captured inside GPU graphs
          */
-        bool collectivesSupportCapturedGraph() const;
+        bool collectivesSupportCapturedGraph(std::string *reason_out = nullptr) const;
 
         /**
          * @brief Check if we can use cached graph for current execution
@@ -3403,6 +3419,42 @@ namespace llaminar2
         /** Store the main-decode replay stream for the next main-logits consumer. */
         void setPendingMainDecodeStream(void *stream) override;
 
+        struct DeviceMoERebalanceMaintenanceGraphCache;
+
+        /** Launch graph-captured device-side MoE rebalance maintenance when due. */
+        bool maybeRunDeviceMoERebalanceMaintenanceGraph(const ForwardInput &input);
+
+        struct DeviceMoERebalanceMaintenanceOutcome
+        {
+            bool valid = false;
+            bool useful_work = false;
+            uint32_t status_code = 0;
+            uint32_t windows_applied = 0;
+            uint32_t selected_replicas = 0;
+            uint32_t planned_arrivals = 0;
+            uint32_t payload_bucket_slots = 0;
+            uint32_t payload_source_participant_mask = 0;
+            uint32_t payload_destination_participant_mask = 0;
+            uint64_t payload_edge_mask = 0;
+        };
+
+        /** Export completed device-side MoE rebalance diagnostic status to PerfStats. */
+        bool exportCompletedDeviceMoERebalanceMaintenanceStats(
+            DeviceMoERebalanceMaintenanceGraphCache &cache,
+            void *maintenance_stream,
+            const std::string &device_key,
+            const std::map<std::string, std::string> &maintenance_tags,
+            DeviceMoERebalanceMaintenanceOutcome *outcome = nullptr);
+
+        /**
+         * @brief Export a completed maintenance wave at request reset.
+         *
+         * clear_cache() synchronizes GPU contexts before calling this hook, so
+         * diagnostics can be retired without pushing stale readback into the
+         * next request.
+         */
+        void drainCompletedDeviceMoERebalanceMaintenanceForRequestReset();
+
         /** Report host-side safety state for chunk-boundary maintenance. */
         PrefillChunkMaintenanceState prefillChunkMaintenanceState(
             const PrefillChunkPlan &chunk) const override;
@@ -3476,6 +3528,7 @@ namespace llaminar2
         };
         mutable std::vector<LiveHybridCheckpointStorageSlot> live_hybrid_checkpoint_storage_pool_;
         bool ensurePrefixCacheReady();
+        bool refreshPrefixPayloadLayoutForLiveHybridState(const char *operation);
         bool isPrefixCacheMoEModel() const;
         bool mtpSpecStatePublicationRequiresCapturedStage() const;
         void *explicitGPUStreamForOperation(const char *operation) const;
@@ -3907,6 +3960,7 @@ namespace llaminar2
 
         std::array<PendingLogitsStreamHandoff, 3> pending_logits_streams_{};
         std::vector<PendingGpuDirectTransferSlotArrival> pending_gpu_direct_transfer_slot_arrivals_;
+        std::vector<GpuDirectTransferCompletion> pending_gpu_direct_activation_completions_;
         std::vector<std::shared_ptr<GpuExpertTransferStagingPool>> gpu_direct_transfer_staging_pools_;
         bool defer_next_mtp_main_decode_sync_ = false;
         bool defer_all_position_verifier_sync_ = false;
@@ -4032,6 +4086,99 @@ namespace llaminar2
         /// and handles cache HIT/MISS dispatch, GPU graph replay, timeline collection.
         std::unique_ptr<ForwardExecutionEngine> forward_engine_;
         std::shared_ptr<ForwardGraphExecutionRendezvous> forward_execution_rendezvous_;
+
+        struct DeviceMoERebalanceMaintenanceGraphCache
+        {
+            std::unique_ptr<ComputeGraph> graph;
+            DeviceGraphExecutor::GraphSegmentCache segment_cache;
+            uint64_t workspace_generation = 0;
+            uint64_t payload_edge_mask = 0;
+            uint64_t launch_count = 0;
+            std::shared_ptr<void> completion_event;
+            bool completion_event_in_flight = false;
+            uint64_t skipped_inflight_count = 0;
+            std::shared_ptr<void> timing_start_event;
+            std::shared_ptr<void> timing_stop_event;
+            PerfStatsCollector::Tags timing_tags;
+            uint64_t no_work_backoff_remaining = 0;
+            uint64_t no_work_backoff_streak = 0;
+
+            void resetReplayState()
+            {
+                segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Preserve);
+            }
+
+            void resetSessionStatePreservingGraphReplay()
+            {
+                /*
+                 * clear_cache() synchronizes every GPU context before reaching
+                 * this replay-preserving reset.  Any maintenance graph recorded
+                 * by the prior request is therefore complete, and its device
+                 * effects have either already been applied by the graph or are
+                 * intentionally discarded with the request-local rebalance
+                 * state below.  Keep the graph executable/event allocation, but
+                 * do not make the next request pay a diagnostic export for a
+                 * stale warmup/request-boundary event.
+                 */
+                completion_event_in_flight = false;
+                skipped_inflight_count = 0;
+                no_work_backoff_remaining = 0;
+                no_work_backoff_streak = 0;
+                timing_start_event.reset();
+                timing_stop_event.reset();
+                timing_tags.clear();
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionStatePreservingCapturedReplay();
+                }
+            }
+
+            void resetSessionState()
+            {
+                resetReplayState();
+                no_work_backoff_remaining = 0;
+                no_work_backoff_streak = 0;
+                timing_start_event.reset();
+                timing_stop_event.reset();
+                timing_tags.clear();
+                if (!graph)
+                    return;
+                graph->reset();
+                for (const auto &node_name : graph->getExecutionOrder())
+                {
+                    ComputeNode *node = graph->getNode(node_name);
+                    if (node && node->stage)
+                        node->stage->resetSessionState();
+                }
+            }
+
+            void invalidate()
+            {
+                segment_cache.reset(DeviceGraphExecutor::GraphSegmentCache::StreamResetPolicy::Destroy);
+                graph.reset();
+                workspace_generation = 0;
+                payload_edge_mask = 0;
+                launch_count = 0;
+                completion_event.reset();
+                completion_event_in_flight = false;
+                skipped_inflight_count = 0;
+                no_work_backoff_remaining = 0;
+                no_work_backoff_streak = 0;
+                timing_start_event.reset();
+                timing_stop_event.reset();
+                timing_tags.clear();
+            }
+        };
+
+        DeviceMoERebalanceMaintenanceGraphCache device_moe_rebalance_maintenance_graph_;
+        std::unordered_map<uint64_t, DeviceMoERebalanceMaintenanceGraphCache>
+            device_moe_rebalance_maintenance_payload_graphs_;
+        uint64_t device_moe_rebalance_decode_tokens_seen_ = 0;
 
         /// Padded sequence length from last forward_batch() call
         int padded_seq_len_ = 0;

@@ -7734,7 +7734,10 @@ add_v2_test(V2_Unit_TPContextFactory
 add_executable(v2_test_local_tp_context unit/collective/Test__LocalTPContext.cpp)
 target_link_libraries(v2_test_local_tp_context llaminar2_core GTest::gtest GTest::gtest_main)
 target_compile_definitions(v2_test_local_tp_context PRIVATE
+    LLAMINAR_LOCAL_TP_CONTEXT_HEADER="${CMAKE_SOURCE_DIR}/collective/ILocalTPContext.h"
     LLAMINAR_LOCAL_TP_CONTEXT_SOURCE="${CMAKE_SOURCE_DIR}/collective/LocalTPContext.cpp"
+    LLAMINAR_COLLECTIVE_BACKEND_HEADER="${CMAKE_SOURCE_DIR}/collective/ICollectiveBackend.h"
+    LLAMINAR_NCCL_COORDINATOR_SOURCE="${CMAKE_SOURCE_DIR}/collective/coordinators/NCCLCoordinator.cu"
     LLAMINAR_CUDA_CAST_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/cuda/ops/CUDACastKernels.cu"
     LLAMINAR_ROCM_CAST_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/rocm/ops/ROCmCastKernels.hip"
     LLAMINAR_CUDA_GDN_KERNELS_SOURCE="${CMAKE_SOURCE_DIR}/kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu"
@@ -7767,6 +7770,8 @@ add_v2_test(V2_Unit_LocalTPWeightSharder
 # single-device no-op for both scopes, and is_global scalar in dump info.
 add_executable(v2_test_tp_allreduce_stage unit/execution/compute_stages/stages/Test__TPAllreduceStage.cpp)
 target_link_libraries(v2_test_tp_allreduce_stage llaminar2_core GTest::gtest GTest::gtest_main)
+target_compile_definitions(v2_test_tp_allreduce_stage PRIVATE
+    LLAMINAR_TP_ALLREDUCE_STAGE_SOURCE="${CMAKE_SOURCE_DIR}/execution/compute_stages/stages/TPAllreduceStage.cpp")
 add_v2_test(V2_Unit_TPAllreduceStage
     COMMAND $<TARGET_FILE:v2_test_tp_allreduce_stage>
     LABELS "V2;Unit;TP;Allreduce;ComputeStage;TensorParallel;Collective;GlobalTP;LocalTP;ITPContext"
@@ -10418,8 +10423,8 @@ endif()
 # =============================================================================
 # GPU Expert Transfer Unit Tests
 # =============================================================================
-# Tests GPU↔GPU (peer DMA or host-staged) transfer of packed MoE expert
-# weight arrays between same-backend CUDA or ROCm devices. D2D tests require
+# Tests explicit-stream GPU↔GPU transfer of packed MoE expert weight arrays
+# between same-backend CUDA or ROCm devices. D2D tests require
 # ≥2 devices for the backend being exercised.
 
 if(HAVE_CUDA OR HAVE_ROCM)
@@ -10753,6 +10758,7 @@ message(STATUS "V2 Tests: Added ITPContext LocalTP unit tests (CPU-only)")
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_tp_backend_behavior
         integration/collective/Test__LocalTPBackendBehavior.cpp
+        integration/collective/Test__LocalTPRCCLGraphCapture.cpp
     )
     target_link_libraries(v2_integration_local_tp_backend_behavior PRIVATE
         llaminar2_core

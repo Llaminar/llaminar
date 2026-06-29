@@ -216,7 +216,20 @@ namespace llaminar2
                     // (no rebalancing) for profiling summary.
                     benchmark.setPostWarmupCallback([orch_runner, controller, &mpi_ctx]()
                                                     {
-                        orch_runner->applyMoERebalanceWithReplicas(/*log_histogram_summary=*/true);
+                        if (orch_runner->usesDeviceSideMoERebalanceController())
+                        {
+                            if (mpi_ctx->rank() == 0)
+                            {
+                                LOG_DEBUG("[MoE] Skipping host post-warmup rebalance; "
+                                          "device-side graph controller owns publish/apply");
+                            }
+                            return;
+                        }
+
+                        if (!orch_runner->applyMoERebalanceWithReplicas(/*log_histogram_summary=*/true))
+                        {
+                            LOG_ERROR("[MoE] Post-warmup rebalance failed");
+                        }
                         if (mpi_ctx->rank() == 0)
                         {
                     LOG_DEBUG("[MoE] Post-warmup setup complete"

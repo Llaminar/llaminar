@@ -947,6 +947,7 @@ TEST_F(Test__DeviceGraphOrchestrator, ReplicatedAttentionStateUsesDecodeDenseGdn
     GraphConfig cfg = config_;
     cfg.dense_tp_enabled = true;
     cfg.dense_tp_decode_replicated = true;
+    cfg.mtp.enabled = true;
     auto graph = std::make_shared<CapturingQwenStandardGraph>(cfg, nullptr);
 
     auto make_binding = [](uint64_t binding_id,

@@ -138,6 +138,55 @@ TEST(Test__PrefixStateCacheLRU, RecordsRequestLevelStatsAndResidentPayloadBytes)
     EXPECT_EQ(cache.stats().mtp_state_bytes, 0u);
 }
 
+TEST(Test__PrefixStateCacheLRU, ClearReleasesResidentEntriesAndPayloadAccounting)
+{
+    auto backend = std::make_shared<RamPrefixStorageBackend>(256);
+    PrefixStateCache cache(256, backend);
+    auto layout = layoutBytes(32);
+    layout.includes_hybrid_state = true;
+    layout.hybrid_state_bytes = 16;
+    layout.includes_mtp_state = true;
+    layout.mtp_kv_bytes = 8;
+
+    auto a = backend->allocate(keyFor(0), layout);
+    auto b = backend->allocate(keyFor(1), layout);
+    ASSERT_TRUE(cache.insert(a));
+    ASSERT_TRUE(cache.insert(b));
+    ASSERT_EQ(cache.usedBytes(), 112u);
+    ASSERT_EQ(cache.stats().ram_bytes, 112u);
+    ASSERT_EQ(cache.stats().hybrid_state_bytes, 32u);
+    ASSERT_EQ(cache.stats().mtp_state_bytes, 16u);
+
+    ASSERT_TRUE(cache.clear());
+
+    EXPECT_EQ(cache.size(), 0u);
+    EXPECT_EQ(cache.usedBytes(), 0u);
+    EXPECT_EQ(cache.stats().ram_bytes, 0u);
+    EXPECT_EQ(cache.stats().hybrid_state_bytes, 0u);
+    EXPECT_EQ(cache.stats().mtp_state_bytes, 0u);
+    EXPECT_FALSE(cache.contains(a.key));
+    EXPECT_TRUE(backend->canStore(256))
+        << "clear should release resident allocations back to the RAM backend";
+}
+
+TEST(Test__PrefixStateCacheLRU, ClearRefusesRetainedResidentEntries)
+{
+    auto backend = std::make_shared<RamPrefixStorageBackend>(128);
+    PrefixStateCache cache(128, backend);
+    auto handle = backend->allocate(keyFor(4), layoutBytes(32));
+    ASSERT_TRUE(cache.insert(handle));
+    ASSERT_TRUE(cache.retain(handle.key));
+
+    EXPECT_FALSE(cache.clear());
+    EXPECT_EQ(cache.size(), 1u);
+    EXPECT_EQ(cache.usedBytes(), 32u);
+    EXPECT_TRUE(cache.contains(handle.key));
+
+    ASSERT_TRUE(cache.release(handle.key));
+    EXPECT_TRUE(cache.clear());
+    EXPECT_EQ(cache.size(), 0u);
+}
+
 TEST(Test__PrefixStateCacheLRU, EvictedBlockPersistsToDiskAndHydratesOnFind)
 {
     const auto dir = tempDir();
@@ -172,6 +221,36 @@ TEST(Test__PrefixStateCacheLRU, EvictedBlockPersistsToDiskAndHydratesOnFind)
     EXPECT_EQ(cache.stats().disk_hydrations, 1u);
     EXPECT_EQ(cache.stats().promotions, 1u);
     EXPECT_GE(cache.stats().disk_bytes, 32u);
+
+    cleanup();
+}
+
+TEST(Test__PrefixStateCacheLRU, ClearReleasesDiskEntries)
+{
+    const auto dir = tempDir();
+    const auto cleanup = [&]() { std::filesystem::remove_all(dir); };
+
+    auto ram = std::make_shared<RamPrefixStorageBackend>(128);
+    auto disk = std::make_shared<DiskPrefixStorageBackend>(dir, 128);
+    PrefixStateCache cache(64, ram, disk);
+    auto a = ram->allocate(keyFor(0), layoutBytes(32));
+    auto b = ram->allocate(keyFor(1), layoutBytes(32));
+    auto c = ram->allocate(keyFor(2), layoutBytes(32));
+    ASSERT_TRUE(cache.insert(a));
+    ASSERT_TRUE(cache.insert(b));
+    ASSERT_TRUE(cache.insert(c));
+    ASSERT_TRUE(cache.contains(a.key));
+    ASSERT_EQ(cache.stats().disk_bytes, 32u);
+
+    ASSERT_TRUE(cache.clear());
+
+    EXPECT_EQ(cache.size(), 0u);
+    EXPECT_EQ(cache.usedBytes(), 0u);
+    EXPECT_EQ(cache.stats().ram_bytes, 0u);
+    EXPECT_EQ(cache.stats().disk_bytes, 0u);
+    EXPECT_FALSE(cache.contains(a.key));
+    EXPECT_FALSE(cache.contains(b.key));
+    EXPECT_FALSE(cache.contains(c.key));
 
     cleanup();
 }

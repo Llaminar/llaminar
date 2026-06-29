@@ -43,24 +43,24 @@ namespace
     // Scoped DebugEnv flag helpers
     // =========================================================================
 
-    class ScopedRocmMoEFlags
+    class ScopedMoEGraphCaptureFlags
     {
     public:
-        ScopedRocmMoEFlags(bool grouped_decode, bool device_routed_decode, bool grouped_prefill)
+        ScopedMoEGraphCaptureFlags(bool grouped_decode, bool device_routed_decode, bool grouped_prefill)
             : old_grouped_(mutableDebugEnv().rocm.moe_grouped_decode),
               old_device_routed_(mutableDebugEnv().rocm.moe_device_routed_decode),
-              old_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+              old_prefill_(mutableDebugEnv().gpu_moe.grouped_prefill)
         {
             mutableDebugEnv().rocm.moe_grouped_decode = grouped_decode;
             mutableDebugEnv().rocm.moe_device_routed_decode = device_routed_decode;
-            mutableDebugEnv().rocm.moe_grouped_prefill = grouped_prefill;
+            mutableDebugEnv().gpu_moe.grouped_prefill = grouped_prefill;
         }
 
-        ~ScopedRocmMoEFlags()
+        ~ScopedMoEGraphCaptureFlags()
         {
             mutableDebugEnv().rocm.moe_grouped_decode = old_grouped_;
             mutableDebugEnv().rocm.moe_device_routed_decode = old_device_routed_;
-            mutableDebugEnv().rocm.moe_grouped_prefill = old_prefill_;
+            mutableDebugEnv().gpu_moe.grouped_prefill = old_prefill_;
         }
 
     private:
@@ -154,6 +154,8 @@ namespace
         mutable int gateup_table_uploads = 0;
         mutable int down_table_uploads = 0;
         mutable int fused_runtime_decode_calls = 0;
+        mutable MoEDecodeDescriptorSource last_fused_descriptor_source =
+            MoEDecodeDescriptorSource::RuntimePlacementTable;
 
         bool supports_device(int) const override { return true; }
         bool route(const float *, const float *, int, int, int, int, bool,
@@ -191,9 +193,12 @@ namespace
             int,
             ITensor *,
             int,
-            int) override
+            int,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::RuntimePlacementTable) override
         {
             ++fused_runtime_decode_calls;
+            last_fused_descriptor_source = descriptor_source;
             return true;
         }
     };
@@ -329,7 +334,7 @@ protected:
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     MoERoutingStage stage(params);
@@ -348,7 +353,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     MoERoutingStage stage(params);
@@ -371,7 +376,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 
 TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplaySeqLenOneUsesPrefillCaptureContract)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto input = TestTensorFactory::createFP32({1, D_MODEL});
     auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
@@ -414,7 +419,7 @@ TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplaySeqLenOneUsesPrefi
 
 TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplayDoesNotFallBackToDecodeCapture)
 {
-    ScopedRocmMoEFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true, false);
 
     auto input = TestTensorFactory::createFP32({1, D_MODEL});
     auto output_indices = TestTensorFactory::createFP32({TOP_K, 1});
@@ -448,7 +453,7 @@ TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplayDoesNotFallBackToD
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsOnCPU)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.device_id = DeviceId::cpu();
@@ -460,7 +465,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsOnCPU)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWhenGroupedPrefillDisabled)
 {
-    ScopedRocmMoEFlags flags(true, true, false); // grouped_prefill = false
+    ScopedMoEGraphCaptureFlags flags(true, true, false); // GPU grouped-prefill = false
 
     auto params = makeValidPrefillParams();
     MoERoutingStage stage(params);
@@ -468,12 +473,12 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWhenGroupedPrefillDisabled)
 
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable())
-        << "Prefill routing should not be capturable when moe_grouped_prefill is disabled";
+        << "Prefill routing should not be capturable when gpu_moe_grouped_prefill is disabled";
 }
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullInput)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.input = nullptr;
@@ -485,7 +490,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullInput)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullGateWeights)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.gate_weights = nullptr;
@@ -497,7 +502,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullGateWeights)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputIndices)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.output_indices = nullptr;
@@ -509,7 +514,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputIndices)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputWeights)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.output_weights = nullptr;
@@ -521,7 +526,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithNullOutputWeights)
 
 TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsInvalidTopK)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     // top_k = 0
     {
@@ -544,7 +549,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsInvalidTopK)
 
 TEST_F(MoERoutingPrefillGraphCapture, NeedsOnGraphReplayedForPrefill)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     DecodeExpertHistogramConfig histogram_config;
@@ -639,13 +644,13 @@ protected:
 
 TEST_F(MoEExpertPrefillGraphCapture, FixedTopologyCapturableWhenReady)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable())
         << "Fixed-topology grouped prefill should be capturable with all engines ready";
@@ -657,13 +662,13 @@ TEST_F(MoEExpertPrefillGraphCapture, FixedTopologyCapturableWhenReady)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     MoEExpertComputeStage stage(params);
     // moe_kernel_ left nullptr
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
         << "Cold padded preflight should allow fixed-topology MoE before kernel warmup";
 #else
@@ -671,7 +676,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
 #endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Should not be capturable without MoE kernel";
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
 #else
     EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
@@ -680,7 +685,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithoutKernel)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsOnCPU)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.device_id = DeviceId::cpu();
@@ -692,7 +697,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsOnCPU)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWhenGroupedPrefillDisabled)
 {
-    ScopedRocmMoEFlags flags(true, true, false); // grouped_prefill = false
+    ScopedMoEGraphCaptureFlags flags(true, true, false); // GPU grouped-prefill = false
 
     auto params = makeValidPrefillParams();
     MoEExpertComputeStage stage(params);
@@ -703,7 +708,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWhenGroupedPrefillDisabled)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.local_expert_count = NUM_EXPERTS - 1; // not full
@@ -716,7 +721,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithPartialExpertOwnership)
 
 TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFullOwnership)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto expect_backend = [&](DeviceId device, bool backend_supported, const char *backend_name)
     {
@@ -756,7 +761,7 @@ TEST_F(MoEExpertPrefillGraphCapture, ForcedDecodeReplayFixedTopologyRequiresFull
 
 TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEnginesOnly)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.expert_mask = {true, false, true, false};
@@ -769,7 +774,7 @@ TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEngin
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable())
         << "Masked LocalTP prefill should capture when local expert engines are ready";
@@ -781,7 +786,7 @@ TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyCapturableWithLocalEngin
 
 TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyRejectsMissingLocalEngine)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.expert_mask = {true, false, true, false};
@@ -794,22 +799,26 @@ TEST_F(MoEExpertPrefillGraphCapture, MaskedFixedTopologyRejectsMissingLocalEngin
         << "Masked LocalTP prefill still needs every locally computed expert engine";
 }
 
-TEST_F(MoEExpertPrefillGraphCapture, RejectsWithReplicas)
+TEST_F(MoEExpertPrefillGraphCapture, AllowsFixedTopologyPrefillWithReplicas)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.replica_set.num_replicated = 1;
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
-    EXPECT_FALSE(stage.isGraphCapturable())
-        << "Should reject when replicas are active";
+#if defined(HAVE_ROCM)
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Regular fixed-topology prefill can capture with a static replica topology";
+#else
+    EXPECT_FALSE(stage.isGraphCapturable());
+#endif
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsWithMissingGemmEngines)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     // One expert has null gate GEMM
@@ -824,7 +833,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsWithMissingGemmEngines)
 
 TEST_F(MoEExpertPrefillGraphCapture, RejectsDecodeSeqLen)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto params = makeValidPrefillParams();
     params.seq_len = 1; // decode — should not hit fixed-topology prefill path
@@ -840,7 +849,7 @@ TEST_F(MoEExpertPrefillGraphCapture, RejectsDecodeSeqLen)
 
 TEST_F(MoEExpertPrefillGraphCapture, DeviceRoutedDecodeRequiresFusedRuntimeWarmupBeforeCapture)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
     ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
@@ -886,10 +895,34 @@ TEST_F(MoEExpertPrefillGraphCapture, DeviceRoutedDecodeRequiresFusedRuntimeWarmu
 #endif
 }
 
+TEST_F(MoEExpertPrefillGraphCapture, RuntimeDecodeDescriptorSourceDefaultsToStaticTables)
+{
+    MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, routingRuntimeUpdate(1, NUM_EXPERTS, D_MODEL)));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+    auto params = makeValidPrefillParams();
+    params.seq_len = 1;
+    params.layer_idx = 0;
+    params.moe_runtime_table = &runtime_table;
+
+    MoEExpertComputeStage static_stage(params);
+    EXPECT_EQ(static_stage.runtimeDecodeDescriptorSourceForTesting(),
+              MoEDecodeDescriptorSource::StaticDescriptorTable)
+        << "Static/off GPU decode should keep using immutable descriptor tables; "
+           "only runtime top-k ids/weights need the runtime table.";
+
+    params.runtime_decode_uses_mutable_descriptors = true;
+    MoEExpertComputeStage mutable_stage(params);
+    EXPECT_EQ(mutable_stage.runtimeDecodeDescriptorSourceForTesting(),
+              MoEDecodeDescriptorSource::RuntimePlacementTable)
+        << "Device-side graph-stable rebalance must opt into mutable runtime descriptors.";
+}
+
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndFusedDecode)
 {
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
 
@@ -914,6 +947,9 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
     EXPECT_EQ(stub_kernel_.fused_runtime_decode_calls, 1)
         << "Fused runtime decode must be warmed on the first post-reset token, "
            "not deferred until after an avoidable capture failure.";
+    EXPECT_EQ(stub_kernel_.last_fused_descriptor_source,
+              MoEDecodeDescriptorSource::StaticDescriptorTable)
+        << "Ordinary runtime-routed decode should use the fast immutable descriptor tables.";
     EXPECT_TRUE(stage.isGraphCapturable())
         << "After the first warmup token, cached graph capture should be armed "
            "without requiring a fallback decode step.";
@@ -925,7 +961,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWithReplicas)
 {
 #if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
 
@@ -999,7 +1035,7 @@ protected:
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequireWarmScratch)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1018,13 +1054,13 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequire
 
     SharedExpertFFNStage stage(params);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
 #else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
 #endif
     EXPECT_FALSE(stage.isGraphCapturable());
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
 #else
     EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
@@ -1033,7 +1069,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportDoesNotRequire
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
 {
-    ScopedRocmMoEFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true, false);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1056,7 +1092,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillPreflightSupportRejectsDisable
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1070,7 +1106,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
     stage.setMoEKernelForTesting(&stub_kernel_);
     stage.setScratchSeqLenForTesting(SEQ_LEN);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.isGraphCapturable())
         << "SharedExpertFFN should be capturable with sufficient scratch";
 #else
@@ -1080,7 +1116,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillCapturableWhenScratchReady)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsInsufficientScratch)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1100,7 +1136,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsInsufficientScratch)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1119,7 +1155,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsWithoutKernel)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertFFNStage::Params params;
     params.device_id = DeviceId::cpu();
@@ -1138,7 +1174,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, PrefillRejectsOnCPU)
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, RocmDecodeCapturableAfterWarmupWhenGroupedRouteIsDisabled)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
     const bool old_shared_grouped = mutableDebugEnv().rocm.shared_expert_grouped_decode;
     mutableDebugEnv().rocm.shared_expert_grouped_decode = false;
 
@@ -1167,7 +1203,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, RocmDecodeCapturableAfterWarmupWhenGr
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPrefillRoute)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1211,7 +1247,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedVerifierSmallMUsesGroupedPre
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuNormalSmallMPrefillDoesNotForceGroupedVerifierRoute)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto expect_backend = [&](DeviceId device, const char *backend_name)
     {
@@ -1238,7 +1274,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuNormalSmallMPrefillDoesNotForceGro
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPrefillRoute)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1278,7 +1314,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayKeepsGroupedPref
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupedPrefillWarmup)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1312,13 +1348,13 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupe
             << " forced verifier replay must not depend on the normal grouped-decode warmed flag";
     };
 
-#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_CUDA)
     expect_backend(DeviceId::cuda(0), true, "CUDA");
 #else
     expect_backend(DeviceId::cuda(0), false, "CUDA");
 #endif
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     expect_backend(DeviceId::rocm(0), true, "ROCm");
 #else
     expect_backend(DeviceId::rocm(0), false, "ROCm");
@@ -1327,7 +1363,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, ForcedDecodeReplayCapturesAfterGroupe
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPrefillReadiness)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1373,11 +1409,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPr
             << backend_name << " reset must preserve warmed verifier-prefill capture readiness";
     };
 
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-    constexpr bool kGraphCaptureSupportedInThisBuild = false;
-#else
     constexpr bool kGraphCaptureSupportedInThisBuild = true;
-#endif
 
 #if defined(HAVE_CUDA)
     expect_backend(DeviceId::cuda(0), true, kGraphCaptureSupportedInThisBuild, "CUDA");
@@ -1394,7 +1426,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, SessionResetPreservesForcedVerifierPr
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGroupedTableRoute)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, false);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1414,12 +1446,13 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGr
     SharedExpertFFNStage stage(params);
     EXPECT_FALSE(stage.usesGroupedVerifierPrefillRouteForTesting())
         << "Normal CUDA shared-expert decode must not borrow the verifier-only grouped prefill route";
-#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_CUDA)
     EXPECT_TRUE(stage.usesGroupedDecodeForTesting())
         << "CUDA shared-expert normal decode should use the grouped table route once its "
            "pointer arrays are declared in graph-owned workspace.";
     EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
-        << "Cold grouped decode must execute one warmup pass to upload runtime pointer arrays";
+        << "Cold grouped decode must execute one warmup pass to upload runtime pointer arrays "
+           "without depending on grouped-prefill graph support.";
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Grouped decode is not capturable until the warmup pass has populated pointer arrays.";
     stage.setMoEKernelForTesting(&stub_kernel_);
@@ -1427,6 +1460,9 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGr
     stage.setGroupedDecodeWarmedForTesting(true);
     EXPECT_TRUE(stage.isGraphCapturable())
         << "After successful warmup, grouped decode is safe for graph capture.";
+    stage.resetSessionStatePreservingCapturedReplay();
+    EXPECT_TRUE(stage.isGraphCapturable())
+        << "Preserving captured replay must keep workspace-backed grouped decode tables warm.";
     stage.resetSessionState();
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Session reset clears backend pointer-table readiness, so grouped decode must warm again.";
@@ -1443,7 +1479,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, CudaNormalDecodeUsesWorkspaceBackedGr
 
 TEST_F(SharedExpertFFNPrefillGraphCapture, GpuForcedDecodeReplayRequiresGroupedPrefillEnabled)
 {
-    ScopedRocmMoEFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true, false);
 
     auto gate_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
     auto up_w = TestTensorFactory::createFP32({INTERMEDIATE, D_MODEL});
@@ -1499,7 +1535,7 @@ protected:
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWithKernel)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1512,7 +1548,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWit
     SharedExpertGateStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_FALSE(stage.isGraphCapturable())
         << "A host-only shared-expert gate vector would force an H2D during "
         << "graph capture; warmup must make the effective gate tensor resident first.";
@@ -1528,7 +1564,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRequiresDeviceResidentGateWit
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1541,14 +1577,14 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
     SharedExpertGateStage stage(params);
     // moe_kernel_ left nullptr
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
         << "Cold padded preflight should allow shared gate before kernel warmup";
 #else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
 #endif
     EXPECT_FALSE(stage.isGraphCapturable());
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
 #else
     EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
@@ -1557,7 +1593,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillRejectsWithoutKernel)
 
 TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWithoutKernel)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1581,7 +1617,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWit
 
 TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabledGroupedPrefill)
 {
-    ScopedRocmMoEFlags flags(true, true, false);
+    ScopedMoEGraphCaptureFlags flags(true, true, false);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::rocm(0);
@@ -1597,7 +1633,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, PrefillPreflightSupportRejectsDisabl
 
 TEST_F(SharedExpertGatePrefillGraphCapture, RejectsOnCPU)
 {
-    ScopedRocmMoEFlags flags(true, true, true);
+    ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     SharedExpertGateStage::Params params;
     params.device_id = DeviceId::cpu();

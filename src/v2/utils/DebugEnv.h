@@ -80,7 +80,9 @@ namespace llaminar2
             static const std::vector<const char *> names = {
                 "LLAMINAR_PREFILL_GRAPH_BUCKETS",
                 "LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES",
+                "LLAMINAR_PREFILL_GRAPH_REQUIRED",
                 "LLAMINAR_GPU_GRAPHS",
+                "LLAMINAR_ALLREDUCE_PRECISION",
                 "LLAMINAR_MOE_REBALANCE",
                 "LLAMINAR_MOE_REBALANCE_WINDOW",
                 "LLAMINAR_MOE_REBALANCE_MAX_WINDOW",
@@ -347,6 +349,8 @@ namespace llaminar2
         int cuda_moe_gateup_kparts = 16;          ///< K partitions for grouped MoE gate/up decode projection on CUDA (LLAMINAR_CUDA_MOE_GATEUP_KPARTS, valid 2|4|8|16|32, default 16)
         bool cuda_moe_down_kpart_decode = true;   ///< Enable K-partitioned grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPART_DECODE, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_down_kparts = 16;            ///< K partitions for grouped MoE SwiGLU down decode projection on CUDA (LLAMINAR_CUDA_MOE_DOWN_KPARTS, valid 2|4|8|16, default 16)
+        bool cuda_moe_router_q8 = true;           ///< Enable cached Q8 router gate weights for CUDA MoE decode routing (LLAMINAR_CUDA_MOE_ROUTER_Q8, disabled by LLAMINAR_DETERMINISTIC)
+        bool cuda_moe_reuse_router_q8_hidden = true; ///< Reuse CUDA router Q8 hidden/scales for grouped gate/up decode when safe (LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN, disabled by LLAMINAR_DETERMINISTIC)
         int cuda_moe_prefill_tile_m = 0;          ///< Tokens-per-block override for grouped MoE prefill on CUDA (LLAMINAR_CUDA_MOE_PREFILL_TILE_M, valid 0|2|4|8|16, default 0=auto)
         bool cuda_moe_prefill_fuse_swiglu = true; ///< Fuse SwiGLU + blockwise int8 quant into the grouped MoE prefill gate/up GEMM epilogue, eliminating the FP32 gate/up global round-trip + separate swiglu_quantize launch (LLAMINAR_CUDA_MOE_PREFILL_FUSE_SWIGLU, default ON)
 
@@ -525,6 +529,23 @@ namespace llaminar2
             // Split-K reduction reorders the accumulation; disable for determinism.
             if (deterministic)
                 cuda_moe_down_kpart_decode = false;
+
+            // CUDA MoE decode router Q8 path mirrors ROCm's cached Q8 router.
+            // It reduces router GEMV traffic and lets the grouped gate/up decode
+            // reuse the same hidden quantization in production runtime-table flow.
+            cuda_moe_router_q8 = true;
+            cuda_moe_reuse_router_q8_hidden = true;
+            const char *moe_router_q8_env = std::getenv("LLAMINAR_CUDA_MOE_ROUTER_Q8");
+            if (moe_router_q8_env)
+                cuda_moe_router_q8 = (std::atoi(moe_router_q8_env) != 0);
+            const char *moe_reuse_router_q8_hidden_env = std::getenv("LLAMINAR_CUDA_MOE_REUSE_ROUTER_Q8_HIDDEN");
+            if (moe_reuse_router_q8_hidden_env)
+                cuda_moe_reuse_router_q8_hidden = (std::atoi(moe_reuse_router_q8_hidden_env) != 0);
+            if (deterministic)
+            {
+                cuda_moe_router_q8 = false;
+                cuda_moe_reuse_router_q8_hidden = false;
+            }
 
             // CUDA grouped MoE prefill tokens-per-block (kTileM). Default auto
             // chooses 2/4 for MTP verifier rows and 16 for larger prompt prefill.
@@ -904,9 +925,9 @@ namespace llaminar2
      *   LLAMINAR_USE_GRAPH_BUFFER_MANAGEMENT - Use DeviceGraphBufferManager for buffers (default: 1 - ON)
      *   LLAMINAR_EXEC_FULL_FORWARD         - Use full forward graph execution (default: 1 - ON)
      *   LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED - Allow segmented GPU-graph replay for decode graphs
-     *                                        containing collectives (default: 0 - OFF, experimental)
-     *   LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES - Capture LocalTP NCCL/RCCL collectives directly into
-     *                                        decode GPU graphs (default: 0 - OFF, experimental)
+     *                                        containing collectives (default: 0 - OFF, diagnostic fallback)
+     *   LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES - Capture homogeneous LocalTP NCCL/RCCL collectives directly
+     *                                        into decode GPU graphs (default: 1 - ON)
      *
      * Device Placement / Heterogeneous Execution:
      *   LLAMINAR_CPU_PREFILL_PARTICIPATE   - Enable CPU participation in PREFILL phase (default: 0 - OFF)
@@ -949,7 +970,7 @@ namespace llaminar2
         bool gpu_graph_recapture = false;                                      ///< Re-capture each decode step instead of replaying cached graph (default: OFF, env: LLAMINAR_GPU_GRAPH_RECAPTURE)
         int gpu_graph_max_stages = 0;                                          ///< Max stages per capturable segment (0=unlimited, env: LLAMINAR_GPU_GRAPH_MAX_STAGES)
         bool gpu_graph_collective_segmented = false;                           ///< Enable segmented replay for collective decode graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED)
-        bool gpu_graph_capture_collectives = false;                            ///< Capture homogeneous LocalTP NCCL/RCCL collectives inside decode GPU graphs (default: OFF, env: LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES)
+        bool gpu_graph_capture_collectives = true;                             ///< Capture homogeneous LocalTP NCCL/RCCL collectives inside decode GPU graphs (default: ON, env: LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES=0 to opt out)
         bool gpu_graph_defer_captured_collective_final_sync = false;           ///< Allow final-sync deferral when collective nodes are captured in the replay graph (env: LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC)
         std::vector<std::string> gpu_graph_collective_segmented_capture_allow; ///< Optional stage-name allowlist for segmented collective capture (env: LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED_CAPTURE_ALLOW)
         bool gpu_graph_stream_only = false;                                    ///< Execute segmented path on stream-only mode (env: LLAMINAR_GPU_GRAPH_STREAM_ONLY)
@@ -963,6 +984,7 @@ namespace llaminar2
         int prefill_graph_min_seq = 256;                                                                                                                               ///< Minimum seq_len for prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_MIN_SEQ)
         bool prefill_graph_trace = false;                                                                                                                              ///< Verbose prefill graph phase/failure logging (env: LLAMINAR_PREFILL_GRAPH_TRACE)
         bool prefill_graph_buckets = true;                                                                                                                             ///< Enable bucketed prefill graph capture by default (env: LLAMINAR_PREFILL_GRAPH_BUCKETS=0 to opt out)
+        bool prefill_graph_required = false;                                                                                                                           ///< Fail benchmark/runtime probes if eligible prefill does not capture/replay (env: LLAMINAR_PREFILL_GRAPH_REQUIRED)
         std::vector<int> prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes(); ///< Bucket lengths for bucketed prefill graph capture (env: LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES)
         int prefill_graph_max_cached_buckets = 10;                                                                                                                     ///< Maximum cached prefill graph bucket entries (env: LLAMINAR_PREFILL_GRAPH_MAX_BUCKETS)
         int prefill_graph_pad_token_id = 0;                                                                                                                            ///< Token ID used for host-side bucket padding (env: LLAMINAR_PREFILL_GRAPH_PAD_TOKEN_ID)
@@ -1047,6 +1069,18 @@ namespace llaminar2
 
         void reload()
         {
+            fast_decode = true;
+            gpu_graphs = true;
+            gpu_graph_verify = false;
+            gpu_graph_recapture = false;
+            gpu_graph_max_stages = 0;
+            gpu_graph_collective_segmented = false;
+            gpu_graph_capture_collectives = true;
+            gpu_graph_defer_captured_collective_final_sync = false;
+            gpu_graph_stream_only = false;
+            gpu_graph_stream_only_default = false;
+            gpu_graph_trace_replay = false;
+
             const char *use_exec_env = std::getenv("LLAMINAR_USE_LAYER_EXECUTOR");
             if (use_exec_env)
             {
@@ -1204,6 +1238,16 @@ namespace llaminar2
             if (prefill_graph_buckets_env)
             {
                 prefill_graph_buckets = (std::atoi(prefill_graph_buckets_env) != 0);
+            }
+
+            const char *prefill_graph_required_env = std::getenv("LLAMINAR_PREFILL_GRAPH_REQUIRED");
+            if (prefill_graph_required_env)
+            {
+                prefill_graph_required = (std::atoi(prefill_graph_required_env) != 0);
+            }
+            else
+            {
+                prefill_graph_required = false;
             }
 
             prefill_graph_bucket_sizes = defaultPrefillGraphBucketSizes();
@@ -2707,7 +2751,6 @@ namespace llaminar2
         int moe_gateup_kparts = 4;                 ///< K partitions for grouped MoE gate/up decode projection (LLAMINAR_ROCM_MOE_GATEUP_KPARTS)
         bool moe_gateup_swiglu_quant_fused = true; ///< Fuse K-part gate/up reduce into grouped SwiGLU Q8 quantization (LLAMINAR_ROCM_MOE_GATEUP_SWIGLU_QUANT_FUSED, disabled by LLAMINAR_DETERMINISTIC)
         bool moe_device_routed_decode = true;      ///< Enable runtime-table device routed MoE decode (LLAMINAR_ROCM_MOE_DEVICE_ROUTED_DECODE)
-        bool moe_grouped_prefill = true;           ///< Enable grouped MoE prefill path when supported (LLAMINAR_ROCM_MOE_GROUPED_PREFILL)
         int moe_prefill_tile_m = 0;                ///< Tokens-per-block override for grouped MoE prefill on ROCm (LLAMINAR_ROCM_MOE_PREFILL_TILE_M, valid 0|2|4|8, default 0=auto)
         int topk_smallk_partial_blocks = 0;        ///< Override small-k top-k partial block cap (LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS, valid 0|16|32|64|128; 0=auto)
 
@@ -2794,7 +2837,6 @@ namespace llaminar2
             moe_gateup_kparts = 4;
             moe_gateup_swiglu_quant_fused = true;
             moe_device_routed_decode = true;
-            moe_grouped_prefill = true;
             moe_prefill_tile_m = 0;
             topk_smallk_partial_blocks = 0;
             repack_slots = 3;
@@ -3248,11 +3290,6 @@ namespace llaminar2
                 moe_device_routed_decode = (std::atoi(moe_device_routed_decode_env) != 0);
             }
 
-            const char *moe_grouped_prefill_env = std::getenv("LLAMINAR_ROCM_MOE_GROUPED_PREFILL");
-            if (moe_grouped_prefill_env)
-            {
-                moe_grouped_prefill = (std::atoi(moe_grouped_prefill_env) != 0);
-            }
             const char *moe_prefill_tile_m_env = std::getenv("LLAMINAR_ROCM_MOE_PREFILL_TILE_M");
             if (moe_prefill_tile_m_env)
             {
@@ -3404,10 +3441,123 @@ namespace llaminar2
             int gpu_cache_experts_per_layer = 0;
             /// Experts per rolling GPU-direct transfer wave.
             /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS)
-            int gpu_direct_transfer_wave_experts = 16;
+            ///
+            /// Keep the default tight: larger captured payload waves reduce
+            /// overflows but regressed Qwen3.6 CUDA2 512-token decode in the
+            /// device-controller path.
+            int gpu_direct_transfer_wave_experts = 2;
             /// Number of transfer staging waves to reserve. 2 enables double buffering.
             /// (env: LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS)
             int gpu_direct_transfer_buffers = 2;
+            /// Insert the graph-native device-side rebalance controller into
+            /// homogeneous GPU decode graphs. Enabled by default so homogeneous
+            /// same-backend dynamic rebalance avoids host publish/apply; set the
+            /// env var to 0 to force the older host-window diagnostic path. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER)
+            bool device_rebalance_graph_controller = true;
+            /// Run graph-stable GPU rebalance planning/copy as a captured
+            /// maintenance graph instead of embedding the producer in decode.
+            /// Enabled by default with the device-side controller so histogram
+            /// traffic stays off per-token decode collectives. Set the env var
+            /// to 0 only for host-path diagnostics. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH)
+            bool device_rebalance_maintenance_graph = true;
+            /// Obsolete legacy collective-allgather transfer fallback. The
+            /// graph-side rebalance selector now rejects this path because it
+            /// moves fixed payload arenas with empty expert slots. (env:
+            /// LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER)
+            bool allow_legacy_collective_rebalance_transfer = false;
+            /// Obsolete fixed-size expert payload arena sideband. The graph-side
+            /// rebalance selector now rejects this path because it moves empty
+            /// expert slots; a future payload lane must transfer only compact
+            /// non-empty arrivals. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND)
+            bool device_rebalance_payload_sideband = false;
+            /// Layers planned by each captured device-side rebalance replay.
+            /// 0 means the whole configured layer window; the production
+            /// default is a one-layer rolling wave until transfer/compute
+            /// overlap is strong enough to hide larger waves. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE)
+            int device_rebalance_layer_wave_count = 1;
+            /// Captured compact payload slots per maintenance replay. This is
+            /// separate from the physical staging pool so the pool can remain
+            /// double-buffered while the graph-captured NCCL/RCCL payload lane
+            /// moves a tighter bucket. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS)
+            int device_rebalance_compact_payload_slots = 1;
+            /// Keep a ready-wave apply poll in the steady decode graph while
+            /// async maintenance graph mode is active. Disabled by default so
+            /// no-op maintenance does not add a per-token decode-stage launch;
+            /// enable only when measuring immediate post-transfer visibility.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL)
+            bool device_rebalance_decode_apply_poll = false;
+            /// Extra decode forwards to wait before launching the async
+            /// maintenance graph. The device-side readiness gate still uses
+            /// the configured rebalance window. Defaulting to one token avoids
+            /// replaying a maintenance graph on a nearly-full rolling histogram
+            /// window; CUDA2 Qwen3.6 probes saw 2047/2048 routed slots at zero
+            /// slack and action-producing windows at one-token slack.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS)
+            int device_rebalance_maintenance_slack_tokens = 1;
+            /// Minimum decode-token period for async maintenance graph replay
+            /// after the optional first replay. The rebalance policy window
+            /// still controls readiness; this only prevents over-frequent
+            /// host-scheduled graph replays while the device-side graph
+            /// scheduler is not yet the steady-state owner. Set to 0 to run
+            /// exactly at window+slack cadence. CUDA2/ROCm2 Qwen3.6 clean
+            /// 512-token probes recovered the healthiest shared cadence with
+            /// a delayed first replay at 321 tokens and a 512-token floor.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS)
+            int device_rebalance_min_maintenance_period_tokens = 512;
+            /// Optional first async maintenance graph replay period. When set
+            /// above zero, the first replay happens at this decode-token count,
+            /// then later replays use the normal minimum maintenance period.
+            /// The default waits until the first observed 512-token Qwen3.6
+            /// decode window contains enough stable signal for both CUDA and
+            /// ROCm hot-cache placement. Set to 0 to use the regular cadence
+            /// from token zero. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS)
+            int device_rebalance_initial_maintenance_period_tokens = 321;
+            /// Number of scheduled maintenance periods to skip after a
+            /// completed maintenance replay selects no replicas/arrivals. This
+            /// is an interim host-scheduler guard until device-selected
+            /// zero/payload bucket graph bodies remove empty payload-lane
+            /// replays entirely. Set to 0 to disable. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS)
+            int device_rebalance_no_work_backoff_periods = 1;
+            /// Compute projected pre/post participant load-spread diagnostics
+            /// inside the device-side controller. Disabled by default because
+            /// it adds per-expert policy work on the rebalance path. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS)
+            bool device_rebalance_collect_load_stats = false;
+            /// Minimum absolute hot-replica spread improvement required before
+            /// scheduling a GPU rebalance arrival. CUDA2 Qwen3.6 decode
+            /// windows are now dense enough that 64 keeps the useful
+            /// hot-cache moves while rejecting lower-value transfer churn.
+            /// Set to 0 to allow any positive
+            /// improvement. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT)
+            int device_rebalance_min_load_spread_improvement = 64;
+            /// Additional relative spread-improvement floor:
+            /// required >= current_total / divisor. Set to 0 to disable.
+            /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR)
+            int device_rebalance_min_load_spread_improvement_divisor = 128;
+            /// Optional wave-level transfer value gate. When nonzero, a
+            /// transfer-backed maintenance wave must have at least this much
+            /// accepted load-spread improvement per requested compact payload
+            /// slot before publishing arrivals. Set to 0 to disable while
+            /// backend economics are still being tuned. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT)
+            int device_rebalance_min_wave_spread_improvement_per_payload_slot = 0;
+            /// Realized router-benefit gate. When nonzero and the
+            /// current wave already has active local hot-cache replicas, the
+            /// previous router window must have produced at least this much
+            /// spread improvement per requested compact payload slot before
+            /// scheduling another transfer-backed wave. This keeps bootstrap
+            /// arrivals allowed while rejecting steady-state hot-cache churn
+            /// that the router is not using. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT)
+            int device_rebalance_min_router_spread_improvement_per_payload_slot = 1;
             /// Release raw expert weight data after eager packed-weight preparation.
             /// Enabled by default; set LLAMINAR_MOE_RELEASE_RAW_WEIGHTS=0 to opt out.
             bool release_raw_weights = true;
@@ -3435,6 +3585,16 @@ namespace llaminar2
             /// CSV output path. Truthy env values use this default; non-bool env values are paths.
             std::string profile_csv_path = "/tmp/llaminar_moe_ep_profile.csv";
         } moe_expert_overlay;
+
+        /// Backend-neutral GPU MoE execution feature gates.
+        struct
+        {
+            /// Enable fixed-topology grouped MoE prefill when CUDA/ROCm support it.
+            /// This path is the graph-capturable prefill dispatch contract for
+            /// homogeneous GPU LocalTP MoE domains. (env:
+            /// LLAMINAR_GPU_MOE_GROUPED_PREFILL)
+            bool grouped_prefill = true;
+        } gpu_moe;
 
         bool tp_timing = false;                    ///< Enable TP forward timing breakdown (env: LLAMINAR_TP_TIMING)
         bool skip_allreduce = false;               ///< DIAGNOSTIC: Skip allreduce for profiling (env: LLAMINAR_SKIP_ALLREDUCE)
@@ -3591,6 +3751,13 @@ namespace llaminar2
                 gpu_vram_preflight_min_margin_mib = std::max(0, std::atoi(min_mib));
         }
 
+        void reloadGpuMoEEnv()
+        {
+            gpu_moe.grouped_prefill = true;
+            if (const char *grouped_prefill = std::getenv("LLAMINAR_GPU_MOE_GROUPED_PREFILL"))
+                gpu_moe.grouped_prefill = (std::atoi(grouped_prefill) != 0);
+        }
+
         DebugEnv()
         {
             const char *tp_env = std::getenv("LLAMINAR_TP_TIMING");
@@ -3622,6 +3789,7 @@ namespace llaminar2
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
             reloadGpuVramPreflightEnv();
+            reloadGpuMoEEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             const char *act_rot = std::getenv("LLAMINAR_ACTIVATION_ROTATION");
@@ -3658,6 +3826,66 @@ namespace llaminar2
                 moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
             if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
                 moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
+            if (const char *moe_graph_controller = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER"))
+                moe_rebalance.device_rebalance_graph_controller =
+                    (std::atoi(moe_graph_controller) != 0);
+            if (const char *moe_maintenance_graph = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH"))
+                moe_rebalance.device_rebalance_maintenance_graph =
+                    (std::atoi(moe_maintenance_graph) != 0);
+            if (const char *moe_legacy_collective_transfer =
+                    std::getenv("LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER"))
+                moe_rebalance.allow_legacy_collective_rebalance_transfer =
+                    (std::atoi(moe_legacy_collective_transfer) != 0);
+            if (const char *moe_payload_sideband =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND"))
+                moe_rebalance.device_rebalance_payload_sideband =
+                    (std::atoi(moe_payload_sideband) != 0);
+            if (const char *moe_layer_wave = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE"))
+                moe_rebalance.device_rebalance_layer_wave_count =
+                    std::max(0, std::atoi(moe_layer_wave));
+            if (const char *moe_payload_slots =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS"))
+                moe_rebalance.device_rebalance_compact_payload_slots =
+                    std::max(1, std::atoi(moe_payload_slots));
+            if (const char *moe_decode_apply_poll =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL"))
+                moe_rebalance.device_rebalance_decode_apply_poll =
+                    (std::atoi(moe_decode_apply_poll) != 0);
+            if (const char *moe_maintenance_slack =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
+                moe_rebalance.device_rebalance_maintenance_slack_tokens =
+                    std::max(0, std::atoi(moe_maintenance_slack));
+            if (const char *moe_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_min_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_maintenance_period));
+            if (const char *moe_initial_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_initial_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_initial_maintenance_period));
+            if (const char *moe_no_work_backoff =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS"))
+                moe_rebalance.device_rebalance_no_work_backoff_periods =
+                    std::max(0, std::atoi(moe_no_work_backoff));
+            if (const char *moe_load_stats = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"))
+                moe_rebalance.device_rebalance_collect_load_stats =
+                    (std::atoi(moe_load_stats) != 0);
+            if (const char *moe_min_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement =
+                    std::max(0, std::atoi(moe_min_improvement));
+            if (const char *moe_min_improvement_divisor =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement_divisor =
+                    std::max(0, std::atoi(moe_min_improvement_divisor));
+            if (const char *moe_min_wave_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_wave_improvement));
+            if (const char *moe_min_router_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_router_improvement));
             const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release_ctor)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
@@ -3697,6 +3925,7 @@ namespace llaminar2
             vram_trace = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_TRACE"));
             vram_bom = isTruthyEnvValue(std::getenv("LLAMINAR_VRAM_BOM"));
             reloadGpuVramPreflightEnv();
+            reloadGpuMoEEnv();
             const char *coh_audit = std::getenv("LLAMINAR_COHERENCE_AUDIT");
             coherence_audit = coh_audit && std::string(coh_audit) == "1";
             activation_rotation = true; // default on
@@ -3737,12 +3966,88 @@ namespace llaminar2
                 moe_gpu_cache = std::getenv("LLAMINAR_MOE_GPU_EXPERT_CACHE_PER_LAYER");
             if (moe_gpu_cache)
                 moe_rebalance.gpu_cache_experts_per_layer = std::atoi(moe_gpu_cache);
-            moe_rebalance.gpu_direct_transfer_wave_experts = 16;
+            moe_rebalance.gpu_direct_transfer_wave_experts = 2;
             if (const char *moe_wave = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS"))
                 moe_rebalance.gpu_direct_transfer_wave_experts = std::max(1, std::atoi(moe_wave));
             moe_rebalance.gpu_direct_transfer_buffers = 2;
             if (const char *moe_buffers = std::getenv("LLAMINAR_MOE_GPU_DIRECT_TRANSFER_BUFFERS"))
                 moe_rebalance.gpu_direct_transfer_buffers = std::max(1, std::atoi(moe_buffers));
+            moe_rebalance.device_rebalance_graph_controller = true;
+            if (const char *moe_graph_controller = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER"))
+                moe_rebalance.device_rebalance_graph_controller =
+                    (std::atoi(moe_graph_controller) != 0);
+            moe_rebalance.device_rebalance_maintenance_graph = true;
+            if (const char *moe_maintenance_graph = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH"))
+                moe_rebalance.device_rebalance_maintenance_graph =
+                    (std::atoi(moe_maintenance_graph) != 0);
+            moe_rebalance.allow_legacy_collective_rebalance_transfer = false;
+            if (const char *moe_legacy_collective_transfer =
+                    std::getenv("LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER"))
+                moe_rebalance.allow_legacy_collective_rebalance_transfer =
+                    (std::atoi(moe_legacy_collective_transfer) != 0);
+            moe_rebalance.device_rebalance_payload_sideband = false;
+            if (const char *moe_payload_sideband =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND"))
+                moe_rebalance.device_rebalance_payload_sideband =
+                    (std::atoi(moe_payload_sideband) != 0);
+            moe_rebalance.device_rebalance_layer_wave_count = 1;
+            if (const char *moe_layer_wave = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE"))
+                moe_rebalance.device_rebalance_layer_wave_count =
+                    std::max(0, std::atoi(moe_layer_wave));
+            moe_rebalance.device_rebalance_compact_payload_slots = 1;
+            if (const char *moe_payload_slots =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS"))
+                moe_rebalance.device_rebalance_compact_payload_slots =
+                    std::max(1, std::atoi(moe_payload_slots));
+            moe_rebalance.device_rebalance_decode_apply_poll = false;
+            if (const char *moe_decode_apply_poll =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL"))
+                moe_rebalance.device_rebalance_decode_apply_poll =
+                    (std::atoi(moe_decode_apply_poll) != 0);
+            moe_rebalance.device_rebalance_maintenance_slack_tokens = 1;
+            if (const char *moe_maintenance_slack =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
+                moe_rebalance.device_rebalance_maintenance_slack_tokens =
+                    std::max(0, std::atoi(moe_maintenance_slack));
+            moe_rebalance.device_rebalance_min_maintenance_period_tokens = 512;
+            if (const char *moe_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_min_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_maintenance_period));
+            moe_rebalance.device_rebalance_initial_maintenance_period_tokens = 321;
+            if (const char *moe_initial_maintenance_period =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
+                moe_rebalance.device_rebalance_initial_maintenance_period_tokens =
+                    std::max(0, std::atoi(moe_initial_maintenance_period));
+            moe_rebalance.device_rebalance_no_work_backoff_periods = 1;
+            if (const char *moe_no_work_backoff =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS"))
+                moe_rebalance.device_rebalance_no_work_backoff_periods =
+                    std::max(0, std::atoi(moe_no_work_backoff));
+            moe_rebalance.device_rebalance_collect_load_stats = false;
+            if (const char *moe_load_stats = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"))
+                moe_rebalance.device_rebalance_collect_load_stats =
+                    (std::atoi(moe_load_stats) != 0);
+            moe_rebalance.device_rebalance_min_load_spread_improvement = 64;
+            if (const char *moe_min_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement =
+                    std::max(0, std::atoi(moe_min_improvement));
+            moe_rebalance.device_rebalance_min_load_spread_improvement_divisor = 128;
+            if (const char *moe_min_improvement_divisor =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"))
+                moe_rebalance.device_rebalance_min_load_spread_improvement_divisor =
+                    std::max(0, std::atoi(moe_min_improvement_divisor));
+            moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot = 0;
+            if (const char *moe_min_wave_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_wave_improvement));
+            moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot = 1;
+            if (const char *moe_min_router_improvement =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
+                moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot =
+                    std::max(0, std::atoi(moe_min_router_improvement));
             moe_rebalance.release_raw_weights = true;
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)

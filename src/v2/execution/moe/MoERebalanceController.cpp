@@ -9,12 +9,91 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <iomanip>
 
 namespace llaminar2
 {
+    namespace
+    {
+        ExpertLoadImbalanceStats imbalanceStatsFromParticipantLoads(
+            const std::vector<std::vector<uint64_t>> &layer_loads)
+        {
+            ExpertLoadImbalanceStats stats;
+            stats.layer_count = static_cast<int>(layer_loads.size());
+
+            double ratio_sum = 0.0;
+            double spread_sum = 0.0;
+            for (int layer_idx = 0; layer_idx < static_cast<int>(layer_loads.size()); ++layer_idx)
+            {
+                const auto &loads = layer_loads[static_cast<size_t>(layer_idx)];
+                if (loads.empty())
+                    continue;
+
+                const uint64_t total =
+                    std::accumulate(loads.begin(), loads.end(), uint64_t{0});
+                if (total == 0)
+                    continue;
+
+                ++stats.active_layer_count;
+                stats.total_activations += total;
+
+                const auto [min_it, max_it] = std::minmax_element(loads.begin(), loads.end());
+                const uint64_t min_load = *min_it;
+                const uint64_t max_load = *max_it;
+                const double spread =
+                    max_load > 0
+                        ? static_cast<double>(max_load - min_load) / static_cast<double>(max_load)
+                        : 0.0;
+                spread_sum += spread;
+
+                double ratio = 1.0;
+                if (min_load == 0 && max_load > 0)
+                {
+                    ratio = std::numeric_limits<double>::infinity();
+                    ++stats.infinite_ratio_layers;
+                }
+                else if (min_load > 0)
+                {
+                    ratio = static_cast<double>(max_load) / static_cast<double>(min_load);
+                    ratio_sum += ratio;
+                }
+                else
+                {
+                    ratio_sum += ratio;
+                }
+
+                if (stats.worst_layer < 0 || spread > stats.worst_spread)
+                {
+                    stats.worst_spread = spread;
+                    stats.worst_ratio = ratio;
+                    stats.worst_layer = layer_idx;
+                }
+            }
+
+            stats.valid = stats.active_layer_count > 0;
+            if (!stats.valid)
+                return stats;
+
+            stats.average_spread =
+                spread_sum / static_cast<double>(stats.active_layer_count);
+            if (stats.infinite_ratio_layers > 0)
+            {
+                stats.average_ratio = std::numeric_limits<double>::infinity();
+                stats.worst_ratio = std::numeric_limits<double>::infinity();
+            }
+            else
+            {
+                stats.average_ratio =
+                    ratio_sum / static_cast<double>(stats.active_layer_count);
+            }
+
+            return stats;
+        }
+    }
+
     const char *toString(MoERebalanceDecisionReason reason)
     {
         switch (reason)
@@ -456,6 +535,7 @@ namespace llaminar2
         hcfg.num_experts = config_.num_experts;
         hcfg.top_k = config_.top_k;
         hcfg.window_size = config_.window_size;
+        hcfg.token_boundary_layer_idx = config_.token_boundary_layer_idx;
         hcfg.sockets = config_.sockets;
         hcfg.expert_to_socket = config_.initial_expert_to_socket;
         histogram_ = std::make_unique<DecodeExpertHistogram>(std::move(hcfg));
@@ -472,6 +552,7 @@ namespace llaminar2
                   << " experts=" << config_.num_experts
                   << " top_k=" << config_.top_k
                   << " window=" << config_.window_size
+                  << " token_boundary_layer=" << config_.token_boundary_layer_idx
                   << " sockets=" << config_.sockets.size());
     }
 
@@ -510,6 +591,9 @@ namespace llaminar2
         if (!rebalancer_ || !histogram_)
             return {};
 
+        last_imbalance_before_ = histogram_->placementImbalance(current_placement_);
+        last_imbalance_after_ = last_imbalance_before_;
+
         auto proposal = rebalancer_->propose(*histogram_);
 
         if (proposal.empty())
@@ -522,6 +606,7 @@ namespace llaminar2
 
         // Apply swaps to get new placement
         auto new_placement = rebalancer_->apply(current_placement_, proposal);
+        last_imbalance_after_ = histogram_->placementImbalance(new_placement);
         current_placement_ = new_placement;
         ++placement_epoch_;
 
@@ -743,6 +828,9 @@ namespace llaminar2
         const int num_experts = config_.num_experts;
         const int num_sockets = static_cast<int>(config_.sockets.size());
 
+        last_imbalance_before_ = histogram_->placementImbalance(current_placement_);
+        last_imbalance_after_ = last_imbalance_before_;
+
         if (num_sockets < 2)
             return;
 
@@ -803,6 +891,7 @@ namespace llaminar2
             if (new_placement[e] != current_placement_[e])
                 experts_moved++;
         }
+        last_imbalance_after_ = histogram_->placementImbalance(new_placement);
 
         // Also compute per-layer imbalance improvement
         float per_layer_before = 0.0f, per_layer_after = 0.0f;
@@ -875,6 +964,9 @@ namespace llaminar2
 
     ExpertReplicaSet MoERebalanceController::proposeReplicas(int max_replicas_per_socket)
     {
+        last_imbalance_before_ = {};
+        last_imbalance_after_ = {};
+
         ExpertReplicaSet result;
         result.domain_id = config_.domain_id;
         result.is_replicated.resize(config_.num_experts, false);
@@ -911,6 +1003,8 @@ namespace llaminar2
 
         if (total_activations == 0 && current_replicas_.num_replicated > 0)
         {
+            last_imbalance_before_ = histogram_->placementImbalance(current_placement_);
+            last_imbalance_after_ = last_imbalance_before_;
             LOG_DEBUG("[MoERebalanceController] No activation signal; preserving "
                       << current_replicas_.num_replicated << " existing expert replica slots");
             return current_replicas_;
@@ -931,6 +1025,8 @@ namespace llaminar2
                 }
             }
         }
+        last_imbalance_before_ = imbalanceStatsFromParticipantLoads(projected_loads);
+        last_imbalance_after_ = last_imbalance_before_;
 
         auto owner_for = [&](int expert)
         {
@@ -963,7 +1059,7 @@ namespace llaminar2
 
         const uint64_t minimum_replica_shift = std::max<uint64_t>(
             2,
-            static_cast<uint64_t>(std::max(1, current_window_size_) / 64));
+            static_cast<uint64_t>(std::max(1, current_window_size_) / 16));
 
         auto admissible_projected_shift = [&](int layer, int expert, int target_socket)
         {
@@ -1120,6 +1216,7 @@ namespace llaminar2
         }
 
         result.rebuildAggregateReplicaFlags();
+        last_imbalance_after_ = imbalanceStatsFromParticipantLoads(projected_loads);
         const bool replica_placement_changed = !current_replicas_.sameReplicaPlacement(result);
         current_replicas_ = result;
         if (replica_placement_changed && result.num_replicated > 0)
@@ -1234,6 +1331,25 @@ namespace llaminar2
                 std::ostringstream val;
                 val << std::fixed << std::setprecision(2) << last_prep_duration_ms_ << " ms";
                 t << "VNNI prep time" << val.str() << fort::endr;
+            }
+
+            if (last_imbalance_before_.valid)
+            {
+                std::ostringstream val;
+                val << std::fixed << std::setprecision(3)
+                    << last_imbalance_before_.average_spread
+                    << " -> " << last_imbalance_after_.average_spread;
+                t << "Avg load spread" << val.str() << fort::endr;
+            }
+
+            if (last_imbalance_before_.valid)
+            {
+                std::ostringstream val;
+                val << std::fixed << std::setprecision(3)
+                    << last_imbalance_before_.worst_spread
+                    << " -> " << last_imbalance_after_.worst_spread
+                    << " (layer " << last_imbalance_before_.worst_layer << ")";
+                t << "Worst load spread" << val.str() << fort::endr;
             }
 
             if (last_avg_imbalance_before_ > 0)

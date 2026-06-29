@@ -9,6 +9,7 @@
 #pragma once
 
 #include "../qwen35/Qwen35Graph.h"
+#include "../../execution/moe/DeviceMoERebalanceController.h"
 #include "../../execution/moe/MoERuntimeTable.h"
 #include <memory>
 #include <string>
@@ -17,6 +18,10 @@
 
 namespace llaminar2
 {
+    class DeviceMoETransferSlotDirectory;
+    class DeviceMoERebalanceTransferState;
+    class ILocalTPContext;
+    class IMoERuntimeTable;
     struct PrefixFingerprintMaterial;
 
     /**
@@ -57,6 +62,11 @@ namespace llaminar2
             int batch_size,
             DeviceId device) override;
 
+        ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
+            DeviceId device,
+            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Plan,
+            uint64_t payload_edge_mask = 0) override;
+
         ComputeGraph buildMTPGraph(
             int depth_idx,
             const MTPDepthWeights &weights,
@@ -89,11 +99,35 @@ namespace llaminar2
             int previous_depth_idx = -1;
         };
 
+        struct GraphSideRebalanceBinding
+        {
+            std::string transfer_key;
+            std::string workspace_name;
+            DeviceId device_id = DeviceId::invalid();
+            ILocalTPContext *decode_tp_ctx = nullptr;
+            ILocalTPContext *maintenance_tp_ctx = nullptr;
+            IMoERuntimeTable *moe_runtime_table = nullptr;
+            int tp_device_idx = -1;
+            DeviceMoERebalanceConfig config;
+            DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr;
+            uint32_t local_transfer_slot_count = 0;
+            DeviceMoERebalanceTransferMode transfer_mode =
+                DeviceMoERebalanceTransferMode::ResidentOnly;
+            uint64_t collective_payload_slot_bytes = 0;
+            uint32_t collective_payload_slot_capacity = 0;
+            std::shared_ptr<DeviceMoERebalanceTransferState> transfer_state;
+            int producer_layer_idx = -1;
+            bool state_sideband_enabled = false;
+        };
+
         IMoERuntimeTable *moeRuntimeTableForDevice(DeviceId device,
                                                    int prefill_token_capacity = 0,
                                                    const std::string &key_suffix = {},
                                                    int num_layers_override = -1,
                                                    bool register_decode_histogram = true);
+        ILocalTPContext *maintenanceTPContextForDomain(
+            const std::string &domain_key,
+            ILocalTPContext &decode_tp_ctx);
 
     protected:
         void registerRuntimeTableHistogramSyncIfNeeded(
@@ -103,6 +137,10 @@ namespace llaminar2
 
     private:
         std::unordered_map<std::string, std::unique_ptr<MoERuntimeTable>> moe_runtime_tables_;
+        std::unordered_map<std::string, std::shared_ptr<DeviceMoETransferSlotDirectory>> moe_transfer_slot_directories_;
+        std::unordered_map<std::string, std::shared_ptr<DeviceMoERebalanceTransferState>> moe_rebalance_transfer_states_;
+        std::unordered_map<std::string, GraphSideRebalanceBinding> moe_graph_rebalance_bindings_;
+        std::unordered_map<std::string, std::shared_ptr<ILocalTPContext>> moe_maintenance_tp_contexts_;
         std::unordered_set<std::string> moe_runtime_histogram_sync_keys_;
         bool mtp_graph_context_active_ = false;
         int mtp_graph_depth_idx_ = -1;

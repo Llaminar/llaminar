@@ -21,6 +21,7 @@
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoEDeviceRebalanceStage.h"
 #include "stages/MoERoutingStage.h"
 #include "stages/ReceiveActivationsStage.h"
 #include "stages/ResidualAddStage.h"
@@ -148,6 +149,12 @@ namespace llaminar2
         const MoESparseReturnReduceStage::Params &params)
     {
         return std::make_unique<MoESparseReturnReduceStage>(params);
+    }
+
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createMoEDeviceRebalance(
+        const MoEDeviceRebalanceStage::Params &params)
+    {
+        return std::make_unique<MoEDeviceRebalanceStage>(params);
     }
 
     std::unique_ptr<IComputeStage> ComputeStageFactory::createSharedExpertFFN(

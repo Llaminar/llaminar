@@ -532,6 +532,26 @@ namespace llaminar2
         HIP_CHECK_VOID(hipEventRecord(hip_event, hip_stream));
     }
 
+    bool AMDDeviceContext::recordEventChecked(void *event, void *stream)
+    {
+        if (!event || !stream)
+        {
+            LOG_ERROR("[AMDDeviceContext] recordEventChecked requires non-null event and stream");
+            return false;
+        }
+
+        hipEvent_t hip_event = static_cast<hipEvent_t>(event);
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+        hipError_t err = hipEventRecord(hip_event, hip_stream);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipEventRecord failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
     void AMDDeviceContext::waitEvent(void *event, void *stream)
     {
         if (event == nullptr)
@@ -545,6 +565,56 @@ namespace llaminar2
 
         // Make the stream wait for the event (GPU-side wait, not CPU blocking)
         HIP_CHECK_VOID(hipStreamWaitEvent(hip_stream, hip_event, 0));
+    }
+
+    bool AMDDeviceContext::waitEventChecked(void *event, void *stream)
+    {
+        if (!event || !stream)
+        {
+            LOG_ERROR("[AMDDeviceContext] waitEventChecked requires non-null event and stream");
+            return false;
+        }
+
+        hipEvent_t hip_event = static_cast<hipEvent_t>(event);
+        hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+        hipError_t err = hipStreamWaitEvent(hip_stream, hip_event, 0);
+        if (err != hipSuccess)
+        {
+            LOG_ERROR("[AMDDeviceContext] hipStreamWaitEvent failed: "
+                      << hipGetErrorString(err));
+            return false;
+        }
+        return true;
+    }
+
+    bool AMDDeviceContext::queryEventChecked(void *event, bool &ready)
+    {
+        ready = false;
+        if (!event)
+        {
+            LOG_ERROR("[AMDDeviceContext] queryEventChecked requires non-null event");
+            return false;
+        }
+        if (!setAMDDeviceForResource(device_ordinal_, "queryEventChecked"))
+        {
+            return false;
+        }
+
+        hipEvent_t hip_event = static_cast<hipEvent_t>(event);
+        hipError_t err = hipEventQuery(hip_event);
+        if (err == hipSuccess)
+        {
+            ready = true;
+            return true;
+        }
+        if (err == hipErrorNotReady)
+        {
+            return true;
+        }
+
+        LOG_ERROR("[AMDDeviceContext] hipEventQuery failed: "
+                  << hipGetErrorString(err));
+        return false;
     }
 
     void AMDDeviceContext::synchronizeEvent(void *event)

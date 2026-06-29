@@ -549,16 +549,44 @@ namespace llaminar2
                                        .getNvidiaContext(this->device_id())
                                        .defaultStream();
 
-            auto *host_cursor = (needs_host || host_staged_device_state)
-                                    ? reinterpret_cast<uint8_t *>(dst_host)
-                                    : nullptr;
-            auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
-            const bool ok = exportHybridStatePayload(
-                host_cursor,
-                device_cursor,
-                effective_stream,
-                desc.include_host_state,
-                desc.include_device_state);
+            bool ok = true;
+            if (host_staged_device_state)
+            {
+                if (needs_host)
+                {
+                    auto *host_cursor = reinterpret_cast<uint8_t *>(dst_host);
+                    uint8_t *device_cursor = nullptr;
+                    ok = exportHybridStatePayload(
+                        host_cursor,
+                        device_cursor,
+                        effective_stream,
+                        true,
+                        false);
+                }
+                if (ok && needs_device)
+                {
+                    auto *host_device_cursor =
+                        reinterpret_cast<uint8_t *>(dst_host) + metadata.host_bytes;
+                    uint8_t *device_cursor = nullptr;
+                    ok = exportHybridStatePayload(
+                        host_device_cursor,
+                        device_cursor,
+                        effective_stream,
+                        false,
+                        true);
+                }
+            }
+            else
+            {
+                auto *host_cursor = needs_host ? reinterpret_cast<uint8_t *>(dst_host) : nullptr;
+                auto *device_cursor = needs_device ? reinterpret_cast<uint8_t *>(dst_device) : nullptr;
+                ok = exportHybridStatePayload(
+                    host_cursor,
+                    device_cursor,
+                    effective_stream,
+                    desc.include_host_state,
+                    desc.include_device_state);
+            }
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getNvidiaContext(this->device_id())
@@ -590,16 +618,44 @@ namespace llaminar2
                                        .getNvidiaContext(this->device_id())
                                        .defaultStream();
 
-            const auto *host_cursor = (needs_host || host_staged_device_state)
-                                          ? reinterpret_cast<const uint8_t *>(src_host)
-                                          : nullptr;
-            const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
-            const bool ok = importHybridStatePayload(
-                host_cursor,
-                device_cursor,
-                effective_stream,
-                desc.include_host_state,
-                desc.include_device_state);
+            bool ok = true;
+            if (host_staged_device_state)
+            {
+                if (needs_host)
+                {
+                    const auto *host_cursor = reinterpret_cast<const uint8_t *>(src_host);
+                    const uint8_t *device_cursor = nullptr;
+                    ok = importHybridStatePayload(
+                        host_cursor,
+                        device_cursor,
+                        effective_stream,
+                        true,
+                        false);
+                }
+                if (ok && needs_device)
+                {
+                    const auto *host_device_cursor =
+                        reinterpret_cast<const uint8_t *>(src_host) + metadata.host_bytes;
+                    const uint8_t *device_cursor = nullptr;
+                    ok = importHybridStatePayload(
+                        host_device_cursor,
+                        device_cursor,
+                        effective_stream,
+                        false,
+                        true);
+                }
+            }
+            else
+            {
+                const auto *host_cursor = needs_host ? reinterpret_cast<const uint8_t *>(src_host) : nullptr;
+                const auto *device_cursor = needs_device ? reinterpret_cast<const uint8_t *>(src_device) : nullptr;
+                ok = importHybridStatePayload(
+                    host_cursor,
+                    device_cursor,
+                    effective_stream,
+                    desc.include_host_state,
+                    desc.include_device_state);
+            }
             if (ok && effective_stream && desc.synchronize)
                 GPUDeviceContextPool::instance()
                     .getNvidiaContext(this->device_id())
@@ -639,13 +695,14 @@ namespace llaminar2
 
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                const auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
-                if (state->conv_kernel)
-                    metadata.device_bytes += state->conv_kernel->stateBytes();
-                if (state->rec_kernel)
-                    metadata.device_bytes += state->rec_kernel->stateBytes();
+                const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
+                if (state.conv_kernel)
+                    metadata.device_bytes += state.conv_kernel->stateBytes();
+                if (state.rec_kernel)
+                    metadata.device_bytes += state.rec_kernel->stateBytes();
             }
             metadata.has_device_kernel_state = metadata.device_bytes > 0;
             return metadata;
@@ -660,58 +717,59 @@ namespace llaminar2
         {
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                const auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
+                const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                const size_t recurrence_bytes = state.recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
                 if (include_host_state && recurrence_bytes > 0)
                 {
-                    std::memcpy(host_cursor, state->recurrence_state.data(), recurrence_bytes);
+                    std::memcpy(host_cursor, state.recurrence_state.data(), recurrence_bytes);
                     host_cursor += recurrence_bytes;
                 }
                 if (include_host_state && conv_bytes > 0)
                 {
-                    std::memcpy(host_cursor, state->conv_state.data(), conv_bytes);
+                    std::memcpy(host_cursor, state.conv_state.data(), conv_bytes);
                     host_cursor += conv_bytes;
                 }
 
-                if (include_device_state && state->conv_kernel)
+                if (include_device_state && state.conv_kernel)
                 {
-                    const size_t bytes = state->conv_kernel->stateBytes();
+                    const size_t bytes = state.conv_kernel->stateBytes();
                     if (bytes > 0)
                     {
                         if (device_cursor)
                         {
-                            if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
+                            if (!state.conv_kernel->exportState(nullptr, device_cursor, stream))
                                 return false;
                             device_cursor += bytes;
                         }
                         else
                         {
                             if (!host_cursor ||
-                                !state->conv_kernel->exportState(host_cursor, nullptr, stream))
+                                !state.conv_kernel->exportState(host_cursor, nullptr, stream))
                                 return false;
                             host_cursor += bytes;
                         }
                     }
                 }
-                if (include_device_state && state->rec_kernel)
+                if (include_device_state && state.rec_kernel)
                 {
-                    const size_t bytes = state->rec_kernel->stateBytes();
+                    const size_t bytes = state.rec_kernel->stateBytes();
                     if (bytes > 0)
                     {
                         if (device_cursor)
                         {
-                            if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
+                            if (!state.rec_kernel->exportState(nullptr, device_cursor, stream))
                                 return false;
                             device_cursor += bytes;
                         }
                         else
                         {
                             if (!host_cursor ||
-                                !state->rec_kernel->exportState(host_cursor, nullptr, stream))
+                                !state.rec_kernel->exportState(host_cursor, nullptr, stream))
                                 return false;
                             host_cursor += bytes;
                         }
@@ -730,58 +788,59 @@ namespace llaminar2
         {
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
+                auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                const size_t recurrence_bytes = state.recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
                 if (include_host_state && recurrence_bytes > 0)
                 {
-                    std::memcpy(state->recurrence_state.data(), host_cursor, recurrence_bytes);
+                    std::memcpy(state.recurrence_state.data(), host_cursor, recurrence_bytes);
                     host_cursor += recurrence_bytes;
                 }
                 if (include_host_state && conv_bytes > 0)
                 {
-                    std::memcpy(state->conv_state.data(), host_cursor, conv_bytes);
+                    std::memcpy(state.conv_state.data(), host_cursor, conv_bytes);
                     host_cursor += conv_bytes;
                 }
 
-                if (include_device_state && state->conv_kernel)
+                if (include_device_state && state.conv_kernel)
                 {
-                    const size_t bytes = state->conv_kernel->stateBytes();
+                    const size_t bytes = state.conv_kernel->stateBytes();
                     if (bytes > 0)
                     {
                         if (device_cursor)
                         {
-                            if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
+                            if (!state.conv_kernel->importState(nullptr, device_cursor, stream))
                                 return false;
                             device_cursor += bytes;
                         }
                         else
                         {
                             if (!host_cursor ||
-                                !state->conv_kernel->importState(host_cursor, nullptr, stream))
+                                !state.conv_kernel->importState(host_cursor, nullptr, stream))
                                 return false;
                             host_cursor += bytes;
                         }
                     }
                 }
-                if (include_device_state && state->rec_kernel)
+                if (include_device_state && state.rec_kernel)
                 {
-                    const size_t bytes = state->rec_kernel->stateBytes();
+                    const size_t bytes = state.rec_kernel->stateBytes();
                     if (bytes > 0)
                     {
                         if (device_cursor)
                         {
-                            if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
+                            if (!state.rec_kernel->importState(nullptr, device_cursor, stream))
                                 return false;
                             device_cursor += bytes;
                         }
                         else
                         {
                             if (!host_cursor ||
-                                !state->rec_kernel->importState(host_cursor, nullptr, stream))
+                                !state.rec_kernel->importState(host_cursor, nullptr, stream))
                                 return false;
                             host_cursor += bytes;
                         }

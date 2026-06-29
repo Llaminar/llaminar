@@ -492,6 +492,37 @@ TEST(Test__NvidiaDeviceContext, EventRecordAndSynchronize)
     // Success if no exceptions thrown
 }
 
+TEST(Test__NvidiaDeviceContext, EventQueryCheckedReportsCompletion)
+{
+    SKIP_IF_NO_CUDA();
+
+    auto &ctx = GPUDeviceContextPool::instance().getNvidiaContext(0);
+
+    bool query_before_sync_ok = false;
+    bool ready_before_sync = false;
+    bool query_after_sync_ok = false;
+    bool ready_after_sync = false;
+
+    ctx.submitAndWait([&]()
+                      {
+        void* stream = ctx.createStream();
+        void* event = ctx.createEvent();
+        ASSERT_NE(stream, nullptr);
+        ASSERT_NE(event, nullptr);
+
+        ASSERT_TRUE(ctx.recordEventChecked(event, stream));
+        query_before_sync_ok = ctx.queryEventChecked(event, ready_before_sync);
+        ctx.synchronizeEvent(event);
+        query_after_sync_ok = ctx.queryEventChecked(event, ready_after_sync);
+
+        ctx.destroyEvent(event);
+        ctx.destroyStream(stream); });
+
+    EXPECT_TRUE(query_before_sync_ok);
+    EXPECT_TRUE(query_after_sync_ok);
+    EXPECT_TRUE(ready_after_sync);
+}
+
 TEST(Test__NvidiaDeviceContext, EventWait)
 {
     SKIP_IF_NO_CUDA();
@@ -816,6 +847,37 @@ TEST(Test__AMDDeviceContext, EventRecordAndSynchronize)
         ctx.recordEvent(event, nullptr);
         ctx.synchronizeEvent(event);
         ctx.destroyEvent(event); });
+}
+
+TEST(Test__AMDDeviceContext, EventQueryCheckedReportsCompletion)
+{
+    SKIP_IF_NO_ROCM();
+
+    auto &ctx = GPUDeviceContextPool::instance().getAMDContext(0);
+
+    bool query_before_sync_ok = false;
+    bool ready_before_sync = false;
+    bool query_after_sync_ok = false;
+    bool ready_after_sync = false;
+
+    ctx.submitAndWait([&]()
+                      {
+        void* stream = ctx.createStream();
+        void* event = ctx.createEvent();
+        ASSERT_NE(stream, nullptr);
+        ASSERT_NE(event, nullptr);
+
+        ASSERT_TRUE(ctx.recordEventChecked(event, stream));
+        query_before_sync_ok = ctx.queryEventChecked(event, ready_before_sync);
+        ctx.synchronizeEvent(event);
+        query_after_sync_ok = ctx.queryEventChecked(event, ready_after_sync);
+
+        ctx.destroyEvent(event);
+        ctx.destroyStream(stream); });
+
+    EXPECT_TRUE(query_before_sync_ok);
+    EXPECT_TRUE(query_after_sync_ok);
+    EXPECT_TRUE(ready_after_sync);
 }
 
 TEST(Test__AMDDeviceContext, EventWait)

@@ -53,6 +53,7 @@ namespace llaminar2
         DecodeStepOutput decodeStepForBenchmark() override;
         DecodeBatchStepOutput decodeBatchStepForBenchmark(int request_batch) override;
         bool maybeApplyDecodeBoundaryMaintenance() override;
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
         void setSkipLogitsGatherDecode(bool skip) override;
         void setSkipLogitsGatherPrefill(bool skip) override;
         void setSuppressTimeline(bool suppress) override;

@@ -12,7 +12,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <iostream>
 #include <random>
 #include <vector>
 
@@ -366,23 +365,6 @@ namespace
     }
 }
 
-TEST(Test__GPUExpertTransferCUDA, PeerAccessCheck)
-{
-    requireTwoCudaDevices();
-
-    const bool can_access_0_to_1 =
-        GPUExpertTransfer::canAccessPeer(DeviceId::cuda(0), DeviceId::cuda(1));
-    const bool can_access_1_to_0 =
-        GPUExpertTransfer::canAccessPeer(DeviceId::cuda(1), DeviceId::cuda(0));
-    const bool can_access_self =
-        GPUExpertTransfer::canAccessPeer(DeviceId::cuda(0), DeviceId::cuda(0));
-
-    std::cout << "[PeerAccessCheck CUDA] 0->1: " << std::boolalpha << can_access_0_to_1
-              << " 1->0: " << can_access_1_to_0
-              << " 0->0: " << can_access_self << std::endl;
-    EXPECT_TRUE(can_access_self);
-}
-
 TEST(Test__GPUExpertTransferCUDA, D2DTransfer)
 {
     runCudaD2DTransfer(/*include_optional_arrays=*/false);
@@ -393,7 +375,7 @@ TEST(Test__GPUExpertTransferCUDA, D2DTransferAllArrays)
     runCudaD2DTransfer(/*include_optional_arrays=*/true);
 }
 
-TEST(Test__GPUExpertTransferCUDA, RepeatedD2DTransferUsesCachedPeerState)
+TEST(Test__GPUExpertTransferCUDA, RepeatedD2DTransfer)
 {
     runCudaD2DTransfer(/*include_optional_arrays=*/false, /*repetitions=*/3);
 }

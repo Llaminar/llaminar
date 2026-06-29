@@ -69,6 +69,7 @@
 #include <fstream>
 #include <iomanip>
 #include <print>
+#include <stdexcept>
 #include <sstream>
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -227,6 +228,154 @@ namespace llaminar2
         const char *perfBool(bool value)
         {
             return value ? "true" : "false";
+        }
+
+        double finitePerfValue(double value)
+        {
+            return std::isfinite(value) ? value : -1.0;
+        }
+
+        void recordMoEImbalanceStats(
+            const std::string &device,
+            const std::string &domain_id,
+            const std::string &strategy,
+            const ExpertLoadImbalanceStats &before,
+            const ExpertLoadImbalanceStats &after)
+        {
+            const bool valid = before.valid && after.valid;
+            PerfStatsCollector::Tags tags{
+                {"domain_id", domain_id},
+                {"strategy", strategy},
+                {"valid", perfBool(valid)}};
+
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                valid ? "expert_imbalance_windows" : "expert_imbalance_invalid_windows",
+                1.0,
+                "rebalance",
+                device,
+                tags);
+            if (!valid)
+                return;
+
+            const double spread_delta = before.average_spread - after.average_spread;
+            const double spread_improvement_ratio =
+                before.average_spread > 0.0
+                    ? spread_delta / before.average_spread
+                    : 0.0;
+
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_active_layers_before",
+                static_cast<double>(before.active_layer_count),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_active_layers_after",
+                static_cast<double>(after.active_layer_count),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_total_activations_before",
+                static_cast<double>(before.total_activations),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_total_activations_after",
+                static_cast<double>(after.total_activations),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_average_spread_before",
+                before.average_spread,
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_average_spread_after",
+                after.average_spread,
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_worst_spread_before",
+                before.worst_spread,
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_worst_spread_after",
+                after.worst_spread,
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_average_ratio_before",
+                finitePerfValue(before.average_ratio),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_average_ratio_after",
+                finitePerfValue(after.average_ratio),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_infinite_ratio_layers_before",
+                static_cast<double>(before.infinite_ratio_layers),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_infinite_ratio_layers_after",
+                static_cast<double>(after.infinite_ratio_layers),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_worst_layer_before",
+                static_cast<double>(before.worst_layer),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_worst_layer_after",
+                static_cast<double>(after.worst_layer),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_spread_improvement",
+                spread_delta,
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "expert_imbalance_spread_improvement_ratio",
+                spread_improvement_ratio,
+                "rebalance",
+                device,
+                tags);
         }
 
         bool laneSupportsGroupedDecodeEquivalentOutcome(
@@ -1053,7 +1202,16 @@ namespace llaminar2
 
         if (runner_)
         {
-            runner_->clear_cache();
+            try
+            {
+                clearUnderlyingRunnerCacheAfterMoEPublish("shutdown");
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[OrchestrationRunner] shutdown cache reset failed: " << e.what());
+                if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
+                    rank->clearPendingGpuDirectExpertTransfersForAllDevices();
+            }
             synchronizeRunnerPrimaryDeviceBeforeRelease(runner_.get());
         }
 
@@ -1262,7 +1420,7 @@ namespace llaminar2
                           << " blocks=" << coordinated_hit.blocks.size()
                           << " bypass_reason=" << coordinated_hit.bypass_reason);
 
-                runner_->clear_cache();
+                clearUnderlyingRunnerCacheAfterMoEPublish("prefix-cache-initial-reset");
                 prefill_logits_ready_ = false;
                 ready_sampled_token_.reset();
                 ready_sampled_params_.reset();
@@ -1310,7 +1468,7 @@ namespace llaminar2
                               << matched_tokens);
                     matched_tokens = 0;
                     common_hit = make_common_hit();
-                    runner_->clear_cache();
+                    clearUnderlyingRunnerCacheAfterMoEPublish("prefix-cache-populate-fallback");
                 }
 
                 int suffix_start = matched_tokens;
@@ -1344,11 +1502,11 @@ namespace llaminar2
                         common_hit.block_size > 0 ? common_hit.block_size : plan_prefix.block_size;
                     matched_tokens = std::max(0, matched_tokens - std::max(1, block_size));
                     common_hit = make_common_hit();
-                    runner_->clear_cache();
+                    clearUnderlyingRunnerCacheAfterMoEPublish("prefix-cache-terminal-recompute");
                     if (matched_tokens > 0 && !runner_->populatePrefix(common_hit))
                     {
                         matched_tokens = 0;
-                        runner_->clear_cache();
+                        clearUnderlyingRunnerCacheAfterMoEPublish("prefix-cache-terminal-populate-fallback");
                     }
                     suffix_start = matched_tokens;
                     suffix_len = static_cast<int>(prompt_tokens.size()) - suffix_start;
@@ -1632,6 +1790,12 @@ namespace llaminar2
         if (!runner_)
         {
             batch_result.error = "Runner unavailable";
+            return batch_result;
+        }
+        if (!publishPendingMoERebalanceBeforeForward("decode_step_batch"))
+        {
+            batch_result.error =
+                last_error_.empty() ? "MoE rebalance delayed publish failed" : last_error_;
             return batch_result;
         }
         if (request_batch <= 1)
@@ -11044,6 +11208,12 @@ namespace llaminar2
                 "use decodeStepBatch()";
             return result;
         }
+        if (!publishPendingMoERebalanceBeforeForward("decode_step"))
+        {
+            result.error =
+                last_error_.empty() ? "MoE rebalance delayed publish failed" : last_error_;
+            return result;
+        }
 
         // Broadcast to worker ranks so they run decode in lockstep.  The
         // current token budget is part of the decode command: Qwen thinking
@@ -11459,6 +11629,12 @@ namespace llaminar2
                 "forceDecodeToken() cannot consume request-batched prefill state";
             return result;
         }
+        if (!publishPendingMoERebalanceBeforeForward("force_decode_token"))
+        {
+            result.error =
+                last_error_.empty() ? "MoE rebalance delayed publish failed" : last_error_;
+            return result;
+        }
 
         const int rank = mpi_ctx_ ? mpi_ctx_->rank() : 0;
         auto trace_position = [this](const char *context) -> int
@@ -11636,6 +11812,7 @@ namespace llaminar2
 
         // Enable GPU-side logits skip for decode (GPU sampling avoids full D2H)
         runner_->setSkipLogitsGatherDecode(true);
+        const bool device_side_moe_rebalance = usesDeviceSideMoERebalanceController();
 
         while (static_cast<int>(result.tokens.size()) < max_new_tokens)
         {
@@ -11662,10 +11839,26 @@ namespace llaminar2
                 break;
             }
 
-            if (!maybeApplyMoERebalance())
+            if (!device_side_moe_rebalance && !maybeApplyMoERebalance())
             {
                 result.error = last_error_.empty() ? "MoE rebalance failed" : last_error_;
                 break;
+            }
+        }
+
+        if (result.error.empty())
+        {
+            if (device_side_moe_rebalance)
+            {
+                if (pending_moe_rebalance_prepare_.has_value())
+                {
+                    result.error =
+                        "MoE rebalance has a pending host-prepared publish while the device-side controller is active";
+                }
+            }
+            else if (!publishPendingMoERebalanceUpdate())
+            {
+                result.error = last_error_.empty() ? "MoE rebalance delayed publish failed" : last_error_;
             }
         }
 
@@ -11698,22 +11891,108 @@ namespace llaminar2
         return result;
     }
 
+    bool OrchestrationRunner::usesDeviceSideMoERebalanceController() const
+    {
+        return runner_ && runner_->usesDeviceSideMoERebalanceController();
+    }
+
     bool OrchestrationRunner::maybeApplyMoERebalance()
     {
-        auto *controller = moeRebalanceController();
-        if (!controller)
+        const std::string device =
+            runner_ && runner_->primaryDeviceId().is_valid()
+                ? runner_->primaryDeviceId().toString()
+                : std::string{};
+
+        if (usesDeviceSideMoERebalanceController())
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "decode_boundary_maintenance_device_side_skips",
+                1.0,
+                "rebalance",
+                device);
+            if (pending_moe_rebalance_prepare_.has_value())
+            {
+                return setError(
+                    "MoE rebalance has a pending host-prepared publish while the device-side controller is active");
+            }
             return true;
+        }
+
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "decode_boundary_maintenance_calls",
+            1.0,
+            "rebalance",
+            device);
+
+        auto *controller = moeRebalanceController();
+        if (!publishPendingMoERebalanceUpdate())
+            return false;
+
+        if (!controller)
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "decode_boundary_maintenance_no_controller",
+                1.0,
+                "rebalance",
+                device);
+            return true;
+        }
+
+        const std::string domain_id = controller->domainId();
+        PerfStatsCollector::Tags tags{{"domain_id", domain_id}};
 
         if (auto *histogram = controller->histogram())
         {
-            if (histogram->windowFull() && !histogram->syncRuntimeHistograms())
+            const uint64_t window_tokens = histogram->windowTokenCount();
+            const bool window_full = histogram->windowFull();
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "decode_boundary_window_token_observations",
+                static_cast<double>(window_tokens),
+                "rebalance",
+                device,
+                tags);
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "decode_boundary_window_full_observations",
+                window_full ? 1.0 : 0.0,
+                "rebalance",
+                device,
+                tags);
+
+            if (window_full)
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "decode_boundary_runtime_histogram_sync_attempts",
+                    1.0,
+                    "rebalance",
+                    device,
+                    tags);
+            }
+
+            if (window_full && !histogram->syncRuntimeHistograms())
             {
                 setError("MoE rebalance failed to sync runtime histogram");
                 return false;
             }
         }
 
-        if (!controller->shouldRebalance())
+        const MoERebalanceDecision decision = controller->rebalanceDecision();
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "decode_boundary_maintenance_decisions",
+            1.0,
+            "rebalance",
+            device,
+            {{"domain_id", domain_id},
+             {"reason", toString(decision.reason)},
+             {"ready", decision.ready ? "true" : "false"}});
+
+        if (!decision.ready)
             return true;
 
         if (mpi_coordinated_mode_ && mpi_ctx_ &&
@@ -11784,10 +12063,7 @@ namespace llaminar2
         if (mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->rank() == 0 && mpi_ctx_->world_size() > 1)
             broadcastCommand(MPICommand::CLEAR_CACHE);
 
-        if (runner_)
-        {
-            runner_->clear_cache();
-        }
+        clearUnderlyingRunnerCacheAfterMoEPublish("request-clear-cache");
         ++request_epoch_;
 #if defined(__GLIBC__)
         ::malloc_trim(0);
@@ -11816,6 +12092,12 @@ namespace llaminar2
             mtp_depth_controller_->reset();
         }
         mtp_stats_ = {};
+    }
+
+    void OrchestrationRunner::drainCompletedDecodeBoundaryMaintenanceDiagnostics()
+    {
+        if (runner_)
+            runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
     }
 
     PrefixRuntimeStateSnapshot OrchestrationRunner::prefixStateProbe() const
@@ -13263,8 +13545,147 @@ namespace llaminar2
             LOG_DEBUG("[MoE] Released " << (freed >> 20) << " MB raw expert weights");
     }
 
+    bool OrchestrationRunner::publishPendingMoERebalanceUpdate()
+    {
+        if (!pending_moe_rebalance_prepare_.has_value())
+            return true;
+
+        PendingMoERebalanceUpdate pending =
+            std::move(*pending_moe_rebalance_prepare_);
+        pending_moe_rebalance_prepare_.reset();
+
+        if (!pending.rank)
+            return setError("LocalTP MoE rebalance has no rank orchestrator for delayed publish");
+
+        PerfStatsCollector::ScopedTimer publish_timer(
+            "moe_rebalance",
+            "async_delayed_publish_total",
+            "rebalance",
+            pending.device,
+            {{"domain_id", pending.domain_id}});
+
+        if (!pending.rank->publishPreparedMoEExpertMasksForAllDevices(pending.prepared))
+        {
+            pending.rank->clearPendingGpuDirectExpertTransfersForAllDevices();
+            return setError("LocalTP MoE expert mask delayed publish failed");
+        }
+
+        if (pending.publish_replica_set)
+            setExpertReplicaSet(pending.replica_set, pending.participant_id);
+
+        if (pending.release_raw_after_publish)
+            recordMoERebalanceRawExpertRelease(pending.domain_id, pending.device);
+
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "async_delayed_publishes",
+            1.0,
+            "rebalance",
+            pending.device,
+            {{"domain_id", pending.domain_id}});
+        return true;
+    }
+
+    bool OrchestrationRunner::publishPendingMoERebalanceBeforeForward(const char *reason)
+    {
+        if (!pending_moe_rebalance_prepare_.has_value())
+            return true;
+
+        const std::string device =
+            runner_ && runner_->primaryDeviceId().is_valid()
+                ? runner_->primaryDeviceId().toString()
+                : std::string{};
+        const std::string domain_id = pending_moe_rebalance_prepare_->domain_id;
+        const std::string reason_tag =
+            reason && reason[0] ? std::string(reason) : std::string("forward");
+
+        if (usesDeviceSideMoERebalanceController())
+        {
+            return setError(
+                "MoE rebalance has a pending host-prepared publish while the device-side controller is active");
+        }
+
+        /*
+         * LocalTP GPU-direct rebalance preparation can stage arrivals and touch
+         * placement-sensitive graph state. Letting the next decode forward run
+         * before publishing that prepared update can split TP participants:
+         * one child may replay an old captured graph while a sibling rebuilds,
+         * then both enter NCCL/RCCL collectives from different launch paths.
+         * Publish at the forward boundary so all participants observe the same
+         * mask/replica epoch before the next collective-bearing graph launch.
+         */
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "pre_forward_pending_publish_drains",
+            1.0,
+            "rebalance",
+            device,
+            {{"domain_id", domain_id},
+             {"reason", reason_tag}});
+
+        return publishPendingMoERebalanceUpdate();
+    }
+
+    void OrchestrationRunner::drainPendingMoERebalanceBeforeCacheClear()
+    {
+        if (!pending_moe_rebalance_prepare_.has_value())
+            return;
+
+        const std::string device =
+            runner_ && runner_->primaryDeviceId().is_valid()
+                ? runner_->primaryDeviceId().toString()
+                : std::string{};
+        const std::string domain_id = pending_moe_rebalance_prepare_->domain_id;
+
+        if (usesDeviceSideMoERebalanceController())
+        {
+            const std::string message =
+                "clearCache() found a host-prepared MoE rebalance publish while the device-side controller is active";
+            setError(message);
+            LOG_ERROR("[MoE] " << message);
+            throw std::runtime_error(message);
+        }
+
+        LOG_DEBUG("[MoE] clearCache() draining pending LocalTP MoE rebalance publish before request reset");
+        PerfStatsCollector::addCounter(
+            "moe_rebalance",
+            "clear_cache_pending_publish_drains",
+            1.0,
+            "rebalance",
+            device,
+            {{"domain_id", domain_id}});
+
+        if (!publishPendingMoERebalanceUpdate())
+        {
+            std::string detail = lastError();
+            if (detail.empty())
+                detail = "unknown error";
+            const std::string message =
+                "clearCache() refused to discard pending MoE rebalance publish: " + detail;
+            LOG_ERROR("[MoE] " << message);
+            throw std::runtime_error(message);
+        }
+    }
+
+    void OrchestrationRunner::clearUnderlyingRunnerCacheAfterMoEPublish(const char *reason)
+    {
+        drainPendingMoERebalanceBeforeCacheClear();
+
+        if (!runner_)
+            return;
+
+        LOG_DEBUG("[OrchestrationRunner] Clearing underlying runner cache"
+                  << (reason && reason[0] ? std::string(" for ") + reason : std::string{}));
+        if (auto *rank = dynamic_cast<RankOrchestrator *>(runner_.get()))
+            rank->clearPendingGpuDirectExpertTransfersForAllDevices();
+        runner_->clear_cache();
+    }
+
     bool OrchestrationRunner::applyMoERebalanceWithReplicas(bool log_histogram_summary)
     {
+        if (!publishPendingMoERebalanceUpdate())
+            return false;
+
         auto *controller = moeRebalanceController();
         if (!controller)
             return true;
@@ -13290,6 +13711,12 @@ namespace llaminar2
 
         if (auto *histogram = controller->histogram())
         {
+            PerfStatsCollector::ScopedTimer sync_timer(
+                "moe_rebalance",
+                "runtime_histogram_sync",
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
             if (!histogram->syncRuntimeHistograms())
             {
                 setError("MoE rebalance failed to sync runtime histogram");
@@ -13303,7 +13730,15 @@ namespace llaminar2
         std::vector<std::vector<std::vector<bool>>> gpu_cache_masks_by_participant;
         const int gpu_cache_experts = debugEnv().moe_rebalance.gpu_cache_experts_per_layer;
         if (gpu_cache_experts > 0)
+        {
+            PerfStatsCollector::ScopedTimer gpu_cache_timer(
+                "moe_rebalance",
+                "policy_gpu_cache_masks",
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
             gpu_cache_masks_by_participant = controller->computeGpuCacheExpertMasks(gpu_cache_experts);
+        }
 
         const auto old_placement = controller->currentPlacement();
         const ExpertReplicaSet previous_replicas = controller->currentReplicas();
@@ -13323,7 +13758,21 @@ namespace llaminar2
             {{"domain_id", domain_id}});
         if (hot_replica_strategy)
         {
-            controller->proposeReplicasForParticipants(max_replicas);
+            {
+                PerfStatsCollector::ScopedTimer propose_timer(
+                    "moe_rebalance",
+                    "policy_hot_replica_propose",
+                    "rebalance",
+                    device,
+                    {{"domain_id", domain_id}});
+                controller->proposeReplicasForParticipants(max_replicas);
+            }
+            recordMoEImbalanceStats(
+                device,
+                domain_id,
+                "hot_replicas",
+                controller->lastImbalanceBefore(),
+                controller->lastImbalanceAfter());
             if (controller->hasReplicas())
             {
                 const auto &current_replicas = controller->currentReplicas();
@@ -13369,7 +13818,21 @@ namespace llaminar2
 
         if (!controller->hasReplicas() && !hot_replica_strategy)
         {
-            new_placement = controller->rebalance();
+            {
+                PerfStatsCollector::ScopedTimer rebalance_timer(
+                    "moe_rebalance",
+                    "policy_ownership_rebalance",
+                    "rebalance",
+                    device,
+                    {{"domain_id", domain_id}});
+                new_placement = controller->rebalance();
+            }
+            recordMoEImbalanceStats(
+                device,
+                domain_id,
+                "ownership_swaps",
+                controller->lastImbalanceBefore(),
+                controller->lastImbalanceAfter());
             controller->syncReplicaPlacement();
         }
 
@@ -13424,7 +13887,12 @@ namespace llaminar2
             rebalance_tags);
 
         const int participant_id = runner_ ? runner_->moeRebalanceParticipantId() : 0;
-        const bool local_tp_runner = dynamic_cast<RankOrchestrator *>(runner_.get()) != nullptr;
+        auto *rank_runner = dynamic_cast<RankOrchestrator *>(runner_.get());
+        const bool local_tp_runner = rank_runner != nullptr;
+        const bool mpi_coordinated_world =
+            mpi_coordinated_mode_ && mpi_ctx_ && mpi_ctx_->world_size() > 1;
+        const bool local_tp_delayed_publish =
+            local_tp_runner && !mpi_coordinated_world;
         const bool replica_mask_update = controller->hasReplicas() || (had_replicas && replica_state_changed);
         ReceivedWeightsMap received;
         if (!local_tp_runner)
@@ -13447,7 +13915,98 @@ namespace llaminar2
                       << (replica_mask_update ? " (replica-arrival delta)" : ""));
         }
 
-        if (!gpu_cache_masks_by_participant.empty())
+        bool prepared_for_delayed_publish = false;
+        if (local_tp_delayed_publish && rank_runner)
+        {
+            PerfStatsCollector::ScopedTimer delayed_prepare_timer(
+                "moe_rebalance",
+                "local_tp_delayed_prepare_total",
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
+            RankOrchestrator::PreparedMoEExpertMaskUpdate prepared;
+            if (!gpu_cache_masks_by_participant.empty())
+            {
+                PerfStatsCollector::ScopedTimer prepare_timer(
+                    "moe_rebalance",
+                    "local_tp_prepare_transfers",
+                    "rebalance",
+                    device,
+                    {{"domain_id", domain_id},
+                     {"source", "gpu_cache_masks"}});
+                prepared = rank_runner->prepareMoEExpertMaskTransfersForAllDevices(
+                    gpu_cache_masks_by_participant,
+                    controller->domainId());
+            }
+            else
+            {
+                RankOrchestrator::MoEExpertMaskSnapshot snapshot;
+                {
+                    PerfStatsCollector::ScopedTimer snapshot_timer(
+                        "moe_rebalance",
+                        "local_tp_snapshot_masks",
+                        "rebalance",
+                        device,
+                        {{"domain_id", domain_id},
+                         {"replica_mask_update", perfBool(replica_mask_update)}});
+                    snapshot = rank_runner->snapshotMoEExpertMasksForAllDevices(
+                        *controller,
+                        replica_mask_update ? &replica_arrivals : nullptr,
+                        !replica_mask_update && !new_placement.empty()
+                            ? &old_placement
+                            : nullptr);
+                }
+                {
+                    PerfStatsCollector::ScopedTimer prepare_timer(
+                        "moe_rebalance",
+                        "local_tp_prepare_transfers",
+                        "rebalance",
+                        device,
+                        {{"domain_id", domain_id},
+                         {"source", "controller_snapshot"}});
+                    prepared = rank_runner->prepareMoEExpertMaskTransfersForAllDevices(
+                        snapshot.masks_by_participant,
+                        snapshot.domain_id,
+                        snapshot.transferMasks());
+                }
+            }
+
+            const bool gpu_direct_prepare_ok =
+                std::all_of(prepared.gpu_direct_prepare_ok_by_device.begin(),
+                            prepared.gpu_direct_prepare_ok_by_device.end(),
+                            [](bool ok)
+                            {
+                                return ok;
+                            });
+            if (!gpu_direct_prepare_ok)
+            {
+                rank_runner->clearPendingGpuDirectExpertTransfersForAllDevices();
+                return setError("LocalTP MoE expert mask async prepare failed");
+            }
+
+            PendingMoERebalanceUpdate pending;
+            pending.rank = rank_runner;
+            pending.prepared = std::move(prepared);
+            pending.replica_set = controller->currentReplicas();
+            pending.participant_id = participant_id;
+            pending.publish_replica_set =
+                controller->hasReplicas() || (had_replicas && replica_state_changed);
+            pending.release_raw_after_publish =
+                config_.moe_rebalance.release_raw_expert_weights ||
+                debugEnv().moe_rebalance.release_raw_weights;
+            pending.domain_id = domain_id;
+            pending.device = device;
+            pending_moe_rebalance_prepare_ = std::move(pending);
+            prepared_for_delayed_publish = true;
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "async_delayed_prepares",
+                1.0,
+                "rebalance",
+                device,
+                {{"domain_id", domain_id}});
+        }
+        else if (!gpu_cache_masks_by_participant.empty())
         {
             if (!applyMoEExpertMasksForAllLocalDevices(gpu_cache_masks_by_participant, controller->domainId()))
             {
@@ -13470,12 +14029,15 @@ namespace llaminar2
             applyMoEExpertMasks(masks, received, controller->domainId());
         }
 
-        if (controller->hasReplicas())
-            setExpertReplicaSet(controller->currentReplicas(), participant_id);
-        else if (had_replicas && replica_state_changed)
-            setExpertReplicaSet(controller->currentReplicas(), participant_id);
+        if (!prepared_for_delayed_publish)
+        {
+            if (controller->hasReplicas())
+                setExpertReplicaSet(controller->currentReplicas(), participant_id);
+            else if (had_replicas && replica_state_changed)
+                setExpertReplicaSet(controller->currentReplicas(), participant_id);
 
-        recordMoERebalanceRawExpertRelease(domain_id, device);
+            recordMoERebalanceRawExpertRelease(domain_id, device);
+        }
 
         return true;
     }

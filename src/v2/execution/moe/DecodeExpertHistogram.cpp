@@ -56,6 +56,14 @@ namespace llaminar2
             layer_data_.emplace_back(config_.num_experts);
     }
 
+    bool DecodeExpertHistogram::isTokenBoundaryLayer(int layer_idx) const
+    {
+        int boundary = config_.token_boundary_layer_idx;
+        if (boundary < 0 || boundary >= config_.num_layers)
+            boundary = config_.num_layers - 1;
+        return layer_idx == boundary;
+    }
+
     // ── Hot path ──────────────────────────────────────
 
     void DecodeExpertHistogram::record(
@@ -88,7 +96,7 @@ namespace llaminar2
         // window_size tracks actual decode tokens, not per-layer calls.
         // record() is called once per MoE layer per token; without this
         // guard, window_size=256 fills after only 256/num_layers tokens.
-        if (layer_idx == config_.num_layers - 1)
+        if (isTokenBoundaryLayer(layer_idx))
             window_token_count_.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -96,7 +104,7 @@ namespace llaminar2
     {
         if (token_count == 0)
             return;
-        if (layer_idx == config_.num_layers - 1)
+        if (isTokenBoundaryLayer(layer_idx))
             window_token_count_.fetch_add(token_count, std::memory_order_relaxed);
     }
 
@@ -121,7 +129,7 @@ namespace llaminar2
             total_activations += delta;
         }
 
-        if (count_window_tokens && layer_idx == config_.num_layers - 1 && config_.top_k > 0)
+        if (count_window_tokens && isTokenBoundaryLayer(layer_idx) && config_.top_k > 0)
         {
             const uint64_t token_delta = total_activations / static_cast<uint64_t>(config_.top_k);
             if (token_delta > 0)
@@ -196,7 +204,7 @@ namespace llaminar2
             config_.num_experts,
             /*count_window_tokens=*/false);
 
-        if (merge.count_window_tokens && merge.layer_idx == config_.num_layers - 1 &&
+        if (merge.count_window_tokens && isTokenBoundaryLayer(merge.layer_idx) &&
             merge.real_token_count > 0)
         {
             window_token_count_.fetch_add(static_cast<uint64_t>(merge.real_token_count),
@@ -294,6 +302,106 @@ namespace llaminar2
             }
         }
         return finite_count > 0 ? sum / static_cast<float>(finite_count) : std::numeric_limits<float>::infinity();
+    }
+
+    ExpertLoadImbalanceStats DecodeExpertHistogram::placementImbalance(
+        const std::vector<int> &expert_to_socket) const
+    {
+        ExpertLoadImbalanceStats stats;
+        stats.layer_count = config_.num_layers;
+
+        const int num_sockets = static_cast<int>(config_.sockets.size());
+        if (config_.num_layers <= 0 ||
+            config_.num_experts <= 0 ||
+            num_sockets <= 0 ||
+            static_cast<int>(expert_to_socket.size()) < config_.num_experts)
+        {
+            return stats;
+        }
+
+        double ratio_sum = 0.0;
+        double spread_sum = 0.0;
+        for (int layer_idx = 0; layer_idx < config_.num_layers; ++layer_idx)
+        {
+            std::vector<uint64_t> loads(static_cast<size_t>(num_sockets), 0);
+            uint64_t layer_total = 0;
+            const auto &layer = layer_data_[static_cast<size_t>(layer_idx)];
+            for (int expert_id = 0; expert_id < config_.num_experts; ++expert_id)
+            {
+                const int socket = expert_to_socket[static_cast<size_t>(expert_id)];
+                if (socket < 0 || socket >= num_sockets)
+                    continue;
+
+                const uint64_t count =
+                    layer.expert_counts[static_cast<size_t>(expert_id)].load(std::memory_order_relaxed);
+                loads[static_cast<size_t>(socket)] += count;
+                layer_total += count;
+            }
+
+            if (layer_total == 0)
+                continue;
+
+            ++stats.active_layer_count;
+            stats.total_activations += layer_total;
+
+            const auto [min_it, max_it] = std::minmax_element(loads.begin(), loads.end());
+            const uint64_t min_load = *min_it;
+            const uint64_t max_load = *max_it;
+            const double spread =
+                max_load > 0
+                    ? static_cast<double>(max_load - min_load) / static_cast<double>(max_load)
+                    : 0.0;
+            spread_sum += spread;
+
+            double ratio = 1.0;
+            if (min_load == 0 && max_load > 0)
+            {
+                ratio = std::numeric_limits<double>::infinity();
+                ++stats.infinite_ratio_layers;
+            }
+            else if (min_load > 0)
+            {
+                ratio = static_cast<double>(max_load) / static_cast<double>(min_load);
+                ratio_sum += ratio;
+            }
+            else
+            {
+                ratio_sum += ratio;
+            }
+
+            if (stats.worst_layer < 0 || spread > stats.worst_spread)
+            {
+                stats.worst_spread = spread;
+                stats.worst_ratio = ratio;
+                stats.worst_layer = layer_idx;
+            }
+        }
+
+        stats.valid = stats.active_layer_count > 0;
+        if (!stats.valid)
+            return stats;
+
+        stats.average_spread =
+            spread_sum / static_cast<double>(stats.active_layer_count);
+        if (stats.infinite_ratio_layers > 0)
+        {
+            stats.average_ratio = std::numeric_limits<double>::infinity();
+            if (!std::isinf(stats.worst_ratio))
+                stats.worst_ratio = std::numeric_limits<double>::infinity();
+        }
+        else
+        {
+            stats.average_ratio =
+                ratio_sum / static_cast<double>(stats.active_layer_count);
+        }
+
+        return stats;
+    }
+
+    ExpertLoadImbalanceStats DecodeExpertHistogram::currentPlacementImbalance() const
+    {
+        std::lock_guard<std::mutex> lock(placement_mutex_);
+        return placementImbalance(expert_to_socket_);
     }
 
     uint64_t DecodeExpertHistogram::windowTokenCount() const

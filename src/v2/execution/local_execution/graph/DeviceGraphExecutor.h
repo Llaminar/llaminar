@@ -104,6 +104,30 @@ namespace llaminar2
             return p;
         }
 
+        /// Capture phase — normal coherence and dirty marking, no host diagnostics.
+        ///
+        /// Phase-2 graph capture executes stages while HIP/CUDA stream capture may
+        /// be active on sibling TP participants.  Diagnostics that materialize
+        /// outputs on the host (validation, dumps, snapshot callbacks) are not
+        /// part of inference semantics and can make HIP report illegal legacy
+        /// stream dependencies during concurrent multi-device capture.
+        static StageRunPolicy capturePhase()
+        {
+            StageRunPolicy p;
+            p.coherence = true;
+            p.weight_coherence = true;
+            p.mark_dirty = true;
+            p.validation = false;
+            p.profiling = debugEnv().profile.enabled;
+            p.collective_intercept = true;
+            p.timeline = false;
+            p.stage_dump = false;
+            p.snapshot_callback = false;
+            p.pointer_validation = false;
+            p.preserve_gpu_streams = true;
+            return p;
+        }
+
         /// Debug — everything on, including timeline.
         static StageRunPolicy debug()
         {

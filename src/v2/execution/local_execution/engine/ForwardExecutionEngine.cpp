@@ -654,6 +654,30 @@ namespace llaminar2
         cache_.clear();
     }
 
+    size_t ForwardExecutionEngine::invalidateMoEPlacementSensitiveGraphsForStablePlacement()
+    {
+        size_t invalidated = 0;
+        for (auto &[signature, cache] : cache_)
+        {
+            if (!cache.valid)
+                continue;
+
+            const bool graph_stable_single_token_decode =
+                signature.decode && !signature.all_position_logits &&
+                signature.seq_len == 1 && signature.batch_size <= 1;
+            const bool graph_stable_fixed_prefill = !signature.decode;
+            if (graph_stable_single_token_decode || graph_stable_fixed_prefill)
+            {
+                cache.markGPUStreamBindingsDirty();
+                continue;
+            }
+
+            cache.invalidate();
+            ++invalidated;
+        }
+        return invalidated;
+    }
+
     void ForwardExecutionEngine::resetCapturedReplayState()
     {
         all_position_verifier_recapture_pending_ = false;
@@ -1220,6 +1244,75 @@ namespace llaminar2
             observations.push_back(observation);
         }
         return observations;
+    }
+
+    std::vector<ForwardExecutionEngine::PrefillGraphCacheSnapshot>
+    ForwardExecutionEngine::prefillGraphCacheSnapshots() const
+    {
+        std::vector<PrefillGraphCacheSnapshot> snapshots;
+        snapshots.reserve(cache_.size());
+        for (const auto &[signature, cache] : cache_)
+        {
+            if (signature.decode)
+                continue;
+
+            PrefillGraphCacheSnapshot snapshot;
+            snapshot.forward_cache_valid = cache.valid;
+            snapshot.eviction_count = bucketed_prefill_forward_eviction_count_;
+            snapshot.bucket_seq_len = signature.is_bucketed_prefill
+                                          ? signature.bucket_seq_len
+                                          : signature.seq_len;
+            snapshot.placement_epoch = signature.moe_placement_epoch;
+            snapshot.capture_phase = "unknown";
+            snapshot.recapture_reason = "none";
+
+            PrefillGraphCacheKey key;
+            key.seq_len = snapshot.bucket_seq_len;
+            key.device_id = signature.device;
+            key.placement_epoch = signature.moe_placement_epoch;
+
+            if (cache.last_prefill_graph_observation.valid)
+            {
+                const auto &observation = cache.last_prefill_graph_observation;
+                snapshot.observation_valid = true;
+                snapshot.chunk_index = observation.chunk_index;
+                snapshot.bucket_seq_len = observation.bucket_seq_len;
+                snapshot.real_token_start = observation.real_token_start;
+                snapshot.real_token_count = observation.real_token_count;
+                snapshot.real_token_end = observation.real_token_end;
+                snapshot.domain_id = observation.domain_id;
+                snapshot.participant_id = observation.participant_id;
+                snapshot.placement_epoch = observation.placement_epoch;
+                snapshot.topology_signature = observation.topology_signature;
+                snapshot.capture_phase = observation.capture_phase;
+                snapshot.recapture_reason = observation.recapture_reason;
+                snapshot.reject_stage_name = observation.reject_stage_name;
+                snapshot.reject_stage_type = observation.reject_stage_type;
+
+                key.seq_len = observation.bucket_seq_len;
+                key.domain_id = observation.domain_id;
+                key.participant_id = observation.participant_id;
+                key.placement_epoch = observation.placement_epoch;
+                key.topology_signature = observation.topology_signature;
+            }
+
+            if (cache.prefill_graph_cache)
+            {
+                const PrefillGraphCache &prefill_cache = *cache.prefill_graph_cache;
+                snapshot.prefill_cache_initialized = true;
+                snapshot.phase = prefill_cache.phase(key);
+                snapshot.cache_size = prefill_cache.size();
+                snapshot.node_count = prefill_cache.nodeCount(key);
+                snapshot.replay_count = prefill_cache.replayCount(key);
+                snapshot.warmup_count = prefill_cache.warmupCount(key);
+                snapshot.initialized_count = prefill_cache.initializedCount(key);
+                snapshot.capture_count = prefill_cache.captureCount(key);
+                snapshot.eviction_count += prefill_cache.evictionCount();
+            }
+
+            snapshots.push_back(std::move(snapshot));
+        }
+        return snapshots;
     }
 
     // =========================================================================
@@ -2406,18 +2499,27 @@ namespace llaminar2
             return true;
         }
 
-        if (can_attempt_capture && capture_ready_reason != PrefillGraphRejectReason::None &&
-            cache.config().trace)
+        if (can_attempt_capture && capture_ready_reason != PrefillGraphRejectReason::None)
         {
-            LOG_INFO("[ForwardExecutionEngine] Prefill graph capture readiness failed after "
-                     << prefillGraphPhaseName(phase)
-                     << ": " << toString(capture_ready_reason)
-                     << (capture_ready_reject_stage_name.empty() ? "" : " stage=")
-                     << capture_ready_reject_stage_name
-                     << (capture_ready_reject_stage_type.empty() ? "" : " type=")
-                     << capture_ready_reject_stage_type
-                     << " seq_len=" << input.seq_len
-                     << "; running a fresh warmup");
+            LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture readiness rejected after "
+                      << prefillGraphPhaseName(phase)
+                      << ": " << toString(capture_ready_reason)
+                      << (capture_ready_reject_stage_name.empty() ? "" : " stage=")
+                      << capture_ready_reject_stage_name
+                      << (capture_ready_reject_stage_type.empty() ? "" : " type=")
+                      << capture_ready_reject_stage_type
+                      << " seq_len=" << input.seq_len
+                      << "; refusing eager prefill fallback");
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                phase,
+                "rejected",
+                toString(capture_ready_reason),
+                capture_ready_reject_stage_name,
+                capture_ready_reject_stage_type);
+            return false;
         }
 
         // === WARMUP/COLD PATH ===
@@ -2425,9 +2527,11 @@ namespace llaminar2
         PrefillGraphRejectReason cold_reject_reason = PrefillGraphRejectReason::None;
         std::string cold_reject_stage_name;
         std::string cold_reject_stage_type;
-        if (phase == PrefillGraphPhase::Cold ||
+        const bool cold_phase =
+            phase == PrefillGraphPhase::Cold ||
             phase == PrefillGraphPhase::Initialized ||
-            phase == PrefillGraphPhase::Warmup)
+            phase == PrefillGraphPhase::Warmup;
+        if (cold_phase)
         {
             if (padded_preflight_checked)
             {
@@ -2472,15 +2576,29 @@ namespace llaminar2
             {
                 cold_reject_reason = PrefillGraphRejectReason::NoGPUContext;
                 cold_capture_candidate = false;
-                if (padded_bucket)
-                {
-                    LOG_ERROR("[ForwardExecutionEngine] Padded prefill graph rejected by preflight: "
-                              << toString(cold_reject_reason)
-                              << " real_seq_len=" << real_seq_len
-                              << " bucket_seq_len=" << bucket_seq_len);
-                    return false;
-                }
             }
+        }
+
+        if (cold_phase && (!cold_capture_candidate || !cold_stream_ready))
+        {
+            LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture rejected: "
+                      << toString(cold_reject_reason)
+                      << (cold_reject_stage_name.empty() ? "" : " stage=")
+                      << cold_reject_stage_name
+                      << (cold_reject_stage_type.empty() ? "" : " type=")
+                      << cold_reject_stage_type
+                      << " seq_len=" << input.seq_len
+                      << "; refusing eager prefill fallback");
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                PrefillGraphPhase::Cold,
+                "rejected",
+                toString(cold_reject_reason),
+                cold_reject_stage_name,
+                cold_reject_stage_type);
+            return false;
         }
 
         // Execute normally to warm up lazy allocations.
@@ -2491,46 +2609,18 @@ namespace llaminar2
             return false;
 
         // After successful warmup, check if graph capture is eligible
-        if (phase == PrefillGraphPhase::Cold ||
-            phase == PrefillGraphPhase::Initialized ||
-            phase == PrefillGraphPhase::Warmup)
+        if (cold_phase)
         {
-            if (cold_capture_candidate && cold_stream_ready)
-            {
-                cache.markWarmedUp(key);
-                publishPrefillGraphObservation(
-                    forward_cache,
-                    input,
-                    key,
-                    PrefillGraphPhase::Warmup,
-                    "warmup",
-                    "none");
-                if (cache.config().trace)
-                    LOG_INFO("[ForwardExecutionEngine] Prefill graph ARMED for capture: seq_len=" << input.seq_len);
-            }
-            else
-            {
-                if (cache.config().trace)
-                {
-                    LOG_INFO("[ForwardExecutionEngine] Prefill graph capture rejected: "
-                             << toString(cold_reject_reason)
-                             << (cold_reject_stage_name.empty() ? "" : " stage=")
-                             << cold_reject_stage_name
-                             << (cold_reject_stage_type.empty() ? "" : " type=")
-                             << cold_reject_stage_type
-                             << " seq_len=" << input.seq_len);
-                }
-                publishPrefillGraphObservation(
-                    forward_cache,
-                    input,
-                    key,
-                    PrefillGraphPhase::Cold,
-                    "rejected",
-                    toString(cold_reject_reason),
-                    cold_reject_stage_name,
-                    cold_reject_stage_type);
-            }
-            // Rejection is NOT fatal — we just won't use graph capture for this seq_len.
+            cache.markWarmedUp(key);
+            publishPrefillGraphObservation(
+                forward_cache,
+                input,
+                key,
+                PrefillGraphPhase::Warmup,
+                "warmup",
+                "none");
+            if (cache.config().trace)
+                LOG_INFO("[ForwardExecutionEngine] Prefill graph ARMED for capture: seq_len=" << input.seq_len);
         }
 
         return true;
@@ -2615,8 +2705,6 @@ namespace llaminar2
 
         const bool bucketed_prefill_miss =
             should_cache && build_cache && signature.is_bucketed_prefill && !is_decode;
-        const bool padded_bucketed_prefill_miss =
-            bucketed_prefill_miss && isPaddedBucketExecution(effective_input);
         bool bucketed_prefill_capture_candidate = false;
         PrefillGraphRejectReason bucketed_prefill_reject_reason = PrefillGraphRejectReason::None;
         std::string bucketed_prefill_reject_stage_name;
@@ -2654,16 +2742,35 @@ namespace llaminar2
             bucketed_prefill_capture_candidate =
                 (bucketed_prefill_reject_reason == PrefillGraphRejectReason::None);
 
-            if (!bucketed_prefill_capture_candidate && padded_bucketed_prefill_miss)
+            if (!bucketed_prefill_capture_candidate)
             {
-                LOG_ERROR("[ForwardExecutionEngine] Padded prefill graph rejected by preflight before execution: "
+                if (build_cache && !build_cache->prefill_graph_cache)
+                {
+                    build_cache->prefill_graph_cache =
+                        std::make_unique<PrefillGraphCache>(makePrefillGraphConfigFromEnv());
+                }
+                if (build_cache && build_cache->prefill_graph_cache)
+                {
+                    publishPrefillGraphObservation(
+                        *build_cache,
+                        effective_input,
+                        key,
+                        PrefillGraphPhase::Cold,
+                        "rejected",
+                        toString(bucketed_prefill_reject_reason),
+                        bucketed_prefill_reject_stage_name,
+                        bucketed_prefill_reject_stage_type);
+                }
+
+                LOG_ERROR("[ForwardExecutionEngine] Bucketed prefill graph rejected by preflight before execution: "
                           << toString(bucketed_prefill_reject_reason)
                           << (bucketed_prefill_reject_stage_name.empty() ? "" : " stage=")
                           << bucketed_prefill_reject_stage_name
                           << (bucketed_prefill_reject_stage_type.empty() ? "" : " type=")
                           << bucketed_prefill_reject_stage_type
                           << " real_seq_len=" << effectiveRealSeqLen(effective_input)
-                          << " bucket_seq_len=" << effectiveBucketSeqLen(effective_input));
+                          << " bucket_seq_len=" << effectiveBucketSeqLen(effective_input)
+                          << "; refusing eager prefill fallback");
                 return false;
             }
         }

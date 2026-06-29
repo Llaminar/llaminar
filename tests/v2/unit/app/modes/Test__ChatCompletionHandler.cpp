@@ -869,6 +869,63 @@ TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterDecod
     EXPECT_TRUE(response.ok);
 }
 
+TEST_F(Test__ChatCompletionHandler, HandleRequest_AppliesRebalanceHookAfterFinalCompletedStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+    ON_CALL(*tokenizer_, decode_token(_))
+        .WillByDefault(Return("x"));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(42, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        .Times(1)
+        .WillOnce(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Hello")};
+    request.max_tokens = 8;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+}
+
+TEST_F(Test__ChatCompletionHandler, HandleRequest_DeviceSideRebalanceSkipsHostFinalStepMaintenance)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1, 2}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, clearCache()).Times(2);
+    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController())
+        .Times(1)
+        .WillOnce(Return(true));
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(42, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance()).Times(0);
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "Hello")};
+    request.max_tokens = 8;
+    request.enable_thinking = false;
+
+    auto response = handler->handleRequest(request);
+    EXPECT_TRUE(response.ok);
+}
+
 TEST_F(Test__ChatCompletionHandler, HandleRequest_EmptyDecode_StopsGracefully)
 {
     auto handler = makeHandler();
@@ -2229,6 +2286,77 @@ TEST_F(Test__ChatCompletionHandler, Streaming_FinalChunk_HasFinishReason)
     size_t finish_idx = chunks.size() - 2; // before [DONE]
     auto finish_json = json::parse(chunks[finish_idx].substr(6, chunks[finish_idx].find("\n\n") - 6));
     EXPECT_EQ(finish_json["choices"][0]["finish_reason"], "stop");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_AppliesRebalanceHookAfterFinalCompletedStep)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(1, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance())
+        .Times(1)
+        .WillOnce(Return(true));
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 1u);
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
+}
+
+TEST_F(Test__ChatCompletionHandler, Streaming_DeviceSideRebalanceSkipsHostFinalStepMaintenance)
+{
+    auto handler = makeHandler();
+
+    ON_CALL(*tokenizer_, encodeChat(_, _, _))
+        .WillByDefault(Return(std::vector<int>{1}));
+    ON_CALL(*runner_, prefill(_))
+        .WillByDefault(Return(true));
+    ON_CALL(*tokenizer_, is_stop_token(_))
+        .WillByDefault(Return(false));
+
+    EXPECT_CALL(*runner_, usesDeviceSideMoERebalanceController())
+        .Times(1)
+        .WillOnce(Return(true));
+    EXPECT_CALL(*runner_, decodeStep())
+        .WillOnce(Return(makeToken(1, true)));
+    EXPECT_CALL(*runner_, maybeApplyMoERebalance()).Times(0);
+
+    ChatCompletionRequest request;
+    request.messages = {ChatMessage("user", "test")};
+    request.stream = true;
+
+    std::vector<std::string> chunks;
+    auto cb = [&](const std::string &line) -> bool
+    {
+        chunks.push_back(line);
+        return true;
+    };
+
+    auto response = handler->handleStreamingRequest(request, cb);
+
+    EXPECT_TRUE(response.ok);
+    ASSERT_GE(chunks.size(), 1u);
+    EXPECT_EQ(chunks.back(), "data: [DONE]\n\n");
 }
 
 TEST_F(Test__ChatCompletionHandler, Streaming_DoneSentinel_EmittedLast)

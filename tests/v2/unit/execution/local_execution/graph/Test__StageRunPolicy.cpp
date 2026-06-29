@@ -90,6 +90,23 @@ TEST(Test__StageRunPolicy, FastDecodePolicy_MinimalOverhead)
     EXPECT_TRUE(p.timeline);
 }
 
+TEST(Test__StageRunPolicy, CapturePhasePolicy_NoHostDiagnostics)
+{
+    auto p = StageRunPolicy::capturePhase();
+
+    EXPECT_TRUE(p.coherence);
+    EXPECT_TRUE(p.weight_coherence);
+    EXPECT_TRUE(p.mark_dirty);
+    EXPECT_TRUE(p.collective_intercept);
+    EXPECT_TRUE(p.preserve_gpu_streams);
+
+    EXPECT_FALSE(p.validation);
+    EXPECT_FALSE(p.stage_dump);
+    EXPECT_FALSE(p.snapshot_callback);
+    EXPECT_FALSE(p.pointer_validation);
+    EXPECT_FALSE(p.timeline);
+}
+
 TEST(Test__StageRunPolicy, DebugPolicy_EverythingOn)
 {
     auto p = StageRunPolicy::debug();

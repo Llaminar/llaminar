@@ -555,6 +555,72 @@ namespace llaminar2::test
         EXPECT_EQ(restored_v, v_payload);
     }
 
+    TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRoundTripUsesLocalLayerIndicesForStageCache)
+    {
+        constexpr int FIRST_LAYER = 1;
+        constexpr int STAGE_LAYERS = 8;
+        auto stage_config = makeQwen35_08B_StageConfig(FIRST_LAYER, STAGE_LAYERS);
+        auto cache = std::make_unique<CPUHybridRingKVCacheFP32>(
+            stage_config, getTestMPIContext(), STAGE_LAYERS, BATCH_SIZE,
+            MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM);
+        auto restored = std::make_unique<CPUHybridRingKVCacheFP32>(
+            stage_config, getTestMPIContext(), STAGE_LAYERS, BATCH_SIZE,
+            MAX_SEQ_LEN, N_KV_HEADS, HEAD_DIM);
+
+        std::vector<int> gdn_layers;
+        std::vector<std::vector<float>> expected_recurrence;
+        std::vector<std::vector<float>> expected_conv;
+        for (int global_layer = FIRST_LAYER; global_layer < FIRST_LAYER + STAGE_LAYERS; ++global_layer)
+        {
+            auto *state = cache->getGDNState(global_layer);
+            if (!state)
+                continue;
+
+            for (size_t i = 0; i < state->recurrence_state.size(); ++i)
+            {
+                state->recurrence_state[i] =
+                    static_cast<float>(global_layer * 10000 + static_cast<int>(i % 251));
+            }
+            for (size_t i = 0; i < state->conv_state.size(); ++i)
+            {
+                state->conv_state[i] =
+                    static_cast<float>(global_layer * 20000 + static_cast<int>(i % 127));
+            }
+            gdn_layers.push_back(global_layer);
+            expected_recurrence.push_back(state->recurrence_state);
+            expected_conv.push_back(state->conv_state);
+        }
+        ASSERT_GT(gdn_layers.size(), 2u);
+
+        const HybridPrefixStateMetadata metadata = cache->hybridPrefixStateMetadata();
+        ASSERT_EQ(metadata.host_bytes, cache->gdnMemoryBytes());
+        ASSERT_GT(metadata.host_bytes, 0u);
+
+        constexpr uint8_t kGuard = 0xCD;
+        std::vector<uint8_t> payload(metadata.host_bytes + 4096u, kGuard);
+        HybridPrefixStateDescriptor desc;
+        desc.seq_idx = 0;
+        desc.logical_token_count = 13;
+        ASSERT_TRUE(cache->exportHybridPrefixState(desc, payload.data(), nullptr));
+        for (size_t i = metadata.host_bytes; i < payload.size(); ++i)
+        {
+            ASSERT_EQ(payload[i], kGuard)
+                << "hybrid prefix export wrote past metadata.host_bytes at guard offset "
+                << (i - metadata.host_bytes);
+        }
+
+        ASSERT_TRUE(restored->importHybridPrefixState(desc, payload.data(), nullptr));
+        for (size_t i = 0; i < gdn_layers.size(); ++i)
+        {
+            auto *state = restored->getGDNState(gdn_layers[i]);
+            ASSERT_NE(state, nullptr) << "missing restored GDN layer " << gdn_layers[i];
+            EXPECT_EQ(state->recurrence_state, expected_recurrence[i])
+                << "recurrence state mismatch for global layer " << gdn_layers[i];
+            EXPECT_EQ(state->conv_state, expected_conv[i])
+                << "conv state mismatch for global layer " << gdn_layers[i];
+        }
+    }
+
     TEST_F(Test__CPUHybridKVCache, HybridPrefixStateRoundTripRestoresGDNState)
     {
         auto cache = createCache();

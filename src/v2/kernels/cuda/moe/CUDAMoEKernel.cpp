@@ -20,7 +20,6 @@
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
 
-#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -514,6 +513,17 @@ extern "C"
         int seq_len, int d_model, int num_experts,
         int device_idx, void *stream);
 
+    bool cudaMoE_quantize_router_gate_q8(
+        const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
+        int d_model, int num_experts,
+        int device_idx, void *stream);
+
+    bool cudaMoE_gate_logits_single_token_q8_weights(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int d_model, int num_experts,
+        int device_idx, void *stream);
+
     bool cudaMoE_softmax_topk(
         float *logits, int *expert_indices, float *expert_weights,
         int seq_len, int num_experts, int top_k, bool normalize_weights,
@@ -525,6 +535,17 @@ extern "C"
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool normalize_weights,
         bool write_legacy_outputs, bool update_runtime_histogram,
+        void *runtime_layers,
+        const void *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        void *rebalance_command_header,
+        const void *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const void *rebalance_config,
+        void *rebalance_apply_status,
+        void *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count,
         int device_idx, void *stream);
 
     bool cudaMoE_decode_route_select_runtime(
@@ -533,6 +554,157 @@ extern "C"
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool write_legacy_outputs,
         bool update_runtime_histogram, int device_idx, void *stream);
+
+    bool cudaMoE_device_rebalance_controller(
+        void *runtime_layers,
+        const unsigned long long *gathered_histograms,
+        void *status,
+        const void *config,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        void *command_header,
+        void *wave_state,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_histograms(
+        void *runtime_layers,
+        unsigned long long *local_histograms,
+        const void *config,
+        const void *wave_state,
+        const void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_directory(
+        void *runtime_layers,
+        void *local_directory,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_source_descriptors(
+        void *runtime_layers,
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_source_descriptors,
+        const void *config,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_project_rebalance_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        void *local_command_headers,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_compact_payloads(
+        const void *plan_entries,
+        const void *command_headers,
+        uint32_t plan_capacity,
+        const void *local_source_descriptors,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_pack_rebalance_collective_payloads(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        const void *local_directory,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_unpack_rebalance_collective_payloads(
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *gathered_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_init_rebalance_graph_controller_state(
+        void *controller_state,
+        const void *config,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_publish_rebalance_transfer_complete(
+        void *controller_state,
+        const void *command_header,
+        const void *wave_state,
+        const void *copy_status,
+        const void *config,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_apply_ready_rebalance_wave(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        int target_layer,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_apply_rebalance_arrivals(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        int target_layer,
+        int device_idx,
+        void *stream);
 
     bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream);
     bool cudaMoE_float_to_int(const float *input, int *output, int count, int device_idx, void *stream);
@@ -591,6 +763,11 @@ extern "C"
     bool cudaMoE_exclusive_scan(
         const int *expert_counts, int *expert_offsets,
         int num_experts, int device_idx, void *stream);
+
+    bool cudaMoE_build_active_expert_list(
+        const int *expert_counts, int *active_expert_ids,
+        int num_experts, int max_active_experts,
+        int device_idx, void *stream);
 
     bool cudaMoE_scatter_tokens(
         const int *routing_indices, const float *routing_weights,
@@ -666,6 +843,7 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
         int num_active,
         int intermediate,
         int d_model,
@@ -682,6 +860,44 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int num_active,
+        int intermediate,
+        int d_model,
+        int num_experts,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        int num_active,
+        int intermediate,
+        int d_model,
+        int num_experts,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
         float *d_gate_partials,
         float *d_up_partials,
         int num_active,
@@ -713,6 +929,42 @@ extern "C"
         const float *const *d_gate_ptrs,
         const float *const *d_up_ptrs,
         const llaminar2::DeviceNativeVNNIMatrixDesc *d_desc_table,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_down_partials,
+        float *d_output,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_output,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
         const int *d_expert_ids,
         const float *d_weights,
         int8_t *d_swiglu_int8,
@@ -871,6 +1123,8 @@ namespace llaminar2
         prefill_intermediate_cap_ = 0;
         d_decode_hidden_int8_ = nullptr;
         d_decode_hidden_scales_ = nullptr;
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
         d_grouped_gateup_gate_partials_ = nullptr;
@@ -906,6 +1160,8 @@ namespace llaminar2
         host_grouped_weights_.clear();
         prepared_num_experts_ = 0;
         group_active_expert_slots_ = 0;
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
         /*
          * Runtime pointer slots are staged during graph warmup.  A dynamic
          * reset means the next captured graph must restage its deterministic
@@ -973,6 +1229,11 @@ namespace llaminar2
             release(table.device_gate_descs);
             release(table.device_up_descs);
         }
+        for (auto &entry : router_q8_gate_cache_)
+        {
+            release(entry.d_gate_weights_q8);
+            release(entry.d_gate_scales);
+        }
         staging_capacity_ = 0;
         route_logits_capacity_ = 0;
         route_topk_capacity_ = 0;
@@ -986,6 +1247,9 @@ namespace llaminar2
         prefill_intermediate_cap_ = 0;
         decode_gateup_topk_cap_ = 0;
         decode_gateup_d_model_cap_ = 0;
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
+        router_q8_gate_cache_.clear();
         grouped_gateup_kpart_active_cap_ = 0;
         grouped_gateup_kpart_partitions_cap_ = 0;
         grouped_gateup_kpart_intermediate_cap_ = 0;
@@ -1002,76 +1266,6 @@ namespace llaminar2
         gateup_pointer_slot_ready_.fill(false);
         down_pointer_slot_ready_.fill(false);
 
-        if (router_cublas_handle_)
-        {
-            cublasDestroy(static_cast<cublasHandle_t>(router_cublas_handle_));
-            router_cublas_handle_ = nullptr;
-        }
-    }
-
-    bool CUDAMoEKernel::routeLogitsCuBLAS(const float *hidden, const float *gate_weights, float *logits,
-                                          int seq_len, int d_model, int num_experts)
-    {
-        void *stream = getStream();
-        if (!stream)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] CUDA router requires an explicit stream");
-            return false;
-        }
-
-        if (!router_cublas_handle_)
-        {
-            if (isGraphCaptureActive() || isCudaStreamCapturing(stream))
-            {
-                LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cuBLAS handle was not warmed before graph capture");
-                return false;
-            }
-            if (!setMoEDevice(device_ordinal_, "CUDAMoEKernel::routeLogitsCuBLAS"))
-                return false;
-            cublasHandle_t handle = nullptr;
-            const cublasStatus_t create_status = cublasCreate(&handle);
-            if (create_status != CUBLAS_STATUS_SUCCESS)
-            {
-                LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasCreate failed: "
-                          << static_cast<int>(create_status));
-                return false;
-            }
-            cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
-            router_cublas_handle_ = handle;
-        }
-
-        auto *handle = static_cast<cublasHandle_t>(router_cublas_handle_);
-        cublasStatus_t status = cublasSetStream(handle, static_cast<cudaStream_t>(stream));
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSetStream failed: "
-                      << static_cast<int>(status));
-            return false;
-        }
-
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        // Row-major logits[S,E] = hidden[S,D] * gate[E,D]^T.
-        // In cuBLAS column-major views this is C^T[E,S] = gate[E,D] * hidden^T[D,S].
-        status = cublasSgemm(
-            handle,
-            CUBLAS_OP_T, CUBLAS_OP_N,
-            num_experts, seq_len, d_model,
-            &alpha,
-            gate_weights, d_model,
-            hidden, d_model,
-            &beta,
-            logits, num_experts);
-        if (status != CUBLAS_STATUS_SUCCESS)
-        {
-            LOG_ERROR("[CUDAMoEKernel::routeLogitsCuBLAS] cublasSgemm failed: "
-                      << static_cast<int>(status)
-                      << " seq_len=" << seq_len
-                      << " d_model=" << d_model
-                      << " num_experts=" << num_experts);
-            return false;
-        }
-        return true;
     }
 
     bool CUDAMoEKernel::ensureStagingCapacity(int count)
@@ -1304,6 +1498,198 @@ namespace llaminar2
         d_decode_hidden_scales_ = static_cast<float *>(decode_hidden_scales);
         decode_gateup_topk_cap_ = top_k;
         decode_gateup_d_model_cap_ = d_model;
+        return true;
+    }
+
+    const CUDAMoEKernel::RouterQ8GateCacheEntry *CUDAMoEKernel::getOrCreateQ8RouterGateCache(
+        ITensor *gate_weights,
+        const float *gate_device_ptr,
+        int d_model,
+        int num_experts)
+    {
+        if (!debugEnv().gemm.cuda_moe_router_q8)
+            return nullptr;
+        if (!gate_weights || !gate_device_ptr || d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] invalid Q8 router gate request "
+                      "(gate_weights=" << gate_weights
+                      << " gate_device_ptr=" << static_cast<const void *>(gate_device_ptr)
+                      << " d_model=" << d_model
+                      << " num_experts=" << num_experts << ")");
+            return nullptr;
+        }
+
+        const auto tensor_key = reinterpret_cast<std::uintptr_t>(gate_weights);
+        const auto host_ptr_key = reinterpret_cast<std::uintptr_t>(gate_weights->raw_data());
+        const auto device_ptr_key = reinterpret_cast<std::uintptr_t>(gate_device_ptr);
+        for (const auto &entry : router_q8_gate_cache_)
+        {
+            if (entry.source_tensor == tensor_key &&
+                entry.source_host_ptr == host_ptr_key &&
+                entry.source_device_ptr == device_ptr_key &&
+                entry.d_model == d_model &&
+                entry.num_experts == num_experts &&
+                entry.d_gate_weights_q8 && entry.d_gate_scales)
+            {
+                return &entry;
+            }
+        }
+
+        void *stream = getStream();
+        const bool capture_active =
+            isGraphCaptureActive() ||
+            (deviceContext() && deviceContext()->isDeviceGraphCaptureActive()) ||
+            isCudaStreamCapturing(stream);
+        if (capture_active)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] Q8 router cache miss during graph capture");
+            return nullptr;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] explicit CUDA stream is required");
+            return nullptr;
+        }
+
+        const size_t d_model_sz = static_cast<size_t>(d_model);
+        const size_t experts_sz = static_cast<size_t>(num_experts);
+        if (d_model_sz > std::numeric_limits<size_t>::max() / experts_sz)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] router gate size overflow");
+            return nullptr;
+        }
+        const size_t element_count = d_model_sz * experts_sz;
+        const int blocks_per_row = d_model / 32;
+        const size_t scale_count = static_cast<size_t>(num_experts) * static_cast<size_t>(blocks_per_row);
+
+        if (!setMoEDevice(device_ordinal_, "getOrCreateQ8RouterGateCache"))
+            return nullptr;
+
+        for (auto it = router_q8_gate_cache_.begin(); it != router_q8_gate_cache_.end();)
+        {
+            if (it->source_tensor == tensor_key &&
+                it->d_model == d_model &&
+                it->num_experts == num_experts &&
+                (it->source_device_ptr != device_ptr_key ||
+                 it->source_host_ptr != host_ptr_key))
+            {
+                if (it->d_gate_weights_q8)
+                    (void)cudaFree(it->d_gate_weights_q8);
+                if (it->d_gate_scales)
+                    (void)cudaFree(it->d_gate_scales);
+                it = router_q8_gate_cache_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        int8_t *d_gate_weights_q8 = nullptr;
+        float *d_gate_scales = nullptr;
+        cudaError_t err = cudaMalloc(&d_gate_weights_q8, element_count * sizeof(int8_t));
+        if (err == cudaSuccess)
+            err = cudaMalloc(&d_gate_scales, scale_count * sizeof(float));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] cudaMalloc Q8 router gate failed: "
+                      << cudaGetErrorString(err));
+            if (d_gate_weights_q8)
+                (void)cudaFree(d_gate_weights_q8);
+            return nullptr;
+        }
+
+        if (!cudaMoE_quantize_router_gate_q8(gate_device_ptr, d_gate_weights_q8, d_gate_scales,
+                                             d_model, num_experts,
+                                             device_ordinal_, stream))
+        {
+            LOG_ERROR("[CUDAMoEKernel::getOrCreateQ8RouterGateCache] FP32->Q8 router gate conversion launch failed");
+            (void)cudaFree(d_gate_weights_q8);
+            (void)cudaFree(d_gate_scales);
+            return nullptr;
+        }
+
+        RouterQ8GateCacheEntry entry{};
+        entry.source_tensor = tensor_key;
+        entry.source_host_ptr = host_ptr_key;
+        entry.source_device_ptr = device_ptr_key;
+        entry.d_model = d_model;
+        entry.num_experts = num_experts;
+        entry.blocks_per_row = blocks_per_row;
+        entry.element_count = element_count;
+        entry.scale_count = scale_count;
+        entry.d_gate_weights_q8 = d_gate_weights_q8;
+        entry.d_gate_scales = d_gate_scales;
+        router_q8_gate_cache_.push_back(entry);
+
+        LOG_DEBUG("[CUDAMoEKernel] Cached Q8 router gate tensor="
+                  << reinterpret_cast<const void *>(tensor_key)
+                  << " host="
+                  << reinterpret_cast<const void *>(host_ptr_key)
+                  << " source_device=" << reinterpret_cast<const void *>(device_ptr_key)
+                  << " shape=[" << num_experts << "," << d_model << "] payload_bytes="
+                  << element_count << " scale_bytes=" << (scale_count * sizeof(float)));
+        return &router_q8_gate_cache_.back();
+    }
+
+    bool CUDAMoEKernel::tryRouteDecodeLogitsQ8(
+        ITensor *gate_weights,
+        const float *d_hidden,
+        const float *d_gate,
+        int d_model,
+        int num_experts,
+        int top_k,
+        const char *context)
+    {
+        router_q8_hidden_source_ = nullptr;
+        router_q8_hidden_valid_ = false;
+        if (!debugEnv().gemm.cuda_moe_router_q8)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router requested while disabled");
+            return false;
+        }
+        if (!d_hidden || !d_gate || d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] invalid Q8 router shape or pointer state");
+            return false;
+        }
+        if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router hidden scratch unavailable");
+            return false;
+        }
+
+        const auto *q8_gate = getOrCreateQ8RouterGateCache(gate_weights, d_gate, d_model, num_experts);
+        if (!q8_gate)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router gate cache unavailable");
+            return false;
+        }
+
+        void *stream = requireStream(context ? context : "CUDAMoEKernel::tryRouteDecodeLogitsQ8");
+        const bool ok = cudaMoE_gate_logits_single_token_q8_weights(
+            d_hidden,
+            d_decode_hidden_int8_,
+            d_decode_hidden_scales_,
+            q8_gate->d_gate_weights_q8,
+            q8_gate->d_gate_scales,
+            d_route_logits_,
+            d_model,
+            num_experts,
+            device_ordinal_,
+            stream);
+        if (!ok)
+        {
+            LOG_ERROR("[CUDAMoEKernel::tryRouteDecodeLogitsQ8] Q8 router logits kernel failed");
+            return false;
+        }
+
+        router_q8_hidden_source_ = d_hidden;
+        router_q8_hidden_valid_ = true;
+        PerfStatsCollector::addCounter(
+            "kernel", "cuda_moe_router_q8_decode_calls", 1.0, {}, {},
+            {{"num_experts", std::to_string(num_experts)},
+             {"d_model", std::to_string(d_model)}});
         return true;
     }
 
@@ -1870,7 +2256,7 @@ namespace llaminar2
         if (gate_is_fp32 && seq_len >= 16)
         {
             PerfStatsCollector::addCounter(
-                "kernel", "cuda_moe_router_cublas_prefill_calls", 1.0, {}, {},
+                "kernel", "cuda_moe_router_tiled_prefill_calls", 1.0, {}, {},
                 {{"seq_len", std::to_string(seq_len)},
                  {"d_model", std::to_string(d_model)},
                  {"num_experts", std::to_string(num_experts)}});
@@ -2226,20 +2612,54 @@ namespace llaminar2
         if (gate_is_fp32 && !requireAlignedPointer(d_gate, 16, "FP32 gate", "decodeRouteSelect"))
             return false;
 
-        const bool route_ok = gate_is_fp32
-                                  ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
-                                                         /*seq_len=*/1, d_model, num_experts,
-                                                         device_ordinal_, stream)
-                                  : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
-                                                              /*seq_len=*/1, d_model, num_experts,
-                                                              device_ordinal_, stream);
-        if (!route_ok)
+        bool logits_ready = false;
+        const bool q8_router_requested = gate_is_fp32 && debugEnv().gemm.cuda_moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelect] Q8 router requires d_model to be a multiple of 32, got "
+                      << d_model);
             return false;
+        }
+        if (q8_router_requested)
+        {
+            if (!tryRouteDecodeLogitsQ8(
+                gate_weights, d_hidden, static_cast<const float *>(d_gate),
+                d_model, num_experts, top_k, "CUDAMoEKernel::decodeRouteSelect"))
+            {
+                return false;
+            }
+            logits_ready = true;
+        }
+        if (!logits_ready)
+        {
+            router_q8_hidden_source_ = nullptr;
+            router_q8_hidden_valid_ = false;
+            const bool route_ok = gate_is_fp32
+                                      ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
+                                                             /*seq_len=*/1, d_model, num_experts,
+                                                             device_ordinal_, stream)
+                                      : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
+                                                                  /*seq_len=*/1, d_model, num_experts,
+                                                                  device_ordinal_, stream);
+            if (!route_ok)
+                return false;
+        }
         if (!cudaMoE_softmax_topk_decode_runtime(d_route_logits_,
                                                  runtime_layer,
                                                  legacy_indices, legacy_weights,
                                                  num_experts, top_k, normalize_weights,
                                                  write_legacy_outputs, update_runtime_histogram,
+                                                 nullptr,
+                                                 nullptr,
+                                                 0u,
+                                                 nullptr,
+                                                 nullptr,
+                                                 0u,
+                                                 nullptr,
+                                                 nullptr,
+                                                 nullptr,
+                                                 -1,
+                                                 1u,
                                                  device_ordinal_, stream))
             return false;
 
@@ -2249,6 +2669,627 @@ namespace llaminar2
             markDeviceWritten(output_weights, device, stream);
         }
         return true;
+    }
+
+    bool CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply(
+        DeviceMoELayerRuntime *runtime_layers,
+        DeviceMoELayerRuntime *runtime_layer,
+        ITensor *hidden, ITensor *gate_weights,
+        int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        bool write_legacy_outputs,
+        bool update_runtime_histogram,
+        const DeviceMoERebalancePlanEntry *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *rebalance_command_header,
+        const DeviceMoEExpertDirectoryEntry *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &rebalance_config,
+        DeviceMoERebalanceApplyStatus *rebalance_apply_status,
+        DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count)
+    {
+        void *stream = requireStream("CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply");
+        const DeviceId device = deviceId();
+        if (!runtime_layers || !runtime_layer || !hidden || !gate_weights ||
+            !rebalance_plan_entries || rebalance_plan_capacity == 0 ||
+            !rebalance_command_header || !rebalance_apply_status ||
+            !rebalance_controller_state ||
+            !validateDeviceMoERebalanceConfig(rebalance_config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] invalid runtime or rebalance binding");
+            return false;
+        }
+        if (!ensureTensorOnDevice(hidden, device, stream, "hidden") ||
+            !ensureTensorOnDevice(gate_weights, device, stream, "gate_weights"))
+            return false;
+
+        auto *hidden_base = asTensorBase(hidden, "decodeRouteSelectWithReadyRebalanceApply hidden");
+        auto *gate_base = asTensorBase(gate_weights, "decodeRouteSelectWithReadyRebalanceApply gate_weights");
+        if (!hidden_base || !gate_base)
+            return false;
+        if (hidden_base->native_type() != TensorType::FP32)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] hidden must be FP32, got "
+                      << tensorTypeName(hidden_base->native_type()));
+            return false;
+        }
+        const TensorType gate_type = gate_base->native_type();
+        const bool gate_is_fp32 = (gate_type == TensorType::FP32);
+        const bool gate_is_bf16 = (gate_type == TensorType::BF16);
+        if (!gate_is_fp32 && !gate_is_bf16)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] CUDA runtime router supports FP32 or BF16 gate weights, got "
+                      << tensorTypeName(gate_type));
+            return false;
+        }
+
+        float *legacy_indices = nullptr;
+        float *legacy_weights = nullptr;
+        if (write_legacy_outputs)
+        {
+            if (!output_indices || !output_weights ||
+                !ensureOutputOnDevice(output_indices, device, stream, "output_indices") ||
+                !ensureOutputOnDevice(output_weights, device, stream, "output_weights"))
+                return false;
+            legacy_indices = static_cast<float *>(output_indices->gpu_data_ptr());
+            legacy_weights = static_cast<float *>(output_weights->gpu_data_ptr());
+        }
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        const void *d_gate = gate_weights->gpu_data_ptr();
+        if (!d_hidden || !d_gate)
+            return false;
+
+        if (!ensureRouteBufferCapacity(static_cast<size_t>(num_experts), static_cast<size_t>(top_k)))
+            return false;
+        if (!requireAlignedPointer(d_hidden, 16, "hidden", "decodeRouteSelectWithReadyRebalanceApply") ||
+            !requireAlignedPointer(d_route_logits_, 16, "route logits", "decodeRouteSelectWithReadyRebalanceApply"))
+            return false;
+        if (gate_is_fp32 && !requireAlignedPointer(d_gate, 16, "FP32 gate", "decodeRouteSelectWithReadyRebalanceApply"))
+            return false;
+
+        bool logits_ready = false;
+        const bool q8_router_requested = gate_is_fp32 && debugEnv().gemm.cuda_moe_router_q8;
+        if (q8_router_requested && (d_model % 32) != 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router requires d_model to be a multiple of 32, got "
+                      << d_model);
+            return false;
+        }
+        if (q8_router_requested)
+        {
+            if (!tryRouteDecodeLogitsQ8(
+                gate_weights, d_hidden, static_cast<const float *>(d_gate),
+                d_model, num_experts, top_k,
+                "CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply"))
+            {
+                return false;
+            }
+            logits_ready = true;
+        }
+        if (!logits_ready)
+        {
+            router_q8_hidden_source_ = nullptr;
+            router_q8_hidden_valid_ = false;
+            const bool route_ok = gate_is_fp32
+                                      ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
+                                                             /*seq_len=*/1, d_model, num_experts,
+                                                             device_ordinal_, stream)
+                                      : cudaMoE_route_logits_bf16(d_hidden, d_gate, d_route_logits_,
+                                                                  /*seq_len=*/1, d_model, num_experts,
+                                                                  device_ordinal_, stream);
+            if (!route_ok)
+                return false;
+        }
+        if (!cudaMoE_softmax_topk_decode_runtime(
+                d_route_logits_,
+                runtime_layer,
+                legacy_indices, legacy_weights,
+                num_experts, top_k, normalize_weights,
+                write_legacy_outputs, update_runtime_histogram,
+                runtime_layers,
+                rebalance_plan_entries,
+                rebalance_plan_capacity,
+                rebalance_command_header,
+                rebalance_local_transfer_slots,
+                rebalance_local_transfer_slot_count,
+                &rebalance_config,
+                rebalance_apply_status,
+                rebalance_controller_state,
+                rebalance_target_layer,
+                rebalance_command_buffer_count,
+                device_ordinal_, stream))
+            return false;
+
+        if (write_legacy_outputs)
+        {
+            markDeviceWritten(output_indices, device, stream);
+            markDeviceWritten(output_weights, device, stream);
+        }
+        return true;
+    }
+
+    bool CUDAMoEKernel::runDeviceRebalanceController(
+        DeviceMoELayerRuntime *runtime_layers,
+        const uint64_t *gathered_histograms,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceWaveState *wave_state,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !gathered_histograms || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::runDeviceRebalanceController] runtime layers, gathered histograms, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::runDeviceRebalanceController");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "runDeviceRebalanceController"))
+            return false;
+
+        return cudaMoE_device_rebalance_controller(
+            runtime_layers,
+            reinterpret_cast<const unsigned long long *>(gathered_histograms),
+            status,
+            &config,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            payload_slot_capacity,
+            command_header,
+            wave_state,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceHistograms(
+        DeviceMoELayerRuntime *runtime_layers,
+        uint64_t *local_histograms,
+        const DeviceMoERebalanceConfig &config,
+        const DeviceMoERebalanceWaveState *wave_state,
+        const DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceHistograms] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !local_histograms)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceHistograms] runtime layers and local histograms must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::packDeviceRebalanceHistograms");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceHistograms"))
+            return false;
+
+        return cudaMoE_pack_rebalance_histograms(
+            runtime_layers,
+            reinterpret_cast<unsigned long long *>(local_histograms),
+            &config,
+            wave_state,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceDirectory(
+        DeviceMoELayerRuntime *runtime_layers,
+        DeviceMoEExpertDirectoryEntry *local_directory,
+        const DeviceMoERebalanceConfig &config)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceDirectory] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !local_directory)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceDirectory] runtime layers and local directory must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::packDeviceRebalanceDirectory");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceDirectory"))
+            return false;
+
+        return cudaMoE_pack_rebalance_directory(
+            runtime_layers,
+            local_directory,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceSourceDescriptors(
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *command_headers,
+        uint32_t plan_capacity,
+        DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceSourceDescriptors] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || !command_headers ||
+            !local_source_descriptors)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceSourceDescriptors] runtime, projected plans, headers, and source descriptor output must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::packDeviceRebalanceSourceDescriptors");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceSourceDescriptors"))
+            return false;
+
+        return cudaMoE_pack_rebalance_source_descriptors(
+            runtime_layers,
+            plan_entries,
+            command_headers,
+            plan_capacity,
+            local_source_descriptors,
+            &config,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::projectDeviceRebalanceDomainCommands(
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntry *local_plan_entries,
+        DeviceMoERebalanceCommandBufferHeader *local_command_headers,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceStatus *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectDeviceRebalanceDomainCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_plan_entries || !local_command_headers ||
+            plan_capacity == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::projectDeviceRebalanceDomainCommands] gathered and local command buffers must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::projectDeviceRebalanceDomainCommands");
+        if (!setMoEDevice(device_ordinal_, "projectDeviceRebalanceDomainCommands"))
+            return false;
+
+        return cudaMoE_project_rebalance_domain_commands(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_plan_entries,
+            local_command_headers,
+            &config,
+            status,
+            payload_slot_capacity,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceCompactPayloads(
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCompactPayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!plan_entries || !command_headers ||
+            !local_source_descriptors || !local_payload || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCompactPayloads] plans, headers, source descriptors, payload, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::packDeviceRebalanceCompactPayloads");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCompactPayloads"))
+            return false;
+
+        return cudaMoE_pack_rebalance_compact_payloads(
+            plan_entries,
+            command_headers,
+            plan_capacity,
+            local_source_descriptors,
+            local_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::applyDeviceRebalanceArrivals(
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        int target_layer)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyDeviceRebalanceArrivals] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !local_transfer_slots || !status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyDeviceRebalanceArrivals] runtime, plan, transfer slots, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::applyDeviceRebalanceArrivals");
+        if (!setMoEDevice(device_ordinal_, "applyDeviceRebalanceArrivals"))
+            return false;
+
+        return cudaMoE_apply_rebalance_arrivals(
+            runtime_layers,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            target_layer,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::packDeviceRebalanceCollectivePayloads(
+        const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_directory,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCollectivePayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_directory || !local_payload || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::packDeviceRebalanceCollectivePayloads] gathered plans, headers, local directory, payload, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::packDeviceRebalanceCollectivePayloads");
+        if (!setMoEDevice(device_ordinal_, "packDeviceRebalanceCollectivePayloads"))
+            return false;
+
+        return cudaMoE_pack_rebalance_collective_payloads(
+            gathered_plan_entries,
+            gathered_command_headers,
+            plan_capacity,
+            local_directory,
+            local_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads(
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        const uint8_t *gathered_payload,
+        uint32_t local_payload_slot_count,
+        uint64_t payload_slot_bytes,
+        DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads] invalid device rebalance config");
+            return false;
+        }
+        if (!plan_entries || (!plan_count && !command_header) ||
+            !gathered_payload || !local_transfer_slots || !status ||
+            plan_capacity == 0 || local_payload_slot_count == 0 ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntry))
+        {
+            LOG_ERROR("[CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads] plan, gathered payload, transfer slots, and status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::unpackDeviceRebalanceCollectivePayloads");
+        if (!setMoEDevice(device_ordinal_, "unpackDeviceRebalanceCollectivePayloads"))
+            return false;
+
+        return cudaMoE_unpack_rebalance_collective_payloads(
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            gathered_payload,
+            local_payload_slot_count,
+            static_cast<unsigned long long>(payload_slot_bytes),
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            controller_state,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::initializeDeviceRebalanceGraphController(
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        const DeviceMoERebalanceConfig &config)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::initializeDeviceRebalanceGraphController] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state)
+        {
+            LOG_ERROR("[CUDAMoEKernel::initializeDeviceRebalanceGraphController] controller state must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::initializeDeviceRebalanceGraphController");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "initializeDeviceRebalanceGraphController"))
+            return false;
+
+        return cudaMoE_init_rebalance_graph_controller_state(
+            controller_state,
+            &config,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::publishDeviceRebalanceTransferComplete(
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        const DeviceMoERebalanceCommandBufferHeader *command_header,
+        const DeviceMoERebalanceWaveState *wave_state,
+        const DeviceMoERebalanceApplyStatus *copy_status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishDeviceRebalanceTransferComplete] invalid device rebalance config");
+            return false;
+        }
+        if (!controller_state || !command_header || !wave_state || !copy_status)
+        {
+            LOG_ERROR("[CUDAMoEKernel::publishDeviceRebalanceTransferComplete] controller state, command header, wave state, and copy status must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::publishDeviceRebalanceTransferComplete");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "publishDeviceRebalanceTransferComplete"))
+            return false;
+
+        return cudaMoE_publish_rebalance_transfer_complete(
+            controller_state,
+            command_header,
+            wave_state,
+            copy_status,
+            &config,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::applyReadyDeviceRebalanceWave(
+        DeviceMoELayerRuntime *runtime_layers,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const DeviceMoERebalanceConfig &config,
+        DeviceMoERebalanceApplyStatus *status,
+        DeviceMoERebalanceGraphControllerState *controller_state,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        int target_layer,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyReadyDeviceRebalanceWave] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !status || !controller_state)
+        {
+            LOG_ERROR("[CUDAMoEKernel::applyReadyDeviceRebalanceWave] runtime, plan, status, controller state, and command ABI must be non-null");
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::applyReadyDeviceRebalanceWave");
+        if (!stream)
+            return false;
+        if (!setMoEDevice(device_ordinal_, "applyReadyDeviceRebalanceWave"))
+            return false;
+
+        return cudaMoE_apply_ready_rebalance_wave(
+            runtime_layers,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            local_transfer_slots,
+            local_transfer_slot_count,
+            &config,
+            status,
+            controller_state,
+            target_layer,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
     }
 
     void CUDAMoEKernel::zeroBuffer(ITensor *tensor, size_t bytes)
@@ -2575,6 +3616,10 @@ namespace llaminar2
                                         num_experts, device_ordinal_, stream) &&
                cudaMoE_exclusive_scan(d_expert_counts, d_expert_offsets,
                                        num_experts, device_ordinal_, stream) &&
+               cudaMoE_build_active_expert_list(
+                   d_expert_counts, d_group_active_expert_ids_,
+                   num_experts, std::min(total_slots, num_experts),
+                   device_ordinal_, stream) &&
                cudaMoE_scatter_tokens_deterministic(
                    d_routing_indices, d_routing_weights,
                    d_expert_offsets, d_expert_counts,
@@ -2882,6 +3927,161 @@ namespace llaminar2
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
     }
 
+    bool CUDAMoEKernel::updateGroupedExpertDownDescriptorTable(
+        int descriptor_table_id,
+        const DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!down_descs || descriptor_table_id < 0 ||
+            descriptor_table_id >= static_cast<int>(grouped_down_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
+            (intermediate % 32) != 0)
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "updateGroupedExpertDownDescriptorTable"))
+            return false;
+
+        auto &table = grouped_down_desc_tables_[static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid || !table.device_descs ||
+            table.num_experts != num_experts ||
+            table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        uint8_t codebook_id = 0;
+        uint32_t codebook_mask = 0;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &desc = down_descs[expert_id];
+            if (isBlankGroupedDesc(desc))
+                continue;
+            if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
+                return false;
+            codebook_mask |= cudaGroupedPrefillCodebookBit(desc.codebook_id);
+            if (codebook_id == 0)
+                codebook_id = desc.codebook_id;
+        }
+        if (codebook_mask == 0)
+            return false;
+        if (codebook_mask & (codebook_mask - 1u))
+            codebook_id = kCudaMoEMixedCodebookSentinel;
+        if (table.codebook_id != codebook_id ||
+            table.codebook_mask != codebook_mask)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertDownDescriptorTable] refusing in-place update "
+                      "with changed codebook semantics");
+            return false;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        cudaError_t err = cudaMemcpyAsync(table.device_descs, down_descs,
+                                          desc_bytes,
+                                          cudaMemcpyHostToDevice,
+                                          static_cast<cudaStream_t>(getStream()));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertDownDescriptorTable] descriptor refresh failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        table.host_descs.assign(down_descs, down_descs + num_experts);
+        return true;
+    }
+
+    bool CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables(
+        int descriptor_table_id,
+        const DeviceNativeVNNIMatrixDesc *gate_descs,
+        const DeviceNativeVNNIMatrixDesc *up_descs,
+        int num_experts,
+        int d_model,
+        int intermediate)
+    {
+        if (!gate_descs || !up_descs || descriptor_table_id < 0 ||
+            descriptor_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            num_experts <= 0 || d_model <= 0 || intermediate <= 0 ||
+            (d_model % 32) != 0)
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "updateGroupedExpertGateUpDescriptorTables"))
+            return false;
+
+        auto &table = grouped_gateup_desc_tables_[static_cast<size_t>(descriptor_table_id)];
+        if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
+            table.num_experts != num_experts ||
+            table.d_model != d_model ||
+            table.intermediate != intermediate)
+        {
+            return false;
+        }
+
+        uint8_t codebook_id = 0;
+        uint32_t codebook_mask = 0;
+        for (int expert_id = 0; expert_id < num_experts; ++expert_id)
+        {
+            const auto &gate_desc = gate_descs[expert_id];
+            const auto &up_desc = up_descs[expert_id];
+            const bool gate_blank = isBlankGroupedDesc(gate_desc);
+            const bool up_blank = isBlankGroupedDesc(up_desc);
+            if (gate_blank || up_blank)
+            {
+                if (gate_blank && up_blank)
+                    continue;
+                return false;
+            }
+            if (!gate_desc.valid() || !up_desc.valid() ||
+                gate_desc.codebook_id != up_desc.codebook_id ||
+                !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
+                !validateCudaGroupedDescShape(up_desc, intermediate, d_model))
+            {
+                return false;
+            }
+            codebook_mask |= cudaGroupedPrefillCodebookBit(gate_desc.codebook_id);
+            if (codebook_id == 0)
+                codebook_id = gate_desc.codebook_id;
+        }
+        if (codebook_mask == 0)
+            return false;
+        if (codebook_mask & (codebook_mask - 1u))
+            codebook_id = kCudaMoEMixedCodebookSentinel;
+        if (table.codebook_id != codebook_id ||
+            table.codebook_mask != codebook_mask)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] refusing in-place update "
+                      "with changed codebook semantics");
+            return false;
+        }
+
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        cudaError_t err = cudaMemcpyAsync(table.device_gate_descs, gate_descs,
+                                          desc_bytes,
+                                          cudaMemcpyHostToDevice,
+                                          static_cast<cudaStream_t>(getStream()));
+        if (err == cudaSuccess)
+            err = cudaMemcpyAsync(table.device_up_descs, up_descs,
+                                  desc_bytes,
+                                  cudaMemcpyHostToDevice,
+                                  static_cast<cudaStream_t>(getStream()));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedExpertGateUpDescriptorTables] descriptor refresh failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        table.host_gate_descs.assign(gate_descs, gate_descs + num_experts);
+        table.host_up_descs.assign(up_descs, up_descs + num_experts);
+        return true;
+    }
+
     bool CUDAMoEKernel::prepareExpertGroupsAsync(ITensor *routing_indices, ITensor *routing_weights,
                                                  int seq_len, int num_experts, int top_k)
     {
@@ -2948,6 +4148,7 @@ namespace llaminar2
                                        d_group_token_indices_, d_group_weights_))
             return false;
 
+        group_active_expert_slots_ = std::min(total_slots, num_experts);
         prepared_num_experts_ = num_experts;
         return true;
     }
@@ -3042,7 +4243,70 @@ namespace llaminar2
                                        d_group_token_indices_, d_group_weights_))
             return false;
 
+        group_active_expert_slots_ = std::min(total_slots, num_experts);
         prepared_num_experts_ = num_experts;
+        return true;
+    }
+
+    bool CUDAMoEKernel::updateGroupedPrefillExpertMask(
+        const uint8_t *expert_mask,
+        int num_experts)
+    {
+        if (num_experts <= 0 || !expert_mask)
+            return false;
+
+        void *stream = requireStream("CUDAMoEKernel::updateGroupedPrefillExpertMask");
+        if (!stream)
+            return false;
+
+        uint64_t mask_hash = 1469598103934665603ull;
+        for (int i = 0; i < num_experts; ++i)
+        {
+            mask_hash ^= static_cast<uint64_t>(expert_mask[i]);
+            mask_hash *= 1099511628211ull;
+        }
+        mask_hash ^= static_cast<uint64_t>(num_experts);
+        mask_hash *= 1099511628211ull;
+
+        if (!d_group_expert_mask_ || group_expert_mask_cap_ < num_experts)
+        {
+            if (d_group_expert_mask_)
+            {
+                cudaFree(d_group_expert_mask_);
+                d_group_expert_mask_ = nullptr;
+            }
+            cudaError_t err = cudaMalloc(
+                reinterpret_cast<void **>(&d_group_expert_mask_),
+                static_cast<size_t>(num_experts) * sizeof(uint8_t));
+            if (err != cudaSuccess)
+            {
+                LOG_ERROR("[CUDAMoEKernel::updateGroupedPrefillExpertMask] cudaMalloc mask failed: "
+                          << cudaGetErrorString(err));
+                group_expert_mask_cap_ = 0;
+                group_expert_mask_hash_ = 0;
+                return false;
+            }
+            group_expert_mask_cap_ = num_experts;
+            group_expert_mask_hash_ = 0;
+        }
+
+        if (group_expert_mask_hash_ == mask_hash)
+            return true;
+
+        cudaError_t err = cudaMemcpyAsync(
+            d_group_expert_mask_,
+            expert_mask,
+            static_cast<size_t>(num_experts) * sizeof(uint8_t),
+            cudaMemcpyHostToDevice,
+            static_cast<cudaStream_t>(stream));
+        if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDAMoEKernel::updateGroupedPrefillExpertMask] H2D mask copy failed: "
+                      << cudaGetErrorString(err));
+            return false;
+        }
+
+        group_expert_mask_hash_ = mask_hash;
         return true;
     }
 
@@ -3140,7 +4404,7 @@ namespace llaminar2
          * zeroed destination before accumulation.
          */
         const bool ordered_scatter_overwrites_output =
-            d_group_original_to_grouped_ != nullptr;
+            active_expert_slots > 0 && d_group_original_to_grouped_ != nullptr;
         if (!ordered_scatter_overwrites_output)
         {
             cudaError_t err = cudaMemsetAsync(d_output, 0,
@@ -3339,6 +4603,7 @@ namespace llaminar2
                                   d_up_ptrs,
                                   d_decode_hidden_int8_,
                                   d_decode_hidden_scales_,
+                                  false,
                                   d_grouped_gateup_gate_partials_,
                                   d_grouped_gateup_up_partials_,
                                   num_active,
@@ -3358,6 +4623,7 @@ namespace llaminar2
                                   d_up_ptrs,
                                   d_decode_hidden_int8_,
                                   d_decode_hidden_scales_,
+                                  false,
                                   num_active,
                                   intermediate,
                                   d_model,
@@ -3630,6 +4896,7 @@ namespace llaminar2
                                   d_up_ptrs,
                                   d_decode_hidden_int8_,
                                   d_decode_hidden_scales_,
+                                  false,
                                   d_grouped_gateup_gate_partials_,
                                   d_grouped_gateup_up_partials_,
                                   top_k,
@@ -3649,6 +4916,7 @@ namespace llaminar2
                                   d_up_ptrs,
                                   d_decode_hidden_int8_,
                                   d_decode_hidden_scales_,
+                                  false,
                                   top_k,
                                   intermediate,
                                   d_model,
@@ -3843,7 +5111,8 @@ namespace llaminar2
         int top_k,
         ITensor *output,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source)
     {
         if (!runtime_layer || !input || gateup_table_id < 0 || down_table_id < 0 ||
             top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
@@ -3946,85 +5215,177 @@ namespace llaminar2
             return false;
         }
 
-        const bool gateup_ok = use_gateup_kpart
-                                   ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
-                                         d_hidden,
-                                         gateup_table.device_gate_descs,
-                                         gateup_table.device_up_descs,
-                                         d_expert_ids,
-                                         d_gate_ptrs,
-                                         d_up_ptrs,
-                                         d_decode_hidden_int8_,
-                                         d_decode_hidden_scales_,
-                                         d_grouped_gateup_gate_partials_,
-                                         d_grouped_gateup_up_partials_,
-                                         top_k,
-                                         intermediate,
-                                         d_model,
-                                         gateup_table.num_experts,
-                                         gateup_table.codebook_id,
-                                         gateup_k_partitions,
-                                         device_ordinal_,
-                                         stream)
-                                   : cudaMoE_grouped_gate_up_native_vnni_decode_table(
-                                         d_hidden,
-                                         gateup_table.device_gate_descs,
-                                         gateup_table.device_up_descs,
-                                         d_expert_ids,
-                                         d_gate_ptrs,
-                                         d_up_ptrs,
-                                         d_decode_hidden_int8_,
-                                         d_decode_hidden_scales_,
-                                         top_k,
-                                         intermediate,
-                                         d_model,
-                                         gateup_table.codebook_id,
-                                         device_ordinal_,
-                                         stream);
+        const bool use_runtime_descriptors =
+            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+        const bool reuse_router_q8_hidden =
+            debugEnv().gemm.cuda_moe_reuse_router_q8_hidden &&
+            router_q8_hidden_valid_ &&
+            router_q8_hidden_source_ == d_hidden &&
+            d_decode_hidden_int8_ &&
+            d_decode_hidden_scales_ &&
+            decode_gateup_d_model_cap_ >= d_model;
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel", "cuda_moe_gateup_reused_router_q8_hidden_calls", 1.0, {}, {},
+                {{"top_k", std::to_string(top_k)},
+                 {"d_model", std::to_string(d_model)}});
+        }
+        const bool gateup_ok = use_runtime_descriptors
+                                   ? (use_gateup_kpart
+                                          ? cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+                                                d_hidden,
+                                                runtime_layer,
+                                                d_expert_ids,
+                                                d_gate_ptrs,
+                                                d_up_ptrs,
+                                                d_decode_hidden_int8_,
+                                                d_decode_hidden_scales_,
+                                                reuse_router_q8_hidden,
+                                                d_grouped_gateup_gate_partials_,
+                                                d_grouped_gateup_up_partials_,
+                                                top_k,
+                                                intermediate,
+                                                d_model,
+                                                gateup_table.num_experts,
+                                                gateup_table.codebook_id,
+                                                gateup_k_partitions,
+                                                device_ordinal_,
+                                                stream)
+                                          : cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
+                                                d_hidden,
+                                                runtime_layer,
+                                                d_expert_ids,
+                                                d_gate_ptrs,
+                                                d_up_ptrs,
+                                                d_decode_hidden_int8_,
+                                                d_decode_hidden_scales_,
+                                                reuse_router_q8_hidden,
+                                                top_k,
+                                                intermediate,
+                                                d_model,
+                                                gateup_table.num_experts,
+                                                gateup_table.codebook_id,
+                                                device_ordinal_,
+                                                stream))
+                                   : (use_gateup_kpart
+                                          ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                                                d_hidden,
+                                                gateup_table.device_gate_descs,
+                                                gateup_table.device_up_descs,
+                                                d_expert_ids,
+                                                d_gate_ptrs,
+                                                d_up_ptrs,
+                                                d_decode_hidden_int8_,
+                                                d_decode_hidden_scales_,
+                                                reuse_router_q8_hidden,
+                                                d_grouped_gateup_gate_partials_,
+                                                d_grouped_gateup_up_partials_,
+                                                top_k,
+                                                intermediate,
+                                                d_model,
+                                                gateup_table.num_experts,
+                                                gateup_table.codebook_id,
+                                                gateup_k_partitions,
+                                                device_ordinal_,
+                                                stream)
+                                          : cudaMoE_grouped_gate_up_native_vnni_decode_table(
+                                                d_hidden,
+                                                gateup_table.device_gate_descs,
+                                                gateup_table.device_up_descs,
+                                                d_expert_ids,
+                                                d_gate_ptrs,
+                                                d_up_ptrs,
+                                                d_decode_hidden_int8_,
+                                                d_decode_hidden_scales_,
+                                                reuse_router_q8_hidden,
+                                                top_k,
+                                                intermediate,
+                                                d_model,
+                                                gateup_table.codebook_id,
+                                                device_ordinal_,
+                                                stream));
         if (!gateup_ok)
             return false;
 
-        const bool down_ok = use_down_kpart
-                                 ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_decode_swiglu_int8_,
-                                       d_decode_swiglu_scales_,
-                                       d_grouped_down_partials_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.num_experts,
-                                       down_table.codebook_id,
-                                       down_k_partitions,
-                                       device_ordinal_,
-                                       stream)
-                                 : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
-                                       d_down_gate_ptrs,
-                                       d_down_up_ptrs,
-                                       down_table.device_descs,
-                                       d_expert_ids,
-                                       d_weights,
-                                       d_decode_swiglu_int8_,
-                                       d_decode_swiglu_scales_,
-                                       d_output,
-                                       top_k,
-                                       d_model,
-                                       intermediate,
-                                       down_table.codebook_id,
-                                       device_ordinal_,
-                                       stream);
+        const bool down_ok = use_runtime_descriptors
+                                 ? (use_down_kpart
+                                        ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              runtime_layer,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_decode_swiglu_int8_,
+                                              d_decode_swiglu_scales_,
+                                              d_grouped_down_partials_,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.num_experts,
+                                              down_table.codebook_id,
+                                              down_k_partitions,
+                                              device_ordinal_,
+                                              stream)
+                                        : cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              runtime_layer,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_decode_swiglu_int8_,
+                                              d_decode_swiglu_scales_,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.num_experts,
+                                              down_table.codebook_id,
+                                              device_ordinal_,
+                                              stream))
+                                 : (use_down_kpart
+                                        ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              down_table.device_descs,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_decode_swiglu_int8_,
+                                              d_decode_swiglu_scales_,
+                                              d_grouped_down_partials_,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.num_experts,
+                                              down_table.codebook_id,
+                                              down_k_partitions,
+                                              device_ordinal_,
+                                              stream)
+                                        : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
+                                              d_down_gate_ptrs,
+                                              d_down_up_ptrs,
+                                              down_table.device_descs,
+                                              d_expert_ids,
+                                              d_weights,
+                                              d_decode_swiglu_int8_,
+                                              d_decode_swiglu_scales_,
+                                              d_output,
+                                              top_k,
+                                              d_model,
+                                              intermediate,
+                                              down_table.codebook_id,
+                                              device_ordinal_,
+                                              stream));
         if (!down_ok)
             return false;
 
         markDeviceWritten(output, device, stream);
         recordGroupedDecodeCounter(
-            "cuda_moe_grouped_decode_fused_calls", "runtime", top_k,
-            d_model, intermediate, "fused_block_down");
+            "cuda_moe_grouped_decode_fused_calls",
+            use_runtime_descriptors ? "runtime" : "runtime_static_table",
+            top_k, d_model, intermediate, "fused_block_down");
         if (!capture_active)
         {
             recordFusedDecodeTimer("cuda_moe_fused_decode_hidden_quantize", top_k, d_model, intermediate);
@@ -4137,16 +5498,31 @@ namespace llaminar2
             return false;
         }
 
+        const bool reuse_router_q8_hidden =
+            debugEnv().gemm.cuda_moe_reuse_router_q8_hidden &&
+            router_q8_hidden_valid_ &&
+            router_q8_hidden_source_ == d_hidden &&
+            d_decode_hidden_int8_ &&
+            d_decode_hidden_scales_ &&
+            decode_gateup_d_model_cap_ >= d_model;
+        if (reuse_router_q8_hidden)
+        {
+            PerfStatsCollector::addCounter(
+                "kernel", "cuda_moe_gateup_reused_router_q8_hidden_calls", 1.0, {}, {},
+                {{"top_k", std::to_string(top_k)},
+                 {"d_model", std::to_string(d_model)}});
+        }
+
         const bool ok = use_kpart
-                            ? cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart(
+                            ? cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
                                   d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
+                                  runtime_layer,
                                   d_expert_ids,
                                   d_gate_ptrs,
                                   d_up_ptrs,
                                   d_decode_hidden_int8_,
                                   d_decode_hidden_scales_,
+                                  reuse_router_q8_hidden,
                                   d_grouped_gateup_gate_partials_,
                                   d_grouped_gateup_up_partials_,
                                   top_k,
@@ -4157,18 +5533,19 @@ namespace llaminar2
                                   k_partitions,
                                   device_ordinal_,
                                   stream)
-                            : cudaMoE_grouped_gate_up_native_vnni_decode_table(
+                            : cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
                                   d_hidden,
-                                  table.device_gate_descs,
-                                  table.device_up_descs,
+                                  runtime_layer,
                                   d_expert_ids,
                                   d_gate_ptrs,
                                   d_up_ptrs,
                                   d_decode_hidden_int8_,
                                   d_decode_hidden_scales_,
+                                  reuse_router_q8_hidden,
                                   top_k,
                                   intermediate,
                                   d_model,
+                                  table.num_experts,
                                   table.codebook_id,
                                   device_ordinal_,
                                   stream);
@@ -4275,10 +5652,10 @@ namespace llaminar2
                                ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k);
 
         const bool ok = use_kpart
-            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
+            ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
                   d_gate_ptrs,
                   d_up_ptrs,
-                  table.device_descs,
+                  runtime_layer,
                   d_expert_ids,
                   d_weights,
                   d_decode_swiglu_int8_,
@@ -4293,10 +5670,10 @@ namespace llaminar2
                   k_partitions,
                   device_ordinal_,
                   stream)
-            : cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
+            : cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
                   d_gate_ptrs,
                   d_up_ptrs,
-                  table.device_descs,
+                  runtime_layer,
                   d_expert_ids,
                   d_weights,
                   d_decode_swiglu_int8_,
@@ -4305,6 +5682,7 @@ namespace llaminar2
                   top_k,
                   d_model,
                   intermediate,
+                  table.num_experts,
                   table.codebook_id,
                   device_ordinal_,
                   stream);

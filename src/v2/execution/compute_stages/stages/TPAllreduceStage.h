@@ -20,13 +20,38 @@
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
+#include "../../../collective/ILocalTPContext.h"
 #include "../../../collective/ITPContext.h"
+#include "../../../interfaces/IWorkspaceConsumer.h"
 #include "../../../memory/BufferId.h"
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llaminar2
 {
+    class DeviceWorkspaceManager;
+    struct WorkspaceRequirements;
+
+    /**
+     * @brief Workspace-backed control sideband attached to a TP allreduce.
+     *
+     * The graph builder names persistent device workspace buffers here. At
+     * execution/capture time TPAllreduceStage resolves them to raw device
+     * pointers and passes the compact sideband to LocalTP. This keeps rebalance
+     * metadata on the graph stream without baking allocator addresses into graph
+     * construction.
+     */
+    struct TPAllreduceSidebandWorkspaceBinding
+    {
+        LocalTPCollectiveSidebandKind kind = LocalTPCollectiveSidebandKind::AllreduceSum;
+        std::string send_buffer_name;
+        std::string recv_buffer_name;
+        size_t element_count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT32;
+        int root_device_index = 0;
+        std::string name;
+    };
 
     /**
      * @brief Parameters for TPAllreduceStage
@@ -41,6 +66,9 @@ namespace llaminar2
         std::string stage_name;                   ///< Stage identifier for registered tensor lookup (optional)
         std::string precision;                    ///< Allreduce precision override ("fp32", "fp16", "bf16", "" = use global default)
         std::optional<BufferId> tensor_buffer_id; ///< Arena BufferId for the in-place tensor (enables contract-based coherence)
+        int sideband_device_index = -1;           ///< LocalTP participant index for optional sidebands.
+        std::vector<LocalTPCollectiveSidebandBuffer> sidebands; ///< Optional same-stream control sidebands.
+        std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings; ///< Workspace-resolved sidebands.
     };
 
     /**
@@ -52,7 +80,7 @@ namespace llaminar2
      *
      * Thread safety: Execute must be called from appropriate device context.
      */
-    class TPAllreduceStage : public IComputeStage
+    class TPAllreduceStage : public IComputeStage, public IWorkspaceConsumer
     {
     public:
         using Params = TPAllreduceParams;
@@ -105,6 +133,16 @@ namespace llaminar2
          */
         void onGraphReplayed() override;
         bool needsOnGraphReplayed() const override;
+
+        /**
+         * @brief TP allreduce sidebands reuse buffers declared by producer stages.
+         */
+        WorkspaceRequirements getWorkspaceRequirements(
+            int m, int n = 0, int k = 0) const override;
+        void bindWorkspace(DeviceWorkspaceManager *workspace) override;
+        void unbindWorkspace() override;
+        bool hasWorkspace() const override { return bound_workspace_ != nullptr; }
+        DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
         /**
          * @brief Check if stage supports a backend type
@@ -168,6 +206,7 @@ namespace llaminar2
 
     private:
         Params params_;
+        DeviceWorkspaceManager *bound_workspace_ = nullptr;
     };
 
 } // namespace llaminar2

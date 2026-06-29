@@ -227,6 +227,164 @@ TEST_F(Test__LocalTPContext, AllreduceOnStreamRejectsNullStream)
         std::invalid_argument);
 }
 
+TEST_F(Test__LocalTPContext, CollectiveSidebandAbiNamesNonAdditiveMetadataSemantics)
+{
+    EXPECT_STREQ(toString(LocalTPCollectiveSidebandKind::AllreduceSum), "AllreduceSum");
+    EXPECT_STREQ(toString(LocalTPCollectiveSidebandKind::Allgather), "Allgather");
+    EXPECT_STREQ(toString(LocalTPCollectiveSidebandKind::Broadcast), "Broadcast");
+
+    const std::string header = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_HEADER);
+    ASSERT_FALSE(header.empty());
+    EXPECT_NE(header.find("LocalTPCollectiveSidebandKind"), std::string::npos);
+    EXPECT_NE(header.find("Command metadata is not additive"), std::string::npos)
+        << "MoE rebalance command bytes must not be smuggled through an activation allreduce.";
+    EXPECT_NE(header.find("AllreduceSum"), std::string::npos);
+    EXPECT_NE(header.find("Allgather"), std::string::npos);
+    EXPECT_NE(header.find("Broadcast"), std::string::npos);
+}
+
+TEST_F(Test__LocalTPContext, CollectiveSidebandOnStreamRejectsNullStream)
+{
+    auto ctx = createLocalTPContext({cuda0_}, {}, CollectiveBackendType::HOST);
+    LocalTPCollectiveSidebandBuffer sideband;
+    sideband.kind = LocalTPCollectiveSidebandKind::AllreduceSum;
+    sideband.element_count = 4;
+    sideband.name = "unit_histogram_sideband";
+    std::vector<LocalTPCollectiveSidebandBuffer> sidebands{sideband};
+
+    EXPECT_THROW(
+        ctx->collectiveSidebandOnStream(sidebands, 0, nullptr, "unit_anchor_collective"),
+        std::invalid_argument);
+}
+
+TEST_F(Test__LocalTPContext, CollectiveSidebandRoutesSemanticKindsToMatchingOnStreamPrimitives)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t fn = source.find("bool LocalTPContext::collectiveSidebandOnStream(");
+    ASSERT_NE(fn, std::string::npos);
+    const size_t next_fn = source.find("bool LocalTPContext::allgatherRawOnStream(", fn);
+    ASSERT_NE(next_fn, std::string::npos);
+    const std::string body = source.substr(fn, next_fn - fn);
+
+    EXPECT_NE(body.find("LocalTPCollectiveSidebandKind::AllreduceSum"), std::string::npos);
+    EXPECT_NE(body.find("allreduceSingleDeviceOnStream"), std::string::npos);
+    EXPECT_NE(body.find("CollectiveOp::ALLREDUCE_SUM"), std::string::npos);
+    EXPECT_NE(body.find("LocalTPCollectiveSidebandKind::Allgather"), std::string::npos);
+    EXPECT_NE(body.find("allgatherSingleDeviceOnStream"), std::string::npos);
+    EXPECT_NE(body.find("LocalTPCollectiveSidebandKind::Broadcast"), std::string::npos);
+    EXPECT_NE(body.find("broadcastSingleDeviceOnStream"), std::string::npos)
+        << "Root command publication needs broadcast semantics; it must not be encoded as an activation allreduce.";
+    EXPECT_NE(body.find("record_sideband_runtime"), std::string::npos);
+    EXPECT_NE(body.find("sideband_backend_collective_calls"), std::string::npos);
+    EXPECT_NE(body.find("sideband_separate_backend_collective_calls"), std::string::npos);
+    EXPECT_NE(body.find("\"backend_primitive\""), std::string::npos);
+    EXPECT_NE(body.find("\"launch_relation\", \"same_stream_after_anchor\""), std::string::npos);
+    EXPECT_NE(body.find("\"fused_with_anchor\", \"false\""), std::string::npos);
+    EXPECT_NE(body.find("\"physical_fusion\", \"separate_backend_collective\""), std::string::npos)
+        << "Perfstats must make clear that sidebands are same-stream adjacent collectives, not physically fused into the anchor.";
+}
+
+TEST_F(Test__LocalTPContext, AllreduceWithSidebandsUsesOneGroupedBackendBundle)
+{
+    const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
+    ASSERT_FALSE(source.empty());
+
+    const size_t entry = source.find("bool LocalTPContext::allreduceWithSidebandsOnStream(");
+    ASSERT_NE(entry, std::string::npos);
+    const size_t legacy = source.find("bool LocalTPContext::collectiveSidebandOnStream(", entry);
+    ASSERT_NE(legacy, std::string::npos);
+    const std::string body = source.substr(entry, legacy - entry);
+
+    EXPECT_NE(body.find("supportsAllreduceWithSidebandsMultiOnStreams"), std::string::npos);
+    EXPECT_NE(body.find("allreduceGroupedOnExplicitStreams("), std::string::npos);
+    EXPECT_NE(body.find("&sidebands"), std::string::npos);
+    EXPECT_NE(body.find("recordLocalTPRuntimeGroupedSidebands"), std::string::npos);
+    EXPECT_EQ(body.find("collectiveSidebandOnStream"), std::string::npos)
+        << "The production grouped path must not fall back to adjacent sideband collectives.";
+
+    const size_t grouped = source.find("bool LocalTPContext::allreduceGroupedOnExplicitStreams(");
+    ASSERT_NE(grouped, std::string::npos);
+    const size_t rendezvous = source.find("bool LocalTPContext::rendezvousOnStreamCollective(", grouped);
+    ASSERT_NE(rendezvous, std::string::npos);
+    const std::string grouped_body = source.substr(grouped, rendezvous - grouped);
+
+    EXPECT_NE(grouped_body.find("grouped_onstream_allreduce_reference_sidebands_"), std::string::npos);
+    EXPECT_NE(grouped_body.find("CollectiveSidebandMultiOnStreamsOp"), std::string::npos);
+    EXPECT_NE(grouped_body.find("backend_impl_->allreduceWithSidebandsMultiOnStreams"), std::string::npos);
+    EXPECT_NE(grouped_body.find("sideband descriptor mismatch"), std::string::npos);
+    EXPECT_NE(grouped_body.find("sideband count mismatch"), std::string::npos);
+
+    const size_t support = source.find("bool LocalTPContext::supportsCollectiveSidebandOnStreamGraphCapture() const");
+    ASSERT_NE(support, std::string::npos);
+    const size_t support_end = source.find("bool LocalTPContext::allreduceWithSidebandsOnStream(", support);
+    ASSERT_NE(support_end, std::string::npos);
+    const std::string support_body = source.substr(support, support_end - support);
+    EXPECT_NE(support_body.find("supportsAllreduceWithSidebandsMultiOnStreams"), std::string::npos)
+        << "Graph-native MoE rebalance should require grouped sideband bundles, not merely standalone sideband primitives.";
+}
+
+TEST_F(Test__LocalTPContext, BackendCoordinatorsGroupAnchorAndSidebandsInOneRegion)
+{
+    const std::string backend = readTextFile(LLAMINAR_COLLECTIVE_BACKEND_HEADER);
+    const std::string nccl = readTextFile(LLAMINAR_NCCL_COORDINATOR_SOURCE);
+    const std::string rccl = readTextFile(LLAMINAR_RCCL_COORDINATOR_SOURCE);
+    ASSERT_FALSE(backend.empty());
+    ASSERT_FALSE(nccl.empty());
+    ASSERT_FALSE(rccl.empty());
+
+    EXPECT_NE(backend.find("CollectiveSidebandMultiOnStreamsOp"), std::string::npos);
+    EXPECT_NE(backend.find("allreduceWithSidebandsMultiOnStreams"), std::string::npos);
+
+    auto expectGroupedBundle = [](const std::string &source,
+                                  const char *signature,
+                                  const char *group_start,
+                                  const char *group_end,
+                                  const char *anchor_call,
+                                  const char *allgather_call,
+                                  const char *broadcast_call)
+    {
+        const size_t fn = source.find(signature);
+        ASSERT_NE(fn, std::string::npos) << signature;
+        const size_t next = source.find("\n    bool ", fn + 1);
+        const std::string body = source.substr(fn, next == std::string::npos
+                                                       ? std::string::npos
+                                                       : next - fn);
+
+        const size_t start = body.find(group_start);
+        ASSERT_NE(start, std::string::npos) << signature;
+        const size_t anchor = body.find(anchor_call, start);
+        ASSERT_NE(anchor, std::string::npos) << signature;
+        const size_t sideband_loop = body.find("for (size_t sideband_idx", anchor);
+        ASSERT_NE(sideband_loop, std::string::npos) << signature;
+        EXPECT_NE(body.find(allgather_call, sideband_loop), std::string::npos) << signature;
+        EXPECT_NE(body.find(broadcast_call, sideband_loop), std::string::npos) << signature;
+        const size_t end = body.rfind(group_end);
+        ASSERT_NE(end, std::string::npos) << signature;
+        EXPECT_LT(start, anchor) << signature;
+        EXPECT_LT(anchor, sideband_loop) << signature;
+        EXPECT_LT(sideband_loop, end) << signature;
+    };
+
+    expectGroupedBundle(
+        nccl,
+        "bool NCCLCoordinator::allreduceWithSidebandsMultiOnStreams(",
+        "nccl::ncclGroupStart()",
+        "nccl::ncclGroupEnd()",
+        "nccl::ncclAllReduce(",
+        "nccl::ncclAllGather(",
+        "nccl::ncclBroadcast(");
+    expectGroupedBundle(
+        rccl,
+        "bool RCCLCoordinator::allreduceWithSidebandsMultiOnStreams(",
+        "rccl::ncclGroupStart()",
+        "rccl::ncclGroupEnd()",
+        "rccl::ncclAllReduce(",
+        "rccl::ncclAllGather(",
+        "rccl::ncclBroadcast(");
+}
+
 TEST_F(Test__LocalTPContext, OnStreamGpuCollectivesStayGroupedDuringGraphCapture)
 {
     const std::string source = readTextFile(LLAMINAR_LOCAL_TP_CONTEXT_SOURCE);
@@ -823,6 +981,7 @@ public:
     std::atomic<int> allreduce_call_count{0};
     std::atomic<int> allreduce_multi_call_count{0};
     std::atomic<int> allreduce_multi_on_streams_call_count{0};
+    std::atomic<int> allreduce_on_stream_call_count{0};
     std::atomic<int> allgather_call_count{0};
     std::atomic<int> allgather_multi_call_count{0};
     std::atomic<int> allgather_multi_on_streams_call_count{0};
@@ -837,6 +996,7 @@ public:
     bool should_fail_allgather = false;
     bool should_fail_reduce_scatter = false;
     bool multi_gpu_mode = true;
+    bool supports_allreduce_on_stream = true;
     bool supports_allgather_on_stream = true;
 
     // Captured parameters from last call (for verification)
@@ -848,6 +1008,8 @@ public:
     std::vector<void *> last_multi_buffers;
     std::vector<void *> last_allreduce_multi_streams;
     std::vector<void *> last_allgather_multi_streams;
+    int last_allreduce_on_stream_device_idx = -1;
+    void *last_allreduce_on_stream_stream = nullptr;
     int last_allgather_on_stream_device_idx = -1;
     void *last_allgather_on_stream_stream = nullptr;
 
@@ -1000,6 +1162,29 @@ public:
         return multi_gpu_mode;
     }
 
+    bool allreduceSingleDeviceOnStream(
+        void *buffer,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        int device_idx,
+        void *stream) override
+    {
+        allreduce_on_stream_call_count++;
+        last_allreduce_count = count;
+        last_dtype = dtype;
+        last_op = op;
+        last_allreduce_on_stream_device_idx = device_idx;
+        last_allreduce_on_stream_stream = stream;
+        (void)buffer;
+        return supports_allreduce_on_stream && !should_fail_allreduce;
+    }
+
+    bool supportsAllreduceSingleDeviceOnStream() const override
+    {
+        return supports_allreduce_on_stream;
+    }
+
     bool allgatherMulti(const std::vector<const void *> &send_bufs,
                         const std::vector<void *> &recv_bufs,
                         size_t send_count, CollectiveDataType dtype) override
@@ -1066,6 +1251,7 @@ public:
         allreduce_call_count = 0;
         allreduce_multi_call_count = 0;
         allreduce_multi_on_streams_call_count = 0;
+        allreduce_on_stream_call_count = 0;
         allgather_call_count = 0;
         allgather_multi_call_count = 0;
         allgather_multi_on_streams_call_count = 0;
@@ -1078,10 +1264,13 @@ public:
         should_fail_allgather = false;
         should_fail_reduce_scatter = false;
         multi_gpu_mode = true;
+        supports_allreduce_on_stream = true;
         supports_allgather_on_stream = true;
         last_multi_buffers.clear();
         last_allreduce_multi_streams.clear();
         last_allgather_multi_streams.clear();
+        last_allreduce_on_stream_device_idx = -1;
+        last_allreduce_on_stream_stream = nullptr;
         last_allgather_on_stream_device_idx = -1;
         last_allgather_on_stream_stream = nullptr;
     }
@@ -1167,6 +1356,54 @@ TEST_F(Test__LocalTPContext, RawAllgatherUsesOnStreamPathDuringGraphCapture)
         << "Graph capture must stay participant-local instead of using eager grouped launch.";
     EXPECT_EQ(backend_raw->last_allgather_on_stream_device_idx, 0);
     EXPECT_EQ(backend_raw->last_allgather_on_stream_stream, stream);
+}
+
+TEST_F(Test__LocalTPContext, RCCLRawAllgatherGraphCaptureSupportUsesAllreducePrimitive)
+{
+    auto ctx_base = createLocalTPContext({cpu0_, GlobalDeviceAddress::cpu(1)}, {}, CollectiveBackendType::HOST);
+    auto *ctx = dynamic_cast<LocalTPContext *>(ctx_base.get());
+    ASSERT_NE(ctx, nullptr);
+
+    auto backend = std::make_unique<MockCollectiveBackend>();
+    auto *backend_raw = backend.get();
+    backend_raw->multi_gpu_mode = true;
+    backend_raw->supports_allgather_on_stream = false;
+    backend_raw->supports_allreduce_on_stream = true;
+    ctx->setBackendForTesting(
+        std::move(backend),
+        CollectiveBackendType::RCCL,
+        /*initialized=*/true);
+
+    EXPECT_TRUE(ctx->supportsRawAllgatherOnStreamGraphCapture())
+        << "RCCL graph-captured raw allgather is implemented via captured allreduce emulation.";
+
+    backend_raw->supports_allreduce_on_stream = false;
+    EXPECT_FALSE(ctx->supportsRawAllgatherOnStreamGraphCapture());
+}
+
+TEST_F(Test__LocalTPContext, RCCLGraphCapturedRawAllgatherUsesAllreduceEmulation)
+{
+    std::ifstream source("src/v2/collective/LocalTPContext.cpp");
+    ASSERT_TRUE(source.is_open());
+    const std::string contents((std::istreambuf_iterator<char>(source)),
+                               std::istreambuf_iterator<char>());
+
+    const size_t branch = contents.find("backend_ == CollectiveBackendType::RCCL");
+    ASSERT_NE(branch, std::string::npos);
+    const size_t emulation_comment = contents.find(
+        "RCCL allgather can report successful capture",
+        branch);
+    ASSERT_NE(emulation_comment, std::string::npos);
+    const size_t allreduce_call = contents.find(
+        "backend_impl_->allreduceSingleDeviceOnStream",
+        emulation_comment);
+    ASSERT_NE(allreduce_call, std::string::npos);
+    const size_t native_allgather_call = contents.find(
+        "backend_impl_->allgatherSingleDeviceOnStream",
+        emulation_comment);
+    ASSERT_NE(native_allgather_call, std::string::npos);
+    EXPECT_LT(allreduce_call, native_allgather_call)
+        << "The RCCL graph-captured branch must avoid native allgather capture.";
 }
 
 TEST_F(Test__LocalTPContext, RawAllgatherGraphCaptureFailsWithoutOnStreamSupport)

@@ -10,12 +10,14 @@ backend="both"
 placement="twocard"
 reps="${LLAMINAR_GPU_MOE_REBALANCE_REPS:-5}"
 context_length="${LLAMINAR_GPU_MOE_REBALANCE_CONTEXT:-1024}"
-n_predict="${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT:-128}"
+n_predict_csv="${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT_LIST:-${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT:-128}}"
+seeds_csv="${LLAMINAR_GPU_MOE_REBALANCE_SEEDS:-}"
 cases_csv="${LLAMINAR_GPU_MOE_REBALANCE_CASES:-static,observe,dynamic,dynamic_hot10}"
 rebalance_window="${LLAMINAR_GPU_MOE_REBALANCE_WINDOW:-64}"
 dry_run=0
 perfstats="${LLAMINAR_GPU_MOE_REBALANCE_PERFSTATS:-0}"
 stage_gpu_stats="${LLAMINAR_GPU_MOE_REBALANCE_STAGE_GPU_STATS:-0}"
+rebalance_trace="${LLAMINAR_GPU_MOE_REBALANCE_TRACE:-0}"
 capture_collectives="${LLAMINAR_GPU_MOE_REBALANCE_CAPTURE_COLLECTIVES:-1}"
 defer_captured_collective_sync="${LLAMINAR_GPU_MOE_REBALANCE_DEFER_CAPTURED_COLLECTIVE_SYNC:-0}"
 dense_tp="${LLAMINAR_GPU_MOE_REBALANCE_DENSE_TP:-0}"
@@ -25,10 +27,11 @@ allreduce_precision="${LLAMINAR_GPU_MOE_REBALANCE_ALLREDUCE_PRECISION:-}"
 allreduce_fp16_min_elements="${LLAMINAR_GPU_MOE_REBALANCE_ALLREDUCE_FP16_MIN_ELEMENTS:-}"
 small_gpu_allreduce="${LLAMINAR_GPU_MOE_REBALANCE_SMALL_GPU_ALLREDUCE:-0}"
 small_gpu_allreduce_max_elements="${LLAMINAR_GPU_MOE_REBALANCE_SMALL_GPU_ALLREDUCE_MAX_ELEMENTS:-}"
+require_prefill_graph="${LLAMINAR_GPU_MOE_REBALANCE_REQUIRE_PREFILL_GRAPH:-1}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--small-gpu-allreduce] [--small-gpu-allreduce-max-elements N] [--dry-run]
+Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--small-gpu-allreduce] [--small-gpu-allreduce-max-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
 
 Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   static placement
@@ -46,9 +49,18 @@ Single-card placement is included for 1x CUDA/ROCm baselines:
 
 LIST is comma-separated, e.g. --cases static,dynamic_hot10.
 
+Use --n-predict-list 512,1024,2048 and --seeds 101,202,303 to gather a
+decode-length/seed matrix for rebalance policy training. When --seeds is
+omitted, the benchmark's default seed path is used.
+
 By default rows are clean throughput measurements. Use --perfstats for
 diagnostic JSON/CSV counters including tp_allreduce_bom; use --stage-gpu-stats
 only when you need per-stage GPU event timing, since it perturbs throughput.
+
+Use --rebalance-trace for policy-lab data collection. It writes
+rebalance_trace.jsonl beside each run with one JSON object per maintenance
+export, including aggregate imbalance economics plus the selected command
+buffer entries. This is a diagnostic run mode, not a clean throughput row.
 
 Dynamic/observe cases default to --moe-rebalance-window 64 so the standard
 128-token sprint proof crosses at least one rebalance decision window. Override
@@ -85,6 +97,10 @@ reductions on fp32 while preserving fp16 for larger prefill reductions.
 Use --small-gpu-allreduce to try the experimental two-card LocalTP peer-add
 fast path for tiny fp32 decode reductions. Use
 --small-gpu-allreduce-max-elements N to adjust the cutoff.
+
+Two-card MoE runs require captured/replayed prefill graphs by default. Use
+--no-require-prefill-graph only for fallback diagnostics; the sprint proof loop
+should fail fast if apportioned-expert prefill does not enter graph capture.
 USAGE
 }
 
@@ -123,8 +139,20 @@ while [[ $# -gt 0 ]]; do
       shift 2
       ;;
     --n-predict)
-      n_predict="${2:?missing --n-predict value}"
+      n_predict_csv="${2:?missing --n-predict value}"
       shift 2
+      ;;
+    --n-predict-list)
+      n_predict_csv="${2:?missing --n-predict-list value}"
+      shift 2
+      ;;
+    --seeds)
+      seeds_csv="${2:?missing --seeds value}"
+      shift 2
+      ;;
+    --no-seeds)
+      seeds_csv=""
+      shift
       ;;
     --rebalance-window)
       rebalance_window="${2:?missing --rebalance-window value}"
@@ -142,6 +170,14 @@ while [[ $# -gt 0 ]]; do
     --stage-gpu-stats)
       perfstats=1
       stage_gpu_stats=1
+      shift
+      ;;
+    --rebalance-trace)
+      rebalance_trace=1
+      shift
+      ;;
+    --no-rebalance-trace)
+      rebalance_trace=0
       shift
       ;;
     --capture-collectives)
@@ -216,6 +252,14 @@ while [[ $# -gt 0 ]]; do
       small_gpu_allreduce_max_elements=""
       shift
       ;;
+    --require-prefill-graph)
+      require_prefill_graph=1
+      shift
+      ;;
+    --no-require-prefill-graph)
+      require_prefill_graph=0
+      shift
+      ;;
     --dry-run)
       dry_run=1
       shift
@@ -258,11 +302,6 @@ if [[ "${context_length}" -lt 1 ]]; then
   exit 2
 fi
 
-if [[ "${n_predict}" -lt 0 ]]; then
-  echo "error: --n-predict must be >= 0" >&2
-  exit 2
-fi
-
 if [[ "${rebalance_window}" -lt 1 ]]; then
   echo "error: --rebalance-window must be >= 1" >&2
   exit 2
@@ -298,7 +337,7 @@ fi
 
 mkdir -p "${out_dir}"
 summary="${out_dir}/summary.tsv"
-printf 'backend\tplacement\tcase\trep\texit_code\tbenchmark_json\tperf_json\tperf_csv\tlog\n' > "${summary}"
+printf 'backend\tplacement\tcase\tn_predict\tseed\trep\texit_code\tbenchmark_json\tperf_json\tperf_csv\trebalance_trace_jsonl\tlog\n' > "${summary}"
 
 selected_backends=()
 if [[ "${backend}" == "both" || "${backend}" == "cuda" ]]; then
@@ -319,6 +358,30 @@ fi
 IFS=',' read -r -a case_names <<< "${cases_csv}"
 for i in "${!case_names[@]}"; do
   case_names[$i]="$(printf '%s' "${case_names[$i]}" | xargs)"
+done
+
+IFS=',' read -r -a n_predict_values <<< "${n_predict_csv}"
+for i in "${!n_predict_values[@]}"; do
+  n_predict_values[$i]="$(printf '%s' "${n_predict_values[$i]}" | xargs)"
+done
+seed_values=("")
+if [[ -n "${seeds_csv}" ]]; then
+  IFS=',' read -r -a seed_values <<< "${seeds_csv}"
+  for i in "${!seed_values[@]}"; do
+    seed_values[$i]="$(printf '%s' "${seed_values[$i]}" | xargs)"
+  done
+fi
+for n_value in "${n_predict_values[@]}"; do
+  if [[ -z "${n_value}" || ! "${n_value}" =~ ^[0-9]+$ || "${n_value}" == "0" ]]; then
+    echo "error: --n-predict-list values must be positive integers; got '${n_value}'" >&2
+    exit 2
+  fi
+done
+for seed_value in "${seed_values[@]}"; do
+  if [[ -n "${seed_value}" && ! "${seed_value}" =~ ^-?[0-9]+$ ]]; then
+    echo "error: --seeds values must be integers; got '${seed_value}'" >&2
+    exit 2
+  fi
 done
 
 case_args() {
@@ -385,13 +448,18 @@ run_one() {
   local be="$1"
   local place="$2"
   local case_name="$3"
-  local rep="$4"
-  local run_dir="${out_dir}/${be}/${place}/${case_name}/rep_${rep}"
+  local n_predict_value="$4"
+  local seed_value="$5"
+  local rep="$6"
+  local seed_label="${seed_value:-default}"
+  seed_label="${seed_label//-/_neg_}"
+  local run_dir="${out_dir}/${be}/${place}/${case_name}/n_${n_predict_value}/seed_${seed_label}/rep_${rep}"
   mkdir -p "${run_dir}"
 
   local benchmark_json="${run_dir}/benchmark.json"
   local perf_json="${run_dir}/perfstats.json"
   local perf_csv="${run_dir}/perfstats.csv"
+  local rebalance_trace_jsonl="${run_dir}/rebalance_trace.jsonl"
   local log="${run_dir}/stdout_stderr.log"
   local command_file="${run_dir}/command.txt"
 
@@ -410,12 +478,15 @@ run_one() {
     "${bin}" benchmark
     -m "${model}"
     --context-length "${context_length}"
-    -n "${n_predict}"
+    -n "${n_predict_value}"
     --benchmark-json-output "${benchmark_json}"
     --moe-release-raw-expert-weights
     "${placement_args[@]}"
     "${rebalance[@]}"
   )
+  if [[ -n "${seed_value}" ]]; then
+    cmd+=(--seed "${seed_value}")
+  fi
   local dense_tp_enabled=0
   local dense_decode_replicated_enabled=0
   if [[ "${dense_tp}" != "0" && "${dense_tp}" != "false" && "${dense_tp}" != "off" ]]; then
@@ -437,6 +508,26 @@ run_one() {
 
   local run_env=(
   )
+  inherit_env_if_set() {
+    local name="$1"
+    if [[ -n "${!name+x}" ]]; then
+      run_env+=("${name}=${!name}")
+    fi
+  }
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH
+  inherit_env_if_set LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT
   if [[ -n "${allreduce_fp16_min_elements}" ]]; then
     run_env+=("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS=${allreduce_fp16_min_elements}")
   fi
@@ -451,7 +542,15 @@ run_one() {
       "LLAMINAR_PERF_STATS_FILTER=${perf_filter}"
     )
   fi
+  if [[ "${rebalance_trace}" != "0" && "${rebalance_trace}" != "false" && "${rebalance_trace}" != "off" ]]; then
+    run_env+=("LLAMINAR_MOE_REBALANCE_TRACE_JSONL=${rebalance_trace_jsonl}")
+  fi
   if [[ "${place}" == "twocard" ]]; then
+    if [[ "${require_prefill_graph}" != "0" && "${require_prefill_graph}" != "false" && "${require_prefill_graph}" != "off" ]]; then
+      run_env+=("LLAMINAR_PREFILL_GRAPH_REQUIRED=1")
+    else
+      run_env+=("LLAMINAR_PREFILL_GRAPH_REQUIRED=0")
+    fi
     if [[ "${small_gpu_allreduce}" != "0" && "${small_gpu_allreduce}" != "false" && "${small_gpu_allreduce}" != "off" ]]; then
       run_env+=("LLAMINAR_LOCALTP_SMALL_GPU_ALLREDUCE=1")
       if [[ -n "${small_gpu_allreduce_max_elements}" ]]; then
@@ -479,12 +578,12 @@ run_one() {
   printf '%q ' "${cmd[@]}" >> "${command_file}"
   printf '\n' >> "${command_file}"
 
-  echo "[qwen36-moe-gpu-rebalance] backend=${be} placement=${place} case=${case_name} rep=${rep}"
+  echo "[qwen36-moe-gpu-rebalance] backend=${be} placement=${place} case=${case_name} n_predict=${n_predict_value} seed=${seed_value:-default} rep=${rep}"
   if [[ ${dry_run} -eq 1 ]]; then
     cat "${command_file}"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "${be}" "${place}" "${case_name}" "${rep}" "dry-run" \
-      "${benchmark_json}" "${perf_json}" "${perf_csv}" "${log}" >> "${summary}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "${be}" "${place}" "${case_name}" "${n_predict_value}" "${seed_value:-default}" "${rep}" "dry-run" \
+      "${benchmark_json}" "${perf_json}" "${perf_csv}" "${rebalance_trace_jsonl}" "${log}" >> "${summary}"
     return
   fi
 
@@ -497,9 +596,9 @@ run_one() {
   local exit_code=$?
   set -e
 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "${be}" "${place}" "${case_name}" "${rep}" "${exit_code}" \
-    "${benchmark_json}" "${perf_json}" "${perf_csv}" "${log}" >> "${summary}"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "${be}" "${place}" "${case_name}" "${n_predict_value}" "${seed_value:-default}" "${rep}" "${exit_code}" \
+    "${benchmark_json}" "${perf_json}" "${perf_csv}" "${rebalance_trace_jsonl}" "${log}" >> "${summary}"
 
   if [[ ${exit_code} -ne 0 ]]; then
     echo "warning: run failed; see ${log}" >&2
@@ -509,8 +608,12 @@ run_one() {
 for be in "${selected_backends[@]}"; do
   for place in "${selected_placements[@]}"; do
     for case_name in "${case_names[@]}"; do
-      for ((rep = 1; rep <= reps; ++rep)); do
-        run_one "${be}" "${place}" "${case_name}" "${rep}"
+      for n_predict_value in "${n_predict_values[@]}"; do
+        for seed_value in "${seed_values[@]}"; do
+          for ((rep = 1; rep <= reps; ++rep)); do
+            run_one "${be}" "${place}" "${case_name}" "${n_predict_value}" "${seed_value}" "${rep}"
+          done
+        done
       done
     done
   done

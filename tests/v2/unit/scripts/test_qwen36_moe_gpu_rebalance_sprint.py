@@ -23,6 +23,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         rebalance_window: int | None = None,
         perfstats: bool = False,
         stage_gpu_stats: bool = False,
+        rebalance_trace: bool = False,
         capture_collectives: bool = False,
         no_capture_collectives: bool = False,
         defer_captured_collective_sync: bool = False,
@@ -33,6 +34,9 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         allreduce_fp16_min_elements: str | None = None,
         small_gpu_allreduce: bool = False,
         small_gpu_allreduce_max_elements: str | None = None,
+        no_require_prefill_graph: bool = False,
+        n_predict_list: str | None = None,
+        seeds: str | None = None,
         extra_env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
@@ -40,6 +44,8 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
             env.pop("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", None)
             env.pop("LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", None)
             env.pop("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", None)
+            env.pop("LLAMINAR_PREFILL_GRAPH_REQUIRED", None)
+            env.pop("LLAMINAR_MOE_REBALANCE_TRACE_JSONL", None)
             if extra_env:
                 env.update(extra_env)
 
@@ -63,14 +69,20 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 "--context-length",
                 "1024",
                 "--n-predict",
-                "16",
+                n_predict_list if n_predict_list is not None else "16",
             ]
+            if n_predict_list is not None and "," in n_predict_list:
+                args[-2] = "--n-predict-list"
+            if seeds is not None:
+                args.extend(["--seeds", seeds])
             if rebalance_window is not None:
                 args.extend(["--rebalance-window", str(rebalance_window)])
             if perfstats:
                 args.append("--perfstats")
             if stage_gpu_stats:
                 args.append("--stage-gpu-stats")
+            if rebalance_trace:
+                args.append("--rebalance-trace")
             if capture_collectives:
                 args.append("--capture-collectives")
             if no_capture_collectives:
@@ -97,6 +109,8 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                     "--small-gpu-allreduce-max-elements",
                     small_gpu_allreduce_max_elements,
                 ])
+            if no_require_prefill_graph:
+                args.append("--no-require-prefill-graph")
 
             return subprocess.run(
                 args,
@@ -118,6 +132,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertNotIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
         self.assertNotIn("tp_allreduce_bom", result.stdout)
         self.assertIn("--moe-expert-overlay", result.stdout)
+        self.assertIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
 
     def test_no_capture_collectives_dry_run_forces_segmented_collective_graphs(self) -> None:
         result = self.run_script(no_capture_collectives=True)
@@ -142,12 +157,42 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
         self.assertIn("stage_gpu", result.stdout)
 
+    def test_rebalance_trace_dry_run_writes_trace_sidecar_without_perfstats(self) -> None:
+        result = self.run_script(rebalance_trace=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LLAMINAR_MOE_REBALANCE_TRACE_JSONL=", result.stdout)
+        self.assertIn("rebalance_trace.jsonl", result.stdout)
+        self.assertNotIn("LLAMINAR_PERF_STATS_JSON=", result.stdout)
+
+    def test_decode_length_seed_matrix_expands_trace_runs(self) -> None:
+        result = self.run_script(
+            rebalance_trace=True,
+            n_predict_list="512,1024",
+            seeds="101,202",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.count("LLAMINAR_MOE_REBALANCE_TRACE_JSONL="), 4)
+        self.assertEqual(result.stdout.count("--seed 101"), 2)
+        self.assertEqual(result.stdout.count("--seed 202"), 2)
+        self.assertIn("/n_512/seed_101/", result.stdout)
+        self.assertIn("/n_1024/seed_202/", result.stdout)
+
     def test_single_card_dry_run_does_not_force_segmented_collective_graphs(self) -> None:
         result = self.run_script(placement="single")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED=1", result.stdout)
+        self.assertNotIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
         self.assertIn("-d cuda:0", result.stdout)
+
+    def test_twocard_dry_run_can_opt_out_of_prefill_graph_requirement_for_diagnostics(self) -> None:
+        result = self.run_script(no_require_prefill_graph=True)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=0", result.stdout)
+        self.assertNotIn("LLAMINAR_PREFILL_GRAPH_REQUIRED=1", result.stdout)
 
     def test_capture_collectives_dry_run_uses_captured_collective_graph_policy(self) -> None:
         result = self.run_script(capture_collectives=True)
@@ -195,6 +240,44 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--moe-rebalance-window 8", result.stdout)
         self.assertNotIn("--moe-rebalance-window 64", result.stdout)
+
+    def test_device_rebalance_env_knobs_are_forwarded_to_benchmark(self) -> None:
+        result = self.run_script(
+            extra_env={
+                "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS": "2",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS": "4",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS": "128",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS": "65",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT": "4096",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT": "2048",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS=2",
+            result.stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS=4",
+            result.stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS=128",
+            result.stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=65",
+            result.stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=4096",
+            result.stdout,
+        )
+        self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=2048",
+            result.stdout,
+        )
 
     def test_existing_segmented_collective_setting_is_preserved(self) -> None:
         result = self.run_script(

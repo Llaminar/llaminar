@@ -6,6 +6,8 @@
  */
 
 #include "TPAllreduceStage.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
 #include "../../../memory/StageBufferContract.h"
 #include "../../../tensors/TensorClasses.h"
 #include "../../../utils/Logger.h"
@@ -14,6 +16,7 @@
 #include "../../../utils/PerfStatsCollector.h"
 
 #include <cstdint>
+#include <utility>
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -93,6 +96,167 @@ namespace llaminar2
                 return sizeof(uint16_t);
             }
             return tensor_element_bytes;
+        }
+
+        const char *collectiveDataTypeNameForStats(CollectiveDataType dtype)
+        {
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+                return "fp32";
+            case CollectiveDataType::FLOAT16:
+                return "fp16";
+            case CollectiveDataType::BFLOAT16:
+                return "bf16";
+            case CollectiveDataType::INT32:
+                return "int32";
+            case CollectiveDataType::INT8:
+                return "int8";
+            }
+            return "unknown";
+        }
+
+        size_t collectiveDataTypeBytesForStats(CollectiveDataType dtype)
+        {
+            switch (dtype)
+            {
+            case CollectiveDataType::FLOAT32:
+            case CollectiveDataType::INT32:
+                return sizeof(std::uint32_t);
+            case CollectiveDataType::FLOAT16:
+            case CollectiveDataType::BFLOAT16:
+                return sizeof(std::uint16_t);
+            case CollectiveDataType::INT8:
+                return sizeof(std::uint8_t);
+            }
+            return 0;
+        }
+
+        size_t sidebandResultElements(
+            LocalTPCollectiveSidebandKind kind,
+            size_t element_count,
+            size_t degree)
+        {
+            if (kind == LocalTPCollectiveSidebandKind::Allgather)
+                return element_count * degree;
+            return element_count;
+        }
+
+        void recordAllreduceSidebandBillOfMaterialsEntry(
+            const TPAllreduceParams &params,
+            LocalTPCollectiveSidebandKind kind,
+            size_t element_count,
+            CollectiveDataType dtype,
+            int root_device_index,
+            const std::string &sideband_name,
+            const std::string &source,
+            bool grouped_with_anchor)
+        {
+            if (!PerfStatsCollector::isEnabled())
+                return;
+
+            const size_t degree = params.tp_ctx ? static_cast<size_t>(params.tp_ctx->degree()) : 0;
+            const size_t element_bytes = collectiveDataTypeBytesForStats(dtype);
+            const size_t local_bytes = element_count * element_bytes;
+            const size_t result_bytes =
+                sidebandResultElements(kind, element_count, degree) * element_bytes;
+
+            PerfStatsCollector::Tags tags{
+                {"stage", params.stage_name.empty() ? "unnamed" : params.stage_name},
+                {"role", allreduceRoleForStage(params.stage_name)},
+                {"anchor_stage", params.stage_name.empty() ? "unnamed" : params.stage_name},
+                {"anchor_collective", "allreduce"},
+                {"backend", params.tp_ctx ? collectiveBackendTypeToString(params.tp_ctx->backend()) : "none"},
+                {"scope", allreduceScopeString(params.tp_ctx)},
+                {"degree", std::to_string(degree)},
+                {"sideband", sideband_name.empty() ? "unnamed" : sideband_name},
+                {"kind", toString(kind)},
+                {"dtype", collectiveDataTypeNameForStats(dtype)},
+                {"element_bytes", std::to_string(element_bytes)},
+                {"elements", std::to_string(element_count)},
+                {"result_elements", std::to_string(sidebandResultElements(kind, element_count, degree))},
+                {"root_device_index", std::to_string(root_device_index)},
+                {"source", source},
+                {"attachment", "tp_allreduce_stage_sideband"},
+                {"launch_relation", grouped_with_anchor ? "same_group_as_anchor" : "same_stream_after_anchor"},
+                {"fused_with_anchor", grouped_with_anchor ? "true" : "false"},
+                {"physical_fusion", grouped_with_anchor ? "grouped_with_anchor_collective" : "separate_backend_collective"}};
+
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "sideband_collective_calls",
+                1.0,
+                {},
+                params.device_id.toString(),
+                tags);
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                grouped_with_anchor
+                    ? "sideband_grouped_with_anchor_collective_calls"
+                    : "sideband_separate_backend_collective_calls",
+                1.0,
+                {},
+                params.device_id.toString(),
+                tags);
+
+            PerfStatsCollector::Tags local_byte_tags = tags;
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "sideband_local_bytes",
+                static_cast<double>(local_bytes),
+                {},
+                params.device_id.toString(),
+                std::move(local_byte_tags));
+
+            PerfStatsCollector::Tags result_byte_tags = tags;
+            PerfStatsCollector::addCounter(
+                "tp_allreduce_bom",
+                "sideband_result_bytes",
+                static_cast<double>(result_bytes),
+                {},
+                params.device_id.toString(),
+                std::move(result_byte_tags));
+        }
+
+        void recordAllreduceSidebandBillOfMaterials(
+            const TPAllreduceParams &params,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            bool grouped_with_anchor)
+        {
+            for (const auto &sideband : sidebands)
+            {
+                recordAllreduceSidebandBillOfMaterialsEntry(
+                    params,
+                    sideband.kind,
+                    sideband.element_count,
+                    sideband.dtype,
+                    sideband.root_device_index,
+                    sideband.name,
+                    "raw_buffer",
+                    grouped_with_anchor);
+            }
+        }
+
+        void recordAllreduceWorkspaceSidebandBillOfMaterials(
+            const TPAllreduceParams &params,
+            bool grouped_with_anchor)
+        {
+            for (const auto &binding : params.sideband_workspace_bindings)
+            {
+                recordAllreduceSidebandBillOfMaterialsEntry(
+                    params,
+                    binding.kind,
+                    binding.element_count,
+                    binding.dtype,
+                    binding.root_device_index,
+                    binding.name.empty()
+                        ? (binding.recv_buffer_name.empty()
+                               ? binding.send_buffer_name
+                                           : binding.recv_buffer_name)
+                        : binding.name,
+                    "workspace_binding",
+                    grouped_with_anchor);
+            }
         }
 
         void recordAllreduceBillOfMaterials(
@@ -227,14 +391,109 @@ namespace llaminar2
                                        << " (params_.count=" << params_.count
                                        << ", tensor numel=" << params_.tensor->numel() << ")");
 
-        // Use stage_name overload with count parameter
-        // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size)
-        bool success;
         void *stage_stream = gpuStream();
         const std::string transport_precision = requestedTransportPrecision(params_);
         const bool gpu_stage =
             params_.device_id.is_gpu() || (ctx && ctx->isGPU());
-        if (gpu_stage)
+
+        std::vector<LocalTPCollectiveSidebandBuffer> sidebands = params_.sidebands;
+        if (!params_.sideband_workspace_bindings.empty())
+        {
+            if (!bound_workspace_)
+            {
+                LOG_ERROR("TPAllreduceStage: workspace sidebands require a bound workspace"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " binding_count=" << params_.sideband_workspace_bindings.size());
+                return false;
+            }
+
+            for (const auto &binding : params_.sideband_workspace_bindings)
+            {
+                auto resolveBuffer = [&](const std::string &buffer_name) -> void *
+                {
+                    if (buffer_name.empty())
+                        return nullptr;
+                    return bound_workspace_->getBuffer(buffer_name);
+                };
+
+                void *send_buffer = resolveBuffer(binding.send_buffer_name);
+                void *recv_buffer = resolveBuffer(binding.recv_buffer_name);
+                if (!binding.send_buffer_name.empty() && !send_buffer)
+                {
+                    LOG_ERROR("TPAllreduceStage: missing sideband send workspace buffer"
+                              << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                              << " sideband=" << (binding.name.empty() ? "(unnamed)" : binding.name)
+                              << " buffer=" << binding.send_buffer_name);
+                    return false;
+                }
+                if (!binding.recv_buffer_name.empty() && !recv_buffer)
+                {
+                    LOG_ERROR("TPAllreduceStage: missing sideband recv workspace buffer"
+                              << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                              << " sideband=" << (binding.name.empty() ? "(unnamed)" : binding.name)
+                              << " buffer=" << binding.recv_buffer_name);
+                    return false;
+                }
+
+                LocalTPCollectiveSidebandBuffer sideband;
+                sideband.kind = binding.kind;
+                sideband.send_buffer = send_buffer;
+                sideband.recv_buffer = recv_buffer;
+                sideband.element_count = binding.element_count;
+                sideband.dtype = binding.dtype;
+                sideband.root_device_index = binding.root_device_index;
+                sideband.name = binding.name.empty()
+                                    ? (binding.recv_buffer_name.empty()
+                                           ? binding.send_buffer_name
+                                           : binding.recv_buffer_name)
+                                    : binding.name;
+                sidebands.push_back(std::move(sideband));
+            }
+        }
+
+        // Use stage_name overload with count parameter.
+        // CRITICAL: Pass actual count for decode (seq_len * hidden_dim, not buffer size).
+        bool success;
+        if (!sidebands.empty())
+        {
+            if (!stage_stream)
+            {
+                LOG_ERROR("TPAllreduceStage: sidebands require an explicit non-null stream"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+            auto *local_tp = dynamic_cast<ILocalTPContext *>(params_.tp_ctx);
+            if (!local_tp)
+            {
+                LOG_ERROR("TPAllreduceStage: sidebands require a LocalTP context"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
+                return false;
+            }
+            if (params_.sideband_device_index < 0)
+            {
+                LOG_ERROR("TPAllreduceStage: sidebands require a valid LocalTP participant index"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " sideband_device_index=" << params_.sideband_device_index);
+                return false;
+            }
+            recordAllreduceSidebandBillOfMaterials(params_, sidebands, true);
+            success = local_tp->allreduceWithSidebandsOnStream(
+                params_.tensor,
+                params_.stage_name,
+                effective_count,
+                stage_stream,
+                transport_precision,
+                sidebands,
+                params_.sideband_device_index);
+            if (!success)
+            {
+                LOG_ERROR("TPAllreduceStage: LocalTP grouped allreduce sideband bundle failed"
+                          << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name)
+                          << " sideband_count=" << sidebands.size());
+                return false;
+            }
+        }
+        else if (gpu_stage)
         {
             if (!stage_stream)
             {
@@ -271,13 +530,33 @@ namespace llaminar2
         if (!success)
         {
             LOG_ERROR("TPAllreduceStage (" << scope_str << "): allreduce failed");
+            return false;
         }
 
         // Dirty-marking is handled by LocalTPContext::allreduceOnStream() which
         // calls transitionToWithEvent(DEVICE_AUTHORITATIVE, ..., stream) to record a completion event.
         // This ensures ensureOnHost() waits for the allreduce to finish before D2H.
 
-        return success;
+        return true;
+    }
+
+    WorkspaceRequirements TPAllreduceStage::getWorkspaceRequirements(
+        int m, int n, int k) const
+    {
+        (void)m;
+        (void)n;
+        (void)k;
+        return {};
+    }
+
+    void TPAllreduceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+    }
+
+    void TPAllreduceStage::unbindWorkspace()
+    {
+        bound_workspace_ = nullptr;
     }
 
     void TPAllreduceStage::onGraphReplayed()
@@ -290,6 +569,8 @@ namespace llaminar2
         const bool no_op_allreduce =
             !params_.tp_ctx || params_.tp_ctx->degree() == 1 || debugEnv().skip_allreduce;
         recordAllreduceBillOfMaterials(params_, effective_count, no_op_allreduce);
+        recordAllreduceSidebandBillOfMaterials(params_, params_.sidebands, true);
+        recordAllreduceWorkspaceSidebandBillOfMaterials(params_, true);
     }
 
     bool TPAllreduceStage::needsOnGraphReplayed() const

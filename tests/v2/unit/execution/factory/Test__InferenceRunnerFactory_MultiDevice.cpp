@@ -296,6 +296,32 @@ namespace
         return plan;
     }
 
+    std::shared_ptr<MoEExpertParallelPlan> makeActiveCudaLocalTPReplicatedOverlayPlan()
+    {
+        auto plan = std::make_shared<MoEExpertParallelPlan>();
+        plan->enabled = true;
+        plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+        plan->continuation_domain = "cuda_hot";
+        plan->shared_expert_domain = "cuda_hot";
+        plan->residency_policy = ExpertResidencyPolicy::ExplicitMasks;
+
+        ExpertComputeDomain cuda_hot;
+        cuda_hot.name = "cuda_hot";
+        cuda_hot.kind = ExpertDomainKind::LocalTP;
+        cuda_hot.backend = CollectiveBackendType::NCCL;
+        cuda_hot.compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        cuda_hot.participants = {
+            GlobalDeviceAddress::cuda(0),
+            GlobalDeviceAddress::cuda(1),
+        };
+
+        plan->domains = {cuda_hot};
+        plan->routed_tiers = {
+            overlayTier("hot", "cuda_hot", 0),
+        };
+        return plan;
+    }
+
     // =============================================================================
     // Test Fixture
     // =============================================================================
@@ -562,6 +588,37 @@ namespace
         EXPECT_EQ(graph_config.moe.rebalance_mode, active->mode());
     }
 
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, HomogeneousGpuOwnershipMovesAreBoundedByLayerFanout)
+    {
+        GraphConfig graph_config;
+        graph_config.n_layers = 40;
+        graph_config.moe.num_experts = 256;
+        graph_config.moe.top_k = 8;
+        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::Dynamic;
+        graph_config.moe.rebalance_config.window_size = 256;
+        graph_config.moe.expert_overlay_runtime_plan =
+            resolveMoEExpertOverlayRuntimePlan(makeActiveCudaLocalTPReplicatedOverlayPlan());
+
+        auto controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            nullptr,
+            nullptr);
+
+        auto it = std::find_if(
+            controllers.begin(),
+            controllers.end(),
+            [](const std::unique_ptr<MoERebalanceController> &controller)
+            {
+                return controller && controller->domainId() == "overlay_routed_cuda_hot";
+            });
+        ASSERT_NE(it, controllers.end());
+
+        const SocketRebalanceConfig &policy = (*it)->rebalanceConfig();
+        EXPECT_EQ(policy.max_total_swaps, 6)
+            << "Qwen-sized GPU ownership moves must fit the first-class staging arena";
+        EXPECT_EQ(policy.max_swaps_per_layer, 3);
+    }
+
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, GlobalTPRebalanceControllerPreservesCpuDomain)
     {
         GraphConfig graph_config;
@@ -585,6 +642,8 @@ namespace
         EXPECT_EQ(controller.participantDevices()[0], DeviceId(DeviceType::CPU, 0));
         EXPECT_EQ(controller.participantDevices()[1], DeviceId(DeviceType::CPU, 1));
         EXPECT_EQ(controller.mode(), MoERebalanceMode::DYNAMIC);
+        EXPECT_EQ(controller.rebalanceConfig().max_total_swaps, 16)
+            << "CPU domains keep the historical socket-rebalancer default";
 
         auto rank0_masks = controller.computeExpertMasksForParticipant(0);
         auto rank1_masks = controller.computeExpertMasksForParticipant(1);

@@ -52,7 +52,10 @@ namespace
                     entry.old_value = old_value;
                 }
                 entries_.push_back(entry);
-                ::setenv(name, value, 1);
+                if (value)
+                    ::setenv(name, value, 1);
+                else
+                    ::unsetenv(name);
             }
             mutableDebugEnv().reload();
         }
@@ -197,7 +200,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, MockGraphBuilder_ConfigAcc
     EXPECT_EQ(cfg.head_dim, 64);
 }
 
-TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DoesNotGraphCaptureCollectivesByDefault)
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DisableCapturedCollectivesOverrideKeepsCollectiveDecodeEager)
 {
     ScopedEnvVars env({
         {"LLAMINAR_GPU_GRAPHS", "1"},
@@ -219,6 +222,147 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_DoesNo
     EXPECT_FALSE(policy.collective_segmented_enabled);
     EXPECT_FALSE(policy.collectives_graph_capturable);
     EXPECT_FALSE(policy.allow_cached_graph_replay);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceGraphControllerDefaultsEnabled)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER", nullptr},
+    });
+
+    EXPECT_TRUE(debugEnv().moe_rebalance.device_rebalance_graph_controller)
+        << "Homogeneous GPU dynamic rebalance should use the graph-native device controller by default.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceGraphControllerEnvCanDisableDefault)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_GRAPH_CONTROLLER", "0"},
+    });
+
+    EXPECT_FALSE(debugEnv().moe_rebalance.device_rebalance_graph_controller);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalancePayloadSidebandDefaultsOff)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND", nullptr},
+    });
+
+    EXPECT_FALSE(debugEnv().moe_rebalance.device_rebalance_payload_sideband)
+        << "Bulk expert payload sidebands must not be attached to every decode-token graph replay by default.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalancePayloadSidebandEnvStillParsesButSelectorRejects)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND", "1"},
+    });
+
+    EXPECT_TRUE(debugEnv().moe_rebalance.device_rebalance_payload_sideband);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpreadFloorDefaultsToMeasuredCostGate)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", nullptr},
+    });
+
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement, 64)
+        << "The default device-side hot-replica policy should allow realistic Qwen3.6 decode "
+           "hot experts while still rejecting tiny transfer churn.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 128);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 0)
+        << "The wave-level value gate is opt-in until CUDA/ROCm economics have both been measured.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 1)
+        << "Steady-state hot-replica waves should require positive realized router benefit by default.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_no_work_backoff_periods, 1)
+        << "Empty maintenance replays should back off by default until zero-bucket graph bodies exist.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpreadFloorEnvOverridesDefault)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "96"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "192"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "384"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", "3"},
+    });
+
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement, 96);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 192);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 384);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_no_work_backoff_periods, 3);
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesByDefaultForHomogeneousCudaLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", nullptr},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", nullptr},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx,
+        0);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay)
+        << "Homogeneous CUDA LocalTP collective decode must remain graph-replay eligible by default.";
+}
+
+TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesCollectivesByDefaultForHomogeneousRocmLocalTP)
+{
+    ScopedEnvVars env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_GPU_GRAPH_COLLECTIVE_SEGMENTED", nullptr},
+        {"LLAMINAR_GPU_GRAPH_CAPTURE_COLLECTIVES", nullptr},
+    });
+
+    auto tp_ctx = std::make_shared<llaminar2::test::MockLocalTPContext>();
+    tp_ctx->setBackend(CollectiveBackendType::RCCL);
+    tp_ctx->setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+
+    GraphConfig cfg = mock_builder_->config();
+    cfg.tp_ctx = tp_ctx.get();
+    mock_builder_->setConfig(cfg);
+
+    auto deps = minimalDeps();
+    DeviceGraphOrchestrator dgo(std::move(deps));
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+    const IForwardExecutionHost &host = dgo;
+
+    const auto policy = host.buildDecodeCapturePolicy(
+        true,
+        &gpu_ctx,
+        0);
+
+    EXPECT_TRUE(policy.allow_fast_decode);
+    EXPECT_FALSE(policy.collective_segmented_enabled);
+    EXPECT_TRUE(policy.collectives_graph_capturable);
+    EXPECT_TRUE(policy.allow_cached_graph_replay)
+        << "Homogeneous ROCm LocalTP collective decode should graph-capture through participant-local RCCL enqueue.";
 }
 
 TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DecodeCapturePolicy_CapturesDenseDecodeReplicatedWithCollectiveOptIn)

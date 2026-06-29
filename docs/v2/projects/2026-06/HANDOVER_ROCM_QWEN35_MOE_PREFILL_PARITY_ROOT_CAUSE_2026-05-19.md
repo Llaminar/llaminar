@@ -365,7 +365,7 @@ if (params_.device_id.is_rocm() && params_.seq_len > 1)
     return false;
 ```
 
-This hard-fail is why `LLAMINAR_ROCM_MOE_GROUPED_PREFILL=0` alone does not provide an A/B oracle today.
+This hard-fail is why disabling the shared GPU grouped-prefill gate (`LLAMINAR_GPU_MOE_GROUPED_PREFILL=0`) alone does not provide an A/B oracle today.
 
 ### ROCm MoE Kernel
 

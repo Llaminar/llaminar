@@ -50,10 +50,22 @@ namespace llaminar2
         }
         config.moe.shared_intermediate_size = config.moe.intermediate_size; // same for Qwen3.5
 
+        config.moe.decode_histogram_token_boundary_layer = -1;
+        for (int local_layer = 0; local_layer < config.n_layers; ++local_layer)
+        {
+            const int model_layer = config.pp_layer_offset + local_layer;
+            const std::string routed_gate =
+                "blk." + std::to_string(model_layer) + ".ffn_gate_inp.weight";
+            if (ctx.hasTensor(routed_gate))
+                config.moe.decode_histogram_token_boundary_layer = local_layer;
+        }
+
         LOG_DEBUG("[Qwen35MoEGraphConfigBuilder] MoE config:"
                   << " num_experts=" << config.moe.num_experts
                   << " top_k=" << config.moe.top_k
-                  << " has_shared_expert=" << config.moe.has_shared_expert);
+                  << " has_shared_expert=" << config.moe.has_shared_expert
+                  << " histogram_boundary_layer="
+                  << config.moe.decode_histogram_token_boundary_layer);
 
         return true;
     }

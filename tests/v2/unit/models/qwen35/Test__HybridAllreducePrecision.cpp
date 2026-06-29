@@ -25,6 +25,7 @@
 #include "execution/local_execution/graph/GraphSchema.h"
 #include "execution/compute_stages/stages/FusedAddAllreduceStage.h"
 #include "execution/compute_stages/stages/TPAllreduceStage.h"
+#include "utils/DebugEnv.h"
 
 using namespace llaminar2;
 
@@ -40,6 +41,7 @@ namespace
             if (old)
                 old_value_ = std::string(old);
             ::setenv(name_.c_str(), value, 1);
+            mutableDebugEnv().reload();
         }
 
         ~ScopedEnv()
@@ -48,6 +50,7 @@ namespace
                 ::setenv(name_.c_str(), old_value_->c_str(), 1);
             else
                 ::unsetenv(name_.c_str());
+            mutableDebugEnv().reload();
         }
 
         ScopedEnv(const ScopedEnv &) = delete;

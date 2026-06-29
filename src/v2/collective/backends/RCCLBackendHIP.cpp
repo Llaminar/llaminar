@@ -231,6 +231,15 @@ namespace llaminar2
             return (err == hipSuccess);
         }
 
+        bool hipMemsetAsyncDevice(void *dst, int value, size_t bytes, int device_ordinal, void *stream)
+        {
+            hipError_t err = hipSetDevice(device_ordinal);
+            if (err != hipSuccess)
+                return false;
+            err = hipMemsetAsync(dst, value, bytes, static_cast<hipStream_t>(stream));
+            return (err == hipSuccess);
+        }
+
         bool hipMemcpyPeerAsyncDevice(void *dst, int dst_device, const void *src, int src_device, size_t bytes, void *stream)
         {
             hipError_t err = hipMemcpyPeerAsync(dst, dst_device, src, src_device, bytes, static_cast<hipStream_t>(stream));

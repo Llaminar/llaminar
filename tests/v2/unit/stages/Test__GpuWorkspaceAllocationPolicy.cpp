@@ -431,6 +431,55 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GraphCaptureControllerChecksStreamSynch
     EXPECT_NE(source.find("Initial captured launch stream sync failed after segment starting at"), std::string::npos);
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, StageVerifierUsesTensorDeviceOrdinalForGpuValidators)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/graph/StageVerifier.cpp");
+    const auto executable_source = stripCommentsAndStringLiterals(source);
+
+    EXPECT_NE(executable_source.find("getTensorValidator(device_opt->type, device_opt->ordinal)"),
+              std::string::npos)
+        << "Multi-GPU validation must fetch the validator for the tensor's actual "
+           "device ordinal, not the ambient CUDA/HIP current device.";
+    EXPECT_EQ(executable_source.find("getTensorValidator(device_opt->type);"),
+              std::string::npos);
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, MoERebalanceMaintenanceSkipsSyncForDedicatedCollectiveLane)
+{
+    const auto source =
+        readFile(repoRoot() / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp");
+    const auto fn = sliceBetween(
+        source,
+        "bool DeviceGraphOrchestrator::maybeRunDeviceMoERebalanceMaintenanceGraph(",
+        "// =====================================================================\n    // IForwardExecutionHost interface implementations");
+    const auto executable_fn = stripCommentsAndStringLiterals(fn);
+
+    EXPECT_NE(fn.find("Dedicated maintenance lanes skip this guard"), std::string::npos)
+        << "The maintenance scheduler must document why dedicated lanes are allowed to overlap decode.";
+    EXPECT_NE(fn.find("Shared-communicator maintenance graphs must finish"), std::string::npos)
+        << "The fallback guard must still document why shared-communicator overlap is forbidden.";
+    EXPECT_NE(executable_fn.find("maintenance_graph_uses_decode_collective_lane()"), std::string::npos)
+        << "Maintenance should only synchronize when the captured graph really uses the decode LocalTP context.";
+    EXPECT_NE(fn.find("device_maintenance_graph_same_communicator_sync"), std::string::npos);
+    EXPECT_NE(fn.find("dedicated_collective_lane"), std::string::npos)
+        << "PerfStats must report whether the maintenance graph used a dedicated collective lane.";
+    EXPECT_NE(executable_fn.find("gpu_ctx->synchronizeStreamChecked(maintenance_stream)"), std::string::npos)
+        << "The shared-lane fallback must still fail safe.";
+    EXPECT_NE(executable_fn.find("cache.completion_event_in_flight = false;"), std::string::npos)
+        << "A synchronously completed maintenance wave must not be reported as still in flight.";
+    expectNeedleBefore(
+        fn,
+        "device_maintenance_graph_replay_enqueue",
+        "device_maintenance_graph_same_communicator_sync",
+        "The shared-communicator guard must run after the maintenance graph is enqueued.");
+    expectNeedleBefore(
+        executable_fn,
+        "maintenance_graph_uses_decode_collective_lane()",
+        "gpu_ctx->synchronizeStreamChecked(maintenance_stream)",
+        "The sync fallback must be gated by an actual shared LocalTP context.");
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MTPPendingLogitsStreamsUseOwnershipHelpers)
 {
     const auto source =
@@ -4534,6 +4583,49 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoECombineDoesNotForceFreshGraphS
         << "The no-shared-expert copy form must not reintroduce per-layer graph segmentation either.";
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMaintenanceGraphUsesDedicatedCollectiveLane)
+{
+    const auto header_source =
+        readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.h");
+    const auto graph_source =
+        readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
+    const auto binding_section = sliceBetween(
+        header_source,
+        "struct GraphSideRebalanceBinding",
+        "IMoERuntimeTable *moeRuntimeTableForDevice");
+    const auto maintenance_build = sliceBetween(
+        graph_source,
+        "ComputeGraph Qwen35MoEGraph::buildDeviceMoERebalanceMaintenanceGraph(",
+        "void Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial");
+    const auto insertion_section = sliceBetween(
+        graph_source,
+        "if (env.moe_rebalance.device_rebalance_maintenance_graph)",
+        "moe_graph_rebalance_bindings_[domain_key]");
+
+    EXPECT_NE(binding_section.find("decode_tp_ctx"), std::string::npos);
+    EXPECT_NE(binding_section.find("maintenance_tp_ctx"), std::string::npos);
+    EXPECT_NE(graph_source.find("maintenanceTPContextForDomain("), std::string::npos)
+        << "Maintenance graph mode must own a second LocalTP context/communicator.";
+    EXPECT_NE(graph_source.find("std::weak_ptr<ILocalTPContext>"), std::string::npos)
+        << "Separate graph builders for different devices must share the same "
+           "domain-wide maintenance context instead of creating one communicator per participant.";
+    EXPECT_NE(graph_source.find("Reusing dedicated MoE rebalance maintenance collective lane"),
+              std::string::npos);
+    EXPECT_NE(graph_source.find("key << \":devices=\""), std::string::npos)
+        << "The maintenance collective lane key must include concrete participants, "
+           "not just backend/degree.";
+    EXPECT_NE(insertion_section.find("maintenance_lane_key"),
+              std::string::npos);
+    EXPECT_EQ(insertion_section.find("maintenanceTPContextForDomain(domain_key, *local_tp_ctx)"),
+              std::string::npos)
+        << "The maintenance collective lane must be domain-wide, not participant-specific.";
+    EXPECT_NE(maintenance_build.find("params.tp_ctx = binding.maintenance_tp_ctx"),
+              std::string::npos)
+        << "Standalone maintenance collectives must not ride the decode communicator.";
+    EXPECT_EQ(maintenance_build.find("params.tp_ctx = binding.decode_tp_ctx"),
+              std::string::npos);
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPublicationGuards)
 {
     const auto graph_source = readFile(repoRoot() / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp");
@@ -4594,7 +4686,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, Qwen35MoEMultiRowVerifierKeepsStrictPub
         removeAsciiWhitespace(stripCommentsAndStringLiterals(shared_policy_section));
     EXPECT_FALSE(compact_shared_policy.empty())
         << "Could not find the shared-expert verifier grouping policy.";
-    EXPECT_NE(compact_shared_policy.find("rocm_env.moe_grouped_prefill&&"),
+    EXPECT_NE(compact_shared_policy.find("gpu_moe_env.grouped_prefill&&"),
               std::string::npos)
         << "If grouped prefill is disabled, the graph must choose the explicit "
            "decode-equivalent path rather than quietly falling through.";

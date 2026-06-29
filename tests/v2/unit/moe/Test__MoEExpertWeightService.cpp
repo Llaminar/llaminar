@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -43,6 +44,24 @@ namespace
     constexpr int kExpertIntermediate = 64; // small for fast tests
     constexpr int kDModel = 32;
     constexpr size_t kBlockSize = 32; // Q4_0 block size
+
+    std::string readRepoFile(const std::filesystem::path &relative_path)
+    {
+        for (auto dir = std::filesystem::current_path(); !dir.empty(); dir = dir.parent_path())
+        {
+            const auto candidate = dir / relative_path;
+            if (std::filesystem::exists(candidate))
+            {
+                std::ifstream in(candidate);
+                std::ostringstream buffer;
+                buffer << in.rdbuf();
+                return buffer.str();
+            }
+            if (dir == dir.root_path())
+                break;
+        }
+        return {};
+    }
 
     /// Create a 3D Q4_0 tensor [cols, rows, num_experts] (GGUF convention).
     /// cols = fastest-varying dimension (ne[0]).
@@ -1881,4 +1900,56 @@ TEST(Test__MoEExpertWeightService, FullLifecycle)
     EXPECT_NE(owner.prepared_gate_gemm[1], nullptr);
     EXPECT_EQ(owner.prepared_gate_gemm[2], nullptr);
     EXPECT_EQ(owner.prepared_gate_gemm[3], nullptr);
+}
+
+TEST(Test__MoEExpertWeightService, GpuDirectTransferSlotStagingUsesSourceDescriptorFormat)
+{
+    const std::string source =
+        readRepoFile("src/v2/execution/moe/MoEExpertWeightService.cpp");
+    ASSERT_FALSE(source.empty());
+
+    const size_t staging_fn =
+        source.find("bool MoEExpertWeightService::stageExpertsGPUDirectToTransferSlots");
+    ASSERT_NE(staging_fn, std::string::npos);
+
+    const size_t experts_to_copy =
+        source.find("std::vector<int> experts_to_copy", staging_fn);
+    ASSERT_NE(experts_to_copy, std::string::npos);
+    const size_t make_specs =
+        source.find("auto make_slot_pool_specs", experts_to_copy);
+    ASSERT_NE(make_specs, std::string::npos);
+
+    const std::string admission_block =
+        source.substr(experts_to_copy, make_specs - experts_to_copy);
+    EXPECT_NE(admission_block.find("deviceMoEProjectionFormat"), std::string::npos)
+        << "inactive destination expert views may not carry NativeVNNI metadata";
+    EXPECT_EQ(admission_block.find("has no NativeVNNI format info"), std::string::npos)
+        << "GPU-direct arrivals must not require destination VNNI format metadata";
+    EXPECT_EQ(admission_block.find("grp.dst_views[expert_id]->rows()"), std::string::npos)
+        << "inactive destination expert views may be absent during transfer-slot staging";
+
+    const size_t allocation_ns =
+        source.find("uint64_t allocation_ns", make_specs);
+    ASSERT_NE(allocation_ns, std::string::npos);
+    const std::string spec_block =
+        source.substr(make_specs, allocation_ns - make_specs);
+    EXPECT_NE(spec_block.find("source_descriptor_for(grp, sample_expert"), std::string::npos);
+    EXPECT_NE(spec_block.find("deviceMoEProjectionFormat"), std::string::npos);
+    EXPECT_EQ(spec_block.find("vnni_info_for(grp, sample_expert"), std::string::npos)
+        << "slot pool specs must come from the source descriptor for inactive arrivals";
+    EXPECT_EQ(spec_block.find("grp.dst_views[static_cast<size_t>(sample_expert)]->rows()"), std::string::npos)
+        << "slot pool specs must not require an already-materialized destination view";
+
+    const size_t copy_loop =
+        source.find("for (int expert_id : experts_to_copy)", allocation_ns);
+    ASSERT_NE(copy_loop, std::string::npos);
+    const size_t publish_stats =
+        source.find("PerfStatsCollector::Tags tags", copy_loop);
+    ASSERT_NE(publish_stats, std::string::npos);
+    const std::string copy_block =
+        source.substr(copy_loop, publish_stats - copy_loop);
+    EXPECT_EQ(copy_block.find("vnni_info_for(grp, expert_id"), std::string::npos)
+        << "async transfer-slot enqueue must use source descriptor metadata";
+    EXPECT_EQ(copy_block.find("grp.dst_views[expert_id]->rows()"), std::string::npos)
+        << "async transfer-slot enqueue must not dereference absent destination views";
 }

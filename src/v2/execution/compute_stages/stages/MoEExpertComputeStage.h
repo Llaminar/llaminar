@@ -26,6 +26,7 @@
 #include "../../moe/MoERuntimeTable.h"
 
 #include <memory>
+#include <stdexcept>
 #include <vector>
 
 namespace llaminar2
@@ -100,6 +101,10 @@ namespace llaminar2
 
             /// This rank's participant ID (for per-token replica dispatch).
             int my_socket_id = 0;
+
+            /// Number of participants in the routed expert domain. Zero means
+            /// infer from replica metadata for legacy single-device paths.
+            int participant_count = 0;
 
             // Per-expert 2D tensor views — used by GPU path
             // Each vector has num_experts entries; each entry is a 2D view
@@ -189,6 +194,15 @@ namespace llaminar2
             // layer; stages only cache the per-layer device pointer.
             IMoERuntimeTable *moe_runtime_table = nullptr;
 
+            /*
+             * Runtime decode always consumes runtime top-k ids/weights. This
+             * flag controls where the expert weight descriptors come from:
+             * false keeps static/off decode on the fast immutable descriptor
+             * tables; true makes graph replay observe mutable runtime placement
+             * descriptors after device-side rebalance applies ownership changes.
+             */
+            bool runtime_decode_uses_mutable_descriptors = false;
+
             // Phase C: Cached slab refs for store-based resolution and rebalance
             std::optional<ExpertSlabRef> gate_slab_ref;
             std::optional<ExpertSlabRef> up_slab_ref;
@@ -205,6 +219,25 @@ namespace llaminar2
 
         /// Layer index this stage belongs to (-1 if unset).
         int layerIndex() const { return params_.layer_idx; }
+
+        /// True for the graph-stable GPU decode path whose placement is
+        /// published by mutating persistent runtime descriptor tables.
+        bool usesGraphStableRuntimeDecodePlacement() const;
+
+        /// True for fixed-topology GPU prefill graphs whose placement can be
+        /// published by mutating descriptor tables and the persistent group mask.
+        bool usesGraphStableFixedTopologyPrefillPlacement() const;
+
+        /// True when this stage can consume dynamic MoE placement without a
+        /// graph recapture.
+        bool usesGraphStableMoEPlacement() const;
+
+        MoEDecodeDescriptorSource runtimeDecodeDescriptorSourceForTesting() const
+        {
+            return params_.runtime_decode_uses_mutable_descriptors
+                       ? MoEDecodeDescriptorSource::RuntimePlacementTable
+                       : MoEDecodeDescriptorSource::StaticDescriptorTable;
+        }
 
         /// Test-only visibility for replica metadata stamped onto rebuilt graphs.
         int replicaCountForTesting() const { return params_.replica_set.num_replicated; }
@@ -233,16 +266,14 @@ namespace llaminar2
                 params_.replica_set.buildPrefillMask(socket_id, params_.expert_mask, params_.layer_idx);
             else
                 params_.replica_set.prefill_mask.clear();
-            grouped_gateup_desc_table_id_ = -1;
-            grouped_gateup_desc_table_num_experts_ = 0;
-            grouped_gateup_desc_table_d_model_ = 0;
-            grouped_gateup_desc_table_intermediate_ = 0;
-            grouped_down_desc_table_id_ = -1;
-            grouped_down_desc_table_num_experts_ = 0;
-            grouped_down_desc_table_d_model_ = 0;
-            grouped_down_desc_table_intermediate_ = 0;
+            grouped_gateup_desc_table_dirty_ = true;
+            grouped_down_desc_table_dirty_ = true;
             moe_runtime_table_initialized_ = false;
-            runtime_grouped_decode_warmed_ = false;
+            if (!refreshGraphStablePlacement(/*preserve_capture_ready=*/true))
+            {
+                throw std::runtime_error(
+                    "MoE expert replica publication failed to refresh graph-stable runtime tables");
+            }
         }
 
         /// Detach and serialize packed weights for a departing expert.
@@ -528,6 +559,9 @@ namespace llaminar2
         void addPendingGpuDirectTransfer(GpuDirectTransferCompletion completion);
         void addPendingGpuDirectTransfersFromStore(const std::vector<int> &expert_ids);
         bool waitForPendingGpuDirectTransfers();
+        bool refreshGraphStablePlacement(bool preserve_capture_ready);
+        bool refreshRuntimeGroupedDecodePlacement(bool preserve_capture_ready);
+        bool refreshFixedTopologyGroupedPrefillPlacement();
         bool ensureGroupedGateUpDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureGroupedDownDescriptorTable(IMoEKernel *kernel, int d_model, int intermediate);
         bool ensureCombinedSharedVerifierResources(IMoEKernel *kernel, int d_model, int intermediate);
@@ -573,11 +607,13 @@ namespace llaminar2
         mutable int grouped_gateup_desc_table_num_experts_ = 0;
         mutable int grouped_gateup_desc_table_d_model_ = 0;
         mutable int grouped_gateup_desc_table_intermediate_ = 0;
+        bool grouped_gateup_desc_table_dirty_ = false;
 
         mutable int grouped_down_desc_table_id_ = -1;
         mutable int grouped_down_desc_table_num_experts_ = 0;
         mutable int grouped_down_desc_table_d_model_ = 0;
         mutable int grouped_down_desc_table_intermediate_ = 0;
+        bool grouped_down_desc_table_dirty_ = false;
 
         mutable int combined_shared_desc_table_d_model_ = 0;
         mutable int combined_shared_desc_table_intermediate_ = 0;
@@ -653,6 +689,7 @@ namespace llaminar2
         bool supportsBackend(ComputeBackendType backend) const override;
         bool isGraphCapturable() const override;
         bool supportsWarmupDependentGraphCapture() const override;
+        std::string graphCaptureReadinessDebugString() const override;
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         /**

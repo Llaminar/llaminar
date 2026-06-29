@@ -192,6 +192,14 @@ namespace llaminar2
                                      CollectiveDataType dtype, CollectiveOp op,
                                      const std::vector<void *> &streams);
 
+        bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams);
+
         /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
@@ -259,6 +267,19 @@ namespace llaminar2
                                            int device_idx,
                                            void *stream);
 
+        bool broadcastSingleDeviceOnStream(const void *send_buf,
+                                           void *recv_buf,
+                                           size_t count,
+                                           CollectiveDataType dtype,
+                                           int root,
+                                           int device_idx,
+                                           void *stream);
+
+        bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream);
+
         /**
          * @brief Allgather across local GPUs on explicit producer streams.
          *
@@ -270,6 +291,13 @@ namespace llaminar2
                                      const std::vector<void *> &recv_buffers,
                                      size_t send_count,
                                      CollectiveDataType dtype,
+                                     const std::vector<void *> &streams);
+
+        bool broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                     const std::vector<void *> &recv_buffers,
+                                     size_t count,
+                                     CollectiveDataType dtype,
+                                     int root,
                                      const std::vector<void *> &streams);
 
         /**

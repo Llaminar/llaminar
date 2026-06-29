@@ -48,6 +48,7 @@
 #include "stages/MoELocalExpertStage.h"
 #include "stages/MoESparseDispatchStage.h"
 #include "stages/MoESparseReturnReduceStage.h"
+#include "stages/MoEDeviceRebalanceStage.h"
 
 // Qwen 3.5 FA stages
 #include "stages/QGateSplitStage.h"

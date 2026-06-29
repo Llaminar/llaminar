@@ -2011,9 +2011,24 @@ namespace llaminar2
                 if (node->stage->supportsWarmupDependentGraphCapture() &&
                     !node->stage->isGraphCapturable())
                 {
+                    const std::string readiness =
+                        node->stage->graphCaptureReadinessDebugString();
                     LOG_WARN("[DeviceGraphCaptureController] Warmup-dependent stage '"
                              << stage_name
-                             << "' is not graph-capturable after warmup; executing this Phase-2 pass without capture");
+                             << "' is not graph-capturable after warmup"
+                             << (readiness.empty() ? "" : "; ")
+                             << readiness
+                             << "; executing this Phase-2 pass without capture");
+                    PerfStatsCollector::addCounter(
+                        "forward_graph",
+                        "warmup_dependent_capture_not_ready",
+                        1.0,
+                        "decode",
+                        ctx ? ctx->deviceId().toString() : std::string{},
+                        {{"stage", stage_name},
+                         {"stage_type", computeStageTypeName(node->stage->type())},
+                         {"context", segment_cache.perf_context},
+                         {"readiness", readiness.empty() ? std::string("unspecified") : readiness}});
                     capture_abandoned = true;
                     break;
                 }

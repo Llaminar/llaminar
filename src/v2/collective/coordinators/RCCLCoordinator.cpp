@@ -1054,6 +1054,226 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::allreduceWithSidebandsMultiOnStreams(
+        const std::vector<void *> &buffers,
+        size_t count,
+        CollectiveDataType dtype,
+        CollectiveOp op,
+        const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+        const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!buffers[i])
+            {
+                last_error_ = "Null anchor allreduce buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null grouped bundle stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        for (size_t sideband_idx = 0; sideband_idx < sidebands.size(); ++sideband_idx)
+        {
+            const auto &sideband = sidebands[sideband_idx];
+            if (sideband.count == 0)
+            {
+                last_error_ = "Zero-count grouped sideband " + std::to_string(sideband_idx);
+                return false;
+            }
+            if (sideband.kind == CollectiveSidebandOp::Broadcast &&
+                (sideband.root < 0 || sideband.root >= num_devices_))
+            {
+                last_error_ = "Invalid grouped sideband broadcast root " +
+                              std::to_string(sideband.root);
+                return false;
+            }
+            if (sideband.recv_buffers.size() != static_cast<size_t>(num_devices_))
+            {
+                last_error_ = "Grouped sideband recv buffer count mismatch at index " +
+                              std::to_string(sideband_idx);
+                return false;
+            }
+            if ((sideband.kind == CollectiveSidebandOp::Allgather ||
+                 sideband.kind == CollectiveSidebandOp::Broadcast) &&
+                sideband.send_buffers.size() != static_cast<size_t>(num_devices_))
+            {
+                last_error_ = "Grouped sideband send buffer count mismatch at index " +
+                              std::to_string(sideband_idx);
+                return false;
+            }
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                if (!sideband.recv_buffers[static_cast<size_t>(i)])
+                {
+                    last_error_ = "Null grouped sideband recv buffer at sideband " +
+                                  std::to_string(sideband_idx) + " device " + std::to_string(i);
+                    return false;
+                }
+                if ((sideband.kind == CollectiveSidebandOp::Allgather ||
+                     sideband.kind == CollectiveSidebandOp::Broadcast) &&
+                    !sideband.send_buffers[static_cast<size_t>(i)])
+                {
+                    last_error_ = "Null grouped sideband send buffer at sideband " +
+                                  std::to_string(sideband_idx) + " device " + std::to_string(i);
+                    return false;
+                }
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_BUNDLE] thread=" << thread_hash
+                                                                    << " slot=" << i
+                                                                    << " target_device=" << device_ordinals_[i]
+                                                                    << " current_device=" << current_device
+                                                                    << " stream=" << streams[i]
+                                                                    << " buffer=" << buffers[i]
+                                                                    << " count=" << count
+                                                                    << " sidebands=" << sidebands.size());
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclAllReduce(
+                buffers[i], buffers[i], count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)), toRcclRedOpInt(toOpInt(op)),
+                comm, stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclAllReduce(grouped bundle anchor) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        for (size_t sideband_idx = 0; sideband_idx < sidebands.size(); ++sideband_idx)
+        {
+            const auto &sideband = sidebands[sideband_idx];
+            for (int i = 0; i < num_devices_; ++i)
+            {
+                hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+                if (err != hipSuccess)
+                {
+                    last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+
+                rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+                hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+                const auto rccl_dtype = toRcclDataTypeInt(toDataTypeInt(sideband.dtype));
+                switch (sideband.kind)
+                {
+                case CollectiveSidebandOp::AllreduceSum:
+                    r = rccl::ncclAllReduce(
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        rccl_dtype,
+                        rccl::ncclSum,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Allgather:
+                    r = rccl::ncclAllGather(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        rccl_dtype,
+                        comm,
+                        stream);
+                    break;
+                case CollectiveSidebandOp::Broadcast:
+                    r = rccl::ncclBroadcast(
+                        sideband.send_buffers[static_cast<size_t>(i)],
+                        sideband.recv_buffers[static_cast<size_t>(i)],
+                        sideband.count,
+                        rccl_dtype,
+                        sideband.root,
+                        comm,
+                        stream);
+                    break;
+                }
+
+                if (r != rccl::ncclSuccess)
+                {
+                    last_error_ = std::string("RCCL grouped sideband failed at sideband ") +
+                                  std::to_string(sideband_idx) + " device " +
+                                  std::to_string(device_ordinals_[i]) + ": " +
+                                  rccl::ncclGetErrorString(r);
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)buffers;
+        (void)count;
+        (void)dtype;
+        (void)op;
+        (void)sidebands;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allreduceSingleDeviceAsync(void *buffer, size_t count,
                                                      CollectiveDataType dtype, CollectiveOp op,
                                                      int device_idx)
@@ -1345,6 +1565,237 @@ namespace llaminar2
 #endif
     }
 
+    bool RCCLCoordinator::broadcastSingleDeviceOnStream(const void *send_buf,
+                                                        void *recv_buf,
+                                                        size_t count,
+                                                        CollectiveDataType dtype,
+                                                        int root,
+                                                        int device_idx,
+                                                        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid broadcast root " + std::to_string(root) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+
+        if (!send_buf || !recv_buf)
+        {
+            last_error_ = "Null broadcast buffer for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        if (!stream)
+        {
+            last_error_ = "Null stream for device " + std::to_string(device_idx);
+            return false;
+        }
+
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_broadcast = -1;
+        if (tl_last_hip_device_for_broadcast != ordinal)
+        {
+            hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_broadcast = ordinal;
+        }
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_broadcast_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " send_buf=" << send_buf
+                     << " recv_buf=" << recv_buf
+                     << " count=" << count
+                     << " dtype=" << static_cast<int>(dtype)
+                     << " root=" << root
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
+
+        rccl::ncclResult_t r = rccl::ncclBroadcast(
+            send_buf,
+            recv_buf,
+            count,
+            toRcclDataTypeInt(toDataTypeInt(dtype)),
+            root,
+            comm,
+            caller_stream);
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclBroadcast(on-stream) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buf;
+        (void)recv_buf;
+        (void)count;
+        (void)dtype;
+        (void)root;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::groupedP2PSingleDeviceOnStream(
+        const std::vector<CollectiveP2POp> &ops,
+        int device_idx,
+        void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+        if (device_idx < 0 || device_idx >= num_devices_)
+        {
+            last_error_ = "Invalid device_idx " + std::to_string(device_idx) +
+                          " (num_devices=" + std::to_string(num_devices_) + ")";
+            return false;
+        }
+        if (!stream)
+        {
+            last_error_ = "Null stream for grouped P2P device " + std::to_string(device_idx);
+            return false;
+        }
+        if (ops.empty())
+            return true;
+
+        const int ordinal = device_ordinals_[device_idx];
+        rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[device_idx]);
+        hipStream_t caller_stream = static_cast<hipStream_t>(stream);
+
+        static thread_local int tl_last_hip_device_for_grouped_p2p = -1;
+        if (tl_last_hip_device_for_grouped_p2p != ordinal)
+        {
+            hipError_t err = trackedHipSetDevice(ordinal);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                return false;
+            }
+            tl_last_hip_device_for_grouped_p2p = ordinal;
+        }
+
+        if (debugEnv().tp_collective_contract_trace)
+        {
+            LOG_DEBUG("[TP_COLLECTIVE_CONTRACT] event=rccl_grouped_p2p_onstream_launch"
+                     << " coordinator=" << static_cast<const void *>(this)
+                     << " slot=" << device_idx
+                     << " ordinal=" << ordinal
+                     << " ops=" << ops.size()
+                     << " stream=" << stream
+                     << " comm=" << comm);
+        }
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart(grouped P2P) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (const auto &op : ops)
+        {
+            if (op.peer < 0 || op.peer >= num_devices_ || op.peer == device_idx)
+            {
+                last_error_ = "Invalid grouped P2P peer " + std::to_string(op.peer) +
+                              " for device " + std::to_string(device_idx);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+            const auto dtype_int = toRcclDataTypeInt(toDataTypeInt(op.dtype));
+            if (op.kind == CollectiveP2POpKind::Send)
+            {
+                if (!op.send_buffer || op.count == 0)
+                {
+                    last_error_ = "Invalid grouped P2P send buffer/count";
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+                r = rccl::ncclSend(
+                    op.send_buffer,
+                    op.count,
+                    dtype_int,
+                    op.peer,
+                    comm,
+                    caller_stream);
+            }
+            else
+            {
+                if (!op.recv_buffer || op.count == 0)
+                {
+                    last_error_ = "Invalid grouped P2P recv buffer/count";
+                    rccl::ncclGroupEnd();
+                    return false;
+                }
+                r = rccl::ncclRecv(
+                    op.recv_buffer,
+                    op.count,
+                    dtype_int,
+                    op.peer,
+                    comm,
+                    caller_stream);
+            }
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rccl grouped P2P op failed: ") +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd(grouped P2P) failed: ") +
+                          rccl::ncclGetErrorString(r);
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)ops;
+        (void)device_idx;
+        (void)stream;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
     bool RCCLCoordinator::allgatherMultiOnStreams(const std::vector<const void *> &send_buffers,
                                                   const std::vector<void *> &recv_buffers,
                                                   size_t send_count,
@@ -1451,6 +1902,128 @@ namespace llaminar2
         (void)recv_buffers;
         (void)send_count;
         (void)dtype;
+        (void)streams;
+        last_error_ = "RCCL not available";
+        return false;
+#endif
+    }
+
+    bool RCCLCoordinator::broadcastMultiOnStreams(const std::vector<const void *> &send_buffers,
+                                                  const std::vector<void *> &recv_buffers,
+                                                  size_t count,
+                                                  CollectiveDataType dtype,
+                                                  int root,
+                                                  const std::vector<void *> &streams)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load())
+        {
+            last_error_ = "RCCLCoordinator not initialized";
+            return false;
+        }
+
+        if (root < 0 || root >= num_devices_)
+        {
+            last_error_ = "Invalid broadcast root " + std::to_string(root);
+            return false;
+        }
+
+        if (send_buffers.size() != static_cast<size_t>(num_devices_) ||
+            recv_buffers.size() != static_cast<size_t>(num_devices_) ||
+            streams.size() != static_cast<size_t>(num_devices_))
+        {
+            last_error_ = "Buffer/stream count does not match device count";
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            if (!send_buffers[i] || !recv_buffers[i])
+            {
+                last_error_ = "Null broadcast buffer for device " + std::to_string(i);
+                return false;
+            }
+            if (!streams[i])
+            {
+                last_error_ = "Null broadcast stream for device " + std::to_string(i);
+                return false;
+            }
+        }
+
+        const bool trace_device_state = debugEnv().validation.validate_gpu_ptrs;
+        const size_t thread_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+        std::lock_guard<std::mutex> lock(direct_exec_mutex_);
+
+        rccl::ncclResult_t r = rccl::ncclGroupStart();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupStart failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        for (int i = 0; i < num_devices_; ++i)
+        {
+            hipError_t err = trackedHipSetDevice(device_ordinals_[i]);
+            if (err != hipSuccess)
+            {
+                last_error_ = std::string("hipSetDevice failed: ") + hipGetErrorString(err);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+
+            if (trace_device_state)
+            {
+                int current_device = -1;
+                hipError_t get_device = hipGetDevice(&current_device);
+                if (get_device == hipSuccess)
+                {
+                    LOG_DEBUG("[RCCL_STREAM_GROUP_BROADCAST] thread=" << thread_hash
+                                                                       << " slot=" << i
+                                                                       << " target_device=" << device_ordinals_[i]
+                                                                       << " current_device=" << current_device
+                                                                       << " stream=" << streams[i]
+                                                                       << " send=" << send_buffers[i]
+                                                                       << " recv=" << recv_buffers[i]
+                                                                       << " count=" << count
+                                                                       << " root=" << root);
+                }
+            }
+
+            rccl::ncclComm_t comm = static_cast<rccl::ncclComm_t>(comms_[i]);
+            hipStream_t stream = static_cast<hipStream_t>(streams[i]);
+            r = rccl::ncclBroadcast(
+                send_buffers[i],
+                recv_buffers[i],
+                count,
+                toRcclDataTypeInt(toDataTypeInt(dtype)),
+                root,
+                comm,
+                stream);
+            if (r != rccl::ncclSuccess)
+            {
+                last_error_ = std::string("rcclBroadcast(on-stream group) failed for device ") +
+                              std::to_string(device_ordinals_[i]) + ": " +
+                              rccl::ncclGetErrorString(r);
+                rccl::ncclGroupEnd();
+                return false;
+            }
+        }
+
+        r = rccl::ncclGroupEnd();
+        if (r != rccl::ncclSuccess)
+        {
+            last_error_ = std::string("rcclGroupEnd failed: ") + rccl::ncclGetErrorString(r);
+            return false;
+        }
+
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send_buffers;
+        (void)recv_buffers;
+        (void)count;
+        (void)dtype;
+        (void)root;
         (void)streams;
         last_error_ = "RCCL not available";
         return false;

@@ -63,6 +63,47 @@ namespace llaminar2
         INT8
     };
 
+    enum class CollectiveP2POpKind
+    {
+        Send,
+        Recv
+    };
+
+    struct CollectiveP2POp
+    {
+        CollectiveP2POpKind kind = CollectiveP2POpKind::Send;
+        const void *send_buffer = nullptr;
+        void *recv_buffer = nullptr;
+        size_t count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT8;
+        int peer = -1;
+    };
+
+    /**
+     * @brief Sideband collective operation inside a grouped backend bundle.
+     *
+     * These descriptors are backend-facing. Higher layers keep semantic names
+     * such as LocalTPCollectiveSidebandKind, then lower them to this compact
+     * representation when the sideband can be grouped with its anchor
+     * collective.
+     */
+    enum class CollectiveSidebandOp
+    {
+        AllreduceSum,
+        Allgather,
+        Broadcast
+    };
+
+    struct CollectiveSidebandMultiOnStreamsOp
+    {
+        CollectiveSidebandOp kind = CollectiveSidebandOp::AllreduceSum;
+        std::vector<const void *> send_buffers;
+        std::vector<void *> recv_buffers;
+        size_t count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT32;
+        int root = 0;
+    };
+
     /**
      * @brief Convert string to CollectiveBackendType
      *
@@ -721,6 +762,37 @@ namespace llaminar2
         virtual bool supportsAllreduceMultiOnStreams() const { return false; }
 
         /**
+         * @brief Group one anchor allreduce and compact sideband collectives.
+         *
+         * Implementations must enqueue the anchor allreduce and every sideband
+         * descriptor inside one backend group region over the supplied streams.
+         * This is the required path for MoE rebalance control traffic that is
+         * intended to ride an existing LocalTP allreduce, rather than launch
+         * separate rebalance-specific collectives.
+         */
+        virtual bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams)
+        {
+            (void)buffers;
+            (void)count;
+            (void)dtype;
+            (void)op;
+            (void)sidebands;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether grouped anchor+sideband bundles are available.
+         */
+        virtual bool supportsAllreduceWithSidebandsMultiOnStreams() const { return false; }
+
+        /**
          * @brief Per-device non-blocking allreduce (barrier-free)
          *
          * Called independently by each device thread. RCCL/NCCL internally
@@ -783,6 +855,11 @@ namespace llaminar2
         }
 
         /**
+         * @brief Whether participant-local on-stream allreduce is available.
+         */
+        virtual bool supportsAllreduceSingleDeviceOnStream() const { return false; }
+
+        /**
          * @brief Per-device all-gather on a caller-provided stream (graph-capturable)
          *
          * Like allreduceSingleDeviceOnStream(), this records the collective
@@ -823,6 +900,72 @@ namespace llaminar2
         virtual bool supportsAllgatherSingleDeviceOnStream() const { return false; }
 
         /**
+         * @brief Per-device broadcast on a caller-provided stream (graph-capturable).
+         *
+         * Each participant calls independently with its own send/recv buffers.
+         * The root participant provides the source bytes in send_buf; non-root
+         * participants may pass recv_buf for send_buf because NCCL/RCCL ignore
+         * non-root send buffers. The result is written to recv_buf on every
+         * participant. No host-side synchronization is performed.
+         *
+         * @param send_buf Source buffer on root, ignored on non-root.
+         * @param recv_buf Receive buffer on every participant.
+         * @param count Elements to broadcast.
+         * @param dtype Element type.
+         * @param root Root participant index.
+         * @param device_idx Device index (0 to num_gpus-1).
+         * @param stream GPU stream (cudaStream_t/hipStream_t cast to void*).
+         * @return true on success, false if unsupported.
+         */
+        virtual bool broadcastSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            int device_idx,
+            void *stream)
+        {
+            (void)send_buf;
+            (void)recv_buf;
+            (void)count;
+            (void)dtype;
+            (void)root;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Whether broadcastSingleDeviceOnStream is implemented.
+         */
+        virtual bool supportsBroadcastSingleDeviceOnStream() const { return false; }
+
+        /**
+         * @brief Per-device grouped P2P send/recv on a caller-provided stream.
+         *
+         * Each participant records the send and recv operations that involve
+         * its device. Matching peer participants record the complementary
+         * operations in their own per-device graph. NCCL/RCCL choose the
+         * transport path; callers must not special-case peer copies here.
+         */
+        virtual bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream)
+        {
+            (void)ops;
+            (void)device_idx;
+            (void)stream;
+            return false;
+        }
+
+        /**
+         * @brief Whether groupedP2PSingleDeviceOnStream is implemented.
+         */
+        virtual bool supportsGroupedP2PSingleDeviceOnStream() const { return false; }
+
+        /**
          * @brief Multi-GPU AllGather on caller-provided producer streams.
          *
          * Enqueues one grouped backend collective over streams[i], where
@@ -853,6 +996,34 @@ namespace llaminar2
          * @brief Whether allgatherMultiOnStreams is available.
          */
         virtual bool supportsAllgatherMultiOnStreams() const { return false; }
+
+        /**
+         * @brief Multi-GPU Broadcast on caller-provided producer streams.
+         *
+         * Enqueues one grouped backend broadcast over streams[i]. This is the
+         * eager counterpart to broadcastSingleDeviceOnStream().
+         */
+        virtual bool broadcastMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            const std::vector<void *> &streams)
+        {
+            (void)send_bufs;
+            (void)recv_bufs;
+            (void)count;
+            (void)dtype;
+            (void)root;
+            (void)streams;
+            return false;
+        }
+
+        /**
+         * @brief Whether broadcastMultiOnStreams is available.
+         */
+        virtual bool supportsBroadcastMultiOnStreams() const { return false; }
 
         /**
          * @brief Multi-GPU AllGather (single process)

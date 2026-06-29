@@ -243,6 +243,15 @@ namespace llaminar2
             const std::vector<void *> &streams) override;
         bool supportsAllreduceMultiOnStreams() const override;
 
+        bool allreduceWithSidebandsMultiOnStreams(
+            const std::vector<void *> &buffers,
+            size_t count,
+            CollectiveDataType dtype,
+            CollectiveOp op,
+            const std::vector<CollectiveSidebandMultiOnStreamsOp> &sidebands,
+            const std::vector<void *> &streams) override;
+        bool supportsAllreduceWithSidebandsMultiOnStreams() const override;
+
         bool allreduceSingleDeviceAsync(
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
@@ -252,6 +261,7 @@ namespace llaminar2
             void *buffer, size_t count,
             CollectiveDataType dtype, CollectiveOp op,
             int device_idx, void *stream) override;
+        bool supportsAllreduceSingleDeviceOnStream() const override;
 
         bool allgatherSingleDeviceOnStream(
             const void *send_buf,
@@ -262,6 +272,22 @@ namespace llaminar2
             void *stream) override;
         bool supportsAllgatherSingleDeviceOnStream() const override;
 
+        bool broadcastSingleDeviceOnStream(
+            const void *send_buf,
+            void *recv_buf,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            int device_idx,
+            void *stream) override;
+        bool supportsBroadcastSingleDeviceOnStream() const override;
+
+        bool groupedP2PSingleDeviceOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_idx,
+            void *stream) override;
+        bool supportsGroupedP2PSingleDeviceOnStream() const override;
+
         bool allgatherMultiOnStreams(
             const std::vector<const void *> &send_bufs,
             const std::vector<void *> &recv_bufs,
@@ -269,6 +295,15 @@ namespace llaminar2
             CollectiveDataType dtype,
             const std::vector<void *> &streams) override;
         bool supportsAllgatherMultiOnStreams() const override;
+
+        bool broadcastMultiOnStreams(
+            const std::vector<const void *> &send_bufs,
+            const std::vector<void *> &recv_bufs,
+            size_t count,
+            CollectiveDataType dtype,
+            int root,
+            const std::vector<void *> &streams) override;
+        bool supportsBroadcastMultiOnStreams() const override;
 
         /// Multi-GPU AllGather (each GPU sends from send_bufs, receives to recv_bufs)
         bool allgatherMulti(

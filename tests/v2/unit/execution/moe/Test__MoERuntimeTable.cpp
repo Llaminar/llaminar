@@ -4,6 +4,7 @@
  */
 
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/DeviceMoERebalanceController.h"
 #include "execution/moe/DecodeExpertHistogram.h"
 
 #include <gtest/gtest.h>
@@ -52,6 +53,15 @@ namespace llaminar2::test
             return desc;
         }
 
+        DeviceMoEExpertDescriptor expertOwnerOnlyDesc(int expert_id, int owner)
+        {
+            DeviceMoEExpertDescriptor desc;
+            desc.logical_expert_id = expert_id;
+            desc.owner_participant = owner;
+            desc.local_slot = -1;
+            return desc;
+        }
+
         MoEPlacementUpdate updateForEpoch(uint32_t epoch, int expert_count)
         {
             MoEPlacementUpdate update;
@@ -70,6 +80,45 @@ namespace llaminar2::test
                                                                        : DeviceMoEReplicaRole::Replica));
             }
             return update;
+        }
+
+        DeviceMoERebalanceConfig rebalanceConfig(
+            uint32_t layers,
+            uint32_t experts,
+            uint32_t top_k,
+            uint32_t participant,
+            uint32_t participants,
+            uint32_t window_tokens,
+            uint32_t max_hot_replicas,
+            uint32_t root_participant = 0)
+        {
+            DeviceMoERebalanceConfig config;
+            config.num_layers = layers;
+            config.num_experts = experts;
+            config.top_k = top_k;
+            config.participant_id = participant;
+            config.participant_count = participants;
+            config.root_participant = root_participant;
+            config.window_size_tokens = window_tokens;
+            config.max_hot_replicas_per_participant = max_hot_replicas;
+            return config;
+        }
+
+        void addGatheredCount(std::vector<uint64_t> &histograms,
+                              const DeviceMoERebalanceConfig &config,
+                              uint32_t participant,
+                              uint32_t layer,
+                              uint32_t expert,
+                              uint64_t count)
+        {
+            const uint64_t participant_stride =
+                static_cast<uint64_t>(config.num_layers) *
+                static_cast<uint64_t>(config.num_experts);
+            const uint64_t idx =
+                static_cast<uint64_t>(participant) * participant_stride +
+                static_cast<uint64_t>(layer) * static_cast<uint64_t>(config.num_experts) +
+                static_cast<uint64_t>(expert);
+            histograms[static_cast<size_t>(idx)] += count;
         }
     } // namespace
 
@@ -95,6 +144,244 @@ namespace llaminar2::test
         EXPECT_EQ(layer0->active_epoch, 0u);
         EXPECT_EQ(layer0->participant_id, 0u);
         EXPECT_EQ(layer0->participant_count, 1u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceConfigValidatesExplicitRootParticipant)
+    {
+        auto config = rebalanceConfig(/*layers=*/2,
+                                      /*experts=*/4,
+                                      /*top_k=*/2,
+                                      /*participant=*/1,
+                                      /*participants=*/3,
+                                      /*window_tokens=*/8,
+                                      /*max_hot_replicas=*/1,
+                                      /*root_participant=*/2);
+
+        EXPECT_TRUE(validateDeviceMoERebalanceConfig(config));
+        EXPECT_FALSE(deviceMoEIsRootParticipant(config));
+        config.participant_id = 2;
+        EXPECT_TRUE(deviceMoEIsRootParticipant(config));
+
+        config.root_participant = 3;
+        EXPECT_FALSE(validateDeviceMoERebalanceConfig(config))
+            << "root participant must be inside the homogeneous rebalance domain.";
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePayloadEdgeMaskUsesStableDirectedStride)
+    {
+        using llaminar2::moe_rebalance_policy::directedParticipantEdgeBit;
+
+        EXPECT_EQ(directedParticipantEdgeBit(0, 1, 8), 1ULL << 1u);
+        EXPECT_EQ(directedParticipantEdgeBit(1, 0, 8), 1ULL << 8u);
+        EXPECT_EQ(directedParticipantEdgeBit(3, 4, 8), 1ULL << 28u);
+        EXPECT_EQ(directedParticipantEdgeBit(7, 7, 8), 1ULL << 63u);
+        EXPECT_EQ(directedParticipantEdgeBit(8, 0, 8), 0ULL);
+        EXPECT_EQ(directedParticipantEdgeBit(0, 8, 8), 0ULL);
+        EXPECT_EQ(directedParticipantEdgeBit(0, 0, 0), 0ULL);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceTransferCostEstimateAccountsFixedPayloadCapacity)
+    {
+        auto config = rebalanceConfig(/*layers=*/4,
+                                      /*experts=*/8,
+                                      /*top_k=*/2,
+                                      /*participant=*/0,
+                                      /*participants=*/2,
+                                      /*window_tokens=*/8,
+                                      /*max_hot_replicas=*/3);
+
+        constexpr uint32_t kLocalTransferSlots = 5;
+        constexpr uint64_t kSlotBytes = 1024;
+        constexpr uint32_t kCopiedArrivals = 2;
+
+        EXPECT_FALSE(deviceMoERebalanceModeMovesFixedPayloadCapacity(
+            DeviceMoERebalanceTransferMode::ResidentOnly));
+        EXPECT_FALSE(deviceMoERebalanceModeMovesFixedPayloadCapacity(
+            DeviceMoERebalanceTransferMode::CompactTransferSlots));
+        EXPECT_TRUE(deviceMoERebalanceModeUsesCollectivePayloadLane(
+            DeviceMoERebalanceTransferMode::CompactTransferSlots));
+        EXPECT_TRUE(deviceMoERebalanceModeUsesCollectivePayloadLane(
+            DeviceMoERebalanceTransferMode::CollectiveSidebandPayload));
+        EXPECT_TRUE(deviceMoERebalanceModeMovesFixedPayloadCapacity(
+            DeviceMoERebalanceTransferMode::CollectiveSidebandPayload));
+        EXPECT_TRUE(deviceMoERebalanceModeMovesFixedPayloadCapacity(
+            DeviceMoERebalanceTransferMode::LegacyCollectiveAllGather));
+        EXPECT_FALSE(deviceMoERebalanceModeUsesTransferSlots(
+            DeviceMoERebalanceTransferMode::ResidentOnly));
+        EXPECT_TRUE(deviceMoERebalanceModeUsesTransferSlots(
+            DeviceMoERebalanceTransferMode::CompactTransferSlots));
+        EXPECT_TRUE(deviceMoERebalanceModePlansMissingArrivals(
+            DeviceMoERebalanceTransferMode::CompactTransferSlots));
+
+        const auto estimate =
+            estimateDeviceMoERebalanceTransferCost(
+                config,
+                DeviceMoERebalanceTransferMode::CollectiveSidebandPayload,
+                kLocalTransferSlots,
+                kSlotBytes,
+                kCopiedArrivals);
+
+        EXPECT_EQ(estimate.command_buffer_count, 2u);
+        EXPECT_EQ(estimate.transfer_plan_capacity, 12u)
+            << "command metadata capacity must be independent from compact payload slots.";
+        EXPECT_EQ(estimate.payload_slot_capacity, 5u)
+            << "payload capacity is bounded by the rolling transfer slots.";
+        EXPECT_EQ(estimate.payload_slot_count, 10u);
+        EXPECT_EQ(estimate.slot_payload_bytes, kSlotBytes);
+        EXPECT_EQ(estimate.plan_local_bytes,
+                  2u * 12u * sizeof(DeviceMoERebalancePlanEntry));
+        EXPECT_EQ(estimate.plan_gathered_bytes,
+                  2u * estimate.plan_local_bytes);
+        EXPECT_EQ(estimate.header_local_bytes,
+                  2u * sizeof(DeviceMoERebalanceCommandBufferHeader));
+        EXPECT_EQ(estimate.header_gathered_bytes,
+                  2u * estimate.header_local_bytes);
+        EXPECT_EQ(estimate.source_descriptor_local_bytes, 0u);
+        EXPECT_EQ(estimate.source_descriptor_gathered_bytes, 0u);
+        EXPECT_EQ(estimate.selected_payload_bucket_slots, 5u);
+        EXPECT_EQ(estimate.selected_payload_slot_count, 10u);
+        EXPECT_EQ(estimate.selected_payload_local_capacity_bytes, 10u * kSlotBytes);
+        EXPECT_EQ(estimate.selected_payload_gathered_capacity_bytes, 20u * kSlotBytes);
+        EXPECT_EQ(estimate.payload_local_capacity_bytes, 10u * kSlotBytes);
+        EXPECT_EQ(estimate.payload_gathered_capacity_bytes, 20u * kSlotBytes);
+        EXPECT_EQ(estimate.captured_payload_slack_bytes, 0u);
+        EXPECT_EQ(estimate.useful_payload_bytes, kCopiedArrivals * kSlotBytes);
+        EXPECT_EQ(estimate.wasted_payload_capacity_bytes,
+                  estimate.payload_gathered_capacity_bytes - estimate.useful_payload_bytes);
+        EXPECT_EQ(deviceMoELoadSpread(/*min_load=*/3, /*max_load=*/10), 7u);
+
+        const auto resident_only =
+            estimateDeviceMoERebalanceTransferCost(
+                config,
+                DeviceMoERebalanceTransferMode::ResidentOnly,
+                kLocalTransferSlots,
+                kSlotBytes,
+                kCopiedArrivals);
+        EXPECT_EQ(resident_only.transfer_plan_capacity, 0u);
+        EXPECT_EQ(resident_only.selected_payload_bucket_slots, 0u);
+        EXPECT_EQ(resident_only.selected_payload_gathered_capacity_bytes, 0u);
+        EXPECT_EQ(resident_only.payload_gathered_capacity_bytes, 0u);
+        EXPECT_EQ(resident_only.useful_payload_bytes, 0u);
+        EXPECT_EQ(resident_only.wasted_payload_capacity_bytes, 0u);
+
+        const auto full_window_compact =
+            estimateDeviceMoERebalanceTransferCost(
+                config,
+                DeviceMoERebalanceTransferMode::CompactTransferSlots,
+                kLocalTransferSlots,
+                kSlotBytes,
+                kCopiedArrivals);
+        EXPECT_EQ(full_window_compact.transfer_plan_capacity, 48u)
+            << "Full-window compact root planning reserves participant^2 command headroom.";
+
+        auto wave_config = config;
+        wave_config.layer_wave_count = 1;
+        const auto compact =
+            estimateDeviceMoERebalanceTransferCost(
+                wave_config,
+                DeviceMoERebalanceTransferMode::CompactTransferSlots,
+                kLocalTransferSlots,
+                kSlotBytes,
+                kCopiedArrivals,
+                /*collective_payload_slot_capacity=*/1);
+        EXPECT_EQ(compact.command_buffer_count, 2u);
+        EXPECT_EQ(compact.transfer_plan_capacity, 12u)
+            << "Production one-layer waves keep compact command metadata bounded.";
+        EXPECT_EQ(compact.payload_slot_capacity, 1u);
+        EXPECT_EQ(compact.plan_local_bytes,
+                  2u * 12u * sizeof(DeviceMoERebalancePlanEntry));
+        EXPECT_EQ(compact.header_local_bytes,
+                  2u * sizeof(DeviceMoERebalanceCommandBufferHeader));
+        EXPECT_EQ(compact.source_descriptor_local_bytes,
+                  2u * 2u * 12u * sizeof(DeviceMoEExpertDirectoryEntry));
+        EXPECT_EQ(compact.source_descriptor_gathered_bytes, 0u);
+        EXPECT_EQ(compact.selected_payload_bucket_slots, 1u);
+        EXPECT_EQ(compact.selected_payload_slot_count, 1u);
+        EXPECT_EQ(compact.selected_payload_local_capacity_bytes, kSlotBytes);
+        EXPECT_EQ(compact.selected_payload_gathered_capacity_bytes, 2u * kSlotBytes);
+        EXPECT_EQ(compact.payload_slot_count, 1u);
+        EXPECT_EQ(compact.payload_local_capacity_bytes, kSlotBytes);
+        EXPECT_EQ(compact.payload_gathered_capacity_bytes, 2u * kSlotBytes);
+        EXPECT_EQ(compact.captured_payload_slack_bytes, 0u);
+        EXPECT_EQ(compact.useful_payload_bytes, kCopiedArrivals * kSlotBytes);
+        EXPECT_EQ(compact.wasted_payload_capacity_bytes,
+                  compact.payload_gathered_capacity_bytes - compact.useful_payload_bytes);
+
+        const auto captured_wider_than_selected =
+            estimateDeviceMoERebalanceTransferCost(
+                wave_config,
+                DeviceMoERebalanceTransferMode::CompactTransferSlots,
+                kLocalTransferSlots,
+                kSlotBytes,
+                kCopiedArrivals,
+                /*collective_payload_slot_capacity=*/4,
+                /*selected_payload_bucket_slots=*/1);
+        EXPECT_EQ(captured_wider_than_selected.payload_slot_capacity, 4u);
+        EXPECT_EQ(captured_wider_than_selected.payload_slot_count, 4u);
+        EXPECT_EQ(captured_wider_than_selected.payload_gathered_capacity_bytes,
+                  8u * kSlotBytes);
+        EXPECT_EQ(captured_wider_than_selected.selected_payload_bucket_slots, 1u);
+        EXPECT_EQ(captured_wider_than_selected.selected_payload_slot_count, 1u);
+        EXPECT_EQ(captured_wider_than_selected.selected_payload_gathered_capacity_bytes,
+                  2u * kSlotBytes);
+        EXPECT_EQ(captured_wider_than_selected.captured_payload_slack_bytes,
+                  6u * kSlotBytes)
+            << "Perf accounting must expose captured bucket slack separately from useful selected payload.";
+        EXPECT_EQ(captured_wider_than_selected.wasted_payload_capacity_bytes, 0u)
+            << "Wasted payload capacity is charged to the selected bucket, not the full captured variant.";
+
+        const auto no_payload_bucket =
+            estimateDeviceMoERebalanceTransferCost(
+                wave_config,
+                DeviceMoERebalanceTransferMode::CompactTransferSlots,
+                kLocalTransferSlots,
+                kSlotBytes,
+                /*copied_arrivals=*/0,
+                /*collective_payload_slot_capacity=*/4,
+                /*selected_payload_bucket_slots=*/0);
+        EXPECT_EQ(no_payload_bucket.payload_slot_capacity, 4u);
+        EXPECT_EQ(no_payload_bucket.payload_gathered_capacity_bytes,
+                  8u * kSlotBytes)
+            << "Capacity telemetry still exposes the graph variant size.";
+        EXPECT_EQ(no_payload_bucket.selected_payload_bucket_slots, 0u);
+        EXPECT_EQ(no_payload_bucket.selected_payload_slot_count, 0u);
+        EXPECT_EQ(no_payload_bucket.selected_payload_gathered_capacity_bytes, 0u);
+        EXPECT_EQ(no_payload_bucket.captured_payload_slack_bytes, 0u)
+            << "A skipped payload graph must not report captured payload slack.";
+        EXPECT_EQ(no_payload_bucket.useful_payload_bytes, 0u);
+        EXPECT_EQ(no_payload_bucket.wasted_payload_capacity_bytes, 0u)
+            << "No-work waves must not look like empty payload-bucket transfers.";
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceRouterBenefitFloorAllowsBootstrapThenRejectsLowValueWaves)
+    {
+        using moe_rebalance_policy::transferWaveMeetsRealizedRouterBenefitFloor;
+
+        EXPECT_TRUE(transferWaveMeetsRealizedRouterBenefitFloor(
+            /*realized_router_spread_improvement=*/0,
+            /*requested_payload_slots=*/2,
+            /*min_router_spread_improvement_per_payload_slot=*/64,
+            /*existing_hot_cache_active=*/false))
+            << "Cold-start arrivals must be allowed before hot-cache routing has had a chance to pay off.";
+
+        EXPECT_TRUE(transferWaveMeetsRealizedRouterBenefitFloor(
+            /*realized_router_spread_improvement=*/0,
+            /*requested_payload_slots=*/2,
+            /*min_router_spread_improvement_per_payload_slot=*/0,
+            /*existing_hot_cache_active=*/true))
+            << "A zero threshold disables the realized router-benefit gate.";
+
+        EXPECT_FALSE(transferWaveMeetsRealizedRouterBenefitFloor(
+            /*realized_router_spread_improvement=*/63,
+            /*requested_payload_slots=*/2,
+            /*min_router_spread_improvement_per_payload_slot=*/32,
+            /*existing_hot_cache_active=*/true));
+
+        EXPECT_TRUE(transferWaveMeetsRealizedRouterBenefitFloor(
+            /*realized_router_spread_improvement=*/64,
+            /*requested_payload_slots=*/2,
+            /*min_router_spread_improvement_per_payload_slot=*/32,
+            /*existing_hot_cache_active=*/true));
     }
 
     TEST(Test__MoERuntimeTable, PrepareInactiveBankCopiesDescriptorsMasksAndReplicaRoles)
@@ -169,6 +456,53 @@ namespace llaminar2::test
         missing_owner.experts[1].owner_participant = 1;
         missing_owner.resident_participant_mask.assign(4, 0b01u);
         EXPECT_THROW(table.prepareInactiveBank(0, missing_owner), std::invalid_argument);
+    }
+
+    TEST(Test__MoERuntimeTable, PlacementBankTracksMultiResidentExpertCountForHotCacheStats)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+
+        MoEPlacementUpdate static_update;
+        static_update.epoch = 1;
+        static_update.expert_count = 4;
+        static_update.participant_id = 0;
+        static_update.participant_count = 2;
+        for (int expert = 0; expert < 4; ++expert)
+        {
+            const int owner = expert / 2;
+            static_update.experts.push_back(
+                owner == 0 ? expertDesc(expert, owner, expert)
+                           : expertOwnerOnlyDesc(expert, owner));
+            static_update.local_compute_mask.push_back(owner == 0 ? 1u : 0u);
+            static_update.replica_role.push_back(static_cast<uint8_t>(
+                owner == 0 ? DeviceMoEReplicaRole::Primary : DeviceMoEReplicaRole::None));
+        }
+
+        ASSERT_TRUE(table.prepareInactiveBank(0, static_update));
+        EXPECT_EQ(table.hostLayerState(0).banks[1].reserved[0], 0u)
+            << "Static apportioned placement must not enable hot-cache router-stat work.";
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].reserved[0], 0u);
+
+        auto hot_update = static_update;
+        hot_update.epoch = 2;
+        hot_update.participant_count = 3;
+        hot_update.resident_participant_mask = {0b001u, 0b001u, 0b110u, 0b110u};
+        hot_update.experts[2].owner_participant = 1;
+        hot_update.experts[3].owner_participant = 1;
+        hot_update.local_compute_mask = {1u, 1u, 0u, 0u};
+        hot_update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Replica),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Replica),
+        };
+
+        ASSERT_TRUE(table.prepareInactiveBank(0, hot_update));
+        EXPECT_EQ(table.hostLayerState(0).banks[0].reserved[0], 2u)
+            << "Only multi-resident experts should enable hot-cache router-stat accounting.";
+        ASSERT_TRUE(table.flipActiveBank(0, 2, nullptr));
+        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].reserved[0], 2u);
     }
 
     TEST(Test__MoERuntimeTable, FlipActiveBankAdvancesEpochWithoutChangingLayerPointer)
@@ -251,6 +585,16 @@ namespace llaminar2::test
         table.hostLayerState(0).decode_histogram[2] = 3;
         table.hostLayerState(0).decode_local_histogram[0] = 5;
         table.hostLayerState(0).decode_local_histogram[2] = 1;
+        table.hostLayerState(0).router_hot_cache_eligible_dispatches = 4;
+        table.hostLayerState(0).router_hot_cache_used_dispatches = 2;
+        table.hostLayerState(0).router_hot_cache_improved_dispatches = 1;
+        table.hostLayerState(0).router_hot_cache_default_load_spread_total = 9;
+        table.hostLayerState(0).router_hot_cache_actual_load_spread_total = 5;
+        table.hostLayerState(0).router_hot_cache_load_spread_improvement_total = 4;
+        table.hostLayerState(0).router_hot_cache_active_dispatches = 8;
+        table.hostLayerState(0).router_hot_cache_miss_dispatches = 6;
+        table.hostLayerState(0).router_hot_cache_selected_expert_slots = 16;
+        table.hostLayerState(0).router_hot_cache_replicated_selected_expert_slots = 4;
 
         /**
          * Request/session boundaries clear runtime counters but must not clear
@@ -282,6 +626,16 @@ namespace llaminar2::test
             EXPECT_EQ(after_reset->decode_histogram[expert], 0u);
             EXPECT_EQ(after_reset->decode_local_histogram[expert], 0u);
         }
+        EXPECT_EQ(after_reset->router_hot_cache_eligible_dispatches, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_used_dispatches, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_improved_dispatches, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_default_load_spread_total, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_actual_load_spread_total, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_load_spread_improvement_total, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_active_dispatches, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_miss_dispatches, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_selected_expert_slots, 0u);
+        EXPECT_EQ(after_reset->router_hot_cache_replicated_selected_expert_slots, 0u);
     }
 
     TEST(Test__MoERuntimeTable, InvalidLayerBoundsAndUpdatesThrowConsistently)
@@ -351,6 +705,20 @@ namespace llaminar2::test
         table.hostLayerState(1).decode_histogram[3] = 2;
         table.hostLayerState(1).decode_local_histogram[1] = 1;
         table.hostLayerState(1).decode_local_histogram[3] = 2;
+        table.hostLayerState(0).router_hot_cache_eligible_dispatches = 2;
+        table.hostLayerState(0).router_hot_cache_used_dispatches = 1;
+        table.hostLayerState(0).router_hot_cache_improved_dispatches = 1;
+        table.hostLayerState(0).router_hot_cache_active_dispatches = 4;
+        table.hostLayerState(0).router_hot_cache_miss_dispatches = 2;
+        table.hostLayerState(0).router_hot_cache_selected_expert_slots = 8;
+        table.hostLayerState(0).router_hot_cache_replicated_selected_expert_slots = 3;
+        table.hostLayerState(1).router_hot_cache_eligible_dispatches = 3;
+        table.hostLayerState(1).router_hot_cache_used_dispatches = 2;
+        table.hostLayerState(1).router_hot_cache_improved_dispatches = 1;
+        table.hostLayerState(1).router_hot_cache_active_dispatches = 5;
+        table.hostLayerState(1).router_hot_cache_miss_dispatches = 2;
+        table.hostLayerState(1).router_hot_cache_selected_expert_slots = 10;
+        table.hostLayerState(1).router_hot_cache_replicated_selected_expert_slots = 4;
 
         DecodeExpertHistogramConfig cfg;
         cfg.num_layers = 2;
@@ -376,10 +744,1087 @@ namespace llaminar2::test
                 EXPECT_EQ(table.hostLayerState(layer).decode_histogram[expert], 0u);
                 EXPECT_EQ(table.hostLayerState(layer).decode_local_histogram[expert], 0u);
             }
+        for (int layer = 0; layer < 2; ++layer)
+        {
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_eligible_dispatches, 0u);
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_used_dispatches, 0u);
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_improved_dispatches, 0u);
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_active_dispatches, 0u);
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_miss_dispatches, 0u);
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_selected_expert_slots, 0u);
+            EXPECT_EQ(table.hostLayerState(layer).router_hot_cache_replicated_selected_expert_slots, 0u);
+        }
 
         ASSERT_TRUE(table.syncDecodeHistogramToHost(hist));
         EXPECT_EQ(hist.activationCount(0, 0), 3u);
         EXPECT_EQ(hist.activationCount(1, 1), 2u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyPublishesHotReplicasFromResidentMasks)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 2, 4, 2);
+
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {
+            0b011u, // expert 0 has arrived on participant 1 as a replica slot.
+            0b001u,
+            0b010u,
+            0b110u,
+        };
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        auto layer1_update = update;
+        layer1_update.epoch = 1;
+        ASSERT_TRUE(table.prepareInactiveBank(1, layer1_update));
+        ASSERT_TRUE(table.flipActiveBank(1, 1, nullptr));
+
+        table.hostLayerState(0).decode_histogram[0] = 7;
+        table.hostLayerState(0).decode_local_histogram[2] = 3;
+        table.hostLayerState(0).router_hot_cache_eligible_dispatches = 2;
+        table.hostLayerState(0).router_hot_cache_used_dispatches = 1;
+        table.hostLayerState(0).router_hot_cache_improved_dispatches = 1;
+        table.hostLayerState(0).router_hot_cache_default_load_spread_total = 6;
+        table.hostLayerState(0).router_hot_cache_actual_load_spread_total = 4;
+        table.hostLayerState(0).router_hot_cache_load_spread_improvement_total = 2;
+        table.hostLayerState(0).router_hot_cache_active_dispatches = 10;
+        table.hostLayerState(0).router_hot_cache_miss_dispatches = 6;
+        table.hostLayerState(0).router_hot_cache_selected_expert_slots = 20;
+        table.hostLayerState(0).router_hot_cache_replicated_selected_expert_slots = 8;
+        table.hostLayerState(1).router_hot_cache_eligible_dispatches = 3;
+        table.hostLayerState(1).router_hot_cache_used_dispatches = 2;
+        table.hostLayerState(1).router_hot_cache_improved_dispatches = 1;
+        table.hostLayerState(1).router_hot_cache_default_load_spread_total = 9;
+        table.hostLayerState(1).router_hot_cache_actual_load_spread_total = 6;
+        table.hostLayerState(1).router_hot_cache_load_spread_improvement_total = 3;
+        table.hostLayerState(1).router_hot_cache_active_dispatches = 20;
+        table.hostLayerState(1).router_hot_cache_miss_dispatches = 7;
+        table.hostLayerState(1).router_hot_cache_selected_expert_slots = 40;
+        table.hostLayerState(1).router_hot_cache_replicated_selected_expert_slots = 12;
+
+        const auto config = rebalanceConfig(/*layers=*/2, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/1, /*participants=*/3,
+                                            /*window_tokens=*/2, /*max_hot_replicas=*/1);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 30);
+        addGatheredCount(gathered, config, 1, 0, 3, 20);
+        addGatheredCount(gathered, config, 0, 1, 0, 30);
+        addGatheredCount(gathered, config, 2, 1, 3, 20);
+
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0), gathered.data(), config, &status));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.windows_applied, 1u);
+        EXPECT_EQ(status.changed_layers, 2u);
+        EXPECT_EQ(status.selected_replicas, 2u);
+        EXPECT_EQ(status.router_hot_cache_eligible_dispatches, 5u);
+        EXPECT_EQ(status.router_hot_cache_used_dispatches, 3u);
+        EXPECT_EQ(status.router_hot_cache_improved_dispatches, 2u);
+        EXPECT_EQ(status.router_hot_cache_default_load_spread_total, 15u);
+        EXPECT_EQ(status.router_hot_cache_actual_load_spread_total, 10u);
+        EXPECT_EQ(status.router_hot_cache_load_spread_improvement_total, 5u);
+        EXPECT_EQ(status.router_hot_cache_active_dispatches, 30u);
+        EXPECT_EQ(status.router_hot_cache_miss_dispatches, 13u);
+        EXPECT_EQ(status.router_hot_cache_selected_expert_slots, 60u);
+        EXPECT_EQ(status.router_hot_cache_replicated_selected_expert_slots, 20u);
+
+        for (int layer = 0; layer < 2; ++layer)
+        {
+            const auto &state = table.hostLayerState(layer);
+            ASSERT_EQ(state.active_epoch, 2u);
+            const auto &bank = state.banks[state.active_bank];
+            EXPECT_EQ(bank.local_compute_mask[0], 1u) << "hot resident expert should become local";
+            EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+            EXPECT_EQ(bank.replica_role[0], static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
+            EXPECT_EQ(bank.local_compute_mask[1], 0u);
+            EXPECT_FALSE(hasMoEExpertFlag(bank.experts[1].flags, DeviceMoEExpertFlags::Replicated));
+            EXPECT_EQ(bank.local_compute_mask[2], 1u);
+            EXPECT_EQ(bank.replica_role[2], static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+            for (int expert = 0; expert < 4; ++expert)
+            {
+                EXPECT_EQ(state.decode_histogram[expert], 0u);
+                EXPECT_EQ(state.decode_local_histogram[expert], 0u);
+            }
+            EXPECT_EQ(state.router_hot_cache_eligible_dispatches, 0u);
+            EXPECT_EQ(state.router_hot_cache_used_dispatches, 0u);
+            EXPECT_EQ(state.router_hot_cache_improved_dispatches, 0u);
+            EXPECT_EQ(state.router_hot_cache_default_load_spread_total, 0u);
+            EXPECT_EQ(state.router_hot_cache_actual_load_spread_total, 0u);
+            EXPECT_EQ(state.router_hot_cache_load_spread_improvement_total, 0u);
+            EXPECT_EQ(state.router_hot_cache_active_dispatches, 0u);
+            EXPECT_EQ(state.router_hot_cache_miss_dispatches, 0u);
+            EXPECT_EQ(state.router_hot_cache_selected_expert_slots, 0u);
+            EXPECT_EQ(state.router_hot_cache_replicated_selected_expert_slots, 0u);
+        }
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyHonorsLayerWindow)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 3, 4, 2);
+
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0] = expertOwnerOnlyDesc(0, 0);
+        update.experts[1] = expertOwnerOnlyDesc(1, 0);
+        update.experts[2].owner_participant = 1;
+        update.experts[3] = expertOwnerOnlyDesc(3, 2);
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b011u, 0b001u, 0b010u, 0b100u};
+        for (int layer = 0; layer < 3; ++layer)
+        {
+            ASSERT_TRUE(table.prepareInactiveBank(layer, update));
+            ASSERT_TRUE(table.flipActiveBank(layer, 1, nullptr));
+        }
+
+        auto config = rebalanceConfig(/*layers=*/3, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.layer_window_start = 1;
+        config.layer_window_count = 1;
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 99);
+        addGatheredCount(gathered, config, 0, 1, 0, 99);
+        addGatheredCount(gathered, config, 0, 2, 0, 99);
+
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0), gathered.data(), config, &status));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.changed_layers, 1u);
+        EXPECT_EQ(table.hostLayerState(0).active_epoch, 1u)
+            << "rolling rebalance windows must not apply layers before the staged wave";
+        EXPECT_EQ(table.hostLayerState(1).active_epoch, 2u);
+        EXPECT_EQ(table.hostLayerState(2).active_epoch, 1u)
+            << "rolling rebalance windows must not apply layers after the staged wave";
+
+        const auto &layer1_bank =
+            table.hostLayerState(1).banks[table.hostLayerState(1).active_bank];
+        EXPECT_EQ(layer1_bank.local_compute_mask[0], 1u);
+        EXPECT_TRUE(hasMoEExpertFlag(layer1_bank.experts[0].flags,
+                                     DeviceMoEExpertFlags::Replicated));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyHonorsLayerWaveCount)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 4, 4, 2);
+
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b011u, 0b001u, 0b010u, 0b100u};
+        for (int layer = 0; layer < 4; ++layer)
+        {
+            ASSERT_TRUE(table.prepareInactiveBank(layer, update));
+            ASSERT_TRUE(table.flipActiveBank(layer, 1, nullptr));
+        }
+
+        auto config = rebalanceConfig(/*layers=*/4, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.layer_window_start = 1;
+        config.layer_window_count = 3;
+        config.layer_wave_count = 2;
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 1, 0, 99);
+        addGatheredCount(gathered, config, 0, 2, 0, 99);
+        addGatheredCount(gathered, config, 0, 3, 0, 99);
+
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0), gathered.data(), config, &status));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.changed_layers, 2u)
+            << "Layer wave count must bound one graph-captured maintenance replay.";
+        EXPECT_EQ(table.hostLayerState(0).active_epoch, 1u);
+        EXPECT_EQ(table.hostLayerState(1).active_epoch, 2u);
+        EXPECT_EQ(table.hostLayerState(2).active_epoch, 2u);
+        EXPECT_EQ(table.hostLayerState(3).active_epoch, 1u)
+            << "The remaining layer should wait for the next rolling maintenance replay.";
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyWaitsForWindowWithoutMutating)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b011u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        table.hostLayerState(0).decode_histogram[0] = 5;
+
+        const auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/1, /*participants=*/3,
+                                            /*window_tokens=*/64, /*max_hot_replicas=*/1);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 4);
+
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0), gathered.data(), config, &status));
+
+        EXPECT_EQ(status.status_code,
+                  static_cast<uint32_t>(DeviceMoERebalanceStatusCode::WindowNotReady));
+        EXPECT_EQ(status.skipped_not_ready, 1u);
+        EXPECT_EQ(status.skipped_busy_wave, 0u)
+            << "host policy WindowNotReady means histogram cadence, not an active wave.";
+        EXPECT_EQ(status.window_ready_slots, 4u);
+        EXPECT_EQ(status.window_required_slots, 128u);
+        EXPECT_EQ(status.windows_applied, 0u);
+        EXPECT_EQ(table.hostLayerState(0).active_epoch, 1u);
+        EXPECT_EQ(table.hostLayerState(0).decode_histogram[0], 5u)
+            << "window wait must not reset runtime counters";
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyPlansMissingHotReplicaArrivals)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0] = expertOwnerOnlyDesc(0, 0);
+        update.experts[1] = expertOwnerOnlyDesc(1, 0);
+        update.experts[2].owner_participant = 1;
+        update.experts[3] = expertOwnerOnlyDesc(3, 2);
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+        EXPECT_FALSE(table.hostLayerState(0)
+                         .banks[table.hostLayerState(0).active_bank]
+                         .experts[0]
+                         .gate.valid())
+            << "Non-local experts should not need local payload descriptors to be arrival candidates.";
+
+        auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 6);
+
+        DeviceMoERebalancePlanEntry plan[2];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            2));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.planned_arrivals, 1u);
+        EXPECT_EQ(status.plan_overflow, 0u);
+        EXPECT_EQ(status.selected_replicas, 0u)
+            << "missing arrivals are planned, not exposed as active local replicas";
+        EXPECT_EQ(status.pre_policy_load_total, 6u);
+        EXPECT_EQ(status.pre_policy_load_min, 0u);
+        EXPECT_EQ(status.pre_policy_load_max, 6u);
+        EXPECT_EQ(status.post_policy_load_total, 6u);
+        EXPECT_EQ(status.post_policy_load_min, 0u);
+        EXPECT_EQ(status.post_policy_load_max, 3u)
+            << "diagnostic post-policy load must account for planned arrivals without publishing them early";
+        EXPECT_EQ(status.pre_policy_participant_load[0], 6u);
+        EXPECT_EQ(status.pre_policy_participant_load[1], 0u);
+        EXPECT_EQ(status.pre_policy_participant_load[2], 0u);
+        EXPECT_EQ(status.post_policy_participant_load[0], 3u);
+        EXPECT_EQ(status.post_policy_participant_load[1], 3u);
+        EXPECT_EQ(status.post_policy_participant_load[2], 0u);
+        EXPECT_GT(status.pre_policy_imbalance_numerator,
+                  status.post_policy_imbalance_numerator);
+        EXPECT_EQ(status.candidate_arrivals_considered, 1u);
+        EXPECT_EQ(status.candidate_arrivals_below_floor, 0u);
+        EXPECT_EQ(status.candidate_arrivals_pruned_by_count_bound, 0u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_total, 3u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_max, 3u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_total, 3u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_max, 3u);
+        ASSERT_EQ(plan_count, 1u);
+        EXPECT_EQ(plan[0].op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival));
+        EXPECT_EQ(plan[0].layer, 0u);
+        EXPECT_EQ(plan[0].expert, 0u);
+        EXPECT_EQ(plan[0].source_participant, 0u);
+        EXPECT_EQ(plan[0].destination_participant, 1u);
+        EXPECT_EQ(plan[0].source_resident_mask, 0b001u);
+        EXPECT_EQ(plan[0].destination_slot, 0u)
+            << "controller assigns graph-consumable transfer slots deterministically";
+        EXPECT_EQ(plan[0].payload_slot, 0u)
+            << "controller assigns dense outgoing payload slots separately from destination slots";
+
+        const auto &bank = table.hostLayerState(0).banks[table.hostLayerState(0).active_bank];
+        EXPECT_EQ(bank.local_compute_mask[0], 0u)
+            << "the plan must not expose an expert before graph-side transfer/apply copies it";
+        EXPECT_FALSE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyRanksMissingArrivalsBySpreadImprovement)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0] = expertOwnerOnlyDesc(0, 0);
+        update.experts[1] = expertOwnerOnlyDesc(1, 0);
+        update.experts[2].owner_participant = 1;
+        update.experts[3] = expertOwnerOnlyDesc(3, 2);
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 50);
+        addGatheredCount(gathered, config, 0, 0, 1, 50);
+        addGatheredCount(gathered, config, 2, 0, 3, 80);
+
+        DeviceMoERebalancePlanEntry plan[2];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            2));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.planned_arrivals, 1u);
+        EXPECT_EQ(status.candidate_arrivals_considered, 3u);
+        EXPECT_EQ(status.candidate_arrivals_below_floor, 0u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_total, 130u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_max, 45u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_total, 45u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_max, 45u);
+        ASSERT_EQ(plan_count, 1u);
+        EXPECT_EQ(plan[0].expert, 0u)
+            << "expert 3 is hotter, but moving expert 0 to participant 1 reduces projected "
+               "load spread more and should win the transfer slot.";
+        EXPECT_EQ(plan[0].source_participant, 0u);
+        EXPECT_EQ(plan[0].destination_participant, 1u);
+        EXPECT_EQ(status.post_policy_participant_load[0], 75u);
+        EXPECT_EQ(status.post_policy_participant_load[1], 25u);
+        EXPECT_EQ(status.post_policy_participant_load[2], 80u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicySkipsMissingArrivalThatWorsensImbalance)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0] = expertOwnerOnlyDesc(0, 0);
+        update.experts[1] = expertOwnerOnlyDesc(1, 0);
+        update.experts[2].owner_participant = 1;
+        update.experts[3] = expertOwnerOnlyDesc(3, 2);
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 6);
+        addGatheredCount(gathered, config, 1, 0, 2, 10);
+
+        DeviceMoERebalancePlanEntry plan[2];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            2));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.planned_arrivals, 0u);
+        EXPECT_EQ(status.selected_replicas, 0u);
+        EXPECT_EQ(status.skipped_no_improvement, 1u)
+            << "The controller should reject arrivals that increase projected load spread.";
+        EXPECT_EQ(status.pre_policy_load_total, 16u);
+        EXPECT_EQ(status.pre_policy_load_min, 0u);
+        EXPECT_EQ(status.pre_policy_load_max, 10u);
+        EXPECT_EQ(status.post_policy_load_total, 16u);
+        EXPECT_EQ(status.post_policy_load_min, 0u);
+        EXPECT_EQ(status.post_policy_load_max, 10u);
+        EXPECT_EQ(status.pre_policy_imbalance_numerator,
+                  status.post_policy_imbalance_numerator);
+        EXPECT_EQ(status.candidate_arrivals_considered, 1u);
+        EXPECT_EQ(status.candidate_arrivals_below_floor, 1u);
+        EXPECT_EQ(status.candidate_arrivals_pruned_by_count_bound, 0u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_total, 0u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_max, 0u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_total, 0u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_max, 0u);
+        EXPECT_EQ(plan_count, 0u);
+
+        const auto &bank = table.hostLayerState(0).banks[table.hostLayerState(0).active_bank];
+        EXPECT_EQ(bank.local_compute_mask[0], 0u);
+        EXPECT_FALSE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicySkipsTinyLoadSpreadImprovement)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0] = expertOwnerOnlyDesc(0, 0);
+        update.experts[1] = expertOwnerOnlyDesc(1, 0);
+        update.experts[2].owner_participant = 1;
+        update.experts[3] = expertOwnerOnlyDesc(3, 2);
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        config.min_load_spread_improvement = 4;
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 6);
+
+        DeviceMoERebalancePlanEntry plan[2];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            2));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.planned_arrivals, 0u);
+        EXPECT_EQ(status.selected_replicas, 0u);
+        EXPECT_EQ(status.skipped_no_improvement, 1u);
+        EXPECT_EQ(status.pre_policy_imbalance_numerator, 6u);
+        EXPECT_EQ(status.post_policy_imbalance_numerator, 6u);
+        EXPECT_EQ(status.pre_policy_participant_load[0], 6u);
+        EXPECT_EQ(status.post_policy_participant_load[0], 6u);
+        EXPECT_EQ(status.candidate_arrivals_considered, 1u);
+        EXPECT_EQ(status.candidate_arrivals_below_floor, 1u);
+        EXPECT_EQ(status.candidate_arrivals_pruned_by_count_bound, 0u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_total, 3u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_max, 3u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_total, 0u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_max, 0u);
+        EXPECT_EQ(plan_count, 0u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyPrunesMissingArrivalBelowCountBound)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0] = expertOwnerOnlyDesc(0, 0);
+        update.experts[1] = expertOwnerOnlyDesc(1, 0);
+        update.experts[2].owner_participant = 1;
+        update.experts[3] = expertOwnerOnlyDesc(3, 2);
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+        config.min_load_spread_improvement = 8;
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 6);
+
+        DeviceMoERebalancePlanEntry plan[2];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            2));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.planned_arrivals, 0u);
+        EXPECT_EQ(status.selected_replicas, 0u);
+        EXPECT_EQ(status.skipped_no_improvement, 1u);
+        EXPECT_EQ(status.pre_policy_load_total, 6u);
+        EXPECT_EQ(status.pre_policy_imbalance_numerator,
+                  status.post_policy_imbalance_numerator);
+        EXPECT_EQ(status.candidate_arrivals_considered, 0u)
+            << "count-bound prunes should skip the expensive projected-spread evaluation";
+        EXPECT_EQ(status.candidate_arrivals_below_floor, 0u);
+        EXPECT_EQ(status.candidate_arrivals_pruned_by_count_bound, 1u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_total, 0u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_max, 0u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_total, 0u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_max, 0u);
+        EXPECT_EQ(plan_count, 0u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyResidentOnlySkipsMissingReplicaCandidates)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        const auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/1, /*participants=*/3,
+                                            /*window_tokens=*/1, /*max_hot_replicas=*/2);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 8);
+
+        DeviceMoERebalancePlanEntry plan[2];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            2));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.windows_applied, 1u);
+        EXPECT_EQ(status.selected_replicas, 0u);
+        EXPECT_EQ(status.planned_arrivals, 0u);
+        EXPECT_EQ(status.skipped_no_resident, 0u)
+            << "Resident-only mode should not rank non-local missing experts as failed arrivals.";
+        EXPECT_EQ(plan_count, 0u);
+
+        const auto &bank = table.hostLayerState(0).banks[table.hostLayerState(0).active_bank];
+        EXPECT_EQ(bank.local_compute_mask[0], 0u);
+        EXPECT_FALSE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+        EXPECT_EQ(bank.local_compute_mask[2], 1u);
+        EXPECT_EQ(bank.replica_role[2], static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceDirectoryPacksOnlyLocalResidentDescriptors)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        const auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/1, /*participants=*/3,
+                                            /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        std::vector<DeviceMoEExpertDirectoryEntry> directory(
+            static_cast<size_t>(config.num_layers) * static_cast<size_t>(config.num_experts));
+
+        ASSERT_TRUE(packDeviceMoELocalDirectoryHost(
+            table.deviceLayerState(0),
+            directory.data(),
+            config));
+
+        EXPECT_FALSE(deviceMoEDirectoryEntryReady(directory[0], 1, 0, 0))
+            << "non-local owner metadata is not a usable source descriptor";
+        EXPECT_FALSE(deviceMoEDirectoryEntryReady(directory[1], 1, 0, 1));
+        ASSERT_TRUE(deviceMoEDirectoryEntryReady(directory[2], 1, 0, 2));
+        EXPECT_EQ(directory[2].descriptor.logical_expert_id, 2);
+        EXPECT_EQ(directory[2].slot_index, 2u);
+        EXPECT_TRUE((directory[2].flags &
+                     static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::LocalCompute)) != 0u);
+        EXPECT_FALSE(deviceMoEDirectoryEntryReady(directory[3], 1, 0, 3));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceArrivalApplyFailsClosedUntilPeerCopyCompletes)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        const auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/1, /*participants=*/3,
+                                            /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        DeviceMoERebalancePlanEntry plan;
+        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival);
+        plan.layer = 0;
+        plan.expert = 0;
+        plan.source_participant = 0;
+        plan.destination_participant = 1;
+        plan.source_resident_mask = 0b001u;
+        plan.destination_slot = 0;
+        plan.payload_slot = 0;
+
+        std::vector<DeviceMoEExpertDirectoryEntry> gathered_directory(
+            static_cast<size_t>(config.participant_count) *
+            static_cast<size_t>(config.num_layers) *
+            static_cast<size_t>(config.num_experts));
+        std::vector<DeviceMoEExpertDirectoryEntry> transfer_slots(1);
+
+        DeviceMoERebalanceApplyStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            table.deviceLayerState(0),
+            &plan,
+            1,
+            gathered_directory.data(),
+            transfer_slots.data(),
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            &status));
+        EXPECT_EQ(status.applied_arrivals, 0u);
+        EXPECT_EQ(status.missing_source_descriptors, 1u);
+        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].local_compute_mask[0], 0u);
+
+        auto &source_entry = gathered_directory[deviceMoEDirectoryIndex(config, 0, 0, 0)];
+        source_entry.descriptor = expertDesc(0, 0, 0);
+        source_entry.layer = 0;
+        source_entry.expert = 0;
+        source_entry.participant = 0;
+        source_entry.resident_mask = 0b001u;
+        source_entry.flags =
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::LocalCompute);
+        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(source_entry));
+
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            table.deviceLayerState(0),
+            &plan,
+            1,
+            gathered_directory.data(),
+            transfer_slots.data(),
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            &status));
+        EXPECT_EQ(status.applied_arrivals, 0u);
+        EXPECT_EQ(status.missing_destination_slots, 1u)
+            << "a source descriptor alone must not expose peer memory as local compute";
+
+        auto &slot = transfer_slots[0];
+        slot.descriptor = expertDesc(0, 0, 17);
+        slot.descriptor.logical_expert_id = -1;
+        slot.layer = kDeviceMoEInvalidSlot;
+        slot.expert = kDeviceMoEInvalidSlot;
+        slot.participant = 1;
+        slot.resident_mask = 0b010u;
+        slot.slot_index = 17;
+        slot.flags =
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot);
+        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(slot));
+
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            table.deviceLayerState(0),
+            &plan,
+            1,
+            gathered_directory.data(),
+            transfer_slots.data(),
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            &status));
+        EXPECT_EQ(status.applied_arrivals, 0u);
+        EXPECT_EQ(status.copy_incomplete, 1u)
+            << "a staged destination slot must not publish until peer copy completion is visible";
+        EXPECT_EQ(table.hostLayerState(0).banks[table.hostLayerState(0).active_bank].local_compute_mask[0], 0u);
+
+        slot.flags |= static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::CopyComplete);
+
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            table.deviceLayerState(0),
+            &plan,
+            1,
+            gathered_directory.data(),
+            transfer_slots.data(),
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            &status));
+        EXPECT_EQ(status.applied_arrivals, 0u);
+        EXPECT_EQ(status.copy_incomplete, 1u)
+            << "copy completion must also prove the generic slot was bound to the planned expert";
+
+        slot.layer = plan.layer;
+        slot.expert = plan.expert;
+        slot.descriptor.logical_expert_id = static_cast<int32_t>(plan.expert);
+        auto &runtime_before_apply = table.hostLayerState(0);
+        runtime_before_apply.router_hot_cache_eligible_dispatches = 11;
+        runtime_before_apply.router_hot_cache_used_dispatches = 7;
+        runtime_before_apply.router_hot_cache_improved_dispatches = 5;
+        runtime_before_apply.router_hot_cache_default_load_spread_total = 19;
+        runtime_before_apply.router_hot_cache_actual_load_spread_total = 13;
+        runtime_before_apply.router_hot_cache_load_spread_improvement_total = 6;
+        runtime_before_apply.router_hot_cache_active_dispatches = 23;
+        runtime_before_apply.router_hot_cache_miss_dispatches = 17;
+        runtime_before_apply.router_hot_cache_selected_expert_slots = 46;
+        runtime_before_apply.router_hot_cache_replicated_selected_expert_slots = 12;
+
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            table.deviceLayerState(0),
+            &plan,
+            1,
+            gathered_directory.data(),
+            transfer_slots.data(),
+            static_cast<uint32_t>(transfer_slots.size()),
+            config,
+            &status));
+        EXPECT_EQ(status.applied_arrivals, 1u);
+        EXPECT_EQ(status.changed_layers, 1u);
+
+        const auto &bank = table.hostLayerState(0).banks[table.hostLayerState(0).active_bank];
+        EXPECT_EQ(bank.local_compute_mask[0], 1u);
+        EXPECT_EQ(bank.replica_role[0], static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
+        EXPECT_EQ(bank.resident_participant_mask[0], 0b011u);
+        EXPECT_EQ(bank.experts[0].local_slot, 17);
+        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::LocalCompute));
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_eligible_dispatches, 11u)
+            << "arrival apply starts a new histogram window but must leave router-benefit counters for controller export";
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_used_dispatches, 7u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_improved_dispatches, 5u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_default_load_spread_total, 19u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_actual_load_spread_total, 13u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_load_spread_improvement_total, 6u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_active_dispatches, 23u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_miss_dispatches, 17u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_selected_expert_slots, 46u);
+        EXPECT_EQ(table.hostLayerState(0).router_hot_cache_replicated_selected_expert_slots, 12u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceArrivalApplyPropagatesReplicaMetadataToNonDestination)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 0;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {1, 1, 0, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        const auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/0, /*participants=*/3,
+                                            /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        DeviceMoERebalancePlanEntry plan;
+        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival);
+        plan.layer = 0;
+        plan.expert = 0;
+        plan.source_participant = 0;
+        plan.destination_participant = 1;
+        plan.source_resident_mask = 0b001u;
+        plan.destination_slot = 0;
+        plan.payload_slot = 0;
+
+        DeviceMoERebalanceApplyStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            table.deviceLayerState(0),
+            &plan,
+            1,
+            nullptr,
+            nullptr,
+            0,
+            config,
+            &status));
+
+        EXPECT_EQ(status.applied_arrivals, 0u)
+            << "non-destination participants should not count remote arrivals as local slot installs";
+        EXPECT_EQ(status.changed_layers, 1u);
+        EXPECT_EQ(status.skipped_wrong_destination, 0u)
+            << "non-destination participants still need replica metadata for deterministic routing";
+
+        const auto &bank = table.hostLayerState(0).banks[table.hostLayerState(0).active_bank];
+        EXPECT_EQ(bank.local_compute_mask[0], 1u)
+            << "the owner remains locally computable but can now yield routes to the replica";
+        EXPECT_EQ(bank.replica_role[0], static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+        EXPECT_EQ(bank.resident_participant_mask[0], 0b011u);
+        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::LocalCompute));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyReportsTransferPlanOverflow)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 1;
+        update.participant_count = 3;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 0;
+        update.experts[2].owner_participant = 1;
+        update.experts[3].owner_participant = 2;
+        update.local_compute_mask = {0, 0, 1, 0};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        update.resident_participant_mask = {0b001u, 0b001u, 0b010u, 0b100u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                      /*participant=*/1, /*participants=*/3,
+                                      /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 6);
+
+        DeviceMoERebalancePlanEntry plan[1];
+        uint32_t plan_count = 99;
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0),
+            gathered.data(),
+            config,
+            &status,
+            plan,
+            &plan_count,
+            0));
+
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(status.planned_arrivals, 0u);
+        EXPECT_EQ(status.plan_overflow, 1u);
+        EXPECT_EQ(status.skipped_no_resident, 0u)
+            << "A full command buffer should stop ranking rather than misclassify capacity as a missing source.";
+        EXPECT_EQ(plan_count, 0u);
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyHandlesFourParticipantDomains)
+    {
+        MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
+        auto update = updateForEpoch(1, 4);
+        update.participant_id = 3;
+        update.participant_count = 4;
+        update.experts[0].owner_participant = 0;
+        update.experts[1].owner_participant = 1;
+        update.experts[2].owner_participant = 2;
+        update.experts[3].owner_participant = 3;
+        update.local_compute_mask = {0, 0, 0, 1};
+        update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+        };
+        update.resident_participant_mask = {0b1001u, 0b0010u, 0b0100u, 0b1000u};
+        ASSERT_TRUE(table.prepareInactiveBank(0, update));
+        ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
+
+        const auto config = rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                                            /*participant=*/3, /*participants=*/4,
+                                            /*window_tokens=*/1, /*max_hot_replicas=*/1);
+        std::vector<uint64_t> gathered(
+            static_cast<size_t>(config.participant_count) *
+                static_cast<size_t>(config.num_layers) *
+                static_cast<size_t>(config.num_experts),
+            0);
+        addGatheredCount(gathered, config, 0, 0, 0, 8);
+
+        DeviceMoERebalanceStatus status;
+        ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+            table.deviceLayerState(0), gathered.data(), config, &status));
+
+        const auto &state = table.hostLayerState(0);
+        const auto &bank = state.banks[state.active_bank];
+        EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+        EXPECT_EQ(bank.local_compute_mask[0], 1u)
+            << "policy must not assume a two-participant domain";
+        EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
+        EXPECT_EQ(bank.replica_role[0], static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
+        EXPECT_EQ(bank.local_compute_mask[3], 1u);
+        EXPECT_EQ(bank.replica_role[3], static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
     }
 
     TEST(Test__MoERuntimeTable, ConstructorRejectsInvalidBoundsAndCpuMirroring)

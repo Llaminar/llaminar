@@ -4,6 +4,7 @@
  */
 
 #include "MoERoutingStage.h"
+#include "MoEDeviceRebalanceStage.h"
 #include "../../../kernels/KernelFactory.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
@@ -70,7 +71,7 @@ namespace llaminar2
             (void)device;
             return false;
 #else
-            if (!debugEnv().rocm.moe_grouped_prefill)
+            if (!debugEnv().gpu_moe.grouped_prefill)
                 return false;
 #if defined(HAVE_ROCM)
             if (device.is_rocm())
@@ -643,9 +644,81 @@ namespace llaminar2
             }
             params_.moe_runtime_table->recordDecodeHistogramProducerStream(route_stream);
 
-            // The current grouped expert decode still consumes the legacy routing
-            // tensors, so keep them device-resident while also filling runtime top-k.
-            if (!kernel->decodeRouteSelect(
+            bool routed = false;
+            if (params_.device_rebalance_route_apply)
+            {
+                if (!bound_workspace_)
+                {
+                    LOG_ERROR("[MoERoutingStage] Device rebalance route-apply requested without a bound workspace");
+                    return false;
+                }
+                if (params_.device_rebalance_workspace_name.empty() ||
+                    params_.device_rebalance_plan_capacity == 0 ||
+                    params_.device_rebalance_command_buffer_count == 0 ||
+                    !validateDeviceMoERebalanceConfig(params_.device_rebalance_config))
+                {
+                    LOG_ERROR("[MoERoutingStage] Device rebalance route-apply has an invalid binding"
+                              << " workspace='" << params_.device_rebalance_workspace_name
+                              << "' plan_capacity=" << params_.device_rebalance_plan_capacity
+                              << " command_buffers=" << params_.device_rebalance_command_buffer_count);
+                    return false;
+                }
+
+                auto requireWorkspaceBuffer =
+                    [&](const char *base_name, size_t min_bytes) -> void *
+                {
+                    const std::string name =
+                        MoEDeviceRebalanceStage::workspaceBufferName(
+                            base_name,
+                            params_.device_rebalance_workspace_name);
+                    if (!bound_workspace_->hasBuffer(name) ||
+                        bound_workspace_->getBufferSize(name) < min_bytes)
+                    {
+                        LOG_ERROR("[MoERoutingStage] Device rebalance route-apply missing workspace buffer '"
+                                  << name << "' required_bytes=" << min_bytes
+                                  << " actual_bytes=" << bound_workspace_->getBufferSize(name));
+                        return nullptr;
+                    }
+                    void *ptr = bound_workspace_->getBuffer(name);
+                    if (!ptr)
+                    {
+                        LOG_ERROR("[MoERoutingStage] Device rebalance route-apply workspace buffer '"
+                                  << name << "' resolved to null");
+                        return nullptr;
+                    }
+                    return ptr;
+                };
+
+                auto *runtime_layers = params_.moe_runtime_table->deviceLayerState(0);
+                auto *plan_entries = static_cast<DeviceMoERebalancePlanEntry *>(
+                    requireWorkspaceBuffer(
+                        MoEDeviceRebalanceStage::WS_TRANSFER_PLAN,
+                        static_cast<size_t>(params_.device_rebalance_command_buffer_count) *
+                            static_cast<size_t>(params_.device_rebalance_plan_capacity) *
+                            sizeof(DeviceMoERebalancePlanEntry)));
+                auto *command_headers = static_cast<DeviceMoERebalanceCommandBufferHeader *>(
+                    requireWorkspaceBuffer(
+                        MoEDeviceRebalanceStage::WS_COMMAND_HEADER,
+                        static_cast<size_t>(params_.device_rebalance_command_buffer_count) *
+                            sizeof(DeviceMoERebalanceCommandBufferHeader)));
+                auto *apply_status = static_cast<DeviceMoERebalanceApplyStatus *>(
+                    requireWorkspaceBuffer(
+                        MoEDeviceRebalanceStage::WS_APPLY_STATUS,
+                        sizeof(DeviceMoERebalanceApplyStatus)));
+                auto *controller_state = static_cast<DeviceMoERebalanceGraphControllerState *>(
+                    requireWorkspaceBuffer(
+                        MoEDeviceRebalanceStage::WS_CONTROLLER_STATE,
+                        sizeof(DeviceMoERebalanceGraphControllerState)));
+                if (!runtime_layers || !plan_entries || !command_headers ||
+                    !apply_status || !controller_state)
+                {
+                    return false;
+                }
+
+                // The current grouped expert decode still consumes the legacy routing
+                // tensors, so keep them device-resident while also filling runtime top-k.
+                routed = kernel->decodeRouteSelectWithReadyRebalanceApply(
+                    runtime_layers,
                     moe_runtime_layer_,
                     params_.input,
                     params_.gate_weights,
@@ -656,7 +729,39 @@ namespace llaminar2
                     params_.output_indices,
                     params_.output_weights,
                     /*write_legacy_outputs=*/true,
-                    /*update_runtime_histogram=*/true))
+                    /*update_runtime_histogram=*/true,
+                    plan_entries,
+                    params_.device_rebalance_plan_capacity,
+                    command_headers,
+                    params_.device_rebalance_local_transfer_slots,
+                    params_.device_rebalance_local_transfer_slot_count,
+                    params_.device_rebalance_config,
+                    apply_status,
+                    controller_state,
+                    params_.device_rebalance_apply_layer_idx == -2
+                        ? params_.layer_idx
+                        : params_.device_rebalance_apply_layer_idx,
+                    params_.device_rebalance_command_buffer_count);
+            }
+            else
+            {
+                // The current grouped expert decode still consumes the legacy routing
+                // tensors, so keep them device-resident while also filling runtime top-k.
+                routed = kernel->decodeRouteSelect(
+                    moe_runtime_layer_,
+                    params_.input,
+                    params_.gate_weights,
+                    d_model,
+                    num_experts,
+                    top_k,
+                    params_.norm_topk_prob,
+                    params_.output_indices,
+                    params_.output_weights,
+                    /*write_legacy_outputs=*/true,
+                    /*update_runtime_histogram=*/true);
+            }
+
+            if (!routed)
             {
                 LOG_ERROR("[MoERoutingStage] Runtime-table decode routing failed");
                 return false;
@@ -682,7 +787,7 @@ namespace llaminar2
             LOG_ERROR("[MoERoutingStage] MTP verifier correction replay requested grouped prefill "
                       "routing for seq_len=1, but the device-routed prefill path is unavailable"
                       << " (device=" << params_.device_id.toString()
-                      << ", grouped_prefill=" << debugEnv().rocm.moe_grouped_prefill
+                      << ", gpu_moe_grouped_prefill=" << debugEnv().gpu_moe.grouped_prefill
                       << ", d_model=" << params_.d_model
                       << ", num_experts=" << params_.num_experts
                       << ", top_k=" << params_.top_k
@@ -1094,13 +1199,57 @@ namespace llaminar2
     {
         if (!params_.device_id.is_cuda() && !params_.device_id.is_rocm())
             return WorkspaceRequirements{};
-        if (params_.device_id.is_rocm())
-            return MoEWorkspaceBuffers::rocmRouting(
+        WorkspaceRequirements reqs =
+            params_.device_id.is_rocm()
+                ? MoEWorkspaceBuffers::rocmRouting(
                 params_.seq_len,
                 params_.d_model,
                 params_.num_experts,
-                params_.top_k);
-        return MoEWorkspaceBuffers::routing(params_.seq_len, params_.num_experts, params_.top_k);
+                      params_.top_k)
+                : MoEWorkspaceBuffers::routing(params_.seq_len, params_.num_experts, params_.top_k);
+
+        if (params_.device_rebalance_route_apply)
+        {
+            const std::string &workspace_name =
+                params_.device_rebalance_workspace_name;
+            const size_t command_buffer_count =
+                static_cast<size_t>(std::max<uint32_t>(
+                    1u,
+                    params_.device_rebalance_command_buffer_count));
+            const size_t plan_capacity =
+                static_cast<size_t>(params_.device_rebalance_plan_capacity);
+            reqs.buffers.push_back({
+                MoEDeviceRebalanceStage::workspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_TRANSFER_PLAN,
+                    workspace_name),
+                command_buffer_count * plan_capacity *
+                    sizeof(DeviceMoERebalancePlanEntry),
+                256,
+                true});
+            reqs.buffers.push_back({
+                MoEDeviceRebalanceStage::workspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_COMMAND_HEADER,
+                    workspace_name),
+                command_buffer_count *
+                    sizeof(DeviceMoERebalanceCommandBufferHeader),
+                256,
+                true});
+            reqs.buffers.push_back({
+                MoEDeviceRebalanceStage::workspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_APPLY_STATUS,
+                    workspace_name),
+                sizeof(DeviceMoERebalanceApplyStatus),
+                256,
+                true});
+            reqs.buffers.push_back({
+                MoEDeviceRebalanceStage::workspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_CONTROLLER_STATE,
+                    workspace_name),
+                sizeof(DeviceMoERebalanceGraphControllerState),
+                256,
+                true});
+        }
+        return reqs;
     }
 
     void MoERoutingStage::bindWorkspace(DeviceWorkspaceManager *workspace)

@@ -1,0 +1,1621 @@
+/**
+ * @file MoEDeviceRebalanceStage.cpp
+ * @brief Implementation of graph-capturable MoE device rebalance stage.
+ */
+
+#include "MoEDeviceRebalanceStage.h"
+
+#include "../../../backends/BackendManager.h"
+#include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../backends/IWorkerGPUContext.h"
+#include "../../../collective/ILocalTPContext.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+#include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
+#include "../../../execution/local_execution/device/WorkspaceDescriptor.h"
+#include "../../../execution/moe/MoERuntimeTable.h"
+#include "../../../kernels/IMoEKernel.h"
+#include "../../../kernels/KernelFactory.h"
+#include "../../../utils/Logger.h"
+#include "../../../utils/PerfStatsCollector.h"
+
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
+#include <utility>
+#include <vector>
+
+namespace llaminar2
+{
+    namespace
+    {
+        using KernelFactory = llaminar::v2::kernels::KernelFactory;
+
+        constexpr const char *kDefaultStageName = "moe_device_rebalance";
+
+        std::string suffixFor(const std::string &stage_name)
+        {
+            return stage_name.empty() ? std::string(kDefaultStageName) : stage_name;
+        }
+
+        const char *phaseName(DeviceMoERebalanceStagePhase phase)
+        {
+            switch (phase)
+            {
+            case DeviceMoERebalanceStagePhase::PlanCopyApply:
+                return "plan_copy_apply";
+            case DeviceMoERebalanceStagePhase::CollectState:
+                return "collect_state";
+            case DeviceMoERebalanceStagePhase::CollectAndGatherState:
+                return "collect_and_gather_state";
+            case DeviceMoERebalanceStagePhase::PlanAndCopy:
+                return "plan_and_copy";
+            case DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband:
+                return "plan_and_copy_after_sideband";
+            case DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband:
+                return "plan_commands_after_sideband";
+            case DeviceMoERebalanceStagePhase::CopyPreparedPayload:
+                return "copy_prepared_payload";
+            case DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband:
+                return "pack_collective_payload_after_sideband";
+            case DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband:
+                return "unpack_collective_payload_after_sideband";
+            case DeviceMoERebalanceStagePhase::Apply:
+                return "apply";
+            case DeviceMoERebalanceStagePhase::JoinTransfer:
+                return "join_transfer";
+            default:
+                return "unknown";
+            }
+        }
+
+        const char *boolString(bool value)
+        {
+            return value ? "true" : "false";
+        }
+
+    } // namespace
+
+    std::string MoEDeviceRebalanceStage::workspaceBufferName(
+        const char *base_name,
+        const std::string &workspace_name)
+    {
+        if (!base_name || !*base_name)
+            throw std::invalid_argument("MoEDeviceRebalanceStage workspace buffer base name is required");
+        return std::string(base_name) + "_" + suffixFor(workspace_name);
+    }
+
+    DeviceMoERebalanceTransferState::~DeviceMoERebalanceTransferState()
+    {
+        release();
+    }
+
+    bool DeviceMoERebalanceTransferState::ensure(
+        DeviceId device,
+        const std::string &name_suffix)
+    {
+        if (transfer_stream_ && compute_ready_event_ && transfer_done_event_)
+            return true;
+
+        IBackend *backend = getBackendFor(device);
+        if (!backend)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Could not resolve backend for "
+                      << device.to_string());
+            return false;
+        }
+
+        int device_ordinal = -1;
+        try
+        {
+            device_ordinal = device.gpu_ordinal();
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Could not resolve GPU ordinal for "
+                      << device.to_string() << ": " << e.what());
+            return false;
+        }
+
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(device);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Could not resolve worker GPU context for "
+                      << device.to_string() << ": " << e.what());
+            return false;
+        }
+
+        transfer_stream_ = gpu_ctx->getOrCreateAuxiliaryStream(
+            "moe_device_rebalance_transfer:" + suffixFor(name_suffix));
+        if (!transfer_stream_)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to create context-owned transfer stream for "
+                      << device.to_string());
+            return false;
+        }
+
+        event_backend_ = backend;
+        event_device_ordinal_ = device_ordinal;
+        if (!compute_ready_event_)
+            compute_ready_event_ = backend->createEvent(device_ordinal);
+        if (!transfer_done_event_)
+            transfer_done_event_ = backend->createEvent(device_ordinal);
+
+        if (!compute_ready_event_ || !transfer_done_event_)
+        {
+            LOG_ERROR("[DeviceMoERebalanceTransferState] Failed to create transfer stream ordering events for "
+                      << device.to_string());
+            release();
+            return false;
+        }
+
+        return true;
+    }
+
+    void DeviceMoERebalanceTransferState::release()
+    {
+        if (event_backend_ && event_device_ordinal_ >= 0)
+        {
+            if (compute_ready_event_)
+                event_backend_->destroyEvent(
+                    compute_ready_event_,
+                    event_device_ordinal_);
+            if (transfer_done_event_)
+                event_backend_->destroyEvent(
+                    transfer_done_event_,
+                    event_device_ordinal_);
+        }
+        compute_ready_event_ = nullptr;
+        transfer_done_event_ = nullptr;
+        event_backend_ = nullptr;
+        event_device_ordinal_ = -1;
+        /*
+         * transfer_stream_ is context-owned via IWorkerGPUContext. It remains
+         * valid until the context resets auxiliary streams or shuts down.
+         */
+        transfer_stream_ = nullptr;
+    }
+
+    MoEDeviceRebalanceStage::MoEDeviceRebalanceStage(Params params)
+        : IComputeStage(params.device_id), params_(std::move(params))
+    {
+    }
+
+    MoEDeviceRebalanceStage::~MoEDeviceRebalanceStage() = default;
+
+    std::string MoEDeviceRebalanceStage::localHistogramBufferName() const
+    {
+        return std::string(WS_LOCAL_HISTOGRAM) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::gatheredHistogramBufferName() const
+    {
+        return std::string(WS_GATHERED_HISTOGRAM) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::transferPlanBufferName() const
+    {
+        return std::string(WS_TRANSFER_PLAN) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::transferPlanCountBufferName() const
+    {
+        return std::string(WS_TRANSFER_PLAN_COUNT) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::commandHeaderBufferName() const
+    {
+        return std::string(WS_COMMAND_HEADER) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::controllerStateBufferName() const
+    {
+        return std::string(WS_CONTROLLER_STATE) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::gatheredTransferPlanBufferName() const
+    {
+        return std::string(WS_GATHERED_TRANSFER_PLAN) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::gatheredCommandHeaderBufferName() const
+    {
+        return std::string(WS_GATHERED_COMMAND_HEADER) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::waveStateBufferName() const
+    {
+        return std::string(WS_WAVE_STATE) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::statusBufferName() const
+    {
+        return std::string(WS_STATUS) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::localDirectoryBufferName() const
+    {
+        return std::string(WS_LOCAL_DIRECTORY) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::localSourceDescriptorsBufferName() const
+    {
+        return std::string(WS_LOCAL_SOURCE_DESCRIPTORS) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::localTransferPayloadBufferName() const
+    {
+        return std::string(WS_LOCAL_TRANSFER_PAYLOAD) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::gatheredTransferPayloadBufferName() const
+    {
+        return std::string(WS_GATHERED_TRANSFER_PAYLOAD) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::applyStatusBufferName() const
+    {
+        return std::string(WS_APPLY_STATUS) + "_" + workspaceSuffix();
+    }
+
+    size_t MoEDeviceRebalanceStage::localHistogramEntries() const
+    {
+        return histogramLayerCount() *
+               static_cast<size_t>(params_.config.num_experts);
+    }
+
+    size_t MoEDeviceRebalanceStage::gatheredHistogramEntries() const
+    {
+        return localHistogramEntries() *
+               static_cast<size_t>(params_.config.participant_count);
+    }
+
+    size_t MoEDeviceRebalanceStage::localDirectoryEntries() const
+    {
+        return static_cast<size_t>(params_.config.num_layers) *
+               static_cast<size_t>(params_.config.num_experts);
+    }
+
+    size_t MoEDeviceRebalanceStage::localSourceDescriptorEntries() const
+    {
+        return static_cast<size_t>(params_.config.participant_count) *
+               commandBufferCount() *
+               transferPlanCapacity();
+    }
+
+    size_t MoEDeviceRebalanceStage::histogramLayerCount() const
+    {
+        const uint32_t window_count =
+            params_.config.layer_window_count == 0u
+                ? params_.config.num_layers
+                : std::min(params_.config.layer_window_count,
+                           params_.config.num_layers);
+        const uint32_t wave_count =
+            params_.config.layer_wave_count == 0u
+                ? window_count
+                : std::min(params_.config.layer_wave_count, window_count);
+        return static_cast<size_t>(std::max<uint32_t>(1u, wave_count));
+    }
+
+    size_t MoEDeviceRebalanceStage::transferPlanEntries() const
+    {
+        return static_cast<size_t>(
+            deviceMoERebalanceCommandPlanCapacity(params_.config, params_.transfer_mode));
+    }
+
+    size_t MoEDeviceRebalanceStage::transferPlanCapacity() const
+    {
+        return transferPlanEntries();
+    }
+
+    size_t MoEDeviceRebalanceStage::payloadSlotCapacity() const
+    {
+        if (!usesCollectivePayloadLane())
+            return 0;
+        const size_t captured_slot_capacity =
+            params_.collective_payload_slot_capacity == 0
+                ? static_cast<size_t>(params_.local_transfer_slot_count)
+                : std::min<size_t>(
+                      static_cast<size_t>(params_.collective_payload_slot_capacity),
+                      static_cast<size_t>(params_.local_transfer_slot_count));
+        return std::min<size_t>(
+            transferPlanCapacity(),
+            captured_slot_capacity);
+    }
+
+    size_t MoEDeviceRebalanceStage::commandBufferCount() const
+    {
+        return usesTransferSlotApply() ? 2u : 1u;
+    }
+
+    size_t MoEDeviceRebalanceStage::collectivePayloadSlotCount() const
+    {
+        const size_t slot_capacity = payloadSlotCapacity();
+        if (usesCompactTransferSlots())
+            return slot_capacity;
+        return slot_capacity * static_cast<size_t>(params_.config.participant_count);
+    }
+
+    size_t MoEDeviceRebalanceStage::collectivePayloadLocalBytes() const
+    {
+        return collectivePayloadSlotCount() *
+               static_cast<size_t>(params_.collective_payload_slot_bytes);
+    }
+
+    size_t MoEDeviceRebalanceStage::collectivePayloadGatheredBytes() const
+    {
+        return collectivePayloadLocalBytes() *
+               static_cast<size_t>(params_.config.participant_count);
+    }
+
+    bool MoEDeviceRebalanceStage::usesTransferSlotApply() const
+    {
+        return deviceMoERebalanceModeUsesTransferSlots(params_.transfer_mode) &&
+               params_.local_transfer_slots != nullptr &&
+               params_.local_transfer_slot_count > 0;
+    }
+
+    bool MoEDeviceRebalanceStage::usesCompactTransferSlots() const
+    {
+        return usesTransferSlotApply() &&
+               params_.transfer_mode == DeviceMoERebalanceTransferMode::CompactTransferSlots;
+    }
+
+    bool MoEDeviceRebalanceStage::usesFixedPayloadTransfer() const
+    {
+        return usesTransferSlotApply() &&
+               deviceMoERebalanceModeMovesFixedPayloadCapacity(params_.transfer_mode);
+    }
+
+    bool MoEDeviceRebalanceStage::usesCollectivePayloadLane() const
+    {
+        return usesTransferSlotApply() &&
+               deviceMoERebalanceModeUsesCollectivePayloadLane(params_.transfer_mode);
+    }
+
+    bool MoEDeviceRebalanceStage::usesReadyWaveApply() const
+    {
+        return usesTransferSlotApply() ||
+               hasDeviceMoERebalanceFlag(
+                   params_.config.flags,
+                   DeviceMoERebalanceFlags::DeferRuntimeApply);
+    }
+
+    bool MoEDeviceRebalanceStage::collectsState() const
+    {
+        return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
+               params_.phase == DeviceMoERebalanceStagePhase::CollectState ||
+               params_.phase == DeviceMoERebalanceStagePhase::CollectAndGatherState ||
+               params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy;
+    }
+
+    bool MoEDeviceRebalanceStage::gathersStateInline() const
+    {
+        return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
+               params_.phase == DeviceMoERebalanceStagePhase::CollectAndGatherState ||
+               params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy;
+    }
+
+    bool MoEDeviceRebalanceStage::runsController() const
+    {
+        return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
+               params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy ||
+               params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
+               params_.phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband;
+    }
+
+    bool MoEDeviceRebalanceStage::runsPlanning() const
+    {
+        if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
+            return false;
+        if (params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband ||
+            params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload ||
+            params_.phase == DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband)
+        {
+            return false;
+        }
+        return collectsState() || runsController();
+    }
+
+    bool MoEDeviceRebalanceStage::runsApply() const
+    {
+        return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
+               params_.phase == DeviceMoERebalanceStagePhase::Apply;
+    }
+
+    std::string MoEDeviceRebalanceStage::workspaceSuffix() const
+    {
+        return suffixFor(params_.workspace_name.empty()
+                             ? params_.stage_name
+                             : params_.workspace_name);
+    }
+
+    DeviceMoERebalanceTransferState *MoEDeviceRebalanceStage::transferState() const
+    {
+        return params_.transfer_state.get();
+    }
+
+    bool MoEDeviceRebalanceStage::ensureAsyncTransferState()
+    {
+        if (!usesTransferSlotApply())
+            return true;
+        if (!params_.transfer_state)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-slot rebalance requires shared transfer state"
+                      << " stage=" << suffixFor(params_.stage_name)
+                      << " phase=" << phaseName(params_.phase));
+            return false;
+        }
+        return params_.transfer_state->ensure(params_.device_id, workspaceSuffix());
+    }
+
+    bool MoEDeviceRebalanceStage::validateCommon(const char *context) const
+    {
+        const char *label = context ? context : "MoEDeviceRebalanceStage";
+        if (!params_.device_id.is_gpu())
+        {
+            LOG_ERROR("[" << label << "] GPU device required, got "
+                          << params_.device_id.to_string());
+            return false;
+        }
+        if (!validateDeviceMoERebalanceConfig(params_.config))
+        {
+            LOG_ERROR("[" << label << "] Invalid device rebalance config"
+                          << " layers=" << params_.config.num_layers
+                          << " experts=" << params_.config.num_experts
+                          << " top_k=" << params_.config.top_k
+                          << " participant_id=" << params_.config.participant_id
+                          << " participant_count=" << params_.config.participant_count
+                          << " root_participant=" << params_.config.root_participant
+                          << " window=" << params_.config.window_size_tokens);
+            return false;
+        }
+        if (!params_.tp_ctx)
+        {
+            LOG_ERROR("[" << label << "] Missing LocalTP context");
+            return false;
+        }
+        if (!params_.moe_runtime_table)
+        {
+            LOG_ERROR("[" << label << "] Missing MoE runtime table");
+            return false;
+        }
+        if (params_.tp_ctx->degree() != static_cast<int>(params_.config.participant_count))
+        {
+            LOG_ERROR("[" << label << "] LocalTP degree/config participant count mismatch"
+                          << " degree=" << params_.tp_ctx->degree()
+                          << " participant_count=" << params_.config.participant_count);
+            return false;
+        }
+        if (params_.tp_device_idx < 0 ||
+            params_.tp_device_idx >= params_.tp_ctx->degree() ||
+            params_.tp_device_idx != static_cast<int>(params_.config.participant_id))
+        {
+            LOG_ERROR("[" << label << "] Invalid TP participant index"
+                          << " tp_device_idx=" << params_.tp_device_idx
+                          << " config_participant_id=" << params_.config.participant_id
+                          << " degree=" << params_.tp_ctx->degree());
+            return false;
+        }
+        if (params_.moe_runtime_table->layerCount() != static_cast<int>(params_.config.num_layers))
+        {
+            LOG_ERROR("[" << label << "] Runtime table layer/config mismatch"
+                          << " runtime_layers=" << params_.moe_runtime_table->layerCount()
+                          << " config_layers=" << params_.config.num_layers);
+            return false;
+        }
+        auto *device_table = dynamic_cast<DeviceMoERuntimeTable *>(params_.moe_runtime_table);
+        if (!device_table || !device_table->isMirroredToDevice())
+        {
+            LOG_ERROR("[" << label << "] Device-side rebalance requires a mirrored DeviceMoERuntimeTable");
+            return false;
+        }
+        if (device_table->expertCount() != static_cast<int>(params_.config.num_experts) ||
+            device_table->topK() != static_cast<int>(params_.config.top_k))
+        {
+            LOG_ERROR("[" << label << "] Runtime table shape/config mismatch"
+                          << " table_experts=" << device_table->expertCount()
+                          << " config_experts=" << params_.config.num_experts
+                          << " table_top_k=" << device_table->topK()
+                          << " config_top_k=" << params_.config.top_k);
+            return false;
+        }
+        if (usesCollectivePayloadLane() && params_.collective_payload_slot_bytes == 0)
+        {
+            LOG_ERROR("[" << label << "] Transfer-slot apply with a collective payload lane requires non-zero payload slot bytes");
+            return false;
+        }
+        if (usesCollectivePayloadLane() && payloadSlotCapacity() == 0)
+        {
+            LOG_ERROR("[" << label << "] Transfer-slot apply with a collective payload lane requires non-zero payload slot capacity");
+            return false;
+        }
+        return true;
+    }
+
+    bool MoEDeviceRebalanceStage::execute(IDeviceContext *ctx)
+    {
+        if (!ensureContext(ctx, "MoEDeviceRebalanceStage"))
+            return false;
+        if (!validateCommon("MoEDeviceRebalanceStage"))
+            return false;
+
+        void *stream = gpuStream();
+        if (!stream)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Explicit non-null GPU stream is required");
+            return false;
+        }
+
+        if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
+        {
+            if (!ensureAsyncTransferState())
+                return false;
+            auto *transfer_state = transferState();
+            if (!transfer_state || !transfer_state->transferDoneEvent())
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] JoinTransfer requires transfer completion event");
+                return false;
+            }
+
+            IWorkerGPUContext *gpu_ctx = nullptr;
+            try
+            {
+                gpu_ctx = &GPUDeviceContextPool::instance().getContext(params_.device_id);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Could not resolve worker GPU context for transfer join on "
+                          << params_.device_id.to_string() << ": " << e.what());
+                return false;
+            }
+
+            if (!gpu_ctx ||
+                !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue late transfer-stream join");
+                return false;
+            }
+
+            return true;
+        }
+
+        if (!bound_workspace_)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Workspace was not bound");
+            return false;
+        }
+
+        auto *plan_entries = static_cast<DeviceMoERebalancePlanEntry *>(
+            bound_workspace_->getBuffer(transferPlanBufferName()));
+        auto *plan_count = static_cast<uint32_t *>(
+            bound_workspace_->getBuffer(transferPlanCountBufferName()));
+        auto *command_header = static_cast<DeviceMoERebalanceCommandBufferHeader *>(
+            bound_workspace_->getBuffer(commandHeaderBufferName()));
+        auto *controller_state = static_cast<DeviceMoERebalanceGraphControllerState *>(
+            bound_workspace_->getBuffer(controllerStateBufferName()));
+        auto *wave_state = static_cast<DeviceMoERebalanceWaveState *>(
+            bound_workspace_->getBuffer(waveStateBufferName()));
+        if (!plan_entries || !plan_count || !command_header || !controller_state || !wave_state)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Missing workspace buffers"
+                      << " plan_entries=" << static_cast<void *>(plan_entries)
+                      << " plan_count=" << static_cast<void *>(plan_count)
+                      << " command_header=" << static_cast<void *>(command_header)
+                      << " controller_state=" << static_cast<void *>(controller_state)
+                      << " wave_state=" << static_cast<void *>(wave_state)
+                      << " phase=" << phaseName(params_.phase));
+            return false;
+        }
+
+        uint64_t *local = nullptr;
+        uint64_t *gathered = nullptr;
+        DeviceMoERebalanceStatus *status = nullptr;
+        if (runsPlanning())
+        {
+            local = static_cast<uint64_t *>(
+                bound_workspace_->getBuffer(localHistogramBufferName()));
+            gathered = static_cast<uint64_t *>(
+                bound_workspace_->getBuffer(gatheredHistogramBufferName()));
+            status = static_cast<DeviceMoERebalanceStatus *>(
+                bound_workspace_->getBuffer(statusBufferName()));
+            if (!local || !gathered || !status)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Missing planning workspace buffers"
+                          << " local=" << static_cast<void *>(local)
+                          << " gathered=" << static_cast<void *>(gathered)
+                          << " status=" << static_cast<void *>(status)
+                          << " phase=" << phaseName(params_.phase));
+                return false;
+            }
+        }
+
+        DeviceMoEExpertDirectoryEntry *local_directory = nullptr;
+        DeviceMoERebalanceApplyStatus *apply_status = nullptr;
+        DeviceMoERebalancePlanEntry *gathered_plan_entries = nullptr;
+        DeviceMoERebalanceCommandBufferHeader *gathered_command_headers = nullptr;
+        DeviceMoEExpertDirectoryEntry *local_source_descriptors = nullptr;
+        uint8_t *local_transfer_payload = nullptr;
+        uint8_t *gathered_transfer_payload = nullptr;
+        if (usesReadyWaveApply())
+        {
+            apply_status = static_cast<DeviceMoERebalanceApplyStatus *>(
+                bound_workspace_->getBuffer(applyStatusBufferName()));
+            if (!apply_status)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Missing ready-wave apply status workspace buffer"
+                          << " apply_status=" << static_cast<void *>(apply_status));
+                return false;
+            }
+        }
+        if (usesTransferSlotApply())
+        {
+            gathered_plan_entries = static_cast<DeviceMoERebalancePlanEntry *>(
+                bound_workspace_->getBuffer(gatheredTransferPlanBufferName()));
+            gathered_command_headers = static_cast<DeviceMoERebalanceCommandBufferHeader *>(
+                bound_workspace_->getBuffer(gatheredCommandHeaderBufferName()));
+            if (!gathered_plan_entries ||
+                !gathered_command_headers)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Missing transfer-slot metadata workspace buffers"
+                          << " gathered_plan_entries=" << static_cast<void *>(gathered_plan_entries)
+                          << " gathered_command_headers=" << static_cast<void *>(gathered_command_headers));
+                return false;
+            }
+            if (usesCompactTransferSlots())
+            {
+                local_source_descriptors = static_cast<DeviceMoEExpertDirectoryEntry *>(
+                    bound_workspace_->getBuffer(localSourceDescriptorsBufferName()));
+                if (!local_source_descriptors)
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Missing compact source-descriptor workspace buffers"
+                              << " local_source_descriptors=" << static_cast<void *>(local_source_descriptors));
+                    return false;
+                }
+            }
+            if (usesCollectivePayloadLane())
+            {
+                local_transfer_payload = static_cast<uint8_t *>(
+                    bound_workspace_->getBuffer(localTransferPayloadBufferName()));
+                gathered_transfer_payload = static_cast<uint8_t *>(
+                    bound_workspace_->getBuffer(gatheredTransferPayloadBufferName()));
+                if (!local_transfer_payload || !gathered_transfer_payload)
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Missing collective payload transfer workspace buffers"
+                              << " local_transfer_payload=" << static_cast<void *>(local_transfer_payload)
+                              << " gathered_transfer_payload=" << static_cast<void *>(gathered_transfer_payload));
+                    return false;
+                }
+            }
+            if (usesFixedPayloadTransfer())
+            {
+                local_directory = static_cast<DeviceMoEExpertDirectoryEntry *>(
+                    bound_workspace_->getBuffer(localDirectoryBufferName()));
+                if (!local_directory)
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Missing fixed-payload local directory workspace buffer"
+                              << " local_directory=" << static_cast<void *>(local_directory));
+                    return false;
+                }
+            }
+        }
+
+        IMoEKernel *moe_kernel = KernelFactory::getOrCreateMoEKernel(params_.device_id);
+        if (!moe_kernel)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Failed to get MoE kernel for "
+                      << params_.device_id.to_string());
+            return false;
+        }
+        moe_kernel->setGPUStream(stream);
+
+        if (!moe_kernel->initializeDeviceRebalanceGraphController(
+                controller_state,
+                params_.config))
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Failed to initialize device rebalance graph controller state");
+            return false;
+        }
+
+        if (PerfStatsCollector::isEnabled())
+        {
+            PerfStatsCollector::addCounter(
+                "moe_rebalance",
+                "device_rebalance_stage_mode",
+                1.0,
+                "decode",
+                params_.device_id.to_string(),
+                {{"stage", suffixFor(params_.stage_name)},
+                 {"phase", phaseName(params_.phase)},
+                 {"collects_state", boolString(collectsState())},
+	                 {"gathers_state_inline", boolString(gathersStateInline())},
+	                 {"uses_sideband_state",
+	                  boolString(params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
+	                             params_.phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband)},
+                 {"uses_transfer_slots", boolString(usesTransferSlotApply())},
+                 {"command_buffer_count", std::to_string(commandBufferCount())}});
+            if (runsPlanning())
+            {
+                const size_t local_histogram_entries = localHistogramEntries();
+                const size_t gathered_histogram_entries = gatheredHistogramEntries();
+                const size_t local_histogram_bytes =
+                    local_histogram_entries * sizeof(uint64_t);
+                const size_t gathered_histogram_bytes =
+                    gathered_histogram_entries * sizeof(uint64_t);
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_rebalance_histogram_payload_bytes",
+                    static_cast<double>(gathered_histogram_bytes),
+                    "decode",
+                    params_.device_id.to_string(),
+                    {{"stage", suffixFor(params_.stage_name)},
+                     {"phase", phaseName(params_.phase)},
+                     {"histogram_layer_count", std::to_string(histogramLayerCount())},
+                     {"num_experts", std::to_string(params_.config.num_experts)},
+                     {"participant_count", std::to_string(params_.config.participant_count)},
+                     {"layer_window_count", std::to_string(params_.config.layer_window_count)},
+                     {"layer_wave_count", std::to_string(params_.config.layer_wave_count)},
+                     {"local_entries", std::to_string(local_histogram_entries)},
+                     {"gathered_entries", std::to_string(gathered_histogram_entries)},
+                     {"local_bytes", std::to_string(local_histogram_bytes)},
+                     {"gathered_bytes", std::to_string(gathered_histogram_bytes)}});
+            }
+        }
+
+        DeviceMoELayerRuntime *runtime_layers =
+            params_.moe_runtime_table->deviceLayerState(0);
+        if (!runtime_layers)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Runtime table returned null device state");
+            return false;
+        }
+
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        DeviceMoERebalanceTransferState *transfer_state = nullptr;
+        void *transfer_stream = nullptr;
+        bool transfer_stream_is_stage_stream = false;
+        if (usesTransferSlotApply())
+        {
+            if (!ensureAsyncTransferState())
+                return false;
+            transfer_state = transferState();
+            if (!transfer_state ||
+                !transfer_state->transferStream() ||
+                !transfer_state->computeReadyEvent() ||
+                !transfer_state->transferDoneEvent())
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-slot rebalance requires an explicit transfer stream and events"
+                          << " phase=" << phaseName(params_.phase));
+                return false;
+            }
+
+            transfer_stream = transfer_state->transferStream();
+#ifdef HAVE_ROCM
+            if (isGraphCaptureActive() && params_.device_id.is_rocm())
+            {
+                /*
+                 * HIP stream capture currently does not replay the event-linked
+                 * auxiliary transfer stream reliably for the rebalance graph.
+                 * Keep ROCm captured transfer work on the stage stream until
+                 * the ROCm multi-stream capture path has parity coverage.
+                 */
+                transfer_stream = stream;
+                transfer_stream_is_stage_stream = true;
+            }
+#endif
+
+            try
+            {
+                gpu_ctx = &GPUDeviceContextPool::instance().getContext(params_.device_id);
+            }
+            catch (const std::exception &e)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Could not resolve worker GPU context for transfer stream ordering on "
+                          << params_.device_id.to_string() << ": " << e.what());
+                return false;
+            }
+
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_rebalance_transfer_stream_path",
+                    1.0,
+                    "decode",
+                    params_.device_id.to_string(),
+                    {{"stage", suffixFor(params_.stage_name)},
+                     {"phase", phaseName(params_.phase)},
+                     {"path", transfer_stream_is_stage_stream ? "stage_stream_fallback" : "auxiliary_stream"},
+                     {"graph_capture_active", boolString(isGraphCaptureActive())}});
+            }
+        }
+
+        auto project_domain_commands = [&]() -> bool
+        {
+            if (!usesTransferSlotApply())
+                return true;
+            if (!gathered_plan_entries || !gathered_command_headers)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Domain command projection requires gathered command buffers");
+                return false;
+            }
+            if (!moe_kernel->projectDeviceRebalanceDomainCommands(
+                    gathered_plan_entries,
+                    gathered_command_headers,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    plan_entries,
+                    command_header,
+                    params_.config,
+                    status,
+                    static_cast<uint32_t>(payloadSlotCapacity()),
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to project gathered root commands into local apply ABI");
+                return false;
+            }
+            if (PerfStatsCollector::isEnabled())
+            {
+                PerfStatsCollector::addCounter(
+                    "moe_rebalance",
+                    "device_rebalance_domain_command_projection",
+                    1.0,
+                    "decode",
+                    params_.device_id.to_string(),
+                    {{"stage", suffixFor(params_.stage_name)},
+                     {"phase", phaseName(params_.phase)},
+                     {"root_participant", std::to_string(params_.config.root_participant)},
+                     {"participant", std::to_string(params_.config.participant_id)},
+                     {"command_buffer_count", std::to_string(commandBufferCount())}});
+            }
+            return true;
+        };
+
+        auto join_transfer_stream_to_stage = [&](const char *context) -> bool
+        {
+            if (!usesTransferSlotApply())
+                return true;
+            if (!gpu_ctx || !transfer_state)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] " << context
+                          << " requires transfer stream state");
+                return false;
+            }
+            if (!gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent(),
+                                             transfer_stream))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to record "
+                          << context << " transfer-stream completion event");
+                return false;
+            }
+            if (isGraphCaptureActive() &&
+                params_.join_transfer_stream_after_copy &&
+                !transfer_stream_is_stage_stream &&
+                !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join "
+                          << context << " transfer stream back to capture stream");
+                return false;
+            }
+            moe_kernel->setGPUStream(stream);
+            return true;
+        };
+
+        auto copy_prepared_payload = [&](bool transfer_stream_already_ordered) -> bool
+        {
+            if (!usesCollectivePayloadLane())
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Prepared payload copy requires a collective payload lane");
+                return false;
+            }
+            if (!gpu_ctx || !transfer_state)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Prepared payload copy requires transfer stream state");
+                return false;
+            }
+
+            if (!transfer_stream_already_ordered &&
+                !transfer_stream_is_stage_stream &&
+                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+                 !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue prepared payload compute-to-transfer dependency");
+                return false;
+            }
+
+            moe_kernel->setGPUStream(transfer_stream);
+            if (usesCompactTransferSlots())
+            {
+                if (!moe_kernel->packDeviceRebalanceSourceDescriptors(
+                        runtime_layers,
+                        plan_entries,
+                        command_header,
+                        static_cast<uint32_t>(transferPlanCapacity()),
+                        local_source_descriptors,
+                        params_.config,
+                        controller_state,
+                        static_cast<uint32_t>(commandBufferCount())))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Compact rebalance source-descriptor pack failed");
+                    return false;
+                }
+
+                if (!moe_kernel->packDeviceRebalanceCompactPayloads(
+                        plan_entries,
+                        command_header,
+                        static_cast<uint32_t>(transferPlanCapacity()),
+                        local_source_descriptors,
+                        local_transfer_payload,
+                        static_cast<uint32_t>(collectivePayloadSlotCount()),
+                        params_.collective_payload_slot_bytes,
+                        params_.config,
+                        apply_status,
+                        controller_state,
+                        static_cast<uint32_t>(commandBufferCount())))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Compact rebalance payload pack failed");
+                    return false;
+                }
+            }
+            else
+            {
+                if (!moe_kernel->packDeviceRebalanceCollectivePayloads(
+                        gathered_plan_entries,
+                        gathered_command_headers,
+                        static_cast<uint32_t>(transferPlanCapacity()),
+                        local_directory,
+                        local_transfer_payload,
+                        static_cast<uint32_t>(collectivePayloadSlotCount()),
+                        params_.collective_payload_slot_bytes,
+                        params_.config,
+                        apply_status,
+                        controller_state,
+                        static_cast<uint32_t>(commandBufferCount())))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Collective rebalance payload pack failed");
+                    return false;
+                }
+            }
+
+            if (params_.payload_edge_mask != 0ULL)
+            {
+                std::vector<CollectiveP2POp> p2p_ops;
+                const size_t local_payload_bytes = collectivePayloadLocalBytes();
+                const uint32_t participant_count =
+                    std::min<uint32_t>(
+                        params_.config.participant_count,
+                        static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                for (uint32_t source = 0; source < participant_count; ++source)
+                {
+                    for (uint32_t destination = 0;
+                         destination < participant_count;
+                         ++destination)
+                    {
+                        if (source == destination)
+                            continue;
+                        const uint64_t edge_bit =
+                            moe_rebalance_policy::directedParticipantEdgeBit(
+                                source,
+                                destination,
+                                static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                        if ((params_.payload_edge_mask & edge_bit) == 0ULL)
+                            continue;
+
+                        if (source == static_cast<uint32_t>(params_.tp_device_idx))
+                        {
+                            CollectiveP2POp op;
+                            op.kind = CollectiveP2POpKind::Send;
+                            op.send_buffer = local_transfer_payload;
+                            op.count = local_payload_bytes;
+                            op.dtype = CollectiveDataType::INT8;
+                            op.peer = static_cast<int>(destination);
+                            p2p_ops.push_back(op);
+                        }
+                        if (destination == static_cast<uint32_t>(params_.tp_device_idx))
+                        {
+                            CollectiveP2POp op;
+                            op.kind = CollectiveP2POpKind::Recv;
+                            op.recv_buffer =
+                                gathered_transfer_payload +
+                                static_cast<size_t>(source) * local_payload_bytes;
+                            op.count = local_payload_bytes;
+                            op.dtype = CollectiveDataType::INT8;
+                            op.peer = static_cast<int>(source);
+                            p2p_ops.push_back(op);
+                        }
+                    }
+                }
+
+                if (!params_.tp_ctx->groupedP2PRawOnStream(
+                        p2p_ops,
+                        params_.tp_device_idx,
+                        transfer_stream,
+                        workspaceSuffix() + "_transfer_payload_p2p"))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Directed transfer-payload grouped P2P failed");
+                    return false;
+                }
+            }
+            else if (!params_.tp_ctx->allgatherRawOnStream(
+                         local_transfer_payload,
+                         gathered_transfer_payload,
+                         collectivePayloadLocalBytes(),
+                         CollectiveDataType::INT8,
+                         params_.tp_device_idx,
+                         transfer_stream,
+                         workspaceSuffix() + "_transfer_payload"))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-payload allgather failed");
+                return false;
+            }
+
+            if (!moe_kernel->unpackDeviceRebalanceCollectivePayloads(
+                    plan_entries,
+                    plan_count,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    command_header,
+                    gathered_transfer_payload,
+                    static_cast<uint32_t>(collectivePayloadSlotCount()),
+                    params_.collective_payload_slot_bytes,
+                    params_.local_transfer_slots,
+                    params_.local_transfer_slot_count,
+                    params_.config,
+                    apply_status,
+                    controller_state,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Collective rebalance payload unpack failed");
+                return false;
+            }
+
+            if (!moe_kernel->publishDeviceRebalanceTransferComplete(
+                    controller_state,
+                    command_header,
+                    wave_state,
+                    apply_status,
+                    params_.config,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to publish device rebalance transfer completion");
+                return false;
+            }
+
+            return join_transfer_stream_to_stage("prepared payload copy");
+        };
+
+        if (params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload)
+            return copy_prepared_payload(/*transfer_stream_already_ordered=*/false);
+
+        if (params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband)
+        {
+            if (!usesFixedPayloadTransfer())
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] PackCollectivePayloadAfterSideband requires fixed payload transfer slots");
+                return false;
+            }
+            if (!project_domain_commands())
+                return false;
+
+            if (!moe_kernel->packDeviceRebalanceCollectivePayloads(
+                    gathered_plan_entries,
+                    gathered_command_headers,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    local_directory,
+                    local_transfer_payload,
+                    static_cast<uint32_t>(collectivePayloadSlotCount()),
+                    params_.collective_payload_slot_bytes,
+                    params_.config,
+                    apply_status,
+                    controller_state,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Sideband collective rebalance payload pack failed");
+                return false;
+            }
+            return true;
+        }
+
+        if (params_.phase == DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband)
+        {
+            if (!usesFixedPayloadTransfer())
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] UnpackCollectivePayloadAfterSideband requires fixed payload transfer slots");
+                return false;
+            }
+            if (!gpu_ctx || !transfer_state)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Sideband collective payload unpack requires transfer stream state");
+                return false;
+            }
+
+            if (!transfer_stream_is_stage_stream &&
+                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+                 !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue sideband payload compute-to-transfer dependency");
+                return false;
+            }
+
+            moe_kernel->setGPUStream(transfer_stream);
+            if (!moe_kernel->unpackDeviceRebalanceCollectivePayloads(
+                    plan_entries,
+                    plan_count,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    command_header,
+                    gathered_transfer_payload,
+                    static_cast<uint32_t>(collectivePayloadSlotCount()),
+                    params_.collective_payload_slot_bytes,
+                    params_.local_transfer_slots,
+                    params_.local_transfer_slot_count,
+                    params_.config,
+                    apply_status,
+                    controller_state,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Sideband collective rebalance payload unpack failed");
+                return false;
+            }
+
+            if (!moe_kernel->publishDeviceRebalanceTransferComplete(
+                    controller_state,
+                    command_header,
+                    wave_state,
+                    apply_status,
+                    params_.config,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to publish sideband collective rebalance transfer completion");
+                return false;
+            }
+
+            if (!gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent(),
+                                             transfer_stream))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to record sideband transfer completion event");
+                return false;
+            }
+            if (isGraphCaptureActive() &&
+                params_.join_transfer_stream_after_copy &&
+                !transfer_stream_is_stage_stream &&
+                !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join sideband transfer stream back to capture stream");
+                return false;
+            }
+            moe_kernel->setGPUStream(stream);
+            return true;
+        }
+
+        if (runsPlanning())
+        {
+            if (collectsState())
+            {
+                if (!moe_kernel->packDeviceRebalanceHistograms(
+                        runtime_layers,
+                        local,
+                        params_.config,
+                        wave_state,
+                        controller_state,
+                        static_cast<uint32_t>(commandBufferCount())))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Failed to pack local runtime histograms");
+                    return false;
+                }
+
+                if (usesFixedPayloadTransfer())
+                {
+                    if (!moe_kernel->packDeviceRebalanceDirectory(
+                            runtime_layers,
+                            local_directory,
+                            params_.config))
+                    {
+                        LOG_ERROR("[MoEDeviceRebalanceStage] Failed to pack local expert directory");
+                        return false;
+                    }
+                }
+            }
+
+            if (gathersStateInline())
+            {
+                static_assert(sizeof(uint64_t) == 2 * sizeof(int32_t));
+                const size_t int32_words = localHistogramEntries() * 2u;
+                if (!params_.tp_ctx->allgatherRawOnStream(
+                        local,
+                        gathered,
+                        int32_words,
+                        CollectiveDataType::INT32,
+                        params_.tp_device_idx,
+                        stream,
+                        workspaceSuffix() + "_histogram"))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Histogram allgather failed");
+                    return false;
+                }
+
+            }
+
+            if (runsController())
+            {
+                if (!moe_kernel->runDeviceRebalanceController(
+                        runtime_layers,
+                        gathered,
+                        status,
+                        params_.config,
+                        plan_entries,
+                        plan_count,
+                        static_cast<uint32_t>(transferPlanCapacity()),
+                        static_cast<uint32_t>(payloadSlotCapacity()),
+                        command_header,
+                        wave_state,
+                        controller_state,
+                        static_cast<uint32_t>(commandBufferCount())))
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance controller failed");
+                    return false;
+                }
+
+                if (usesTransferSlotApply())
+                {
+                    if (!transfer_stream_is_stage_stream &&
+                        (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+                         !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
+                    {
+                        LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue compute-to-transfer stream dependency");
+                        return false;
+                    }
+                    moe_kernel->setGPUStream(transfer_stream);
+
+                    {
+                        static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
+                        static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
+                        const size_t plan_int32_words =
+                            (commandBufferCount() * transferPlanCapacity() * sizeof(DeviceMoERebalancePlanEntry)) /
+                            sizeof(int32_t);
+                        const size_t header_int32_words =
+                            (commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader)) / sizeof(int32_t);
+                        if (!params_.tp_ctx->allgatherRawOnStream(
+                                plan_entries,
+                                gathered_plan_entries,
+                                plan_int32_words,
+                                CollectiveDataType::INT32,
+                                params_.tp_device_idx,
+                                transfer_stream,
+                                workspaceSuffix() + "_transfer_plan"))
+                        {
+                            LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-plan allgather failed");
+                            return false;
+                        }
+                        if (!params_.tp_ctx->allgatherRawOnStream(
+                                command_header,
+                                gathered_command_headers,
+                                header_int32_words,
+                                CollectiveDataType::INT32,
+                                params_.tp_device_idx,
+                                transfer_stream,
+                                workspaceSuffix() + "_transfer_header"))
+                        {
+                            LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-header allgather failed");
+                            return false;
+                        }
+
+                        if (!project_domain_commands())
+                            return false;
+
+                        if (params_.phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband)
+                        {
+                            if (!join_transfer_stream_to_stage("planned command metadata"))
+                                return false;
+                            return true;
+                        }
+
+                        if (!copy_prepared_payload(/*transfer_stream_already_ordered=*/true))
+                            return false;
+                    }
+                }
+            }
+        }
+
+        if (runsApply() && usesReadyWaveApply())
+        {
+            const bool must_wait_for_inline_transfer =
+                usesTransferSlotApply() &&
+                !transfer_stream_is_stage_stream &&
+                (params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
+                 commandBufferCount() < 2u);
+            if (must_wait_for_inline_transfer &&
+                !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue transfer-to-apply stream dependency");
+                return false;
+            }
+            moe_kernel->setGPUStream(stream);
+
+            if (!moe_kernel->applyReadyDeviceRebalanceWave(
+                    runtime_layers,
+                    plan_entries,
+                    plan_count,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    params_.local_transfer_slots,
+                    params_.local_transfer_slot_count,
+                    params_.config,
+                    apply_status,
+                    controller_state,
+                    command_header,
+                    params_.apply_layer_idx,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Device rebalance ready-wave apply failed");
+                return false;
+            }
+        }
+
+        LOG_DEBUG("[MoEDeviceRebalanceStage] Enqueued graph-side rebalance"
+                  << " stage=" << suffixFor(params_.stage_name)
+                  << " device=" << params_.device_id.to_string()
+                  << " participant=" << params_.tp_device_idx
+                  << " layers=" << params_.config.num_layers
+                  << " experts=" << params_.config.num_experts
+                  << " phase=" << phaseName(params_.phase));
+        return true;
+    }
+
+    size_t MoEDeviceRebalanceStage::estimatedMemoryBytes() const
+    {
+        if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
+            return 0;
+        size_t bytes =
+            (localHistogramEntries() + gatheredHistogramEntries()) * sizeof(uint64_t) +
+            commandBufferCount() * transferPlanCapacity() * sizeof(DeviceMoERebalancePlanEntry) +
+            commandBufferCount() * sizeof(uint32_t) +
+            commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader) +
+            sizeof(DeviceMoERebalanceGraphControllerState) +
+            commandBufferCount() * sizeof(DeviceMoERebalanceWaveState) +
+            sizeof(DeviceMoERebalanceStatus);
+        if (usesReadyWaveApply())
+        {
+            bytes += sizeof(DeviceMoERebalanceApplyStatus);
+        }
+        if (usesTransferSlotApply())
+        {
+            bytes += transferPlanCapacity() *
+                         static_cast<size_t>(params_.config.participant_count) *
+                         commandBufferCount() *
+                         sizeof(DeviceMoERebalancePlanEntry) +
+                     static_cast<size_t>(params_.config.participant_count) *
+                         commandBufferCount() *
+                         sizeof(DeviceMoERebalanceCommandBufferHeader);
+            if (usesCompactTransferSlots())
+            {
+                bytes +=
+                    localSourceDescriptorEntries() *
+                    sizeof(DeviceMoEExpertDirectoryEntry);
+            }
+            if (usesCollectivePayloadLane())
+            {
+                bytes +=
+                    collectivePayloadLocalBytes() +
+                    collectivePayloadGatheredBytes();
+            }
+            if (usesFixedPayloadTransfer())
+            {
+                bytes +=
+                    localDirectoryEntries() * sizeof(DeviceMoEExpertDirectoryEntry);
+            }
+        }
+        return bytes;
+    }
+
+    bool MoEDeviceRebalanceStage::supportsBackend(ComputeBackendType backend) const
+    {
+        switch (backend)
+        {
+#ifdef HAVE_CUDA
+        case ComputeBackendType::GPU_CUDA:
+            return true;
+#endif
+#ifdef HAVE_ROCM
+        case ComputeBackendType::GPU_ROCM:
+            return true;
+#endif
+        default:
+            return false;
+        }
+    }
+
+    bool MoEDeviceRebalanceStage::isGraphCapturable() const
+    {
+        if (!validateDeviceMoERebalanceConfig(params_.config))
+            return false;
+        if (!params_.device_id.is_gpu() || !params_.tp_ctx || !params_.moe_runtime_table)
+            return false;
+        if (params_.tp_ctx->degree() <= 1 ||
+            params_.tp_ctx->degree() != static_cast<int>(params_.config.participant_count))
+            return false;
+        if (params_.tp_device_idx < 0 ||
+            params_.tp_device_idx >= params_.tp_ctx->degree() ||
+            params_.tp_device_idx != static_cast<int>(params_.config.participant_id))
+            return false;
+        auto *device_table = dynamic_cast<DeviceMoERuntimeTable *>(params_.moe_runtime_table);
+        if (!device_table || !device_table->isMirroredToDevice())
+            return false;
+
+        bool backend_supported = false;
+#ifdef HAVE_CUDA
+        backend_supported = backend_supported || params_.device_id.is_cuda();
+#endif
+#ifdef HAVE_ROCM
+        backend_supported = backend_supported || params_.device_id.is_rocm();
+#endif
+        return backend_supported &&
+               params_.tp_ctx->supportsRawAllgatherOnStreamGraphCapture();
+    }
+
+    bool MoEDeviceRebalanceStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
+    {
+        (void)ctx;
+        if (!stream)
+        {
+            LOG_ERROR("[MoEDeviceRebalanceStage] Graph launch preparation requires an explicit non-null stream");
+            return false;
+        }
+        setGPUStream(stream);
+        return !usesTransferSlotApply() || ensureAsyncTransferState();
+    }
+
+    StageDumpInfo MoEDeviceRebalanceStage::buildDumpInfoImpl() const
+    {
+        StageDumpInfo info;
+        info.addScalarInt("num_layers", static_cast<int>(params_.config.num_layers))
+            .addScalarInt("num_experts", static_cast<int>(params_.config.num_experts))
+            .addScalarInt("top_k", static_cast<int>(params_.config.top_k))
+            .addScalarInt("participant_id", static_cast<int>(params_.config.participant_id))
+            .addScalarInt("participant_count", static_cast<int>(params_.config.participant_count))
+            .addScalarInt("root_participant", static_cast<int>(params_.config.root_participant))
+            .addScalarInt("window_size_tokens", static_cast<int>(params_.config.window_size_tokens))
+            .addScalarInt("max_hot_replicas_per_participant",
+                          static_cast<int>(params_.config.max_hot_replicas_per_participant))
+            .addScalarInt("layer_window_start",
+                          static_cast<int>(params_.config.layer_window_start))
+            .addScalarInt("layer_window_count",
+                          static_cast<int>(params_.config.layer_window_count))
+            .addScalarInt("layer_wave_count",
+                          static_cast<int>(params_.config.layer_wave_count))
+            .addScalarInt("histogram_layer_count",
+                          static_cast<int>(histogramLayerCount()))
+            .addScalarInt("apply_layer_idx", params_.apply_layer_idx)
+            .addScalarBool("transfer_slots",
+                           usesTransferSlotApply())
+            .addScalarInt("collective_payload_slot_bytes",
+                          static_cast<int>(params_.collective_payload_slot_bytes))
+            .addScalarInt("collective_payload_slot_capacity",
+                          static_cast<int>(params_.collective_payload_slot_capacity))
+            .addScalarInt("payload_slot_capacity",
+                          static_cast<int>(payloadSlotCapacity()))
+            .addScalarInt("collective_payload_slot_count",
+                          static_cast<int>(collectivePayloadSlotCount()))
+            .addScalarInt("transfer_plan_entries",
+                          static_cast<int>(transferPlanEntries()))
+            .addScalarInt("transfer_plan_capacity",
+                          static_cast<int>(transferPlanCapacity()))
+            .addScalarInt("command_buffer_count",
+                          static_cast<int>(commandBufferCount()))
+            .addScalarInt("command_header_bytes",
+                          static_cast<int>(sizeof(DeviceMoERebalanceCommandBufferHeader)))
+            .addScalarInt("controller_state_bytes",
+                          static_cast<int>(sizeof(DeviceMoERebalanceGraphControllerState)))
+            .addScalarInt("wave_state_bytes",
+                          static_cast<int>(sizeof(DeviceMoERebalanceWaveState)))
+            .addScalarInt("flags", static_cast<int>(params_.config.flags));
+        return info;
+    }
+
+    WorkspaceRequirements MoEDeviceRebalanceStage::getWorkspaceRequirements(int m, int n, int k) const
+    {
+        (void)m;
+        (void)n;
+        (void)k;
+        WorkspaceRequirements reqs;
+        if (!validateDeviceMoERebalanceConfig(params_.config))
+            return reqs;
+        if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
+            return reqs;
+
+        reqs.buffers.push_back({localHistogramBufferName(),
+                                localHistogramEntries() * sizeof(uint64_t),
+                                256,
+                                true});
+        reqs.buffers.push_back({gatheredHistogramBufferName(),
+                                gatheredHistogramEntries() * sizeof(uint64_t),
+                                256,
+                                true});
+        reqs.buffers.push_back({transferPlanBufferName(),
+                                commandBufferCount() * transferPlanCapacity() *
+                                    sizeof(DeviceMoERebalancePlanEntry),
+                                256,
+                                true});
+        reqs.buffers.push_back({transferPlanCountBufferName(),
+                                commandBufferCount() * sizeof(uint32_t),
+                                256,
+                                true});
+        reqs.buffers.push_back({commandHeaderBufferName(),
+                                commandBufferCount() *
+                                    sizeof(DeviceMoERebalanceCommandBufferHeader),
+                                256,
+                                true});
+        reqs.buffers.push_back({controllerStateBufferName(),
+                                sizeof(DeviceMoERebalanceGraphControllerState),
+                                256,
+                                true});
+        reqs.buffers.push_back({waveStateBufferName(),
+                                commandBufferCount() * sizeof(DeviceMoERebalanceWaveState),
+                                256,
+                                true});
+        reqs.buffers.push_back({statusBufferName(),
+                                sizeof(DeviceMoERebalanceStatus),
+                                256,
+                                true});
+        if (usesReadyWaveApply())
+        {
+            reqs.buffers.push_back({applyStatusBufferName(),
+                                    sizeof(DeviceMoERebalanceApplyStatus),
+                                    256,
+                                    true});
+        }
+        if (usesTransferSlotApply())
+        {
+            reqs.buffers.push_back({gatheredTransferPlanBufferName(),
+                                    transferPlanCapacity() *
+                                        commandBufferCount() *
+                                        static_cast<size_t>(params_.config.participant_count) *
+                                        sizeof(DeviceMoERebalancePlanEntry),
+                                    256,
+                                    true});
+            reqs.buffers.push_back({gatheredCommandHeaderBufferName(),
+                                    static_cast<size_t>(params_.config.participant_count) *
+                                        commandBufferCount() *
+                                        sizeof(DeviceMoERebalanceCommandBufferHeader),
+                                    256,
+                                    true});
+            if (usesCompactTransferSlots())
+            {
+                reqs.buffers.push_back({localSourceDescriptorsBufferName(),
+                                        localSourceDescriptorEntries() *
+                                            sizeof(DeviceMoEExpertDirectoryEntry),
+                                        256,
+                                        true});
+            }
+            if (usesCollectivePayloadLane())
+            {
+                reqs.buffers.push_back({localTransferPayloadBufferName(),
+                                        collectivePayloadLocalBytes(),
+                                        256,
+                                        true});
+                reqs.buffers.push_back({gatheredTransferPayloadBufferName(),
+                                        collectivePayloadGatheredBytes(),
+                                        256,
+                                        true});
+            }
+            if (usesFixedPayloadTransfer())
+            {
+                reqs.buffers.push_back({localDirectoryBufferName(),
+                                        localDirectoryEntries() * sizeof(DeviceMoEExpertDirectoryEntry),
+                                        256,
+                                        true});
+            }
+        }
+        return reqs;
+    }
+
+    void MoEDeviceRebalanceStage::bindWorkspace(DeviceWorkspaceManager *workspace)
+    {
+        bound_workspace_ = workspace;
+    }
+
+    void MoEDeviceRebalanceStage::unbindWorkspace()
+    {
+        bound_workspace_ = nullptr;
+    }
+
+} // namespace llaminar2

@@ -6239,7 +6239,8 @@ bool rocmGemv_repackVNNI_to_rowmajor(
  * @brief Entrypoint for INT8 VNNI prefill GEMM.
  *
  * This function dispatches to tiled INT8-x-INT8 GEMM kernels for M>1 prefill.
- * Returning false instructs the caller to keep using the CK fallback path.
+ * Returning false is terminal for the selected Q8/INT8 prefill path; the
+ * retired CK fallback path must not be revived implicitly.
  *
  * Junior-dev note:
  * - The decode path (M=1) already has specialized GEMV kernels.

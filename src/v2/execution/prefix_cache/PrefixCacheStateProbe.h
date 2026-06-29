@@ -70,6 +70,34 @@ namespace llaminar2
         std::vector<float> conv_sample_values;
     };
 
+    struct PrefillGraphRuntimeProbe
+    {
+        bool forward_cache_valid = false;
+        bool prefill_cache_initialized = false;
+        std::string phase = "cold";
+        size_t cache_size = 0;
+        size_t node_count = 0;
+        int replay_count = 0;
+        uint64_t warmup_count = 0;
+        uint64_t initialized_count = 0;
+        uint64_t capture_count = 0;
+        uint64_t eviction_count = 0;
+        bool observation_valid = false;
+        int chunk_index = 0;
+        int bucket_seq_len = 0;
+        int real_token_start = 0;
+        int real_token_count = 0;
+        int real_token_end = 0;
+        std::string domain_id;
+        int participant_id = 0;
+        uint64_t placement_epoch = 0;
+        uint64_t topology_signature = 0;
+        std::string capture_phase;
+        std::string recapture_reason;
+        std::string reject_stage_name;
+        std::string reject_stage_type;
+    };
+
     struct PrefixRuntimeStateSnapshot
     {
         bool initialized = false;
@@ -154,6 +182,7 @@ namespace llaminar2
         std::vector<PrefixKVCacheProbe> kv_caches;
         std::vector<PrefixKVCacheProbe> mtp_kv_caches;
         std::vector<PrefixGDNLayerProbe> gdn_layers;
+        std::vector<PrefillGraphRuntimeProbe> prefill_graphs;
 
         int totalCachedTokens() const;
         int totalMTPCachedTokens() const;

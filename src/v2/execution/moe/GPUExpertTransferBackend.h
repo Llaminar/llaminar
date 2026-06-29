@@ -16,8 +16,6 @@ namespace llaminar2::detail
         size_t emins_bytes,
         void *stream);
 
-    bool canAccessPeerCUDABackend(const DeviceId &src_device, const DeviceId &dst_device);
-    bool enablePeerAccessCUDABackend(const DeviceId &current_device, const DeviceId &peer_device);
 #endif
 
 #ifdef HAVE_ROCM
@@ -32,7 +30,5 @@ namespace llaminar2::detail
         size_t emins_bytes,
         void *stream);
 
-    bool canAccessPeerROCmBackend(const DeviceId &src_device, const DeviceId &dst_device);
-    bool enablePeerAccessROCmBackend(const DeviceId &current_device, const DeviceId &peer_device);
 #endif
 }

@@ -133,10 +133,11 @@ namespace llaminar2
             int num_experts = 0;
             int top_k = 0;
             int window_size = 256;
+            int token_boundary_layer_idx = -1;       ///< Routed layer that advances decode-token windows
             int max_window_size = 4096;                ///< Cap for adaptive growth (0 = no adaptive growth)
             float window_growth_factor = 1.5f;         ///< Multiply window_size by this after each rebalance
-        int max_replicas = 0;                      ///< Max replica slots per participant (0 = disabled)
-        std::vector<DeviceId> sockets;             ///< Domain participants, e.g. {cpu:0, cpu:1}
+            int max_replicas = 0;                      ///< Max replica slots per participant (0 = disabled)
+            std::vector<DeviceId> sockets;             ///< Domain participants, e.g. {cpu:0, cpu:1}
             std::vector<int> initial_expert_to_socket; ///< [num_experts]
             SocketRebalanceConfig rebalance_config;
         };
@@ -196,6 +197,23 @@ namespace llaminar2
 
         /// Get max hot expert replica slots per participant/rank.
         int maxReplicasPerSocket() const { return config_.max_replicas; }
+
+        /// Get the ownership-swap rebalancer policy configured for this domain.
+        const SocketRebalanceConfig &rebalanceConfig() const { return config_.rebalance_config; }
+
+        /// Load-spread stats scored before the most recent rebalance policy decision.
+        const ExpertLoadImbalanceStats &lastImbalanceBefore() const { return last_imbalance_before_; }
+
+        /// Load-spread stats scored after the most recent rebalance policy decision.
+        const ExpertLoadImbalanceStats &lastImbalanceAfter() const { return last_imbalance_after_; }
+
+        /// Mean normalized spread reduction from the last policy decision.
+        double lastAverageSpreadImprovement() const
+        {
+            if (!last_imbalance_before_.valid || !last_imbalance_after_.valid)
+                return 0.0;
+            return last_imbalance_before_.average_spread - last_imbalance_after_.average_spread;
+        }
 
         /// Get total rebalances performed
         int totalRebalances() const { return total_rebalances_; }
@@ -298,6 +316,8 @@ namespace llaminar2
         float last_avg_imbalance_after_ = 0.0f;
         float last_worst_imbalance_before_ = 0.0f;
         int last_worst_layer_before_ = 0;
+        ExpertLoadImbalanceStats last_imbalance_before_;
+        ExpertLoadImbalanceStats last_imbalance_after_;
         int current_window_size_ = 0;       ///< Tracks effective window size for adaptive growth
         ExpertReplicaSet current_replicas_; ///< Active replica set
 

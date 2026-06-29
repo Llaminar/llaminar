@@ -343,6 +343,19 @@ namespace
         PrefillReplayParamProbe *probe_ = nullptr;
     };
 
+    class NonCapturablePrefillStage final : public llaminar2::testing::MockComputeStage
+    {
+    public:
+        NonCapturablePrefillStage(std::string name, DeviceId device)
+            : MockComputeStage(ComputeStageType::GEMM, std::move(name), device)
+        {
+        }
+
+        bool isGraphCapturable() const override { return false; }
+        bool supportsLazyPrefillGraphCapturePreflight() const override { return false; }
+        bool supportsPaddedPrefillGraphCapturePreflight() const override { return false; }
+    };
+
     /**
      * @brief Create a minimal ForwardInput for testing.
      *
@@ -1168,6 +1181,92 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_forward_input.token_offset, 200);
     EXPECT_EQ(host.last_forward_input.position_offset, 200);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngine, Execute_PaddedBucketedPrefillRejectsBeforeEagerFallback)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    NonCapturablePrefillStage *stage = nullptr;
+    host.graph_stage_factories.push_back(
+        [&](const std::string &name, DeviceId device)
+        {
+            auto non_capturable = std::make_unique<NonCapturablePrefillStage>(name, device);
+            stage = non_capturable.get();
+            return non_capturable;
+        });
+
+    const std::vector<int> tokens = {80, 81, 82};
+    const std::vector<int> positions = {0, 1, 2};
+    auto input = makeTestInput(3, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+    input.position_offset = 0;
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input, output, host))
+        << "A rejected bucketed prefill graph must fail instead of running an eager fallback.";
+
+    ASSERT_NE(stage, nullptr);
+    EXPECT_EQ(stage->executionCount(), 0)
+        << "Prefill rejection must happen before ordinary graph execution can mutate runtime state.";
+    EXPECT_EQ(host.ensure_workspace_calls, 0)
+        << "Rejected prefill graph should not allocate execution workspace for a fallback pass.";
+    EXPECT_EQ(host.sync_logits_calls, 0)
+        << "Rejected prefill graph should not reach the forward boundary.";
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+}
+
+TEST_F(Test__ForwardExecutionEngine, Execute_ExactPrefillRejectsBeforeFreshWarmupFallback)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "0"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    NonCapturablePrefillStage *stage = nullptr;
+    host.graph_stage_factories.push_back(
+        [&](const std::string &name, DeviceId device)
+        {
+            auto non_capturable = std::make_unique<NonCapturablePrefillStage>(name, device);
+            stage = non_capturable.get();
+            return non_capturable;
+        });
+
+    const std::vector<int> tokens = {90, 91, 92, 93};
+    const std::vector<int> positions = {0, 1, 2, 3};
+    auto input = makeTestInput(4, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+    input.position_offset = 0;
+
+    ForwardOutput output{};
+    ASSERT_TRUE(engine.execute(input, output, host))
+        << "The first exact prefill builds and executes the ordinary forward graph before cache-hit preflight.";
+    ASSERT_NE(stage, nullptr);
+    ASSERT_EQ(stage->executionCount(), 1);
+    ASSERT_EQ(host.build_forward_graph_calls, 1);
+
+    EXPECT_FALSE(engine.execute(input, output, host))
+        << "A rejected exact prefill graph cache hit must fail instead of running a fresh warmup.";
+    EXPECT_EQ(stage->executionCount(), 1)
+        << "Rejected exact prefill graph should not execute the cached graph as an eager fallback.";
+    EXPECT_EQ(host.build_forward_graph_calls, 1)
+        << "Rejected exact prefill graph should not rebuild a fallback graph.";
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_BatchedGpuPrefillSkipsBucketedAdapter)

@@ -5,6 +5,7 @@
 
 #include "Qwen35MoEGraph.h"
 #include "Qwen35MoESchema.h"
+#include "../../collective/ILocalTPContext.h"
 #include "../../utils/Logger.h"
 #include "../../execution/compute_stages/ComputeStageFactory.h"
 #include "../../execution/compute_stages/stages/MoEExpertDispatchStage.h"
@@ -17,7 +18,11 @@
 #include "../../execution/moe/MoEExpertOwnerMap.h"
 #include "../../execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "../../execution/moe/MoEOverlaySparseCollective.h"
+#include "../../execution/moe/MoERebalanceController.h"
+#include "../../execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
+#include "../../backends/BackendManager.h"
+#include "../../loaders/GPUVramPreflight.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
 #include "../../tensors/Tensors.h"
@@ -27,10 +32,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace llaminar2
 {
@@ -162,6 +172,40 @@ namespace llaminar2
                     expert_mask[static_cast<size_t>(expert)]);
         }
 
+        std::vector<int> contiguousApportionedExpertOwners(
+            int num_experts,
+            int participant_count)
+        {
+            std::vector<int> owners(static_cast<size_t>(std::max(0, num_experts)), -1);
+            if (num_experts <= 0 || participant_count <= 0)
+                return owners;
+
+            const int base = num_experts / participant_count;
+            const int remainder = num_experts % participant_count;
+            for (int participant = 0; participant < participant_count; ++participant)
+            {
+                const int count = base + (participant < remainder ? 1 : 0);
+                const int start = participant * base + std::min(participant, remainder);
+                for (int expert = start; expert < start + count && expert < num_experts; ++expert)
+                    owners[static_cast<size_t>(expert)] = participant;
+            }
+            return owners;
+        }
+
+        std::vector<int> ownerParticipantsFromMap(
+            const MoEExpertOwnerMap &owner_map,
+            int layer_idx,
+            int num_experts)
+        {
+            std::vector<int> owners(static_cast<size_t>(std::max(0, num_experts)), -1);
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                if (const auto *owner = owner_map.ownerFor(layer_idx, expert))
+                    owners[static_cast<size_t>(expert)] = owner->owner_participant;
+            }
+            return owners;
+        }
+
         bool runtimeTableHasUsableDecodeBank(
             IMoERuntimeTable *runtime_table,
             int layer_idx,
@@ -215,19 +259,35 @@ namespace llaminar2
             int layer_idx,
             int num_experts,
             int top_k,
-            const std::vector<bool> &expert_mask)
+            const std::vector<bool> &expert_mask,
+            int local_participant,
+            int participant_count,
+            const std::vector<int> &owner_participants = {})
         {
             if (!runtime_table || layer_idx < 0)
                 return false;
             if (!expert_mask.empty() &&
                 expert_mask.size() != static_cast<size_t>(num_experts))
                 return false;
+            if (local_participant < 0 ||
+                participant_count <= 0 ||
+                local_participant >= participant_count)
+            {
+                return false;
+            }
+            if (!owner_participants.empty() &&
+                owner_participants.size() != static_cast<size_t>(num_experts))
+            {
+                return false;
+            }
 
             const auto &state = runtime_table->hostLayerState(layer_idx);
             if (state.active_bank > 1 ||
                 state.active_epoch == 0 ||
                 state.expert_count != static_cast<uint32_t>(num_experts) ||
-                state.top_k != static_cast<uint32_t>(top_k))
+                state.top_k != static_cast<uint32_t>(top_k) ||
+                state.participant_id != static_cast<uint32_t>(local_participant) ||
+                state.participant_count != static_cast<uint32_t>(participant_count))
             {
                 return false;
             }
@@ -244,6 +304,24 @@ namespace llaminar2
                 const bool expected_local = expertMaskEnablesExpert(expert_mask, expert, num_experts);
                 if (bank.local_compute_mask[static_cast<size_t>(expert)] != (expected_local ? 1u : 0u))
                     return false;
+                const int expected_owner =
+                    owner_participants.empty()
+                        ? (expected_local ? local_participant : -1)
+                        : owner_participants[static_cast<size_t>(expert)];
+                if (!owner_participants.empty() && expected_owner < 0)
+                    return false;
+                if (expected_owner >= 0)
+                {
+                    if (expected_owner >= participant_count)
+                        return false;
+                    if ((bank.resident_participant_mask[static_cast<size_t>(expert)] &
+                         (1u << static_cast<uint32_t>(expected_owner))) == 0u)
+                    {
+                        return false;
+                    }
+                    if (bank.experts[static_cast<size_t>(expert)].owner_participant != expected_owner)
+                        return false;
+                }
                 if (!expected_local)
                     continue;
 
@@ -271,8 +349,9 @@ namespace llaminar2
             int d_model,
             int expert_intermediate,
             const std::vector<bool> &expert_mask,
-            int owner_participant,
+            int local_participant,
             int participant_count,
+            const std::vector<int> &owner_participants,
             const std::vector<ITensorGemm *> &gate_gemms,
             const std::vector<ITensorGemm *> &up_gemms,
             const std::vector<ITensorGemm *> &down_gemms,
@@ -291,18 +370,33 @@ namespace llaminar2
             }
             if (participant_count <= 0 ||
                 participant_count > static_cast<int>(kDeviceMoEMaxParticipants) ||
-                owner_participant < 0 ||
-                owner_participant >= participant_count)
+                local_participant < 0 ||
+                local_participant >= participant_count)
             {
                 LOG_ERROR("[Qwen35MoEGraph] " << context
                                               << ": invalid participant metadata id="
-                                              << owner_participant
+                                              << local_participant
                                               << " count=" << participant_count);
+                return false;
+            }
+            if (!owner_participants.empty() &&
+                owner_participants.size() != static_cast<size_t>(num_experts))
+            {
+                LOG_ERROR("[Qwen35MoEGraph] " << context
+                                              << ": owner participant vector size does not match num_experts="
+                                              << num_experts);
                 return false;
             }
 
             if (runtimeTableHasUsableMaskedDecodeBank(
-                    runtime_table, layer_idx, num_experts, top_k, expert_mask))
+                    runtime_table,
+                    layer_idx,
+                    num_experts,
+                    top_k,
+                    expert_mask,
+                    local_participant,
+                    participant_count,
+                    owner_participants))
             {
                 return true;
             }
@@ -329,23 +423,47 @@ namespace llaminar2
             MoEPlacementUpdate update;
             update.epoch = 1;
             update.expert_count = static_cast<uint32_t>(num_experts);
-            update.participant_id = static_cast<uint32_t>(owner_participant);
+            update.participant_id = static_cast<uint32_t>(local_participant);
             update.participant_count = static_cast<uint32_t>(participant_count);
             update.experts.resize(static_cast<size_t>(num_experts));
             update.local_compute_mask.assign(static_cast<size_t>(num_experts), 0u);
             update.replica_role.assign(static_cast<size_t>(num_experts),
                                        static_cast<uint8_t>(DeviceMoEReplicaRole::None));
-
-            const uint32_t flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
-                                                    DeviceMoEExpertFlags::Resident |
-                                                    DeviceMoEExpertFlags::PreferredOwner |
-                                                    DeviceMoEExpertFlags::LocalCompute);
+            update.resident_participant_mask.assign(static_cast<size_t>(num_experts), 0u);
 
             bool has_local_expert = false;
             for (int expert = 0; expert < num_experts; ++expert)
             {
+                const int expert_owner =
+                    owner_participants.empty()
+                        ? (expertMaskEnablesExpert(expert_mask, expert, num_experts) ? local_participant : -1)
+                        : owner_participants[static_cast<size_t>(expert)];
+                if (!owner_participants.empty() && expert_owner < 0)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": missing owner participant for expert "
+                                                  << expert << " layer " << layer_idx);
+                    return false;
+                }
+                if (expert_owner >= participant_count)
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] " << context
+                                                  << ": owner participant " << expert_owner
+                                                  << " for expert " << expert
+                                                  << " is outside participant_count="
+                                                  << participant_count);
+                    return false;
+                }
+                if (expert_owner >= 0)
+                    update.resident_participant_mask[static_cast<size_t>(expert)] =
+                        1u << static_cast<uint32_t>(expert_owner);
+
                 if (!expertMaskEnablesExpert(expert_mask, expert, num_experts))
+                {
+                    update.experts[static_cast<size_t>(expert)].logical_expert_id = expert;
+                    update.experts[static_cast<size_t>(expert)].owner_participant = expert_owner;
                     continue;
+                }
 
                 auto *gate = gate_gemms[static_cast<size_t>(expert)];
                 auto *up = up_gemms[static_cast<size_t>(expert)];
@@ -381,13 +499,20 @@ namespace llaminar2
                 }
 
                 desc.logical_expert_id = expert;
-                desc.owner_participant = owner_participant;
+                desc.owner_participant = expert_owner >= 0 ? expert_owner : local_participant;
                 desc.local_slot = expert;
-                desc.flags = flags;
+                DeviceMoEExpertFlags flags = DeviceMoEExpertFlags::Valid |
+                                             DeviceMoEExpertFlags::Resident |
+                                             DeviceMoEExpertFlags::LocalCompute;
+                if (desc.owner_participant == local_participant)
+                    flags |= DeviceMoEExpertFlags::PreferredOwner;
+                desc.flags = toMoEExpertFlags(flags);
                 update.experts[static_cast<size_t>(expert)] = desc;
                 update.local_compute_mask[static_cast<size_t>(expert)] = 1u;
                 update.replica_role[static_cast<size_t>(expert)] =
                     static_cast<uint8_t>(DeviceMoEReplicaRole::Primary);
+                update.resident_participant_mask[static_cast<size_t>(expert)] |=
+                    1u << static_cast<uint32_t>(local_participant);
                 has_local_expert = true;
             }
 
@@ -413,7 +538,14 @@ namespace llaminar2
             }
 
             return runtimeTableHasUsableMaskedDecodeBank(
-                runtime_table, layer_idx, num_experts, top_k, expert_mask);
+                runtime_table,
+                layer_idx,
+                num_experts,
+                top_k,
+                expert_mask,
+                local_participant,
+                participant_count,
+                owner_participants);
         }
 
         bool initializeFullLocalDecodeRuntimeTable(
@@ -827,6 +959,170 @@ namespace llaminar2
             return true;
         }
 
+        bool supportsDeviceSideGraphRebalanceTransfer(
+            const ILocalTPContext &tp_ctx)
+        {
+            const auto &moe_env = debugEnv().moe_rebalance;
+            if (moe_env.device_rebalance_maintenance_graph)
+                return tp_ctx.supportsRawAllgatherOnStreamGraphCapture();
+            return false;
+        }
+
+        bool isHomogeneousGpuLocalTPRebalanceDomain(
+            const ILocalTPContext &tp_ctx,
+            DeviceId device,
+            int tp_device_idx)
+        {
+            const int degree = tp_ctx.degree();
+            if (!device.is_gpu() ||
+                degree <= 1 ||
+                degree > static_cast<int>(kDeviceMoEMaxParticipants) ||
+                tp_device_idx < 0 ||
+                tp_device_idx >= degree ||
+                !supportsDeviceSideGraphRebalanceTransfer(tp_ctx))
+            {
+                return false;
+            }
+
+            const CollectiveBackendType backend = tp_ctx.backend();
+            if ((device.is_cuda() && backend != CollectiveBackendType::NCCL) ||
+                (device.is_rocm() && backend != CollectiveBackendType::RCCL))
+            {
+                return false;
+            }
+
+            const auto &participants = tp_ctx.devices();
+            if (static_cast<int>(participants.size()) != degree)
+                return false;
+
+            const DeviceType expected_type =
+                device.is_cuda() ? DeviceType::CUDA : DeviceType::ROCm;
+            for (const auto &participant : participants)
+            {
+                if (!participant.isLocal() ||
+                    !participant.isGPU() ||
+                    participant.device_type != expected_type)
+                {
+                    return false;
+                }
+            }
+
+            return participants[static_cast<size_t>(tp_device_idx)].toLocalDeviceId() == device;
+        }
+
+        std::optional<DeviceMoERebalanceTransferMode> selectGraphRebalanceTransferMode(
+            const ILocalTPContext &tp_ctx,
+            const DeviceId &destination_device,
+            uint32_t max_hot_replicas_per_participant)
+        {
+            const auto &moe_env = debugEnv().moe_rebalance;
+            if (moe_env.device_rebalance_payload_sideband ||
+                moe_env.allow_legacy_collective_rebalance_transfer)
+            {
+                LOG_ERROR("[Qwen35MoEGraph] Device-side MoE rebalance payload migration is disabled on "
+                          << destination_device.to_string()
+                          << " because fixed-size collective payload arenas move empty expert slots. "
+                             "Use CompactTransferSlots async maintenance for non-empty transfer-slot arrivals.");
+                return std::nullopt;
+            }
+
+            if (max_hot_replicas_per_participant == 0)
+            {
+                LOG_DEBUG("[Qwen35MoEGraph] Device-side MoE rebalance for "
+                          << destination_device.to_string()
+                          << " is resident-only because hot replica capacity is zero; "
+                             "host publish/apply fallback remains disabled");
+                return DeviceMoERebalanceTransferMode::ResidentOnly;
+            }
+
+            if (moe_env.device_rebalance_maintenance_graph)
+            {
+                if (!tp_ctx.supportsRawAllgatherOnStreamGraphCapture())
+                {
+                    LOG_ERROR("[Qwen35MoEGraph] Async device-side MoE rebalance maintenance on "
+                              << destination_device.to_string()
+                              << " requires graph-capturable raw NCCL/RCCL allgather on an explicit stream.");
+                    return std::nullopt;
+                }
+
+                LOG_DEBUG("[Qwen35MoEGraph] Device-side MoE rebalance will collect histogram and compact "
+                          "arrival metadata "
+                          "with the async maintenance graph on "
+                          << destination_device.to_string()
+                          << "; decode collectives will not carry rebalance histogram sidebands");
+                return DeviceMoERebalanceTransferMode::CompactTransferSlots;
+            }
+
+            LOG_ERROR("[Qwen35MoEGraph] Device-side MoE rebalance requires "
+                         "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH=1 so histogram "
+                         "state moves on the async rolling-wave maintenance lane for "
+                      << destination_device.to_string()
+                      << ". Host publish/apply fallback is refused.");
+            return std::nullopt;
+        }
+
+        int gpuOrdinalForGraphDevice(DeviceId device)
+        {
+            if (device.is_cuda())
+                return device.cuda_ordinal();
+            if (device.is_rocm())
+                return device.rocm_ordinal();
+            return -1;
+        }
+
+        std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
+        transferSlotSpecsFromExpertParams(
+            const MoEExpertComputeStage::Params &expert_params,
+            int num_experts)
+        {
+            auto make_spec =
+                [](const char *label, const std::shared_ptr<TensorBase> &view)
+                -> std::optional<DeviceMoETransferSlotDirectory::ProjectionSpec>
+            {
+                if (!view)
+                    return std::nullopt;
+                auto *unpackable = dynamic_cast<IINT8Unpackable *>(view.get());
+                const NativeVnniFormatInfo *vnni =
+                    unpackable ? unpackable->vnniFormatInfo() : nullptr;
+                if (!vnni)
+                    return std::nullopt;
+
+                DeviceMoETransferSlotDirectory::ProjectionSpec spec;
+                spec.label = label;
+                spec.N = static_cast<int>(view->rows());
+                spec.K = static_cast<int>(view->cols());
+                spec.payload_bytes_per_block = vnni->payload_bytes;
+                spec.is_asymmetric = vnni->is_asymmetric;
+                spec.has_emins = vnni->has_emins;
+                spec.codebook_id = vnni->codebook_id;
+                return spec;
+            };
+
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                if (expert >= static_cast<int>(expert_params.expert_gate_views.size()) ||
+                    expert >= static_cast<int>(expert_params.expert_up_views.size()) ||
+                    expert >= static_cast<int>(expert_params.expert_down_views.size()))
+                {
+                    break;
+                }
+
+                auto gate = make_spec("gate", expert_params.expert_gate_views[expert]);
+                auto up = make_spec("up", expert_params.expert_up_views[expert]);
+                auto down = make_spec("down", expert_params.expert_down_views[expert]);
+                if (gate && up && down)
+                {
+                    std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
+                    specs.reserve(3);
+                    specs.push_back(std::move(*gate));
+                    specs.push_back(std::move(*up));
+                    specs.push_back(std::move(*down));
+                    return specs;
+                }
+            }
+            return std::nullopt;
+        }
+
         int participantIdForTierDevice(
             const MoEExpertOwnerMap &owner_map,
             int tier_index,
@@ -914,6 +1210,165 @@ namespace llaminar2
             if (table)
                 table->resetDecodeHistogramCounts();
         }
+    }
+
+    ILocalTPContext *Qwen35MoEGraph::maintenanceTPContextForDomain(
+        const std::string &domain_key,
+        ILocalTPContext &decode_tp_ctx)
+    {
+        auto &maintenance_ctx = moe_maintenance_tp_contexts_[domain_key];
+        if (maintenance_ctx)
+            return maintenance_ctx.get();
+
+        static std::mutex registry_mutex;
+        static std::unordered_map<std::string, std::weak_ptr<ILocalTPContext>>
+            registry;
+
+        std::lock_guard<std::mutex> lock(registry_mutex);
+        if (auto existing = registry[domain_key].lock())
+        {
+            if (existing->degree() != decode_tp_ctx.degree() ||
+                existing->backend() != decode_tp_ctx.backend())
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE graph-side rebalance reused an incompatible maintenance lane for " +
+                    domain_key);
+            }
+            maintenance_ctx = std::move(existing);
+            LOG_INFO("[Qwen35MoEGraph] Reusing dedicated MoE rebalance maintenance collective lane"
+                     << " domain=" << domain_key
+                     << " degree=" << maintenance_ctx->degree()
+                     << " backend=" << collectiveBackendTypeToString(maintenance_ctx->backend())
+                     << " decode_ctx=" << static_cast<const void *>(&decode_tp_ctx)
+                     << " maintenance_ctx=" << static_cast<const void *>(maintenance_ctx.get()));
+            return maintenance_ctx.get();
+        }
+
+        auto created =
+            createLocalTPContext(
+                decode_tp_ctx.devices(),
+                decode_tp_ctx.weights(),
+                decode_tp_ctx.backend());
+        if (!created)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE graph-side rebalance could not create maintenance collective lane for " +
+                domain_key);
+        }
+        if (created->degree() != decode_tp_ctx.degree() ||
+            created->backend() != decode_tp_ctx.backend())
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE graph-side rebalance maintenance lane does not match decode lane for " +
+                domain_key);
+        }
+
+        maintenance_ctx = std::shared_ptr<ILocalTPContext>(std::move(created));
+        registry[domain_key] = maintenance_ctx;
+        LOG_INFO("[Qwen35MoEGraph] Created dedicated MoE rebalance maintenance collective lane"
+                 << " domain=" << domain_key
+                 << " degree=" << maintenance_ctx->degree()
+                 << " backend=" << collectiveBackendTypeToString(maintenance_ctx->backend())
+                 << " decode_ctx=" << static_cast<const void *>(&decode_tp_ctx)
+                 << " maintenance_ctx=" << static_cast<const void *>(maintenance_ctx.get()));
+        return maintenance_ctx.get();
+    }
+
+    ComputeGraph Qwen35MoEGraph::buildDeviceMoERebalanceMaintenanceGraph(
+        DeviceId device,
+        DeviceMoERebalanceMaintenanceGraphKind kind,
+        uint64_t payload_edge_mask)
+    {
+        const auto binding_it = std::find_if(
+            moe_graph_rebalance_bindings_.begin(),
+            moe_graph_rebalance_bindings_.end(),
+            [&](const auto &entry)
+            {
+                return entry.second.device_id == device;
+            });
+        if (binding_it == moe_graph_rebalance_bindings_.end())
+        {
+            return {};
+        }
+
+        const GraphSideRebalanceBinding &binding = binding_it->second;
+        const bool transfer_slot_mode_enabled =
+            deviceMoERebalanceModeUsesTransferSlots(binding.transfer_mode);
+        if (!binding.decode_tp_ctx ||
+            !binding.maintenance_tp_ctx ||
+            !binding.moe_runtime_table ||
+            (transfer_slot_mode_enabled &&
+             (!binding.local_transfer_slots ||
+              binding.local_transfer_slot_count == 0 ||
+              !binding.transfer_state)))
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE device rebalance maintenance graph has incomplete binding for " +
+                device.to_string());
+        }
+
+        auto makeMaintenanceParams =
+            [&](const std::string &stage_name,
+                DeviceMoERebalanceStagePhase phase)
+            {
+                MoEDeviceRebalanceStage::Params params;
+                params.device_id = binding.device_id;
+                params.tp_ctx = binding.maintenance_tp_ctx;
+                params.moe_runtime_table = binding.moe_runtime_table;
+                params.tp_device_idx = binding.tp_device_idx;
+                params.config = binding.config;
+                params.local_transfer_slots = binding.local_transfer_slots;
+                params.local_transfer_slot_count = binding.local_transfer_slot_count;
+                params.collective_payload_slot_bytes = binding.collective_payload_slot_bytes;
+                params.collective_payload_slot_capacity = binding.collective_payload_slot_capacity;
+                params.payload_edge_mask =
+                    kind == DeviceMoERebalanceMaintenanceGraphKind::Payload
+                        ? payload_edge_mask
+                        : 0ULL;
+                params.stage_name = stage_name;
+                params.workspace_name = binding.workspace_name;
+                params.phase = phase;
+                params.transfer_mode = binding.transfer_mode;
+                params.transfer_state = binding.transfer_state;
+                return params;
+            };
+
+        ComputeGraph graph;
+        if (kind == DeviceMoERebalanceMaintenanceGraphKind::Payload)
+        {
+            MoEDeviceRebalanceStage::Params payload_params =
+                makeMaintenanceParams(
+                    "moe_device_rebalance_maintenance_copy_prepared_payload",
+                    DeviceMoERebalanceStagePhase::CopyPreparedPayload);
+            payload_params.join_transfer_stream_after_copy = true;
+
+            graph.addNode(payload_params.stage_name,
+                          ComputeStageFactory::createMoEDeviceRebalance(payload_params),
+                          binding.device_id);
+            graph.setTerminalNode(payload_params.stage_name);
+            return graph;
+        }
+
+        MoEDeviceRebalanceStage::Params collect_params =
+            makeMaintenanceParams(
+                "moe_device_rebalance_maintenance_collect",
+                DeviceMoERebalanceStagePhase::CollectAndGatherState);
+
+        MoEDeviceRebalanceStage::Params plan_params =
+            makeMaintenanceParams(
+                "moe_device_rebalance_maintenance_plan_commands_after_snapshot",
+                DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband);
+        plan_params.join_transfer_stream_after_copy = true;
+
+        graph.addNode(collect_params.stage_name,
+                      ComputeStageFactory::createMoEDeviceRebalance(collect_params),
+                      binding.device_id);
+        graph.addNode(plan_params.stage_name,
+                      ComputeStageFactory::createMoEDeviceRebalance(plan_params),
+                      binding.device_id);
+        graph.addDependency(plan_params.stage_name, collect_params.stage_name);
+        graph.setTerminalNode(plan_params.stage_name);
+        return graph;
     }
 
     void Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
@@ -1239,9 +1694,10 @@ namespace llaminar2
 
         IMoERuntimeTable *moe_runtime_table = nullptr;
         const auto &rocm_env = debugEnv().rocm;
+        const auto &gpu_moe_env = debugEnv().gpu_moe;
         auto forceGroupedSharedMoEVerifierPrefill = [&](DeviceId candidate)
         {
-            return rocm_env.moe_grouped_prefill &&
+            return gpu_moe_env.grouped_prefill &&
                    forceGroupedMoEVerifierPrefill(candidate);
         };
         /*
@@ -1263,6 +1719,38 @@ namespace llaminar2
                                                      ? "mtp_depth" + std::to_string(mtp_depth_idx)
                                                      : std::string{};
         const bool register_runtime_histogram = !use_mtp_runtime_table;
+        const bool local_decode_layer =
+            !mtp_sidecar_context &&
+            total_tokens == 1 &&
+            layer_idx >= config_.pp_layer_offset &&
+            layer_idx < config_.pp_layer_offset + config_.n_layers &&
+            !config_.compute_all_position_logits;
+        const bool first_local_decode_layer =
+            local_decode_layer &&
+            layer_idx == config_.pp_layer_offset;
+        const bool last_local_decode_layer =
+            local_decode_layer &&
+            layer_idx == config_.pp_layer_offset + config_.n_layers - 1;
+        auto *local_tp_ctx = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
+        int hot_replica_cap = config_.moe.hot_expert_cache.resolveCap(
+            config_.moe.num_experts,
+            /*dynamic_rebalance_enabled=*/true);
+        const auto &env = debugEnv();
+        if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
+            hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
+        const bool device_side_graph_rebalance_candidate =
+            local_decode_layer &&
+            env.moe_rebalance.device_rebalance_graph_controller &&
+            config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC &&
+            env.moe_rebalance.gpu_cache_experts_per_layer <= 0 &&
+            local_tp_ctx &&
+            isHomogeneousGpuLocalTPRebalanceDomain(
+                *local_tp_ctx,
+                device,
+                config_.tp_device_idx);
+        const bool register_runtime_histogram_for_decode =
+            register_runtime_histogram &&
+            !device_side_graph_rebalance_candidate;
         const auto has_static_full_local_expert_ownership = [&]()
         {
             /*
@@ -1272,12 +1760,9 @@ namespace llaminar2
              * ExpertParallel runners own only a contiguous expert range, so
              * handing them this table would make the expert stage fail at graph
              * build or, worse, capture a single-device contract for a sharded
-             * topology.  Tiered overlays also express routed ownership with
-             * per-participant masks, even when a routed tier's compute kind is
-             * ApportionedExperts.  Keep the fast table for full-owner lanes and
-             * let partial-owner TP/overlay paths use the ordinary mask/range +
-             * allreduce path until a sharded runtime table/reducer is
-             * implemented.
+             * topology. Tiered overlays and graph-side rebalance use masked
+             * runtime tables instead; the full table is only for full-owner
+             * lanes.
              */
             if (use_expert_overlay)
                 return false;
@@ -1308,9 +1793,17 @@ namespace llaminar2
             overlay_plan &&
             canUseLocalTPApportionedExpertsFastPath(*overlay_plan, device) &&
             debugEnv().moe_rebalance.gpu_cache_experts_per_layer <= 0;
+        const bool masked_local_tp_apportioned_decode_runtime_table =
+            device_side_graph_rebalance_candidate &&
+            !use_expert_overlay &&
+            config_.moe.expert_mode == MoEExpertMode::ApportionedExperts &&
+            config_.moe.local_expert_count >= 0 &&
+            local_tp_ctx &&
+            local_tp_ctx->degree() > 1;
         const bool decode_runtime_table_eligible =
             static_full_local_expert_ownership ||
-            masked_local_tp_overlay_decode_runtime_table;
+            masked_local_tp_overlay_decode_runtime_table ||
+            masked_local_tp_apportioned_decode_runtime_table;
         const bool allow_eager_partial_owner_gpu_route =
             device.is_gpu() &&
             total_tokens == 1 &&
@@ -1327,10 +1820,10 @@ namespace llaminar2
                 0,
                 runtime_table_suffix,
                 runtime_table_layers,
-                register_runtime_histogram);
+                register_runtime_histogram_for_decode);
         }
         else if (total_tokens > 1 &&
-                 (rocm_env.moe_grouped_prefill ||
+                 (gpu_moe_env.grouped_prefill ||
                   forceDecodeEquivalentMoERouting(device)))
         {
             // Fixed-topology grouped prefill consumes routing tensors directly.
@@ -1349,6 +1842,857 @@ namespace llaminar2
                 runtime_table_layers,
                 /*register_decode_histogram=*/false);
         }
+
+        std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
+            graph_rebalance_transfer_specs;
+        std::optional<DeviceMoERebalanceTransferMode> graph_rebalance_transfer_mode;
+        auto graphRebalanceDomainKey = [&]() -> std::string
+        {
+            std::ostringstream key;
+            key << device.to_string()
+                << ":participant=" << config_.tp_device_idx
+                << ":layers=" << runtime_table_layers
+                << ":experts=" << config_.moe.num_experts
+                << ":topk=" << config_.moe.top_k;
+            return key.str();
+        };
+        auto graphRebalanceCollectiveKey = [&]() -> std::string
+        {
+            std::ostringstream key;
+            key << "backend=" << static_cast<int>(local_tp_ctx ? local_tp_ctx->backend() : CollectiveBackendType::AUTO)
+                << ":degree=" << (local_tp_ctx ? local_tp_ctx->degree() : 0)
+                << ":layers=" << runtime_table_layers
+                << ":experts=" << config_.moe.num_experts
+                << ":topk=" << config_.moe.top_k;
+            if (local_tp_ctx)
+            {
+                key << ":devices=";
+                const auto &devices = local_tp_ctx->devices();
+                for (size_t i = 0; i < devices.size(); ++i)
+                {
+                    if (i > 0)
+                        key << ',';
+                    key << devices[i].toString();
+                }
+            }
+            return key.str();
+        };
+        auto makeGraphRebalanceConfig = [&]() -> DeviceMoERebalanceConfig
+        {
+            DeviceMoERebalanceConfig rebalance_config;
+            rebalance_config.num_layers = static_cast<uint32_t>(runtime_table_layers);
+            rebalance_config.num_experts = static_cast<uint32_t>(config_.moe.num_experts);
+            rebalance_config.top_k = static_cast<uint32_t>(config_.moe.top_k);
+            rebalance_config.participant_id = static_cast<uint32_t>(config_.tp_device_idx);
+            rebalance_config.participant_count = static_cast<uint32_t>(local_tp_ctx ? local_tp_ctx->degree() : 0);
+            rebalance_config.root_participant = static_cast<uint32_t>(
+                overlay_plan ? continuationRootParticipant(*overlay_plan) : 0);
+            rebalance_config.window_size_tokens = static_cast<uint32_t>(
+                std::max(1, config_.moe.rebalance_config.window_size));
+            rebalance_config.max_hot_replicas_per_participant = static_cast<uint32_t>(
+                std::min(hot_replica_cap, config_.moe.num_experts));
+            rebalance_config.min_load_spread_improvement = static_cast<uint32_t>(
+                std::max(0, env.moe_rebalance.device_rebalance_min_load_spread_improvement));
+            rebalance_config.min_load_spread_improvement_divisor = static_cast<uint32_t>(
+                std::max(0, env.moe_rebalance.device_rebalance_min_load_spread_improvement_divisor));
+            rebalance_config.min_wave_spread_improvement_per_payload_slot = static_cast<uint32_t>(
+                std::max(0, env.moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot));
+            rebalance_config.min_router_spread_improvement_per_payload_slot = static_cast<uint32_t>(
+                std::max(0, env.moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot));
+            rebalance_config.flags =
+                static_cast<uint32_t>(DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
+            if (rebalance_config.max_hot_replicas_per_participant > 0)
+            {
+                rebalance_config.flags |=
+                    static_cast<uint32_t>(DeviceMoERebalanceFlags::HotReplicaCache);
+            }
+            if (env.moe_rebalance.device_rebalance_maintenance_graph)
+            {
+                rebalance_config.flags |=
+                    static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply);
+            }
+            if (env.moe_rebalance.device_rebalance_collect_load_stats ||
+                PerfStatsCollector::isEnabled())
+            {
+                rebalance_config.flags |=
+                    static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+            }
+
+            if (first_local_decode_layer && rebalance_config.num_layers > 0)
+            {
+                const uint32_t current_layer =
+                    static_cast<uint32_t>(std::max(0, layer_idx));
+                if (current_layer + 1u < rebalance_config.num_layers)
+                {
+                    rebalance_config.layer_window_start = current_layer + 1u;
+                    rebalance_config.layer_window_count =
+                        rebalance_config.num_layers - rebalance_config.layer_window_start;
+                }
+                else if (current_layer < rebalance_config.num_layers)
+                {
+                    rebalance_config.layer_window_start = current_layer;
+                    rebalance_config.layer_window_count = 1u;
+                }
+            }
+            rebalance_config.layer_wave_count =
+                static_cast<uint32_t>(
+                    std::max(0, env.moe_rebalance.device_rebalance_layer_wave_count));
+            return rebalance_config;
+        };
+        auto graphRebalanceMovesFixedPayloadCapacity =
+            [](DeviceMoERebalanceTransferMode mode) -> bool
+        {
+            return deviceMoERebalanceModeMovesFixedPayloadCapacity(mode);
+        };
+        auto graphRebalanceTransferModeName =
+            [](DeviceMoERebalanceTransferMode mode) -> const char *
+        {
+            switch (mode)
+            {
+            case DeviceMoERebalanceTransferMode::ResidentOnly:
+                return "resident_only";
+            case DeviceMoERebalanceTransferMode::CompactTransferSlots:
+                return "compact_transfer_slots";
+            case DeviceMoERebalanceTransferMode::CollectiveSidebandPayload:
+                return "collective_sideband_payload";
+            case DeviceMoERebalanceTransferMode::LegacyCollectiveAllGather:
+                return "legacy_collective_allgather";
+            }
+            return "unknown";
+        };
+        auto graphRebalanceUsesTransferSlots = [&]() -> bool
+        {
+            return graph_rebalance_transfer_mode.has_value() &&
+                   deviceMoERebalanceModeUsesTransferSlots(*graph_rebalance_transfer_mode);
+        };
+        auto graphRebalanceFixedPayloadTransferEnabled = [&]() -> bool
+        {
+            return graph_rebalance_transfer_mode.has_value() &&
+                   graphRebalanceMovesFixedPayloadCapacity(*graph_rebalance_transfer_mode);
+        };
+        auto graphRebalanceEnsureTransferMode = [&]() -> bool
+        {
+            if (!device_side_graph_rebalance_candidate ||
+                !moe_runtime_table ||
+                !local_tp_ctx)
+            {
+                return false;
+            }
+
+            if (!graph_rebalance_transfer_mode.has_value())
+            {
+                graph_rebalance_transfer_mode =
+                    selectGraphRebalanceTransferMode(
+                        *local_tp_ctx,
+                        device,
+                        static_cast<uint32_t>(
+                            std::min(hot_replica_cap, config_.moe.num_experts)));
+            }
+            if (!graph_rebalance_transfer_mode.has_value())
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE graph-side rebalance requires graph-captured NCCL/RCCL maintenance-wave transport for " +
+                    device.to_string() +
+                    "; refusing to fall back to host publish/apply in device-side mode");
+            }
+
+            return true;
+        };
+        auto graphRebalanceDecodeUsesMutableDescriptors = [&]() -> bool
+        {
+            if (!device_side_graph_rebalance_candidate)
+                return false;
+            if (!graphRebalanceEnsureTransferMode())
+                return false;
+
+            /*
+             * ResidentOnly changes runtime top-k/local-compute masks for
+             * ResidentOnly changes runtime top-k/local-compute masks for
+             * experts that already have local resident descriptors, so the
+             * immutable grouped descriptor tables remain valid. Compact and
+             * fixed-payload transfer-slot modes can publish newly-arrived
+             * descriptors and must therefore use mutable runtime descriptors.
+             */
+            return deviceMoERebalanceModeUsesTransferSlots(*graph_rebalance_transfer_mode);
+        };
+        auto ensureGraphRebalanceTransferMode = [&]() -> bool
+        {
+            if (!first_local_decode_layer ||
+                !device_side_graph_rebalance_candidate ||
+                !moe_runtime_table ||
+                !local_tp_ctx)
+            {
+                return false;
+            }
+
+            return graphRebalanceEnsureTransferMode();
+        };
+        auto shouldCollectGraphRebalanceTransferSpecs = [&]() -> bool
+        {
+            if (!ensureGraphRebalanceTransferMode())
+                return false;
+            return graphRebalanceUsesTransferSlots();
+        };
+
+        bool graph_rebalance_plan_inserted = false;
+        std::string graph_rebalance_apply_node;
+        std::string graph_rebalance_collect_node;
+        std::string graph_rebalance_plan_after_sideband_node;
+        std::optional<MoEDeviceRebalanceStage::Params> graph_rebalance_plan_after_sideband_params;
+        std::string graph_rebalance_pack_payload_node;
+        std::optional<MoEDeviceRebalanceStage::Params> graph_rebalance_pack_payload_params;
+        std::string graph_rebalance_unpack_payload_node;
+        std::optional<MoEDeviceRebalanceStage::Params> graph_rebalance_unpack_payload_params;
+        bool graph_rebalance_transfer_command_sideband_taken = false;
+        bool graph_rebalance_transfer_payload_sideband_taken = false;
+        const bool graph_rebalance_can_have_allreduce_anchor =
+            config_.tp_ctx && config_.tp_ctx->degree() > 1;
+        auto makeGraphRebalanceStateSidebands =
+            [&](const GraphSideRebalanceBinding &binding)
+            -> std::vector<TPAllreduceSidebandWorkspaceBinding>
+        {
+            std::vector<TPAllreduceSidebandWorkspaceBinding> sidebands;
+            if (!binding.decode_tp_ctx ||
+                !binding.decode_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture())
+            {
+                return sidebands;
+            }
+
+            const uint32_t window_count =
+                binding.config.layer_window_count == 0u
+                    ? binding.config.num_layers
+                    : std::min(binding.config.layer_window_count,
+                               binding.config.num_layers);
+            const uint32_t wave_count =
+                binding.config.layer_wave_count == 0u
+                    ? window_count
+                    : std::min(binding.config.layer_wave_count, window_count);
+            const size_t local_histogram_entries =
+                static_cast<size_t>(std::max<uint32_t>(1u, wave_count)) *
+                static_cast<size_t>(binding.config.num_experts);
+            if (local_histogram_entries == 0)
+                return sidebands;
+
+            TPAllreduceSidebandWorkspaceBinding histogram_sideband;
+            histogram_sideband.kind = LocalTPCollectiveSidebandKind::Allgather;
+            histogram_sideband.send_buffer_name =
+                MoEDeviceRebalanceStage::workspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_LOCAL_HISTOGRAM,
+                    binding.workspace_name);
+            histogram_sideband.recv_buffer_name =
+                MoEDeviceRebalanceStage::workspaceBufferName(
+                    MoEDeviceRebalanceStage::WS_GATHERED_HISTOGRAM,
+                    binding.workspace_name);
+            static_assert(sizeof(uint64_t) == 2 * sizeof(int32_t));
+            histogram_sideband.element_count = local_histogram_entries * 2u;
+            histogram_sideband.dtype = CollectiveDataType::INT32;
+            histogram_sideband.root_device_index =
+                static_cast<int>(binding.config.root_participant);
+            histogram_sideband.name = "moe_rebalance_histogram_sideband";
+            sidebands.push_back(std::move(histogram_sideband));
+
+            return sidebands;
+        };
+        auto takeGraphRebalanceStateSidebands =
+            [&]() -> std::vector<TPAllreduceSidebandWorkspaceBinding>
+        {
+            if (graph_rebalance_collect_node.empty())
+                return {};
+
+            const auto binding_it = moe_graph_rebalance_bindings_.find(graphRebalanceDomainKey());
+            if (binding_it == moe_graph_rebalance_bindings_.end())
+                return {};
+
+            auto sidebands = makeGraphRebalanceStateSidebands(binding_it->second);
+            if (!sidebands.empty())
+                binding_it->second.state_sideband_enabled = true;
+            return sidebands;
+        };
+        auto transferPlanCapacityForBinding =
+            [](const GraphSideRebalanceBinding &binding) -> size_t
+        {
+            return static_cast<size_t>(
+                deviceMoERebalanceCommandPlanCapacity(
+                    binding.config,
+                    binding.transfer_mode));
+        };
+        auto commandBufferCountForBinding =
+            [](const GraphSideRebalanceBinding &binding) -> size_t
+        {
+            return binding.local_transfer_slot_count > 0 ? 2u : 1u;
+        };
+        auto makeRebalanceStageParamsFromBinding =
+            [&](const GraphSideRebalanceBinding &binding,
+                const std::string &stage_name,
+                DeviceMoERebalanceStagePhase phase)
+            -> MoEDeviceRebalanceStage::Params
+        {
+            MoEDeviceRebalanceStage::Params params;
+            params.device_id = device;
+            params.tp_ctx = binding.decode_tp_ctx;
+            params.moe_runtime_table = binding.moe_runtime_table;
+            params.tp_device_idx = config_.tp_device_idx;
+            params.config = binding.config;
+            params.local_transfer_slots = binding.local_transfer_slots;
+            params.local_transfer_slot_count = binding.local_transfer_slot_count;
+            params.collective_payload_slot_bytes = binding.collective_payload_slot_bytes;
+            params.collective_payload_slot_capacity = binding.collective_payload_slot_capacity;
+            params.stage_name = stage_name;
+            params.workspace_name = binding.workspace_name;
+            params.phase = phase;
+            params.transfer_mode = binding.transfer_mode;
+            params.transfer_state = binding.transfer_state;
+            params.join_transfer_stream_after_copy = false;
+            return params;
+        };
+        auto takeGraphRebalanceTransferSidebands =
+            [&]() -> std::vector<TPAllreduceSidebandWorkspaceBinding>
+        {
+            const auto binding_it = moe_graph_rebalance_bindings_.find(graphRebalanceDomainKey());
+            if (binding_it == moe_graph_rebalance_bindings_.end())
+                return {};
+            const auto &binding = binding_it->second;
+            if (!binding.decode_tp_ctx ||
+                !binding.decode_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture() ||
+                binding.transfer_mode != DeviceMoERebalanceTransferMode::CollectiveSidebandPayload ||
+                binding.local_transfer_slot_count == 0 ||
+                binding.collective_payload_slot_bytes == 0 ||
+                binding.producer_layer_idx < 0)
+            {
+                return {};
+            }
+
+            const int layer_delta = layer_idx - binding.producer_layer_idx;
+            const size_t plan_capacity = transferPlanCapacityForBinding(binding);
+            const size_t command_buffer_count = commandBufferCountForBinding(binding);
+            if (plan_capacity == 0)
+                return {};
+
+            std::vector<TPAllreduceSidebandWorkspaceBinding> sidebands;
+            bool consumed_sideband = false;
+            if (layer_delta == 1 && !graph_rebalance_transfer_command_sideband_taken)
+            {
+                static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
+                static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
+
+                TPAllreduceSidebandWorkspaceBinding plan_sideband;
+                plan_sideband.kind = LocalTPCollectiveSidebandKind::Allgather;
+                plan_sideband.send_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_TRANSFER_PLAN,
+                        binding.workspace_name);
+                plan_sideband.recv_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_GATHERED_TRANSFER_PLAN,
+                        binding.workspace_name);
+                plan_sideband.element_count =
+                    (command_buffer_count * plan_capacity *
+                     sizeof(DeviceMoERebalancePlanEntry)) /
+                    sizeof(int32_t);
+                plan_sideband.dtype = CollectiveDataType::INT32;
+                plan_sideband.root_device_index =
+                    static_cast<int>(binding.config.root_participant);
+                plan_sideband.name = "moe_rebalance_transfer_plan_sideband";
+                sidebands.push_back(std::move(plan_sideband));
+
+                TPAllreduceSidebandWorkspaceBinding header_sideband;
+                header_sideband.kind = LocalTPCollectiveSidebandKind::Allgather;
+                header_sideband.send_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_COMMAND_HEADER,
+                        binding.workspace_name);
+                header_sideband.recv_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_GATHERED_COMMAND_HEADER,
+                        binding.workspace_name);
+                header_sideband.element_count =
+                    (command_buffer_count *
+                     sizeof(DeviceMoERebalanceCommandBufferHeader)) /
+                    sizeof(int32_t);
+                header_sideband.dtype = CollectiveDataType::INT32;
+                header_sideband.root_device_index =
+                    static_cast<int>(binding.config.root_participant);
+                header_sideband.name = "moe_rebalance_command_header_sideband";
+                sidebands.push_back(std::move(header_sideband));
+
+                graph_rebalance_pack_payload_node =
+                    prefix + "moe_device_rebalance_pack_payload_after_command_sideband";
+                graph_rebalance_pack_payload_params =
+                    makeRebalanceStageParamsFromBinding(
+                        binding,
+                        graph_rebalance_pack_payload_node,
+                        DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband);
+                graph_rebalance_transfer_command_sideband_taken = true;
+                consumed_sideband = true;
+            }
+            else if (layer_delta == 2 && !graph_rebalance_transfer_payload_sideband_taken)
+            {
+                const size_t payload_slot_capacity =
+                    std::min<size_t>(
+                        plan_capacity,
+                        binding.collective_payload_slot_capacity == 0
+                            ? static_cast<size_t>(binding.local_transfer_slot_count)
+                            : std::min<size_t>(
+                                  static_cast<size_t>(binding.collective_payload_slot_capacity),
+                                  static_cast<size_t>(binding.local_transfer_slot_count)));
+                const size_t payload_local_bytes =
+                    payload_slot_capacity *
+                    (binding.transfer_mode == DeviceMoERebalanceTransferMode::CompactTransferSlots
+                         ? 1u
+                         : static_cast<size_t>(binding.config.participant_count)) *
+                    static_cast<size_t>(binding.collective_payload_slot_bytes);
+                if (payload_local_bytes == 0)
+                    return {};
+
+                TPAllreduceSidebandWorkspaceBinding payload_sideband;
+                payload_sideband.kind = LocalTPCollectiveSidebandKind::Allgather;
+                payload_sideband.send_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_LOCAL_TRANSFER_PAYLOAD,
+                        binding.workspace_name);
+                payload_sideband.recv_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_GATHERED_TRANSFER_PAYLOAD,
+                        binding.workspace_name);
+                payload_sideband.element_count = payload_local_bytes;
+                payload_sideband.dtype = CollectiveDataType::INT8;
+                payload_sideband.root_device_index =
+                    static_cast<int>(binding.config.root_participant);
+                payload_sideband.name = "moe_rebalance_transfer_payload_sideband";
+                sidebands.push_back(std::move(payload_sideband));
+
+                graph_rebalance_unpack_payload_node =
+                    prefix + "moe_device_rebalance_unpack_payload_after_payload_sideband";
+                graph_rebalance_unpack_payload_params =
+                    makeRebalanceStageParamsFromBinding(
+                        binding,
+                        graph_rebalance_unpack_payload_node,
+                        DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband);
+                graph_rebalance_transfer_payload_sideband_taken = true;
+                consumed_sideband = true;
+            }
+
+            if (sidebands.empty() && consumed_sideband)
+            {
+                graph_rebalance_transfer_command_sideband_taken = false;
+                graph_rebalance_transfer_payload_sideband_taken = false;
+            }
+            return sidebands;
+        };
+        auto appendRebalanceSidebands =
+            [&](std::vector<TPAllreduceSidebandWorkspaceBinding> &sidebands,
+                std::vector<TPAllreduceSidebandWorkspaceBinding> extra)
+        {
+            for (auto &sideband : extra)
+                sidebands.push_back(std::move(sideband));
+        };
+        auto takeGraphRebalanceSidebandsForAllreduce =
+            [&]() -> std::vector<TPAllreduceSidebandWorkspaceBinding>
+        {
+            std::vector<TPAllreduceSidebandWorkspaceBinding> sidebands;
+            if (!graph_rebalance_collect_node.empty())
+                sidebands = takeGraphRebalanceStateSidebands();
+            appendRebalanceSidebands(sidebands, takeGraphRebalanceTransferSidebands());
+            return sidebands;
+        };
+        auto maybeAddGraphRebalancePayloadStageAfterSideband =
+            [&](const std::string &anchor_name,
+                std::string &terminal_name)
+        {
+            if (graph_rebalance_pack_payload_params.has_value() &&
+                !graph_rebalance_pack_payload_node.empty())
+            {
+                graph.addNode(
+                    graph_rebalance_pack_payload_node,
+                    ComputeStageFactory::createMoEDeviceRebalance(
+                        *graph_rebalance_pack_payload_params),
+                    device);
+                graph.addDependency(graph_rebalance_pack_payload_node, anchor_name);
+                terminal_name = graph_rebalance_pack_payload_node;
+                graph_rebalance_pack_payload_node.clear();
+                graph_rebalance_pack_payload_params.reset();
+            }
+            if (graph_rebalance_unpack_payload_params.has_value() &&
+                !graph_rebalance_unpack_payload_node.empty())
+            {
+                graph.addNode(
+                    graph_rebalance_unpack_payload_node,
+                    ComputeStageFactory::createMoEDeviceRebalance(
+                        *graph_rebalance_unpack_payload_params),
+                    device);
+                graph.addDependency(graph_rebalance_unpack_payload_node, anchor_name);
+                terminal_name = graph_rebalance_unpack_payload_node;
+                graph_rebalance_unpack_payload_node.clear();
+                graph_rebalance_unpack_payload_params.reset();
+            }
+        };
+        auto maybeInsertGraphSideRebalance =
+            [&](const char *context,
+                const std::string &graph_rebalance_producer_node_name) -> std::string
+        {
+            if (!device_side_graph_rebalance_candidate ||
+                !moe_runtime_table ||
+                !local_tp_ctx)
+            {
+                return {};
+            }
+
+            if (!graph_rebalance_apply_node.empty())
+                return graph_rebalance_apply_node;
+
+            DeviceMoERebalanceConfig rebalance_config = makeGraphRebalanceConfig();
+            if (!validateDeviceMoERebalanceConfig(rebalance_config))
+            {
+                return {};
+            }
+
+            const std::string domain_key = graphRebalanceDomainKey();
+            if (first_local_decode_layer && !graph_rebalance_plan_inserted)
+            {
+                moe_graph_rebalance_bindings_.erase(domain_key);
+                if (!ensureGraphRebalanceTransferMode())
+                    return {};
+
+                const bool transfer_slot_mode_enabled =
+                    graphRebalanceUsesTransferSlots();
+                const std::string rebalance_workspace =
+                    "moe_device_rebalance_" + graphRebalanceCollectiveKey();
+                std::string transfer_key = domain_key + ":resident_only";
+                DeviceMoEExpertDirectoryEntry *local_transfer_slots = nullptr;
+                uint32_t local_transfer_slot_count = 0;
+                uint64_t collective_payload_slot_bytes = 0;
+                uint32_t collective_payload_slot_capacity = 0;
+                std::shared_ptr<DeviceMoERebalanceTransferState> transfer_state;
+
+                if (transfer_slot_mode_enabled)
+                {
+                    if (deviceMoERebalanceModePlansMissingArrivals(
+                            graph_rebalance_transfer_mode.value()))
+                    {
+                        rebalance_config.flags |=
+                            static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+                    }
+                    if (!graph_rebalance_transfer_specs.has_value())
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph-side rebalance requires NativeVNNI transfer slot specs for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string() +
+                            (context ? std::string(" (") + context + ")" : std::string{}));
+                    }
+
+                    IBackend *backend = getBackendFor(device);
+                    const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
+                    if (!backend || gpu_ordinal < 0)
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph-side rebalance could not resolve backend for " +
+                            device.to_string());
+                    }
+
+                    const uint32_t effective_layer_wave_count =
+                        rebalance_config.layer_wave_count == 0u
+                            ? std::max<uint32_t>(
+                                  1u,
+                                  rebalance_config.layer_window_count == 0u
+                                      ? rebalance_config.num_layers
+                                      : rebalance_config.layer_window_count)
+                            : rebalance_config.layer_wave_count;
+                    const uint64_t requested_transfer_slots =
+                        static_cast<uint64_t>(std::max<uint32_t>(
+                            1u,
+                            rebalance_config.max_hot_replicas_per_participant)) *
+                        static_cast<uint64_t>(effective_layer_wave_count);
+                    const uint32_t transfer_slot_count =
+                        std::max<uint32_t>(
+                            1u,
+                            std::min<uint32_t>(
+                                static_cast<uint32_t>(
+                                    std::min<uint64_t>(
+                                        requested_transfer_slots,
+                                        static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))),
+                                static_cast<uint32_t>(
+                                    std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts))));
+
+                    std::ostringstream transfer_key_builder;
+                    transfer_key_builder << domain_key
+                                         << ":slots=" << transfer_slot_count;
+                    for (const auto &spec : *graph_rebalance_transfer_specs)
+                    {
+                        transfer_key_builder << ':' << spec.label
+                                             << '=' << spec.N << 'x' << spec.K
+                                             << ":cb" << static_cast<int>(spec.codebook_id)
+                                             << ":pb" << spec.payload_bytes_per_block
+                                             << ":asym" << (spec.is_asymmetric ? 1 : 0)
+                                             << ":emins" << (spec.has_emins ? 1 : 0);
+                    }
+                    transfer_key = transfer_key_builder.str();
+
+                    auto &transfer_directory =
+                        moe_transfer_slot_directories_[transfer_key];
+                    if (!transfer_directory)
+                    {
+                        transfer_directory = DeviceMoETransferSlotDirectory::create(
+                            backend,
+                            device,
+                            gpu_ordinal,
+                            rebalance_config.participant_id,
+                            transfer_slot_count,
+                            *graph_rebalance_transfer_specs,
+                            gpuDirectRebalanceVramSafetyMarginBytes());
+                    }
+
+                    local_transfer_slots = transfer_directory->deviceEntries();
+                    local_transfer_slot_count = transfer_directory->slotCount();
+                    collective_payload_slot_capacity =
+                        std::min<uint32_t>(
+                            local_transfer_slot_count,
+                            static_cast<uint32_t>(
+                                std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots)));
+                    auto &state_ref =
+                        moe_rebalance_transfer_states_[transfer_key + ":workspace=" + rebalance_workspace];
+                    if (!state_ref)
+                        state_ref = std::make_shared<DeviceMoERebalanceTransferState>();
+                    transfer_state = state_ref;
+                    collective_payload_slot_bytes =
+                        static_cast<uint64_t>(
+                            ((transfer_directory->slotPayloadBytes() +
+                              sizeof(DeviceMoEExpertDirectoryEntry) + 255u) /
+                             256u) *
+                            256u);
+                }
+
+                ILocalTPContext *maintenance_tp_ctx = local_tp_ctx;
+                if (env.moe_rebalance.device_rebalance_maintenance_graph)
+                {
+                    const std::string maintenance_lane_key =
+                        graphRebalanceCollectiveKey();
+                    maintenance_tp_ctx =
+                        maintenanceTPContextForDomain(maintenance_lane_key, *local_tp_ctx);
+                }
+
+                moe_graph_rebalance_bindings_[domain_key] = GraphSideRebalanceBinding{
+                    transfer_key,
+                    rebalance_workspace,
+                    device,
+                    local_tp_ctx,
+                    maintenance_tp_ctx,
+                    moe_runtime_table,
+                    config_.tp_device_idx,
+                    rebalance_config,
+                    local_transfer_slots,
+                    local_transfer_slot_count,
+                    graph_rebalance_transfer_mode.value(),
+                    collective_payload_slot_bytes,
+                    collective_payload_slot_capacity,
+                    transfer_state,
+                    layer_idx};
+                graph_rebalance_plan_inserted = true;
+
+                const bool producer_runs_in_maintenance_graph =
+                    env.moe_rebalance.device_rebalance_maintenance_graph;
+                const bool producer_can_use_collective_sideband =
+                    !producer_runs_in_maintenance_graph &&
+                    graph_rebalance_transfer_mode.value() ==
+                        DeviceMoERebalanceTransferMode::CollectiveSidebandPayload &&
+                    graph_rebalance_can_have_allreduce_anchor &&
+                    local_tp_ctx &&
+                    local_tp_ctx->supportsCollectiveSidebandOnStreamGraphCapture();
+
+                if (producer_can_use_collective_sideband)
+                {
+                    graph_rebalance_collect_node =
+                        prefix + "moe_device_rebalance_collect_state";
+                    MoEDeviceRebalanceStage::Params collect_params;
+                    collect_params.device_id = device;
+                    collect_params.tp_ctx = local_tp_ctx;
+                    collect_params.moe_runtime_table = moe_runtime_table;
+                    collect_params.tp_device_idx = config_.tp_device_idx;
+                    collect_params.config = rebalance_config;
+                    collect_params.local_transfer_slots = local_transfer_slots;
+                    collect_params.local_transfer_slot_count = local_transfer_slot_count;
+                    collect_params.collective_payload_slot_bytes = collective_payload_slot_bytes;
+                    collect_params.collective_payload_slot_capacity = collective_payload_slot_capacity;
+                    collect_params.stage_name = graph_rebalance_collect_node;
+                    collect_params.workspace_name = rebalance_workspace;
+                    collect_params.phase = DeviceMoERebalanceStagePhase::CollectState;
+                    collect_params.transfer_mode = graph_rebalance_transfer_mode.value();
+                    collect_params.transfer_state = transfer_state;
+
+                    graph.addNode(graph_rebalance_collect_node,
+                                  ComputeStageFactory::createMoEDeviceRebalance(collect_params),
+                                  device);
+                    if (!graph_rebalance_producer_node_name.empty())
+                    {
+                        graph.addDependency(graph_rebalance_collect_node,
+                                            graph_rebalance_producer_node_name);
+                    }
+                }
+
+                if (!producer_runs_in_maintenance_graph)
+                {
+                    const std::string plan_node = prefix + "moe_device_rebalance_plan_copy";
+
+                    MoEDeviceRebalanceStage::Params plan_params;
+                    plan_params.device_id = device;
+                    plan_params.tp_ctx = local_tp_ctx;
+                    plan_params.moe_runtime_table = moe_runtime_table;
+                    plan_params.tp_device_idx = config_.tp_device_idx;
+                    plan_params.config = rebalance_config;
+                    plan_params.local_transfer_slots = local_transfer_slots;
+                    plan_params.local_transfer_slot_count = local_transfer_slot_count;
+                    plan_params.collective_payload_slot_bytes = collective_payload_slot_bytes;
+                    plan_params.collective_payload_slot_capacity = collective_payload_slot_capacity;
+                    plan_params.stage_name = plan_node;
+                    plan_params.workspace_name = rebalance_workspace;
+                    plan_params.phase = DeviceMoERebalanceStagePhase::PlanAndCopy;
+                    plan_params.transfer_mode = graph_rebalance_transfer_mode.value();
+                    plan_params.join_transfer_stream_after_copy =
+                        producer_runs_in_maintenance_graph;
+                    plan_params.transfer_state = transfer_state;
+
+                    if (producer_can_use_collective_sideband)
+                    {
+                        plan_params.phase =
+                            DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband;
+                        graph_rebalance_plan_after_sideband_node = plan_node;
+                        graph_rebalance_plan_after_sideband_params = plan_params;
+                    }
+                    else
+                    {
+                        graph.addNode(plan_node,
+                                      ComputeStageFactory::createMoEDeviceRebalance(plan_params),
+                                      device);
+                        graph.addDependency(plan_node, prefix + "ffn_norm");
+                    }
+                }
+
+                LOG_DEBUG("[Qwen35MoEGraph] Added graph-side MoE device rebalance producer"
+                          << " layer=" << layer_idx
+                          << " device=" << device.to_string()
+                          << " participant=" << config_.tp_device_idx
+                          << " degree=" << local_tp_ctx->degree()
+                          << " hot_replica_cap=" << hot_replica_cap
+                          << " transfer_mode="
+                          << graphRebalanceTransferModeName(graph_rebalance_transfer_mode.value())
+                          << " transfer_slots=" << local_transfer_slot_count
+                          << " collective_payload_slot_capacity=" << collective_payload_slot_capacity
+                          << " window_tokens=" << rebalance_config.window_size_tokens
+                          << " layer_window_start=" << rebalance_config.layer_window_start
+                          << " layer_window_count=" << rebalance_config.layer_window_count
+                          << " layer_wave_count=" << rebalance_config.layer_wave_count
+                          << " producer_mode="
+                          << (producer_runs_in_maintenance_graph ? "maintenance_graph" : "inline_decode_graph")
+                          << " context=" << (context ? context : ""));
+
+                const bool resident_boundary_apply_candidate =
+                    producer_runs_in_maintenance_graph &&
+                    !deviceMoERebalanceModeUsesTransferSlots(graph_rebalance_transfer_mode.value());
+                const bool producer_covers_current_layer =
+                    rebalance_config.layer_window_count == 1u &&
+                    rebalance_config.layer_window_start == static_cast<uint32_t>(std::max(0, layer_idx));
+                if (!producer_covers_current_layer && !resident_boundary_apply_candidate)
+                    return {};
+            }
+
+            const auto binding_it = moe_graph_rebalance_bindings_.find(domain_key);
+            if (binding_it == moe_graph_rebalance_bindings_.end())
+                return {};
+            /*
+             * Maintenance-graph mode applies ready waves from the route kernel
+             * itself so steady-state decode does not pay an extra per-token
+             * apply-stage launch.
+             */
+            if (env.moe_rebalance.device_rebalance_maintenance_graph)
+            {
+                return {};
+            }
+            const bool decode_apply_poll_enabled =
+                env.moe_rebalance.device_rebalance_decode_apply_poll;
+            if (!decode_apply_poll_enabled)
+            {
+                return {};
+            }
+
+            const bool needs_transfer_slot_apply =
+                deviceMoERebalanceModeUsesTransferSlots(binding_it->second.transfer_mode) &&
+                binding_it->second.local_transfer_slot_count > 0;
+            const bool needs_deferred_resident_apply =
+                hasDeviceMoERebalanceFlag(
+                    binding_it->second.config.flags,
+                    DeviceMoERebalanceFlags::DeferRuntimeApply);
+            if (!needs_transfer_slot_apply && !needs_deferred_resident_apply)
+            {
+                return {};
+            }
+            const bool boundary_apply =
+                needs_deferred_resident_apply || needs_transfer_slot_apply;
+            if (boundary_apply && !last_local_decode_layer)
+            {
+                return {};
+            }
+
+            DeviceMoEExpertDirectoryEntry *apply_transfer_slots = nullptr;
+            uint32_t apply_transfer_slot_count = 0;
+            std::shared_ptr<DeviceMoERebalanceTransferState> apply_transfer_state =
+                binding_it->second.transfer_state;
+            if (needs_transfer_slot_apply)
+            {
+                const auto transfer_directory_it =
+                    moe_transfer_slot_directories_.find(binding_it->second.transfer_key);
+                const auto transfer_state_it =
+                    moe_rebalance_transfer_states_.find(
+                        binding_it->second.transfer_key + ":workspace=" +
+                        binding_it->second.workspace_name);
+                if (transfer_directory_it == moe_transfer_slot_directories_.end() ||
+                    !transfer_directory_it->second ||
+                    transfer_state_it == moe_rebalance_transfer_states_.end() ||
+                    !transfer_state_it->second)
+                {
+                    throw std::runtime_error(
+                        "Qwen35 MoE graph-side rebalance lost its device transfer binding for layer " +
+                        std::to_string(layer_idx) + " on " + device.to_string());
+                }
+                apply_transfer_slots = transfer_directory_it->second->deviceEntries();
+                apply_transfer_slot_count = transfer_directory_it->second->slotCount();
+                apply_transfer_state = transfer_state_it->second;
+            }
+
+            graph_rebalance_apply_node = prefix + "moe_device_rebalance_apply";
+            MoEDeviceRebalanceStage::Params apply_params;
+            apply_params.device_id = device;
+            apply_params.tp_ctx = local_tp_ctx;
+            apply_params.moe_runtime_table = moe_runtime_table;
+            apply_params.tp_device_idx = config_.tp_device_idx;
+            apply_params.config = rebalance_config;
+            apply_params.local_transfer_slots = apply_transfer_slots;
+            apply_params.local_transfer_slot_count = apply_transfer_slot_count;
+            apply_params.collective_payload_slot_bytes =
+                binding_it->second.collective_payload_slot_bytes;
+            apply_params.collective_payload_slot_capacity =
+                binding_it->second.collective_payload_slot_capacity;
+            apply_params.stage_name = graph_rebalance_apply_node;
+            apply_params.workspace_name = binding_it->second.workspace_name;
+            apply_params.phase = DeviceMoERebalanceStagePhase::Apply;
+            apply_params.transfer_mode = binding_it->second.transfer_mode;
+            apply_params.apply_layer_idx = boundary_apply ? -1 : layer_idx;
+            apply_params.transfer_state = apply_transfer_state;
+
+            graph.addNode(graph_rebalance_apply_node,
+                          ComputeStageFactory::createMoEDeviceRebalance(apply_params),
+                          device);
+            graph.addDependency(graph_rebalance_apply_node, prefix + "ffn_norm");
+            graph.addDependency(prefix + "moe_routing", graph_rebalance_apply_node);
+
+            LOG_DEBUG("[Qwen35MoEGraph] Added graph-side MoE device rebalance layer apply"
+                      << " producer_layer=" << binding_it->second.producer_layer_idx
+                      << " layer=" << layer_idx
+                      << " apply_layer=" << apply_params.apply_layer_idx
+                      << " device=" << device.to_string()
+                      << " participant=" << config_.tp_device_idx
+                      << " context=" << (context ? context : ""));
+
+            return graph_rebalance_apply_node;
+        };
 
         // =====================================================================
         // Stage 1: Pre-FFN RMSNorm (fused with attention residual add)
@@ -1378,6 +2722,13 @@ namespace llaminar2
         // =====================================================================
         TensorBase *routing_indices = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_INDICES));
         TensorBase *routing_weights = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS));
+        int expert_intermediate = config_.moe.intermediate_size;
+        if (expert_intermediate == 0 && layer.moe_gate_exps)
+        {
+            // gate_exps shape: [num_experts, intermediate, d_model] or rows=num_experts*intermediate
+            size_t total_rows = layer.moe_gate_exps->rows();
+            expert_intermediate = static_cast<int>(total_rows / config_.moe.num_experts);
+        }
 
         {
             MoERoutingStage::Params route_params;
@@ -1403,6 +2754,79 @@ namespace llaminar2
             route_params.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
             route_params.output_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
             route_params.output_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+
+            if (device_side_graph_rebalance_candidate &&
+                env.moe_rebalance.device_rebalance_maintenance_graph &&
+                local_decode_layer &&
+                (first_local_decode_layer || last_local_decode_layer))
+            {
+                if (first_local_decode_layer &&
+                    shouldCollectGraphRebalanceTransferSpecs() &&
+                    !graph_rebalance_transfer_specs.has_value())
+                {
+                    MoEExpertComputeStage::Params spec_params;
+                    spec_params.device_id = device;
+                    spec_params.num_experts = config_.moe.num_experts;
+                    spec_params.gate_exps = layer.moe_gate_exps;
+                    spec_params.up_exps = layer.moe_up_exps;
+                    spec_params.down_exps = layer.moe_down_exps;
+                    spec_params.expert_intermediate = expert_intermediate;
+                    if (!MoEExpertComputeStage::extractExpertViews(spec_params))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph failed to extract expert transfer-slot views before routing for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+                    graph_rebalance_transfer_specs =
+                        transferSlotSpecsFromExpertParams(spec_params, config_.moe.num_experts);
+                    if (!graph_rebalance_transfer_specs.has_value())
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph could not derive NativeVNNI transfer-slot specs before routing for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+                }
+
+                if (first_local_decode_layer)
+                    (void)maybeInsertGraphSideRebalance(
+                        "MoE routing ready-wave apply piggyback",
+                        std::string{});
+
+                const auto binding_it =
+                    moe_graph_rebalance_bindings_.find(graphRebalanceDomainKey());
+                if (binding_it != moe_graph_rebalance_bindings_.end())
+                {
+                    const auto &binding = binding_it->second;
+                    const bool needs_transfer_slot_apply =
+                        deviceMoERebalanceModeUsesTransferSlots(binding.transfer_mode) &&
+                        binding.local_transfer_slot_count > 0;
+                    const bool needs_deferred_resident_apply =
+                        hasDeviceMoERebalanceFlag(
+                            binding.config.flags,
+                            DeviceMoERebalanceFlags::DeferRuntimeApply);
+                    if (needs_transfer_slot_apply || needs_deferred_resident_apply)
+                    {
+                        if (last_local_decode_layer)
+                        {
+                            route_params.device_rebalance_route_apply = true;
+                            route_params.device_rebalance_workspace_name =
+                                binding.workspace_name;
+                            route_params.device_rebalance_config = binding.config;
+                            route_params.device_rebalance_local_transfer_slots =
+                                binding.local_transfer_slots;
+                            route_params.device_rebalance_local_transfer_slot_count =
+                                binding.local_transfer_slot_count;
+                            route_params.device_rebalance_plan_capacity =
+                                static_cast<uint32_t>(
+                                    transferPlanCapacityForBinding(binding));
+                            route_params.device_rebalance_command_buffer_count =
+                                static_cast<uint32_t>(
+                                    commandBufferCountForBinding(binding));
+                            route_params.device_rebalance_apply_layer_idx = -1;
+                        }
+                    }
+                }
+            }
 
             graph.addNode(prefix + "moe_routing",
                           ComputeStageFactory::createMoERouting(route_params),
@@ -1451,15 +2875,6 @@ namespace llaminar2
         bool deferred_local_tp_moe_allreduce_to_combined = false;
 
         {
-            // Infer expert intermediate size from weight shape
-            int expert_intermediate = config_.moe.intermediate_size;
-            if (expert_intermediate == 0 && layer.moe_gate_exps)
-            {
-                // gate_exps shape: [num_experts, intermediate, d_model] or rows=num_experts*intermediate
-                size_t total_rows = layer.moe_gate_exps->rows();
-                expert_intermediate = static_cast<int>(total_rows / config_.moe.num_experts);
-            }
-
             auto makeExpertParams = [&](TensorBase *output,
                                         BufferId output_buffer_id,
                                         std::vector<bool> expert_mask,
@@ -1487,10 +2902,17 @@ namespace llaminar2
                 expert_params.prepared_store = prepared_weight_store_;
                 expert_params.expert_mask = std::move(expert_mask);
                 expert_params.moe_runtime_table = moe_runtime_table;
+                expert_params.runtime_decode_uses_mutable_descriptors =
+                    graphRebalanceDecodeUsesMutableDescriptors();
                 expert_params.force_grouped_verifier_prefill_for_decode =
                     forceGroupedMoEVerifierPrefill(stage_device);
                 expert_params.force_decode_equivalent_verifier_prefill =
                     forceDecodeEquivalentMoEVerifier(stage_device);
+                expert_params.my_socket_id = std::max(0, config_.tp_device_idx);
+                expert_params.participant_count =
+                    local_tp_ctx && local_tp_ctx->degree() > 0
+                        ? local_tp_ctx->degree()
+                        : std::max(1, expert_params.my_socket_id + 1);
 
                 if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts &&
                     expert_params.expert_mask.empty())
@@ -1662,16 +3084,24 @@ namespace llaminar2
              * of the graph until a full-model cosine/L2/KL/max-abs proof passes;
              * previous attempts diverged even when the component microbenches
              * looked healthy.
-             */
+            */
             const bool can_combine_shared_verifier = false;
 
             const ExpertRoutedTier *local_tp_fast_tier = nullptr;
-            const bool use_local_tp_replicated_fast_path =
+            const bool local_tp_apportioned_fast_candidate =
                 use_expert_overlay &&
                 canUseLocalTPApportionedExpertsFastPath(
                     *overlay_plan,
                     device,
                     &local_tp_fast_tier);
+            const bool phase_split_local_tp_apportioned_gpu_prefill =
+                local_tp_apportioned_fast_candidate &&
+                device.is_gpu() &&
+                total_tokens > 1 &&
+                config_.dense_parallel_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE;
+            const bool use_local_tp_apportioned_fast_path =
+                local_tp_apportioned_fast_candidate ||
+                phase_split_local_tp_apportioned_gpu_prefill;
 
             if (overlay_requested && !use_expert_overlay)
             {
@@ -1679,7 +3109,7 @@ namespace llaminar2
                                                                                 << " but no usable placement was found; using legacy routed expert path");
             }
 
-            if (use_local_tp_replicated_fast_path)
+            if (use_local_tp_apportioned_fast_path)
             {
                 auto owner_map_lifetime = std::make_shared<MoEExpertOwnerMap>(
                     MoEExpertOwnerMap::build(*overlay_plan));
@@ -1710,6 +3140,11 @@ namespace llaminar2
                     buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
                     std::move(participant_mask),
                     device);
+                expert_params.my_socket_id = local_participant;
+                expert_params.participant_count =
+                    participantCountForGraphNativeOverlay(
+                        *owner_map_lifetime,
+                        continuationRootParticipant(*overlay_plan));
                 const std::string domain_name = local_tp_fast_tier ? local_tp_fast_tier->domain : std::string{};
                 if (!prepareExpertParams(
                         expert_params,
@@ -1722,15 +3157,22 @@ namespace llaminar2
                         "Qwen35 MoE graph failed to prepare LocalTP apportioned-experts fast-path parameters for layer " +
                         std::to_string(layer_idx) + " on " + device.to_string());
                 }
+                if (shouldCollectGraphRebalanceTransferSpecs())
+                {
+                    graph_rebalance_transfer_specs =
+                        transferSlotSpecsFromExpertParams(expert_params, config_.moe.num_experts);
+                }
 
                 if (moe_runtime_table &&
                     masked_local_tp_overlay_decode_runtime_table &&
                     expert_params.replica_set.num_replicated == 0)
                 {
-                    const int participant_count =
-                        participantCountForGraphNativeOverlay(
+                    const int participant_count = expert_params.participant_count;
+                    const auto owner_participants =
+                        ownerParticipantsFromMap(
                             *owner_map_lifetime,
-                            continuationRootParticipant(*overlay_plan));
+                            layer_idx,
+                            config_.moe.num_experts);
                     if (!initializeMaskedLocalDecodeRuntimeTable(
                             moe_runtime_table,
                             layer_idx,
@@ -1741,6 +3183,7 @@ namespace llaminar2
                             expert_params.expert_mask,
                             local_participant,
                             participant_count,
+                            owner_participants,
                             expert_params.prepared_gate_gemm,
                             expert_params.prepared_up_gemm,
                             expert_params.prepared_down_gemm,
@@ -1756,7 +3199,14 @@ namespace llaminar2
                 graph.addNode(prefix + "moe_expert_ffn_overlay_fast",
                               ComputeStageFactory::createMoEExpertCompute(expert_params),
                               device);
-                graph.addDependency(prefix + "moe_expert_ffn_overlay_fast", prefix + "moe_routing");
+                const std::string rebalance_apply_dependency =
+                    maybeInsertGraphSideRebalance(
+                        "LocalTP apportioned-experts fast path",
+                        prefix + "moe_expert_ffn_overlay_fast");
+                graph.addDependency(prefix + "moe_expert_ffn_overlay_fast",
+                                    rebalance_apply_dependency.empty()
+                                        ? prefix + "moe_routing"
+                                        : rebalance_apply_dependency);
                 ffn_terminal = prefix + "moe_expert_ffn_overlay_fast";
 
                 if (needsMoEParticipantAllreduce())
@@ -1770,6 +3220,7 @@ namespace llaminar2
                         const size_t allreduce_count =
                             static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                         const std::string ar_name = prefix + "moe_expert_overlay_fast_allreduce";
+                        auto rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
                         auto allreduce_stage = createTPAllreduceStage(
                             moe_output,
                             allreduce_count,
@@ -1777,12 +3228,37 @@ namespace llaminar2
                             layer_idx,
                             /*is_attention=*/false,
                             ar_name,
-                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+                            buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                            std::move(rebalance_sidebands));
                         if (allreduce_stage)
                         {
                             graph.addNode(ar_name, std::move(allreduce_stage), device);
-                            graph.addDependency(ar_name, prefix + "moe_expert_ffn_overlay_fast");
-                            ffn_terminal = ar_name;
+                            graph.addDependency(ar_name,
+                                                graph_rebalance_collect_node.empty()
+                                                    ? prefix + "moe_expert_ffn_overlay_fast"
+                                                    : graph_rebalance_collect_node);
+                            if (graph_rebalance_plan_after_sideband_params.has_value() &&
+                                !graph_rebalance_plan_after_sideband_node.empty())
+                            {
+                                graph.addNode(
+                                    graph_rebalance_plan_after_sideband_node,
+                                    ComputeStageFactory::createMoEDeviceRebalance(
+                                        *graph_rebalance_plan_after_sideband_params),
+                                    device);
+                                graph.addDependency(
+                                    graph_rebalance_plan_after_sideband_node,
+                                    ar_name);
+                                ffn_terminal = graph_rebalance_plan_after_sideband_node;
+                                graph_rebalance_plan_after_sideband_node.clear();
+                                graph_rebalance_plan_after_sideband_params.reset();
+                            }
+                            else
+                            {
+                                ffn_terminal = ar_name;
+                            }
+                            maybeAddGraphRebalancePayloadStageAfterSideband(
+                                ar_name,
+                                ffn_terminal);
                         }
                     }
                 }
@@ -1869,18 +3345,18 @@ namespace llaminar2
 
                     std::vector<int> target_participants = owner_map_lifetime->participantIdsForTier(
                         static_cast<int>(tier_index));
-                    const bool local_tp_replicated_tier =
+                    const bool local_tp_apportioned_tier =
                         isLocalTPApportionedExpertsTier(*overlay_plan, tier);
                     const int graph_local_participant =
-                        local_tp_replicated_tier
+                        local_tp_apportioned_tier
                             ? participantIdForTierDevice(
                                   *owner_map_lifetime,
                                   static_cast<int>(tier_index),
                                   device)
                             : -1;
-                    const bool compute_replicated_tier_on_graph_local_participant =
+                    const bool compute_apportioned_tier_on_graph_local_participant =
                         graph_local_participant >= 0;
-                    if (compute_replicated_tier_on_graph_local_participant)
+                    if (compute_apportioned_tier_on_graph_local_participant)
                     {
                         target_participants = {graph_local_participant};
                     }
@@ -2129,12 +3605,14 @@ namespace llaminar2
                         if (!root_return_node.empty())
                         {
                             std::string tier_terminal = root_return_node;
-                            if (compute_replicated_tier_on_graph_local_participant && needsMoEParticipantAllreduce())
+                            if (compute_apportioned_tier_on_graph_local_participant && needsMoEParticipantAllreduce())
                             {
                                 const size_t allreduce_count =
                                     static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                                 const std::string ar_name = prefix + "moe_sparse_return_reduce_" +
-                                                            participant_suffix + "_allreduce";
+                                                            nodeSuffixForTier(tier, static_cast<int>(tier_index)) +
+                                                            "_allreduce";
+                                auto rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
                                 auto allreduce_stage = createTPAllreduceStage(
                                     moe_output,
                                     allreduce_count,
@@ -2142,12 +3620,16 @@ namespace llaminar2
                                     layer_idx,
                                     /*is_attention=*/false,
                                     ar_name,
-                                    buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+                                    buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                                    std::move(rebalance_sidebands));
                                 if (allreduce_stage)
                                 {
                                     graph.addNode(ar_name, std::move(allreduce_stage), device);
                                     graph.addDependency(ar_name, root_return_node);
                                     tier_terminal = ar_name;
+                                    maybeAddGraphRebalancePayloadStageAfterSideband(
+                                        ar_name,
+                                        tier_terminal);
                                 }
                             }
 
@@ -2176,6 +3658,11 @@ namespace llaminar2
                         "Qwen35 MoE graph failed to prepare expert parameters for layer " +
                         std::to_string(layer_idx) + " on " + device.to_string());
                 }
+                if (shouldCollectGraphRebalanceTransferSpecs())
+                {
+                    graph_rebalance_transfer_specs =
+                        transferSlotSpecsFromExpertParams(expert_params, config_.moe.num_experts);
+                }
 
                 if (device.is_gpu() &&
                     total_tokens == 1 &&
@@ -2183,44 +3670,85 @@ namespace llaminar2
                     debugEnv().rocm.moe_grouped_decode &&
                     debugEnv().rocm.moe_device_routed_decode)
                 {
-                    const bool full_local_decode =
-                        expert_params.local_expert_start == 0 &&
-                        (expert_params.local_expert_count < 0 ||
-                         expert_params.local_expert_count == config_.moe.num_experts) &&
-                        expert_params.replica_set.num_replicated == 0 &&
-                        allExpertsEnabled(expert_params.expert_mask, config_.moe.num_experts);
-                    if (!full_local_decode)
+                    if (masked_local_tp_apportioned_decode_runtime_table)
                     {
-                        throw std::runtime_error(
-                            "Qwen35 MoE GPU decode runtime table requires full local expert "
-                            "ownership for layer " +
-                            std::to_string(layer_idx) + " on " + device.to_string());
+                        const int participant_count =
+                            local_tp_ctx ? local_tp_ctx->degree() : expert_params.participant_count;
+                        const auto owner_participants =
+                            contiguousApportionedExpertOwners(
+                                config_.moe.num_experts,
+                                participant_count);
+                        if (!initializeMaskedLocalDecodeRuntimeTable(
+                                moe_runtime_table,
+                                layer_idx,
+                                config_.moe.num_experts,
+                                config_.moe.top_k,
+                                config_.d_model,
+                                expert_intermediate,
+                                expert_params.expert_mask,
+                                config_.tp_device_idx,
+                                participant_count,
+                                owner_participants,
+                                expert_params.prepared_gate_gemm,
+                                expert_params.prepared_up_gemm,
+                                expert_params.prepared_down_gemm,
+                                nullptr,
+                                "LocalTP apportioned-experts masked GPU decode graph build"))
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE graph failed to initialize masked LocalTP decode "
+                                "runtime table for layer " +
+                                std::to_string(layer_idx) + " on " + device.to_string());
+                        }
                     }
-
-                    if (!initializeFullLocalDecodeRuntimeTable(
-                            moe_runtime_table,
-                            layer_idx,
-                            config_.moe.num_experts,
-                            config_.moe.top_k,
-                            config_.d_model,
-                            expert_intermediate,
-                            expert_params.prepared_gate_gemm,
-                            expert_params.prepared_up_gemm,
-                            expert_params.prepared_down_gemm,
-                            nullptr,
-                            "single-device GPU decode graph build"))
+                    else
                     {
-                        throw std::runtime_error(
-                            "Qwen35 MoE graph failed to initialize device decode "
-                            "runtime table for layer " +
-                            std::to_string(layer_idx) + " on " + device.to_string());
+                        const bool full_local_decode =
+                            expert_params.local_expert_start == 0 &&
+                            (expert_params.local_expert_count < 0 ||
+                             expert_params.local_expert_count == config_.moe.num_experts) &&
+                            expert_params.replica_set.num_replicated == 0 &&
+                            allExpertsEnabled(expert_params.expert_mask, config_.moe.num_experts);
+                        if (!full_local_decode)
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE GPU decode runtime table requires full local expert "
+                                "ownership for layer " +
+                                std::to_string(layer_idx) + " on " + device.to_string());
+                        }
+
+                        if (!initializeFullLocalDecodeRuntimeTable(
+                                moe_runtime_table,
+                                layer_idx,
+                                config_.moe.num_experts,
+                                config_.moe.top_k,
+                                config_.d_model,
+                                expert_intermediate,
+                                expert_params.prepared_gate_gemm,
+                                expert_params.prepared_up_gemm,
+                                expert_params.prepared_down_gemm,
+                                nullptr,
+                                "single-device GPU decode graph build"))
+                        {
+                            throw std::runtime_error(
+                                "Qwen35 MoE graph failed to initialize device decode "
+                                "runtime table for layer " +
+                                std::to_string(layer_idx) + " on " + device.to_string());
+                        }
                     }
                 }
 
                 graph.addNode(prefix + "moe_expert_ffn",
                               ComputeStageFactory::createMoEExpertCompute(expert_params),
                               device);
-                graph.addDependency(prefix + "moe_expert_ffn", prefix + "moe_routing");
+                const std::string rebalance_apply_dependency =
+                    maybeInsertGraphSideRebalance(
+                        "standard routed expert path",
+                        prefix + "moe_expert_ffn");
+                graph.addDependency(prefix + "moe_expert_ffn",
+                                    rebalance_apply_dependency.empty()
+                                        ? prefix + "moe_routing"
+                                        : rebalance_apply_dependency);
                 ffn_terminal = prefix + "moe_expert_ffn";
 
                 // Qwen35 MoE expert weights are normally replicated, so every rank
@@ -2232,14 +3760,19 @@ namespace llaminar2
                 {
                     size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                     std::string ar_name = prefix + "moe_expert_allreduce";
+                    auto rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
                     auto allreduce_stage = createTPAllreduceStage(
                         moe_output, allreduce_count, device, layer_idx,
-                        /*is_attention=*/false, ar_name, buffers.idFor(BufferId::MOE_COMBINED_OUTPUT));
+                        /*is_attention=*/false, ar_name, buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
+                        std::move(rebalance_sidebands));
                     if (allreduce_stage)
                     {
                         graph.addNode(ar_name, std::move(allreduce_stage), device);
                         graph.addDependency(ar_name, prefix + "moe_expert_ffn");
                         ffn_terminal = ar_name;
+                        maybeAddGraphRebalancePayloadStageAfterSideband(
+                            ar_name,
+                            ffn_terminal);
                     }
                 }
             }
@@ -2355,14 +3888,24 @@ namespace llaminar2
             {
                 size_t allreduce_count = static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                 std::string ar_name = prefix + "shared_expert_allreduce";
+                std::vector<TPAllreduceSidebandWorkspaceBinding> rebalance_sidebands;
+                if (shared_device == device)
+                    rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
                 auto allreduce_stage = createTPAllreduceStage(
                     shared_output, allreduce_count, shared_device, layer_idx,
-                    /*is_attention=*/false, ar_name, buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
+                    /*is_attention=*/false, ar_name, buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT),
+                    std::move(rebalance_sidebands));
                 if (allreduce_stage)
                 {
                     graph.addNode(ar_name, std::move(allreduce_stage), shared_device);
                     graph.addDependency(ar_name, prefix + "shared_expert_ffn");
                     shared_ffn_last = ar_name;
+                    if (shared_device == device)
+                    {
+                        maybeAddGraphRebalancePayloadStageAfterSideband(
+                            ar_name,
+                            shared_ffn_last);
+                    }
                 }
             }
 
@@ -2410,6 +3953,7 @@ namespace llaminar2
                     const size_t allreduce_count =
                         static_cast<size_t>(total_tokens) * static_cast<size_t>(config_.d_model);
                     const std::string ar_name = prefix + "moe_combined_allreduce";
+                    auto rebalance_sidebands = takeGraphRebalanceSidebandsForAllreduce();
                     auto allreduce_stage = createTPAllreduceStage(
                         buffers.attn_proj,
                         allreduce_count,
@@ -2417,7 +3961,8 @@ namespace llaminar2
                         layer_idx,
                         /*is_attention=*/false,
                         ar_name,
-                        buffers.idFor(BufferId::ATTN_PROJ));
+                        buffers.idFor(BufferId::ATTN_PROJ),
+                        std::move(rebalance_sidebands));
                     if (!allreduce_stage)
                     {
                         throw std::runtime_error(
@@ -2426,7 +3971,30 @@ namespace llaminar2
                     }
                     graph.addNode(ar_name, std::move(allreduce_stage), device);
                     graph.addDependency(ar_name, prefix + "shared_expert_gate");
-                    ffn_terminal = ar_name;
+                    if (!graph_rebalance_collect_node.empty())
+                        graph.addDependency(ar_name, graph_rebalance_collect_node);
+                    if (graph_rebalance_plan_after_sideband_params.has_value() &&
+                        !graph_rebalance_plan_after_sideband_node.empty())
+                    {
+                        graph.addNode(
+                            graph_rebalance_plan_after_sideband_node,
+                            ComputeStageFactory::createMoEDeviceRebalance(
+                                *graph_rebalance_plan_after_sideband_params),
+                            device);
+                        graph.addDependency(
+                            graph_rebalance_plan_after_sideband_node,
+                            ar_name);
+                        ffn_terminal = graph_rebalance_plan_after_sideband_node;
+                        graph_rebalance_plan_after_sideband_node.clear();
+                        graph_rebalance_plan_after_sideband_params.reset();
+                    }
+                    else
+                    {
+                        ffn_terminal = ar_name;
+                    }
+                    maybeAddGraphRebalancePayloadStageAfterSideband(
+                        ar_name,
+                        ffn_terminal);
                 }
                 else if (shared_gate_writes_combined_output)
                 {
@@ -2511,6 +4079,64 @@ namespace llaminar2
                           device);
             graph.addDependency(prefix + "ffn_residual", ffn_terminal);
             ffn_terminal = prefix + "ffn_residual";
+        }
+
+        if (last_local_decode_layer &&
+            !env.moe_rebalance.device_rebalance_maintenance_graph &&
+            !ffn_terminal.empty())
+        {
+            const auto binding_it =
+                moe_graph_rebalance_bindings_.find(graphRebalanceDomainKey());
+            if (binding_it != moe_graph_rebalance_bindings_.end())
+            {
+                if (deviceMoERebalanceModeUsesTransferSlots(binding_it->second.transfer_mode) &&
+                    binding_it->second.local_transfer_slot_count > 0)
+                {
+                    const auto transfer_directory_it =
+                        moe_transfer_slot_directories_.find(binding_it->second.transfer_key);
+                    const auto transfer_state_it =
+                        moe_rebalance_transfer_states_.find(
+                            binding_it->second.transfer_key + ":workspace=" +
+                            binding_it->second.workspace_name);
+                    if (transfer_directory_it == moe_transfer_slot_directories_.end() ||
+                        !transfer_directory_it->second ||
+                        transfer_state_it == moe_rebalance_transfer_states_.end() ||
+                        !transfer_state_it->second)
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph-side rebalance lost its late transfer-join binding for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+
+                    const std::string join_node =
+                        prefix + "moe_device_rebalance_transfer_join";
+                    MoEDeviceRebalanceStage::Params join_params;
+                    join_params.device_id = device;
+                    join_params.tp_ctx = local_tp_ctx;
+                    join_params.moe_runtime_table = binding_it->second.moe_runtime_table;
+                    join_params.tp_device_idx = config_.tp_device_idx;
+                    join_params.config = binding_it->second.config;
+                    join_params.local_transfer_slots =
+                        transfer_directory_it->second->deviceEntries();
+                    join_params.local_transfer_slot_count =
+                        transfer_directory_it->second->slotCount();
+                    join_params.collective_payload_slot_bytes =
+                        binding_it->second.collective_payload_slot_bytes;
+                    join_params.collective_payload_slot_capacity =
+                        binding_it->second.collective_payload_slot_capacity;
+                    join_params.stage_name = join_node;
+                    join_params.workspace_name = binding_it->second.workspace_name;
+                    join_params.phase = DeviceMoERebalanceStagePhase::JoinTransfer;
+                    join_params.transfer_mode = binding_it->second.transfer_mode;
+                    join_params.transfer_state = transfer_state_it->second;
+
+                    graph.addNode(join_node,
+                                  ComputeStageFactory::createMoEDeviceRebalance(join_params),
+                                  device);
+                    graph.addDependency(join_node, ffn_terminal);
+                    ffn_terminal = join_node;
+                }
+            }
         }
 
         graph.setTerminalNode(ffn_terminal);

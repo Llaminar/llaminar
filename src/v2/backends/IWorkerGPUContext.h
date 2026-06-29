@@ -54,7 +54,7 @@ namespace llaminar2
      *
      * **Worker-thread-only methods** (must be called from within submitted work):
      * - `defaultStream()`, `createStream()`, `destroyStream()`
-     * - `createEvent()`, `destroyEvent()`, `recordEvent()`, `waitEvent()`, `synchronizeEvent()`
+     * - `createEvent()`, `destroyEvent()`, `recordEvent()`, `waitEvent()`, `queryEventChecked()`, `synchronizeEvent()`
      * - `blasHandle()`
      * - `setCollectiveComm()` (write access)
      *
@@ -239,6 +239,22 @@ namespace llaminar2
         virtual void recordEvent(void *event, void *stream = nullptr) = 0;
 
         /**
+         * @brief Record an event on a stream and report launch status.
+         *
+         * This status-bearing companion is intended for graph-captured stream
+         * dependencies where losing the event edge must fail the stage instead
+         * of only logging. Implementations should not silently fall back to the
+         * default/null stream.
+         */
+        virtual bool recordEventChecked(void *event, void *stream = nullptr)
+        {
+            if (!event || !stream)
+                return false;
+            recordEvent(event, stream);
+            return true;
+        }
+
+        /**
          * @brief Make a stream wait for an event
          * @param event Event handle to wait for
          * @param stream Stream that should wait (nullptr = default stream)
@@ -247,6 +263,37 @@ namespace llaminar2
          * @note This is a GPU-side wait, not a CPU-side wait
          */
         virtual void waitEvent(void *event, void *stream = nullptr) = 0;
+
+        /**
+         * @brief Make a stream wait for an event and report launch status.
+         *
+         * Use this for required graph-captured stream edges. A false result
+         * means the dependency was not queued and callers should fail fast.
+         */
+        virtual bool waitEventChecked(void *event, void *stream = nullptr)
+        {
+            if (!event || !stream)
+                return false;
+            waitEvent(event, stream);
+            return true;
+        }
+
+        /**
+         * @brief Query whether an event has completed without blocking the CPU.
+         *
+         * @param event Event handle to query.
+         * @param ready Output flag set to true only when the event has completed.
+         * @return false when the event is invalid or the backend query failed.
+         *
+         * This is intended for opportunistic async scheduling decisions. Callers
+         * must not replace a false result with a blocking synchronize fallback.
+         */
+        virtual bool queryEventChecked(void *event, bool &ready)
+        {
+            ready = false;
+            (void)event;
+            return false;
+        }
 
         /**
          * @brief Synchronize the CPU with an event (blocking)

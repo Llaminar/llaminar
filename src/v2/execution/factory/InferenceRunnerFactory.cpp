@@ -219,6 +219,8 @@ namespace llaminar2
             ctrl_config.num_experts = graph_config.moe.num_experts;
             ctrl_config.top_k = graph_config.moe.top_k;
             ctrl_config.window_size = rebalance_config.window_size;
+            ctrl_config.token_boundary_layer_idx =
+                graph_config.moe.decode_histogram_token_boundary_layer;
             ctrl_config.max_window_size = rebalance_config.max_window_size;
             ctrl_config.window_growth_factor = rebalance_config.window_growth_factor;
             ctrl_config.max_replicas = max_replicas;
@@ -227,6 +229,42 @@ namespace llaminar2
                 graph_config.moe.num_experts,
                 static_cast<int>(ctrl_config.sockets.size()));
             ctrl_config.rebalance_config = SocketRebalanceConfig{};
+            const bool homogeneous_gpu_domain =
+                ctrl_config.sockets.size() > 1 &&
+                std::all_of(ctrl_config.sockets.begin(),
+                            ctrl_config.sockets.end(),
+                            [](const DeviceId &device)
+                            {
+                                return device.is_gpu();
+                            }) &&
+                std::all_of(ctrl_config.sockets.begin(),
+                            ctrl_config.sockets.end(),
+                            [&](const DeviceId &device)
+                            {
+                                return device.type == ctrl_config.sockets.front().type;
+                            });
+            if (homogeneous_gpu_domain &&
+                ctrl_config.num_layers > 0 &&
+                ctrl_config.num_experts > 0)
+            {
+                /*
+                 * Ownership swaps are global expert moves; each moved expert
+                 * must arrive for every routed MoE layer on its destination.
+                 * Bound a single GPU maintenance window to the first-class
+                 * staging arena instead of silently inflating VRAM. Hot
+                 * replicas remain the higher-bandwidth policy for additive
+                 * per-layer tuning.
+                 */
+                const int max_arrivals_per_destination =
+                    std::max(1, ctrl_config.num_experts);
+                const int max_global_moves =
+                    std::max(2, max_arrivals_per_destination / ctrl_config.num_layers);
+                ctrl_config.rebalance_config.max_total_swaps =
+                    std::min(ctrl_config.rebalance_config.max_total_swaps, max_global_moves);
+                ctrl_config.rebalance_config.max_swaps_per_layer =
+                    std::min(ctrl_config.rebalance_config.max_swaps_per_layer,
+                             std::max(1, ctrl_config.rebalance_config.max_total_swaps / 2));
+            }
 
             return std::make_unique<MoERebalanceController>(std::move(ctrl_config));
         }

@@ -12,6 +12,7 @@
 #include <cuda_bf16.h>
 
 #include "kernels/cuda/gemm/CUDANativeVNNIDecodeCommon.cuh"
+#include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "utils/DebugEnv.h"
 
 #include <cassert>
@@ -27,7 +28,41 @@ namespace
     constexpr int kDeviceMoEMaxParticipants = 8;
     constexpr int kMaxTopK = 16;
     constexpr uint8_t kMixedCodebookSentinel = 0xffu;
+    constexpr uint32_t kDeviceMoEFlagValid = 1u << 0;
+    constexpr uint32_t kDeviceMoEFlagResident = 1u << 1;
     constexpr uint32_t kDeviceMoEFlagReplicated = 1u << 2;
+    constexpr uint32_t kDeviceMoEFlagLocalCompute = 1u << 4;
+    constexpr uint32_t kDeviceMoEDirectoryFlagValid = 1u << 0;
+    constexpr uint32_t kDeviceMoEDirectoryFlagResident = 1u << 1;
+    constexpr uint32_t kDeviceMoEDirectoryFlagLocalCompute = 1u << 2;
+    constexpr uint32_t kDeviceMoEDirectoryFlagTransferSlot = 1u << 3;
+    constexpr uint32_t kDeviceMoEDirectoryFlagCopyComplete = 1u << 4;
+    constexpr uint32_t kDeviceMoEReplicaRoleNone = 0u;
+    constexpr uint32_t kDeviceMoEReplicaRolePrimary = 1u;
+    constexpr uint32_t kDeviceMoEReplicaRoleReplica = 2u;
+    constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u;
+    constexpr uint32_t kDeviceMoERebalanceVersion = 1u;
+    constexpr uint32_t kDeviceMoERebalanceFlagHotReplicaCache = 1u << 0;
+    constexpr uint32_t kDeviceMoERebalanceFlagResetHistograms = 1u << 1;
+    constexpr uint32_t kDeviceMoERebalanceFlagPlanMissingArrivals = 1u << 2;
+    constexpr uint32_t kDeviceMoERebalanceFlagDeferRuntimeApply = 1u << 3;
+    constexpr uint32_t kDeviceMoERebalanceFlagCollectLoadStats = 1u << 4;
+    constexpr uint32_t kDeviceMoERebalanceStatusOk = 0u;
+    constexpr uint32_t kDeviceMoERebalanceStatusWindowNotReady = 1u;
+    constexpr uint32_t kDeviceMoERebalanceStatusInvalidConfig = 2u;
+    constexpr uint32_t kDeviceMoERebalanceStatusInvalidRuntime = 3u;
+    constexpr uint32_t kDeviceMoERebalanceStatusMissingHistogram = 4u;
+    constexpr uint32_t kDeviceMoERebalancePlanHotReplicaArrival = 1u;
+    constexpr uint32_t kDeviceMoERebalancePlanResidentHotReplica = 2u;
+    constexpr uint32_t kDeviceMoERebalancePhasePlanAssignments = 2u;
+    constexpr uint32_t kDeviceMoERebalanceLifecycleIdle = 0u;
+    constexpr uint32_t kDeviceMoERebalanceLifecyclePlanning = 1u;
+    constexpr uint32_t kDeviceMoERebalanceLifecycleTransferInFlight = 2u;
+    constexpr uint32_t kDeviceMoERebalanceLifecycleReadyToApply = 3u;
+    constexpr uint32_t kDeviceMoERebalanceLifecycleApplying = 4u;
+    constexpr uint32_t kDeviceMoERebalanceLifecycleApplied = 5u;
+    constexpr uint32_t kDeviceMoERebalanceLifecycleError = 6u;
+    constexpr uint32_t kDeviceMoEInvalidSlot = 0xffffffffu;
 
     struct DeviceNativeVNNIMatrixDesc
     {
@@ -75,6 +110,16 @@ namespace
         float topk_weights[kMaxTopK];
         uint64_t decode_histogram[kDeviceMoEMaxExperts];
         uint64_t decode_local_histogram[kDeviceMoEMaxExperts];
+        uint64_t router_hot_cache_eligible_dispatches;
+        uint64_t router_hot_cache_used_dispatches;
+        uint64_t router_hot_cache_improved_dispatches;
+        uint64_t router_hot_cache_default_load_spread_total;
+        uint64_t router_hot_cache_actual_load_spread_total;
+        uint64_t router_hot_cache_load_spread_improvement_total;
+        uint64_t router_hot_cache_active_dispatches;
+        uint64_t router_hot_cache_miss_dispatches;
+        uint64_t router_hot_cache_selected_expert_slots;
+        uint64_t router_hot_cache_replicated_selected_expert_slots;
         int32_t *route_expert_ids;
         float *route_weights;
         int32_t *expert_counts;
@@ -92,6 +137,419 @@ namespace
         uint32_t participant_id;
         uint32_t participant_count;
     };
+
+    struct DeviceMoERebalanceConfigView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t num_layers;
+        uint32_t num_experts;
+        uint32_t top_k;
+        uint32_t participant_id;
+        uint32_t participant_count;
+        uint32_t root_participant;
+        uint32_t window_size_tokens;
+        uint32_t max_hot_replicas_per_participant;
+        uint32_t layer_window_start;
+        uint32_t layer_window_count;
+        uint32_t layer_wave_count;
+        uint32_t flags;
+        uint32_t min_load_spread_improvement;
+        uint32_t min_load_spread_improvement_divisor;
+        uint32_t min_wave_spread_improvement_per_payload_slot;
+        uint32_t min_router_spread_improvement_per_payload_slot;
+    };
+
+    struct DeviceMoERebalanceStatusView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t status_code;
+        uint32_t last_epoch;
+        uint32_t windows_observed;
+        uint32_t windows_applied;
+        uint32_t changed_layers;
+        uint32_t selected_replicas;
+        uint32_t skipped_not_ready;
+        uint32_t skipped_no_resident;
+        uint32_t invalid_runtime_layers;
+        uint32_t planned_arrivals;
+        uint32_t plan_overflow;
+        uint32_t payload_bucket_requested_slots;
+        uint32_t payload_bucket_slots;
+        uint32_t payload_bucket_index;
+        uint32_t payload_bucket_overflow;
+        uint32_t skipped_no_improvement;
+        uint32_t candidate_arrivals_considered;
+        uint32_t candidate_arrivals_below_floor;
+        uint32_t candidate_arrivals_pruned_by_count_bound;
+        uint32_t skipped_busy_wave;
+        uint64_t candidate_load_spread_improvement_total;
+        uint64_t candidate_load_spread_improvement_max;
+        uint64_t accepted_load_spread_improvement_total;
+        uint64_t accepted_load_spread_improvement_max;
+        uint64_t router_hot_cache_eligible_dispatches;
+        uint64_t router_hot_cache_used_dispatches;
+        uint64_t router_hot_cache_improved_dispatches;
+        uint64_t router_hot_cache_default_load_spread_total;
+        uint64_t router_hot_cache_actual_load_spread_total;
+        uint64_t router_hot_cache_load_spread_improvement_total;
+        uint64_t router_hot_cache_active_dispatches;
+        uint64_t router_hot_cache_miss_dispatches;
+        uint64_t router_hot_cache_selected_expert_slots;
+        uint64_t router_hot_cache_replicated_selected_expert_slots;
+        uint64_t pre_policy_load_total;
+        uint64_t pre_policy_load_min;
+        uint64_t pre_policy_load_max;
+        uint64_t pre_policy_imbalance_numerator;
+        uint64_t pre_policy_imbalance_denominator;
+        uint64_t post_policy_load_total;
+        uint64_t post_policy_load_min;
+        uint64_t post_policy_load_max;
+        uint64_t post_policy_imbalance_numerator;
+        uint64_t post_policy_imbalance_denominator;
+        uint64_t pre_policy_participant_load[kDeviceMoEMaxParticipants];
+        uint64_t post_policy_participant_load[kDeviceMoEMaxParticipants];
+        uint32_t window_ready_slots;
+        uint32_t window_required_slots;
+        uint32_t skipped_wave_cost_floor;
+        uint32_t skipped_low_router_benefit;
+        uint32_t payload_source_participant_mask;
+        uint32_t payload_destination_participant_mask;
+        uint64_t payload_edge_mask;
+    };
+
+    struct DeviceMoERebalancePlanEntryView
+    {
+        uint32_t op;
+        uint32_t layer;
+        uint32_t expert;
+        uint32_t source_participant;
+        uint32_t destination_participant;
+        uint32_t source_resident_mask;
+        uint32_t flags;
+        uint32_t destination_slot;
+        uint32_t payload_slot;
+    };
+
+    struct DeviceMoERebalanceCommandBufferHeaderView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t epoch;
+        uint32_t phase;
+        uint32_t command_count;
+        uint32_t command_capacity;
+        uint32_t participant_id;
+        uint32_t participant_count;
+    };
+
+    struct DeviceMoERebalanceWaveStateView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t epoch;
+        uint32_t next_start_layer;
+        uint32_t planned_start_layer;
+        uint32_t planned_layer_count;
+        uint32_t command_capacity;
+        uint32_t participant_id;
+        uint32_t participant_count;
+        uint32_t reserved[3];
+    };
+
+    struct DeviceMoERebalanceWaveProgressView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t epoch;
+        uint32_t state;
+        uint32_t planned_start_layer;
+        uint32_t planned_layer_count;
+        uint32_t command_count;
+        uint32_t copied_arrivals;
+        uint32_t applied_arrivals;
+        uint32_t applied_layer_count;
+        uint32_t error_code;
+        uint32_t requested_payload_slots;
+        uint32_t payload_bucket_slots;
+        uint32_t payload_bucket_index;
+        uint32_t payload_bucket_overflow;
+        uint32_t reserved[1];
+    };
+
+    struct DeviceMoERebalanceGraphControllerStateView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t participant_id;
+        uint32_t participant_count;
+        uint32_t next_epoch;
+        uint32_t active_wave;
+        uint32_t wave_count;
+        uint32_t maintenance_launches;
+        uint32_t decode_apply_polls;
+        uint32_t decode_apply_hits;
+        uint32_t last_error_code;
+        uint32_t reserved[5];
+        DeviceMoERebalanceWaveProgressView waves[2];
+    };
+
+    struct DeviceMoEExpertDirectoryEntryView
+    {
+        DeviceMoEExpertDescriptorView descriptor;
+        uint32_t layer;
+        uint32_t expert;
+        uint32_t participant;
+        uint32_t resident_mask;
+        uint32_t epoch;
+        uint32_t flags;
+        uint32_t slot_index;
+        uint32_t generation;
+        uint8_t payload_bytes_per_block;
+        uint8_t is_asymmetric;
+        uint8_t has_emins;
+        uint8_t reserved_u8;
+        uint32_t reserved;
+    };
+
+    struct DeviceMoERebalanceApplyStatusView
+    {
+        uint32_t magic;
+        uint32_t version;
+        uint32_t status_code;
+        uint32_t plan_entries_seen;
+        uint32_t applied_arrivals;
+        uint32_t skipped_wrong_destination;
+        uint32_t invalid_plan_entries;
+        uint32_t missing_source_descriptors;
+        uint32_t missing_destination_slots;
+        uint32_t descriptor_mismatches;
+        uint32_t changed_layers;
+        uint32_t copied_arrivals;
+        uint32_t copy_incomplete;
+        uint32_t reserved[3];
+    };
+
+    __device__ __forceinline__ bool rebalance_config_ok(
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return config.magic == kDeviceMoERebalanceMagic &&
+               config.version == kDeviceMoERebalanceVersion &&
+               config.num_layers > 0u &&
+               config.num_experts > 0u &&
+               config.num_experts <= static_cast<uint32_t>(kDeviceMoEMaxExperts) &&
+               config.top_k > 0u &&
+               config.top_k <= static_cast<uint32_t>(kMaxTopK) &&
+               config.participant_count > 0u &&
+               config.participant_count <= static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+               config.participant_id < config.participant_count &&
+               llaminar2::moe_rebalance_policy::hasValidRootParticipant(config) &&
+               config.window_size_tokens > 0u &&
+               (config.layer_window_count == 0u ||
+                config.layer_window_start < config.num_layers);
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_command_buffer_count(
+        uint32_t requested)
+    {
+        if (requested <= 1u)
+            return 1u;
+        return min(requested, 2u);
+    }
+
+    __device__ __forceinline__ bool rebalance_graph_controller_state_basic_ok(
+        const DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return state &&
+               state->magic == kDeviceMoERebalanceMagic &&
+               state->version == kDeviceMoERebalanceVersion &&
+               state->participant_id == config.participant_id &&
+               state->participant_count == config.participant_count &&
+               state->wave_count == 2u;
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_active_command_wave_index(
+        const DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t command_buffer_count)
+    {
+        const uint32_t count = rebalance_command_buffer_count(command_buffer_count);
+        if (count == 1u)
+            return 0u;
+        if (!rebalance_graph_controller_state_basic_ok(state, config))
+            return 0u;
+        return state->active_wave % count;
+    }
+
+    __device__ __forceinline__ bool rebalance_active_wave_busy_for_new_plan(
+        const DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t command_wave_index)
+    {
+        if (!rebalance_graph_controller_state_basic_ok(state, config) ||
+            command_wave_index >= state->wave_count)
+        {
+            return false;
+        }
+        const auto &wave = state->waves[command_wave_index];
+        if (wave.magic != kDeviceMoERebalanceMagic ||
+            wave.version != kDeviceMoERebalanceVersion ||
+            wave.epoch == 0u)
+        {
+            return false;
+        }
+        return wave.state == kDeviceMoERebalanceLifecyclePlanning ||
+               wave.state == kDeviceMoERebalanceLifecycleTransferInFlight ||
+               wave.state == kDeviceMoERebalanceLifecycleReadyToApply ||
+               wave.state == kDeviceMoERebalanceLifecycleApplying;
+    }
+
+    __device__ __forceinline__ void reset_rebalance_wave_progress_device(
+        DeviceMoERebalanceWaveProgressView &wave)
+    {
+        DeviceMoERebalanceWaveProgressView zero{};
+        wave = zero;
+        wave.magic = kDeviceMoERebalanceMagic;
+        wave.version = kDeviceMoERebalanceVersion;
+        wave.state = kDeviceMoERebalanceLifecycleIdle;
+    }
+
+    __device__ __forceinline__ void clear_rebalance_command_header_device(
+        DeviceMoERebalanceCommandBufferHeaderView *header)
+    {
+        if (!header)
+            return;
+        const uint32_t command_capacity = header->command_capacity;
+        const uint32_t participant_id = header->participant_id;
+        const uint32_t participant_count = header->participant_count;
+        header->magic = kDeviceMoERebalanceMagic;
+        header->version = kDeviceMoERebalanceVersion;
+        header->epoch = 0u;
+        header->phase = kDeviceMoERebalancePhasePlanAssignments;
+        header->command_count = 0u;
+        header->command_capacity = command_capacity;
+        header->participant_id = participant_id;
+        header->participant_count = participant_count;
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_layer_window_count(
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return config.layer_window_count == 0u
+                   ? config.num_layers
+                   : min(config.layer_window_count, config.num_layers);
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_layer_wave_count(
+        const DeviceMoERebalanceConfigView &config)
+    {
+        const uint32_t window_count = rebalance_layer_window_count(config);
+        return config.layer_wave_count == 0u
+                   ? window_count
+                   : min(config.layer_wave_count, window_count);
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_wave_start_offset(
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoERebalanceWaveStateView *wave_state)
+    {
+        const uint32_t window_count = rebalance_layer_window_count(config);
+        if (!wave_state ||
+            window_count == 0u ||
+            config.num_layers == 0u ||
+            wave_state->magic != kDeviceMoERebalanceMagic ||
+            wave_state->version != kDeviceMoERebalanceVersion ||
+            wave_state->participant_id != config.participant_id ||
+            wave_state->participant_count != config.participant_count)
+        {
+            return 0u;
+        }
+
+        const uint32_t layer_window_start = config.layer_window_start % config.num_layers;
+        const uint32_t candidate = wave_state->next_start_layer % config.num_layers;
+        const uint32_t candidate_offset =
+            (candidate + config.num_layers - layer_window_start) % config.num_layers;
+        return candidate_offset < window_count ? candidate_offset : 0u;
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_actual_layer_for_wave_index(
+        const DeviceMoERebalanceConfigView &config,
+        const DeviceMoERebalanceWaveStateView *wave_state,
+        uint32_t wave_layer)
+    {
+        const uint32_t window_count = rebalance_layer_window_count(config);
+        if (window_count == 0u || config.num_layers == 0u)
+            return 0u;
+        const uint32_t layer_window_start = config.layer_window_start % config.num_layers;
+        const uint32_t start_offset = rebalance_wave_start_offset(config, wave_state);
+        return (layer_window_start + ((start_offset + wave_layer) % window_count)) %
+               config.num_layers;
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_histogram_count(
+        const unsigned long long *histograms,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t participant,
+        uint32_t wave_layer,
+        uint32_t expert)
+    {
+        const unsigned long long participant_stride =
+            static_cast<unsigned long long>(rebalance_layer_wave_count(config)) *
+            static_cast<unsigned long long>(config.num_experts);
+        const unsigned long long layer_stride =
+            static_cast<unsigned long long>(config.num_experts);
+        return histograms[static_cast<unsigned long long>(participant) * participant_stride +
+                          static_cast<unsigned long long>(wave_layer) * layer_stride +
+                          static_cast<unsigned long long>(expert)];
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_global_count(
+        const unsigned long long *histograms,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t wave_layer,
+        uint32_t expert)
+    {
+        unsigned long long total = 0;
+        for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+            total += rebalance_histogram_count(histograms, config, participant, wave_layer, expert);
+        return total;
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_clamp_u64_to_u32(
+        unsigned long long value)
+    {
+        return value > 0xffffffffULL ? 0xffffffffu : static_cast<uint32_t>(value);
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_window_observed_slots(
+        const unsigned long long *histograms,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        if (!histograms || config.num_layers == 0u || config.top_k == 0u ||
+            config.participant_count == 0u)
+        {
+            return 0ULL;
+        }
+        const uint32_t wave_count = rebalance_layer_wave_count(config);
+        if (wave_count == 0u)
+            return 0ULL;
+        unsigned long long last_layer_slots = 0;
+        const uint32_t last_layer = wave_count - 1u;
+        for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+            for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                last_layer_slots += rebalance_histogram_count(
+                    histograms, config, participant, last_layer, expert);
+        return last_layer_slots;
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_window_required_slots(
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return static_cast<unsigned long long>(config.window_size_tokens) *
+               static_cast<unsigned long long>(config.top_k);
+    }
 
     __device__ __forceinline__ bool runtime_shape_ok(
         const DeviceMoELayerRuntimeView *runtime,
@@ -121,12 +579,77 @@ namespace
 
     __device__ __forceinline__ uint32_t runtime_participant_bit(int participant)
     {
-        return 1u << static_cast<uint32_t>(participant);
+        return llaminar2::moe_rebalance_policy::participantBit(
+            static_cast<uint32_t>(participant));
     }
 
     __device__ __forceinline__ uint32_t runtime_valid_participant_mask(uint32_t participant_count)
     {
-        return (1u << participant_count) - 1u;
+        return llaminar2::moe_rebalance_policy::validParticipantMask(participant_count);
+    }
+
+    __device__ __forceinline__ int rebalance_first_resident_participant(
+        uint32_t resident_mask,
+        uint32_t participant_count,
+        int preferred_participant,
+        int excluded_participant)
+    {
+        return llaminar2::moe_rebalance_policy::firstResidentParticipant(
+            resident_mask,
+            participant_count,
+            preferred_participant,
+            excluded_participant);
+    }
+
+    __device__ __forceinline__ bool rebalance_candidate_can_affect_local_compute(
+        const DeviceMoEExpertDescriptorView &desc,
+        uint32_t resident_mask,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t participant_bit,
+        bool plan_missing_arrivals)
+    {
+        (void)participant_bit;
+        return llaminar2::moe_rebalance_policy::candidateCanAffectLocalCompute(
+            desc,
+            resident_mask,
+            config,
+            plan_missing_arrivals);
+    }
+
+    __device__ __forceinline__ bool rebalance_candidate_can_affect_domain_compute(
+        const DeviceMoEExpertDescriptorView &desc,
+        uint32_t resident_mask,
+        const DeviceMoERebalanceConfigView &config,
+        bool plan_missing_arrivals)
+    {
+        return llaminar2::moe_rebalance_policy::candidateCanAffectDomainCompute(
+            desc,
+            resident_mask,
+            config,
+            plan_missing_arrivals);
+    }
+
+    __device__ __forceinline__ bool rebalance_append_plan_entry(
+        DeviceMoERebalancePlanEntryView *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalancePlanEntryView &entry,
+        DeviceMoERebalanceStatusView *status)
+    {
+        if (!plan_entries || !plan_count)
+            return false;
+        const uint32_t index = *plan_count;
+        if (index >= plan_capacity)
+        {
+            if (status)
+                ++status->plan_overflow;
+            return false;
+        }
+        plan_entries[index] = entry;
+        *plan_count = index + 1u;
+        if (status)
+            ++status->planned_arrivals;
+        return true;
     }
 
     __device__ __forceinline__ uint32_t runtime_expert_resident_mask(
@@ -159,6 +682,53 @@ namespace
                 ++count;
         }
         return count;
+    }
+
+    __device__ __forceinline__ uint32_t runtime_multi_resident_expert_count(
+        const DeviceMoEPlacementBankView &bank)
+    {
+        return bank.reserved[0];
+    }
+
+    __device__ __forceinline__ uint32_t runtime_compute_multi_resident_expert_count(
+        const DeviceMoEPlacementBankView &bank,
+        uint32_t expert_count,
+        uint32_t participant_count)
+    {
+        uint32_t count = 0u;
+        const uint32_t valid_mask = runtime_valid_participant_mask(participant_count);
+        for (uint32_t expert = 0; expert < expert_count; ++expert)
+        {
+            if (runtime_resident_count(bank.resident_participant_mask[expert] & valid_mask,
+                                       participant_count) > 1)
+            {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    __device__ __forceinline__ bool runtime_has_local_hot_replica(
+        const DeviceMoELayerRuntimeView *runtime,
+        const DeviceMoEPlacementBankView &bank,
+        uint32_t expert_count)
+    {
+        for (uint32_t expert = 0; expert < expert_count; ++expert)
+        {
+            const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+            const uint32_t resident_mask =
+                runtime_expert_resident_mask(runtime, bank, static_cast<int>(expert));
+            const bool local_resident =
+                (resident_mask & runtime_participant_bit(
+                                     static_cast<int>(runtime->participant_id))) != 0u;
+            const bool owner_local =
+                desc.owner_participant == static_cast<int32_t>(runtime->participant_id);
+            const bool multi_resident =
+                (resident_mask & (resident_mask - 1u)) != 0u;
+            if (local_resident && !owner_local && multi_resident)
+                return true;
+        }
+        return false;
     }
 
     __device__ __forceinline__ int runtime_nth_resident_participant(
@@ -230,83 +800,3585 @@ namespace
         return best;
     }
 
-    __device__ __forceinline__ bool runtime_selected_slot_local_compute(
-        const DeviceMoELayerRuntimeView *runtime,
+    __device__ __forceinline__ uint64_t runtime_participant_load_spread(
+        const int *load,
+        uint32_t participant_count)
+    {
+        if (!load || participant_count == 0u)
+            return 0ULL;
+        int min_load = load[0];
+        int max_load = load[0];
+        for (uint32_t participant = 1; participant < participant_count; ++participant)
+        {
+            const int value = load[participant];
+            if (value < min_load)
+                min_load = value;
+            if (value > max_load)
+                max_load = value;
+        }
+        return static_cast<uint64_t>(max_load - min_load);
+    }
+
+    __device__ __forceinline__ void runtime_resolve_decode_dispatch(
+        DeviceMoELayerRuntimeView *runtime,
         const int *selected_experts,
-        int selected_slot,
         int num_experts,
-        int top_k)
+        int top_k,
+        bool record_balance,
+        bool *local_compute_flags)
     {
         if (!runtime_shape_ok(runtime, num_experts, top_k) ||
-            selected_slot < 0 ||
-            selected_slot >= top_k)
+            !selected_experts ||
+            !local_compute_flags)
         {
-            return false;
+            return;
         }
 
         const auto &bank = runtime->banks[runtime->active_bank];
-        const int expert_id = selected_experts[selected_slot];
-        if (expert_id < 0 || expert_id >= num_experts)
-            return false;
-
-        const bool local_resident = bank.local_compute_mask[expert_id] != 0u;
-        if (!runtime_expert_replicated(bank, expert_id))
-            return local_resident;
-
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t participant_id = runtime->participant_id;
-        if (participant_count == 0u ||
-            participant_count > static_cast<uint32_t>(kDeviceMoEMaxParticipants) ||
-            participant_id >= participant_count)
+        const bool valid_participants =
+            participant_count > 0u &&
+            participant_count <= static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+            participant_id < participant_count;
+        const bool has_multi_resident_experts =
+            runtime_multi_resident_expert_count(bank) != 0u;
+        if (!has_multi_resident_experts)
         {
-            return local_resident;
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                const int expert_id = selected_experts[slot];
+                local_compute_flags[slot] =
+                    expert_id >= 0 &&
+                    expert_id < num_experts &&
+                    bank.local_compute_mask[expert_id] != 0u;
+            }
+            return;
         }
+        const bool track_balance =
+            record_balance &&
+            valid_participants;
 
-        const int current_owner = runtime_expert_owner(bank, expert_id);
-        if (current_owner < 0 || current_owner >= static_cast<int>(participant_count))
-            return local_resident;
+        int default_load[kDeviceMoEMaxParticipants] = {};
+        int actual_load[kDeviceMoEMaxParticipants] = {};
+        bool eligible = false;
+        bool used_remote_replica = false;
+        uint64_t selected_expert_slots = 0ULL;
+        uint64_t replicated_selected_expert_slots = 0ULL;
+        if (track_balance)
+            ++runtime->router_hot_cache_active_dispatches;
 
-        int load[kDeviceMoEMaxParticipants] = {};
         for (int slot = 0; slot < top_k; ++slot)
         {
-            const int fixed_expert = selected_experts[slot];
-            if (fixed_expert < 0 || fixed_expert >= num_experts ||
-                runtime_expert_replicated(bank, fixed_expert))
+            const int expert_id = selected_experts[slot];
+            if (expert_id < 0 || expert_id >= num_experts)
+                continue;
+            if (track_balance)
+                ++selected_expert_slots;
+
+            const bool local_resident = bank.local_compute_mask[expert_id] != 0u;
+            const bool replicated = runtime_expert_replicated(bank, expert_id);
+            const int owner = runtime_expert_owner(bank, expert_id);
+            const bool owner_valid =
+                valid_participants &&
+                owner >= 0 &&
+                owner < static_cast<int>(participant_count);
+
+            if (track_balance && owner_valid)
+                ++default_load[owner];
+
+            if (!replicated || !valid_participants || !owner_valid)
             {
+                local_compute_flags[slot] = local_resident;
+                if (!replicated && owner_valid)
+                    ++actual_load[owner];
                 continue;
             }
 
-            const int owner = runtime_expert_owner(bank, fixed_expert);
-            if (owner >= 0 && owner < static_cast<int>(participant_count))
-                ++load[owner];
+            if (track_balance)
+            {
+                const uint32_t resident_mask =
+                    runtime_expert_resident_mask(runtime, bank, expert_id);
+                if (runtime_resident_count(resident_mask, participant_count) > 1)
+                {
+                    eligible = true;
+                    ++replicated_selected_expert_slots;
+                }
+            }
         }
 
-        for (int slot = 0; slot <= selected_slot; ++slot)
+        if (track_balance)
         {
-            const int replicated_expert = selected_experts[slot];
-            if (replicated_expert < 0 || replicated_expert >= num_experts ||
-                !runtime_expert_replicated(bank, replicated_expert))
+            runtime->router_hot_cache_selected_expert_slots += selected_expert_slots;
+            runtime->router_hot_cache_replicated_selected_expert_slots +=
+                replicated_selected_expert_slots;
+            if (!eligible)
+                ++runtime->router_hot_cache_miss_dispatches;
+        }
+
+        for (int slot = 0; slot < top_k; ++slot)
+        {
+            const int expert_id = selected_experts[slot];
+            if (expert_id < 0 || expert_id >= num_experts ||
+                !runtime_expert_replicated(bank, expert_id))
             {
                 continue;
             }
 
-            const int owner = runtime_expert_owner(bank, replicated_expert);
-            if (owner < 0 || owner >= static_cast<int>(participant_count))
+            const bool local_resident = bank.local_compute_mask[expert_id] != 0u;
+            const int owner = runtime_expert_owner(bank, expert_id);
+            if (!valid_participants ||
+                owner < 0 ||
+                owner >= static_cast<int>(participant_count))
+            {
+                local_compute_flags[slot] = local_resident;
                 continue;
+            }
 
-            const int best =
+            const int selected_participant =
                 runtime_choose_replicated_participant(
-                    runtime, bank, selected_experts, slot, replicated_expert, load);
-            if (best < 0)
-                continue;
-
-            if (slot == selected_slot)
-                return local_resident && best == static_cast<int>(participant_id);
-
-            ++load[best];
+                    runtime, bank, selected_experts, slot, expert_id, actual_load);
+            if (selected_participant >= 0 &&
+                selected_participant < static_cast<int>(participant_count))
+            {
+                local_compute_flags[slot] =
+                    local_resident &&
+                    selected_participant == static_cast<int>(participant_id);
+                ++actual_load[selected_participant];
+                if (track_balance && selected_participant != owner)
+                    used_remote_replica = true;
+            }
+            else if (track_balance)
+            {
+                ++actual_load[owner];
+            }
         }
 
+        if (!track_balance || !eligible)
+            return;
+
+        const uint64_t default_spread =
+            runtime_participant_load_spread(default_load, participant_count);
+        const uint64_t actual_spread =
+            runtime_participant_load_spread(actual_load, participant_count);
+        ++runtime->router_hot_cache_eligible_dispatches;
+        runtime->router_hot_cache_default_load_spread_total += default_spread;
+        runtime->router_hot_cache_actual_load_spread_total += actual_spread;
+        if (!used_remote_replica)
+            return;
+        ++runtime->router_hot_cache_used_dispatches;
+        if (actual_spread < default_spread)
+        {
+            ++runtime->router_hot_cache_improved_dispatches;
+            runtime->router_hot_cache_load_spread_improvement_total +=
+                default_spread - actual_spread;
+        }
+    }
+
+    __global__ void device_rebalance_controller_kernel(
+        DeviceMoELayerRuntimeView *runtime_layers,
+        const unsigned long long *gathered_histograms,
+        DeviceMoERebalanceStatusView *status,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalancePlanEntryView *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        DeviceMoERebalanceWaveStateView *wave_state,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (blockIdx.x != 0)
+            return;
+
+        const uint32_t lane = threadIdx.x;
+        const bool leader = lane == 0u;
+        __shared__ uint32_t shared_command_wave_index;
+        __shared__ uint32_t shared_abort;
+        __shared__ uint32_t shared_layer_invalid;
+        __shared__ uint32_t shared_selected[kDeviceMoEMaxExperts];
+        __shared__ uint32_t shared_selected_count;
+        __shared__ uint32_t shared_local_replicas;
+        __shared__ uint32_t shared_plan_epoch;
+        __shared__ unsigned long long shared_candidate_values[kDeviceMoEMaxExperts];
+        __shared__ unsigned long long shared_candidate_counts[kDeviceMoEMaxExperts];
+        __shared__ unsigned long long shared_candidate_improvements[kDeviceMoEMaxExperts];
+        __shared__ uint32_t shared_candidate_experts[kDeviceMoEMaxExperts];
+        __shared__ uint32_t shared_candidate_arrival_considered[kDeviceMoEMaxExperts];
+        __shared__ uint32_t shared_candidate_arrival_below_floor[kDeviceMoEMaxExperts];
+        __shared__ uint32_t shared_stop_rank;
+        __shared__ uint32_t shared_post_policy_resident_mask[kDeviceMoEMaxExperts];
+        __shared__ uint64_t shared_current_policy_load[kDeviceMoEMaxParticipants];
+        __shared__ uint64_t shared_candidate_policy_load[kDeviceMoEMaxParticipants];
+        __shared__ uint64_t shared_pre_policy_load[kDeviceMoEMaxParticipants];
+        __shared__ uint64_t shared_post_policy_load[kDeviceMoEMaxParticipants];
+        __shared__ uint64_t shared_required_load_spread_improvement;
+        __shared__ uint32_t shared_count_bound_prunes;
+        __shared__ uint32_t shared_destination_replica_counts[kDeviceMoEMaxParticipants];
+        __shared__ uint32_t shared_destination_transfer_slot_counts[kDeviceMoEMaxParticipants];
+        __shared__ uint32_t shared_source_payload_slot_counts[kDeviceMoEMaxParticipants];
+
+        if (leader)
+        {
+            shared_command_wave_index =
+                rebalance_active_command_wave_index(controller_state, config, command_buffer_count);
+            shared_abort = 0u;
+        }
+        for (uint32_t participant = lane;
+             participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
+            participant += blockDim.x)
+        {
+            shared_current_policy_load[participant] = 0ULL;
+            shared_candidate_policy_load[participant] = 0ULL;
+            shared_pre_policy_load[participant] = 0ULL;
+            shared_post_policy_load[participant] = 0ULL;
+            shared_destination_replica_counts[participant] = 0u;
+            shared_destination_transfer_slot_counts[participant] = 0u;
+            shared_source_payload_slot_counts[participant] = 0u;
+        }
+        __syncthreads();
+
+        const uint32_t command_wave_index = shared_command_wave_index;
+        if (plan_entries)
+            plan_entries += static_cast<unsigned long long>(command_wave_index) * plan_capacity;
+        if (plan_count)
+            plan_count += command_wave_index;
+        if (command_header)
+            command_header += command_wave_index;
+        if (wave_state)
+            wave_state += command_wave_index;
+
+        if (leader)
+        {
+            if (status)
+            {
+                DeviceMoERebalanceStatusView zero_status{};
+                *status = zero_status;
+                status->magic = kDeviceMoERebalanceMagic;
+                status->version = kDeviceMoERebalanceVersion;
+                status->status_code = kDeviceMoERebalanceStatusOk;
+            }
+            else
+            {
+                shared_abort = 1u;
+            }
+
+            if (shared_abort == 0u &&
+                rebalance_active_wave_busy_for_new_plan(
+                    controller_state,
+                    config,
+                    command_wave_index))
+            {
+                status->status_code = kDeviceMoERebalanceStatusWindowNotReady;
+                status->skipped_not_ready = 1u;
+                status->skipped_busy_wave = 1u;
+                shared_abort = 1u;
+            }
+
+            if (plan_count)
+                *plan_count = 0u;
+
+            if (command_header)
+            {
+                command_header->magic = kDeviceMoERebalanceMagic;
+                command_header->version = kDeviceMoERebalanceVersion;
+                command_header->epoch = 0u;
+                command_header->phase = kDeviceMoERebalancePhasePlanAssignments;
+                command_header->command_count = 0u;
+                command_header->command_capacity = plan_capacity;
+                command_header->participant_id = config.participant_id;
+                command_header->participant_count = config.participant_count;
+            }
+
+            if (wave_state)
+            {
+                const bool keep_cursor =
+                    wave_state->magic == kDeviceMoERebalanceMagic &&
+                    wave_state->version == kDeviceMoERebalanceVersion &&
+                    wave_state->participant_id == config.participant_id &&
+                    wave_state->participant_count == config.participant_count;
+                const uint32_t next_start = keep_cursor ? wave_state->next_start_layer : 0u;
+                wave_state->magic = kDeviceMoERebalanceMagic;
+                wave_state->version = kDeviceMoERebalanceVersion;
+                wave_state->epoch = 0u;
+                wave_state->next_start_layer = next_start;
+                wave_state->planned_start_layer = 0u;
+                wave_state->planned_layer_count = 0u;
+                wave_state->command_capacity = plan_capacity;
+                wave_state->participant_id = config.participant_id;
+                wave_state->participant_count = config.participant_count;
+            }
+
+            if (shared_abort == 0u && !rebalance_config_ok(config))
+            {
+                status->status_code = kDeviceMoERebalanceStatusInvalidConfig;
+                shared_abort = 1u;
+            }
+            if (shared_abort == 0u && !runtime_layers)
+            {
+                status->status_code = kDeviceMoERebalanceStatusInvalidRuntime;
+                shared_abort = 1u;
+            }
+            if (shared_abort == 0u && !gathered_histograms)
+            {
+                status->status_code = kDeviceMoERebalanceStatusMissingHistogram;
+                shared_abort = 1u;
+            }
+            if (shared_abort == 0u)
+            {
+                const unsigned long long observed_slots =
+                    rebalance_window_observed_slots(gathered_histograms, config);
+                const unsigned long long required_slots =
+                    rebalance_window_required_slots(config);
+                status->window_ready_slots =
+                    rebalance_clamp_u64_to_u32(observed_slots);
+                status->window_required_slots =
+                    rebalance_clamp_u64_to_u32(required_slots);
+                if (observed_slots < required_slots)
+                {
+                    status->status_code = kDeviceMoERebalanceStatusWindowNotReady;
+                    status->skipped_not_ready = 1u;
+                    status->skipped_busy_wave = 0u;
+                    shared_abort = 1u;
+                }
+            }
+        }
+        __syncthreads();
+        if (shared_abort != 0u)
+            return;
+
+        const uint32_t participant_bit = runtime_participant_bit(static_cast<int>(config.participant_id));
+        const uint32_t valid_mask = runtime_valid_participant_mask(config.participant_count);
+        const bool plan_missing_arrivals =
+            (config.flags & kDeviceMoERebalanceFlagPlanMissingArrivals) != 0u;
+        const bool defer_runtime_apply =
+            (config.flags & kDeviceMoERebalanceFlagDeferRuntimeApply) != 0u;
+        const bool domain_root_planning = defer_runtime_apply && plan_missing_arrivals;
+        const bool collect_load_stats =
+            (config.flags & kDeviceMoERebalanceFlagCollectLoadStats) != 0u;
+        uint32_t changed_layers = 0;
+        uint32_t selected_replicas = 0;
+        uint32_t skipped_no_resident = 0;
+        uint32_t skipped_no_improvement = 0;
+        uint32_t candidate_arrivals_considered = 0;
+        uint32_t candidate_arrivals_below_floor = 0;
+        uint32_t candidate_arrivals_pruned_by_count_bound = 0;
+        uint64_t candidate_load_spread_improvement_total = 0ULL;
+        uint64_t candidate_load_spread_improvement_max = 0ULL;
+        uint64_t accepted_load_spread_improvement_total = 0ULL;
+        uint64_t accepted_load_spread_improvement_max = 0ULL;
+        uint64_t router_hot_cache_eligible_dispatches = 0ULL;
+        uint64_t router_hot_cache_used_dispatches = 0ULL;
+        uint64_t router_hot_cache_improved_dispatches = 0ULL;
+        uint64_t router_hot_cache_default_load_spread_total = 0ULL;
+        uint64_t router_hot_cache_actual_load_spread_total = 0ULL;
+        uint64_t router_hot_cache_load_spread_improvement_total = 0ULL;
+        uint64_t router_hot_cache_active_dispatches = 0ULL;
+        uint64_t router_hot_cache_miss_dispatches = 0ULL;
+        uint64_t router_hot_cache_selected_expert_slots = 0ULL;
+        uint64_t router_hot_cache_replicated_selected_expert_slots = 0ULL;
+        uint32_t hot_cache_active_layers = 0u;
+        uint32_t invalid_layers = 0;
+        uint32_t last_epoch = 0;
+        const uint32_t layer_window_count =
+            config.layer_window_count == 0u
+                ? config.num_layers
+                : min(config.layer_window_count, config.num_layers);
+        const uint32_t layer_wave_count =
+            config.layer_wave_count == 0u
+                ? layer_window_count
+                : min(config.layer_wave_count, layer_window_count);
+        const uint32_t layer_window_start =
+            config.num_layers == 0u ? 0u : (config.layer_window_start % config.num_layers);
+        uint32_t start_offset = 0u;
+        if (wave_state && layer_window_count > 0u)
+        {
+            const uint32_t candidate = wave_state->next_start_layer % config.num_layers;
+            const uint32_t candidate_offset =
+                (candidate + config.num_layers - layer_window_start) % config.num_layers;
+            if (candidate_offset < layer_window_count)
+                start_offset = candidate_offset;
+        }
+        if (leader)
+        {
+            shared_plan_epoch =
+                (defer_runtime_apply &&
+                 rebalance_graph_controller_state_basic_ok(controller_state, config) &&
+                 controller_state->next_epoch > 0u)
+                    ? controller_state->next_epoch
+                    : 1u;
+        }
+        __syncthreads();
+
+        /*
+         * In deferred transfer-slot mode the root participant produces the
+         * domain-wide assignment plan and project_rebalance_domain_commands()
+         * later broadcasts that root plan into every participant's local apply
+         * ABI. Non-root participants must still advance the rolling wave cursor
+         * so their next histogram pack stays aligned with the root, but running
+         * the full candidate-selection loop here is wasted work.
+         */
+        if (domain_root_planning && config.participant_id != config.root_participant)
+        {
+            if (leader)
+            {
+                if (status)
+                {
+                    status->status_code = kDeviceMoERebalanceStatusOk;
+                    status->windows_observed = 1u;
+                    status->windows_applied = 0u;
+                    status->changed_layers = 0u;
+                    status->last_epoch = 0u;
+                }
+                if (command_header)
+                {
+                    command_header->epoch = 0u;
+                    command_header->command_count = 0u;
+                }
+                if (wave_state)
+                {
+                    const uint32_t start_layer =
+                        (layer_window_start + start_offset) % config.num_layers;
+                    wave_state->epoch = 0u;
+                    wave_state->planned_start_layer = start_layer;
+                    wave_state->planned_layer_count = layer_wave_count;
+                    const uint32_t next_offset =
+                        layer_window_count > 0u
+                            ? ((start_offset + layer_wave_count) % layer_window_count)
+                            : 0u;
+                    wave_state->next_start_layer =
+                        (layer_window_start + next_offset) % config.num_layers;
+                }
+            }
+            return;
+        }
+
+        for (uint32_t window_index = 0; window_index < layer_wave_count; ++window_index)
+        {
+            const uint32_t layer =
+                (layer_window_start + ((start_offset + window_index) % layer_window_count)) %
+                config.num_layers;
+            DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
+            if (leader)
+            {
+                shared_layer_invalid =
+                    (runtime.active_bank > 1u ||
+                     runtime.expert_count != config.num_experts ||
+                     runtime.top_k != config.top_k ||
+                     runtime.participant_id != config.participant_id ||
+                     runtime.participant_count != config.participant_count)
+                        ? 1u
+                        : 0u;
+                if (shared_layer_invalid != 0u)
+                    ++invalid_layers;
+            }
+            __syncthreads();
+            if (shared_layer_invalid != 0u)
+                continue;
+            if (leader)
+            {
+                router_hot_cache_eligible_dispatches +=
+                    runtime.router_hot_cache_eligible_dispatches;
+                router_hot_cache_used_dispatches +=
+                    runtime.router_hot_cache_used_dispatches;
+                router_hot_cache_improved_dispatches +=
+                    runtime.router_hot_cache_improved_dispatches;
+                router_hot_cache_default_load_spread_total +=
+                    runtime.router_hot_cache_default_load_spread_total;
+                router_hot_cache_actual_load_spread_total +=
+                    runtime.router_hot_cache_actual_load_spread_total;
+                router_hot_cache_load_spread_improvement_total +=
+                    runtime.router_hot_cache_load_spread_improvement_total;
+                router_hot_cache_active_dispatches +=
+                    runtime.router_hot_cache_active_dispatches;
+                router_hot_cache_miss_dispatches +=
+                    runtime.router_hot_cache_miss_dispatches;
+                router_hot_cache_selected_expert_slots +=
+                    runtime.router_hot_cache_selected_expert_slots;
+                router_hot_cache_replicated_selected_expert_slots +=
+                    runtime.router_hot_cache_replicated_selected_expert_slots;
+                if ((config.flags & kDeviceMoERebalanceFlagResetHistograms) != 0u)
+                {
+                    runtime.router_hot_cache_eligible_dispatches = 0ULL;
+                    runtime.router_hot_cache_used_dispatches = 0ULL;
+                    runtime.router_hot_cache_improved_dispatches = 0ULL;
+                    runtime.router_hot_cache_default_load_spread_total = 0ULL;
+                    runtime.router_hot_cache_actual_load_spread_total = 0ULL;
+                    runtime.router_hot_cache_load_spread_improvement_total = 0ULL;
+                    runtime.router_hot_cache_active_dispatches = 0ULL;
+                    runtime.router_hot_cache_miss_dispatches = 0ULL;
+                    runtime.router_hot_cache_selected_expert_slots = 0ULL;
+                    runtime.router_hot_cache_replicated_selected_expert_slots = 0ULL;
+                }
+            }
+
+            const uint32_t inactive_bank = 1u - runtime.active_bank;
+            const DeviceMoEPlacementBankView &active = runtime.banks[runtime.active_bank];
+            DeviceMoEPlacementBankView &next = runtime.banks[inactive_bank];
+            if (leader &&
+                runtime_has_local_hot_replica(&runtime, active, config.num_experts))
+            {
+                ++hot_cache_active_layers;
+            }
+            if (leader && collect_load_stats)
+            {
+                for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                {
+                    const DeviceMoEExpertDescriptorView &desc = active.experts[expert];
+                    uint32_t resident_mask =
+                        active.resident_participant_mask[expert] & valid_mask;
+                    if (desc.owner_participant >= 0 &&
+                        desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                    {
+                        resident_mask |= runtime_participant_bit(desc.owner_participant);
+                    }
+                    const unsigned long long count =
+                        rebalance_global_count(gathered_histograms, config, window_index, expert);
+                    for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                    {
+                        shared_pre_policy_load[participant] +=
+                            llaminar2::moe_rebalance_policy::projectedParticipantLoadForExpert(
+                                count,
+                                resident_mask,
+                                config.participant_count,
+                                participant);
+                    }
+                }
+            }
+            __syncthreads();
+            if (leader)
+            {
+                next.epoch = runtime.active_epoch + 1u;
+                next.expert_count = config.num_experts;
+                next.reserved[0] = active.reserved[0];
+                next.reserved[1] = active.reserved[1];
+            }
+
+            for (uint32_t expert = lane; expert < config.num_experts; expert += blockDim.x)
+            {
+                next.experts[expert] = active.experts[expert];
+                DeviceMoEExpertDescriptorView &desc = next.experts[expert];
+                desc.flags &= ~kDeviceMoEFlagReplicated;
+                const bool owner_local =
+                    desc.owner_participant == static_cast<int32_t>(config.participant_id);
+                next.local_compute_mask[expert] = owner_local ? 1u : 0u;
+                next.replica_role[expert] = owner_local
+                                                ? static_cast<uint8_t>(kDeviceMoEReplicaRolePrimary)
+                                                : static_cast<uint8_t>(kDeviceMoEReplicaRoleNone);
+                next.resident_participant_mask[expert] =
+                    active.resident_participant_mask[expert] & valid_mask;
+                if (desc.owner_participant >= 0 &&
+                    desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                {
+                    next.resident_participant_mask[expert] |=
+                        runtime_participant_bit(desc.owner_participant);
+                }
+                shared_post_policy_resident_mask[expert] =
+                    next.resident_participant_mask[expert] & valid_mask;
+            }
+            __syncthreads();
+            if (leader)
+            {
+                for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                    shared_current_policy_load[participant] = 0ULL;
+                for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                {
+                    const DeviceMoEExpertDescriptorView &desc = next.experts[expert];
+                    uint32_t resident_mask =
+                        shared_post_policy_resident_mask[expert] & valid_mask;
+                    if (desc.owner_participant >= 0 &&
+                        desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                    {
+                        resident_mask |= runtime_participant_bit(desc.owner_participant);
+                    }
+                    const unsigned long long count =
+                        rebalance_global_count(gathered_histograms, config, window_index, expert);
+                    for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                    {
+                        shared_current_policy_load[participant] +=
+                            llaminar2::moe_rebalance_policy::projectedParticipantLoadForExpert(
+                                count,
+                                resident_mask,
+                                config.participant_count,
+                                participant);
+                    }
+                }
+            }
+            __syncthreads();
+
+            const uint32_t max_local_replicas =
+                (config.flags & kDeviceMoERebalanceFlagHotReplicaCache) != 0u
+                    ? config.max_hot_replicas_per_participant
+                    : 0u;
+            const uint32_t max_selected_replicas =
+                domain_root_planning
+                    ? max_local_replicas * config.participant_count
+                    : max_local_replicas;
+            if (leader)
+            {
+                shared_selected_count = 0u;
+                shared_local_replicas = 0u;
+                for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                    shared_destination_replica_counts[participant] = 0u;
+            }
+            __syncthreads();
+
+            for (uint32_t rank = 0; rank < config.num_experts; ++rank)
+            {
+                if (shared_local_replicas >= max_selected_replicas)
+                    break;
+                if (leader)
+                {
+                    shared_stop_rank = 0u;
+                    shared_count_bound_prunes = 0u;
+                    uint64_t current_policy_total = 0ULL;
+                    for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                        current_policy_total += shared_current_policy_load[participant];
+                    shared_required_load_spread_improvement =
+                        llaminar2::moe_rebalance_policy::requiredLoadSpreadImprovement(
+                            current_policy_total,
+                            config.min_load_spread_improvement,
+                            config.min_load_spread_improvement_divisor);
+                    if (plan_count &&
+                        llaminar2::moe_rebalance_policy::commandBufferFull(
+                            *plan_count,
+                            plan_capacity))
+                    {
+                        if (status)
+                            ++status->plan_overflow;
+                        shared_stop_rank = 1u;
+                    }
+                }
+                __syncthreads();
+                if (shared_stop_rank != 0u)
+                    break;
+
+                uint32_t candidate_expert = static_cast<uint32_t>(kDeviceMoEMaxExperts);
+                unsigned long long candidate_value = 0ULL;
+                unsigned long long candidate_count = 0ULL;
+                unsigned long long candidate_improvement = 0ULL;
+                uint32_t candidate_arrival_considered = 0u;
+                uint32_t candidate_arrival_below_floor = 0u;
+                if (lane < config.num_experts)
+                {
+                    bool already_selected = false;
+                    for (uint32_t i = 0; i < shared_selected_count; ++i)
+                    {
+                        if (shared_selected[i] == lane)
+                        {
+                            already_selected = true;
+                            break;
+                        }
+                    }
+                    if (!already_selected)
+                    {
+                        const DeviceMoEExpertDescriptorView &candidate_desc =
+                            next.experts[lane];
+                        uint32_t candidate_resident_mask =
+                            next.resident_participant_mask[lane] & valid_mask;
+                        if (candidate_desc.owner_participant >= 0 &&
+                            candidate_desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                        {
+                            candidate_resident_mask |=
+                                runtime_participant_bit(candidate_desc.owner_participant);
+                        }
+                        const bool candidate_can_affect =
+                            domain_root_planning
+                                ? rebalance_candidate_can_affect_domain_compute(
+                                      candidate_desc,
+                                      candidate_resident_mask,
+                                      config,
+                                      plan_missing_arrivals)
+                                : rebalance_candidate_can_affect_local_compute(
+                                      candidate_desc,
+                                      candidate_resident_mask,
+                                      config,
+                                      participant_bit,
+                                      plan_missing_arrivals);
+                        if (candidate_can_affect)
+                        {
+                            const unsigned long long count =
+                                rebalance_global_count(gathered_histograms, config, window_index, lane);
+                            if (count > 0ULL)
+                            {
+                                const bool candidate_local_resident =
+                                    (candidate_resident_mask & participant_bit) != 0u;
+                                const bool candidate_owner_local =
+                                    candidate_desc.owner_participant ==
+                                    static_cast<int32_t>(config.participant_id);
+                                if (domain_root_planning)
+                                {
+                                    if (shared_required_load_spread_improvement != 0ULL &&
+                                        count < shared_required_load_spread_improvement)
+                                    {
+                                        atomicAdd(&shared_count_bound_prunes, 1u);
+                                    }
+                                    else
+                                    {
+                                        const auto destination_choice =
+                                            llaminar2::moe_rebalance_policy::bestMissingResidentDestination(
+                                                shared_current_policy_load,
+                                                count,
+                                                candidate_resident_mask,
+                                                config.participant_count,
+                                                shared_destination_replica_counts,
+                                                max_local_replicas,
+                                                config.min_load_spread_improvement,
+                                                config.min_load_spread_improvement_divisor);
+                                        candidate_arrival_considered = 1u;
+                                        candidate_improvement = destination_choice.delta.improvement;
+                                        const int source_participant =
+                                            rebalance_first_resident_participant(
+                                                candidate_resident_mask,
+                                                config.participant_count,
+                                                candidate_desc.owner_participant,
+                                                static_cast<int>(destination_choice.destination_participant));
+                                        const bool destination_has_transfer_slot =
+                                            destination_choice.valid &&
+                                            destination_choice.destination_participant < kDeviceMoEMaxParticipants &&
+                                            shared_destination_transfer_slot_counts[
+                                                destination_choice.destination_participant] < payload_slot_capacity;
+                                        const bool source_has_payload_slot =
+                                            source_participant >= 0 &&
+                                            static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
+                                            shared_source_payload_slot_counts[
+                                                static_cast<uint32_t>(source_participant)] < payload_slot_capacity;
+                                        if (destination_choice.valid &&
+                                            destination_has_transfer_slot &&
+                                            source_has_payload_slot)
+                                        {
+                                            candidate_value = destination_choice.delta.improvement;
+                                            candidate_count = count;
+                                            candidate_expert = lane;
+                                        }
+                                        else if ((candidate_resident_mask & (candidate_resident_mask - 1u)) == 0u)
+                                        {
+                                            candidate_arrival_below_floor = 1u;
+                                        }
+                                        else
+                                        {
+                                            candidate_value = count;
+                                            candidate_count = count;
+                                            candidate_expert = lane;
+                                        }
+                                    }
+                                }
+                                else if (plan_missing_arrivals &&
+                                    !candidate_local_resident &&
+                                    !candidate_owner_local)
+                                {
+                                    if (shared_required_load_spread_improvement != 0ULL &&
+                                        count < shared_required_load_spread_improvement)
+                                    {
+                                        atomicAdd(&shared_count_bound_prunes, 1u);
+                                    }
+                                    else
+                                    {
+                                        const uint32_t proposed_resident_mask =
+                                            (candidate_resident_mask | participant_bit) & valid_mask;
+                                        const auto delta =
+                                            llaminar2::moe_rebalance_policy::evaluateAddingResidentLoadSpread(
+                                                shared_current_policy_load,
+                                                count,
+                                                candidate_resident_mask,
+                                                proposed_resident_mask,
+                                                config.participant_count,
+                                                config.min_load_spread_improvement,
+                                                config.min_load_spread_improvement_divisor);
+                                        candidate_arrival_considered = 1u;
+                                        candidate_improvement = delta.improvement;
+                                        if (!delta.meets_floor)
+                                        {
+                                            candidate_arrival_below_floor = 1u;
+                                        }
+                                        else
+                                        {
+                                            const int source_participant =
+                                                rebalance_first_resident_participant(
+                                                    candidate_resident_mask,
+                                                    config.participant_count,
+                                                    candidate_desc.owner_participant,
+                                                    static_cast<int>(config.participant_id));
+                                            const bool source_has_payload_slot =
+                                                source_participant >= 0 &&
+                                                static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
+                                                shared_source_payload_slot_counts[
+                                                    static_cast<uint32_t>(source_participant)] < payload_slot_capacity;
+                                            if (config.participant_id < kDeviceMoEMaxParticipants &&
+                                                shared_destination_transfer_slot_counts[config.participant_id] <
+                                                    payload_slot_capacity &&
+                                                source_has_payload_slot)
+                                            {
+                                                candidate_value = delta.improvement;
+                                                candidate_count = count;
+                                                candidate_expert = lane;
+                                            }
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    candidate_value = count;
+                                    candidate_count = count;
+                                    candidate_expert = lane;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                shared_candidate_values[lane] = candidate_value;
+                shared_candidate_counts[lane] = candidate_count;
+                shared_candidate_improvements[lane] = candidate_improvement;
+                shared_candidate_experts[lane] = candidate_expert;
+                shared_candidate_arrival_considered[lane] = candidate_arrival_considered;
+                shared_candidate_arrival_below_floor[lane] = candidate_arrival_below_floor;
+                __syncthreads();
+
+                if (leader)
+                {
+                    for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                    {
+                        candidate_arrivals_considered +=
+                            shared_candidate_arrival_considered[expert];
+                        candidate_arrivals_below_floor +=
+                            shared_candidate_arrival_below_floor[expert];
+                        skipped_no_improvement +=
+                            shared_candidate_arrival_below_floor[expert];
+                        candidate_load_spread_improvement_total +=
+                            shared_candidate_improvements[expert];
+                        if (shared_candidate_improvements[expert] >
+                            candidate_load_spread_improvement_max)
+                        {
+                            candidate_load_spread_improvement_max =
+                                shared_candidate_improvements[expert];
+                        }
+                    }
+                }
+                __syncthreads();
+
+                for (uint32_t stride = kDeviceMoEMaxExperts / 2u; stride > 0u; stride >>= 1u)
+                {
+                    if (lane < stride)
+                    {
+                        const uint32_t other = lane + stride;
+                        const unsigned long long lhs_value = shared_candidate_values[lane];
+                        const unsigned long long rhs_value = shared_candidate_values[other];
+                        const unsigned long long lhs_count = shared_candidate_counts[lane];
+                        const unsigned long long rhs_count = shared_candidate_counts[other];
+                        const uint32_t lhs_expert = shared_candidate_experts[lane];
+                        const uint32_t rhs_expert = shared_candidate_experts[other];
+                        if (llaminar2::moe_rebalance_policy::candidateValueIsBetter(
+                                rhs_value,
+                                rhs_count,
+                                rhs_expert,
+                                lhs_value,
+                                lhs_count,
+                                lhs_expert))
+                        {
+                            shared_candidate_values[lane] = rhs_value;
+                            shared_candidate_counts[lane] = rhs_count;
+                            shared_candidate_experts[lane] = rhs_expert;
+                        }
+                    }
+                    __syncthreads();
+                }
+
+                if (leader)
+                {
+                    const uint32_t best_expert = shared_candidate_experts[0];
+                    const unsigned long long best_count = shared_candidate_counts[0];
+                    shared_stop_rank =
+                        (best_expert >= config.num_experts || best_count == 0ULL) ? 1u : 0u;
+                    candidate_arrivals_pruned_by_count_bound += shared_count_bound_prunes;
+                    skipped_no_improvement += shared_count_bound_prunes;
+                    if (shared_stop_rank == 0u)
+                        shared_selected[shared_selected_count++] = best_expert;
+                }
+                __syncthreads();
+                if (shared_stop_rank != 0u)
+                    break;
+
+                if (leader)
+                {
+                    const uint32_t best_expert = shared_selected[shared_selected_count - 1u];
+                    DeviceMoEExpertDescriptorView &desc = next.experts[best_expert];
+                    uint32_t resident_mask = next.resident_participant_mask[best_expert] & valid_mask;
+                    if (desc.owner_participant >= 0 &&
+                        desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                    {
+                        resident_mask |= runtime_participant_bit(desc.owner_participant);
+                    }
+                    next.resident_participant_mask[best_expert] = resident_mask;
+
+                    const bool replicated = (resident_mask & (resident_mask - 1u)) != 0u;
+                    const bool local_resident = (resident_mask & participant_bit) != 0u;
+                    const bool owner_local =
+                        desc.owner_participant == static_cast<int32_t>(config.participant_id);
+                    if (domain_root_planning)
+                    {
+                        const unsigned long long count =
+                            rebalance_global_count(gathered_histograms, config, window_index, best_expert);
+                        const auto destination_choice =
+                            llaminar2::moe_rebalance_policy::bestMissingResidentDestination(
+                                shared_current_policy_load,
+                                count,
+                                resident_mask,
+                                config.participant_count,
+                                shared_destination_replica_counts,
+                                max_local_replicas,
+                                config.min_load_spread_improvement,
+                                config.min_load_spread_improvement_divisor);
+                        if (destination_choice.valid)
+                        {
+                            if (!llaminar2::moe_rebalance_policy::addingResidentImprovesLoadSpread(
+                                    shared_current_policy_load,
+                                    count,
+                                    resident_mask,
+                                    destination_choice.proposed_resident_mask,
+                                    config.participant_count,
+                                    shared_candidate_policy_load,
+                                    config.min_load_spread_improvement,
+                                    config.min_load_spread_improvement_divisor))
+                            {
+                                ++skipped_no_improvement;
+                            }
+                            else
+                            {
+                                const int source_participant = rebalance_first_resident_participant(
+                                    resident_mask,
+                                    config.participant_count,
+                                    desc.owner_participant,
+                                    static_cast<int>(destination_choice.destination_participant));
+                                uint32_t destination_slot = kDeviceMoEInvalidSlot;
+                                uint32_t payload_slot = kDeviceMoEInvalidSlot;
+                                if (destination_choice.destination_participant < kDeviceMoEMaxParticipants &&
+                                    shared_destination_transfer_slot_counts[
+                                        destination_choice.destination_participant] < payload_slot_capacity &&
+                                    source_participant >= 0 &&
+                                    static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
+                                    shared_source_payload_slot_counts[
+                                        static_cast<uint32_t>(source_participant)] < payload_slot_capacity)
+                                {
+                                    destination_slot =
+                                        shared_destination_transfer_slot_counts[
+                                            destination_choice.destination_participant];
+                                    payload_slot =
+                                        shared_source_payload_slot_counts[
+                                            static_cast<uint32_t>(source_participant)];
+                                }
+                                DeviceMoERebalancePlanEntryView entry{};
+                                entry.op = kDeviceMoERebalancePlanHotReplicaArrival;
+                                entry.layer = layer;
+                                entry.expert = best_expert;
+                                entry.source_participant =
+                                    source_participant >= 0 ? static_cast<uint32_t>(source_participant) : 0u;
+                                entry.destination_participant =
+                                    destination_choice.destination_participant;
+                                entry.source_resident_mask = resident_mask;
+                                entry.destination_slot = destination_slot;
+                                entry.payload_slot = payload_slot;
+                                if (destination_slot != kDeviceMoEInvalidSlot &&
+                                    payload_slot != kDeviceMoEInvalidSlot &&
+                                    source_participant >= 0 &&
+                                    rebalance_append_plan_entry(
+                                        plan_entries,
+                                        plan_count,
+                                        plan_capacity,
+                                        entry,
+                                        status))
+                                {
+                                    ++shared_destination_transfer_slot_counts[
+                                        destination_choice.destination_participant];
+                                    ++shared_source_payload_slot_counts[
+                                        static_cast<uint32_t>(source_participant)];
+                                    shared_post_policy_resident_mask[best_expert] =
+                                        destination_choice.proposed_resident_mask;
+                                    for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                                        shared_current_policy_load[participant] =
+                                            shared_candidate_policy_load[participant];
+                                    accepted_load_spread_improvement_total +=
+                                        destination_choice.delta.improvement;
+                                    if (destination_choice.delta.improvement >
+                                        accepted_load_spread_improvement_max)
+                                    {
+                                        accepted_load_spread_improvement_max =
+                                            destination_choice.delta.improvement;
+                                    }
+                                    ++shared_destination_replica_counts[
+                                        destination_choice.destination_participant];
+                                    ++shared_local_replicas;
+                                    ++selected_replicas;
+                                }
+                                else
+                                {
+                                    if (destination_slot == kDeviceMoEInvalidSlot && status)
+                                        ++status->plan_overflow;
+                                    ++skipped_no_resident;
+                                }
+                            }
+                        }
+                        else if (!replicated)
+                        {
+                            ++skipped_no_resident;
+                        }
+                        else
+                        {
+                            bool resident_plan_ready = false;
+                            for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                            {
+                                if ((resident_mask & runtime_participant_bit(static_cast<int>(participant))) == 0u)
+                                    continue;
+                                DeviceMoERebalancePlanEntryView entry{};
+                                entry.op = kDeviceMoERebalancePlanResidentHotReplica;
+                                entry.layer = layer;
+                                entry.expert = best_expert;
+                                entry.source_participant =
+                                    desc.owner_participant >= 0
+                                        ? static_cast<uint32_t>(desc.owner_participant)
+                                        : participant;
+                                entry.destination_participant = participant;
+                                entry.source_resident_mask = resident_mask;
+                                entry.destination_slot = kDeviceMoEInvalidSlot;
+                                entry.payload_slot = kDeviceMoEInvalidSlot;
+                                if (rebalance_append_plan_entry(
+                                        plan_entries,
+                                        plan_count,
+                                        plan_capacity,
+                                        entry,
+                                        status))
+                                {
+                                    resident_plan_ready = true;
+                                    if (desc.owner_participant != static_cast<int32_t>(participant))
+                                    {
+                                        ++shared_destination_replica_counts[participant];
+                                        ++shared_local_replicas;
+                                    }
+                                }
+                            }
+                            if (resident_plan_ready)
+                            {
+                                shared_post_policy_resident_mask[best_expert] =
+                                    resident_mask & valid_mask;
+                                ++selected_replicas;
+                            }
+                            else
+                            {
+                                ++skipped_no_resident;
+                            }
+                        }
+                    }
+                    else if (plan_missing_arrivals && !local_resident && !owner_local)
+                    {
+                        const uint32_t proposed_resident_mask =
+                            (resident_mask | participant_bit) & valid_mask;
+                        const unsigned long long count =
+                            rebalance_global_count(gathered_histograms, config, window_index, best_expert);
+                        const auto delta =
+                            llaminar2::moe_rebalance_policy::evaluateAddingResidentLoadSpread(
+                                shared_current_policy_load,
+                                count,
+                                resident_mask,
+                                proposed_resident_mask,
+                                config.participant_count,
+                                config.min_load_spread_improvement,
+                                config.min_load_spread_improvement_divisor);
+                        if (!delta.meets_floor)
+                        {
+                            ++skipped_no_improvement;
+                        }
+                        else if (!llaminar2::moe_rebalance_policy::addingResidentImprovesLoadSpread(
+                                shared_current_policy_load,
+                                count,
+                                resident_mask,
+                                proposed_resident_mask,
+                                config.participant_count,
+                                shared_candidate_policy_load,
+                                config.min_load_spread_improvement,
+                                config.min_load_spread_improvement_divisor))
+                        {
+                            ++skipped_no_improvement;
+                        }
+                        else
+                        {
+                            const int source_participant = rebalance_first_resident_participant(
+                                resident_mask,
+                                config.participant_count,
+                                desc.owner_participant,
+                                static_cast<int>(config.participant_id));
+                            uint32_t destination_slot = kDeviceMoEInvalidSlot;
+                            uint32_t payload_slot = kDeviceMoEInvalidSlot;
+                            if (config.participant_id < kDeviceMoEMaxParticipants &&
+                                shared_destination_transfer_slot_counts[config.participant_id] < payload_slot_capacity &&
+                                source_participant >= 0 &&
+                                static_cast<uint32_t>(source_participant) < kDeviceMoEMaxParticipants &&
+                                shared_source_payload_slot_counts[
+                                    static_cast<uint32_t>(source_participant)] < payload_slot_capacity)
+                            {
+                                destination_slot =
+                                    shared_destination_transfer_slot_counts[config.participant_id];
+                                payload_slot =
+                                    shared_source_payload_slot_counts[
+                                        static_cast<uint32_t>(source_participant)];
+                            }
+                            DeviceMoERebalancePlanEntryView entry{};
+                            entry.op = kDeviceMoERebalancePlanHotReplicaArrival;
+                            entry.layer = layer;
+                            entry.expert = best_expert;
+                            entry.source_participant =
+                                source_participant >= 0 ? static_cast<uint32_t>(source_participant) : 0u;
+                            entry.destination_participant = config.participant_id;
+                            entry.source_resident_mask = resident_mask;
+                            entry.destination_slot = destination_slot;
+                            entry.payload_slot = payload_slot;
+                            if (destination_slot != kDeviceMoEInvalidSlot &&
+                                payload_slot != kDeviceMoEInvalidSlot &&
+                                source_participant >= 0 &&
+                                rebalance_append_plan_entry(
+                                    plan_entries,
+                                    plan_count,
+                                    plan_capacity,
+                                    entry,
+                                    status))
+                            {
+                                ++shared_destination_transfer_slot_counts[config.participant_id];
+                                ++shared_source_payload_slot_counts[
+                                    static_cast<uint32_t>(source_participant)];
+                                shared_post_policy_resident_mask[best_expert] =
+                                    proposed_resident_mask;
+                                for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                                    shared_current_policy_load[participant] =
+                                        shared_candidate_policy_load[participant];
+                                accepted_load_spread_improvement_total += delta.improvement;
+                                if (delta.improvement > accepted_load_spread_improvement_max)
+                                    accepted_load_spread_improvement_max = delta.improvement;
+                                ++shared_local_replicas;
+                            }
+                            else
+                            {
+                                if (destination_slot == kDeviceMoEInvalidSlot && status)
+                                    ++status->plan_overflow;
+                                ++skipped_no_resident;
+                            }
+                        }
+                    }
+                    else if (!replicated)
+                    {
+                        ++skipped_no_resident;
+                    }
+                    else
+                    {
+                        desc.flags |= kDeviceMoEFlagReplicated;
+                        if (local_resident)
+                        {
+                            bool resident_plan_ready = true;
+                            if (defer_runtime_apply)
+                            {
+                                DeviceMoERebalancePlanEntryView entry{};
+                                entry.op = kDeviceMoERebalancePlanResidentHotReplica;
+                                entry.layer = layer;
+                                entry.expert = best_expert;
+                                entry.source_participant =
+                                    desc.owner_participant >= 0
+                                        ? static_cast<uint32_t>(desc.owner_participant)
+                                        : config.participant_id;
+                                entry.destination_participant = config.participant_id;
+                                entry.source_resident_mask = resident_mask;
+                                entry.destination_slot = kDeviceMoEInvalidSlot;
+                                entry.payload_slot = kDeviceMoEInvalidSlot;
+                                if (!rebalance_append_plan_entry(
+                                        plan_entries,
+                                        plan_count,
+                                        plan_capacity,
+                                        entry,
+                                        status))
+                                {
+                                    ++skipped_no_resident;
+                                    resident_plan_ready = false;
+                                }
+                            }
+                            if (resident_plan_ready)
+                            {
+                                next.local_compute_mask[best_expert] = 1u;
+                                next.replica_role[best_expert] =
+                                    owner_local
+                                        ? static_cast<uint8_t>(kDeviceMoEReplicaRolePrimary)
+                                        : static_cast<uint8_t>(kDeviceMoEReplicaRoleReplica);
+                                if (!owner_local)
+                                    ++shared_local_replicas;
+                                ++selected_replicas;
+                            }
+                            shared_post_policy_resident_mask[best_expert] =
+                                next.resident_participant_mask[best_expert] & valid_mask;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (leader)
+            {
+                if (defer_runtime_apply)
+                {
+                    const uint32_t command_count =
+                        plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
+                    if (command_count > 0u)
+                    {
+                        last_epoch = shared_plan_epoch;
+                        ++changed_layers;
+                    }
+                }
+                else
+                {
+                    next.reserved[0] =
+                        runtime_compute_multi_resident_expert_count(
+                            next, config.num_experts, config.participant_count);
+                    runtime.active_bank = inactive_bank;
+                    runtime.active_epoch = next.epoch;
+                    last_epoch = runtime.active_epoch;
+                    ++changed_layers;
+                }
+            }
+
+            if (!defer_runtime_apply &&
+                (config.flags & kDeviceMoERebalanceFlagResetHistograms) != 0u)
+            {
+                for (uint32_t expert = lane; expert < config.num_experts; expert += blockDim.x)
+                {
+                    runtime.decode_histogram[expert] = 0ULL;
+                    runtime.decode_local_histogram[expert] = 0ULL;
+                }
+                if (leader)
+                {
+                    runtime.router_hot_cache_eligible_dispatches = 0ULL;
+                    runtime.router_hot_cache_used_dispatches = 0ULL;
+                    runtime.router_hot_cache_improved_dispatches = 0ULL;
+                    runtime.router_hot_cache_default_load_spread_total = 0ULL;
+                    runtime.router_hot_cache_actual_load_spread_total = 0ULL;
+                    runtime.router_hot_cache_load_spread_improvement_total = 0ULL;
+                    runtime.router_hot_cache_active_dispatches = 0ULL;
+                    runtime.router_hot_cache_miss_dispatches = 0ULL;
+                    runtime.router_hot_cache_selected_expert_slots = 0ULL;
+                    runtime.router_hot_cache_replicated_selected_expert_slots = 0ULL;
+                }
+            }
+            if (leader && collect_load_stats)
+            {
+                for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                {
+                    const DeviceMoEExpertDescriptorView &desc = next.experts[expert];
+                    uint32_t resident_mask =
+                        shared_post_policy_resident_mask[expert] & valid_mask;
+                    if (desc.owner_participant >= 0 &&
+                        desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                    {
+                        resident_mask |= runtime_participant_bit(desc.owner_participant);
+                    }
+                    const unsigned long long count =
+                        rebalance_global_count(gathered_histograms, config, window_index, expert);
+                    for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                    {
+                        shared_post_policy_load[participant] +=
+                            llaminar2::moe_rebalance_policy::projectedParticipantLoadForExpert(
+                                count,
+                                resident_mask,
+                                config.participant_count,
+                                participant);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        if (leader)
+        {
+            uint64_t pre_total = 0ULL;
+            uint64_t pre_min = 0ULL;
+            uint64_t pre_max = 0ULL;
+            uint64_t post_total = 0ULL;
+            uint64_t post_min = 0ULL;
+            uint64_t post_max = 0ULL;
+            if (collect_load_stats)
+            {
+                llaminar2::moe_rebalance_policy::finalizeLoadSpread(
+                    shared_pre_policy_load,
+                    config.participant_count,
+                    pre_total,
+                    pre_min,
+                    pre_max);
+                llaminar2::moe_rebalance_policy::finalizeLoadSpread(
+                    shared_post_policy_load,
+                    config.participant_count,
+                    post_total,
+                    post_min,
+                    post_max);
+            }
+            status->status_code = invalid_layers > 0u
+                                      ? kDeviceMoERebalanceStatusInvalidRuntime
+                                      : kDeviceMoERebalanceStatusOk;
+            status->windows_observed = 1u;
+            status->windows_applied = changed_layers > 0u ? 1u : 0u;
+            status->changed_layers = changed_layers;
+            status->selected_replicas = selected_replicas;
+            status->skipped_no_resident = skipped_no_resident;
+            status->skipped_no_improvement = skipped_no_improvement;
+            status->candidate_arrivals_considered = candidate_arrivals_considered;
+            status->candidate_arrivals_below_floor = candidate_arrivals_below_floor;
+            status->candidate_arrivals_pruned_by_count_bound =
+                candidate_arrivals_pruned_by_count_bound;
+            status->candidate_load_spread_improvement_total =
+                candidate_load_spread_improvement_total;
+            status->candidate_load_spread_improvement_max =
+                candidate_load_spread_improvement_max;
+            status->accepted_load_spread_improvement_total =
+                accepted_load_spread_improvement_total;
+            status->accepted_load_spread_improvement_max =
+                accepted_load_spread_improvement_max;
+            status->router_hot_cache_eligible_dispatches =
+                router_hot_cache_eligible_dispatches;
+            status->router_hot_cache_used_dispatches =
+                router_hot_cache_used_dispatches;
+            status->router_hot_cache_improved_dispatches =
+                router_hot_cache_improved_dispatches;
+            status->router_hot_cache_default_load_spread_total =
+                router_hot_cache_default_load_spread_total;
+            status->router_hot_cache_actual_load_spread_total =
+                router_hot_cache_actual_load_spread_total;
+            status->router_hot_cache_load_spread_improvement_total =
+                router_hot_cache_load_spread_improvement_total;
+            status->router_hot_cache_active_dispatches =
+                router_hot_cache_active_dispatches;
+            status->router_hot_cache_miss_dispatches =
+                router_hot_cache_miss_dispatches;
+            status->router_hot_cache_selected_expert_slots =
+                router_hot_cache_selected_expert_slots;
+            status->router_hot_cache_replicated_selected_expert_slots =
+                router_hot_cache_replicated_selected_expert_slots;
+            status->invalid_runtime_layers = invalid_layers;
+            status->last_epoch = last_epoch;
+            status->window_ready_slots =
+                rebalance_clamp_u64_to_u32(
+                    rebalance_window_observed_slots(gathered_histograms, config));
+            status->window_required_slots =
+                rebalance_clamp_u64_to_u32(rebalance_window_required_slots(config));
+            if (collect_load_stats)
+            {
+                status->pre_policy_load_total = pre_total;
+                status->pre_policy_load_min = pre_min;
+                status->pre_policy_load_max = pre_max;
+                status->pre_policy_imbalance_numerator = pre_max - pre_min;
+                status->pre_policy_imbalance_denominator = pre_total;
+                status->post_policy_load_total = post_total;
+                status->post_policy_load_min = post_min;
+                status->post_policy_load_max = post_max;
+                status->post_policy_imbalance_numerator = post_max - post_min;
+                status->post_policy_imbalance_denominator = post_total;
+                for (uint32_t participant = 0;
+                     participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
+                     ++participant)
+                {
+                    status->pre_policy_participant_load[participant] =
+                        participant < config.participant_count
+                            ? shared_pre_policy_load[participant]
+                            : 0ULL;
+                    status->post_policy_participant_load[participant] =
+                        participant < config.participant_count
+                            ? shared_post_policy_load[participant]
+                            : 0ULL;
+                }
+            }
+
+            uint32_t command_count =
+                plan_count ? ((*plan_count < plan_capacity) ? *plan_count : plan_capacity) : 0u;
+            uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
+            uint32_t requested_payload_slots = 0u;
+            uint32_t payload_source_participant_mask = 0u;
+            uint32_t payload_destination_participant_mask = 0u;
+            uint64_t payload_edge_mask = 0ULL;
+            if (plan_entries)
+            {
+                for (uint32_t i = 0; i < command_count; ++i)
+                {
+                    const auto &plan = plan_entries[i];
+                    if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                        plan.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+                        plan.destination_participant < config.participant_count &&
+                        plan.destination_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+                        plan.payload_slot != kDeviceMoEInvalidSlot)
+                    {
+                        const uint32_t requested = plan.payload_slot + 1u;
+                        if (requested_by_source[plan.source_participant] < requested)
+                            requested_by_source[plan.source_participant] = requested;
+                        payload_source_participant_mask |=
+                            llaminar2::moe_rebalance_policy::participantBit(
+                                plan.source_participant);
+                        payload_destination_participant_mask |=
+                            llaminar2::moe_rebalance_policy::participantBit(
+                                plan.destination_participant);
+                        payload_edge_mask |=
+                            llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
+                                plan.source_participant,
+                                plan.destination_participant,
+                                static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                    }
+                }
+                for (uint32_t participant = 0;
+                     participant < config.participant_count &&
+                     participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
+                     ++participant)
+                {
+                    if (requested_by_source[participant] > requested_payload_slots)
+                        requested_payload_slots = requested_by_source[participant];
+                }
+            }
+            uint32_t payload_bucket_slots =
+                llaminar2::moe_rebalance_policy::payloadBucketSlots(
+                    requested_payload_slots,
+                    payload_slot_capacity);
+            uint32_t payload_bucket_index =
+                llaminar2::moe_rebalance_policy::payloadBucketIndex(
+                    payload_bucket_slots);
+            uint32_t payload_bucket_overflow =
+                (status->plan_overflow != 0u ||
+                 requested_payload_slots > payload_bucket_slots)
+                    ? 1u
+                    : 0u;
+            const bool wave_cost_floor_rejected =
+                requested_payload_slots > 0u &&
+                !llaminar2::moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+                    accepted_load_spread_improvement_total,
+                    requested_payload_slots,
+                    config.min_wave_spread_improvement_per_payload_slot);
+            const bool router_benefit_floor_rejected =
+                requested_payload_slots > 0u &&
+                !llaminar2::moe_rebalance_policy::transferWaveMeetsRealizedRouterBenefitFloor(
+                    router_hot_cache_load_spread_improvement_total,
+                    requested_payload_slots,
+                    config.min_router_spread_improvement_per_payload_slot,
+                    hot_cache_active_layers > 0u);
+            const bool wave_rejected =
+                wave_cost_floor_rejected || router_benefit_floor_rejected;
+            if (wave_rejected)
+            {
+                skipped_no_improvement += selected_replicas > 0u ? selected_replicas : 1u;
+                selected_replicas = 0u;
+                accepted_load_spread_improvement_total = 0ULL;
+                accepted_load_spread_improvement_max = 0ULL;
+                changed_layers = 0u;
+                last_epoch = 0u;
+                command_count = 0u;
+                requested_payload_slots = 0u;
+                payload_bucket_slots = 0u;
+                payload_bucket_index = 0u;
+                payload_bucket_overflow = 0u;
+                payload_source_participant_mask = 0u;
+                payload_destination_participant_mask = 0u;
+                payload_edge_mask = 0ULL;
+                if (plan_count)
+                    *plan_count = 0u;
+            }
+            if (wave_rejected)
+            {
+                status->windows_applied = 0u;
+                status->changed_layers = changed_layers;
+                status->selected_replicas = selected_replicas;
+                status->skipped_no_improvement = skipped_no_improvement;
+                status->accepted_load_spread_improvement_total =
+                    accepted_load_spread_improvement_total;
+                status->accepted_load_spread_improvement_max =
+                    accepted_load_spread_improvement_max;
+                status->last_epoch = last_epoch;
+                status->planned_arrivals = 0u;
+                if (collect_load_stats)
+                {
+                    status->post_policy_load_total = status->pre_policy_load_total;
+                    status->post_policy_load_min = status->pre_policy_load_min;
+                    status->post_policy_load_max = status->pre_policy_load_max;
+                    status->post_policy_imbalance_numerator =
+                        status->pre_policy_imbalance_numerator;
+                    status->post_policy_imbalance_denominator =
+                        status->pre_policy_imbalance_denominator;
+                    for (uint32_t participant = 0;
+                         participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
+                         ++participant)
+                    {
+                        status->post_policy_participant_load[participant] =
+                            status->pre_policy_participant_load[participant];
+                    }
+                }
+            }
+            status->payload_bucket_requested_slots = requested_payload_slots;
+            status->payload_bucket_slots = payload_bucket_slots;
+            status->payload_bucket_index = payload_bucket_index;
+            status->payload_bucket_overflow = payload_bucket_overflow;
+            status->skipped_wave_cost_floor = wave_cost_floor_rejected ? 1u : 0u;
+            status->skipped_low_router_benefit =
+                router_benefit_floor_rejected ? 1u : 0u;
+            status->payload_source_participant_mask = payload_source_participant_mask;
+            status->payload_destination_participant_mask =
+                payload_destination_participant_mask;
+            status->payload_edge_mask = payload_edge_mask;
+            if (command_header)
+            {
+                command_header->epoch = defer_runtime_apply && command_count > 0u
+                                            ? shared_plan_epoch
+                                            : last_epoch;
+                command_header->command_count = command_count;
+            }
+            if (wave_state)
+            {
+                const uint32_t start_layer =
+                    (layer_window_start + start_offset) % config.num_layers;
+                wave_state->epoch = last_epoch;
+                wave_state->planned_start_layer = start_layer;
+                wave_state->planned_layer_count = layer_wave_count;
+                const uint32_t next_offset =
+                    layer_window_count > 0u
+                        ? ((start_offset + layer_wave_count) % layer_window_count)
+                        : 0u;
+                wave_state->next_start_layer =
+                    (layer_window_start + next_offset) % config.num_layers;
+            }
+            if (defer_runtime_apply &&
+                command_count > 0u &&
+                controller_state &&
+                rebalance_graph_controller_state_basic_ok(controller_state, config) &&
+                command_wave_index < controller_state->wave_count)
+            {
+                const bool transfer_payload_required = requested_payload_slots > 0u;
+                auto &wave = controller_state->waves[command_wave_index];
+                wave.magic = kDeviceMoERebalanceMagic;
+                wave.version = kDeviceMoERebalanceVersion;
+                wave.epoch = shared_plan_epoch;
+                wave.state = kDeviceMoERebalanceLifecyclePlanning;
+                wave.planned_start_layer =
+                    wave_state ? wave_state->planned_start_layer : layer_window_start;
+                wave.planned_layer_count =
+                    wave_state ? wave_state->planned_layer_count : layer_wave_count;
+                wave.command_count = command_count;
+                wave.copied_arrivals = transfer_payload_required ? 0u : command_count;
+                wave.applied_arrivals = 0u;
+                wave.applied_layer_count = 0u;
+                wave.error_code = 0u;
+                wave.requested_payload_slots = requested_payload_slots;
+                wave.payload_bucket_slots = payload_bucket_slots;
+                wave.payload_bucket_index = payload_bucket_index;
+                wave.payload_bucket_overflow = payload_bucket_overflow;
+                __threadfence();
+                wave.state = transfer_payload_required
+                                 ? kDeviceMoERebalanceLifecyclePlanning
+                                 : kDeviceMoERebalanceLifecycleReadyToApply;
+                controller_state->next_epoch = shared_plan_epoch + 1u;
+            }
+            else if (defer_runtime_apply &&
+                     command_count == 0u &&
+                     controller_state &&
+                     rebalance_graph_controller_state_basic_ok(controller_state, config) &&
+                     command_wave_index < controller_state->wave_count)
+            {
+                reset_rebalance_wave_progress_device(controller_state->waves[command_wave_index]);
+            }
+        }
+    }
+
+    __global__ void pack_rebalance_histograms_kernel(
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        unsigned long long *local_histograms,
+        DeviceMoERebalanceConfigView config,
+        const DeviceMoERebalanceWaveStateView *wave_state,
+        const DeviceMoERebalanceGraphControllerStateView *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!runtime_layers || !local_histograms || !rebalance_config_ok(config))
+            return;
+
+        const uint32_t command_wave_index =
+            rebalance_active_command_wave_index(controller_state, config, command_buffer_count);
+        const DeviceMoERebalanceWaveStateView *selected_wave_state =
+            wave_state ? wave_state + command_wave_index : nullptr;
+        const uint32_t packed_layers = rebalance_layer_wave_count(config);
+        const uint32_t total =
+            packed_layers * config.num_experts;
+        uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        while (idx < total)
+        {
+            const uint32_t wave_layer = idx / config.num_experts;
+            const uint32_t expert = idx - wave_layer * config.num_experts;
+            const uint32_t layer =
+                rebalance_actual_layer_for_wave_index(config, selected_wave_state, wave_layer);
+            const DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
+            unsigned long long value = 0ULL;
+            if (runtime.expert_count == config.num_experts &&
+                runtime.top_k == config.top_k &&
+                runtime.participant_id == config.participant_id &&
+                runtime.participant_count == config.participant_count)
+            {
+                value = static_cast<unsigned long long>(
+                    runtime.decode_local_histogram[expert]);
+            }
+            local_histograms[idx] = value;
+            idx += blockDim.x * gridDim.x;
+        }
+    }
+
+    __device__ __forceinline__ bool rebalance_matrix_desc_ready(
+        const DeviceNativeVNNIMatrixDesc &desc)
+    {
+        return desc.payload != nullptr &&
+               desc.scales != nullptr &&
+               desc.n > 0 &&
+               desc.k > 0 &&
+               desc.blocks_per_row > 0u;
+    }
+
+    __device__ __forceinline__ bool rebalance_expert_desc_ready(
+        const DeviceMoEExpertDescriptorView &desc)
+    {
+        return desc.logical_expert_id >= 0 &&
+               rebalance_matrix_desc_ready(desc.gate) &&
+               rebalance_matrix_desc_ready(desc.up) &&
+               rebalance_matrix_desc_ready(desc.down);
+    }
+
+    __device__ __forceinline__ bool rebalance_transfer_desc_ready(
+        const DeviceMoEExpertDescriptorView &desc)
+    {
+        return rebalance_matrix_desc_ready(desc.gate) &&
+               rebalance_matrix_desc_ready(desc.up) &&
+               rebalance_matrix_desc_ready(desc.down);
+    }
+
+    __device__ __forceinline__ bool rebalance_format_for_codebook(
+        uint8_t codebook_id,
+        uint8_t &payload_bytes,
+        uint8_t &is_asymmetric,
+        uint8_t &has_emins)
+    {
+        payload_bytes = 0u;
+        is_asymmetric = 0u;
+        has_emins = 0u;
+        switch (codebook_id)
+        {
+        case 0:
+        case 4:
+            payload_bytes = 16u;
+            return true;
+        case 5:
+            payload_bytes = 16u;
+            is_asymmetric = 1u;
+            return true;
+        case 6:
+            payload_bytes = 20u;
+            return true;
+        case 7:
+            payload_bytes = 20u;
+            is_asymmetric = 1u;
+            return true;
+        case 8:
+            payload_bytes = 24u;
+            is_asymmetric = 1u;
+            return true;
+        case 9:
+            payload_bytes = 12u;
+            is_asymmetric = 1u;
+            return true;
+        case 10:
+            payload_bytes = 8u;
+            is_asymmetric = 1u;
+            has_emins = 1u;
+            return true;
+        case 11:
+            payload_bytes = 13u;
+            return true;
+        case 12:
+            payload_bytes = 12u;
+            return true;
+        case 13:
+        case 14:
+            payload_bytes = 9u;
+            is_asymmetric = 1u;
+            return true;
+        case 15:
+            payload_bytes = 8u;
+            return true;
+        case 16:
+        case 17:
+            payload_bytes = 6u;
+            is_asymmetric = 1u;
+            return true;
+        case 19:
+        case 20:
+            payload_bytes = 32u;
+            return true;
+        default:
+            return false;
+        }
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_block_count(
+        const DeviceNativeVNNIMatrixDesc &desc)
+    {
+        return static_cast<unsigned long long>(desc.blocks_per_row) *
+               static_cast<unsigned long long>(desc.n);
+    }
+
+    __device__ __forceinline__ bool rebalance_projection_format(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        uint8_t &payload_bytes,
+        uint8_t &is_asymmetric,
+        uint8_t &has_emins)
+    {
+        return rebalance_format_for_codebook(
+            desc.codebook_id,
+            payload_bytes,
+            is_asymmetric,
+            has_emins);
+    }
+
+    __device__ __forceinline__ bool rebalance_matrix_copy_ready(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceMoEExpertDirectoryEntryView &entry)
+    {
+        (void)entry;
+        uint8_t payload_bytes = 0u;
+        uint8_t is_asymmetric = 0u;
+        uint8_t has_emins = 0u;
+        if (!rebalance_matrix_desc_ready(desc) ||
+            !rebalance_projection_format(desc, payload_bytes, is_asymmetric, has_emins) ||
+            payload_bytes == 0u)
+            return false;
+        if (is_asymmetric != 0u && desc.mins == nullptr)
+            return false;
+        if (has_emins != 0u && desc.emins == nullptr)
+            return false;
+        return true;
+    }
+
+    __device__ __forceinline__ bool rebalance_directory_copy_ready(
+        const DeviceMoEExpertDirectoryEntryView &entry)
+    {
+        return rebalance_matrix_copy_ready(entry.descriptor.gate, entry) &&
+               rebalance_matrix_copy_ready(entry.descriptor.up, entry) &&
+               rebalance_matrix_copy_ready(entry.descriptor.down, entry);
+    }
+
+    __device__ __forceinline__ bool rebalance_source_entry_ready(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t participant,
+        uint32_t layer,
+        uint32_t expert)
+    {
+        const uint32_t required = kDeviceMoEDirectoryFlagValid |
+                                  kDeviceMoEDirectoryFlagResident;
+        return entry.participant == participant &&
+               entry.layer == layer &&
+               entry.expert == expert &&
+               (entry.flags & required) == required &&
+               rebalance_expert_desc_ready(entry.descriptor) &&
+               rebalance_directory_copy_ready(entry);
+    }
+
+    __device__ __forceinline__ bool rebalance_transfer_slot_ready(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t participant,
+        uint32_t layer,
+        uint32_t expert)
+    {
+        (void)layer;
+        (void)expert;
+        const uint32_t required = kDeviceMoEDirectoryFlagValid |
+                                  kDeviceMoEDirectoryFlagTransferSlot;
+        return entry.participant == participant &&
+               (entry.flags & required) == required &&
+               rebalance_transfer_desc_ready(entry.descriptor) &&
+               rebalance_directory_copy_ready(entry);
+    }
+
+    __device__ __forceinline__ bool rebalance_transfer_slot_copy_complete(
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint32_t participant,
+        uint32_t layer,
+        uint32_t expert)
+    {
+        return rebalance_transfer_slot_ready(entry, participant, layer, expert) &&
+               entry.layer == layer &&
+               entry.expert == expert &&
+               entry.descriptor.logical_expert_id == static_cast<int32_t>(expert) &&
+               (entry.flags & kDeviceMoEDirectoryFlagResident) != 0u &&
+               (entry.flags & kDeviceMoEDirectoryFlagCopyComplete) != 0u;
+    }
+
+    __device__ __forceinline__ bool rebalance_directory_compatible(
+        const DeviceMoEExpertDirectoryEntryView &src,
+        const DeviceMoEExpertDirectoryEntryView &dst)
+    {
+        return src.descriptor.gate.n == dst.descriptor.gate.n &&
+               src.descriptor.gate.k == dst.descriptor.gate.k &&
+               src.descriptor.gate.blocks_per_row == dst.descriptor.gate.blocks_per_row &&
+               src.descriptor.gate.codebook_id == dst.descriptor.gate.codebook_id &&
+               src.descriptor.up.n == dst.descriptor.up.n &&
+               src.descriptor.up.k == dst.descriptor.up.k &&
+               src.descriptor.up.blocks_per_row == dst.descriptor.up.blocks_per_row &&
+               src.descriptor.up.codebook_id == dst.descriptor.up.codebook_id &&
+               src.descriptor.down.n == dst.descriptor.down.n &&
+               src.descriptor.down.k == dst.descriptor.down.k &&
+               src.descriptor.down.blocks_per_row == dst.descriptor.down.blocks_per_row &&
+	               src.descriptor.down.codebook_id == dst.descriptor.down.codebook_id;
+    }
+
+    __device__ __forceinline__ DeviceMoEExpertDirectoryEntryView make_rebalance_source_entry(
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t layer,
+        uint32_t expert)
+    {
+        DeviceMoEExpertDirectoryEntryView entry{};
+        entry.layer = layer;
+        entry.expert = expert;
+        entry.participant = config.participant_id;
+        entry.slot_index = kDeviceMoEInvalidSlot;
+        if (!runtime_layers ||
+            !rebalance_config_ok(config) ||
+            layer >= config.num_layers ||
+            expert >= config.num_experts)
+        {
+            return entry;
+        }
+
+        const uint32_t participant_bit = runtime_participant_bit(static_cast<int>(config.participant_id));
+        const uint32_t valid_mask = runtime_valid_participant_mask(config.participant_count);
+        const DeviceMoELayerRuntimeView &runtime = runtime_layers[layer];
+        const bool runtime_ok =
+            runtime.active_bank <= 1u &&
+            runtime.expert_count == config.num_experts &&
+            runtime.top_k == config.top_k &&
+            runtime.participant_id == config.participant_id &&
+            runtime.participant_count == config.participant_count;
+        if (!runtime_ok)
+            return entry;
+
+        const DeviceMoEPlacementBankView &bank = runtime.banks[runtime.active_bank];
+        const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
+        const uint32_t resident_mask =
+            runtime_expert_resident_mask(&runtime, bank, static_cast<int>(expert)) & valid_mask;
+        const bool local_resident = (resident_mask & participant_bit) != 0u;
+        entry.epoch = runtime.active_epoch;
+        entry.generation = runtime.active_epoch;
+        entry.resident_mask = resident_mask;
+        if (desc.local_slot >= 0)
+            entry.slot_index = static_cast<uint32_t>(desc.local_slot);
+
+        if (local_resident && rebalance_expert_desc_ready(desc))
+        {
+            entry.descriptor = desc;
+            if (rebalance_format_for_codebook(
+                    desc.gate.codebook_id,
+                    entry.payload_bytes_per_block,
+                    entry.is_asymmetric,
+                    entry.has_emins) &&
+                rebalance_directory_copy_ready(entry))
+            {
+                entry.flags = kDeviceMoEDirectoryFlagValid |
+                              kDeviceMoEDirectoryFlagResident;
+                if (bank.local_compute_mask[expert] != 0u)
+                    entry.flags |= kDeviceMoEDirectoryFlagLocalCompute;
+            }
+            else
+            {
+                entry.descriptor = DeviceMoEExpertDescriptorView{};
+            }
+        }
+        return entry;
+    }
+
+    __global__ void pack_rebalance_directory_kernel(
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        DeviceMoEExpertDirectoryEntryView *local_directory,
+        DeviceMoERebalanceConfigView config)
+    {
+        if (!runtime_layers || !local_directory || !rebalance_config_ok(config))
+            return;
+
+        const uint32_t total = config.num_layers * config.num_experts;
+        uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        while (idx < total)
+        {
+            const uint32_t layer = idx / config.num_experts;
+            const uint32_t expert = idx - layer * config.num_experts;
+            local_directory[idx] = make_rebalance_source_entry(
+                runtime_layers,
+                config,
+                layer,
+                expert);
+            idx += blockDim.x * gridDim.x;
+        }
+    }
+
+    __device__ __forceinline__ void init_rebalance_apply_status_device(DeviceMoERebalanceApplyStatusView *status)
+    {
+        DeviceMoERebalanceApplyStatusView zero{};
+        *status = zero;
+        status->magic = kDeviceMoERebalanceMagic;
+        status->version = kDeviceMoERebalanceVersion;
+        status->status_code = 0u;
+    }
+
+    __global__ void init_rebalance_apply_status_kernel(DeviceMoERebalanceApplyStatusView *status)
+    {
+        if (!status || blockIdx.x != 0 || threadIdx.x != 0)
+            return;
+        init_rebalance_apply_status_device(status);
+    }
+
+    __device__ __forceinline__ bool rebalance_command_header_ok(
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        const DeviceMoERebalanceConfigView &config);
+
+    __device__ __forceinline__ bool rebalance_graph_controller_state_ok(
+        const DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return state &&
+               state->magic == kDeviceMoERebalanceMagic &&
+               state->version == kDeviceMoERebalanceVersion &&
+               state->participant_id == config.participant_id &&
+               state->participant_count == config.participant_count &&
+               state->wave_count == 2u;
+    }
+
+    __device__ void init_rebalance_graph_controller_state_device(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        DeviceMoERebalanceGraphControllerStateView zero{};
+        *state = zero;
+        state->magic = kDeviceMoERebalanceMagic;
+        state->version = kDeviceMoERebalanceVersion;
+        state->participant_id = config.participant_id;
+        state->participant_count = config.participant_count;
+        state->next_epoch = 1u;
+        state->active_wave = 0u;
+        state->wave_count = 2u;
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            auto &wave = state->waves[i];
+            wave.magic = kDeviceMoERebalanceMagic;
+            wave.version = kDeviceMoERebalanceVersion;
+            wave.state = kDeviceMoERebalanceLifecycleIdle;
+        }
+    }
+
+    __global__ void init_rebalance_graph_controller_state_kernel(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        DeviceMoERebalanceConfigView config)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0 || !state)
+            return;
+        if (!rebalance_config_ok(config))
+        {
+            state->last_error_code = kDeviceMoERebalanceStatusInvalidConfig;
+            return;
+        }
+        if (!rebalance_graph_controller_state_ok(state, config))
+            init_rebalance_graph_controller_state_device(state, config);
+    }
+
+    __device__ __forceinline__ bool rebalance_wave_covers_layer(
+        const DeviceMoERebalanceWaveProgressView &wave,
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t layer)
+    {
+        if (layer >= config.num_layers || wave.planned_layer_count == 0u)
+            return false;
+        const uint32_t count = min(wave.planned_layer_count, config.num_layers);
+        const uint32_t start = config.num_layers == 0u ? 0u : wave.planned_start_layer % config.num_layers;
+        for (uint32_t i = 0; i < count; ++i)
+        {
+            if (((start + i) % config.num_layers) == layer)
+                return true;
+        }
         return false;
+    }
+
+    struct DeviceMoEReadyWaveSelection
+    {
+        DeviceMoERebalanceWaveProgressView *wave;
+        uint32_t wave_index;
+    };
+
+    __device__ DeviceMoEReadyWaveSelection rebalance_find_ready_wave(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        const DeviceMoERebalanceConfigView &config,
+        int target_layer,
+        uint32_t command_buffer_count)
+    {
+        DeviceMoEReadyWaveSelection selection{nullptr, 0u};
+        const uint32_t count = rebalance_command_buffer_count(command_buffer_count);
+        if (!rebalance_graph_controller_state_ok(state, config) ||
+            !command_headers)
+        {
+            return selection;
+        }
+
+        for (uint32_t i = 0; i < state->wave_count && i < count; ++i)
+        {
+            auto &wave = state->waves[i];
+            const auto &command_header = command_headers[i];
+            if (wave.magic != kDeviceMoERebalanceMagic ||
+                wave.version != kDeviceMoERebalanceVersion ||
+                !rebalance_command_header_ok(&command_header, config) ||
+                command_header.epoch == 0u ||
+                wave.epoch != command_header.epoch ||
+                wave.state != kDeviceMoERebalanceLifecycleReadyToApply)
+            {
+                continue;
+            }
+            if (target_layer >= 0 &&
+                !rebalance_wave_covers_layer(wave, config, static_cast<uint32_t>(target_layer)))
+            {
+                continue;
+            }
+            selection.wave = &wave;
+            selection.wave_index = i;
+            return selection;
+        }
+        return selection;
+    }
+
+    __global__ void publish_rebalance_transfer_complete_kernel(
+        DeviceMoERebalanceGraphControllerStateView *state,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        const DeviceMoERebalanceWaveStateView *wave_state,
+        const DeviceMoERebalanceApplyStatusView *copy_status,
+        DeviceMoERebalanceConfigView config,
+        uint32_t command_buffer_count)
+    {
+        if (blockIdx.x != 0 || threadIdx.x != 0 || !state)
+            return;
+        if (!rebalance_config_ok(config))
+        {
+            state->last_error_code = kDeviceMoERebalanceStatusInvalidConfig;
+            return;
+        }
+        if (!rebalance_graph_controller_state_ok(state, config))
+            init_rebalance_graph_controller_state_device(state, config);
+        ++state->maintenance_launches;
+        const uint32_t wave_index =
+            rebalance_active_command_wave_index(state, config, command_buffer_count);
+        if (command_header)
+            command_header += wave_index;
+        if (wave_state)
+            wave_state += wave_index;
+        if (!command_header || !wave_state || !copy_status ||
+            !rebalance_command_header_ok(command_header, config))
+        {
+            state->last_error_code = 3u;
+            return;
+        }
+        const uint32_t command_count =
+            min(command_header->command_count, command_header->command_capacity);
+        if (command_header->epoch == 0u || command_count == 0u)
+        {
+            if (wave_index < state->wave_count)
+            {
+                reset_rebalance_wave_progress_device(state->waves[wave_index]);
+            }
+            return;
+        }
+
+        auto &wave = state->waves[wave_index];
+        const uint32_t requested_payload_slots = wave.requested_payload_slots;
+        const uint32_t payload_bucket_slots = wave.payload_bucket_slots;
+        const uint32_t payload_bucket_index = wave.payload_bucket_index;
+        const uint32_t payload_bucket_overflow = wave.payload_bucket_overflow;
+        if (wave.state == kDeviceMoERebalanceLifecycleReadyToApply &&
+            wave.epoch != command_header->epoch)
+        {
+            state->last_error_code = 5u;
+            wave.error_code = 5u;
+            wave.state = kDeviceMoERebalanceLifecycleError;
+            return;
+        }
+
+        wave.magic = kDeviceMoERebalanceMagic;
+        wave.version = kDeviceMoERebalanceVersion;
+        wave.epoch = command_header->epoch;
+        wave.state = kDeviceMoERebalanceLifecycleTransferInFlight;
+        wave.planned_start_layer = wave_state->planned_start_layer;
+        wave.planned_layer_count = wave_state->planned_layer_count;
+        wave.command_count = command_count;
+        wave.copied_arrivals = copy_status->copied_arrivals;
+        wave.applied_arrivals = 0u;
+        wave.applied_layer_count = 0u;
+        wave.error_code = 0u;
+        wave.requested_payload_slots = requested_payload_slots;
+        wave.payload_bucket_slots = payload_bucket_slots;
+        wave.payload_bucket_index = payload_bucket_index;
+        wave.payload_bucket_overflow = payload_bucket_overflow;
+        __threadfence();
+        wave.state = kDeviceMoERebalanceLifecycleReadyToApply;
+        state->next_epoch = max(state->next_epoch, command_header->epoch + 1u);
+    }
+
+    __device__ __forceinline__ bool rebalance_command_header_ok(
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return !command_header ||
+               (command_header->magic == kDeviceMoERebalanceMagic &&
+                command_header->version == kDeviceMoERebalanceVersion &&
+                command_header->phase == kDeviceMoERebalancePhasePlanAssignments &&
+                command_header->participant_id == config.participant_id &&
+                command_header->participant_count == config.participant_count);
+    }
+
+    __device__ __forceinline__ bool rebalance_command_header_for_participant_ok(
+        const DeviceMoERebalanceCommandBufferHeaderView &command_header,
+        uint32_t participant,
+        const DeviceMoERebalanceConfigView &config)
+    {
+        return command_header.magic == kDeviceMoERebalanceMagic &&
+               command_header.version == kDeviceMoERebalanceVersion &&
+               command_header.phase == kDeviceMoERebalancePhasePlanAssignments &&
+               command_header.participant_id == participant &&
+               command_header.participant_count == config.participant_count;
+    }
+
+    __device__ __forceinline__ uint32_t rebalance_command_count(
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header)
+    {
+        if (command_header)
+            return min(command_header->command_count,
+                       min(command_header->command_capacity, plan_capacity));
+        return plan_count ? min(*plan_count, plan_capacity) : 0u;
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_source_descriptor_local_index(
+        const DeviceMoERebalanceConfigView &config,
+        uint32_t command_buffer_count,
+        uint32_t plan_capacity,
+        uint32_t destination_participant,
+        uint32_t command_buffer_index,
+        uint32_t plan_index)
+    {
+        (void)config;
+        return ((static_cast<unsigned long long>(destination_participant) *
+                 static_cast<unsigned long long>(command_buffer_count) +
+                 static_cast<unsigned long long>(command_buffer_index)) *
+                static_cast<unsigned long long>(plan_capacity)) +
+               static_cast<unsigned long long>(plan_index);
+    }
+
+    __global__ void project_rebalance_domain_commands_kernel(
+        const DeviceMoERebalancePlanEntryView *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeaderView *gathered_command_headers,
+        uint32_t plan_capacity,
+        DeviceMoERebalancePlanEntryView *local_plan_entries,
+        DeviceMoERebalanceCommandBufferHeaderView *local_command_headers,
+        DeviceMoERebalanceStatusView *status,
+        uint32_t payload_slot_capacity,
+        DeviceMoERebalanceConfigView config,
+        uint32_t command_buffer_count)
+    {
+        if (!gathered_plan_entries ||
+            !gathered_command_headers ||
+            !local_plan_entries ||
+            !local_command_headers ||
+            !rebalance_config_ok(config) ||
+            plan_capacity == 0u)
+        {
+            return;
+        }
+
+        const uint32_t metadata_buffer_count =
+            rebalance_command_buffer_count(command_buffer_count);
+        const uint32_t root_participant = config.root_participant;
+        if (root_participant >= config.participant_count)
+            return;
+
+        for (uint32_t buffer_index = threadIdx.x;
+             buffer_index < metadata_buffer_count;
+             buffer_index += blockDim.x)
+        {
+            const auto &root_header =
+                gathered_command_headers[static_cast<unsigned long long>(root_participant) *
+                                             static_cast<unsigned long long>(metadata_buffer_count) +
+                                         static_cast<unsigned long long>(buffer_index)];
+            auto projected = DeviceMoERebalanceCommandBufferHeaderView{};
+            projected.magic = kDeviceMoERebalanceMagic;
+            projected.version = kDeviceMoERebalanceVersion;
+            projected.phase = kDeviceMoERebalancePhasePlanAssignments;
+            projected.command_capacity = plan_capacity;
+            projected.participant_id = config.participant_id;
+            projected.participant_count = config.participant_count;
+            if (rebalance_command_header_for_participant_ok(
+                    root_header,
+                    root_participant,
+                    config))
+            {
+                projected.epoch = root_header.epoch;
+                projected.command_count =
+                    min(root_header.command_count,
+                        min(root_header.command_capacity, plan_capacity));
+            }
+            local_command_headers[buffer_index] = projected;
+        }
+
+        const unsigned long long total_entries =
+            static_cast<unsigned long long>(metadata_buffer_count) *
+            static_cast<unsigned long long>(plan_capacity);
+        for (unsigned long long idx = static_cast<unsigned long long>(threadIdx.x);
+             idx < total_entries;
+             idx += static_cast<unsigned long long>(blockDim.x))
+        {
+            const uint32_t buffer_index =
+                static_cast<uint32_t>(idx / static_cast<unsigned long long>(plan_capacity));
+            const uint32_t plan_index =
+                static_cast<uint32_t>(idx % static_cast<unsigned long long>(plan_capacity));
+            const auto &root_header =
+                gathered_command_headers[static_cast<unsigned long long>(root_participant) *
+                                             static_cast<unsigned long long>(metadata_buffer_count) +
+                                         static_cast<unsigned long long>(buffer_index)];
+            DeviceMoERebalancePlanEntryView entry{};
+            if (rebalance_command_header_for_participant_ok(
+                    root_header,
+                    root_participant,
+                    config))
+            {
+                const uint32_t command_count =
+                    min(root_header.command_count,
+                        min(root_header.command_capacity, plan_capacity));
+                if (plan_index < command_count)
+                {
+                    const unsigned long long root_plan_index =
+                        (static_cast<unsigned long long>(root_participant) *
+                             static_cast<unsigned long long>(metadata_buffer_count) +
+                         static_cast<unsigned long long>(buffer_index)) *
+                            static_cast<unsigned long long>(plan_capacity) +
+                        static_cast<unsigned long long>(plan_index);
+                    entry = gathered_plan_entries[root_plan_index];
+                }
+            }
+            local_plan_entries[idx] = entry;
+        }
+
+        if (threadIdx.x == 0 && status)
+        {
+            uint32_t total_command_count = 0u;
+            uint32_t last_projected_epoch = 0u;
+            uint32_t requested_by_source[kDeviceMoEMaxParticipants] = {};
+            uint32_t payload_source_participant_mask = 0u;
+            uint32_t payload_destination_participant_mask = 0u;
+            uint64_t payload_edge_mask = 0ULL;
+            for (uint32_t buffer_index = 0; buffer_index < metadata_buffer_count; ++buffer_index)
+            {
+                const auto &root_header =
+                    gathered_command_headers[static_cast<unsigned long long>(root_participant) *
+                                                 static_cast<unsigned long long>(metadata_buffer_count) +
+                                             static_cast<unsigned long long>(buffer_index)];
+                if (rebalance_command_header_for_participant_ok(
+                        root_header,
+                        root_participant,
+                        config))
+                {
+                    const uint32_t command_count =
+                        min(root_header.command_count,
+                            min(root_header.command_capacity, plan_capacity));
+                    total_command_count += command_count;
+                    if (root_header.epoch != 0u)
+                        last_projected_epoch = root_header.epoch;
+                    for (uint32_t plan_index = 0; plan_index < command_count; ++plan_index)
+                    {
+                        const unsigned long long root_plan_index =
+                            (static_cast<unsigned long long>(root_participant) *
+                                 static_cast<unsigned long long>(metadata_buffer_count) +
+                             static_cast<unsigned long long>(buffer_index)) *
+                                static_cast<unsigned long long>(plan_capacity) +
+                            static_cast<unsigned long long>(plan_index);
+                        const auto &plan = gathered_plan_entries[root_plan_index];
+                        if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                            plan.source_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+                            plan.destination_participant < config.participant_count &&
+                            plan.destination_participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
+                            plan.payload_slot != kDeviceMoEInvalidSlot)
+                        {
+                            const uint32_t requested = plan.payload_slot + 1u;
+                            if (requested_by_source[plan.source_participant] < requested)
+                                requested_by_source[plan.source_participant] = requested;
+                            payload_source_participant_mask |=
+                                llaminar2::moe_rebalance_policy::participantBit(
+                                    plan.source_participant);
+                            payload_destination_participant_mask |=
+                                llaminar2::moe_rebalance_policy::participantBit(
+                                    plan.destination_participant);
+                            payload_edge_mask |=
+                                llaminar2::moe_rebalance_policy::directedParticipantEdgeBit(
+                                    plan.source_participant,
+                                    plan.destination_participant,
+                                    static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                        }
+                    }
+                }
+            }
+
+            uint32_t requested_payload_slots = 0u;
+            for (uint32_t participant = 0;
+                 participant < config.participant_count &&
+                 participant < static_cast<uint32_t>(kDeviceMoEMaxParticipants);
+                 ++participant)
+            {
+                if (requested_by_source[participant] > requested_payload_slots)
+                    requested_payload_slots = requested_by_source[participant];
+            }
+            const uint32_t payload_bucket_slots =
+                llaminar2::moe_rebalance_policy::payloadBucketSlots(
+                    requested_payload_slots,
+                    payload_slot_capacity);
+            const uint32_t payload_bucket_index =
+                llaminar2::moe_rebalance_policy::payloadBucketIndex(
+                    payload_bucket_slots);
+            const uint32_t payload_bucket_overflow =
+                requested_payload_slots > payload_bucket_slots ? 1u : 0u;
+
+            if (status->magic != kDeviceMoERebalanceMagic ||
+                status->version != kDeviceMoERebalanceVersion)
+            {
+                DeviceMoERebalanceStatusView zero_status{};
+                *status = zero_status;
+                status->magic = kDeviceMoERebalanceMagic;
+                status->version = kDeviceMoERebalanceVersion;
+                status->status_code = kDeviceMoERebalanceStatusOk;
+            }
+            if (status->status_code == kDeviceMoERebalanceStatusOk)
+            {
+                status->windows_observed = max(status->windows_observed, 1u);
+                status->planned_arrivals = total_command_count;
+                if (total_command_count != 0u)
+                {
+                    status->windows_applied = max(status->windows_applied, 1u);
+                    if (status->last_epoch == 0u)
+                        status->last_epoch = last_projected_epoch;
+                }
+                status->payload_bucket_requested_slots = requested_payload_slots;
+                status->payload_bucket_slots = payload_bucket_slots;
+                status->payload_bucket_index = payload_bucket_index;
+                status->payload_bucket_overflow = payload_bucket_overflow;
+                status->payload_source_participant_mask = payload_source_participant_mask;
+                status->payload_destination_participant_mask =
+                    payload_destination_participant_mask;
+                status->payload_edge_mask = payload_edge_mask;
+            }
+        }
+    }
+
+    __global__ void pack_rebalance_source_descriptors_kernel(
+        const DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalancePlanEntryView *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        uint32_t plan_capacity,
+        DeviceMoEExpertDirectoryEntryView *local_source_descriptors,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        uint32_t command_buffer_count)
+    {
+        (void)controller_state;
+        if (!runtime_layers ||
+            !plan_entries ||
+            !command_headers ||
+            !local_source_descriptors ||
+            !rebalance_config_ok(config) ||
+            plan_capacity == 0u)
+        {
+            return;
+        }
+
+        const uint32_t metadata_buffer_count =
+            rebalance_command_buffer_count(command_buffer_count);
+        const unsigned long long total =
+            static_cast<unsigned long long>(config.participant_count) *
+            static_cast<unsigned long long>(metadata_buffer_count) *
+            static_cast<unsigned long long>(plan_capacity);
+        unsigned long long idx = static_cast<unsigned long long>(blockIdx.x) *
+                                 static_cast<unsigned long long>(blockDim.x) +
+                                 static_cast<unsigned long long>(threadIdx.x);
+        while (idx < total)
+        {
+            local_source_descriptors[idx] = DeviceMoEExpertDirectoryEntryView{};
+
+            const uint32_t plan_index =
+                static_cast<uint32_t>(idx % static_cast<unsigned long long>(plan_capacity));
+            const unsigned long long tmp =
+                idx / static_cast<unsigned long long>(plan_capacity);
+            const uint32_t command_buffer_index =
+                static_cast<uint32_t>(tmp % static_cast<unsigned long long>(metadata_buffer_count));
+            const uint32_t destination_participant =
+                static_cast<uint32_t>(tmp / static_cast<unsigned long long>(metadata_buffer_count));
+            const auto &header =
+                command_headers[static_cast<unsigned long long>(command_buffer_index)];
+            if (!rebalance_command_header_ok(&header, config))
+            {
+                idx += static_cast<unsigned long long>(blockDim.x) *
+                       static_cast<unsigned long long>(gridDim.x);
+                continue;
+            }
+            const uint32_t command_count =
+                min(header.command_count, min(header.command_capacity, plan_capacity));
+            if (plan_index >= command_count)
+            {
+                idx += static_cast<unsigned long long>(blockDim.x) *
+                       static_cast<unsigned long long>(gridDim.x);
+                continue;
+            }
+
+            const auto &plan =
+                plan_entries[static_cast<unsigned long long>(command_buffer_index) *
+                                 static_cast<unsigned long long>(plan_capacity) +
+                             static_cast<unsigned long long>(plan_index)];
+            if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                plan.source_participant == config.participant_id &&
+                plan.destination_participant == destination_participant &&
+                plan.layer < config.num_layers &&
+                plan.expert < config.num_experts)
+            {
+                local_source_descriptors[idx] = make_rebalance_source_entry(
+                    runtime_layers,
+                    config,
+                    plan.layer,
+                    plan.expert);
+            }
+
+            idx += static_cast<unsigned long long>(blockDim.x) *
+                   static_cast<unsigned long long>(gridDim.x);
+        }
+    }
+
+    __device__ void rebalance_copy_bytes(const void *src, const void *dst_const, unsigned long long bytes)
+    {
+        const auto *src_bytes = static_cast<const uint8_t *>(src);
+        auto *dst_bytes = const_cast<uint8_t *>(static_cast<const uint8_t *>(dst_const));
+        for (unsigned long long i = threadIdx.x; i < bytes; i += blockDim.x)
+            dst_bytes[i] = src_bytes[i];
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_projection_payload_bytes(
+        const DeviceNativeVNNIMatrixDesc &desc,
+        const DeviceMoEExpertDirectoryEntryView &entry)
+    {
+        (void)entry;
+        uint8_t payload_bytes_per_block = 0u;
+        uint8_t is_asymmetric = 0u;
+        uint8_t has_emins = 0u;
+        if (!rebalance_projection_format(desc, payload_bytes_per_block, is_asymmetric, has_emins))
+            return 0ULL;
+        const unsigned long long blocks = rebalance_block_count(desc);
+        const unsigned long long scales_bytes = blocks * sizeof(uint16_t);
+        return blocks * static_cast<unsigned long long>(payload_bytes_per_block) +
+               scales_bytes +
+               (is_asymmetric != 0u ? scales_bytes : 0ULL) +
+               (has_emins != 0u ? blocks * sizeof(uint32_t) : 0ULL);
+    }
+
+    __device__ __forceinline__ unsigned long long rebalance_expert_payload_bytes(
+        const DeviceMoEExpertDirectoryEntryView &entry)
+    {
+        return rebalance_projection_payload_bytes(entry.descriptor.gate, entry) +
+               rebalance_projection_payload_bytes(entry.descriptor.up, entry) +
+               rebalance_projection_payload_bytes(entry.descriptor.down, entry);
+    }
+
+    __device__ unsigned long long rebalance_pack_projection_to_payload(
+        const DeviceNativeVNNIMatrixDesc &src,
+        const DeviceMoEExpertDirectoryEntryView &entry,
+        uint8_t *payload)
+    {
+        (void)entry;
+        uint8_t payload_bytes_per_block = 0u;
+        uint8_t is_asymmetric = 0u;
+        uint8_t has_emins = 0u;
+        if (!rebalance_projection_format(src, payload_bytes_per_block, is_asymmetric, has_emins))
+            return 0ULL;
+        const unsigned long long blocks = rebalance_block_count(src);
+        const unsigned long long payload_bytes =
+            blocks * static_cast<unsigned long long>(payload_bytes_per_block);
+        const unsigned long long scales_bytes = blocks * sizeof(uint16_t);
+        const unsigned long long mins_bytes =
+            is_asymmetric != 0u ? scales_bytes : 0ULL;
+        const unsigned long long emins_bytes =
+            has_emins != 0u ? blocks * sizeof(uint32_t) : 0ULL;
+
+        unsigned long long offset = 0ULL;
+        rebalance_copy_bytes(src.payload, payload + offset, payload_bytes);
+        offset += payload_bytes;
+        rebalance_copy_bytes(src.scales, payload + offset, scales_bytes);
+        offset += scales_bytes;
+        if (mins_bytes > 0ULL)
+        {
+            rebalance_copy_bytes(src.mins, payload + offset, mins_bytes);
+            offset += mins_bytes;
+        }
+        if (emins_bytes > 0ULL)
+        {
+            rebalance_copy_bytes(src.emins, payload + offset, emins_bytes);
+            offset += emins_bytes;
+        }
+        return offset;
+    }
+
+    __device__ unsigned long long rebalance_unpack_projection_from_payload(
+        const uint8_t *payload,
+        const DeviceNativeVNNIMatrixDesc &dst,
+        const DeviceMoEExpertDirectoryEntryView &entry)
+    {
+        (void)entry;
+        uint8_t payload_bytes_per_block = 0u;
+        uint8_t is_asymmetric = 0u;
+        uint8_t has_emins = 0u;
+        if (!rebalance_projection_format(dst, payload_bytes_per_block, is_asymmetric, has_emins))
+            return 0ULL;
+        const unsigned long long blocks = rebalance_block_count(dst);
+        const unsigned long long payload_bytes =
+            blocks * static_cast<unsigned long long>(payload_bytes_per_block);
+        const unsigned long long scales_bytes = blocks * sizeof(uint16_t);
+        const unsigned long long mins_bytes =
+            is_asymmetric != 0u ? scales_bytes : 0ULL;
+        const unsigned long long emins_bytes =
+            has_emins != 0u ? blocks * sizeof(uint32_t) : 0ULL;
+
+        unsigned long long offset = 0ULL;
+        rebalance_copy_bytes(payload + offset, dst.payload, payload_bytes);
+        offset += payload_bytes;
+        rebalance_copy_bytes(payload + offset, dst.scales, scales_bytes);
+        offset += scales_bytes;
+        if (mins_bytes > 0ULL)
+        {
+            rebalance_copy_bytes(payload + offset, dst.mins, mins_bytes);
+            offset += mins_bytes;
+        }
+        if (emins_bytes > 0ULL)
+        {
+            rebalance_copy_bytes(payload + offset, dst.emins, emins_bytes);
+            offset += emins_bytes;
+        }
+        return offset;
+    }
+
+    __device__ void rebalance_zero_payload_slot(uint8_t *slot, unsigned long long bytes)
+    {
+        for (unsigned long long i = threadIdx.x; i < bytes; i += blockDim.x)
+            slot[i] = 0u;
+    }
+
+    __global__ void pack_rebalance_collective_payloads_kernel(
+        const DeviceMoERebalancePlanEntryView *gathered_plan_entries,
+        const DeviceMoERebalanceCommandBufferHeaderView *gathered_command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntryView *local_directory,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!status || !gathered_plan_entries || !gathered_command_headers ||
+            !local_directory || !local_payload || plan_capacity == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+            return;
+        const uint32_t global_slot = blockIdx.x;
+        if (global_slot >= local_payload_slot_count)
+            return;
+
+        uint8_t *payload_slot =
+            local_payload + static_cast<unsigned long long>(global_slot) * payload_slot_bytes;
+        rebalance_zero_payload_slot(payload_slot, payload_slot_bytes);
+
+        const uint32_t destination_participant = global_slot / plan_capacity;
+        const uint32_t plan_index = global_slot % plan_capacity;
+        if (destination_participant >= config.participant_count)
+            return;
+        const uint32_t metadata_buffer_count =
+            rebalance_command_buffer_count(command_buffer_count);
+        const uint32_t active_wave =
+            rebalance_active_command_wave_index(controller_state, config, metadata_buffer_count);
+        const unsigned long long metadata_participant_base =
+            static_cast<unsigned long long>(destination_participant) *
+            static_cast<unsigned long long>(metadata_buffer_count);
+        const auto &header = gathered_command_headers[metadata_participant_base + active_wave];
+        if (!rebalance_command_header_for_participant_ok(
+                header,
+                destination_participant,
+                config))
+            return;
+        const uint32_t count = min(header.command_count,
+                                   min(header.command_capacity, plan_capacity));
+        if (plan_index >= count)
+            return;
+
+        const auto &plan =
+            gathered_plan_entries[(metadata_participant_base + active_wave) *
+                                      static_cast<unsigned long long>(plan_capacity) +
+                                  static_cast<unsigned long long>(plan_index)];
+        if (plan.op == 0u ||
+            plan.op != kDeviceMoERebalancePlanHotReplicaArrival ||
+            plan.destination_participant != destination_participant ||
+            plan.source_participant != config.participant_id ||
+            plan.layer >= config.num_layers ||
+            plan.expert >= config.num_experts)
+        {
+            return;
+        }
+
+        const auto &src =
+            local_directory[static_cast<unsigned long long>(plan.layer) *
+                                static_cast<unsigned long long>(config.num_experts) +
+                            static_cast<unsigned long long>(plan.expert)];
+        if (!rebalance_source_entry_ready(src, config.participant_id, plan.layer, plan.expert))
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->missing_source_descriptors, 1u);
+            return;
+        }
+        const unsigned long long payload_data_bytes =
+            payload_slot_bytes - sizeof(DeviceMoEExpertDirectoryEntryView);
+        if (rebalance_expert_payload_bytes(src) > payload_data_bytes)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->descriptor_mismatches, 1u);
+            return;
+        }
+
+        if (threadIdx.x == 0)
+            *reinterpret_cast<DeviceMoEExpertDirectoryEntryView *>(payload_slot) = src;
+        __syncthreads();
+
+        unsigned long long offset = 0ULL;
+        uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload_data + offset);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload_data + offset);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload_data + offset);
+        (void)offset;
+    }
+
+    __global__ void pack_rebalance_compact_payloads_kernel(
+        const DeviceMoERebalancePlanEntryView *plan_entries,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        uint32_t plan_capacity,
+        const DeviceMoEExpertDirectoryEntryView *local_source_descriptors,
+        uint8_t *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        uint32_t command_buffer_count)
+    {
+        if (!status || !plan_entries || !command_headers ||
+            !local_source_descriptors || !local_payload ||
+            !rebalance_config_ok(config) || plan_capacity == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+            return;
+
+        const uint32_t global_slot = blockIdx.x;
+        if (global_slot >= local_payload_slot_count)
+            return;
+
+        uint8_t *payload_slot =
+            local_payload + static_cast<unsigned long long>(global_slot) * payload_slot_bytes;
+        rebalance_zero_payload_slot(payload_slot, payload_slot_bytes);
+
+        const uint32_t metadata_buffer_count =
+            rebalance_command_buffer_count(command_buffer_count);
+        const uint32_t active_wave =
+            rebalance_active_command_wave_index(controller_state, config, metadata_buffer_count);
+        const auto &header = command_headers[active_wave];
+        if (!rebalance_command_header_ok(&header, config))
+            return;
+        const uint32_t command_count =
+            min(header.command_count,
+                min(header.command_capacity, plan_capacity));
+
+        __shared__ uint32_t shared_plan_index;
+        if (threadIdx.x == 0)
+            shared_plan_index = kDeviceMoEInvalidSlot;
+        __syncthreads();
+        for (uint32_t plan_index = threadIdx.x;
+             plan_index < command_count;
+             plan_index += blockDim.x)
+        {
+            const auto &plan =
+                plan_entries[static_cast<unsigned long long>(active_wave) *
+                                 static_cast<unsigned long long>(plan_capacity) +
+                             static_cast<unsigned long long>(plan_index)];
+            if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                plan.source_participant == config.participant_id &&
+                plan.destination_participant < config.participant_count &&
+                plan.payload_slot == global_slot &&
+                plan.layer < config.num_layers &&
+                plan.expert < config.num_experts)
+            {
+                atomicCAS(&shared_plan_index, kDeviceMoEInvalidSlot, plan_index);
+            }
+        }
+        __syncthreads();
+        if (shared_plan_index == kDeviceMoEInvalidSlot)
+            return;
+
+        const auto &selected_plan =
+            plan_entries[static_cast<unsigned long long>(active_wave) *
+                             static_cast<unsigned long long>(plan_capacity) +
+                         static_cast<unsigned long long>(shared_plan_index)];
+        const auto &src = local_source_descriptors[
+            rebalance_source_descriptor_local_index(
+                config,
+                metadata_buffer_count,
+                plan_capacity,
+                selected_plan.destination_participant,
+                active_wave,
+                shared_plan_index)];
+        if (!rebalance_source_entry_ready(src, config.participant_id, src.layer, src.expert))
+            return;
+
+        const unsigned long long payload_data_bytes =
+            payload_slot_bytes - sizeof(DeviceMoEExpertDirectoryEntryView);
+        if (rebalance_expert_payload_bytes(src) > payload_data_bytes)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->descriptor_mismatches, 1u);
+            return;
+        }
+
+        if (threadIdx.x == 0)
+            *reinterpret_cast<DeviceMoEExpertDirectoryEntryView *>(payload_slot) = src;
+        __syncthreads();
+
+        unsigned long long offset = 0ULL;
+        uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload_data + offset);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload_data + offset);
+        offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload_data + offset);
+        (void)offset;
+    }
+
+    __global__ void unpack_rebalance_collective_payloads_kernel(
+        const DeviceMoERebalancePlanEntryView *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        const uint8_t *gathered_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        uint32_t command_buffer_count)
+    {
+        const uint32_t command_wave_index =
+            rebalance_active_command_wave_index(controller_state, config, command_buffer_count);
+        if (plan_entries)
+            plan_entries += static_cast<unsigned long long>(command_wave_index) * plan_capacity;
+        if (plan_count)
+            plan_count += command_wave_index;
+        if (command_header)
+            command_header += command_wave_index;
+
+        if (!status || !plan_entries || (!plan_count && !command_header) ||
+            !gathered_payload || !local_transfer_slots ||
+            plan_capacity == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+            return;
+
+        const uint32_t plan_index = blockIdx.x;
+        const uint32_t count = rebalance_command_count(plan_count, plan_capacity, command_header);
+        if (plan_index >= count)
+            return;
+        const auto &plan = plan_entries[plan_index];
+        if (threadIdx.x == 0)
+            atomicAdd(&status->plan_entries_seen, 1u);
+
+        if (plan.op == 0u)
+            return;
+        if (plan.op != kDeviceMoERebalancePlanHotReplicaArrival ||
+            plan.layer >= config.num_layers ||
+            plan.expert >= config.num_experts ||
+            plan.source_participant >= config.participant_count)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->invalid_plan_entries, 1u);
+            return;
+        }
+        if (plan.destination_participant != config.participant_id)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->skipped_wrong_destination, 1u);
+            return;
+        }
+        if (plan.destination_slot >= local_transfer_slot_count)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->missing_destination_slots, 1u);
+            return;
+        }
+        if (plan.payload_slot >= local_payload_slot_count)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->invalid_plan_entries, 1u);
+            return;
+        }
+
+        const unsigned long long gathered_slot =
+            (static_cast<unsigned long long>(plan.source_participant) *
+                 static_cast<unsigned long long>(local_payload_slot_count) +
+             static_cast<unsigned long long>(plan.payload_slot));
+        const uint8_t *payload_slot = gathered_payload + gathered_slot * payload_slot_bytes;
+        const auto &src =
+            *reinterpret_cast<const DeviceMoEExpertDirectoryEntryView *>(payload_slot);
+        const unsigned long long payload_data_bytes =
+            payload_slot_bytes - sizeof(DeviceMoEExpertDirectoryEntryView);
+        auto &dst = local_transfer_slots[plan.destination_slot];
+        if (threadIdx.x == 0)
+        {
+            dst.layer = kDeviceMoEInvalidSlot;
+            dst.expert = kDeviceMoEInvalidSlot;
+            dst.descriptor.logical_expert_id = -1;
+            dst.resident_mask &= ~runtime_participant_bit(static_cast<int>(config.participant_id));
+            dst.flags &= ~(kDeviceMoEDirectoryFlagResident |
+                           kDeviceMoEDirectoryFlagCopyComplete);
+        }
+        __syncthreads();
+
+        if (!rebalance_source_entry_ready(src, plan.source_participant, plan.layer, plan.expert))
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->missing_source_descriptors, 1u);
+            return;
+        }
+        if (!rebalance_transfer_slot_ready(dst, config.participant_id, plan.layer, plan.expert))
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->missing_destination_slots, 1u);
+            return;
+        }
+        if (!rebalance_directory_compatible(src, dst) ||
+            rebalance_expert_payload_bytes(src) > payload_data_bytes)
+        {
+            if (threadIdx.x == 0)
+                atomicAdd(&status->descriptor_mismatches, 1u);
+            return;
+        }
+
+        unsigned long long offset = 0ULL;
+        const uint8_t *payload_data = payload_slot + sizeof(DeviceMoEExpertDirectoryEntryView);
+        offset += rebalance_unpack_projection_from_payload(payload_data + offset, dst.descriptor.gate, src);
+        offset += rebalance_unpack_projection_from_payload(payload_data + offset, dst.descriptor.up, src);
+        offset += rebalance_unpack_projection_from_payload(payload_data + offset, dst.descriptor.down, src);
+        (void)offset;
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+        {
+            dst.layer = plan.layer;
+            dst.expert = plan.expert;
+            dst.descriptor.logical_expert_id = static_cast<int32_t>(plan.expert);
+            dst.descriptor.owner_participant = src.descriptor.owner_participant;
+            dst.resident_mask |= runtime_participant_bit(static_cast<int>(config.participant_id));
+            dst.flags |= kDeviceMoEDirectoryFlagResident |
+                         kDeviceMoEDirectoryFlagCopyComplete;
+            atomicAdd(&status->copied_arrivals, 1u);
+        }
+    }
+
+    __global__ void apply_rebalance_arrivals_kernel(
+        DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalancePlanEntryView *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeaderView *command_header,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status,
+        int target_layer,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        bool require_ready_wave,
+        uint32_t command_buffer_count)
+    {
+        if (blockIdx.x != 0 || !status)
+            return;
+
+        __shared__ uint8_t changed_layer[kDeviceMoEMaxExperts];
+        __shared__ uint32_t reduce_scratch[kThreads];
+        __shared__ uint32_t shared_valid;
+        __shared__ uint32_t shared_count;
+        __shared__ uint32_t shared_participant_bit;
+        __shared__ uint32_t shared_valid_mask;
+        __shared__ DeviceMoERebalanceWaveProgressView *shared_ready_wave;
+        __shared__ uint32_t shared_ready_wave_index;
+        __shared__ const DeviceMoERebalancePlanEntryView *shared_plan_entries;
+        __shared__ const uint32_t *shared_plan_count;
+        __shared__ DeviceMoERebalanceCommandBufferHeaderView *shared_command_header;
+
+        for (uint32_t layer = threadIdx.x;
+             layer < static_cast<uint32_t>(kDeviceMoEMaxExperts);
+             layer += blockDim.x)
+        {
+            changed_layer[layer] = 0u;
+        }
+        reduce_scratch[threadIdx.x] = 0u;
+        __syncthreads();
+
+        if (threadIdx.x == 0)
+        {
+            if (require_ready_wave)
+                init_rebalance_apply_status_device(status);
+
+            bool setup_ok = true;
+            shared_valid = 0u;
+            shared_count = 0u;
+            shared_participant_bit = 0u;
+            shared_valid_mask = 0u;
+            shared_ready_wave = nullptr;
+            shared_ready_wave_index = 0u;
+            shared_plan_entries = plan_entries;
+            shared_plan_count = plan_count;
+            shared_command_header = command_header;
+
+            if (require_ready_wave)
+            {
+                if (!controller_state)
+                {
+                    setup_ok = false;
+                }
+                else
+                {
+                    if ((config.flags & kDeviceMoERebalanceFlagCollectLoadStats) != 0u &&
+                        rebalance_graph_controller_state_ok(controller_state, config))
+                        ++controller_state->decode_apply_polls;
+                    const DeviceMoEReadyWaveSelection ready = rebalance_find_ready_wave(
+                        controller_state,
+                        command_header,
+                        config,
+                        target_layer,
+                        command_buffer_count);
+                    shared_ready_wave = ready.wave;
+                    shared_ready_wave_index = ready.wave_index;
+                    if (!shared_ready_wave)
+                    {
+                        setup_ok = false;
+                    }
+                    else
+                    {
+                        shared_plan_entries =
+                            plan_entries + static_cast<unsigned long long>(shared_ready_wave_index) * plan_capacity;
+                        if (plan_count)
+                            shared_plan_count = plan_count + shared_ready_wave_index;
+                        if (command_header)
+                            shared_command_header = command_header + shared_ready_wave_index;
+                        shared_ready_wave->state = kDeviceMoERebalanceLifecycleApplying;
+                        ++controller_state->decode_apply_hits;
+                    }
+                }
+            }
+
+            if (setup_ok && !rebalance_config_ok(config))
+            {
+                status->status_code = 1u;
+                if (shared_ready_wave)
+                {
+                    shared_ready_wave->error_code = 1u;
+                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleError;
+                    controller_state->last_error_code = 1u;
+                }
+                setup_ok = false;
+            }
+            if (setup_ok && !runtime_layers)
+            {
+                status->status_code = 2u;
+                if (shared_ready_wave)
+                {
+                    shared_ready_wave->error_code = 2u;
+                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleError;
+                    controller_state->last_error_code = 2u;
+                }
+                setup_ok = false;
+            }
+            if (setup_ok &&
+                (!shared_plan_entries || (!shared_plan_count && !shared_command_header) ||
+                 !rebalance_command_header_ok(shared_command_header, config)))
+            {
+                status->status_code = 3u;
+                if (shared_ready_wave)
+                {
+                    shared_ready_wave->error_code = 3u;
+                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleError;
+                    controller_state->last_error_code = 3u;
+                }
+                setup_ok = false;
+            }
+
+            if (setup_ok)
+            {
+                shared_count = rebalance_command_count(shared_plan_count, plan_capacity, shared_command_header);
+                shared_participant_bit = runtime_participant_bit(static_cast<int>(config.participant_id));
+                shared_valid_mask = runtime_valid_participant_mask(config.participant_count);
+                shared_valid = 1u;
+            }
+        }
+        __syncthreads();
+        if (shared_valid == 0u)
+            return;
+
+        if (threadIdx.x == 0)
+        {
+            for (uint32_t i = 0; i < shared_count; ++i)
+            {
+                ++status->plan_entries_seen;
+                const auto &plan = shared_plan_entries[i];
+                if (plan.op == 0u)
+                    continue;
+                if (target_layer >= 0 &&
+                    plan.layer != static_cast<uint32_t>(target_layer))
+                    continue;
+                if ((plan.op != kDeviceMoERebalancePlanHotReplicaArrival &&
+                     plan.op != kDeviceMoERebalancePlanResidentHotReplica) ||
+                    plan.layer >= config.num_layers ||
+                    plan.expert >= config.num_experts ||
+                    plan.source_participant >= config.participant_count ||
+                    plan.destination_participant >= config.participant_count)
+                {
+                    ++status->invalid_plan_entries;
+                    continue;
+                }
+                const bool destination_local =
+                    plan.destination_participant == config.participant_id;
+                const uint32_t destination_bit =
+                    runtime_participant_bit(static_cast<int>(plan.destination_participant));
+
+                auto &runtime = runtime_layers[plan.layer];
+                if (runtime.active_bank > 1u ||
+                    runtime.expert_count != config.num_experts ||
+                    runtime.top_k != config.top_k ||
+                    runtime.participant_id != config.participant_id ||
+                    runtime.participant_count != config.participant_count)
+                {
+                    ++status->invalid_plan_entries;
+                    continue;
+                }
+
+                const auto &active = runtime.banks[runtime.active_bank];
+                uint32_t resident_mask =
+                    (active.resident_participant_mask[plan.expert] |
+                     plan.source_resident_mask |
+                     destination_bit) &
+                    shared_valid_mask;
+                if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                    destination_local)
+                {
+                    if (!local_transfer_slots ||
+                        plan.destination_slot >= local_transfer_slot_count)
+                    {
+                        ++status->missing_destination_slots;
+                        continue;
+                    }
+
+                    const auto &slot = local_transfer_slots[plan.destination_slot];
+                    if (!rebalance_transfer_slot_copy_complete(slot, config.participant_id, plan.layer, plan.expert))
+                    {
+                        ++status->copy_incomplete;
+                        continue;
+                    }
+                    resident_mask |= shared_participant_bit;
+                }
+                else if (plan.op == kDeviceMoERebalancePlanResidentHotReplica &&
+                         destination_local &&
+                         (resident_mask & shared_participant_bit) == 0u)
+                {
+                    ++status->missing_source_descriptors;
+                    continue;
+                }
+
+                changed_layer[plan.layer] = 1u;
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t layer = 0;
+             layer < config.num_layers && layer < static_cast<uint32_t>(kDeviceMoEMaxExperts);
+             ++layer)
+        {
+            if (changed_layer[layer] == 0u)
+                continue;
+
+            auto &runtime = runtime_layers[layer];
+            const uint32_t inactive_bank = 1u - runtime.active_bank;
+            const auto &active = runtime.banks[runtime.active_bank];
+            auto &next = runtime.banks[inactive_bank];
+            if (threadIdx.x == 0)
+            {
+                next.epoch = runtime.active_epoch + 1u;
+                next.expert_count = config.num_experts;
+                next.reserved[0] = active.reserved[0];
+                next.reserved[1] = active.reserved[1];
+            }
+            for (uint32_t expert = threadIdx.x; expert < config.num_experts; expert += blockDim.x)
+            {
+                next.experts[expert] = active.experts[expert];
+                auto &base_desc = next.experts[expert];
+                base_desc.flags &= ~kDeviceMoEFlagReplicated;
+                const bool owner_local =
+                    base_desc.owner_participant == static_cast<int32_t>(config.participant_id);
+                next.local_compute_mask[expert] = owner_local ? 1u : 0u;
+                next.replica_role[expert] =
+                    owner_local
+                        ? static_cast<uint8_t>(kDeviceMoEReplicaRolePrimary)
+                        : static_cast<uint8_t>(kDeviceMoEReplicaRoleNone);
+                next.resident_participant_mask[expert] =
+                    active.resident_participant_mask[expert] & shared_valid_mask;
+                if (base_desc.owner_participant >= 0 &&
+                    base_desc.owner_participant < static_cast<int32_t>(config.participant_count))
+                {
+                    next.resident_participant_mask[expert] |=
+                        runtime_participant_bit(base_desc.owner_participant);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0)
+        {
+            for (uint32_t i = 0; i < shared_count; ++i)
+            {
+                const auto &plan = shared_plan_entries[i];
+                if (plan.op == 0u)
+                    continue;
+                if (target_layer >= 0 &&
+                    plan.layer != static_cast<uint32_t>(target_layer))
+                    continue;
+                if ((plan.op != kDeviceMoERebalancePlanHotReplicaArrival &&
+                     plan.op != kDeviceMoERebalancePlanResidentHotReplica) ||
+                    plan.layer >= config.num_layers ||
+                    plan.expert >= config.num_experts ||
+                    plan.source_participant >= config.participant_count ||
+                    plan.destination_participant >= config.participant_count ||
+                    changed_layer[plan.layer] == 0u)
+                {
+                    continue;
+                }
+                const bool destination_local =
+                    plan.destination_participant == config.participant_id;
+                const uint32_t destination_bit =
+                    runtime_participant_bit(static_cast<int>(plan.destination_participant));
+
+                auto &runtime = runtime_layers[plan.layer];
+                if (runtime.active_bank > 1u ||
+                    runtime.expert_count != config.num_experts ||
+                    runtime.top_k != config.top_k ||
+                    runtime.participant_id != config.participant_id ||
+                    runtime.participant_count != config.participant_count)
+                {
+                    continue;
+                }
+
+                const auto &active = runtime.banks[runtime.active_bank];
+                auto desc = active.experts[plan.expert];
+                uint32_t resident_mask =
+                    (active.resident_participant_mask[plan.expert] |
+                     plan.source_resident_mask |
+                     destination_bit) &
+                    shared_valid_mask;
+                if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                    destination_local)
+                {
+                    if (!local_transfer_slots ||
+                        plan.destination_slot >= local_transfer_slot_count)
+                        continue;
+                    const auto &slot = local_transfer_slots[plan.destination_slot];
+                    if (!rebalance_transfer_slot_copy_complete(slot, config.participant_id, plan.layer, plan.expert))
+                        continue;
+                    desc = slot.descriptor;
+                    desc.owner_participant = active.experts[plan.expert].owner_participant;
+                    resident_mask |= shared_participant_bit;
+                }
+                else if (plan.op == kDeviceMoERebalancePlanResidentHotReplica &&
+                         destination_local &&
+                         (resident_mask & shared_participant_bit) == 0u)
+                {
+                    continue;
+                }
+
+                const uint32_t inactive_bank = 1u - runtime.active_bank;
+                auto &next = runtime.banks[inactive_bank];
+                desc.flags |= kDeviceMoEFlagReplicated;
+                if (destination_local)
+                {
+                    desc.flags |= kDeviceMoEFlagValid |
+                                  kDeviceMoEFlagResident |
+                                  kDeviceMoEFlagLocalCompute;
+                    next.local_compute_mask[plan.expert] = 1u;
+                    next.replica_role[plan.expert] =
+                        desc.owner_participant == static_cast<int32_t>(config.participant_id)
+                            ? static_cast<uint8_t>(kDeviceMoEReplicaRolePrimary)
+                            : static_cast<uint8_t>(kDeviceMoEReplicaRoleReplica);
+                    ++status->applied_arrivals;
+                }
+                next.experts[plan.expert] = desc;
+                next.resident_participant_mask[plan.expert] =
+                    resident_mask & shared_valid_mask;
+            }
+        }
+        __syncthreads();
+
+        for (uint32_t layer = 0;
+             layer < config.num_layers && layer < static_cast<uint32_t>(kDeviceMoEMaxExperts);
+             ++layer)
+        {
+            if (changed_layer[layer] == 0u)
+                continue;
+
+            auto &runtime = runtime_layers[layer];
+            const uint32_t inactive_bank = 1u - runtime.active_bank;
+            auto &next = runtime.banks[inactive_bank];
+            uint32_t local_multi_resident = 0u;
+            for (uint32_t expert = threadIdx.x; expert < config.num_experts; expert += blockDim.x)
+            {
+                const uint32_t mask = next.resident_participant_mask[expert] & shared_valid_mask;
+                if (runtime_resident_count(mask, config.participant_count) > 1u)
+                    ++local_multi_resident;
+                if ((config.flags & kDeviceMoERebalanceFlagResetHistograms) != 0u)
+                {
+                    runtime.decode_histogram[expert] = 0ULL;
+                    runtime.decode_local_histogram[expert] = 0ULL;
+                }
+            }
+            reduce_scratch[threadIdx.x] = local_multi_resident;
+            __syncthreads();
+            for (uint32_t stride = blockDim.x / 2u; stride > 0u; stride >>= 1u)
+            {
+                if (threadIdx.x < stride)
+                    reduce_scratch[threadIdx.x] += reduce_scratch[threadIdx.x + stride];
+                __syncthreads();
+            }
+            if (threadIdx.x == 0)
+            {
+                next.reserved[0] = reduce_scratch[0];
+                runtime.active_bank = inactive_bank;
+                runtime.active_epoch = next.epoch;
+                ++status->changed_layers;
+            }
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0)
+        {
+            status->status_code = 0u;
+            if (shared_ready_wave)
+            {
+                shared_ready_wave->applied_arrivals += status->applied_arrivals;
+                const uint32_t layer_increment = target_layer >= 0 ? 1u : shared_ready_wave->planned_layer_count;
+                shared_ready_wave->applied_layer_count =
+                    min(shared_ready_wave->planned_layer_count,
+                        shared_ready_wave->applied_layer_count + layer_increment);
+                if (shared_ready_wave->applied_layer_count >= shared_ready_wave->planned_layer_count)
+                {
+                    clear_rebalance_command_header_device(shared_command_header);
+                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleApplied;
+                    controller_state->active_wave =
+                        (controller_state->active_wave + 1u) %
+                        rebalance_command_buffer_count(command_buffer_count);
+                }
+                else
+                {
+                    shared_ready_wave->state = kDeviceMoERebalanceLifecycleReadyToApply;
+                }
+                __threadfence();
+            }
+        }
+    }
+
+    __device__ __forceinline__ void try_apply_ready_rebalance_wave_for_layer_thread0(
+        DeviceMoELayerRuntimeView *runtime_layers,
+        const DeviceMoERebalancePlanEntryView *plan_entries,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeaderView *command_headers,
+        const DeviceMoEExpertDirectoryEntryView *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        DeviceMoERebalanceConfigView config,
+        DeviceMoERebalanceApplyStatusView *status,
+        DeviceMoERebalanceGraphControllerStateView *controller_state,
+        int target_layer,
+        uint32_t command_buffer_count)
+    {
+        if (threadIdx.x != 0 || !runtime_layers ||
+            !plan_entries || !command_headers || !controller_state ||
+            !rebalance_config_ok(config))
+        {
+            return;
+        }
+
+        if ((config.flags & kDeviceMoERebalanceFlagCollectLoadStats) != 0u &&
+            rebalance_graph_controller_state_ok(controller_state, config))
+            ++controller_state->decode_apply_polls;
+        const DeviceMoEReadyWaveSelection ready = rebalance_find_ready_wave(
+            controller_state,
+            command_headers,
+            config,
+            target_layer,
+            command_buffer_count);
+        if (!ready.wave)
+            return;
+
+        DeviceMoERebalanceWaveProgressView *wave = ready.wave;
+        const uint32_t wave_index = ready.wave_index;
+        auto *command_header = command_headers + wave_index;
+        if (!rebalance_command_header_ok(command_header, config))
+            return;
+
+        const auto *wave_plan_entries =
+            plan_entries + static_cast<unsigned long long>(wave_index) * plan_capacity;
+        const uint32_t command_count =
+            rebalance_command_count(nullptr, plan_capacity, command_header);
+        if (command_count == 0u)
+            return;
+
+        if (status)
+            init_rebalance_apply_status_device(status);
+        wave->state = kDeviceMoERebalanceLifecycleApplying;
+        ++controller_state->decode_apply_hits;
+
+        uint32_t layer = target_layer >= 0
+                             ? static_cast<uint32_t>(target_layer)
+                             : config.num_layers;
+        if (target_layer < 0)
+        {
+            for (uint32_t i = 0; i < command_count; ++i)
+            {
+                const auto &plan = wave_plan_entries[i];
+                if (plan.op == 0u)
+                    continue;
+                if ((plan.op == kDeviceMoERebalancePlanHotReplicaArrival ||
+                     plan.op == kDeviceMoERebalancePlanResidentHotReplica) &&
+                    plan.layer < config.num_layers)
+                {
+                    layer = plan.layer;
+                    break;
+                }
+            }
+            if (layer >= config.num_layers)
+            {
+                clear_rebalance_command_header_device(command_header);
+                wave->state = kDeviceMoERebalanceLifecycleApplied;
+                controller_state->active_wave =
+                    (controller_state->active_wave + 1u) %
+                    rebalance_command_buffer_count(command_buffer_count);
+                __threadfence();
+                return;
+            }
+        }
+        uint32_t valid_plan_count = 0u;
+        const uint32_t participant_bit =
+            runtime_participant_bit(static_cast<int>(config.participant_id));
+        const uint32_t valid_mask = runtime_valid_participant_mask(config.participant_count);
+
+        for (uint32_t i = 0; i < command_count; ++i)
+        {
+            const auto &plan = wave_plan_entries[i];
+            if (status)
+                ++status->plan_entries_seen;
+            if (plan.op == 0u || plan.layer != layer)
+                continue;
+            if ((plan.op != kDeviceMoERebalancePlanHotReplicaArrival &&
+                 plan.op != kDeviceMoERebalancePlanResidentHotReplica) ||
+                plan.expert >= config.num_experts ||
+                plan.source_participant >= config.participant_count ||
+                plan.destination_participant >= config.participant_count)
+            {
+                if (status)
+                    ++status->invalid_plan_entries;
+                continue;
+            }
+            ++valid_plan_count;
+        }
+
+        if (valid_plan_count == 0u)
+        {
+            wave->applied_layer_count =
+                min(wave->planned_layer_count, wave->applied_layer_count + 1u);
+            wave->state =
+                wave->applied_layer_count >= wave->planned_layer_count
+                    ? kDeviceMoERebalanceLifecycleApplied
+                    : kDeviceMoERebalanceLifecycleReadyToApply;
+            if (wave->state == kDeviceMoERebalanceLifecycleApplied)
+            {
+                clear_rebalance_command_header_device(command_header);
+                controller_state->active_wave =
+                    (controller_state->active_wave + 1u) %
+                    rebalance_command_buffer_count(command_buffer_count);
+            }
+            __threadfence();
+            return;
+        }
+
+        auto &runtime = runtime_layers[layer];
+        if (runtime.active_bank > 1u ||
+            runtime.expert_count != config.num_experts ||
+            runtime.top_k != config.top_k ||
+            runtime.participant_id != config.participant_id ||
+            runtime.participant_count != config.participant_count)
+        {
+            if (status)
+                status->status_code = 2u;
+            wave->error_code = 2u;
+            wave->state = kDeviceMoERebalanceLifecycleError;
+            controller_state->last_error_code = 2u;
+            return;
+        }
+
+        const uint32_t inactive_bank = 1u - runtime.active_bank;
+        const auto &active = runtime.banks[runtime.active_bank];
+        auto &next = runtime.banks[inactive_bank];
+        next.epoch = runtime.active_epoch + 1u;
+        next.expert_count = config.num_experts;
+        next.reserved[0] = active.reserved[0];
+        next.reserved[1] = active.reserved[1];
+        for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+        {
+            next.experts[expert] = active.experts[expert];
+            auto &base_desc = next.experts[expert];
+            base_desc.flags &= ~kDeviceMoEFlagReplicated;
+            const bool owner_local =
+                base_desc.owner_participant == static_cast<int32_t>(config.participant_id);
+            next.local_compute_mask[expert] = owner_local ? 1u : 0u;
+            next.replica_role[expert] =
+                owner_local
+                    ? static_cast<uint8_t>(kDeviceMoEReplicaRolePrimary)
+                    : static_cast<uint8_t>(kDeviceMoEReplicaRoleNone);
+            next.resident_participant_mask[expert] =
+                active.resident_participant_mask[expert] & valid_mask;
+            if (base_desc.owner_participant >= 0 &&
+                base_desc.owner_participant < static_cast<int32_t>(config.participant_count))
+            {
+                next.resident_participant_mask[expert] |=
+                    runtime_participant_bit(base_desc.owner_participant);
+            }
+        }
+
+        uint32_t applied_arrivals = 0u;
+        for (uint32_t i = 0; i < command_count; ++i)
+        {
+            const auto &plan = wave_plan_entries[i];
+            if (plan.op == 0u || plan.layer != layer)
+                continue;
+            if ((plan.op != kDeviceMoERebalancePlanHotReplicaArrival &&
+                 plan.op != kDeviceMoERebalancePlanResidentHotReplica) ||
+                plan.expert >= config.num_experts ||
+                plan.source_participant >= config.participant_count ||
+                plan.destination_participant >= config.participant_count)
+            {
+                continue;
+            }
+
+            const bool destination_local =
+                plan.destination_participant == config.participant_id;
+            const uint32_t destination_bit =
+                runtime_participant_bit(static_cast<int>(plan.destination_participant));
+            auto desc = active.experts[plan.expert];
+            uint32_t resident_mask =
+                (active.resident_participant_mask[plan.expert] |
+                 plan.source_resident_mask |
+                 destination_bit) &
+                valid_mask;
+
+            if (plan.op == kDeviceMoERebalancePlanHotReplicaArrival &&
+                destination_local)
+            {
+                if (!local_transfer_slots ||
+                    plan.destination_slot >= local_transfer_slot_count)
+                {
+                    if (status)
+                        ++status->missing_destination_slots;
+                    continue;
+                }
+                const auto &slot = local_transfer_slots[plan.destination_slot];
+                if (!rebalance_transfer_slot_copy_complete(
+                        slot, config.participant_id, plan.layer, plan.expert))
+                {
+                    if (status)
+                        ++status->copy_incomplete;
+                    continue;
+                }
+                desc = slot.descriptor;
+                desc.owner_participant = active.experts[plan.expert].owner_participant;
+                resident_mask |= participant_bit;
+            }
+            else if (plan.op == kDeviceMoERebalancePlanResidentHotReplica &&
+                     destination_local &&
+                     (resident_mask & participant_bit) == 0u)
+            {
+                if (status)
+                    ++status->missing_source_descriptors;
+                continue;
+            }
+
+            desc.flags |= kDeviceMoEFlagReplicated;
+            if (destination_local)
+            {
+                desc.flags |= kDeviceMoEFlagValid |
+                              kDeviceMoEFlagResident |
+                              kDeviceMoEFlagLocalCompute;
+                next.local_compute_mask[plan.expert] = 1u;
+                next.replica_role[plan.expert] =
+                    desc.owner_participant == static_cast<int32_t>(config.participant_id)
+                        ? static_cast<uint8_t>(kDeviceMoEReplicaRolePrimary)
+                        : static_cast<uint8_t>(kDeviceMoEReplicaRoleReplica);
+                ++applied_arrivals;
+            }
+            next.experts[plan.expert] = desc;
+            next.resident_participant_mask[plan.expert] = resident_mask & valid_mask;
+        }
+
+        uint32_t multi_resident = 0u;
+        for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+        {
+            const uint32_t mask = next.resident_participant_mask[expert] & valid_mask;
+            if (runtime_resident_count(mask, config.participant_count) > 1u)
+                ++multi_resident;
+            if ((config.flags & kDeviceMoERebalanceFlagResetHistograms) != 0u)
+            {
+                runtime.decode_histogram[expert] = 0ULL;
+                runtime.decode_local_histogram[expert] = 0ULL;
+            }
+        }
+        next.reserved[0] = multi_resident;
+        runtime.active_bank = inactive_bank;
+        runtime.active_epoch = next.epoch;
+        if (status)
+        {
+            status->status_code = 0u;
+            status->changed_layers = 1u;
+            status->applied_arrivals = applied_arrivals;
+        }
+        wave->applied_arrivals += applied_arrivals;
+        wave->applied_layer_count =
+            min(wave->planned_layer_count, wave->applied_layer_count + 1u);
+        if (wave->applied_layer_count >= wave->planned_layer_count)
+        {
+            clear_rebalance_command_header_device(command_header);
+            wave->state = kDeviceMoERebalanceLifecycleApplied;
+            controller_state->active_wave =
+                (controller_state->active_wave + 1u) %
+                rebalance_command_buffer_count(command_buffer_count);
+        }
+        else
+        {
+            wave->state = kDeviceMoERebalanceLifecycleReadyToApply;
+        }
+        __threadfence();
     }
 
     __device__ __forceinline__ bool grouped_desc_supports_codebook(uint8_t codebook_id)
@@ -639,6 +4711,71 @@ namespace
         }
     }
 
+    __device__ __forceinline__ bool moe_topk_pair_better(
+        float candidate_value,
+        int candidate_id,
+        float best_value,
+        int best_id)
+    {
+        return candidate_value > best_value ||
+               (candidate_value == best_value && candidate_id < best_id);
+    }
+
+    __device__ void moe_select_topk_probabilities_block(
+        float *__restrict__ values,
+        int num_experts,
+        int top_k,
+        int *__restrict__ selected,
+        float *__restrict__ selected_weights,
+        float *__restrict__ reductions,
+        int *__restrict__ reduction_indices)
+    {
+        for (int k = 0; k < top_k; ++k)
+        {
+            float best_value = -1.0f;
+            int best = kMaxExperts;
+            for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
+            {
+                const float value = values[expert];
+                if (moe_topk_pair_better(value, expert, best_value, best))
+                {
+                    best_value = value;
+                    best = expert;
+                }
+            }
+            reductions[threadIdx.x] = best_value;
+            reduction_indices[threadIdx.x] = best;
+            __syncthreads();
+
+            for (int stride = blockDim.x / 2; stride > 0; stride >>= 1)
+            {
+                if (threadIdx.x < stride)
+                {
+                    const float other_value = reductions[threadIdx.x + stride];
+                    const int other_idx = reduction_indices[threadIdx.x + stride];
+                    const float current_value = reductions[threadIdx.x];
+                    const int current_idx = reduction_indices[threadIdx.x];
+                    if (moe_topk_pair_better(other_value, other_idx, current_value, current_idx))
+                    {
+                        reductions[threadIdx.x] = other_value;
+                        reduction_indices[threadIdx.x] = other_idx;
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (threadIdx.x == 0)
+            {
+                const int winner = reduction_indices[0];
+                selected[k] = winner;
+                selected_weights[k] = reductions[0];
+                if (winner >= 0 && winner < num_experts)
+                    values[winner] = -1.0f;
+            }
+            __syncthreads();
+        }
+    }
+
     __global__ void softmax_topk_kernel(
         float *__restrict__ logits,
         int *__restrict__ expert_indices,
@@ -788,17 +4925,42 @@ namespace
     __global__ void softmax_topk_decode_runtime_kernel(
         float *__restrict__ logits,
         DeviceMoELayerRuntimeView *__restrict__ runtime,
+        DeviceMoELayerRuntimeView *__restrict__ runtime_layers,
         float *legacy_indices,
         float *legacy_weights,
         int num_experts, int top_k,
         bool normalize_weights,
         bool write_legacy_outputs,
-        bool update_runtime_histogram)
+        bool update_runtime_histogram,
+        const DeviceMoERebalancePlanEntryView *rebalance_plan_entries,
+        uint32_t rebalance_plan_capacity,
+        DeviceMoERebalanceCommandBufferHeaderView *rebalance_command_header,
+        const DeviceMoEExpertDirectoryEntryView *rebalance_local_transfer_slots,
+        uint32_t rebalance_local_transfer_slot_count,
+        DeviceMoERebalanceConfigView rebalance_config,
+        DeviceMoERebalanceApplyStatusView *rebalance_apply_status,
+        DeviceMoERebalanceGraphControllerStateView *rebalance_controller_state,
+        int rebalance_target_layer,
+        uint32_t rebalance_command_buffer_count)
     {
         __shared__ float values[kMaxExperts];
         __shared__ float reductions[kThreads];
+        __shared__ int red_idx[kThreads];
         __shared__ int selected[kMaxTopK];
         __shared__ float selected_weights[kMaxTopK];
+
+        try_apply_ready_rebalance_wave_for_layer_thread0(
+            runtime_layers,
+            rebalance_plan_entries,
+            rebalance_plan_capacity,
+            rebalance_command_header,
+            rebalance_local_transfer_slots,
+            rebalance_local_transfer_slot_count,
+            rebalance_config,
+            rebalance_apply_status,
+            rebalance_controller_state,
+            rebalance_target_layer,
+            rebalance_command_buffer_count);
 
         float local_max = -INFINITY;
         for (int expert = threadIdx.x; expert < num_experts; expert += blockDim.x)
@@ -837,38 +4999,35 @@ namespace
         }
         __syncthreads();
 
+        moe_select_topk_probabilities_block(
+            values, num_experts, top_k, selected, selected_weights, reductions, red_idx);
+
         if (threadIdx.x == 0)
         {
             const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
             float topk_sum = 0.0f;
             for (int k = 0; k < top_k; ++k)
-            {
-                int best = 0;
-                float best_value = -1.0f;
-                for (int expert = 0; expert < num_experts; ++expert)
-                {
-                    if (values[expert] > best_value)
-                    {
-                        best_value = values[expert];
-                        best = expert;
-                    }
-                }
-                selected[k] = best;
-                selected_weights[k] = best_value;
-                topk_sum += best_value;
-                values[best] = -1.0f;
-            }
+                topk_sum += selected_weights[k];
 
+            bool local_compute_flags[kMaxTopK] = {};
+            if (shape_ok)
+            {
+                runtime_resolve_decode_dispatch(
+                    runtime,
+                    selected,
+                    num_experts,
+                    top_k,
+                    update_runtime_histogram,
+                    local_compute_flags);
+            }
             for (int k = 0; k < top_k; ++k)
             {
                 const float weight = normalize_weights && topk_sum > 0.0f
                                          ? selected_weights[k] / topk_sum
                                          : selected_weights[k];
-                bool local_compute = false;
                 if (shape_ok)
                 {
-                    local_compute =
-                        runtime_selected_slot_local_compute(runtime, selected, k, num_experts, top_k);
+                    const bool local_compute = local_compute_flags[k];
                     runtime->topk_expert_ids[k] = local_compute ? selected[k] : -1;
                     runtime->topk_weights[k] = local_compute ? weight : 0.0f;
                 }
@@ -877,13 +5036,19 @@ namespace
                     legacy_indices[k] = static_cast<float>(selected[k]);
                     legacy_weights[k] = weight;
                 }
-                if (update_runtime_histogram)
+            }
+            if (update_runtime_histogram)
+            {
+                for (int k = 0; k < top_k; ++k)
                 {
-                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[selected[k]]),
+                    const int expert = selected[k];
+                    if (expert < 0 || expert >= kDeviceMoEMaxExperts)
+                        continue;
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert]),
                               static_cast<unsigned long long>(1));
-                    if (shape_ok && local_compute)
+                    if (shape_ok && local_compute_flags[k])
                     {
-                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[selected[k]]),
+                        atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert]),
                                   static_cast<unsigned long long>(1));
                     }
                 }
@@ -904,36 +5069,53 @@ namespace
     {
         if (threadIdx.x != 0)
             return;
+
         const bool shape_ok = runtime_shape_ok(runtime, num_experts, top_k);
-        for (int k = 0; k < top_k; ++k)
-        {
-        const int expert = expert_indices[k];
-        const float weight = expert_weights[k];
-        bool local_compute = false;
+        bool local_compute_flags[kMaxTopK] = {};
         if (shape_ok)
         {
-            local_compute =
-                runtime_selected_slot_local_compute(runtime, expert_indices, k, num_experts, top_k);
-            runtime->topk_expert_ids[k] = local_compute ? expert : -1;
-            runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+            runtime_resolve_decode_dispatch(
+                runtime,
+                expert_indices,
+                num_experts,
+                top_k,
+                update_runtime_histogram,
+                local_compute_flags);
         }
+        for (int k = 0; k < top_k; ++k)
+        {
+            const int expert = expert_indices[k];
+            const float weight = expert_weights[k];
+            if (shape_ok)
+            {
+                const bool local_compute = local_compute_flags[k];
+                runtime->topk_expert_ids[k] = local_compute ? expert : -1;
+                runtime->topk_weights[k] = local_compute ? weight : 0.0f;
+            }
             if (write_legacy_outputs)
             {
                 legacy_indices[k] = static_cast<float>(expert);
                 legacy_weights[k] = weight;
+            }
         }
-        if (update_runtime_histogram && expert >= 0 && expert < kDeviceMoEMaxExperts)
+
+        if (update_runtime_histogram)
         {
-            atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert]),
-                      static_cast<unsigned long long>(1));
-            if (shape_ok && local_compute)
+            for (int k = 0; k < top_k; ++k)
             {
-                atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert]),
+                const int expert = expert_indices[k];
+                if (expert < 0 || expert >= kDeviceMoEMaxExperts)
+                    continue;
+                atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_histogram[expert]),
                           static_cast<unsigned long long>(1));
+                if (shape_ok && local_compute_flags[k])
+                {
+                    atomicAdd(reinterpret_cast<unsigned long long *>(&runtime->decode_local_histogram[expert]),
+                              static_cast<unsigned long long>(1));
+                }
             }
         }
     }
-}
 
     __global__ void int_to_float_kernel(const int *__restrict__ input, float *__restrict__ output, int count)
     {
@@ -1379,6 +5561,26 @@ namespace
         grouped_weights[dest] = routing_weights[idx];
     }
 
+    __global__ void build_active_expert_list_kernel(
+        const int *__restrict__ expert_counts,
+        int *__restrict__ active_expert_ids,
+        int num_experts,
+        int max_active_experts)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+
+        int active = 0;
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const int count = expert_counts[expert];
+            if (count > 0 && active < max_active_experts)
+                active_expert_ids[active++] = expert;
+        }
+        for (int slot = active; slot < max_active_experts; ++slot)
+            active_expert_ids[slot] = -1;
+    }
+
     __global__ void scatter_tokens_deterministic_kernel(
         const int *__restrict__ routing_indices,
         const float *__restrict__ routing_weights,
@@ -1591,6 +5793,90 @@ namespace
 
         const float q = hidden[col] / scale;
         A_int8[col] = static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+    }
+
+    __global__ void router_gate_quantize_q8_kernel(
+        const float *__restrict__ gate_weights,
+        int8_t *__restrict__ gate_weights_q8,
+        float *__restrict__ gate_scales,
+        int K,
+        int num_experts)
+    {
+        constexpr int kBlockSize = 32;
+        const int expert = blockIdx.x;
+        const int block_idx = blockIdx.y;
+        const int lane = threadIdx.x;
+        if (expert >= num_experts || lane >= kBlockSize)
+            return;
+
+        const int blocks_per_row = K / kBlockSize;
+        const int col = block_idx * kBlockSize + lane;
+        const size_t scale_idx = static_cast<size_t>(expert) * blocks_per_row + block_idx;
+        const float value = (col < K)
+                                ? gate_weights[static_cast<size_t>(expert) * K + col]
+                                : 0.0f;
+
+        float abs_value = fabsf(value);
+#pragma unroll
+        for (int mask = 16; mask > 0; mask >>= 1)
+            abs_value = fmaxf(abs_value, __shfl_xor_sync(0xffffffffu, abs_value, mask));
+
+        const float scale = (abs_value > 0.0f) ? (abs_value / 127.0f) : 1.0f;
+        if (lane == 0)
+            gate_scales[scale_idx] = scale;
+
+        const float q = value / scale;
+        gate_weights_q8[scale_idx * kBlockSize + lane] =
+            static_cast<int8_t>(rintf(fminf(127.0f, fmaxf(-127.0f, q))));
+    }
+
+    __global__ void router_gate_logits_single_token_q8_kernel(
+        const int8_t *__restrict__ hidden_q8,
+        const float *__restrict__ hidden_scales,
+        const int8_t *__restrict__ gate_weights_q8,
+        const float *__restrict__ gate_scales,
+        float *__restrict__ logits,
+        int K,
+        int num_experts)
+    {
+        constexpr int kBlockSize = 32;
+        const int expert = blockIdx.x;
+        if (expert >= num_experts)
+            return;
+
+        const int blocks_per_row = K / kBlockSize;
+        float sum = 0.0f;
+        for (int block_idx = threadIdx.x; block_idx < blocks_per_row; block_idx += blockDim.x)
+        {
+            const int *h4 = reinterpret_cast<const int *>(hidden_q8 + block_idx * kBlockSize);
+            const size_t scale_idx = static_cast<size_t>(expert) * blocks_per_row + block_idx;
+            const int *w4 = reinterpret_cast<const int *>(gate_weights_q8 + scale_idx * kBlockSize);
+
+            int block_acc = 0;
+#pragma unroll
+            for (int group = 0; group < 8; ++group)
+                block_acc = __dp4a(h4[group], w4[group], block_acc);
+            sum += static_cast<float>(block_acc) * hidden_scales[block_idx] * gate_scales[scale_idx];
+        }
+
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xffffffffu, sum, offset);
+
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int num_warps = blockDim.x >> 5;
+        __shared__ float warp_sums[32];
+        if (lane == 0)
+            warp_sums[warp] = sum;
+        __syncthreads();
+        if (warp == 0)
+        {
+            float v = (lane < num_warps) ? warp_sums[lane] : 0.0f;
+            for (int offset = 16; offset > 0; offset >>= 1)
+                v += __shfl_down_sync(0xffffffffu, v, offset);
+            if (lane == 0)
+                logits[expert] = v;
+        }
     }
 
     __global__ void grouped_swiglu_quantize_blockwise_kernel(
@@ -2942,6 +7228,191 @@ namespace
         output[n] = sum;
     }
 
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_gate_up_decode_runtime_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int *__restrict__ expert_ids,
+        float *const *__restrict__ gate_outputs,
+        float *const *__restrict__ up_outputs,
+        int num_active,
+        int N,
+        int K,
+        int num_experts)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int slot = blockIdx.y;
+        if (slot >= num_active || n >= N)
+            return;
+
+        const int expert_id = expert_ids[slot];
+        if (expert_id < 0 || expert_id >= num_experts)
+        {
+            gate_outputs[slot][n] = 0.0f;
+            up_outputs[slot][n] = 0.0f;
+            return;
+        }
+
+        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
+        const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
+        gate_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
+            gate_desc, n, A_int8, scales_A_blockwise, N, K);
+        up_outputs[slot][n] = native_vnni_dot_desc_dispatch<CodebookId>(
+            up_desc, n, A_int8, scales_A_blockwise, N, K);
+    }
+
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_gate_up_kpart_decode_runtime_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int *__restrict__ expert_ids,
+        float *__restrict__ gate_partials,
+        float *__restrict__ up_partials,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int k_part = blockIdx.y;
+        const int slot = blockIdx.z;
+        if (slot >= num_active || k_part >= k_partitions || n >= N)
+            return;
+
+        const size_t partial_index =
+            (static_cast<size_t>(slot) * static_cast<size_t>(k_partitions) +
+             static_cast<size_t>(k_part)) *
+                static_cast<size_t>(N) +
+            static_cast<size_t>(n);
+
+        const int expert_id = expert_ids[slot];
+        if (expert_id < 0 || expert_id >= num_experts)
+        {
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
+        }
+
+        const int blocks_per_row = K / 32;
+        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int b_start = k_part * blocks_per_part;
+        int b_end = b_start + blocks_per_part;
+        if (b_end > blocks_per_row)
+            b_end = blocks_per_row;
+        if (b_start >= b_end)
+        {
+            gate_partials[partial_index] = 0.0f;
+            up_partials[partial_index] = 0.0f;
+            return;
+        }
+
+        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        const DeviceNativeVNNIMatrixDesc gate_desc = bank.experts[expert_id].gate;
+        const DeviceNativeVNNIMatrixDesc up_desc = bank.experts[expert_id].up;
+        gate_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
+            gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        up_partials[partial_index] = native_vnni_dot_desc_range_dispatch<CodebookId>(
+            up_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+    }
+
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_down_decode_runtime_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int *__restrict__ expert_ids,
+        const float *__restrict__ route_weights,
+        float *__restrict__ output,
+        int num_active,
+        int N,
+        int K,
+        int num_experts)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        if (n >= N)
+            return;
+
+        const int blocks_per_row = K / 32;
+        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        float total = 0.0f;
+#pragma unroll 1
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            const int expert_id = expert_ids[slot];
+            if (expert_id < 0 || expert_id >= num_experts)
+                continue;
+
+            const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
+            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+            const float expert_value = native_vnni_dot_desc_dispatch<CodebookId>(
+                desc, n, slot_A, slot_scales, N, K);
+            total += route_weights[slot] * expert_value;
+        }
+        output[n] = total;
+    }
+
+    template <uint8_t CodebookId>
+    __global__ void grouped_native_vnni_down_kpart_decode_runtime_kernel(
+        const int8_t *__restrict__ A_int8,
+        const float *__restrict__ scales_A_blockwise,
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int *__restrict__ expert_ids,
+        const float *__restrict__ route_weights,
+        float *__restrict__ partials,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        int k_partitions)
+    {
+        constexpr int kTileN = 64;
+        const int n = blockIdx.x * kTileN + threadIdx.x;
+        const int k_part = blockIdx.y;
+        if (k_part >= k_partitions || n >= N)
+            return;
+
+        const size_t partial_index =
+            static_cast<size_t>(k_part) * static_cast<size_t>(N) + static_cast<size_t>(n);
+
+        const int blocks_per_row = K / 32;
+        const int blocks_per_part = (blocks_per_row + k_partitions - 1) / k_partitions;
+        const int b_start = k_part * blocks_per_part;
+        int b_end = b_start + blocks_per_part;
+        if (b_end > blocks_per_row)
+            b_end = blocks_per_row;
+        if (b_start >= b_end)
+        {
+            partials[partial_index] = 0.0f;
+            return;
+        }
+
+        const DeviceMoEPlacementBankView &bank = runtime->banks[runtime->active_bank];
+        float total = 0.0f;
+#pragma unroll 1
+        for (int slot = 0; slot < num_active; ++slot)
+        {
+            const int expert_id = expert_ids[slot];
+            if (expert_id < 0 || expert_id >= num_experts)
+                continue;
+
+            const DeviceNativeVNNIMatrixDesc desc = bank.experts[expert_id].down;
+            const int8_t *slot_A = A_int8 + static_cast<size_t>(slot) * K;
+            const float *slot_scales = scales_A_blockwise + static_cast<size_t>(slot) * blocks_per_row;
+            const float expert_value = native_vnni_dot_desc_range_dispatch<CodebookId>(
+                desc, n, slot_A, slot_scales, N, K, b_start, b_end);
+            total += route_weights[slot] * expert_value;
+        }
+        partials[partial_index] = total;
+    }
+
     int blocksFor(int count)
     {
         return (count + kThreads - 1) / kThreads;
@@ -2973,6 +7444,54 @@ namespace
 
 extern "C"
 {
+    bool cudaMoE_quantize_router_gate_q8(
+        const float *gate_weights, int8_t *gate_weights_q8, float *gate_scales,
+        int d_model, int num_experts,
+        int device_idx, void *stream)
+    {
+        if (!gate_weights || !gate_weights_q8 || !gate_scales || !stream ||
+            d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_quantize_router_gate_q8] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        const int blocks_per_row = d_model / 32;
+        router_gate_quantize_q8_kernel<<<dim3(num_experts, blocks_per_row), dim3(32), 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+            gate_weights, gate_weights_q8, gate_scales, d_model, num_experts);
+        return finishLaunch("cudaMoE_quantize_router_gate_q8");
+    }
+
+    bool cudaMoE_gate_logits_single_token_q8_weights(
+        const float *hidden, int8_t *hidden_q8, float *hidden_scales,
+        const int8_t *gate_weights_q8, const float *gate_scales, float *logits,
+        int d_model, int num_experts,
+        int device_idx, void *stream)
+    {
+        if (!hidden || !hidden_q8 || !hidden_scales ||
+            !gate_weights_q8 || !gate_scales || !logits || !stream ||
+            d_model <= 0 || num_experts <= 0 || (d_model % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_gate_logits_single_token_q8_weights] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        const int blocks_per_row = d_model / 32;
+        grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+            hidden, hidden_q8, hidden_scales, d_model);
+        if (!finishLaunch("cudaMoE_router_hidden_quantize_q8"))
+            return false;
+
+        constexpr int kRouterThreads = 128;
+        router_gate_logits_single_token_q8_kernel<<<num_experts, kRouterThreads, 0, cuda_stream>>>(
+            hidden_q8, hidden_scales, gate_weights_q8, gate_scales, logits, d_model, num_experts);
+        return finishLaunch("cudaMoE_gate_logits_single_token_q8_weights");
+    }
+
     bool cudaMoE_route_logits(const float *hidden, const float *gate_weights, float *logits,
                               int seq_len, int d_model, int num_experts,
                               int device_idx, void *stream)
@@ -3037,15 +7556,45 @@ extern "C"
                                              float *legacy_indices, float *legacy_weights,
                                              int num_experts, int top_k, bool normalize_weights,
                                              bool write_legacy_outputs, bool update_runtime_histogram,
+                                             void *runtime_layers,
+                                             const void *rebalance_plan_entries,
+                                             uint32_t rebalance_plan_capacity,
+                                             void *rebalance_command_header,
+                                             const void *rebalance_local_transfer_slots,
+                                             uint32_t rebalance_local_transfer_slot_count,
+                                             const void *rebalance_config,
+                                             void *rebalance_apply_status,
+                                             void *rebalance_controller_state,
+                                             int rebalance_target_layer,
+                                             uint32_t rebalance_command_buffer_count,
                                              int device_idx, void *stream)
     {
-        if (!runtime_layer || num_experts > kDeviceMoEMaxExperts || top_k > kMaxTopK)
+        if (!runtime_layer ||
+            num_experts <= 0 ||
+            num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 ||
+            top_k > kMaxTopK ||
+            top_k > num_experts)
             return false;
         cudaSetDevice(device_idx);
+        DeviceMoERebalanceConfigView rebalance_cfg{};
+        if (rebalance_config)
+            rebalance_cfg = *static_cast<const DeviceMoERebalanceConfigView *>(rebalance_config);
         softmax_topk_decode_runtime_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
             logits, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
             legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,
-            write_legacy_outputs, update_runtime_histogram);
+            write_legacy_outputs, update_runtime_histogram,
+            static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
+            rebalance_plan_capacity,
+            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(rebalance_command_header),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(rebalance_local_transfer_slots),
+            rebalance_local_transfer_slot_count,
+            rebalance_cfg,
+            static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(rebalance_controller_state),
+            rebalance_target_layer,
+            rebalance_command_buffer_count);
         return finishLaunch("cudaMoE_softmax_topk_decode_runtime");
     }
 
@@ -3062,6 +7611,431 @@ extern "C"
             expert_indices, expert_weights, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
             legacy_indices, legacy_weights, num_experts, top_k, write_legacy_outputs, update_runtime_histogram);
         return finishLaunch("cudaMoE_decode_route_select_runtime");
+    }
+
+    bool cudaMoE_device_rebalance_controller(
+        void *runtime_layers,
+        const unsigned long long *gathered_histograms,
+        void *status,
+        const void *config,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        uint32_t payload_slot_capacity,
+        void *command_header,
+        void *wave_state,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || !gathered_histograms || !status || !config || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        device_rebalance_controller_kernel<<<1, kDeviceMoEMaxExperts, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
+            gathered_histograms,
+            static_cast<DeviceMoERebalanceStatusView *>(status),
+            cfg,
+            static_cast<DeviceMoERebalancePlanEntryView *>(plan_entries),
+            plan_count,
+            plan_capacity,
+            payload_slot_capacity,
+            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(command_header),
+            static_cast<DeviceMoERebalanceWaveStateView *>(wave_state),
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            command_buffer_count);
+        return finishLaunch("cudaMoE_device_rebalance_controller");
+    }
+
+    bool cudaMoE_pack_rebalance_histograms(
+        void *runtime_layers,
+        unsigned long long *local_histograms,
+        const void *config,
+        const void *wave_state,
+        const void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || !local_histograms || !config || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        const uint32_t window_count =
+            cfg.layer_window_count == 0u
+                ? cfg.num_layers
+                : (cfg.layer_window_count < cfg.num_layers ? cfg.layer_window_count : cfg.num_layers);
+        const uint32_t wave_count =
+            cfg.layer_wave_count == 0u
+                ? window_count
+                : (cfg.layer_wave_count < window_count ? cfg.layer_wave_count : window_count);
+        const int total = static_cast<int>(wave_count * cfg.num_experts);
+        const int blocks = (total + kThreads - 1) / kThreads;
+        pack_rebalance_histograms_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+            local_histograms,
+            cfg,
+            static_cast<const DeviceMoERebalanceWaveStateView *>(wave_state),
+            static_cast<const DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            command_buffer_count);
+        return finishLaunch("cudaMoE_pack_rebalance_histograms");
+    }
+
+    bool cudaMoE_pack_rebalance_directory(
+        void *runtime_layers,
+        void *local_directory,
+        const void *config,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || !local_directory || !config || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        const int total = static_cast<int>(cfg.num_layers * cfg.num_experts);
+        const int blocks = (total + kThreads - 1) / kThreads;
+        pack_rebalance_directory_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<DeviceMoEExpertDirectoryEntryView *>(local_directory),
+            cfg);
+        return finishLaunch("cudaMoE_pack_rebalance_directory");
+    }
+
+    bool cudaMoE_pack_rebalance_source_descriptors(
+        void *runtime_layers,
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_source_descriptors,
+        const void *config,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || !gathered_plan_entries || !gathered_command_headers ||
+            !local_source_descriptors || !config || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        const uint32_t metadata_buffer_count =
+            command_buffer_count <= 1u ? 1u : (command_buffer_count < 2u ? command_buffer_count : 2u);
+        const unsigned long long total =
+            static_cast<unsigned long long>(cfg.participant_count) *
+            static_cast<unsigned long long>(metadata_buffer_count) *
+            static_cast<unsigned long long>(plan_capacity);
+        const int blocks =
+            static_cast<int>((total + static_cast<unsigned long long>(kThreads) - 1ULL) /
+                             static_cast<unsigned long long>(kThreads));
+        if (blocks > 0)
+        {
+            pack_rebalance_source_descriptors_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+                static_cast<const DeviceMoELayerRuntimeView *>(runtime_layers),
+                static_cast<const DeviceMoERebalancePlanEntryView *>(gathered_plan_entries),
+                static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(gathered_command_headers),
+                plan_capacity,
+                static_cast<DeviceMoEExpertDirectoryEntryView *>(local_source_descriptors),
+                cfg,
+                static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+                command_buffer_count);
+        }
+        return finishLaunch("cudaMoE_pack_rebalance_source_descriptors");
+    }
+
+    bool cudaMoE_project_rebalance_domain_commands(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        void *local_plan_entries,
+        void *local_command_headers,
+        const void *config,
+        void *status,
+        uint32_t payload_slot_capacity,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!gathered_plan_entries ||
+            !gathered_command_headers ||
+            !local_plan_entries ||
+            !local_command_headers ||
+            !config ||
+            !stream ||
+            plan_capacity == 0u)
+        {
+            return false;
+        }
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        project_rebalance_domain_commands_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoERebalancePlanEntryView *>(gathered_plan_entries),
+            static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(gathered_command_headers),
+            plan_capacity,
+            static_cast<DeviceMoERebalancePlanEntryView *>(local_plan_entries),
+            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(local_command_headers),
+            static_cast<DeviceMoERebalanceStatusView *>(status),
+            payload_slot_capacity,
+            cfg,
+            command_buffer_count);
+        return finishLaunch("cudaMoE_project_rebalance_domain_commands");
+    }
+
+    bool cudaMoE_pack_rebalance_compact_payloads(
+        const void *plan_entries,
+        const void *command_headers,
+        uint32_t plan_capacity,
+        const void *local_source_descriptors,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!plan_entries || !command_headers ||
+            !local_source_descriptors || !local_payload || !config || !status || !stream ||
+            plan_capacity == 0u || local_payload_slot_count == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        init_rebalance_apply_status_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status));
+        pack_rebalance_compact_payloads_kernel<<<
+            static_cast<int>(local_payload_slot_count),
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
+            static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_headers),
+            plan_capacity,
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(local_source_descriptors),
+            static_cast<uint8_t *>(local_payload),
+            local_payload_slot_count,
+            payload_slot_bytes,
+            cfg,
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            command_buffer_count);
+        return finishLaunch("cudaMoE_pack_rebalance_compact_payloads");
+    }
+
+    bool cudaMoE_pack_rebalance_collective_payloads(
+        const void *gathered_plan_entries,
+        const void *gathered_command_headers,
+        uint32_t plan_capacity,
+        const void *local_directory,
+        void *local_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!gathered_plan_entries || !gathered_command_headers ||
+            !local_directory || !local_payload || !config || !status ||
+            !stream || plan_capacity == 0u || local_payload_slot_count == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        init_rebalance_apply_status_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status));
+        pack_rebalance_collective_payloads_kernel<<<
+            static_cast<int>(local_payload_slot_count),
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoERebalancePlanEntryView *>(gathered_plan_entries),
+            static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(gathered_command_headers),
+            plan_capacity,
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(local_directory),
+            static_cast<uint8_t *>(local_payload),
+            local_payload_slot_count,
+            payload_slot_bytes,
+            cfg,
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            command_buffer_count);
+        return finishLaunch("cudaMoE_pack_rebalance_collective_payloads");
+    }
+
+    bool cudaMoE_unpack_rebalance_collective_payloads(
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *gathered_payload,
+        uint32_t local_payload_slot_count,
+        unsigned long long payload_slot_bytes,
+        void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!plan_entries || (!plan_count && !command_header) ||
+            !gathered_payload || !local_transfer_slots || !config || !status ||
+            !stream || plan_capacity == 0u || local_payload_slot_count == 0u ||
+            payload_slot_bytes <= sizeof(DeviceMoEExpertDirectoryEntryView))
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        init_rebalance_apply_status_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status));
+        unpack_rebalance_collective_payloads_kernel<<<
+            static_cast<int>(plan_capacity),
+            kThreads,
+            0,
+            static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
+            plan_count,
+            plan_capacity,
+            const_cast<DeviceMoERebalanceCommandBufferHeaderView *>(
+                static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header)),
+            static_cast<const uint8_t *>(gathered_payload),
+            local_payload_slot_count,
+            payload_slot_bytes,
+            static_cast<DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
+            local_transfer_slot_count,
+            cfg,
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            command_buffer_count);
+        return finishLaunch("cudaMoE_unpack_rebalance_collective_payloads");
+    }
+
+    bool cudaMoE_apply_rebalance_arrivals(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        const void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        int target_layer,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !local_transfer_slots || !config || !status || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        init_rebalance_apply_status_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status));
+        apply_rebalance_arrivals_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
+            plan_count,
+            plan_capacity,
+            const_cast<DeviceMoERebalanceCommandBufferHeaderView *>(
+                static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header)),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
+            local_transfer_slot_count,
+            cfg,
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
+            target_layer,
+            nullptr,
+            false,
+            1u);
+        return finishLaunch("cudaMoE_apply_rebalance_arrivals");
+    }
+
+    bool cudaMoE_init_rebalance_graph_controller_state(
+        void *controller_state,
+        const void *config,
+        int device_idx,
+        void *stream)
+    {
+        if (!controller_state || !config || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        init_rebalance_graph_controller_state_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            cfg);
+        return finishLaunch("cudaMoE_init_rebalance_graph_controller_state");
+    }
+
+    bool cudaMoE_publish_rebalance_transfer_complete(
+        void *controller_state,
+        const void *command_header,
+        const void *wave_state,
+        const void *copy_status,
+        const void *config,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!controller_state || !command_header || !wave_state ||
+            !copy_status || !config || !stream)
+        {
+            return false;
+        }
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        publish_rebalance_transfer_complete_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            static_cast<const DeviceMoERebalanceCommandBufferHeaderView *>(command_header),
+            static_cast<const DeviceMoERebalanceWaveStateView *>(wave_state),
+            static_cast<const DeviceMoERebalanceApplyStatusView *>(copy_status),
+            cfg,
+            command_buffer_count);
+        return finishLaunch("cudaMoE_publish_rebalance_transfer_complete");
+    }
+
+    bool cudaMoE_apply_ready_rebalance_wave(
+        void *runtime_layers,
+        const void *plan_entries,
+        const uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        const void *local_transfer_slots,
+        uint32_t local_transfer_slot_count,
+        const void *config,
+        void *status,
+        void *controller_state,
+        int target_layer,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream)
+    {
+        if (!runtime_layers || !plan_entries || (!plan_count && !command_header) ||
+            !config || !status || !controller_state || !stream)
+        {
+            return false;
+        }
+        cudaSetDevice(device_idx);
+        const auto cfg = *static_cast<const DeviceMoERebalanceConfigView *>(config);
+        apply_rebalance_arrivals_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),
+            static_cast<const DeviceMoERebalancePlanEntryView *>(plan_entries),
+            plan_count,
+            plan_capacity,
+            static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(command_header),
+            static_cast<const DeviceMoEExpertDirectoryEntryView *>(local_transfer_slots),
+            local_transfer_slot_count,
+            cfg,
+            static_cast<DeviceMoERebalanceApplyStatusView *>(status),
+            target_layer,
+            static_cast<DeviceMoERebalanceGraphControllerStateView *>(controller_state),
+            true,
+            command_buffer_count);
+        return finishLaunch("cudaMoE_apply_ready_rebalance_wave");
     }
 
     bool cudaMoE_int_to_float(const int *input, float *output, int count, int device_idx, void *stream)
@@ -3249,6 +8223,23 @@ extern "C"
         return finishLaunch("cudaMoE_exclusive_scan");
     }
 
+    bool cudaMoE_build_active_expert_list(
+        const int *expert_counts,
+        int *active_expert_ids,
+        int num_experts,
+        int max_active_experts,
+        int device_idx,
+        void *stream)
+    {
+        if (!expert_counts || !active_expert_ids || num_experts <= 0 ||
+            max_active_experts <= 0 || max_active_experts > num_experts || !stream)
+            return false;
+        cudaSetDevice(device_idx);
+        build_active_expert_list_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+            expert_counts, active_expert_ids, num_experts, max_active_experts);
+        return finishLaunch("cudaMoE_build_active_expert_list");
+    }
+
     bool cudaMoE_scatter_tokens(const int *routing_indices, const float *routing_weights,
                                 int *write_heads, const int *expert_offsets,
                                 int *grouped_token_indices, float *grouped_weights,
@@ -3370,6 +8361,7 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
         int num_active,
         int N,
         int K,
@@ -3387,11 +8379,14 @@ extern "C"
 
         cudaSetDevice(device_idx);
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
-        const int blocks_per_row = K / 32;
-        grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
-            d_hidden, d_hidden_int8, d_hidden_scales, K);
-        if (!finishLaunch("cudaMoE_grouped_gate_up_hidden_quantize"))
-            return false;
+        if (!hidden_prequantized)
+        {
+            const int blocks_per_row = K / 32;
+            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+                d_hidden, d_hidden_int8, d_hidden_scales, K);
+            if (!finishLaunch("cudaMoE_grouped_gate_up_hidden_quantize"))
+                return false;
+        }
 
         constexpr int kTileN = 64;
         dim3 grid((N + kTileN - 1) / kTileN, num_active);
@@ -3441,6 +8436,7 @@ extern "C"
         float *const *d_up_outputs,
         int8_t *d_hidden_int8,
         float *d_hidden_scales,
+        bool hidden_prequantized,
         float *d_gate_partials,
         float *d_up_partials,
         int num_active,
@@ -3468,11 +8464,14 @@ extern "C"
         cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
 
         // Step 1: blockwise-quantize the shared hidden activation row once.
-        const int blocks_per_row = K / 32;
-        grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
-            d_hidden, d_hidden_int8, d_hidden_scales, K);
-        if (!finishLaunch("cudaMoE_grouped_gate_up_kpart_hidden_quantize"))
-            return false;
+        if (!hidden_prequantized)
+        {
+            const int blocks_per_row = K / 32;
+            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+                d_hidden, d_hidden_int8, d_hidden_scales, K);
+            if (!finishLaunch("cudaMoE_grouped_gate_up_kpart_hidden_quantize"))
+                return false;
+        }
 
         // Step 2: split-K scatter — each (n-tile, k-partition, expert-slot) block
         // reduces its K-slice into the partials buffer.
@@ -3522,6 +8521,173 @@ extern "C"
             num_active, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_table_kpart");
+    }
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_hidden || !d_runtime_layer || !d_expert_ids ||
+            !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
+            num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 || (K % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        if (!hidden_prequantized)
+        {
+            const int blocks_per_row = K / 32;
+            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+                d_hidden, d_hidden_int8, d_hidden_scales, K);
+            if (!finishLaunch("cudaMoE_grouped_gate_up_runtime_hidden_quantize"))
+                return false;
+        }
+
+        constexpr int kTileN = 64;
+        dim3 grid((N + kTileN - 1) / kTileN, num_active);
+        dim3 block(kTileN);
+        const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
+
+#define LAUNCH_GROUPED_GATE_UP_RUNTIME(CB)                                                       \
+    grouped_native_vnni_gate_up_decode_runtime_kernel<CB><<<grid, block, 0, cuda_stream>>>(       \
+        d_hidden_int8, d_hidden_scales, runtime, d_expert_ids,                                    \
+        d_gate_outputs, d_up_outputs, num_active, N, K, num_experts)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_GATE_UP_RUNTIME(0); break;
+        case 4:  LAUNCH_GROUPED_GATE_UP_RUNTIME(4); break;
+        case 5:  LAUNCH_GROUPED_GATE_UP_RUNTIME(5); break;
+        case 6:  LAUNCH_GROUPED_GATE_UP_RUNTIME(6); break;
+        case 7:  LAUNCH_GROUPED_GATE_UP_RUNTIME(7); break;
+        case 8:  LAUNCH_GROUPED_GATE_UP_RUNTIME(8); break;
+        case 9:  LAUNCH_GROUPED_GATE_UP_RUNTIME(9); break;
+        case 10: LAUNCH_GROUPED_GATE_UP_RUNTIME(10); break;
+        case 11: LAUNCH_GROUPED_GATE_UP_RUNTIME(11); break;
+        case 12: LAUNCH_GROUPED_GATE_UP_RUNTIME(12); break;
+        case 13: LAUNCH_GROUPED_GATE_UP_RUNTIME(13); break;
+        case 14: LAUNCH_GROUPED_GATE_UP_RUNTIME(14); break;
+        case 15: LAUNCH_GROUPED_GATE_UP_RUNTIME(15); break;
+        case 16: LAUNCH_GROUPED_GATE_UP_RUNTIME(16); break;
+        case 17: LAUNCH_GROUPED_GATE_UP_RUNTIME(17); break;
+        case 19: LAUNCH_GROUPED_GATE_UP_RUNTIME(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_RUNTIME(kMixedCodebookSentinel); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_GATE_UP_RUNTIME
+
+        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime");
+    }
+
+    bool cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart(
+        const float *d_hidden,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        float *const *d_gate_outputs,
+        float *const *d_up_outputs,
+        int8_t *d_hidden_int8,
+        float *d_hidden_scales,
+        bool hidden_prequantized,
+        float *d_gate_partials,
+        float *d_up_partials,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream)
+    {
+        const bool valid_k_partitions = (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
+                                         k_partitions == 16 || k_partitions == 32);
+        if (!d_hidden || !d_runtime_layer || !d_expert_ids ||
+            !d_gate_outputs || !d_up_outputs || !d_hidden_int8 || !d_hidden_scales ||
+            !d_gate_partials || !d_up_partials ||
+            num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
+            (K % 32) != 0 || !valid_k_partitions)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        if (!hidden_prequantized)
+        {
+            const int blocks_per_row = K / 32;
+            grouped_hidden_quantize_blockwise_kernel<<<blocks_per_row, 32, 0, cuda_stream>>>(
+                d_hidden, d_hidden_int8, d_hidden_scales, K);
+            if (!finishLaunch("cudaMoE_grouped_gate_up_runtime_kpart_hidden_quantize"))
+                return false;
+        }
+
+        constexpr int kTileN = 64;
+        dim3 partial_grid((N + kTileN - 1) / kTileN, k_partitions, num_active);
+        dim3 block(kTileN);
+        const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
+
+#define LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(CB)                                                   \
+    grouped_native_vnni_gate_up_kpart_decode_runtime_kernel<CB><<<partial_grid, block, 0, cuda_stream>>>( \
+        d_hidden_int8, d_hidden_scales, runtime, d_expert_ids,                                      \
+        d_gate_partials, d_up_partials, num_active, N, K, num_experts, k_partitions)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(0); break;
+        case 4:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(4); break;
+        case 5:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(5); break;
+        case 6:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(6); break;
+        case 7:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(7); break;
+        case 8:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(8); break;
+        case 9:  LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(9); break;
+        case 10: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(10); break;
+        case 11: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(11); break;
+        case 12: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(12); break;
+        case 13: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(13); break;
+        case 14: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(14); break;
+        case 15: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(15); break;
+        case 16: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(16); break;
+        case 17: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(17); break;
+        case 19: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART(kMixedCodebookSentinel); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_GATE_UP_RUNTIME_KPART
+
+        if (!finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart partial"))
+            return false;
+
+        dim3 reduce_grid((N + kTileN - 1) / kTileN, num_active);
+        grouped_native_vnni_gate_up_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+            d_gate_partials, d_up_partials, d_expert_ids, d_gate_outputs, d_up_outputs,
+            num_active, N, k_partitions);
+
+        return finishLaunch("cudaMoE_grouped_gate_up_native_vnni_decode_runtime_kpart reduce");
     }
 
     bool cudaMoE_grouped_swiglu_down_native_vnni_decode_table(
@@ -3682,6 +8848,165 @@ extern "C"
             d_down_partials, d_output, N, k_partitions);
 
         return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart reduce");
+    }
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_output,
+        int num_active,
+        int N,
+        int K,
+        int num_experts,
+        uint8_t codebook_id,
+        int device_idx,
+        void *stream)
+    {
+        if (!d_gate_ptrs || !d_up_ptrs || !d_runtime_layer || !d_expert_ids || !d_weights ||
+            !d_swiglu_int8 || !d_swiglu_scales || !d_output ||
+            num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 || (K % 32) != 0)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, K);
+        if (!finishLaunch("cudaMoE_grouped_swiglu_runtime_quantize"))
+            return false;
+
+        constexpr int kTileN = 64;
+        dim3 grid((N + kTileN - 1) / kTileN);
+        dim3 block(kTileN);
+        const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
+
+#define LAUNCH_GROUPED_DOWN_RUNTIME(CB)                                                        \
+    grouped_native_vnni_down_decode_runtime_kernel<CB><<<grid, block, 0, cuda_stream>>>(       \
+        d_swiglu_int8, d_swiglu_scales, runtime, d_expert_ids, d_weights,                      \
+        d_output, num_active, N, K, num_experts)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_DOWN_RUNTIME(0); break;
+        case 4:  LAUNCH_GROUPED_DOWN_RUNTIME(4); break;
+        case 5:  LAUNCH_GROUPED_DOWN_RUNTIME(5); break;
+        case 6:  LAUNCH_GROUPED_DOWN_RUNTIME(6); break;
+        case 7:  LAUNCH_GROUPED_DOWN_RUNTIME(7); break;
+        case 8:  LAUNCH_GROUPED_DOWN_RUNTIME(8); break;
+        case 9:  LAUNCH_GROUPED_DOWN_RUNTIME(9); break;
+        case 10: LAUNCH_GROUPED_DOWN_RUNTIME(10); break;
+        case 11: LAUNCH_GROUPED_DOWN_RUNTIME(11); break;
+        case 12: LAUNCH_GROUPED_DOWN_RUNTIME(12); break;
+        case 13: LAUNCH_GROUPED_DOWN_RUNTIME(13); break;
+        case 14: LAUNCH_GROUPED_DOWN_RUNTIME(14); break;
+        case 15: LAUNCH_GROUPED_DOWN_RUNTIME(15); break;
+        case 16: LAUNCH_GROUPED_DOWN_RUNTIME(16); break;
+        case 17: LAUNCH_GROUPED_DOWN_RUNTIME(17); break;
+        case 19: LAUNCH_GROUPED_DOWN_RUNTIME(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_RUNTIME(kMixedCodebookSentinel); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_DOWN_RUNTIME
+
+        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime");
+    }
+
+    bool cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(
+        const float *const *d_gate_ptrs,
+        const float *const *d_up_ptrs,
+        const void *d_runtime_layer,
+        const int *d_expert_ids,
+        const float *d_weights,
+        int8_t *d_swiglu_int8,
+        float *d_swiglu_scales,
+        float *d_down_partials,
+        float *d_output,
+        int num_active,
+        int d_model,
+        int intermediate,
+        int num_experts,
+        uint8_t codebook_id,
+        int k_partitions,
+        int device_idx,
+        void *stream)
+    {
+        const bool valid_k_partitions =
+            (k_partitions == 2 || k_partitions == 4 || k_partitions == 8 ||
+             k_partitions == 16);
+        if (!d_gate_ptrs || !d_up_ptrs || !d_runtime_layer || !d_expert_ids || !d_weights ||
+            !d_swiglu_int8 || !d_swiglu_scales || !d_down_partials || !d_output ||
+            num_active <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 ||
+            (intermediate % 32) != 0 || !valid_k_partitions)
+        {
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart] invalid arguments\n");
+            return false;
+        }
+
+        cudaSetDevice(device_idx);
+        cudaStream_t cuda_stream = static_cast<cudaStream_t>(stream);
+        grouped_swiglu_quantize_blockwise_kernel<<<num_active, kThreads, 0, cuda_stream>>>(
+            d_gate_ptrs, d_up_ptrs, d_expert_ids, d_swiglu_int8, d_swiglu_scales, num_active, intermediate);
+        if (!finishLaunch("cudaMoE_grouped_swiglu_runtime_quantize"))
+            return false;
+
+        constexpr int kTileN = 64;
+        const int N = d_model;
+        const int K = intermediate;
+        dim3 scatter_grid((N + kTileN - 1) / kTileN, k_partitions);
+        dim3 reduce_grid((N + kTileN - 1) / kTileN);
+        dim3 block(kTileN);
+        const auto *runtime = static_cast<const DeviceMoELayerRuntimeView *>(d_runtime_layer);
+
+#define LAUNCH_GROUPED_DOWN_RUNTIME_KPART(CB)                                                   \
+    grouped_native_vnni_down_kpart_decode_runtime_kernel<CB><<<scatter_grid, block, 0, cuda_stream>>>( \
+        d_swiglu_int8, d_swiglu_scales, runtime, d_expert_ids, d_weights,                       \
+        d_down_partials, num_active, N, K, num_experts, k_partitions)
+
+        switch (codebook_id)
+        {
+        case 0:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(0); break;
+        case 4:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(4); break;
+        case 5:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(5); break;
+        case 6:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(6); break;
+        case 7:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(7); break;
+        case 8:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(8); break;
+        case 9:  LAUNCH_GROUPED_DOWN_RUNTIME_KPART(9); break;
+        case 10: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(10); break;
+        case 11: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(11); break;
+        case 12: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(12); break;
+        case 13: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(13); break;
+        case 14: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(14); break;
+        case 15: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(15); break;
+        case 16: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(16); break;
+        case 17: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(17); break;
+        case 19: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(19); break;
+        case kMixedCodebookSentinel: LAUNCH_GROUPED_DOWN_RUNTIME_KPART(kMixedCodebookSentinel); break;
+        default:
+            std::fprintf(stderr, "[cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart] unsupported codebook_id=%u\n",
+                         static_cast<unsigned>(codebook_id));
+            return false;
+        }
+
+#undef LAUNCH_GROUPED_DOWN_RUNTIME_KPART
+
+        if (!finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart scatter"))
+            return false;
+
+        grouped_native_vnni_down_kpart_reduce_kernel<<<reduce_grid, block, 0, cuda_stream>>>(
+            d_down_partials, d_output, N, k_partitions);
+
+        return finishLaunch("cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart reduce");
     }
 
     bool cudaMoE_grouped_prefill_pipeline(

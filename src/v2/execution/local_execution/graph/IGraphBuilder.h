@@ -27,6 +27,12 @@
 
 namespace llaminar2
 {
+    enum class DeviceMoERebalanceMaintenanceGraphKind
+    {
+        Plan,
+        Payload,
+    };
+
 
     // Forward declarations
     class TensorBase;
@@ -463,6 +469,26 @@ namespace llaminar2
             (void)seq_len;
             (void)batch_size;
             (void)device;
+            return {};
+        }
+
+        /**
+         * @brief Build a producer-only device-side MoE rebalance maintenance graph.
+         *
+         * Ordinary decode graphs should contain only cheap per-layer apply/poll
+         * stages once a backend-neutral runtime table is active. Homogeneous GPU
+         * MoE domains can run planning, allgather, and transfer-slot staging from
+         * a separate captured maintenance graph at rebalance-window boundaries.
+         * Non-MoE builders and unsupported placements return an empty graph.
+         */
+        virtual ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
+            DeviceId device,
+            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Plan,
+            uint64_t payload_edge_mask = 0)
+        {
+            (void)device;
+            (void)kind;
+            (void)payload_edge_mask;
             return {};
         }
 

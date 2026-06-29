@@ -227,7 +227,7 @@ namespace llaminar2::test::parity::qwen36
               old_down_kpart_decode_(mutableDebugEnv().gemm.cuda_moe_down_kpart_decode),
               old_prefill_fuse_swiglu_(mutableDebugEnv().gemm.cuda_moe_prefill_fuse_swiglu),
               old_prefill_tile_m_(mutableDebugEnv().gemm.cuda_moe_prefill_tile_m),
-              old_grouped_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+              old_grouped_prefill_(mutableDebugEnv().gpu_moe.grouped_prefill)
         {
             auto &gemm = mutableDebugEnv().gemm;
             const bool allow_split_k_decode = !gemm.deterministic;
@@ -235,7 +235,7 @@ namespace llaminar2::test::parity::qwen36
             gemm.cuda_moe_down_kpart_decode = allow_split_k_decode;
             gemm.cuda_moe_prefill_fuse_swiglu = true;
             gemm.cuda_moe_prefill_tile_m = 0;
-            mutableDebugEnv().rocm.moe_grouped_prefill = true;
+            mutableDebugEnv().gpu_moe.grouped_prefill = true;
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -246,7 +246,7 @@ namespace llaminar2::test::parity::qwen36
             gemm.cuda_moe_down_kpart_decode = old_down_kpart_decode_;
             gemm.cuda_moe_prefill_fuse_swiglu = old_prefill_fuse_swiglu_;
             gemm.cuda_moe_prefill_tile_m = old_prefill_tile_m_;
-            mutableDebugEnv().rocm.moe_grouped_prefill = old_grouped_prefill_;
+            mutableDebugEnv().gpu_moe.grouped_prefill = old_grouped_prefill_;
             llaminar::v2::kernels::KernelFactory::clearCache();
         }
 
@@ -269,6 +269,13 @@ namespace llaminar2::test::parity::qwen36
          * mode off even if the surrounding shell exports LLAMINAR_DETERMINISTIC.
          */
         return true;
+    }
+
+    inline bool applyHostMoERebalanceIfNeeded(IOrchestrationRunner &runner)
+    {
+        if (runner.usesDeviceSideMoERebalanceController())
+            return true;
+        return runner.maybeApplyMoERebalance();
     }
 
     inline ExpertComputeDomain localTPMoEDomain(
@@ -4501,7 +4508,7 @@ namespace llaminar2::test::parity::qwen36
                             step.tokens.end());
                     }
                     produced += static_cast<int>(step.tokens.size());
-                    if (!runner->maybeApplyMoERebalance())
+                    if (!applyHostMoERebalanceIfNeeded(*runner))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -4586,7 +4593,7 @@ namespace llaminar2::test::parity::qwen36
                     {
                         out_tokens->push_back(step.tokens.front());
                     }
-                    if (!runner->maybeApplyMoERebalance())
+                    if (!applyHostMoERebalanceIfNeeded(*runner))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -4949,7 +4956,7 @@ namespace llaminar2::test::parity::qwen36
                         step.tokens.end());
                 }
                 produced += static_cast<int>(step.tokens.size());
-                if (!runner->maybeApplyMoERebalance())
+                if (!applyHostMoERebalanceIfNeeded(*runner))
                 {
                     ADD_FAILURE() << runner->lastError();
                     return false;
@@ -5272,7 +5279,7 @@ namespace llaminar2::test::parity::qwen36
                     {
                         out_tokens->push_back(token);
                     }
-                    if (!runner->maybeApplyMoERebalance())
+                    if (!applyHostMoERebalanceIfNeeded(*runner))
                     {
                         ADD_FAILURE() << runner->lastError();
                         return false;
@@ -5382,7 +5389,7 @@ namespace llaminar2::test::parity::qwen36
             ASSERT_EQ(step.tokens.size(), 1u)
                 << "budget-limited MTP decode should emit exactly one token per step";
             tokens.push_back(step.tokens.front());
-            ASSERT_TRUE(runner->maybeApplyMoERebalance()) << runner->lastError();
+            ASSERT_TRUE(applyHostMoERebalanceIfNeeded(*runner)) << runner->lastError();
             if (step.is_complete)
                 break;
         }

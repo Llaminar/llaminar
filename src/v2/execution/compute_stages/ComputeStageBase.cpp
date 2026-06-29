@@ -86,6 +86,8 @@ namespace llaminar2
             return "MOE_LOCAL_EXPERT";
         case ComputeStageType::MOE_SPARSE_RETURN_REDUCE:
             return "MOE_SPARSE_RETURN_REDUCE";
+        case ComputeStageType::MOE_DEVICE_REBALANCE:
+            return "MOE_DEVICE_REBALANCE";
         case ComputeStageType::ALLREDUCE:
             return "ALLREDUCE";
         case ComputeStageType::ALLGATHER:

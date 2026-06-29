@@ -5,19 +5,24 @@
 
 #include <gtest/gtest.h>
 
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/MoEExpertDispatchStage.h"
 #include "execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "execution/compute_stages/stages/MoESparseDispatchStage.h"
 #include "execution/compute_stages/stages/MoESparseReturnReduceStage.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "loaders/ExpertGemmRegistry.h"
+#include "loaders/ModelContext.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
 #include "mocks/MockLocalTPContext.h"
+#include "tensors/TensorKernels.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +37,38 @@ namespace llaminar2::test
         constexpr int kTopK = 2;
         constexpr int kSeqLen = 3;
         constexpr int kBatchSize = 1;
+
+        class TestExpertGemm : public ITensorGemm
+        {
+        public:
+            explicit TestExpertGemm(int tag) : tag_(tag) {}
+
+            bool supports_device(int /*device_idx*/) const override { return true; }
+
+            bool multiply_tensor(
+                const TensorBase * /*A*/,
+                TensorBase * /*C*/,
+                int /*m*/,
+                int /*n*/,
+                int /*k*/,
+                bool /*transpose_B*/,
+                float /*alpha*/,
+                float /*beta*/,
+                const TensorBase * /*bias*/,
+                const IMPIContext * /*mpi_ctx*/,
+                int /*device_idx*/,
+                DeviceWorkspaceManager * /*workspace*/,
+                int /*activation_row_offset*/) override
+            {
+                return false;
+            }
+
+        private:
+            int tag_ = 0;
+        };
+
+        using ExpertRole = ExpertGemmRegistry::WeightRole;
+
         class TensorArena
         {
         public:
@@ -207,6 +244,60 @@ namespace llaminar2::test
             return layer;
         }
 
+        void registerDomainExpertEngine(
+            ExpertGemmRegistry &registry,
+            const std::string &domain_name,
+            DeviceId device,
+            int layer_idx,
+            int expert,
+            ExpertRole role,
+            int tag)
+        {
+            auto engine = std::make_shared<TestExpertGemm>(tag);
+            registry.registerEngineForDomain(
+                domain_name,
+                device,
+                layer_idx,
+                expert,
+                role,
+                engine.get(),
+                engine);
+        }
+
+        void registerCompleteDomainExpertLayer(
+            ExpertGemmRegistry &registry,
+            const std::string &domain_name,
+            DeviceId device,
+            int layer_idx)
+        {
+            for (int expert = 0; expert < kNumExperts; ++expert)
+            {
+                const int tag_base = 1000 * device.ordinal + 10 * expert;
+                registerDomainExpertEngine(
+                    registry, domain_name, device, layer_idx, expert, ExpertRole::GATE, tag_base + 1);
+                registerDomainExpertEngine(
+                    registry, domain_name, device, layer_idx, expert, ExpertRole::UP, tag_base + 2);
+                registerDomainExpertEngine(
+                    registry, domain_name, device, layer_idx, expert, ExpertRole::DOWN, tag_base + 3);
+            }
+        }
+
+        std::shared_ptr<ModelContext> makeTestingModelContextWithHotDomainExperts()
+        {
+            auto model_ctx = ModelContext::createForTesting(
+                "test.gguf",
+                nullptr,
+                1,
+                /*with_weight_manager=*/true);
+            if (!model_ctx || !model_ctx->concreteWeightManager())
+                throw std::runtime_error("ModelContext test WeightManager was not created");
+
+            auto &registry = model_ctx->concreteWeightManager()->expertGemmRegistry();
+            registerCompleteDomainExpertLayer(registry, "hot_domain", DeviceId::rocm(0), 0);
+            registerCompleteDomainExpertLayer(registry, "hot_domain", DeviceId::rocm(1), 0);
+            return model_ctx;
+        }
+
         ActivationBuffers makeActivationBuffers(TensorArena &arena)
         {
             ActivationBuffers buffers;
@@ -236,6 +327,18 @@ namespace llaminar2::test
                     ++count;
             }
             return count;
+        }
+
+        std::vector<std::string> stageNamesOfType(const ComputeGraph &graph, ComputeStageType type)
+        {
+            std::vector<std::string> names;
+            for (const auto &node_name : graph.getExecutionOrder())
+            {
+                const auto *node = graph.getNode(node_name);
+                if (node && node->stage->type() == type)
+                    names.push_back(node_name);
+            }
+            return names;
         }
 
         const MoESparseDispatchStage *firstSparseDispatchStage(const ComputeGraph &graph)
@@ -277,6 +380,14 @@ namespace llaminar2::test
                     stages.push_back(stage);
             }
             return stages;
+        }
+
+        const MoEExpertComputeStage *expertComputeStage(const ComputeGraph &graph, const std::string &node_name)
+        {
+            const auto *node = graph.getNode(node_name);
+            if (!node)
+                return nullptr;
+            return dynamic_cast<const MoEExpertComputeStage *>(node->stage.get());
         }
 
     } // namespace
@@ -338,7 +449,7 @@ namespace llaminar2::test
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPApportionedExpertsLowerOnlyGraphLocalGpuParticipant)
+         LocalTPApportionedExpertsGpuPrefillUsesCapturableFastPathByDefault)
     {
         GraphConfig config = makeConfig(makeLocalTPApportionedHotPlan());
         config.default_device = DeviceId::rocm(0);
@@ -353,23 +464,87 @@ namespace llaminar2::test
         TensorArena activation_arena;
         auto buffers = makeActivationBuffers(activation_arena);
 
-        Qwen35MoEGraph graph_builder(config, nullptr);
+        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
         ComputeGraph graph = graph_builder.buildFFNGraph(layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
 
-        const auto stages = localExpertStages(graph);
-        ASSERT_EQ(stages.size(), 1u);
-        const auto &params = stages.front()->params();
-        EXPECT_EQ(params.device_id, DeviceId::rocm(0));
-        EXPECT_EQ(params.runtime_participant_index, 0);
-        ASSERT_EQ(params.expert_mask.size(), static_cast<size_t>(kNumExperts));
-        EXPECT_EQ(params.expert_mask,
-                  (std::vector<bool>{true, true, true, false, false, false}));
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_EXPERT_DISPATCH), 0u)
+            << "Homogeneous LocalTP GPU prefill must not lower through the host dispatch descriptor path";
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_DISPATCH), 0u)
+            << "Homogeneous LocalTP GPU prefill must use the fixed-topology grouped prefill path";
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_SPARSE_RETURN_REDUCE), 0u);
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_LOCAL_EXPERT), 0u);
+        EXPECT_EQ(countStagesOfType(graph, ComputeStageType::MOE_EXPERT_FFN), 1u);
 
-        EXPECT_EQ(graph.getNode("layer0_moe_local_expert_tier0_hot_p1"), nullptr)
-            << "A per-device graph must not schedule another GPU participant's local expert kernel";
-        EXPECT_NE(graph.getNode("layer0_moe_sparse_return_reduce_tier0_hot_p0_allreduce"), nullptr)
+        const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(expert_node, nullptr);
+        EXPECT_EQ(expert_node->device, DeviceId::rocm(0));
+        const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(expert_node->stage.get());
+        ASSERT_NE(expert_stage, nullptr);
+        EXPECT_EQ(expert_stage->fixedTopologyPrefillExpertIdsForTesting(),
+                  (std::vector<int>{0, 1, 2}));
+        EXPECT_TRUE(expert_node->stage->supportsWarmupDependentGraphCapture())
+            << "Cold preflight must allow warmup to build MoE grouped-prefill capture resources";
+        EXPECT_TRUE(expert_node->stage->supportsLazyPrefillGraphCapturePreflight())
+            << "The fixed-topology grouped prefill path is the graph-capturable MoE dispatch contract";
+
+        EXPECT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
             << "Graph-local owner subsets must be rejoined through the continuation TP domain";
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
+    }
+
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPApportionedExpertAllreduceNameIsStableAcrossParticipants)
+    {
+        auto plan = makeLocalTPApportionedHotPlan();
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+
+        GraphConfig config0 = makeConfig(plan);
+        config0.default_device = DeviceId::rocm(0);
+        config0.tp_ctx = &tp_ctx;
+        config0.tp_device_idx = 0;
+
+        GraphConfig config1 = makeConfig(plan);
+        config1.default_device = DeviceId::rocm(1);
+        config1.tp_ctx = &tp_ctx;
+        config1.tp_device_idx = 1;
+
+        TensorArena weight_arena;
+        auto layer = makeLayerWeights(weight_arena);
+
+        TensorArena activation_arena0;
+        auto buffers0 = makeActivationBuffers(activation_arena0);
+        TensorArena activation_arena1;
+        auto buffers1 = makeActivationBuffers(activation_arena1);
+
+        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+
+        Qwen35MoEGraph graph_builder0(model_ctx, nullptr, config0);
+        ComputeGraph graph0 = graph_builder0.buildFFNGraph(
+            layer, buffers0, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+
+        Qwen35MoEGraph graph_builder1(model_ctx, nullptr, config1);
+        ComputeGraph graph1 = graph_builder1.buildFFNGraph(
+            layer, buffers1, 0, kSeqLen, kBatchSize, DeviceId::rocm(1));
+
+        const auto allreduces0 = stageNamesOfType(graph0, ComputeStageType::ALLREDUCE);
+        const auto allreduces1 = stageNamesOfType(graph1, ComputeStageType::ALLREDUCE);
+        ASSERT_EQ(allreduces0.size(), 1u);
+        ASSERT_EQ(allreduces1.size(), 1u);
+        EXPECT_EQ(allreduces0, allreduces1)
+            << "LocalTP grouped collectives require every participant graph to enter the same stage name";
+        EXPECT_EQ(allreduces0.front(), "layer0_moe_expert_overlay_fast_allreduce");
+
+        const auto *expert_stage0 = expertComputeStage(graph0, "layer0_moe_expert_ffn_overlay_fast");
+        const auto *expert_stage1 = expertComputeStage(graph1, "layer0_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(expert_stage0, nullptr);
+        ASSERT_NE(expert_stage1, nullptr);
+        EXPECT_EQ(expert_stage0->fixedTopologyPrefillExpertIdsForTesting(),
+                  (std::vector<int>{0, 1, 2}));
+        EXPECT_EQ(expert_stage1->fixedTopologyPrefillExpertIdsForTesting(),
+                  (std::vector<int>{3, 4, 5}));
     }
 
 } // namespace llaminar2::test

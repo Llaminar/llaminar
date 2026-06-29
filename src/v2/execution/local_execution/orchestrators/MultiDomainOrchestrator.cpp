@@ -156,7 +156,11 @@ namespace llaminar2
 
     int MultiDomainOrchestrator::get_position() const
     {
-        if (!initialized_ || !inner_runner_)
+        if (!initialized_)
+        {
+            return 0;
+        }
+        if (!inner_runner_)
         {
             return 0;
         }
@@ -171,7 +175,11 @@ namespace llaminar2
 
     const char *MultiDomainOrchestrator::architecture() const
     {
-        if (!initialized_ || !inner_runner_)
+        if (!initialized_)
+        {
+            return "unknown";
+        }
+        if (!inner_runner_)
         {
             return "unknown";
         }

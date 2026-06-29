@@ -23,6 +23,7 @@
 #include "ICollectiveBackend.h"
 #include "ITPContext.h"
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 #include <utility>
@@ -32,6 +33,57 @@ namespace llaminar2
 
     // Forward declarations
     class TensorBase;
+
+    /**
+     * @brief Operation semantics for compact LocalTP control sidebands.
+     *
+     * These are intentionally explicit instead of reusing an activation
+     * allreduce's type by convention. Rebalance histograms are additive and may
+     * use AllreduceSum. Command metadata is not additive and must use Allgather
+     * or Broadcast.
+     */
+    enum class LocalTPCollectiveSidebandKind
+    {
+        AllreduceSum,
+        Allgather,
+        Broadcast
+    };
+
+    inline const char *toString(LocalTPCollectiveSidebandKind kind)
+    {
+        switch (kind)
+        {
+        case LocalTPCollectiveSidebandKind::AllreduceSum:
+            return "AllreduceSum";
+        case LocalTPCollectiveSidebandKind::Allgather:
+            return "Allgather";
+        case LocalTPCollectiveSidebandKind::Broadcast:
+            return "Broadcast";
+        }
+        return "Unknown";
+    }
+
+    /**
+     * @brief One compact control sideband attached to a LocalTP collective stage.
+     *
+     * The buffers live on the participant identified by device_index in
+     * collectiveSidebandOnStream(). For AllreduceSum, recv_buffer is the mutable
+     * reduction buffer; send_buffer may be null for in-place reduction or point
+     * at a distinct device buffer for out-of-place implementations. For
+     * Allgather, send_buffer is the participant contribution and recv_buffer
+     * receives degree() contiguous slices. For Broadcast, root_device_index owns
+     * the source bytes and recv_buffer is overwritten on non-root participants.
+     */
+    struct LocalTPCollectiveSidebandBuffer
+    {
+        LocalTPCollectiveSidebandKind kind = LocalTPCollectiveSidebandKind::AllreduceSum;
+        const void *send_buffer = nullptr;
+        void *recv_buffer = nullptr;
+        size_t element_count = 0;
+        CollectiveDataType dtype = CollectiveDataType::INT32;
+        int root_device_index = 0;
+        std::string name;
+    };
 
     /**
      * @brief Interface for LOCAL tensor parallelism operations
@@ -193,6 +245,91 @@ namespace llaminar2
             (void)stage_name;
             return false;
         }
+
+        /**
+         * @brief Execute graph-visible grouped send/recv operations on one participant.
+         *
+         * This is the directed counterpart to allgatherRawOnStream() for
+         * payloads where only a subset of participant edges carries useful
+         * bytes. The caller supplies only operations involving device_index.
+         * Each operation must use a non-null explicit producer stream.
+         */
+        virtual bool groupedP2PRawOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name)
+        {
+            (void)ops;
+            (void)device_index;
+            (void)producer_stream;
+            (void)stage_name;
+            return false;
+        }
+
+        /**
+         * @brief Execute compact graph-visible control sidebands on an explicit stream.
+         *
+         * This lower-level ABI enqueues sidebands adjacent to an existing graph
+         * collective stage. Production MoE rebalance traffic should prefer
+         * allreduceWithSidebandsOnStream() so the anchor and sidebands enter one
+         * backend group. This method remains for diagnostics and unsupported
+         * fallback probes only. It must not use the legacy default stream or a
+         * host-synchronized fallback.
+         *
+         * @param sidebands Compact sideband collectives for this participant.
+         * @param device_index Participant index in devices().
+         * @param producer_stream Explicit stream that produced the sideband buffers.
+         * @param anchor_stage_name Existing collective stage these sidebands ride with.
+         * @return true on success, false when unsupported or failed.
+         */
+        virtual bool collectiveSidebandOnStream(
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name)
+        {
+            (void)sidebands;
+            (void)device_index;
+            (void)anchor_stage_name;
+            if (!producer_stream)
+                throw std::invalid_argument("ILocalTPContext::collectiveSidebandOnStream requires a non-null GPU stream");
+            return sidebands.empty();
+        }
+
+        /**
+         * @brief Execute an anchor allreduce and compact control sidebands as
+         *        one grouped backend launch on an explicit stream.
+         *
+         * Production MoE rebalance traffic uses this path for homogeneous
+         * NCCL/RCCL domains. The allreduce and sidebands are lowered together,
+         * allowing the backend to enqueue them inside the same group region
+         * instead of issuing separate rebalance-specific collectives.
+         */
+        virtual bool allreduceWithSidebandsOnStream(
+            TensorBase *tensor,
+            const std::string &stage_name,
+            size_t count,
+            void *producer_stream,
+            const std::string &precision,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index)
+        {
+            (void)tensor;
+            (void)stage_name;
+            (void)count;
+            (void)precision;
+            (void)sidebands;
+            (void)device_index;
+            if (!producer_stream)
+                throw std::invalid_argument("ILocalTPContext::allreduceWithSidebandsOnStream requires a non-null GPU stream");
+            return false;
+        }
+
+        /**
+         * @brief True when collectiveSidebandOnStream can be captured into a GPU graph.
+         */
+        virtual bool supportsCollectiveSidebandOnStreamGraphCapture() const { return false; }
 
         /**
          * @brief True when raw all-gather handoffs can be captured into a GPU graph.

@@ -582,13 +582,14 @@ namespace llaminar2
 
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                const auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
-                if (state->conv_kernel)
-                    metadata.device_bytes += state->conv_kernel->stateBytes();
-                if (state->rec_kernel)
-                    metadata.device_bytes += state->rec_kernel->stateBytes();
+                const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
+                if (state.conv_kernel)
+                    metadata.device_bytes += state.conv_kernel->stateBytes();
+                if (state.rec_kernel)
+                    metadata.device_bytes += state.rec_kernel->stateBytes();
             }
             metadata.has_device_kernel_state = metadata.device_bytes > 0;
             return metadata;
@@ -606,12 +607,13 @@ namespace llaminar2
             size_t host_offset = 0;
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                const auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
+                const auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                const size_t recurrence_bytes = state.recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
                 if (include_host_state && recurrence_bytes > 0)
                 {
                     if (!host_base)
@@ -619,7 +621,7 @@ namespace llaminar2
                     host_spans.push_back(
                         HostStateCopySpan{
                             host_base + host_offset,
-                            reinterpret_cast<const uint8_t *>(state->recurrence_state.data()),
+                            reinterpret_cast<const uint8_t *>(state.recurrence_state.data()),
                             recurrence_bytes});
                     host_offset += recurrence_bytes;
                 }
@@ -630,27 +632,27 @@ namespace llaminar2
                     host_spans.push_back(
                         HostStateCopySpan{
                             host_base + host_offset,
-                            reinterpret_cast<const uint8_t *>(state->conv_state.data()),
+                            reinterpret_cast<const uint8_t *>(state.conv_state.data()),
                             conv_bytes});
                     host_offset += conv_bytes;
                 }
 
-                if (include_device_state && state->conv_kernel)
+                if (include_device_state && state.conv_kernel)
                 {
-                    const size_t bytes = state->conv_kernel->stateBytes();
+                    const size_t bytes = state.conv_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->conv_kernel->exportState(nullptr, device_cursor, stream))
+                        if (!state.conv_kernel->exportState(nullptr, device_cursor, stream))
                             return false;
                         device_cursor += bytes;
                     }
                 }
-                if (include_device_state && state->rec_kernel)
+                if (include_device_state && state.rec_kernel)
                 {
-                    const size_t bytes = state->rec_kernel->stateBytes();
+                    const size_t bytes = state.rec_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->rec_kernel->exportState(nullptr, device_cursor, stream))
+                        if (!state.rec_kernel->exportState(nullptr, device_cursor, stream))
                             return false;
                         device_cursor += bytes;
                     }
@@ -677,19 +679,20 @@ namespace llaminar2
             size_t host_offset = 0;
             for (int layer = 0; layer < total_layers_; ++layer)
             {
-                auto *state = getGDNState(layer);
-                if (!state)
+                const int gdn_idx = layer_map_.toGDNIndex(layer);
+                if (gdn_idx < 0)
                     continue;
+                auto &state = gdn_states_[static_cast<size_t>(gdn_idx)];
 
-                const size_t recurrence_bytes = state->recurrence_state.size() * sizeof(float);
-                const size_t conv_bytes = state->conv_state.size() * sizeof(float);
+                const size_t recurrence_bytes = state.recurrence_state.size() * sizeof(float);
+                const size_t conv_bytes = state.conv_state.size() * sizeof(float);
                 if (include_host_state && recurrence_bytes > 0)
                 {
                     if (!host_base)
                         return false;
                     host_spans.push_back(
                         HostStateCopySpan{
-                            reinterpret_cast<uint8_t *>(state->recurrence_state.data()),
+                            reinterpret_cast<uint8_t *>(state.recurrence_state.data()),
                             host_base + host_offset,
                             recurrence_bytes});
                     host_offset += recurrence_bytes;
@@ -700,28 +703,28 @@ namespace llaminar2
                         return false;
                     host_spans.push_back(
                         HostStateCopySpan{
-                            reinterpret_cast<uint8_t *>(state->conv_state.data()),
+                            reinterpret_cast<uint8_t *>(state.conv_state.data()),
                             host_base + host_offset,
                             conv_bytes});
                     host_offset += conv_bytes;
                 }
 
-                if (include_device_state && state->conv_kernel)
+                if (include_device_state && state.conv_kernel)
                 {
-                    const size_t bytes = state->conv_kernel->stateBytes();
+                    const size_t bytes = state.conv_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->conv_kernel->importState(nullptr, device_cursor, stream))
+                        if (!state.conv_kernel->importState(nullptr, device_cursor, stream))
                             return false;
                         device_cursor += bytes;
                     }
                 }
-                if (include_device_state && state->rec_kernel)
+                if (include_device_state && state.rec_kernel)
                 {
-                    const size_t bytes = state->rec_kernel->stateBytes();
+                    const size_t bytes = state.rec_kernel->stateBytes();
                     if (bytes > 0)
                     {
-                        if (!state->rec_kernel->importState(nullptr, device_cursor, stream))
+                        if (!state.rec_kernel->importState(nullptr, device_cursor, stream))
                             return false;
                         device_cursor += bytes;
                     }

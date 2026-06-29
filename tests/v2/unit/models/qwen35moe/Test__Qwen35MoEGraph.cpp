@@ -22,6 +22,7 @@
 #include <fstream>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace llaminar2;
@@ -189,7 +190,7 @@ namespace
         return plan;
     }
 
-    std::shared_ptr<MoEExpertParallelPlan> makeLocalTPReplicatedOverlayPlan(const std::string &domain_name)
+    std::shared_ptr<MoEExpertParallelPlan> makeLocalTPApportionedOverlayPlan(const std::string &domain_name)
     {
         auto plan = std::make_shared<MoEExpertParallelPlan>();
         plan->enabled = true;
@@ -754,14 +755,14 @@ TEST(Test__Qwen35MoEGraph, ExpertParallelRoutedExpertOutputAllreducesUnderTP)
     EXPECT_TRUE(hasDependency(graph, "layer0_moe_combine", "layer0_moe_expert_allreduce"));
 }
 
-TEST(Test__Qwen35MoEGraph, LocalTPReplicatedOverlayCombinesMoEBranchesBeforeAllreduce)
+TEST(Test__Qwen35MoEGraph, LocalTPApportionedOverlayCombinesMoEBranchesBeforeAllreduce)
 {
     auto tp_ctx = std::make_unique<MockLocalTPContext>();
     tp_ctx->setDevices({GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)});
     tp_ctx->setBackend(CollectiveBackendType::HOST);
 
     GraphConfig config = makeMoEConfig(tp_ctx.get());
-    config.moe.expert_parallel_plan = makeLocalTPReplicatedOverlayPlan("hot_localtp");
+    config.moe.expert_parallel_plan = makeLocalTPApportionedOverlayPlan("hot_localtp");
     config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
         config.moe.expert_parallel_plan,
         MoEExpertOverlayRuntimeResolverOptions{
@@ -786,7 +787,7 @@ TEST(Test__Qwen35MoEGraph, LocalTPReplicatedOverlayCombinesMoEBranchesBeforeAllr
     ASSERT_NE(graph.getNode("layer0_moe_combined_allreduce"), nullptr);
 
     EXPECT_EQ(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
-        << "LocalTP replicated experts can reduce the routed+shared combined partial once";
+        << "LocalTP apportioned experts can reduce the routed+shared combined partial once";
     EXPECT_EQ(graph.getNode("layer0_shared_expert_allreduce"), nullptr)
         << "Shared expert partial should be gated and combined locally before the TP allreduce";
     EXPECT_EQ(graph.getNode("layer0_moe_combine"), nullptr)
@@ -837,7 +838,7 @@ TEST(Test__Qwen35MoEGraph, DenseTPDisabledKeepsExpertParticipantAllreduceOnly)
     {
         GraphConfig moe_config = makeMoEConfig(tp_ctx.get());
         moe_config.dense_tp_enabled = false;
-        moe_config.moe.expert_parallel_plan = makeLocalTPReplicatedOverlayPlan("hot_localtp");
+        moe_config.moe.expert_parallel_plan = makeLocalTPApportionedOverlayPlan("hot_localtp");
         moe_config.moe.expert_overlay_runtime_plan = resolveMoEExpertOverlayRuntimePlan(
             moe_config.moe.expert_parallel_plan,
             MoEExpertOverlayRuntimeResolverOptions{
@@ -1755,10 +1756,15 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
     ASSERT_NE(decode_call_end, std::string::npos);
     const std::string decode_call_text =
         source.substr(decode_call, decode_call_end - decode_call);
-    EXPECT_NE(decode_call_text.find("register_runtime_histogram"), std::string::npos)
-        << "Decode runtime tables are the only runtime-table decode histogram producers";
+    EXPECT_NE(decode_call_text.find("register_runtime_histogram_for_decode"), std::string::npos)
+        << "Decode runtime tables should register host histogram sync only when host maintenance owns rebalance";
     EXPECT_EQ(decode_call_text.find("register_decode_histogram=*/false"), std::string::npos);
-
+    EXPECT_NE(source.find("device_side_graph_rebalance_candidate"), std::string::npos)
+        << "Device-side graph rebalance must not register host histogram sync callbacks";
+    EXPECT_NE(source.find("!device_side_graph_rebalance_candidate"), std::string::npos);
+    EXPECT_NE(source.find("env.moe_rebalance.device_rebalance_graph_controller &&"),
+              std::string::npos)
+        << "Host-window rebalance should keep decode histogram registration unless the graph-native controller is enabled.";
     const size_t prefill_call = source.find("moeRuntimeTableForDevice(", prefill_branch);
     ASSERT_NE(prefill_call, std::string::npos);
     const size_t prefill_call_end = source.find(");", prefill_call);
@@ -1767,4 +1773,165 @@ TEST(Test__Qwen35MoEGraph, RuntimeHistogramRegistrationIsDecodeOnly)
         source.substr(prefill_call, prefill_call_end - prefill_call);
     EXPECT_NE(prefill_call_text.find("/*register_decode_histogram=*/false"), std::string::npos)
         << "Prefill runtime tables must not register stale decode histogram sync callbacks";
+}
+
+TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceApplyPiggybacksOnRouting)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+    std::string routing_stage_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string graph_suffix = "models/qwen35moe/Qwen35MoEGraph.cpp";
+    const size_t graph_suffix_pos = routing_stage_path.find(graph_suffix);
+    ASSERT_NE(graph_suffix_pos, std::string::npos);
+    routing_stage_path.replace(
+        graph_suffix_pos,
+        graph_suffix.size(),
+        "execution/compute_stages/stages/MoERoutingStage.cpp");
+    std::ifstream routing_in(routing_stage_path);
+    ASSERT_TRUE(routing_in.is_open()) << "Unable to open " << routing_stage_path;
+    const std::string routing_source(
+        (std::istreambuf_iterator<char>(routing_in)),
+        std::istreambuf_iterator<char>());
+
+    EXPECT_NE(source.find("graph.addDependency(plan_node, prefix + \"ffn_norm\")"),
+              std::string::npos)
+        << "The graph-captured rebalance producer must run after ffn_norm and before layer-local apply.";
+    EXPECT_EQ(source.find("graph.addDependency(prefix + \"ffn_norm\", plan_node)"),
+              std::string::npos)
+        << "Reversing this edge makes ffn_norm depend on the rebalance producer and breaks captured dataflow.";
+    EXPECT_NE(source.find("route_params.device_rebalance_route_apply = true"),
+              std::string::npos)
+        << "Maintenance-graph mode should apply ready waves inside the route kernel, not through a standalone apply stage.";
+    EXPECT_NE(routing_source.find("decodeRouteSelectWithReadyRebalanceApply"),
+              std::string::npos)
+        << "The routing stage must call the fused route/apply kernel entrypoint.";
+    EXPECT_NE(source.find("MoE routing ready-wave apply piggyback"),
+              std::string::npos)
+        << "The graph builder should create the rebalance binding before the first routing node.";
+    EXPECT_NE(source.find("graph.addDependency(graph_rebalance_apply_node, prefix + \"ffn_norm\")"),
+              std::string::npos)
+        << "The opt-in standalone apply fallback should still run after ffn_norm.";
+    EXPECT_EQ(source.find("graph.addDependency(graph_rebalance_apply_node, prefix + \"moe_routing\")"),
+              std::string::npos)
+        << "Apply-after-routing makes hot-cache dispatch invisible until a later token.";
+
+    auto readSource = [](const std::string &path)
+    {
+        std::ifstream source_in(path);
+        EXPECT_TRUE(source_in.is_open()) << "Unable to open " << path;
+        return std::string(
+            (std::istreambuf_iterator<char>(source_in)),
+            std::istreambuf_iterator<char>());
+    };
+    auto expectNoImmediateRouteApplyBarrier =
+        [](const std::string &kernel_source, const std::string &path)
+    {
+        const std::string marker = "try_apply_ready_rebalance_wave_for_layer_thread0(";
+        size_t pos = 0;
+        while ((pos = kernel_source.find(marker, pos)) != std::string::npos)
+        {
+            const bool call_site =
+                pos > 0 &&
+                (kernel_source[pos - 1] == ' ' || kernel_source[pos - 1] == '\t');
+            const size_t close = kernel_source.find(");", pos);
+            ASSERT_NE(close, std::string::npos) << "Malformed route-apply call in " << path;
+            const size_t next = kernel_source.find_first_not_of(" \t\r\n", close + 2);
+            ASSERT_NE(next, std::string::npos) << "Unexpected EOF after route-apply call in " << path;
+            if (call_site)
+            {
+                EXPECT_NE(kernel_source.compare(next, std::string("__syncthreads();").size(), "__syncthreads();"), 0)
+                    << "Ready-wave route piggyback must not pay an unconditional no-op block barrier in "
+                    << path;
+            }
+            pos = close + 2;
+        }
+    };
+    std::string cuda_kernel_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    cuda_kernel_path.replace(
+        graph_suffix_pos,
+        graph_suffix.size(),
+        "kernels/cuda/moe/CUDAMoEKernels.cu");
+    std::string rocm_kernel_path = LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    rocm_kernel_path.replace(
+        graph_suffix_pos,
+        graph_suffix.size(),
+        "kernels/rocm/moe/ROCmMoEKernels.hip");
+    expectNoImmediateRouteApplyBarrier(readSource(cuda_kernel_path), cuda_kernel_path);
+    expectNoImmediateRouteApplyBarrier(readSource(rocm_kernel_path), rocm_kernel_path);
+}
+
+TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceRejectsFixedPayloadArenas)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t selector = source.find("selectGraphRebalanceTransferMode");
+    ASSERT_NE(selector, std::string::npos);
+    const size_t payload_gate =
+        source.find("device_rebalance_payload_sideband", selector);
+    ASSERT_NE(payload_gate, std::string::npos)
+        << "Bulk payload sideband requests must be rejected explicitly.";
+    const size_t legacy_gate =
+        source.find("allow_legacy_collective_rebalance_transfer", payload_gate);
+    ASSERT_NE(legacy_gate, std::string::npos)
+        << "Legacy fixed payload allgather requests must be rejected explicitly.";
+    EXPECT_NE(source.find("fixed-size collective payload arenas move empty expert slots",
+                          payload_gate),
+              std::string::npos)
+        << "Measured fixed-arena transfer moved mostly empty slots; selector must fail closed.";
+    EXPECT_NE(source.find("Use CompactTransferSlots async maintenance for non-empty transfer-slot arrivals",
+                          payload_gate),
+              std::string::npos)
+        << "The production path should use compact non-empty transfer slots.";
+    EXPECT_NE(source.find("deviceMoERebalanceModeMovesFixedPayloadCapacity"),
+              std::string::npos)
+        << "Graph code should use the shared fixed-capacity transfer classifier instead of duplicating enum semantics.";
+    const size_t selector_end =
+        source.find("int gpuOrdinalForGraphDevice", selector);
+    ASSERT_NE(selector_end, std::string::npos);
+    const std::string selector_body =
+        source.substr(selector, selector_end - selector);
+    EXPECT_EQ(selector_body.find("DeviceMoERebalanceTransferMode::CollectiveSidebandPayload"),
+              std::string::npos)
+        << "The graph transfer selector must not choose fixed-size payload arenas.";
+    EXPECT_EQ(selector_body.find("DeviceMoERebalanceTransferMode::LegacyCollectiveAllGather"),
+              std::string::npos)
+        << "The graph transfer selector must not choose legacy fixed-size payload allgather.";
+    EXPECT_NE(selector_body.find("DeviceMoERebalanceTransferMode::CompactTransferSlots"),
+              std::string::npos)
+        << "The graph transfer selector should choose compact transfer slots for same-backend maintenance.";
+}
+
+TEST(Test__Qwen35MoEGraph, DeviceSideRebalanceMaintenanceSkipsDecodeHistogramSideband)
+{
+    std::ifstream in(LLAMINAR_QWEN35_MOE_GRAPH_SOURCE);
+    ASSERT_TRUE(in.is_open()) << "Unable to open " << LLAMINAR_QWEN35_MOE_GRAPH_SOURCE;
+    const std::string source(
+        (std::istreambuf_iterator<char>(in)),
+        std::istreambuf_iterator<char>());
+
+    const size_t producer_mode =
+        source.find("const bool producer_runs_in_maintenance_graph");
+    ASSERT_NE(producer_mode, std::string::npos);
+    const size_t sideband_gate =
+        source.find("const bool producer_can_use_collective_sideband", producer_mode);
+    ASSERT_NE(sideband_gate, std::string::npos);
+    const size_t sideband_backend =
+        source.find("supportsCollectiveSidebandOnStreamGraphCapture", sideband_gate);
+    ASSERT_NE(sideband_backend, std::string::npos);
+    const std::string gate_body =
+        source.substr(sideband_gate, sideband_backend - sideband_gate);
+
+    EXPECT_NE(gate_body.find("!producer_runs_in_maintenance_graph"),
+              std::string::npos)
+        << "Async maintenance must not also attach histogram sidebands to decode collectives.";
+    EXPECT_NE(gate_body.find("DeviceMoERebalanceTransferMode::CollectiveSidebandPayload"),
+              std::string::npos)
+        << "Decode-side histogram sidebands may exist only behind the now-refused fixed-payload mode.";
 }

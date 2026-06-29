@@ -27,8 +27,11 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <vector>
+
+#include "../../../utils/Logger.h"
 
 namespace llaminar2
 {
@@ -210,10 +213,34 @@ namespace llaminar2
                         }
                     }
                 }
+                catch (const std::exception &e)
+                {
+                    result.success = false;
+                    result.exception = std::current_exception();
+                    LOG_ERROR("[TPWorkerPool] Worker " << index
+                                                       << " threw exception before collective abort: "
+                                                       << e.what());
+                    // Record first failure
+                    size_t expected = SIZE_MAX;
+                    if (first_failure_index_.compare_exchange_strong(
+                            expected, index, std::memory_order_acq_rel))
+                    {
+                        // First failure — invoke abort callback to unblock stuck workers
+                        std::function<void()> cb;
+                        {
+                            std::lock_guard<std::mutex> lock(mutex_);
+                            cb = failure_callback_;
+                        }
+                        if (cb)
+                            cb();
+                    }
+                }
                 catch (...)
                 {
                     result.success = false;
                     result.exception = std::current_exception();
+                    LOG_ERROR("[TPWorkerPool] Worker " << index
+                                                       << " threw non-std exception before collective abort");
                     // Record first failure
                     size_t expected = SIZE_MAX;
                     if (first_failure_index_.compare_exchange_strong(

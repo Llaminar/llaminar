@@ -112,7 +112,26 @@ namespace llaminar2
             int device_index,
             void *producer_stream,
             const std::string &stage_name) override;
+        bool groupedP2PRawOnStream(
+            const std::vector<CollectiveP2POp> &ops,
+            int device_index,
+            void *producer_stream,
+            const std::string &stage_name) override;
         bool supportsRawAllgatherOnStreamGraphCapture() const override;
+        bool collectiveSidebandOnStream(
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index,
+            void *producer_stream,
+            const std::string &anchor_stage_name) override;
+        bool allreduceWithSidebandsOnStream(
+            TensorBase *tensor,
+            const std::string &stage_name,
+            size_t count,
+            void *producer_stream,
+            const std::string &precision,
+            const std::vector<LocalTPCollectiveSidebandBuffer> &sidebands,
+            int device_index) override;
+        bool supportsCollectiveSidebandOnStreamGraphCapture() const override;
 
         void setBackendForTesting(
             std::unique_ptr<ICollectiveBackend> backend,
@@ -383,6 +402,10 @@ namespace llaminar2
         std::vector<void *> grouped_onstream_allreduce_buffers_;
         std::vector<void *> grouped_onstream_allreduce_streams_;
         std::vector<bool> grouped_onstream_allreduce_seen_;
+        bool grouped_onstream_allreduce_graph_capture_active_{false};
+        size_t grouped_onstream_allreduce_sideband_count_{0};
+        std::vector<LocalTPCollectiveSidebandBuffer> grouped_onstream_allreduce_reference_sidebands_;
+        std::vector<std::vector<LocalTPCollectiveSidebandBuffer>> grouped_onstream_allreduce_sidebands_;
 
         // =====================================================================
         // FP16 Mixed-Precision Allreduce Scratch Buffers
@@ -500,7 +523,8 @@ namespace llaminar2
                                                int device_index,
                                                void *stream,
                                                const std::string &stage_name,
-                                               const std::string &precision);
+                                               const std::string &precision,
+                                               const std::vector<LocalTPCollectiveSidebandBuffer> *sidebands = nullptr);
 
         bool trySmallGpuAllreduceOnStream(void *buffer,
                                           size_t count,
@@ -641,7 +665,7 @@ namespace llaminar2
          * @param reason_out Optional pointer receiving human-readable reason.
          * @return true when policy permits LocalTP collective execution.
          */
-        bool isLocalTPNCCLGraphPolicySupported(std::string *reason_out = nullptr) const;
+        bool isLocalTPGpuGraphPolicySupported(std::string *reason_out = nullptr) const;
     };
 
 } // namespace llaminar2

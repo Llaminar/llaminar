@@ -27,10 +27,10 @@
 #include "../config/TensorParallelConfig.h"
 #include "../config/TPDomain.h"
 #include "../loaders/WeightPlan.h"
+#include "../utils/DebugEnv.h"
 #include "../utils/ToolCallTypes.h"
 #include <algorithm>
 #include <cctype>
-#include <cstdlib>
 #include <functional>
 #include <exception>
 #include <map>
@@ -348,10 +348,11 @@ namespace llaminar2
          */
         std::string getAllreducePrecisionForLayer(int layer_idx) const
         {
-            if (const char *forced = std::getenv("LLAMINAR_ALLREDUCE_PRECISION");
-                forced && forced[0] != '\0')
+            const auto &env = debugEnv();
+            if (env.presence.has("LLAMINAR_ALLREDUCE_PRECISION") &&
+                !env.allreduce_precision.empty())
             {
-                auto normalized = normalizeAllreducePrecisionOverride(forced);
+                auto normalized = normalizeAllreducePrecisionOverride(env.allreduce_precision);
                 if (!normalized.empty())
                     return normalized;
             }
@@ -481,6 +482,15 @@ namespace llaminar2
             /// Set by the orchestrator when MoE rebalancing is enabled.
             /// Lifetime managed by MoERebalanceController. Not owned.
             DecodeExpertHistogram *decode_histogram = nullptr;
+
+            /// Layer index that should advance the decode histogram token window.
+            ///
+            /// Some MoE models have non-routed tail layers. The histogram
+            /// allocates by transformer layer index, but the token window must
+            /// advance at the final routed MoE layer, not necessarily
+            /// n_layers - 1. A negative value preserves the legacy final-layer
+            /// default for models that do not specify this explicitly.
+            int decode_histogram_token_boundary_layer = -1;
 
             /// MoE rebalancing mode (OFF / OBSERVE / DYNAMIC).
             /// Set by InferenceRunnerFactory from MoERebalanceController.

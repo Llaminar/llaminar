@@ -324,8 +324,9 @@ namespace llaminar2
 
     bool QwenGraphBase::denseDecodeReplicatedActiveForTokens(int total_tokens) const
     {
-        const int max_decode_like_rows =
-            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
+        const int max_decode_like_rows = config_.mtp.enabled
+            ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+            : 1;
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_replicated &&
                total_tokens > 0 &&
@@ -335,8 +336,9 @@ namespace llaminar2
 
     bool QwenGraphBase::denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const
     {
-        const int max_decode_like_rows =
-            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
+        const int max_decode_like_rows = config_.mtp.enabled
+            ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+            : 1;
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_mirrored_embedding &&
                total_tokens > 0 &&
@@ -346,8 +348,9 @@ namespace llaminar2
 
     bool QwenGraphBase::replicatedAttentionStateActiveForTokens(int total_tokens) const
     {
-        const int max_decode_like_rows =
-            std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp));
+        const int max_decode_like_rows = config_.mtp.enabled
+            ? std::max(1, resolveMTPMaxTargetQueryRows(config_.mtp))
+            : 1;
         return config_.dense_tp_enabled &&
                config_.dense_tp_decode_replicated &&
                total_tokens > 0 &&
@@ -2756,7 +2759,8 @@ namespace llaminar2
         int layer_idx,
         bool is_attention,
         const std::string &stage_name,
-        std::optional<BufferId> tensor_buffer_id) const
+        std::optional<BufferId> tensor_buffer_id,
+        std::vector<TPAllreduceSidebandWorkspaceBinding> sideband_workspace_bindings) const
     {
         // Unified path: use polymorphic ITPContext for both LOCAL and GLOBAL TP
         if (config_.tp_ctx && config_.tp_ctx->degree() > 1)
@@ -2777,6 +2781,8 @@ namespace llaminar2
             params.stage_name = stage_name;
             params.precision = config_.getAllreducePrecisionForLayer(layer_idx);
             params.tensor_buffer_id = tensor_buffer_id;
+            params.sideband_device_index = config_.tp_device_idx;
+            params.sideband_workspace_bindings = std::move(sideband_workspace_bindings);
 
             return std::make_unique<TPAllreduceStage>(params);
         }

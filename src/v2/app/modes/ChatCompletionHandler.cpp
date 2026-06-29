@@ -344,6 +344,15 @@ namespace llaminar2
                 LOG_INFO("[ChatCompletion] MTP summary (" << mode << "): " << mtp.str());
             }
         }
+
+        bool runChatMoERebalanceMaintenance(IOrchestrationRunner &runner,
+                                            bool device_side_moe_rebalance)
+        {
+            if (device_side_moe_rebalance)
+                return true;
+
+            return runner.maybeApplyMoERebalance();
+        }
     }
 
     // =========================================================================
@@ -944,6 +953,9 @@ namespace llaminar2
         };
 
         bool stop_generation = false;
+        bool last_decode_window_had_moe_maintenance = true;
+        const bool device_side_moe_rebalance =
+            runner_.usesDeviceSideMoERebalanceController();
         while (completion_tokens < effective_max_tokens && !stop_generation)
         {
             std::vector<int32_t> step_tokens;
@@ -975,6 +987,7 @@ namespace llaminar2
                 }
                 step_tokens = result.tokens;
                 step_complete = result.is_complete;
+                last_decode_window_had_moe_maintenance = false;
                 if (stop_thinking_idx >= static_cast<int>(stop_thinking_tokens.size()))
                     injecting_stop_thinking = false;
             }
@@ -1004,12 +1017,14 @@ namespace llaminar2
 
                 if (result.tokens.empty())
                 {
+                    last_decode_window_had_moe_maintenance = false;
                     finish_reason = "stop";
                     break;
                 }
 
                 step_tokens = result.tokens;
                 step_complete = result.is_complete;
+                last_decode_window_had_moe_maintenance = false;
             }
 
             for (size_t token_idx = 0;
@@ -1071,8 +1086,19 @@ namespace llaminar2
                 }
             }
 
-            if (!stop_generation && !runner_.maybeApplyMoERebalance())
+            if (!stop_generation)
+            {
+                if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
+                    return rebalance_error();
+                last_decode_window_had_moe_maintenance = true;
+            }
+        }
+
+        if (!last_decode_window_had_moe_maintenance)
+        {
+            if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
                 return rebalance_error();
+            last_decode_window_had_moe_maintenance = true;
         }
 
         runner_.flushStageTimeline();
@@ -1288,6 +1314,9 @@ namespace llaminar2
         };
 
         bool stop_generation = false;
+        bool last_decode_window_had_moe_maintenance = true;
+        const bool device_side_moe_rebalance =
+            runner_.usesDeviceSideMoERebalanceController();
         while (completion_tokens < effective_max_tokens && !stop_generation)
         {
             std::vector<int32_t> step_tokens;
@@ -1323,6 +1352,7 @@ namespace llaminar2
                 }
                 step_tokens = result.tokens;
                 step_complete = result.is_complete;
+                last_decode_window_had_moe_maintenance = false;
                 if (stop_thinking_idx >= static_cast<int>(stop_thinking_tokens.size()))
                     injecting_stop_thinking = false;
             }
@@ -1356,12 +1386,14 @@ namespace llaminar2
 
                 if (result.tokens.empty())
                 {
+                    last_decode_window_had_moe_maintenance = false;
                     finish_reason = "stop";
                     break;
                 }
 
                 step_tokens = result.tokens;
                 step_complete = result.is_complete;
+                last_decode_window_had_moe_maintenance = false;
             }
 
             bool rebalance_applied = false;
@@ -1384,9 +1416,10 @@ namespace llaminar2
 
                 if (!rebalance_applied)
                 {
-                    if (!runner_.maybeApplyMoERebalance())
+                    if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
                         return emit_rebalance_error();
                     rebalance_applied = true;
+                    last_decode_window_had_moe_maintenance = true;
                 }
 
                 std::string token_text = tokenizer_.decode_token(next_token);
@@ -1476,6 +1509,13 @@ namespace llaminar2
                     }
                 }
             }
+        }
+
+        if (!last_decode_window_had_moe_maintenance)
+        {
+            if (!runChatMoERebalanceMaintenance(runner_, device_side_moe_rebalance))
+                return emit_rebalance_error();
+            last_decode_window_had_moe_maintenance = true;
         }
 
         // Flush any remaining buffered thinking content

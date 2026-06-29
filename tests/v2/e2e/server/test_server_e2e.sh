@@ -99,6 +99,9 @@
 #                       NodeLocal CPU-cold ExpertOverlay suites. These are
 #                       intentionally off until production participant graphs
 #                       run matched MPI sparse dispatch/expert/return stages.
+#   LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE Enable CUDA2/ROCm2 Qwen3.6
+#                       MoE prefix-cache + dynamic-rebalance clear-cache probes
+#                       in the default suite list (default: 0).
 # =============================================================================
 
 set -euo pipefail
@@ -151,6 +154,7 @@ GPU_ACTIVE_MIN_MB="${LLAMINAR_E2E_GPU_ACTIVE_MIN_MB:-256}"
 GPU_RELEASE_TIMEOUT_SECONDS="${LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS:-30}"
 TRACE_TOKENS="${LLAMINAR_E2E_TRACE_TOKENS:-0}"
 REMOTE_EXPERT_OVERLAY_E2E="${LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY:-0}"
+MOE_REBALANCE_CLEAR_PROBE_E2E="${LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE:-0}"
 PERF_STATS_ENABLED="${LLAMINAR_E2E_PERF_STATS:-1}"
 PERF_STATS_GPU_STAGE_TIMING="${LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING:-1}"
 # Thinking-capable Qwen models may spend hundreds of tokens deliberating before
@@ -168,8 +172,12 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 # The optional 6th field (suite_options) is harness metadata. Supported:
 #   no-long-context  Skip duplicate optional long-context helper for feature variants.
 #   no-prefill-graph-buckets  Opt this suite out of default bucketed prefill graph capture.
+#   non-thinking-only  For targeted infrastructure probes, skip thinking-mode
+#                       variants even when the model family supports thinking.
 #   prefill-graph-probe  Send repeated same-key long-enough prompts to prove capture/replay.
 #   require-prefill-graph-capture  Fail unless perfstats record prefill capture/replay.
+#   prefix-cache-rebalance-clear-probe  Exercise HTTP prefix-cache requests while
+#                       dynamic MoE rebalance leaves a prepared publish for request cleanup.
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
@@ -326,6 +334,7 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S9_TP_CUDA2_FLAGS="--tp-devices cuda:0,cuda:1"
     S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
     S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
+    S9_REBALANCE_FLAGS="--moe-rebalance dynamic --moe-hot-expert-cache 2 --moe-rebalance-window 8 --moe-rebalance-max-window 8 --moe-rebalance-window-growth 1 --moe-release-raw-expert-weights"
     # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
     # but they must not run in the default gate until non-root participant ranks
     # execute matched MPI sparse dispatch/local-expert/return-reduce stages.
@@ -342,6 +351,10 @@ if [ ${#SUITES[@]} -eq 0 ]; then
         SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,no-prefill-graph-buckets")
         SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,no-prefill-graph-buckets")
         SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,no-prefill-graph-buckets")
+        if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
+            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
+            SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
+        fi
         if [[ "$REMOTE_EXPERT_OVERLAY_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-prefix-ram-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
             SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_OVERLAY_ROCM2_CPU2_FLAGS}|qwen36-moe-mtp-greedy-d2-expertoverlay-rocm2-cpu2|no-long-context,no-prefill-graph-buckets")
@@ -951,9 +964,19 @@ suite_disables_prefill_graph_buckets() {
     [[ ",${suite_options}," == *",no-prefill-graph-buckets,"* ]]
 }
 
+suite_runs_non_thinking_only() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",non-thinking-only,"* ]]
+}
+
 suite_runs_prefill_graph_probe() {
     local suite_options="$1"
     [[ ",${suite_options}," == *",prefill-graph-probe,"* ]]
+}
+
+suite_runs_prefix_cache_rebalance_clear_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",prefix-cache-rebalance-clear-probe,"* ]]
 }
 
 is_gpu_backend() {
@@ -1702,6 +1725,7 @@ require_prefill_capture = (
     or "prefill-graph-probe" in suite_option_set
 )
 require_prefill_replay = "prefill-graph-probe" in suite_option_set
+require_prefix_rebalance_clear = "prefix-cache-rebalance-clear-probe" in suite_option_set
 expect_decode_replay = (
     is_mtp
     or long_context_run == "true"
@@ -1795,6 +1819,25 @@ if is_gpu and is_mtp:
     ):
         print("FAIL: GPU MTP case did not preserve replay state at request-boundary clear_cache")
         sys.exit(0)
+
+if require_prefix_rebalance_clear:
+    if not is_gpu:
+        print("FAIL: prefix-cache rebalance clear probe requires a GPU backend")
+        sys.exit(0)
+    if " --prefix-cache " not in f" {extra_flags} ":
+        print("FAIL: prefix-cache rebalance clear probe requires --prefix-cache")
+        sys.exit(0)
+    if " --moe-rebalance dynamic " not in f" {extra_flags} ":
+        print("FAIL: prefix-cache rebalance clear probe requires --moe-rebalance dynamic")
+        sys.exit(0)
+    for name in (
+        "async_delayed_prepares",
+        "clear_cache_pending_publish_drains",
+        "async_delayed_publishes",
+    ):
+        if not has_record(name, "moe_rebalance"):
+            print(f"FAIL: prefix-cache rebalance clear probe emitted no {name} counter")
+            sys.exit(0)
 
 print(f"ok {len(records)}")
 PY
@@ -2098,6 +2141,120 @@ except Exception as exc:
     pass "[${tag}] Prefill graph probe: repeated same-key long prefill completed through replay request"
 }
 
+run_prefix_cache_rebalance_clear_probe() {
+    local tag="$1"
+    local port="$2"
+    local extra_flags="${3:-}"
+
+    local probe_max_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MAX_TOKENS:-16}"
+    local min_completion_tokens="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS:-8}"
+    local probe_max_tokens_overridden="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MAX_TOKENS+x}"
+    local min_completion_tokens_overridden="${LLAMINAR_E2E_PREFIX_REBALANCE_PROBE_MIN_COMPLETION_TOKENS+x}"
+    local rebalance_window
+    rebalance_window=$(python3 - "$extra_flags" <<'PY'
+import shlex
+import sys
+
+try:
+    tokens = shlex.split(sys.argv[1])
+except Exception:
+    tokens = sys.argv[1].split()
+
+for idx, token in enumerate(tokens):
+    if token == "--moe-rebalance-window" and idx + 1 < len(tokens):
+        print(tokens[idx + 1])
+        break
+    if token.startswith("--moe-rebalance-window="):
+        print(token.split("=", 1)[1])
+        break
+PY
+)
+    if [[ "$rebalance_window" =~ ^[0-9]+$ ]] && [ "$rebalance_window" -gt 0 ]; then
+        local completion_tokens_for_window=$((rebalance_window + 1))
+        if [ -z "$min_completion_tokens_overridden" ]; then
+            min_completion_tokens="$completion_tokens_for_window"
+        fi
+        if [ -z "$probe_max_tokens_overridden" ]; then
+            probe_max_tokens="$min_completion_tokens"
+        elif [ "$probe_max_tokens" -lt "$min_completion_tokens" ]; then
+            probe_max_tokens="$min_completion_tokens"
+        fi
+    fi
+    local messages_json payload response validation i
+    messages_json=$(python3 - <<'PY'
+import json
+
+shared_prefix = " ".join(
+    "prefix-cache rebalance probe: keep this shared setup resident."
+    for _ in range(32)
+)
+messages = [
+    {
+        "role": "system",
+        "content": "You are a deterministic text generator.",
+    },
+    {
+        "role": "user",
+        "content": (
+            f"{shared_prefix}\n\n"
+            "Now print the digit 7 separated by spaces as many times as the "
+            "token budget allows. Do not explain."
+        ),
+    },
+]
+print(json.dumps(messages, separators=(",", ":")))
+PY
+)
+
+    for i in 1 2 3; do
+        payload=$(make_chat_payload "$messages_json" "$probe_max_tokens" "false" "false")
+        response=$(curl -s --max-time "$REQUEST_TIMEOUT" \
+            -H "Content-Type: application/json" \
+            -d "$payload" \
+            "$(server_base_url "$port")/v1/chat/completions" 2>/dev/null || echo '{"error":"curl_failed"}')
+
+        validation=$(python3 - "$min_completion_tokens" "$response" <<'PY'
+import json
+import sys
+
+min_completion_tokens = int(sys.argv[1])
+response_body = sys.argv[2]
+try:
+    data = json.loads(response_body)
+    content = data.get("choices", [{}])[0].get("message", {}).get("content")
+    usage = data.get("usage", {})
+    prompt_tokens = int(usage.get("prompt_tokens", 0))
+    completion_tokens = int(usage.get("completion_tokens", 0))
+    if not isinstance(content, str):
+        print("FAIL: missing assistant content")
+    elif not content.strip():
+        print("FAIL: empty assistant content")
+    elif prompt_tokens < 64:
+        print(f"FAIL: prompt_tokens {prompt_tokens} below prefix-cache probe threshold")
+    elif completion_tokens < min_completion_tokens:
+        print(
+            f"FAIL: completion_tokens {completion_tokens} below rebalance-window threshold "
+            f"{min_completion_tokens}"
+        )
+    else:
+        print(
+            f"ok prompt_tokens={prompt_tokens} completion_tokens={completion_tokens} "
+            f"preview={content[:48]!r}"
+        )
+except Exception as exc:
+    print(f"FAIL: malformed response: {exc}")
+PY
+)
+        if [[ "$validation" == ok* ]]; then
+            continue
+        fi
+        fail "[${tag}] Prefix-cache rebalance clear probe request ${i}: ${validation}"
+        return
+    done
+
+    pass "[${tag}] Prefix-cache rebalance clear probe: repeated HTTP prefix-cache requests survived rebalance cleanup"
+}
+
 # ─── Test Runner Function ─────────────────────────────────────────────────────
 # Runs the full test suite against a single model+backend combination.
 # Arguments: $1=model_path $2=backend $3=port $4=model_label $5=max_tokens
@@ -2111,7 +2268,7 @@ run_backend_tests() {
     local suite_options="${7:-}"
     local tag="${label}/${backend}"
     local thinking_model="false"
-    if is_thinking_model "$label"; then
+    if is_thinking_model "$label" && ! suite_runs_non_thinking_only "$suite_options"; then
         thinking_model="true"
     fi
 
@@ -2152,6 +2309,11 @@ run_backend_tests() {
     if suite_disables_prefill_graph_buckets "$suite_options"; then
         echo -e "  ${BLUE}INFO${NC} [${tag}] Prefill graph buckets: disabled by suite option for unsupported collective topology"
         server_env+=("LLAMINAR_PREFILL_GRAPH_BUCKETS=0")
+    fi
+    if suite_runs_prefix_cache_rebalance_clear_probe "$suite_options"; then
+        local probe_gpu_cache_experts="${LLAMINAR_E2E_PREFIX_REBALANCE_GPU_CACHE_EXPERTS_PER_LAYER:-2}"
+        echo -e "  ${BLUE}INFO${NC} [${tag}] Prefix-cache rebalance clear probe: gpu_cache_experts_per_layer=${probe_gpu_cache_experts}"
+        server_env+=("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER=${probe_gpu_cache_experts}")
     fi
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
         server_env+=("LLAMINAR_PERF_STATS_JSON=$perf_path")
@@ -2239,6 +2401,16 @@ run_backend_tests() {
         prefix_b_messages='[{"role":"system","content":"You are a calculator. Reply with only the numeric answer, no explanation."},{"role":"user","content":"Shared prefix for prefix-cache E2E: keep this exact setup and answer the final arithmetic only. Final arithmetic: what is 9+5?"}]'
         run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix A" "13" "$prefix_a_messages"
         run_chat_answer_check "$tag" "$port" "$max_tokens" "$thinking_model" "Prefix-cache shared-prefix B" "14" "$prefix_b_messages"
+    fi
+
+    if suite_runs_prefix_cache_rebalance_clear_probe "$suite_options"; then
+        if ! is_prefix_cache_case "$extra_flags"; then
+            fail "[${tag}] Prefix-cache rebalance clear probe requested without --prefix-cache"
+        elif ! is_gpu_backend "$backend"; then
+            fail "[${tag}] Prefix-cache rebalance clear probe requested for non-GPU backend ${backend}"
+        else
+            run_prefix_cache_rebalance_clear_probe "$tag" "$port" "$extra_flags"
+        fi
     fi
 
     # ─── Test 5: Response format validation ───────────────────────────

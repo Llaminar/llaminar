@@ -4,6 +4,8 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/moe/DeviceMoERebalanceController.h"
+#include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoERebalanceController.h"
 #include <algorithm>
 #include <iterator>
@@ -91,7 +93,164 @@ static void fillWindowSkewed(DecodeExpertHistogram &hist, int window_size,
 static void recordExpertHits(DecodeExpertHistogram &hist, int layer,
                              const std::vector<std::pair<int, int>> &expert_counts);
 
+static DeviceMoELayerRuntime makeDeviceRuntimeLayerForLoadStats()
+{
+    DeviceMoELayerRuntime runtime{};
+    runtime.active_bank = 0;
+    runtime.active_epoch = 1;
+    runtime.expert_count = 4;
+    runtime.top_k = 2;
+    runtime.participant_id = 0;
+    runtime.participant_count = 2;
+
+    auto &bank = runtime.banks[0];
+    bank.epoch = runtime.active_epoch;
+    bank.expert_count = runtime.expert_count;
+    for (uint32_t expert = 0; expert < runtime.expert_count; ++expert)
+    {
+        const uint32_t owner = expert % runtime.participant_count;
+        auto &desc = bank.experts[expert];
+        desc.logical_expert_id = static_cast<int32_t>(expert);
+        desc.owner_participant = static_cast<int32_t>(owner);
+        desc.local_slot = static_cast<int32_t>(expert);
+        desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid) |
+                     toMoEExpertFlags(DeviceMoEExpertFlags::Resident);
+        bank.resident_participant_mask[expert] = 1u << owner;
+        bank.local_compute_mask[expert] = owner == runtime.participant_id ? 1u : 0u;
+        bank.replica_role[expert] = owner == runtime.participant_id
+                                        ? static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)
+                                        : static_cast<uint8_t>(DeviceMoEReplicaRole::None);
+    }
+    return runtime;
+}
+
 // ── Tests ─────────────────────────────────────────────
+
+TEST(Test__MoERebalanceController, DeviceSideProjectedLoadSpreadTracksReplicaBenefit)
+{
+    uint64_t single_owner_load[3] = {};
+    uint64_t replicated_load[3] = {};
+
+    for (uint32_t participant = 0; participant < 3; ++participant)
+    {
+        single_owner_load[participant] =
+            moe_rebalance_policy::projectedParticipantLoadForExpert(
+                12,
+                moe_rebalance_policy::participantBit(0),
+                3,
+                participant);
+        replicated_load[participant] =
+            moe_rebalance_policy::projectedParticipantLoadForExpert(
+                12,
+                moe_rebalance_policy::participantBit(0) |
+                    moe_rebalance_policy::participantBit(1),
+                3,
+                participant);
+    }
+
+    uint64_t single_total = 0;
+    uint64_t single_min = 0;
+    uint64_t single_max = 0;
+    uint64_t replicated_total = 0;
+    uint64_t replicated_min = 0;
+    uint64_t replicated_max = 0;
+    moe_rebalance_policy::finalizeLoadSpread(
+        single_owner_load, 3, single_total, single_min, single_max);
+    moe_rebalance_policy::finalizeLoadSpread(
+        replicated_load, 3, replicated_total, replicated_min, replicated_max);
+
+    EXPECT_EQ(single_total, 12u);
+    EXPECT_EQ(replicated_total, 12u);
+    EXPECT_EQ(single_max - single_min, 12u);
+    EXPECT_EQ(replicated_max - replicated_min, 6u);
+    EXPECT_LT(replicated_max - replicated_min, single_max - single_min);
+}
+
+TEST(Test__MoERebalanceController, DeviceSidePayloadBucketsRoundToPowerOfTwoCapacity)
+{
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(0, 8), 0u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(1, 8), 1u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(2, 8), 2u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(3, 8), 4u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(4, 8), 4u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(5, 8), 8u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(9, 8), 8u);
+
+    EXPECT_EQ(deviceMoERebalancePayloadBucketIndex(0), 0u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketIndex(1), 0u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketIndex(2), 1u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketIndex(4), 2u);
+    EXPECT_EQ(deviceMoERebalancePayloadBucketIndex(8), 3u);
+
+    EXPECT_EQ(moe_rebalance_policy::payloadBucketSlots(3, 8),
+              deviceMoERebalancePayloadBucketSlots(3, 8))
+        << "CUDA, ROCm, and CPU mirrors must share one bucket scheduler policy.";
+}
+
+TEST(Test__MoERebalanceController, DeviceSideTransferWaveValueGateUsesPayloadSlots)
+{
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+        0, 0, 256))
+        << "Resident-only waves have no payload slot transfer cost.";
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+        1, 1, 0))
+        << "A zero configured floor disables the wave-level value gate.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+        255, 1, 256));
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+        256, 1, 256));
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+        511, 2, 256));
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
+        512, 2, 256));
+}
+
+TEST(Test__MoERebalanceController, DeviceSideLoadSpreadStatusIsOptIn)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.root_participant = 0;
+    config.window_size_tokens = 1;
+    config.max_hot_replicas_per_participant = 1;
+    config.layer_window_count = 1;
+    config.layer_wave_count = 1;
+
+    std::vector<uint64_t> gathered_histograms(
+        static_cast<size_t>(config.participant_count) *
+            static_cast<size_t>(config.num_layers) *
+            static_cast<size_t>(config.num_experts),
+        0);
+    gathered_histograms[0] = 2;
+    gathered_histograms[config.num_experts] = 2;
+
+    DeviceMoELayerRuntime default_runtime = makeDeviceRuntimeLayerForLoadStats();
+    DeviceMoERebalanceStatus default_status;
+    ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+        &default_runtime,
+        gathered_histograms.data(),
+        config,
+        &default_status));
+    EXPECT_EQ(default_status.pre_policy_load_total, 0u);
+    EXPECT_EQ(default_status.post_policy_load_total, 0u);
+    EXPECT_EQ(default_status.pre_policy_imbalance_numerator, 0u);
+    EXPECT_EQ(default_status.post_policy_imbalance_numerator, 0u);
+
+    config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+    DeviceMoELayerRuntime stats_runtime = makeDeviceRuntimeLayerForLoadStats();
+    DeviceMoERebalanceStatus stats_status;
+    ASSERT_TRUE(applyDeviceMoERebalancePolicyHost(
+        &stats_runtime,
+        gathered_histograms.data(),
+        config,
+        &stats_status));
+    EXPECT_GT(stats_status.pre_policy_load_total, 0u);
+    EXPECT_GT(stats_status.pre_policy_imbalance_numerator, 0u);
+    EXPECT_GT(stats_status.post_policy_load_total, 0u);
+}
 
 TEST(Test__MoERebalanceController, Construction_OffMode)
 {
@@ -292,6 +451,25 @@ TEST(Test__MoERebalanceController, ShouldRebalance_WindowFull)
     EXPECT_TRUE(ctrl.shouldRebalance());
 }
 
+TEST(Test__MoERebalanceController, ShouldRebalance_UsesConfiguredTokenBoundaryLayer)
+{
+    auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 3, 2, 2);
+    cfg.token_boundary_layer_idx = 1;
+    MoERebalanceController ctrl(cfg);
+
+    int indices[] = {0, 1};
+    float weights[] = {0.5f, 0.5f};
+
+    ctrl.histogram()->record(0, indices, weights, 2);
+    ctrl.histogram()->record(1, indices, weights, 2);
+    EXPECT_FALSE(ctrl.shouldRebalance());
+
+    ctrl.histogram()->record(0, indices, weights, 2);
+    ctrl.histogram()->record(1, indices, weights, 2);
+    EXPECT_TRUE(ctrl.shouldRebalance())
+        << "A non-routed tail layer must not be required to fill the decode window.";
+}
+
 TEST(Test__MoERebalanceController, Rebalance_NoImbalance)
 {
     auto cfg = makeConfig(MoERebalanceMode::DYNAMIC, 8, 2, 2, 2, 16);
@@ -328,6 +506,13 @@ TEST(Test__MoERebalanceController, Rebalance_WithImbalance)
     EXPECT_FALSE(result.empty());
     EXPECT_EQ(static_cast<int>(result.size()), 8); // Full placement vector
     EXPECT_EQ(ctrl.placementEpoch(), 1u);
+
+    const auto &before = ctrl.lastImbalanceBefore();
+    const auto &after = ctrl.lastImbalanceAfter();
+    ASSERT_TRUE(before.valid);
+    ASSERT_TRUE(after.valid);
+    EXPECT_GT(before.average_spread, after.average_spread);
+    EXPECT_EQ(before.total_activations, after.total_activations);
 }
 
 TEST(Test__MoERebalanceController, Rebalance_UpdatesPlacement)
@@ -595,6 +780,14 @@ TEST(Test__MoERebalanceController, ReplicaProposalSkipsHotRemoteExpertWhenTarget
         << "expert 0 is owned by the heavier participant and should be offloaded";
     EXPECT_FALSE(replicas.hasReplicaOnParticipant(0, 1, 0))
         << "expert 1 is hot, but copying it to the already-heavier participant would not reduce load";
+
+    const auto &before = ctrl.lastImbalanceBefore();
+    const auto &after = ctrl.lastImbalanceAfter();
+    ASSERT_TRUE(before.valid);
+    ASSERT_TRUE(after.valid);
+    EXPECT_GT(before.average_spread, after.average_spread)
+        << "hot replicas should publish projected load-spread relief";
+    EXPECT_EQ(before.total_activations, after.total_activations);
 }
 
 TEST(Test__MoERebalanceController, ReplicaProposalSkipsLowBenefitCandidates)
@@ -617,6 +810,28 @@ TEST(Test__MoERebalanceController, ReplicaProposalSkipsLowBenefitCandidates)
     ASSERT_EQ(high_replicas.num_replicated, 1);
     EXPECT_TRUE(high_replicas.hasReplicaOnParticipant(0, 0, 1))
         << "a two-assignment projected shift is large enough to admit";
+}
+
+TEST(Test__MoERebalanceController, ReplicaAdmissionThresholdScalesWithWindowSize)
+{
+    auto low_cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/4, /*num_sockets=*/2,
+                              /*num_layers=*/1, /*top_k=*/1, /*window_size=*/256);
+    MoERebalanceController low_ctrl(low_cfg);
+    recordExpertHits(*low_ctrl.histogram(), 0, {{0, 30}});
+
+    auto low_replicas = low_ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    EXPECT_EQ(low_replicas.num_replicated, 0)
+        << "a 15-assignment projected shift is below the 256-token admission threshold";
+
+    auto high_cfg = makeConfig(MoERebalanceMode::DYNAMIC, /*num_experts=*/4, /*num_sockets=*/2,
+                               /*num_layers=*/1, /*top_k=*/1, /*window_size=*/256);
+    MoERebalanceController high_ctrl(high_cfg);
+    recordExpertHits(*high_ctrl.histogram(), 0, {{0, 32}});
+
+    auto high_replicas = high_ctrl.proposeReplicasForParticipants(/*max_replicas_per_participant=*/1);
+    ASSERT_EQ(high_replicas.num_replicated, 1);
+    EXPECT_TRUE(high_replicas.hasReplicaOnParticipant(0, 0, 1))
+        << "a 16-assignment projected shift is large enough to admit";
 }
 
 TEST(Test__MoERebalanceController, ReplicaProposalIsLayerAndParticipantScopedForVariableDomain)

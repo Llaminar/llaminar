@@ -85,20 +85,20 @@ private:
 };
 
 /**
- * @brief Temporarily override the ROCm grouped-prefill flag for preflight tests.
+ * @brief Temporarily override the GPU MoE grouped-prefill flag for preflight tests.
  */
-class ScopedRocmGroupedPrefillFlag
+class ScopedGpuMoEGroupedPrefillFlag
 {
 public:
-    explicit ScopedRocmGroupedPrefillFlag(bool enabled)
-        : old_prefill_(mutableDebugEnv().rocm.moe_grouped_prefill)
+    explicit ScopedGpuMoEGroupedPrefillFlag(bool enabled)
+        : old_prefill_(mutableDebugEnv().gpu_moe.grouped_prefill)
     {
-        mutableDebugEnv().rocm.moe_grouped_prefill = enabled;
+        mutableDebugEnv().gpu_moe.grouped_prefill = enabled;
     }
 
-    ~ScopedRocmGroupedPrefillFlag()
+    ~ScopedGpuMoEGroupedPrefillFlag()
     {
-        mutableDebugEnv().rocm.moe_grouped_prefill = old_prefill_;
+        mutableDebugEnv().gpu_moe.grouped_prefill = old_prefill_;
     }
 
 private:
@@ -962,7 +962,7 @@ TEST(Test__PrefillGraphCache, Preflight_ColdPaddedBucketUsesSupportBeforeWarmupR
 
 TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKernelWarmup)
 {
-    ScopedRocmGroupedPrefillFlag grouped_prefill(true);
+    ScopedGpuMoEGroupedPrefillFlag grouped_prefill(true);
 
     constexpr int seq_len = 608;
     constexpr int real_seq_len = 595;
@@ -1032,7 +1032,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupport
     PrefillGraphCache cache(config);
 
     {
-        ScopedRocmGroupedPrefillFlag grouped_prefill(false);
+        ScopedGpuMoEGroupedPrefillFlag grouped_prefill(false);
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = DeviceId::rocm(0);
@@ -1049,7 +1049,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupport
     }
 
     {
-        ScopedRocmGroupedPrefillFlag grouped_prefill(true);
+        ScopedGpuMoEGroupedPrefillFlag grouped_prefill(true);
         PrefillGraphCacheKey key;
         key.seq_len = seq_len;
         key.device_id = DeviceId::cuda(0);

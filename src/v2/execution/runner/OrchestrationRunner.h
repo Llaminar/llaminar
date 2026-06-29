@@ -173,6 +173,7 @@ namespace llaminar2
             const SamplingParams &sampling) override;
         void setDecodeStepTokenBudget(int max_tokens) override;
         bool maybeApplyMoERebalance() override;
+        bool usesDeviceSideMoERebalanceController() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Configuration
@@ -190,6 +191,7 @@ namespace llaminar2
         int vocabSize() const override;
         int currentPosition() const override;
         void clearCache() override;
+        void drainCompletedDecodeBoundaryMaintenanceDiagnostics() override;
         PrefixRuntimeStateSnapshot prefixStateProbe() const override;
         DeviceId primaryDeviceId() const override;
 
@@ -493,6 +495,10 @@ namespace llaminar2
         void recordMoERebalanceRawExpertRelease(
             const std::string &domain_id,
             const std::string &device);
+        bool publishPendingMoERebalanceUpdate();
+        bool publishPendingMoERebalanceBeforeForward(const char *reason);
+        void drainPendingMoERebalanceBeforeCacheClear();
+        void clearUnderlyingRunnerCacheAfterMoEPublish(const char *reason);
 
         // =====================================================================
         // Error Handling
@@ -523,6 +529,19 @@ namespace llaminar2
 
         // Execution infrastructure
         std::unique_ptr<IInferenceRunner> runner_;
+
+        struct PendingMoERebalanceUpdate
+        {
+            RankOrchestrator *rank = nullptr;
+            RankOrchestrator::PreparedMoEExpertMaskUpdate prepared;
+            ExpertReplicaSet replica_set;
+            int participant_id = 0;
+            bool publish_replica_set = false;
+            bool release_raw_after_publish = false;
+            std::string domain_id;
+            std::string device;
+        };
+        std::optional<PendingMoERebalanceUpdate> pending_moe_rebalance_prepare_;
 
         // Status
         std::atomic<bool> initialized_{false};

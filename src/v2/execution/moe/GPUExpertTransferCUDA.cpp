@@ -9,27 +9,17 @@
 #ifdef HAVE_CUDA
 #include <cuda_runtime.h>
 
-#include <map>
-#include <mutex>
-#include <utility>
-
 namespace llaminar2::detail
 {
     namespace
     {
-        std::mutex peer_access_mutex;
-        std::map<std::pair<int, int>, bool> peer_access_cache;
-        std::mutex peer_enable_mutex;
-        std::map<std::pair<int, int>, bool> peer_enable_cache;
-
-        bool copyArrayPeerAsyncCUDA(
+        bool copyArrayDeviceAsyncCUDA(
             void *dst,
             int dst_ordinal,
             const void *src,
             int src_ordinal,
             size_t bytes,
-            cudaStream_t stream,
-            bool peer_available)
+            cudaStream_t stream)
         {
             if (bytes == 0 || dst == nullptr || src == nullptr)
                 return true;
@@ -56,9 +46,7 @@ namespace llaminar2::detail
                           << cudaGetErrorString(err)
                           << " (src=" << src_ordinal
                           << " dst=" << dst_ordinal
-                          << " bytes=" << bytes
-                          << " peer_access=" << (peer_available ? "true" : "false")
-                          << ")");
+                          << " bytes=" << bytes << ")");
                 return false;
             }
             return true;
@@ -81,30 +69,26 @@ namespace llaminar2::detail
 
         const int src_ord = src_device.cuda_ordinal();
         const int dst_ord = dst_device.cuda_ordinal();
-        const bool peer = canAccessPeerCUDABackend(src_device, dst_device);
-
-        if (peer && src_ord != dst_ord)
-            (void)enablePeerAccessCUDABackend(dst_device, src_device);
 
         auto cuda_stream = static_cast<cudaStream_t>(stream);
         bool success = true;
-        if (!copyArrayPeerAsyncCUDA(dst_ptrs.d_vnni, dst_ord,
+        if (!copyArrayDeviceAsyncCUDA(dst_ptrs.d_vnni, dst_ord,
                                     src_ptrs.d_vnni, src_ord,
-                                    vnni_bytes, cuda_stream, peer))
+                                    vnni_bytes, cuda_stream))
             success = false;
-        if (success && !copyArrayPeerAsyncCUDA(dst_ptrs.d_scales, dst_ord,
+        if (success && !copyArrayDeviceAsyncCUDA(dst_ptrs.d_scales, dst_ord,
                                                src_ptrs.d_scales, src_ord,
-                                               scales_bytes, cuda_stream, peer))
+                                               scales_bytes, cuda_stream))
             success = false;
         if (success && mins_bytes > 0 &&
-            !copyArrayPeerAsyncCUDA(dst_ptrs.d_mins, dst_ord,
+            !copyArrayDeviceAsyncCUDA(dst_ptrs.d_mins, dst_ord,
                                     src_ptrs.d_mins, src_ord,
-                                    mins_bytes, cuda_stream, peer))
+                                    mins_bytes, cuda_stream))
             success = false;
         if (success && emins_bytes > 0 &&
-            !copyArrayPeerAsyncCUDA(dst_ptrs.d_emins, dst_ord,
+            !copyArrayDeviceAsyncCUDA(dst_ptrs.d_emins, dst_ord,
                                     src_ptrs.d_emins, src_ord,
-                                    emins_bytes, cuda_stream, peer))
+                                    emins_bytes, cuda_stream))
             success = false;
 
         if (original_device >= 0)
@@ -118,67 +102,9 @@ namespace llaminar2::detail
                                                                      << "B scales=" << scales_bytes
                                                                      << "B mins=" << mins_bytes
                                                                      << "B emins=" << emins_bytes
-                                                                     << "B"
-                                                                     << (peer ? " (P2P)" : " (host-staged)"));
+                                                                     << "B");
         }
         return success;
-    }
-
-    bool canAccessPeerCUDABackend(const DeviceId &src_device, const DeviceId &dst_device)
-    {
-        if (src_device == dst_device)
-            return true;
-
-        const auto key = std::make_pair(src_device.cuda_ordinal(), dst_device.cuda_ordinal());
-        std::lock_guard<std::mutex> lock(peer_access_mutex);
-        auto it = peer_access_cache.find(key);
-        if (it != peer_access_cache.end())
-            return it->second;
-
-        int can_access = 0;
-        cudaError_t err = cudaDeviceCanAccessPeer(
-            &can_access,
-            src_device.cuda_ordinal(),
-            dst_device.cuda_ordinal());
-        const bool result = err == cudaSuccess && can_access != 0;
-        peer_access_cache[key] = result;
-        return result;
-    }
-
-    bool enablePeerAccessCUDABackend(
-        const DeviceId &current_device,
-        const DeviceId &peer_device)
-    {
-        if (current_device == peer_device)
-            return true;
-
-        const auto key = std::make_pair(current_device.cuda_ordinal(), peer_device.cuda_ordinal());
-        std::lock_guard<std::mutex> lock(peer_enable_mutex);
-        auto it = peer_enable_cache.find(key);
-        if (it != peer_enable_cache.end())
-            return it->second;
-
-        if (!canAccessPeerCUDABackend(current_device, peer_device))
-        {
-            peer_enable_cache[key] = false;
-            return false;
-        }
-
-        int original_device = -1;
-        (void)cudaGetDevice(&original_device);
-        cudaError_t set_err = cudaSetDevice(current_device.cuda_ordinal());
-        if (set_err != cudaSuccess)
-        {
-            peer_enable_cache[key] = false;
-            return false;
-        }
-
-        cudaError_t err = cudaDeviceEnablePeerAccess(peer_device.cuda_ordinal(), 0);
-        if (original_device >= 0)
-            (void)cudaSetDevice(original_device);
-        const bool result = err == cudaSuccess || err == cudaErrorPeerAccessAlreadyEnabled;
-        peer_enable_cache[key] = result;
-        return result;
     }
 }
 #endif

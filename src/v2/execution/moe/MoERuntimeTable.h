@@ -84,6 +84,8 @@ namespace llaminar2
         uint32_t resident_participant_mask[kDeviceMoEMaxExperts] = {};
         uint32_t epoch = 0;
         uint32_t expert_count = 0;
+        // reserved[0]: count of experts resident on more than one participant.
+        // Decode uses this as a cheap hot-cache router-stats gate.
         uint32_t reserved[2] = {};
     };
 
@@ -99,6 +101,16 @@ namespace llaminar2
         float topk_weights[kDeviceMoEMaxTopK] = {};
         uint64_t decode_histogram[kDeviceMoEMaxExperts] = {};
         uint64_t decode_local_histogram[kDeviceMoEMaxExperts] = {};
+        uint64_t router_hot_cache_eligible_dispatches = 0;
+        uint64_t router_hot_cache_used_dispatches = 0;
+        uint64_t router_hot_cache_improved_dispatches = 0;
+        uint64_t router_hot_cache_default_load_spread_total = 0;
+        uint64_t router_hot_cache_actual_load_spread_total = 0;
+        uint64_t router_hot_cache_load_spread_improvement_total = 0;
+        uint64_t router_hot_cache_active_dispatches = 0;
+        uint64_t router_hot_cache_miss_dispatches = 0;
+        uint64_t router_hot_cache_selected_expert_slots = 0;
+        uint64_t router_hot_cache_replicated_selected_expert_slots = 0;
 
         int32_t *route_expert_ids = nullptr;
         float *route_weights = nullptr;

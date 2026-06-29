@@ -123,7 +123,10 @@ namespace llaminar2
         void *createEvent() override;
         void destroyEvent(void *event) override;
         void recordEvent(void *event, void *stream) override;
+        bool recordEventChecked(void *event, void *stream) override;
         void waitEvent(void *event, void *stream) override;
+        bool waitEventChecked(void *event, void *stream) override;
+        bool queryEventChecked(void *event, bool &ready) override;
         void synchronizeEvent(void *event) override;
         float eventElapsedTime(void *start, void *stop) override;
 

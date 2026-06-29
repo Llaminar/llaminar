@@ -18,6 +18,7 @@
 
 #pragma once
 
+#include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
 
 #include <cstdint>
@@ -25,8 +26,6 @@
 
 namespace llaminar2
 {
-
-    struct DeviceMoELayerRuntime;
 
     /**
      * @brief Routing result from MoE gate computation
@@ -39,6 +38,18 @@ namespace llaminar2
         std::vector<int> expert_indices;   ///< [seq_len * top_k] selected expert IDs
         std::vector<float> expert_weights; ///< [seq_len * top_k] normalized weights
         std::vector<float> router_logits;  ///< [seq_len * num_experts] post-softmax probs
+    };
+
+    enum class MoEDecodeDescriptorSource : uint8_t
+    {
+        /// Top-k ids/weights come from the runtime table, but expert weight
+        /// descriptors are read from the immutable per-stage descriptor tables.
+        StaticDescriptorTable = 0,
+
+        /// Top-k ids/weights and expert weight descriptors are both read from
+        /// the mutable runtime placement table. Use this only when captured
+        /// graph replay must observe in-place expert ownership/replica changes.
+        RuntimePlacementTable = 1,
     };
 
     /**
@@ -265,6 +276,55 @@ namespace llaminar2
             return false;
         }
 
+        /// Decode-only runtime-table routing path with graph-capturable
+        /// ready-wave rebalance apply piggybacked into the existing route
+        /// kernel launch. Implementations must not launch a separate apply
+        /// kernel for this method.
+        virtual bool decodeRouteSelectWithReadyRebalanceApply(
+            DeviceMoELayerRuntime *runtime_layers,
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *gate_weights,
+            int d_model, int num_experts, int top_k,
+            bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            bool write_legacy_outputs,
+            bool update_runtime_histogram,
+            const DeviceMoERebalancePlanEntry *rebalance_plan_entries,
+            uint32_t rebalance_plan_capacity,
+            DeviceMoERebalanceCommandBufferHeader *rebalance_command_header,
+            const DeviceMoEExpertDirectoryEntry *rebalance_local_transfer_slots,
+            uint32_t rebalance_local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &rebalance_config,
+            DeviceMoERebalanceApplyStatus *rebalance_apply_status,
+            DeviceMoERebalanceGraphControllerState *rebalance_controller_state,
+            int rebalance_target_layer,
+            uint32_t rebalance_command_buffer_count)
+        {
+            (void)runtime_layers;
+            (void)runtime_layer;
+            (void)hidden;
+            (void)gate_weights;
+            (void)d_model;
+            (void)num_experts;
+            (void)top_k;
+            (void)normalize_weights;
+            (void)output_indices;
+            (void)output_weights;
+            (void)write_legacy_outputs;
+            (void)update_runtime_histogram;
+            (void)rebalance_plan_entries;
+            (void)rebalance_plan_capacity;
+            (void)rebalance_command_header;
+            (void)rebalance_local_transfer_slots;
+            (void)rebalance_local_transfer_slot_count;
+            (void)rebalance_config;
+            (void)rebalance_apply_status;
+            (void)rebalance_controller_state;
+            (void)rebalance_target_layer;
+            (void)rebalance_command_buffer_count;
+            return false;
+        }
+
         /// Zero a tensor's data buffer on the active device.
         /// GPU: zeros device memory, marks DEVICE_AUTHORITATIVE.
         /// CPU: zeros via mutable_data().
@@ -440,6 +500,53 @@ namespace llaminar2
             (void)d_model;
             (void)intermediate;
             return -1;
+        }
+
+        /**
+         * @brief Refresh an existing persistent down descriptor table in place.
+         *
+         * Graph-captured grouped decode records the device pointer for the table,
+         * so dynamic expert rebalancing must update the existing allocation
+         * rather than allocate a new table id when shape/codebook semantics are
+         * unchanged.
+         */
+        virtual bool updateGroupedExpertDownDescriptorTable(
+            int descriptor_table_id,
+            const DeviceNativeVNNIMatrixDesc *down_descs,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)descriptor_table_id;
+            (void)down_descs;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return false;
+        }
+
+        /**
+         * @brief Refresh existing persistent gate/up descriptor tables in place.
+         *
+         * Implementations must preserve the device table pointer associated with
+         * descriptor_table_id; returning false means graph-stable rebalance cannot
+         * safely publish this placement without recapture.
+         */
+        virtual bool updateGroupedExpertGateUpDescriptorTables(
+            int descriptor_table_id,
+            const DeviceNativeVNNIMatrixDesc *gate_descs,
+            const DeviceNativeVNNIMatrixDesc *up_descs,
+            int num_experts,
+            int d_model,
+            int intermediate)
+        {
+            (void)descriptor_table_id;
+            (void)gate_descs;
+            (void)up_descs;
+            (void)num_experts;
+            (void)d_model;
+            (void)intermediate;
+            return false;
         }
 
         /**
@@ -629,7 +736,9 @@ namespace llaminar2
             int top_k,
             ITensor *output,
             int d_model,
-            int intermediate)
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source =
+                MoEDecodeDescriptorSource::RuntimePlacementTable)
         {
             (void)runtime_layer;
             (void)input;
@@ -639,6 +748,361 @@ namespace llaminar2
             (void)output;
             (void)d_model;
             (void)intermediate;
+            (void)descriptor_source;
+            return false;
+        }
+
+        /**
+         * @brief Graph-capturable device-side MoE rebalance publish/apply.
+         *
+         * Backends consume a device-resident gathered histogram buffer with
+         * layout [participant][layer][expert] and mutate the stable
+         * DeviceMoELayerRuntime placement banks in-place. This intentionally
+         * performs only assignment publication; any expert payload movement
+         * must already have populated resident slots and resident masks before
+         * the captured graph observes them.
+         */
+        virtual bool runDeviceRebalanceController(
+            DeviceMoELayerRuntime *runtime_layers,
+            const uint64_t *gathered_histograms,
+            DeviceMoERebalanceStatus *status,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalancePlanEntry *plan_entries = nullptr,
+            uint32_t *plan_count = nullptr,
+            uint32_t plan_capacity = 0,
+            uint32_t payload_slot_capacity = 0,
+            DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
+            DeviceMoERebalanceWaveState *wave_state = nullptr,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)runtime_layers;
+            (void)gathered_histograms;
+            (void)status;
+            (void)config;
+            (void)plan_entries;
+            (void)plan_count;
+            (void)plan_capacity;
+            (void)payload_slot_capacity;
+            (void)command_header;
+            (void)wave_state;
+            (void)controller_state;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
+         * @brief Pack per-layer runtime histograms into a contiguous device buffer.
+         *
+         * The graph-captured rebalance path all-gathers a flat
+         * [wave_layer][expert] histogram from every participant before launching
+         * runDeviceRebalanceController().  GPU backends implement this as a
+         * small device kernel that reads DeviceMoELayerRuntime::decode_histogram
+         * directly from the mirrored runtime table; no host sync or host copy is
+         * permitted on this path.  The optional wave/controller pointers let the
+         * device packer follow the same rolling wave cursor as the controller.
+         */
+        virtual bool packDeviceRebalanceHistograms(
+            DeviceMoELayerRuntime *runtime_layers,
+            uint64_t *local_histograms,
+            const DeviceMoERebalanceConfig &config,
+            const DeviceMoERebalanceWaveState *wave_state = nullptr,
+            const DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)runtime_layers;
+            (void)local_histograms;
+            (void)config;
+            (void)wave_state;
+            (void)controller_state;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
+         * @brief Pack local resident expert descriptors into a graph-visible directory.
+         *
+         * The directory layout is [layer][expert] for this participant.  Each
+         * valid entry describes bytes that are resident on the current device
+         * and can be used as a source by the graph-side peer-copy consumer.
+         * Entries for experts that are known but not locally resident remain
+         * invalid.  No host synchronization or default stream work is allowed.
+         */
+        virtual bool packDeviceRebalanceDirectory(
+            DeviceMoELayerRuntime *runtime_layers,
+            DeviceMoEExpertDirectoryEntry *local_directory,
+            const DeviceMoERebalanceConfig &config)
+        {
+            (void)runtime_layers;
+            (void)local_directory;
+            (void)config;
+            return false;
+        }
+
+        /**
+         * @brief Pack source descriptors only for projected transfer-plan arrivals.
+         *
+         * Compact transfer-slot rebalance first projects the domain-root command
+         * buffer into each participant's local command ABI, and then asks each
+         * participant to publish descriptors only for arrivals where it is the
+         * source.  The local source-descriptor layout is
+         * [destination_participant][command_buffer][plan_index]. After LocalTP
+         * payload allgather, consumers read
+         * [source_participant][destination_participant][command_buffer][plan_index].
+         */
+        virtual bool packDeviceRebalanceSourceDescriptors(
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *command_headers,
+            uint32_t plan_capacity,
+            DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)runtime_layers;
+            (void)plan_entries;
+            (void)command_headers;
+            (void)plan_capacity;
+            (void)local_source_descriptors;
+            (void)config;
+            (void)controller_state;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
+         * @brief Project the domain-root gathered command buffer into the local apply ABI.
+         *
+         * The compact graph path allgathers command buffers before transfer. The
+         * root participant owns placement decisions; every participant then needs
+         * the same command list locally so apply can update replicated metadata
+         * deterministically, while only destination participants install transfer
+         * slots. This graph-capturable projection copies the root command buffers
+         * from the gathered layout into local plan/header buffers and rewrites the
+         * header participant id to the local participant.
+         */
+        virtual bool projectDeviceRebalanceDomainCommands(
+            const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+            uint32_t plan_capacity,
+            DeviceMoERebalancePlanEntry *local_plan_entries,
+            DeviceMoERebalanceCommandBufferHeader *local_command_headers,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceStatus *status = nullptr,
+            uint32_t payload_slot_capacity = 0,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)gathered_plan_entries;
+            (void)gathered_command_headers;
+            (void)plan_capacity;
+            (void)local_plan_entries;
+            (void)local_command_headers;
+            (void)config;
+            (void)status;
+            (void)payload_slot_capacity;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
+         * @brief Pack compact planned-arrival payload slots for a grouped collective.
+         *
+         * The source descriptor buffer is produced by
+         * packDeviceRebalanceSourceDescriptors().  This method packs only the
+         * entries where this participant is the source into the local payload
+         * lane indexed as [destination_participant][plan_index] for the active
+         * command wave.  NCCL/RCCL allgather then moves these staging slots; the
+         * destination unpacks locally.  Device kernels must not read peer device
+         * pointers directly.
+         */
+        virtual bool packDeviceRebalanceCompactPayloads(
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *command_headers,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_source_descriptors,
+            uint8_t *local_payload,
+            uint32_t local_payload_slot_count,
+            uint64_t payload_slot_bytes,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)plan_entries;
+            (void)command_headers;
+            (void)plan_capacity;
+            (void)local_source_descriptors;
+            (void)local_payload;
+            (void)local_payload_slot_count;
+            (void)payload_slot_bytes;
+            (void)config;
+            (void)status;
+            (void)controller_state;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        virtual bool packDeviceRebalanceCollectivePayloads(
+            const DeviceMoERebalancePlanEntry *gathered_plan_entries,
+            const DeviceMoERebalanceCommandBufferHeader *gathered_command_headers,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_directory,
+            uint8_t *local_payload,
+            uint32_t local_payload_slot_count,
+            uint64_t payload_slot_bytes,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)gathered_plan_entries;
+            (void)gathered_command_headers;
+            (void)plan_capacity;
+            (void)local_directory;
+            (void)local_payload;
+            (void)local_payload_slot_count;
+            (void)payload_slot_bytes;
+            (void)config;
+            (void)status;
+            (void)controller_state;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        virtual bool unpackDeviceRebalanceCollectivePayloads(
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const uint32_t *plan_count,
+            uint32_t plan_capacity,
+            const DeviceMoERebalanceCommandBufferHeader *command_header,
+            const uint8_t *gathered_payload,
+            uint32_t local_payload_slot_count,
+            uint64_t payload_slot_bytes,
+            DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state = nullptr,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)plan_entries;
+            (void)plan_count;
+            (void)plan_capacity;
+            (void)command_header;
+            (void)gathered_payload;
+            (void)local_payload_slot_count;
+            (void)payload_slot_bytes;
+            (void)local_transfer_slots;
+            (void)local_transfer_slot_count;
+            (void)config;
+            (void)status;
+            (void)controller_state;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
+         * @brief Initialize persistent device-side rebalance graph controller state.
+         *
+         * The state object is shared by the captured maintenance rebalance graph
+         * and the captured decode graph. Implementations must be graph-capturable:
+         * no host reads, no stream synchronization, and no default stream work.
+         * Replays may call this every launch; kernels should preserve an already
+         * valid matching state rather than resetting wave progress.
+         */
+        virtual bool initializeDeviceRebalanceGraphController(
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            const DeviceMoERebalanceConfig &config)
+        {
+            (void)controller_state;
+            (void)config;
+            return false;
+        }
+
+        /**
+         * @brief Publish a completed transfer wave from the transfer stream.
+         *
+         * This kernel is queued after peer/collective transfer-slot copies and
+         * performs the device-side fence and lifecycle transition to
+         * ReadyToApply. Decode-side apply stages poll this state instead of a
+         * host callback or host-visible publication path.
+         */
+        virtual bool publishDeviceRebalanceTransferComplete(
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            const DeviceMoERebalanceCommandBufferHeader *command_header,
+            const DeviceMoERebalanceWaveState *wave_state,
+            const DeviceMoERebalanceApplyStatus *copy_status,
+            const DeviceMoERebalanceConfig &config,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)controller_state;
+            (void)command_header;
+            (void)wave_state;
+            (void)copy_status;
+            (void)config;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        /**
+         * @brief Poll and apply one ready wave entirely on device.
+         *
+         * A poll miss is not an error: the kernel leaves runtime placement
+         * untouched and returns success. A ready matching wave applies arrivals
+         * for @p target_layer and advances the wave lifecycle after all planned
+         * layers have passed the apply boundary.
+         */
+        virtual bool applyReadyDeviceRebalanceWave(
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const uint32_t *plan_count,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            DeviceMoERebalanceGraphControllerState *controller_state,
+            DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
+            int target_layer = -1,
+            uint32_t command_buffer_count = 1)
+        {
+            (void)runtime_layers;
+            (void)plan_entries;
+            (void)plan_count;
+            (void)plan_capacity;
+            (void)local_transfer_slots;
+            (void)local_transfer_slot_count;
+            (void)config;
+            (void)status;
+            (void)controller_state;
+            (void)command_header;
+            (void)target_layer;
+            (void)command_buffer_count;
+            return false;
+        }
+
+        virtual bool applyDeviceRebalanceArrivals(
+            DeviceMoELayerRuntime *runtime_layers,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            const uint32_t *plan_count,
+            uint32_t plan_capacity,
+            const DeviceMoEExpertDirectoryEntry *local_transfer_slots,
+            uint32_t local_transfer_slot_count,
+            const DeviceMoERebalanceConfig &config,
+            DeviceMoERebalanceApplyStatus *status,
+            const DeviceMoERebalanceCommandBufferHeader *command_header = nullptr,
+            int target_layer = -1)
+        {
+            (void)runtime_layers;
+            (void)plan_entries;
+            (void)plan_count;
+            (void)plan_capacity;
+            (void)local_transfer_slots;
+            (void)local_transfer_slot_count;
+            (void)config;
+            (void)status;
+            (void)command_header;
+            (void)target_layer;
             return false;
         }
 
@@ -908,6 +1372,25 @@ namespace llaminar2
             (void)num_experts;
             (void)top_k;
             (void)expert_mask;
+            return false;
+        }
+
+        /**
+         * @brief Update the persistent device expert mask used by masked
+         *        grouped prefill without rebuilding graph topology.
+         *
+         * Captured prefill graphs read the backend-owned mask buffer by device
+         * address. Dynamic MoE placement changes must therefore update that
+         * buffer on an explicit backend stream before replay, instead of
+         * recapturing the graph or relying on a host-side branch inside
+         * prepareExpertGroupsAsyncMasked().
+         */
+        virtual bool updateGroupedPrefillExpertMask(
+            const uint8_t *expert_mask,
+            int num_experts)
+        {
+            (void)expert_mask;
+            (void)num_experts;
             return false;
         }
 

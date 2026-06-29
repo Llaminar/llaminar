@@ -538,6 +538,50 @@ namespace llaminar2
             uint64_t live_state_epoch) const;
 
         /**
+         * @brief Immutable diagnostic snapshot for one cached prefill graph bucket.
+         *
+         * This is intentionally read-only: callers can observe the warmup,
+         * capture, replay, and eviction counters without reaching into the
+         * ForwardGraphCache internals or mutating graph lifetime state.
+         */
+        struct PrefillGraphCacheSnapshot
+        {
+            bool forward_cache_valid = false;                  ///< True when the matching forward graph entry is valid.
+            bool prefill_cache_initialized = false;            ///< True after the prefill cache has been created for the entry.
+            PrefillGraphPhase phase = PrefillGraphPhase::Cold; ///< Current bucket lifecycle phase.
+            size_t cache_size = 0;                             ///< Number of bucket entries held by the prefill cache.
+            size_t node_count = 0;                             ///< Captured graph node count for Ready entries.
+            int replay_count = 0;                              ///< Successful graph launches for this bucket.
+            uint64_t warmup_count = 0;                         ///< Lifetime warmups for this bucket.
+            uint64_t initialized_count = 0;                    ///< Lifetime request resets preserving lazy init for this bucket.
+            uint64_t capture_count = 0;                        ///< Lifetime successful captures for this bucket.
+            uint64_t eviction_count = 0;                       ///< Total prefill bucket evictions observed by this engine.
+            bool observation_valid = false;                    ///< True when runtime chunk/capture metadata has been observed.
+            int chunk_index = 0;                               ///< Stable chunk ordinal from the latest prefill execution.
+            int bucket_seq_len = 0;                            ///< Fixed graph bucket length from the latest prefill execution.
+            int real_token_start = 0;                          ///< Inclusive real-token start offset from the latest prefill execution.
+            int real_token_count = 0;                          ///< Real tokens represented by the latest prefill execution.
+            int real_token_end = 0;                            ///< Exclusive real-token end offset from the latest prefill execution.
+            std::string domain_id;                             ///< Prefix/MoE domain id associated with this graph observation.
+            int participant_id = 0;                            ///< Domain-local participant id associated with this graph observation.
+            uint64_t placement_epoch = 0;                      ///< MoE placement epoch associated with this graph observation.
+            uint64_t topology_signature = 0;                   ///< Topology signature associated with this graph observation.
+            std::string capture_phase;                         ///< cold, warmup, capture, replay, or rejected.
+            std::string recapture_reason;                      ///< none or a structured reason for recapture/rejection.
+            std::string reject_stage_name;                     ///< First stage that blocked graph capture, if any.
+            std::string reject_stage_type;                     ///< Type of the first stage that blocked graph capture, if any.
+        };
+
+        /**
+         * @brief Snapshot all cached prefill graph buckets for diagnostics.
+         *
+         * The vector is intentionally read-only and includes the latest observed
+         * capture/replay metadata, so benchmark and server probes can assert
+         * that bucketed prefill is using graph replay without parsing logs.
+         */
+        std::vector<PrefillGraphCacheSnapshot> prefillGraphCacheSnapshots() const;
+
+        /**
          * @brief Execute one prepared bucketed prefill chunk.
          *
          * This Phase 6 boundary consumes the prepared chunk buffers from a
@@ -581,6 +625,19 @@ namespace llaminar2
 
         /** Discard all cached forward graphs after a topology/workspace lifetime change. */
         void discardAllCachedGraphs();
+
+        /**
+         * @brief Invalidate cached graphs whose MoE placement is encoded in
+         *        captured stage topology rather than runtime descriptor tables.
+         *
+         * Dynamic GPU MoE rebalance mutates single-token decode runtime tables
+         * in place. Prefill, all-position verifier, and multi-token decode
+         * graphs are not yet proven placement-stable and must not replay after
+         * a mask publication under a stable MoE epoch.
+         *
+         * @return Number of valid cached graphs invalidated.
+         */
+        size_t invalidateMoEPlacementSensitiveGraphsForStablePlacement();
 
         /**
          * @brief Drop captured GPU replay state while keeping cached ComputeGraphs.
@@ -654,41 +711,6 @@ namespace llaminar2
          */
         void forEachCachedStage(ComputeStageType type,
                                 const std::function<void(IComputeStage *)> &visitor) const;
-
-        /**
-         * @brief Immutable diagnostic snapshot for one cached prefill graph bucket.
-         *
-         * This is intentionally read-only: callers can observe the warmup,
-         * capture, replay, and eviction counters without reaching into the
-         * ForwardGraphCache internals or mutating graph lifetime state.
-         */
-        struct PrefillGraphCacheSnapshot
-        {
-            bool forward_cache_valid = false;                  ///< True when the matching forward graph entry is valid.
-            bool prefill_cache_initialized = false;            ///< True after the prefill cache has been created for the entry.
-            PrefillGraphPhase phase = PrefillGraphPhase::Cold; ///< Current bucket lifecycle phase.
-            size_t cache_size = 0;                             ///< Number of bucket entries held by the prefill cache.
-            size_t node_count = 0;                             ///< Captured graph node count for Ready entries.
-            int replay_count = 0;                              ///< Successful graph launches for this bucket.
-            uint64_t warmup_count = 0;                         ///< Lifetime warmups for this bucket.
-            uint64_t initialized_count = 0;                    ///< Lifetime request resets preserving lazy init for this bucket.
-            uint64_t capture_count = 0;                        ///< Lifetime successful captures for this bucket.
-            uint64_t eviction_count = 0;                       ///< Total prefill bucket evictions observed by this engine.
-            bool observation_valid = false;                    ///< True when runtime chunk/capture metadata has been observed.
-            int chunk_index = 0;                               ///< Stable chunk ordinal from the latest prefill execution.
-            int bucket_seq_len = 0;                            ///< Fixed graph bucket length from the latest prefill execution.
-            int real_token_start = 0;                          ///< Inclusive real-token start offset from the latest prefill execution.
-            int real_token_count = 0;                          ///< Real tokens represented by the latest prefill execution.
-            int real_token_end = 0;                            ///< Exclusive real-token end offset from the latest prefill execution.
-            std::string domain_id;                             ///< Prefix/MoE domain id associated with this graph observation.
-            int participant_id = 0;                            ///< Domain-local participant id associated with this graph observation.
-            uint64_t placement_epoch = 0;                      ///< MoE placement epoch associated with this graph observation.
-            uint64_t topology_signature = 0;                   ///< Topology signature associated with this graph observation.
-            std::string capture_phase;                         ///< cold, warmup, capture, replay, or rejected.
-            std::string recapture_reason;                      ///< none or a structured reason for recapture/rejection.
-            std::string reject_stage_name;                     ///< First stage that blocked graph capture, if any.
-            std::string reject_stage_type;                     ///< Type of the first stage that blocked graph capture, if any.
-        };
 
         /**
          * @brief Return diagnostic prefill graph cache state for a cached forward signature.

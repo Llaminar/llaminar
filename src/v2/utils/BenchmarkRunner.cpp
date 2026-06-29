@@ -124,7 +124,8 @@ namespace llaminar2
                snapshot.prefill_chunks != 0 ||
                snapshot.prefill_chunk_real_tokens != 0 ||
                snapshot.prefill_chunk_padded_tokens != 0 ||
-               snapshot.prefill_chunk_failures != 0;
+               snapshot.prefill_chunk_failures != 0 ||
+               !snapshot.prefill_graphs.empty();
     }
 
     static nlohmann::json prefixRequestToJson(const PrefixCacheRequestSummary &request)
@@ -180,6 +181,126 @@ namespace llaminar2
         return attempted_tokens > 0
                    ? static_cast<double>(accepted_tokens) / static_cast<double>(attempted_tokens)
                    : 0.0;
+    }
+
+    static bool prefillGraphProbeShowsCaptureOrReplay(
+        const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        return std::any_of(
+            snapshot.prefill_graphs.begin(),
+            snapshot.prefill_graphs.end(),
+            [](const PrefillGraphRuntimeProbe &probe)
+            {
+                return probe.capture_count > 0 ||
+                       probe.replay_count > 0 ||
+                       probe.capture_phase == "capture" ||
+                       probe.capture_phase == "replay";
+            });
+    }
+
+    static std::string summarizePrefillGraphProbe(
+        const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        uint64_t warmups = 0;
+        uint64_t captures = 0;
+        uint64_t replays = 0;
+        uint64_t ready_entries = 0;
+        std::string last_phase = "none";
+        std::string last_domain;
+        std::string last_reject_stage;
+        std::string last_reject_type;
+        for (const auto &probe : snapshot.prefill_graphs)
+        {
+            warmups += probe.warmup_count;
+            captures += probe.capture_count;
+            replays += static_cast<uint64_t>(std::max(0, probe.replay_count));
+            if (probe.phase == "ready")
+                ++ready_entries;
+            if (!probe.capture_phase.empty())
+                last_phase = probe.capture_phase;
+            if (!probe.domain_id.empty())
+                last_domain = probe.domain_id;
+            if (!probe.reject_stage_name.empty())
+                last_reject_stage = probe.reject_stage_name;
+            if (!probe.reject_stage_type.empty())
+                last_reject_type = probe.reject_stage_type;
+        }
+
+        std::ostringstream out;
+        out << "entries=" << snapshot.prefill_graphs.size()
+            << " ready=" << ready_entries
+            << " warmups=" << warmups
+            << " captures=" << captures
+            << " replays=" << replays
+            << " last_phase=" << last_phase;
+        if (!last_domain.empty())
+            out << " domain=" << last_domain;
+        if (!last_reject_stage.empty())
+            out << " reject_stage=" << last_reject_stage;
+        if (!last_reject_type.empty())
+            out << " reject_type=" << last_reject_type;
+        return out.str();
+    }
+
+    static nlohmann::json prefillGraphProbeToJson(
+        const PrefillGraphRuntimeProbe &probe)
+    {
+        return nlohmann::json{
+            {"forward_cache_valid", probe.forward_cache_valid},
+            {"prefill_cache_initialized", probe.prefill_cache_initialized},
+            {"phase", probe.phase},
+            {"cache_size", probe.cache_size},
+            {"node_count", probe.node_count},
+            {"replay_count", probe.replay_count},
+            {"warmup_count", probe.warmup_count},
+            {"initialized_count", probe.initialized_count},
+            {"capture_count", probe.capture_count},
+            {"eviction_count", probe.eviction_count},
+            {"observation_valid", probe.observation_valid},
+            {"chunk_index", probe.chunk_index},
+            {"bucket_seq_len", probe.bucket_seq_len},
+            {"real_token_start", probe.real_token_start},
+            {"real_token_count", probe.real_token_count},
+            {"real_token_end", probe.real_token_end},
+            {"domain_id", probe.domain_id},
+            {"participant_id", probe.participant_id},
+            {"placement_epoch", probe.placement_epoch},
+            {"topology_signature", probe.topology_signature},
+            {"capture_phase", probe.capture_phase},
+            {"recapture_reason", probe.recapture_reason},
+            {"reject_stage_name", probe.reject_stage_name},
+            {"reject_stage_type", probe.reject_stage_type},
+        };
+    }
+
+    static nlohmann::json prefillGraphSummaryToJson(
+        const PrefixRuntimeStateSnapshot &snapshot)
+    {
+        uint64_t warmups = 0;
+        uint64_t captures = 0;
+        uint64_t replays = 0;
+        uint64_t ready_entries = 0;
+        nlohmann::json entries = nlohmann::json::array();
+        for (const auto &probe : snapshot.prefill_graphs)
+        {
+            warmups += probe.warmup_count;
+            captures += probe.capture_count;
+            replays += static_cast<uint64_t>(std::max(0, probe.replay_count));
+            if (probe.phase == "ready")
+                ++ready_entries;
+            entries.push_back(prefillGraphProbeToJson(probe));
+        }
+
+        return nlohmann::json{
+            {"required", debugEnv().execution.prefill_graph_required},
+            {"captured_or_replayed", prefillGraphProbeShowsCaptureOrReplay(snapshot)},
+            {"entries", snapshot.prefill_graphs.size()},
+            {"ready_entries", ready_entries},
+            {"warmups", warmups},
+            {"captures", captures},
+            {"replays", replays},
+            {"probes", std::move(entries)},
+        };
     }
 
     static const std::vector<std::string> &benchmarkPerfStatFilters()
@@ -477,6 +598,7 @@ namespace llaminar2
                                  {"real_tokens", state.prefill_chunk_real_tokens},
                                  {"padded_tokens", state.prefill_chunk_padded_tokens},
                                  {"failures", state.prefill_chunk_failures}}},
+            {"prefill_graphs", prefillGraphSummaryToJson(state)},
             {"perf_stats", benchmarkPerfStatsToJson()},
         };
 
@@ -1302,10 +1424,40 @@ namespace llaminar2
         // This eliminates ~405ms of PCIe traffic for TP=2 prefill.
         runner_->setSkipLogitsGatherPrefill(true);
 
+        auto requirePrefillGraphCapture = [&](const char *context) -> bool
+        {
+            if (!debugEnv().execution.prefill_graph_required)
+                return true;
+            const PrefixRuntimeStateSnapshot snapshot =
+                runner_ ? runner_->prefixStateProbe() : PrefixRuntimeStateSnapshot{};
+            if (prefillGraphProbeShowsCaptureOrReplay(snapshot))
+                return true;
+
+            std::ostringstream reason;
+            reason << "required prefill graph capture/replay was not observed";
+            if (context && *context)
+                reason << " after " << context;
+            reason << " (" << summarizePrefillGraphProbe(snapshot) << ")";
+            last_failure_reason_ = reason.str();
+            if (mpi_ctx_->rank() == 0)
+                LOG_ERROR(last_failure_reason_);
+            return false;
+        };
+
         auto warmPrefillGraphCapture = [&]() -> bool
         {
             if (!debugEnv().execution.gpu_graphs)
+            {
+                if (debugEnv().execution.prefill_graph_required)
+                {
+                    last_failure_reason_ =
+                        "LLAMINAR_PREFILL_GRAPH_REQUIRED=1 but GPU graphs are disabled";
+                    if (mpi_ctx_->rank() == 0)
+                        LOG_ERROR(last_failure_reason_);
+                    return false;
+                }
                 return true;
+            }
 
             if (mpi_ctx_->rank() == 0)
             {
@@ -1326,7 +1478,7 @@ namespace llaminar2
                 }
             }
 
-            return true;
+            return requirePrefillGraphCapture("prefill graph warmup");
         };
 
         /*
@@ -1421,10 +1573,14 @@ namespace llaminar2
             CUDAKernelProfiler::reset();
             ROCmKernelProfiler::reset();
         }
-        if (post_warmup_cb_ && n_decode > 0)
-            PerfStatsCollector::resetPreservingDomains({"memory", "moe_rebalance"});
-        else
-            PerfStatsCollector::resetPreservingDomains({"memory"});
+        /*
+         * Warmup and post-warmup setup are deliberately outside the measured
+         * benchmark loop.  Keep memory lifecycle records, but reset MoE
+         * rebalance stats here so maintenance perfstats describe steady-state
+         * measured decode rather than graph capture, setup, or host
+         * post-warmup placement work.
+         */
+        PerfStatsCollector::resetPreservingDomains({"memory"});
         // Also reset executor overhead stats so warmup overhead isn't counted
         runner_->resetExecutorStats();
 
@@ -1474,6 +1630,11 @@ namespace llaminar2
                 if (last_failure_reason_.empty())
                     last_failure_reason_ = "prefill failed on benchmark iteration";
                 logGPUMemorySnapshot(("prefill-fail iter=" + std::to_string(iter + 1)).c_str());
+                return capture_and_return();
+            }
+            if (!requirePrefillGraphCapture(("measured prefill iteration " + std::to_string(iter + 1)).c_str()))
+            {
+                logGPUMemorySnapshot(("prefill-graph-required-fail iter=" + std::to_string(iter + 1)).c_str());
                 return capture_and_return();
             }
             prefill_times.push_back(prefill_time);
@@ -1581,6 +1742,9 @@ namespace llaminar2
         {
             LOG_INFO("Benchmark complete.");
         }
+
+        if (runner_)
+            runner_->drainCompletedDecodeBoundaryMaintenanceDiagnostics();
 
         return capture_and_return();
     }
