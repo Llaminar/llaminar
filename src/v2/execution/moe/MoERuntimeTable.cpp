@@ -537,6 +537,7 @@ namespace llaminar2
             state.expert_offsets = scratch.expert_offsets;
             state.grouped_token_ids = scratch.grouped_token_ids;
             state.grouped_route_weights = scratch.grouped_route_weights;
+            state.reserved_ptrs[0] = scratch.llep_split_ends;
             state.prefill_token_capacity = scratch.token_capacity;
             state.prefill_route_capacity = scratch.route_capacity;
         }
@@ -723,7 +724,8 @@ namespace llaminar2
                allocation.expert_counts &&
                allocation.expert_offsets &&
                allocation.grouped_token_ids &&
-               allocation.grouped_route_weights;
+               allocation.grouped_route_weights &&
+               allocation.llep_split_ends;
     }
 
     void DeviceMoERuntimeTable::allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity)
@@ -757,6 +759,8 @@ namespace llaminar2
                 freeMirror(device_id_, scratch.grouped_token_ids, layerPrefix(layer_idx) + "free prefill grouped_token_ids");
             if (scratch.grouped_route_weights)
                 freeMirror(device_id_, scratch.grouped_route_weights, layerPrefix(layer_idx) + "free prefill grouped_route_weights");
+            if (scratch.llep_split_ends)
+                freeMirror(device_id_, scratch.llep_split_ends, layerPrefix(layer_idx) + "free prefill llep_split_ends");
             scratch = {};
         };
 
@@ -779,6 +783,9 @@ namespace llaminar2
             allocate(&allocation.expert_offsets, static_cast<size_t>(num_experts_), "prefill expert_offsets");
             allocate(&allocation.grouped_token_ids, route_capacity, "prefill grouped_token_ids");
             allocate(&allocation.grouped_route_weights, route_capacity, "prefill grouped_route_weights");
+            allocate(&allocation.llep_split_ends,
+                     static_cast<size_t>(num_experts_) * static_cast<size_t>(kDeviceMoEMaxParticipants),
+                     "prefill llep_split_ends");
         }
         catch (...)
         {
@@ -798,6 +805,7 @@ namespace llaminar2
         state.expert_offsets = allocation.expert_offsets;
         state.grouped_token_ids = allocation.grouped_token_ids;
         state.grouped_route_weights = allocation.grouped_route_weights;
+        state.reserved_ptrs[0] = allocation.llep_split_ends;
         state.prefill_token_capacity = allocation.token_capacity;
         state.prefill_route_capacity = allocation.route_capacity;
     }
@@ -822,6 +830,8 @@ namespace llaminar2
                 freeMirror(device_id_, allocation.grouped_token_ids, "[MoERuntimeTable] free prefill grouped_token_ids");
             if (allocation.grouped_route_weights)
                 freeMirror(device_id_, allocation.grouped_route_weights, "[MoERuntimeTable] free prefill grouped_route_weights");
+            if (allocation.llep_split_ends)
+                freeMirror(device_id_, allocation.llep_split_ends, "[MoERuntimeTable] free prefill llep_split_ends");
             allocation = {};
         }
         prefill_route_scratch_.clear();

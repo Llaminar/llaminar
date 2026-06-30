@@ -110,6 +110,15 @@ extern "C" bool hipMoE_softmax_topk(
     bool normalize_weights,
     int device_idx, void *stream,
     const int *device_effective_seq_len);
+
+extern "C" bool hipMoE_materialize_runtime_prefill_descriptor_tables(
+    const void *runtime,
+    llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+    llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+    int num_experts,
+    int device_idx,
+    void *stream);
 #endif
 
 using namespace llaminar2;
@@ -211,6 +220,42 @@ namespace
         desc.blocks_per_row = 1;
         desc.codebook_id = 7;
         return desc;
+    }
+
+    DeviceNativeVNNIMatrixDesc makePrefillRuntimeDesc(
+        uintptr_t base,
+        int rows,
+        int cols,
+        uint8_t codebook_id)
+    {
+        DeviceNativeVNNIMatrixDesc desc{};
+        desc.payload = reinterpret_cast<const uint8_t *>(base);
+        desc.scales = reinterpret_cast<const void *>(base + 0x100u);
+        desc.mins = reinterpret_cast<const void *>(base + 0x200u);
+        desc.emins = reinterpret_cast<const void *>(base + 0x300u);
+        desc.n = rows;
+        desc.k = cols;
+        desc.blocks_per_row = static_cast<uint32_t>(cols / 32);
+        desc.codebook_id = codebook_id;
+        return desc;
+    }
+
+    void expectSameNativeVNNIDesc(
+        const DeviceNativeVNNIMatrixDesc &actual,
+        const DeviceNativeVNNIMatrixDesc &expected)
+    {
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(actual.payload),
+                  reinterpret_cast<uintptr_t>(expected.payload));
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(actual.scales),
+                  reinterpret_cast<uintptr_t>(expected.scales));
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(actual.mins),
+                  reinterpret_cast<uintptr_t>(expected.mins));
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(actual.emins),
+                  reinterpret_cast<uintptr_t>(expected.emins));
+        EXPECT_EQ(actual.n, expected.n);
+        EXPECT_EQ(actual.k, expected.k);
+        EXPECT_EQ(actual.blocks_per_row, expected.blocks_per_row);
+        EXPECT_EQ(actual.codebook_id, expected.codebook_id);
     }
 
     MoEPlacementUpdate makeParticipantOneBaseUpdate(uint32_t epoch)
@@ -802,6 +847,131 @@ TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesRejectInvalidDescriptors)
               -1);
 }
 
+TEST(Test__ROCmMoEKernel, RuntimePrefillDescriptorMaterializationUsesActiveRuntimeBank)
+{
+    SKIP_IF_NO_ROCM();
+
+    constexpr int num_experts = 4;
+    constexpr int top_k = 2;
+    constexpr int d_model = 64;
+    constexpr int intermediate = 96;
+    constexpr uint32_t active_epoch = 17;
+
+    DeviceMoELayerRuntime host_runtime = makeAllLocalRuntime(num_experts, top_k, active_epoch);
+    host_runtime.active_bank = 1;
+    host_runtime.active_epoch = active_epoch;
+
+    std::vector<DeviceNativeVNNIMatrixDesc> expected_gate(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> expected_up(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> expected_down(num_experts);
+
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        const uintptr_t inactive_base = 0x53000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+        host_runtime.banks[0].experts[expert].gate =
+            makePrefillRuntimeDesc(inactive_base + 0x1000u, intermediate, d_model, 4);
+        host_runtime.banks[0].experts[expert].up =
+            makePrefillRuntimeDesc(inactive_base + 0x2000u, intermediate, d_model, 5);
+        host_runtime.banks[0].experts[expert].down =
+            makePrefillRuntimeDesc(inactive_base + 0x3000u, d_model, intermediate, 6);
+
+        const uintptr_t active_base = 0x73000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+        expected_gate[static_cast<size_t>(expert)] =
+            makePrefillRuntimeDesc(active_base + 0x1000u, intermediate, d_model,
+                                   static_cast<uint8_t>(7 + expert));
+        expected_up[static_cast<size_t>(expert)] =
+            makePrefillRuntimeDesc(active_base + 0x2000u, intermediate, d_model,
+                                   static_cast<uint8_t>(11 + expert));
+        expected_down[static_cast<size_t>(expert)] =
+            makePrefillRuntimeDesc(active_base + 0x3000u, d_model, intermediate,
+                                   static_cast<uint8_t>(15 + expert));
+
+        auto &active_desc = host_runtime.banks[1].experts[expert];
+        active_desc.logical_expert_id = expert;
+        active_desc.owner_participant = 0;
+        active_desc.local_slot = expert;
+        active_desc.flags = toMoEExpertFlags(
+            DeviceMoEExpertFlags::Valid |
+            DeviceMoEExpertFlags::Resident |
+            DeviceMoEExpertFlags::LocalCompute);
+        active_desc.gate = expected_gate[static_cast<size_t>(expert)];
+        active_desc.up = expected_up[static_cast<size_t>(expert)];
+        active_desc.down = expected_down[static_cast<size_t>(expert)];
+    }
+
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    DeviceMoELayerRuntime *device_runtime = nullptr;
+    DeviceNativeVNNIMatrixDesc *device_gate = nullptr;
+    DeviceNativeVNNIMatrixDesc *device_up = nullptr;
+    DeviceNativeVNNIMatrixDesc *device_down = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_runtime), sizeof(DeviceMoELayerRuntime)), hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_gate),
+                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_up),
+                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&device_down),
+                        num_experts * sizeof(DeviceNativeVNNIMatrixDesc)),
+              hipSuccess);
+
+    ASSERT_EQ(hipMemcpyAsync(device_runtime, &host_runtime, sizeof(host_runtime),
+                             hipMemcpyHostToDevice, stream),
+              hipSuccess);
+    ASSERT_TRUE(hipMoE_materialize_runtime_prefill_descriptor_tables(
+        device_runtime,
+        device_gate,
+        device_up,
+        device_down,
+        num_experts,
+        0,
+        stream));
+    EXPECT_FALSE(hipMoE_materialize_runtime_prefill_descriptor_tables(
+        device_runtime,
+        device_gate,
+        device_up,
+        device_down,
+        num_experts,
+        0,
+        nullptr));
+
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_gate(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_up(num_experts);
+    std::vector<DeviceNativeVNNIMatrixDesc> actual_down(num_experts);
+    ASSERT_EQ(hipMemcpyAsync(actual_gate.data(), device_gate,
+                             actual_gate.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(actual_up.data(), device_up,
+                             actual_up.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(actual_down.data(), device_down,
+                             actual_down.size() * sizeof(DeviceNativeVNNIMatrixDesc),
+                             hipMemcpyDeviceToHost, stream),
+              hipSuccess);
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        SCOPED_TRACE(expert);
+        expectSameNativeVNNIDesc(actual_gate[static_cast<size_t>(expert)],
+                                 expected_gate[static_cast<size_t>(expert)]);
+        expectSameNativeVNNIDesc(actual_up[static_cast<size_t>(expert)],
+                                 expected_up[static_cast<size_t>(expert)]);
+        expectSameNativeVNNIDesc(actual_down[static_cast<size_t>(expert)],
+                                 expected_down[static_cast<size_t>(expert)]);
+    }
+
+    EXPECT_EQ(hipFree(device_down), hipSuccess);
+    EXPECT_EQ(hipFree(device_up), hipSuccess);
+    EXPECT_EQ(hipFree(device_gate), hipSuccess);
+    EXPECT_EQ(hipFree(device_runtime), hipSuccess);
+    EXPECT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
 TEST(Test__ROCmMoEKernel, UploadGroupedDescriptorTablesAcceptAllNativeVNNICodebooks)
 {
     SKIP_IF_NO_ROCM();
@@ -1159,18 +1329,49 @@ TEST(Test__ROCmMoEKernel, RuntimePrefillLeastLoadedResidentAssignmentBalancesHot
               hipSuccess);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
 
-    EXPECT_EQ(route_participants, (std::array<int32_t, total_slots>{0, 0, 0, 1, 1, 1}));
-    EXPECT_EQ(counts, (std::array<int32_t, num_experts>{0, 1, 2, 0}));
-    EXPECT_EQ(offsets, (std::array<int32_t, num_experts>{0, 0, 1, 3}));
-    EXPECT_EQ(grouped_tokens[0], 1);
-    EXPECT_EQ(grouped_tokens[1], 2);
-    EXPECT_EQ(grouped_tokens[2], 2);
+    std::array<std::array<int, 2>, num_experts> per_expert_participant_counts{};
+    for (int slot = 0; slot < total_slots; ++slot)
+    {
+        const int expert = static_cast<int>(routing_indices_data[slot]);
+        const int participant = route_participants[slot];
+        ASSERT_GE(participant, 0);
+        ASSERT_LT(participant, 2);
+        ASSERT_NE(bank.resident_participant_mask[expert] & (1u << static_cast<uint32_t>(participant)), 0u);
+        ++per_expert_participant_counts[expert][participant];
+    }
+    EXPECT_EQ(per_expert_participant_counts[0][0], 2);
+    EXPECT_EQ(per_expert_participant_counts[0][1], 1);
+    EXPECT_EQ(per_expert_participant_counts[1][0], 0);
+    EXPECT_EQ(per_expert_participant_counts[1][1], 1);
+    EXPECT_EQ(per_expert_participant_counts[2][0], 1);
+    EXPECT_EQ(per_expert_participant_counts[2][1], 1);
+    EXPECT_EQ(per_expert_participant_counts[3][0], 0);
+    EXPECT_EQ(per_expert_participant_counts[3][1], 0);
+
+    EXPECT_EQ(counts, (std::array<int32_t, num_experts>{1, 1, 1, 0}));
+    EXPECT_EQ(offsets, (std::array<int32_t, num_experts>{0, 1, 2, 3}));
+    std::vector<std::pair<int, float>> expected_local_grouped;
+    for (int expert = 0; expert < num_experts; ++expert)
+    {
+        for (int slot = 0; slot < total_slots; ++slot)
+        {
+            if (static_cast<int>(routing_indices_data[slot]) == expert &&
+                route_participants[slot] == 1)
+            {
+                expected_local_grouped.emplace_back(slot / top_k, routing_weights_data[slot]);
+            }
+        }
+    }
+    ASSERT_EQ(expected_local_grouped.size(), 3u);
+    EXPECT_EQ(grouped_tokens[0], expected_local_grouped[0].first);
+    EXPECT_EQ(grouped_tokens[1], expected_local_grouped[1].first);
+    EXPECT_EQ(grouped_tokens[2], expected_local_grouped[2].first);
     EXPECT_EQ(grouped_tokens[3], 0);
     EXPECT_EQ(grouped_tokens[4], 0);
     EXPECT_EQ(grouped_tokens[5], 0);
-    EXPECT_NEAR(grouped_weights[0], 0.10f, 1.0e-6f);
-    EXPECT_NEAR(grouped_weights[1], 0.60f, 1.0e-6f);
-    EXPECT_NEAR(grouped_weights[2], 0.30f, 1.0e-6f);
+    EXPECT_NEAR(grouped_weights[0], expected_local_grouped[0].second, 1.0e-6f);
+    EXPECT_NEAR(grouped_weights[1], expected_local_grouped[1].second, 1.0e-6f);
+    EXPECT_NEAR(grouped_weights[2], expected_local_grouped[2].second, 1.0e-6f);
     EXPECT_NEAR(grouped_weights[3], 0.0f, 1.0e-6f);
     EXPECT_NEAR(grouped_weights[4], 0.0f, 1.0e-6f);
     EXPECT_NEAR(grouped_weights[5], 0.0f, 1.0e-6f);
@@ -2341,6 +2542,129 @@ TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansDynamicOwnershipTransfer
         << "ownership transfer must not become active before async payload arrival apply";
     EXPECT_EQ(bank.experts[2].owner_participant, 1)
         << "ownership transfer must not remove the local primary before apply";
+
+    EXPECT_EQ(hipFree(d_gathered), hipSuccess);
+    EXPECT_EQ(hipFree(d_status), hipSuccess);
+    EXPECT_EQ(hipFree(d_plan), hipSuccess);
+    EXPECT_EQ(hipFree(d_plan_count), hipSuccess);
+    EXPECT_EQ(hipFree(d_command_header), hipSuccess);
+    EXPECT_EQ(hipFree(d_wave_state), hipSuccess);
+    ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+TEST(Test__ROCmMoEKernel, DeviceRebalanceControllerPlansLeastLoadedEPWeightArrivalsWithoutHotCache)
+{
+    SKIP_IF_NO_ROCM();
+
+    const DeviceId device = DeviceId::rocm(0);
+    hipStream_t stream = nullptr;
+    ASSERT_EQ(hipSetDevice(0), hipSuccess);
+    ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+
+    DeviceMoERuntimeTable::Config table_config;
+    table_config.device_id = device;
+    table_config.num_layers = 1;
+    table_config.num_experts = 4;
+    table_config.top_k = 2;
+    table_config.mirror_to_device = true;
+    MoERuntimeTable runtime_table(table_config);
+
+    auto update = makeDynamicOwnershipTransferUpdate(1, 0);
+    ASSERT_TRUE(runtime_table.prepareInactiveBank(0, update));
+    ASSERT_TRUE(runtime_table.flipActiveBank(0, update.epoch, stream));
+
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.root_participant = 0;
+    config.window_size_tokens = 50;
+    config.max_hot_replicas_per_participant = 0;
+    config.dynamic_max_swaps_per_layer = 0;
+    config.dynamic_max_plan_entries_per_wave = 1;
+    config.routed_assignment_policy = kDeviceMoERebalanceAssignmentLeastLoadedEP;
+    config.flags = 0;
+    config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+    config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::CollectLoadStats);
+    config.flags |= static_cast<uint32_t>(DeviceMoERebalanceFlags::DeferRuntimeApply);
+
+    std::vector<uint64_t> gathered(static_cast<size_t>(config.participant_count) *
+                                       config.num_layers * config.num_experts,
+                                   0);
+    gathered[0] = 80;
+    gathered[1] = 20;
+
+    uint64_t *d_gathered = nullptr;
+    DeviceMoERebalanceStatus *d_status = nullptr;
+    DeviceMoERebalancePlanEntry *d_plan = nullptr;
+    uint32_t *d_plan_count = nullptr;
+    DeviceMoERebalanceCommandBufferHeader *d_command_header = nullptr;
+    DeviceMoERebalanceWaveState *d_wave_state = nullptr;
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_gathered),
+                        gathered.size() * sizeof(uint64_t)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_status),
+                        sizeof(DeviceMoERebalanceStatus)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_plan),
+                        sizeof(DeviceMoERebalancePlanEntry)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_plan_count),
+                        sizeof(uint32_t)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_command_header),
+                        sizeof(DeviceMoERebalanceCommandBufferHeader)),
+              hipSuccess);
+    ASSERT_EQ(hipMalloc(reinterpret_cast<void **>(&d_wave_state),
+                        sizeof(DeviceMoERebalanceWaveState)),
+              hipSuccess);
+    ASSERT_EQ(hipMemcpyAsync(d_gathered, gathered.data(),
+                             gathered.size() * sizeof(uint64_t),
+                             hipMemcpyHostToDevice, stream),
+              hipSuccess);
+
+    ROCmMoEKernel gpu_kernel(0);
+    static_cast<IMoEKernel &>(gpu_kernel).setGPUStream(stream);
+    ASSERT_TRUE(gpu_kernel.runDeviceRebalanceController(
+        runtime_table.deviceLayerState(0),
+        d_gathered,
+        d_status,
+        config,
+        d_plan,
+        d_plan_count,
+        1,
+        1,
+        d_command_header,
+        d_wave_state));
+    ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+    DeviceMoERebalanceStatus status;
+    DeviceMoERebalancePlanEntry plan;
+    uint32_t plan_count = 0;
+    ASSERT_EQ(hipMemcpy(&status, d_status, sizeof(status), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(&plan, d_plan, sizeof(plan), hipMemcpyDeviceToHost), hipSuccess);
+    ASSERT_EQ(hipMemcpy(&plan_count, d_plan_count, sizeof(plan_count), hipMemcpyDeviceToHost), hipSuccess);
+
+    EXPECT_EQ(status.status_code, static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok));
+    ASSERT_EQ(plan_count, 1u);
+    EXPECT_EQ(status.planned_arrivals, 1u);
+    EXPECT_EQ(status.selected_replicas, 1u);
+    EXPECT_EQ(status.candidate_arrivals_considered, 1u);
+    EXPECT_EQ(status.accepted_load_spread_improvement_total, 100u);
+    EXPECT_EQ(status.pre_policy_load_min, 0u);
+    EXPECT_EQ(status.pre_policy_load_max, 100u);
+    EXPECT_EQ(status.post_policy_load_min, 50u);
+    EXPECT_EQ(status.post_policy_load_max, 50u);
+    EXPECT_EQ(plan.op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival));
+    EXPECT_EQ(plan.layer, 0u);
+    EXPECT_EQ(plan.expert, 0u);
+    EXPECT_EQ(plan.source_participant, 0u);
+    EXPECT_EQ(plan.destination_participant, 1u);
+    EXPECT_EQ(plan.source_resident_mask, 0b01u);
+    EXPECT_EQ(plan.destination_slot, 0u);
+    EXPECT_EQ(plan.payload_slot, 0u);
 
     EXPECT_EQ(hipFree(d_gathered), hipSuccess);
     EXPECT_EQ(hipFree(d_status), hipSuccess);

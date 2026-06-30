@@ -3676,6 +3676,7 @@ namespace llaminar2
         {
             const auto &runtime_state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
             pipeline_ok = kernel->executeGroupedPrefillPipelineFromRuntime(
+                moe_runtime_layer_,
                 runtime_state,
                 params_.input,
                 params_.output,

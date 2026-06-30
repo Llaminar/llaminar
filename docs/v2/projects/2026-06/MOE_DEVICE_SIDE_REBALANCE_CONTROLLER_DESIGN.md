@@ -216,6 +216,18 @@ Implemented or partially implemented:
   plan-capacity arenas.
 - `LeastLoadedExpertAssignment` and the shared routed-assignment surface exist
   for offline/unit validation.
+- Grouped prefill now materializes compact gate/up/down descriptor tables from
+  the active device runtime bank immediately before execution. CUDA and ROCm
+  share this shape, so runtime-table arrivals can be executed without rebuilding
+  static host descriptor tables or repacking GPU weights.
+- The GPU prefill LLEP bridge is now span-aware for already-resident experts:
+  repeated rows for a hot expert can be split across the least-loaded resident
+  participants, preserving router top-k and route weights while finally making
+  hot-cache/replica residency visible to grouped prefill load balancing.
+- The resident-span prefill bridge now uses first-class runtime-table scratch
+  for a compact `[expert][participant]` split table. CUDA and ROCm plan split
+  counts once, then fill per-route participant assignments in parallel, avoiding
+  the older serial `num_experts * route_slots` walk.
 - `SocketAwareRebalancer` now delegates Dynamic ownership-swap selection to the
   same shared helper used by CUDA and ROCm device-side planning, preserving the
   host proposal/apply API while removing policy drift.
@@ -235,6 +247,19 @@ Implemented or partially implemented:
 - Trace tooling exports expert loads, owner maps, apply visibility, router
   cache-use counters, payload economics, and imbalance metrics.
 
+Latest evidence:
+
+- 2026-06-30 CUDA2 resident-only LLEP bridge A/B, seed 303, 1024 decode tokens,
+  context 4096, `assignment=least-loaded-ep`, captured prefill required:
+  `static` reached 1963.50 prefill tok/s and 126.96 decode tok/s; `dynamic_hot10`
+  reached 1950.57 prefill tok/s and 126.00 decode tok/s. Both paths captured
+  prefill graphs. This proves the resident-span bridge runs end to end, but it
+  is not yet a speedup and should not be considered full transfer-backed LLEP.
+- Matching ROCm2 A/B with the same seed/config reached `static` 517.15 prefill
+  tok/s and 67.32 decode tok/s, versus `dynamic_hot10` 525.86 prefill tok/s and
+  66.59 decode tok/s. ROCm also captures prefill graphs but does not show a
+  resident-only LLEP decode win.
+
 Still incomplete:
 
 - Device-side graph scheduling still needs a host bridge for launching prewarmed
@@ -242,8 +267,11 @@ Still incomplete:
 - Dynamic, LLEP, and hot-cache admission are conceptually separated in code and
   tests. Dynamic now has an explicit sweep surface; LLEP and cache admission
   still need the same level of public config cleanup.
-- Production LLEP assignment is not yet the default execution path for prefill
-  or batched decode.
+- Transfer-backed LLEP is still incomplete. The resident-span bridge never
+  routes to a participant that lacks the expert weights. Full LLEP still needs
+  to consume `LeastLoadedExpertAssignment` foreign spans, schedule compact
+  same-backend arrivals, apply them to the runtime bank, and then execute the
+  span assignment in the same graph-capturable prefill/batched-decode path.
 - Hot-cache policy economics are inconsistent. The cache is mechanically visible
   to routing, but persistent hot10 alone is not a reliable speedup.
 

@@ -109,8 +109,9 @@ namespace llaminar2
 
             /// Policy for assigning already-selected routed expert rows to
             /// domain participants. StaticOwner follows the placement owner;
-            /// LeastLoadedEP preserves router top-k choices and balances rows
-            /// across resident owners/replicas through runtime prefill grouping.
+            /// LeastLoadedEP preserves router top-k choices and balances routed
+            /// row spans across resident owners/replicas through runtime
+            /// prefill grouping.
             RoutedExpertAssignmentPolicy routed_expert_assignment_policy =
                 RoutedExpertAssignmentPolicy::StaticOwner;
 

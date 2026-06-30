@@ -261,7 +261,8 @@ namespace llaminar2
             int num_experts, int top_k) override;
 
         bool executeGroupedPrefillPipelineFromRuntime(
-            const DeviceMoELayerRuntime &runtime_layer,
+            DeviceMoELayerRuntime *device_runtime_layer,
+            const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
@@ -554,6 +555,7 @@ namespace llaminar2
         bool ensureRouteBufferCapacity(size_t logits_count, size_t topk_count);
         bool ensureGroupingBufferCapacity(int total_slots, int num_experts);
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
+        bool ensureRuntimePrefillDescriptorCapacity(int num_experts);
         bool ensureGroupedGateUpDecodeCapacity(int top_k, int d_model);
         bool ensureGroupedGateUpKPartScratchCapacity(int top_k, int k_partitions, int intermediate);
         bool ensureGroupedDownKPartScratchCapacity(int k_partitions, int d_model, int slots = 1);
@@ -698,6 +700,10 @@ namespace llaminar2
 
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
+        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_gate_descs_ = nullptr;
+        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_up_descs_ = nullptr;
+        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_down_descs_ = nullptr;
+        int runtime_prefill_desc_cap_ = 0;
         std::size_t next_grouped_down_desc_workspace_slot_ = 0;
         std::size_t next_grouped_gateup_desc_workspace_slot_ = 0;
         std::size_t next_router_q8_gate_workspace_slot_ = 0;

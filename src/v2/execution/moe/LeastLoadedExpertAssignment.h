@@ -747,4 +747,257 @@ namespace llaminar2::least_loaded_ep
         return status.overflow == 0u;
     }
 
+    LLAMINAR_LLEP_HD bool planLeastLoadedExpertWeightTransfers(
+        const uint64_t *expert_loads,
+        const uint32_t *expert_owner_participants,
+        const LeastLoadedExpertAssignmentConfig &config,
+        const LeastLoadedExpertAssignmentWorkspace &workspace,
+        LeastLoadedExpertWeightTransfer *transfers,
+        uint32_t transfer_capacity,
+        LeastLoadedExpertAssignmentStatus *status_out) noexcept
+    {
+        LeastLoadedExpertAssignmentStatus status{};
+        if (status_out)
+            *status_out = status;
+
+        if (expert_loads == nullptr ||
+            expert_owner_participants == nullptr ||
+            workspace.sorted_experts == nullptr ||
+            workspace.pending_load == nullptr ||
+            workspace.assigned_load == nullptr ||
+            config.expert_count == 0u ||
+            config.participant_count == 0u ||
+            config.participant_count > 64u ||
+            config.alpha_numerator == 0u ||
+            config.alpha_denominator == 0u)
+        {
+            status.invalid_config = 1u;
+            if (status_out)
+                *status_out = status;
+            return false;
+        }
+
+        for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+        {
+            workspace.pending_load[participant] = 0ULL;
+            workspace.assigned_load[participant] = 0ULL;
+        }
+
+        for (uint32_t expert = 0; expert < config.expert_count; ++expert)
+        {
+            const uint32_t owner = expert_owner_participants[expert];
+            if (owner >= config.participant_count)
+            {
+                status.invalid_config = 1u;
+                if (status_out)
+                    *status_out = status;
+                return false;
+            }
+
+            const uint64_t load = expert_loads[expert];
+            status.total_load += load;
+            if (load > status.max_expert_load)
+                status.max_expert_load = load;
+            workspace.pending_load[owner] += load;
+        }
+
+        summarizeParticipantLoads(
+            workspace.pending_load,
+            config.participant_count,
+            &status.standard_load_min,
+            &status.standard_load_max,
+            &status.standard_load_spread);
+
+        if (config.enable_balanced_skip &&
+            isBalancedEnoughToUseStandardEP(
+                status.total_load,
+                status.max_expert_load,
+                config.expert_count,
+                config.lambda_numerator,
+                config.lambda_denominator))
+        {
+            status.skipped_balanced = 1u;
+            status.standard_ep_selected = 1u;
+            status.assigned_load_min = status.standard_load_min;
+            status.assigned_load_max = status.standard_load_max;
+            status.assigned_load_spread = status.standard_load_spread;
+            if (status_out)
+                *status_out = status;
+            return true;
+        }
+
+        const uint64_t capacity_numerator =
+            saturatedMul(status.total_load, static_cast<uint64_t>(config.alpha_numerator));
+        const uint64_t capacity_denominator =
+            static_cast<uint64_t>(config.participant_count) *
+            static_cast<uint64_t>(config.alpha_denominator);
+        status.capacity_per_participant =
+            ceilDiv(capacity_numerator, capacity_denominator);
+
+        sortExpertsByLoadDescending(
+            expert_loads,
+            config.expert_count,
+            workspace.sorted_experts);
+
+        for (uint32_t order = 0; order < config.expert_count; ++order)
+        {
+            const uint32_t expert = workspace.sorted_experts[order];
+            const uint64_t load = expert_loads[expert];
+            if (load == 0ULL)
+                continue;
+
+            const uint32_t owner = expert_owner_participants[expert];
+            workspace.pending_load[owner] =
+                workspace.pending_load[owner] >= load
+                    ? workspace.pending_load[owner] - load
+                    : 0ULL;
+
+            const uint64_t native_available = availableCapacity(
+                status.capacity_per_participant,
+                workspace.assigned_load[owner],
+                workspace.pending_load[owner]);
+            if (native_available >= load)
+            {
+                workspace.assigned_load[owner] += load;
+                status.native_rows += load;
+                continue;
+            }
+
+            uint64_t remaining = load;
+            if (native_available > 0ULL)
+            {
+                workspace.assigned_load[owner] += native_available;
+                status.native_rows += native_available;
+                remaining -= native_available;
+            }
+
+            while (remaining > 0ULL)
+            {
+                bool assigned = false;
+                uint32_t skipped_participants = 0;
+                uint64_t skipped_mask = 0ULL;
+
+                while (skipped_participants < config.participant_count)
+                {
+                    uint32_t best = kInvalidParticipant;
+                    uint64_t best_load = 0ULL;
+                    for (uint32_t participant = 0; participant < config.participant_count; ++participant)
+                    {
+                        if (participant == owner && config.participant_count > 1u)
+                            continue;
+                        if (participant < 64u && (skipped_mask & (1ULL << participant)) != 0ULL)
+                            continue;
+                        const uint64_t participant_load =
+                            workspace.assigned_load[participant] +
+                            workspace.pending_load[participant];
+                        if (best == kInvalidParticipant ||
+                            participant_load < best_load ||
+                            (participant_load == best_load && participant < best))
+                        {
+                            best = participant;
+                            best_load = participant_load;
+                        }
+                    }
+
+                    if (best == kInvalidParticipant)
+                        break;
+
+                    const uint64_t available = availableCapacity(
+                        status.capacity_per_participant,
+                        workspace.assigned_load[best],
+                        workspace.pending_load[best]);
+                    const uint64_t chunk = remaining < available ? remaining : available;
+                    if (chunk == 0ULL ||
+                        (config.min_chunk_tokens > 0u &&
+                         chunk < static_cast<uint64_t>(config.min_chunk_tokens) &&
+                         remaining > chunk))
+                    {
+                        ++status.min_chunk_skips;
+                        ++skipped_participants;
+                        if (best < 64u)
+                            skipped_mask |= (1ULL << best);
+                        else
+                            break;
+                        continue;
+                    }
+
+                    if (!appendWeightTransferIfMissing(
+                            transfers,
+                            transfer_capacity,
+                            status,
+                            expert,
+                            owner,
+                            best))
+                    {
+                        if (status_out)
+                            *status_out = status;
+                        return false;
+                    }
+                    workspace.assigned_load[best] += chunk;
+                    status.spilled_rows += chunk;
+                    remaining -= chunk;
+                    assigned = true;
+                    break;
+                }
+
+                if (!assigned)
+                {
+                    const uint32_t forced_participant = leastLoadedOtherParticipant(
+                        owner,
+                        config.participant_count,
+                        workspace.pending_load,
+                        workspace.assigned_load);
+                    if (!appendWeightTransferIfMissing(
+                            transfers,
+                            transfer_capacity,
+                            status,
+                            expert,
+                            owner,
+                            forced_participant))
+                    {
+                        if (status_out)
+                            *status_out = status;
+                        return false;
+                    }
+                    workspace.assigned_load[forced_participant] += remaining;
+                    status.spilled_rows += remaining;
+                    remaining = 0ULL;
+                    ++status.forced_spills;
+                }
+            }
+        }
+
+        summarizeParticipantLoads(
+            workspace.assigned_load,
+            config.participant_count,
+            &status.assigned_load_min,
+            &status.assigned_load_max,
+            &status.assigned_load_spread);
+        status.assigned_load_spread_improvement =
+            spreadImprovement(status.standard_load_spread, status.assigned_load_spread);
+
+        const uint64_t required_improvement =
+            requiredSpreadImprovement(config, status.weight_transfer_count);
+        status.required_spread_improvement = required_improvement;
+        if (required_improvement > 0ULL &&
+            status.assigned_load_spread_improvement < required_improvement)
+        {
+            status.weight_transfer_count = 0u;
+            status.native_rows = 0ULL;
+            status.spilled_rows = 0ULL;
+            status.min_chunk_skips = 0u;
+            status.forced_spills = 0u;
+            status.assigned_load_min = status.standard_load_min;
+            status.assigned_load_max = status.standard_load_max;
+            status.assigned_load_spread = status.standard_load_spread;
+            status.assigned_load_spread_improvement = 0ULL;
+            status.skipped_insufficient_spread_improvement = 1u;
+            status.standard_ep_selected = 1u;
+        }
+
+        if (status_out)
+            *status_out = status;
+        return status.overflow == 0u;
+    }
+
 } // namespace llaminar2::least_loaded_ep

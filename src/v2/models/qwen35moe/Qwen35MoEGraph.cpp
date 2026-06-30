@@ -1906,6 +1906,10 @@ namespace llaminar2
                 static_cast<uint32_t>(std::min<uint64_t>(
                     config_.moe.rebalance_config.dynamic_min_window_activations,
                     static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
+            rebalance_config.routed_assignment_policy =
+                config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP
+                    ? kDeviceMoERebalanceAssignmentLeastLoadedEP
+                    : kDeviceMoERebalanceAssignmentStaticOwner;
             rebalance_config.min_load_spread_improvement = static_cast<uint32_t>(
                 std::max(0, env.moe_rebalance.device_rebalance_min_load_spread_improvement));
             rebalance_config.min_load_spread_improvement_divisor = static_cast<uint32_t>(
@@ -2000,13 +2004,15 @@ namespace llaminar2
             {
                 const bool dynamic_ownership_transfers =
                     config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC;
+                const bool routed_assignment_payload_transfers =
+                    config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
                 graph_rebalance_transfer_mode =
                     selectGraphRebalanceTransferMode(
                         *local_tp_ctx,
                         device,
                         static_cast<uint32_t>(
                             std::min(hot_replica_cap, config_.moe.num_experts)),
-                        dynamic_ownership_transfers);
+                        dynamic_ownership_transfers || routed_assignment_payload_transfers);
             }
             if (!graph_rebalance_transfer_mode.has_value())
             {

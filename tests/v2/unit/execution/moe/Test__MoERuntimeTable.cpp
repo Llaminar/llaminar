@@ -2013,12 +2013,25 @@ namespace llaminar2::test
         EXPECT_NE(state.expert_offsets, nullptr);
         EXPECT_NE(state.grouped_token_ids, nullptr);
         EXPECT_NE(state.grouped_route_weights, nullptr);
+        EXPECT_NE(state.reserved_ptrs[0], nullptr)
+            << "prefill LLEP split-table scratch must be a first-class runtime buffer";
         EXPECT_NE(table.deviceLayerState(0), &table.hostLayerState(0));
 
-        table.ensurePrefillRouteScratchCapacity(12);
+        void *split_scratch_before_reset = state.reserved_ptrs[0];
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
+        table.resetDecodeRuntimeState(stream);
+        EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[0], split_scratch_before_reset)
+            << "decode-runtime reset must preserve prefill LLEP scratch bindings";
+
+        table.ensurePrefillRouteScratchCapacity(12, stream);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
         EXPECT_TRUE(table.hasPrefillRouteScratchCapacity(0, 12));
         EXPECT_EQ(table.hostLayerState(0).prefill_token_capacity, 12u);
         EXPECT_EQ(table.hostLayerState(0).prefill_route_capacity, 24u);
+        EXPECT_NE(table.hostLayerState(0).reserved_ptrs[0], nullptr);
     }
 #endif
 

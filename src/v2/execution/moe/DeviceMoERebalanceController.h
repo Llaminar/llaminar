@@ -18,6 +18,8 @@ namespace llaminar2
 {
     inline constexpr uint32_t kDeviceMoERebalanceMagic = 0x4d4f4552u; // "MOER"
     inline constexpr uint32_t kDeviceMoERebalanceVersion = 1;
+    inline constexpr uint32_t kDeviceMoERebalanceAssignmentStaticOwner = 0;
+    inline constexpr uint32_t kDeviceMoERebalanceAssignmentLeastLoadedEP = 1;
 
     enum class DeviceMoERebalanceFlags : uint32_t
     {
@@ -349,6 +351,7 @@ namespace llaminar2
             moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave;
         uint32_t dynamic_min_window_activations =
             static_cast<uint32_t>(moe_rebalance_policy::kDefaultDynamicMinWindowActivations);
+        uint32_t routed_assignment_policy = kDeviceMoERebalanceAssignmentStaticOwner;
     };
 
     struct DeviceMoERebalanceStatus

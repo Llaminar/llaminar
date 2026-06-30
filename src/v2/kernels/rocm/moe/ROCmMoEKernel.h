@@ -544,7 +544,8 @@ namespace llaminar2
             int num_experts, int top_k) override;
 
         bool executeGroupedPrefillPipelineFromRuntime(
-            const DeviceMoELayerRuntime &runtime_layer,
+            DeviceMoELayerRuntime *device_runtime_layer,
+            const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
@@ -617,6 +618,7 @@ namespace llaminar2
         bool ensureGroupedDecodeCapacity(int num_active, int intermediate);
         bool ensureGroupedGateUpCapacity(int num_active, int d_model);
         bool ensureGroupedGateUpKPartScratchCapacity(int num_active, int k_partitions, int intermediate);
+        bool ensureRuntimePrefillDescriptorCapacity(int num_experts);
         bool ensureGroupedGateUpDecodeMetadata(const int *expert_ids, int num_active);
         bool ensureGroupedDownDecodeMetadata(const int *expert_ids, const float *expert_weights, int num_active);
         bool isDecodeGraphCaptureActive() const;
@@ -782,6 +784,7 @@ namespace llaminar2
         int grouped_decode_active_cap_ = 0;
         int grouped_decode_intermediate_cap_ = 0;
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
+        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_down_descs_ = nullptr;
         std::vector<int> grouped_down_cached_expert_ids_;
         std::vector<float> grouped_down_cached_weights_;
 
@@ -799,6 +802,9 @@ namespace llaminar2
         int grouped_gateup_kpart_partitions_cap_ = 0;
         int grouped_gateup_kpart_intermediate_cap_ = 0;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
+        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_gate_descs_ = nullptr;
+        DeviceNativeVNNIMatrixDesc *d_runtime_prefill_up_descs_ = nullptr;
+        int runtime_prefill_desc_cap_ = 0;
         std::vector<float *> host_grouped_gate_output_ptrs_;
         std::vector<float *> host_grouped_up_output_ptrs_;
         std::vector<int> host_grouped_gateup_expert_ids_;

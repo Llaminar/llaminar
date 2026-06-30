@@ -53,6 +53,9 @@ namespace llaminar2
         constexpr const char *CUDA_GROUPED_GATE_DESC_TABLES = "cuda_moe_grouped_gate_desc_tables";
         constexpr const char *CUDA_GROUPED_UP_DESC_TABLES = "cuda_moe_grouped_up_desc_tables";
         constexpr const char *CUDA_GROUPED_DOWN_DESC_TABLES = "cuda_moe_grouped_down_desc_tables";
+        constexpr const char *CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE = "cuda_moe_runtime_prefill_gate_desc_table";
+        constexpr const char *CUDA_RUNTIME_PREFILL_UP_DESC_TABLE = "cuda_moe_runtime_prefill_up_desc_table";
+        constexpr const char *CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE = "cuda_moe_runtime_prefill_down_desc_table";
         constexpr const char *CUDA_ROUTER_Q8_GATE_WEIGHTS = "cuda_moe_router_q8_gate_weights";
         constexpr const char *CUDA_ROUTER_Q8_GATE_SCALES = "cuda_moe_router_q8_gate_scales";
 
@@ -74,6 +77,9 @@ namespace llaminar2
         constexpr const char *ROCM_GROUPED_GATE_DESC_TABLES = "rocm_moe_grouped_gate_desc_tables";
         constexpr const char *ROCM_GROUPED_UP_DESC_TABLES = "rocm_moe_grouped_up_desc_tables";
         constexpr const char *ROCM_GROUPED_DOWN_DESC_TABLES = "rocm_moe_grouped_down_desc_tables";
+        constexpr const char *ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE = "rocm_moe_runtime_prefill_gate_desc_table";
+        constexpr const char *ROCM_RUNTIME_PREFILL_UP_DESC_TABLE = "rocm_moe_runtime_prefill_up_desc_table";
+        constexpr const char *ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE = "rocm_moe_runtime_prefill_down_desc_table";
 
         constexpr int kRuntimePointerTableSlots = 1024;
         constexpr int kRuntimePointerWorkspaceScopes = 3;
@@ -216,6 +222,11 @@ namespace llaminar2
             add(reqs, CUDA_GROUPED_GATE_DESC_TABLES, table_descs);
             add(reqs, CUDA_GROUPED_UP_DESC_TABLES, table_descs);
             add(reqs, CUDA_GROUPED_DOWN_DESC_TABLES, table_descs);
+            const std::size_t runtime_prefill_descs =
+                static_cast<std::size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            add(reqs, CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE, runtime_prefill_descs);
+            add(reqs, CUDA_RUNTIME_PREFILL_UP_DESC_TABLE, runtime_prefill_descs);
+            add(reqs, CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE, runtime_prefill_descs);
             add(reqs, CUDA_ROUTER_Q8_GATE_WEIGHTS,
                 static_cast<std::size_t>(kRouterGateCacheSlots) *
                     static_cast<std::size_t>(num_experts) *
@@ -309,6 +320,11 @@ namespace llaminar2
             add(reqs, ROCM_GROUPED_GATE_DESC_TABLES, table_descs);
             add(reqs, ROCM_GROUPED_UP_DESC_TABLES, table_descs);
             add(reqs, ROCM_GROUPED_DOWN_DESC_TABLES, table_descs);
+            const std::size_t runtime_prefill_descs =
+                static_cast<std::size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            add(reqs, ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE, runtime_prefill_descs);
+            add(reqs, ROCM_RUNTIME_PREFILL_UP_DESC_TABLE, runtime_prefill_descs);
+            add(reqs, ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE, runtime_prefill_descs);
             return reqs;
         }
     } // namespace MoEWorkspaceBuffers

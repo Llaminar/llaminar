@@ -123,6 +123,8 @@ namespace llaminar2
         float *grouped_up_scratch = nullptr;
         float *grouped_output_partials = nullptr;
         void *decode_scratch = nullptr;
+        // reserved_ptrs[0]: prefill LLEP split-end table,
+        // [expert][participant] int32 cumulative route counts.
         void *reserved_ptrs[3] = {};
         uint64_t reserved_u64[4] = {};
         uint32_t prefill_token_capacity = 0;
@@ -237,6 +239,7 @@ namespace llaminar2
             int32_t *expert_offsets = nullptr;
             int32_t *grouped_token_ids = nullptr;
             float *grouped_route_weights = nullptr;
+            int32_t *llep_split_ends = nullptr;
             uint32_t token_capacity = 0;
             uint32_t route_capacity = 0;
             uint32_t expert_capacity = 0;

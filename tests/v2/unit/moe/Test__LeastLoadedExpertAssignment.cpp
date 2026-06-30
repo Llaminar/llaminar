@@ -77,6 +77,24 @@ namespace
                 static_cast<uint32_t>(transfers.size()),
                 &status);
         }
+
+        bool planTransfersOnly(const std::vector<uint64_t> &loads,
+                               const std::vector<uint32_t> &owners,
+                               LeastLoadedExpertAssignmentConfig config)
+        {
+            LeastLoadedExpertAssignmentWorkspace workspace{
+                sorted.data(),
+                pending.data(),
+                assigned.data()};
+            return planLeastLoadedExpertWeightTransfers(
+                loads.data(),
+                owners.data(),
+                config,
+                workspace,
+                transfers.data(),
+                static_cast<uint32_t>(transfers.size()),
+                &status);
+        }
     };
 
     LeastLoadedExpertAssignmentConfig configFor(uint32_t expert_count,
@@ -186,6 +204,34 @@ TEST(Test__LeastLoadedExpertAssignment, PolicyDispatcherRoutesLeastLoadedEPToSha
         EXPECT_EQ(dispatched.spans[index].needs_foreign_weight,
                   direct.spans[index].needs_foreign_weight);
     }
+}
+
+TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerMatchesFullPlannerForeignWeights)
+{
+    std::vector<uint64_t> loads{80, 20, 0, 0};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+
+    PlannerFixture full(config.expert_count, config.participant_count);
+    ASSERT_TRUE(full.plan(loads, owners, config));
+    ASSERT_EQ(full.status.weight_transfer_count, 1u);
+
+    PlannerFixture transfer_only(config.expert_count, config.participant_count);
+    ASSERT_TRUE(transfer_only.planTransfersOnly(loads, owners, config));
+
+    EXPECT_EQ(transfer_only.status.total_load, full.status.total_load);
+    EXPECT_EQ(transfer_only.status.standard_load_spread, full.status.standard_load_spread);
+    EXPECT_EQ(transfer_only.status.assigned_load_spread, full.status.assigned_load_spread);
+    EXPECT_EQ(transfer_only.status.assigned_load_spread_improvement,
+              full.status.assigned_load_spread_improvement);
+    EXPECT_EQ(transfer_only.status.native_rows, full.status.native_rows);
+    EXPECT_EQ(transfer_only.status.spilled_rows, full.status.spilled_rows);
+    ASSERT_EQ(transfer_only.status.weight_transfer_count, full.status.weight_transfer_count);
+    EXPECT_EQ(transfer_only.transfers[0].expert, full.transfers[0].expert);
+    EXPECT_EQ(transfer_only.transfers[0].source_participant,
+              full.transfers[0].source_participant);
+    EXPECT_EQ(transfer_only.transfers[0].destination_participant,
+              full.transfers[0].destination_participant);
 }
 
 TEST(Test__LeastLoadedExpertAssignment, EmitsNativeAssignmentsWhenBalancedSkipDisabled)

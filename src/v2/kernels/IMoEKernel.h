@@ -1255,15 +1255,16 @@ namespace llaminar2
         }
 
         /**
-         * @brief Assign prefill routes to the least-loaded resident participant.
+         * @brief Assign prefill routes to least-loaded resident participants.
          *
          * This is the graph-capturable hot-cache/LLEP bridge: it preserves the
          * router's selected experts and weights, then rewrites only
-         * DeviceMoELayerRuntime::route_participant_ids. Candidate destinations
-         * are limited to the active placement bank's resident_participant_mask
-         * for each expert, so this method never schedules a route to a device
-         * that lacks the expert weights and never performs an implicit weight
-         * transfer.
+         * DeviceMoELayerRuntime::route_participant_ids. Repeated rows for a
+         * hot expert may be split across resident participants, but candidate
+         * destinations are limited to the active placement bank's
+         * resident_participant_mask for each expert, so this method never
+         * schedules a route to a device that lacks the expert weights and
+         * never performs an implicit weight transfer.
          */
         virtual bool assignPrefillRoutesLeastLoadedResident(
             DeviceMoELayerRuntime *runtime_layer,
@@ -1496,20 +1497,24 @@ namespace llaminar2
         /**
          * @brief Execute grouped MoE prefill from DeviceMoELayerRuntime scratch.
          *
-         * The runtime host mirror supplies stable device pointer values for
-         * counts, offsets, grouped token ids, and grouped route weights. The
-         * method must not read device-side count values on the host; all route
-         * data remains device-resident and graph-capturable.
+         * @p device_runtime_layer is the graph-stable device runtime table
+         * pointer. @p runtime_host_layer supplies stable scratch pointer values
+         * for counts, offsets, grouped token ids, and grouped route weights.
+         * Implementations must not read device-side count values on the host;
+         * all route and mutable descriptor data remains device-resident and
+         * graph-capturable.
          */
         virtual bool executeGroupedPrefillPipelineFromRuntime(
-            const DeviceMoELayerRuntime &runtime_layer,
+            DeviceMoELayerRuntime *device_runtime_layer,
+            const DeviceMoELayerRuntime &runtime_host_layer,
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k)
         {
-            (void)runtime_layer;
+            (void)device_runtime_layer;
+            (void)runtime_host_layer;
             (void)hidden;
             (void)output;
             (void)gateup_desc_table_id;

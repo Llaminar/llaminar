@@ -830,6 +830,15 @@ extern "C"
         int current_slots, int max_slots, int num_experts, int top_k,
         int device_idx, void *stream);
 
+    bool hipMoE_materialize_runtime_prefill_descriptor_tables(
+        const void *runtime,
+        llaminar2::DeviceNativeVNNIMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *up_descs,
+        llaminar2::DeviceNativeVNNIMatrixDesc *down_descs,
+        int num_experts,
+        int device_idx,
+        void *stream);
+
     bool hipMoE_prefill_gather_expert_runtime(
         const void *runtime,
         const float *hidden,
@@ -1352,6 +1361,9 @@ namespace llaminar2
         d_prefill_swiglu_scales_ = nullptr;
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
+        d_runtime_prefill_gate_descs_ = nullptr;
+        d_runtime_prefill_up_descs_ = nullptr;
+        d_runtime_prefill_down_descs_ = nullptr;
 
         max_experts_ = 0;
         max_layers_ = 0;
@@ -1380,6 +1392,7 @@ namespace llaminar2
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
+        runtime_prefill_desc_cap_ = 0;
         router_fp16_gate_cache_.clear();
         router_q8_gate_cache_.clear();
         for (auto &table : grouped_down_desc_tables_)
@@ -2803,6 +2816,44 @@ namespace llaminar2
         grouped_gateup_kpart_active_cap_ = num_active;
         grouped_gateup_kpart_partitions_cap_ = k_partitions;
         grouped_gateup_kpart_intermediate_cap_ = intermediate;
+        return true;
+    }
+
+    bool ROCmMoEKernel::ensureRuntimePrefillDescriptorCapacity(int num_experts)
+    {
+        if (num_experts <= 0 || num_experts > kDeviceMoEMaxExperts)
+            return false;
+        if (d_runtime_prefill_gate_descs_ &&
+            d_runtime_prefill_up_descs_ &&
+            d_runtime_prefill_down_descs_ &&
+            runtime_prefill_desc_cap_ >= num_experts)
+        {
+            return true;
+        }
+
+        const size_t bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_runtime_prefill_gate_descs_),
+                                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                                 bytes,
+                                 "ensureRuntimePrefillDescriptorCapacity(gate)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_runtime_prefill_up_descs_),
+                                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                                 bytes,
+                                 "ensureRuntimePrefillDescriptorCapacity(up)") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_runtime_prefill_down_descs_),
+                                 MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                                 bytes,
+                                 "ensureRuntimePrefillDescriptorCapacity(down)"))
+        {
+            d_runtime_prefill_gate_descs_ = nullptr;
+            d_runtime_prefill_up_descs_ = nullptr;
+            d_runtime_prefill_down_descs_ = nullptr;
+            runtime_prefill_desc_cap_ = 0;
+            return false;
+        }
+
+        runtime_prefill_desc_cap_ = num_experts;
         return true;
     }
 
@@ -7471,13 +7522,16 @@ namespace llaminar2
     }
 
     bool ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime(
-        const DeviceMoELayerRuntime &runtime_layer,
+        DeviceMoELayerRuntime *device_runtime_layer,
+        const DeviceMoELayerRuntime &runtime_host_layer,
         ITensor *hidden, ITensor *output,
         int gateup_desc_table_id,
         int down_desc_table_id,
         int seq_len, int d_model, int intermediate,
         int num_experts, int top_k)
     {
+        if (!device_runtime_layer)
+            return false;
         if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
             num_experts <= 0 || top_k <= 0)
         {
@@ -7485,23 +7539,23 @@ namespace llaminar2
         }
         if (!setMoEDevice(device_ordinal_, "executeGroupedPrefillPipelineFromRuntime"))
             return false;
-        if (runtime_layer.expert_count != static_cast<uint32_t>(num_experts) ||
-            runtime_layer.top_k != static_cast<uint32_t>(top_k) ||
-            runtime_layer.prefill_token_capacity < static_cast<uint32_t>(seq_len) ||
-            runtime_layer.prefill_route_capacity < static_cast<uint32_t>(seq_len * top_k) ||
-            !runtime_layer.expert_counts ||
-            !runtime_layer.expert_offsets ||
-            !runtime_layer.grouped_token_ids ||
-            !runtime_layer.grouped_route_weights)
+        if (runtime_host_layer.expert_count != static_cast<uint32_t>(num_experts) ||
+            runtime_host_layer.top_k != static_cast<uint32_t>(top_k) ||
+            runtime_host_layer.prefill_token_capacity < static_cast<uint32_t>(seq_len) ||
+            runtime_host_layer.prefill_route_capacity < static_cast<uint32_t>(seq_len * top_k) ||
+            !runtime_host_layer.expert_counts ||
+            !runtime_host_layer.expert_offsets ||
+            !runtime_host_layer.grouped_token_ids ||
+            !runtime_host_layer.grouped_route_weights)
         {
             LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid runtime scratch contract"
-                      << " expert_count=" << runtime_layer.expert_count
+                      << " expert_count=" << runtime_host_layer.expert_count
                       << " expected_experts=" << num_experts
-                      << " top_k=" << runtime_layer.top_k
+                      << " top_k=" << runtime_host_layer.top_k
                       << " expected_top_k=" << top_k
-                      << " token_capacity=" << runtime_layer.prefill_token_capacity
+                      << " token_capacity=" << runtime_host_layer.prefill_token_capacity
                       << " seq_len=" << seq_len
-                      << " route_capacity=" << runtime_layer.prefill_route_capacity
+                      << " route_capacity=" << runtime_host_layer.prefill_route_capacity
                       << " total_slots=" << (seq_len * top_k));
             return false;
         }
@@ -7530,8 +7584,22 @@ namespace llaminar2
 
         const int total_slots = seq_len * top_k;
         const int max_tokens_per_expert = seq_len;
-        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
+        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate) ||
+            !ensureRuntimePrefillDescriptorCapacity(num_experts))
             return false;
+
+        if (!hipMoE_materialize_runtime_prefill_descriptor_tables(
+                device_runtime_layer,
+                d_runtime_prefill_gate_descs_,
+                d_runtime_prefill_up_descs_,
+                d_runtime_prefill_down_descs_,
+                num_experts,
+                device_ordinal_,
+                getStream()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] failed to materialize runtime descriptors");
+            return false;
+        }
 
         hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
         output->ensureOnDevice(DeviceId::rocm(device_ordinal_));
@@ -7559,14 +7627,14 @@ namespace llaminar2
 
         const bool ok = rocmMoE_grouped_prefill_pipeline(
             d_hidden,
-            gateup_table.device_gate_descs,
-            gateup_table.device_up_descs,
-            down_table.device_descs,
-            runtime_layer.expert_counts,
-            runtime_layer.expert_offsets,
-            runtime_layer.grouped_token_ids,
+            d_runtime_prefill_gate_descs_,
+            d_runtime_prefill_up_descs_,
+            d_runtime_prefill_down_descs_,
+            runtime_host_layer.expert_counts,
+            runtime_host_layer.expert_offsets,
+            runtime_host_layer.grouped_token_ids,
             nullptr,
-            runtime_layer.grouped_route_weights,
+            runtime_host_layer.grouped_route_weights,
             nullptr,
             d_prefill_A_int8_,
             d_prefill_A_scales_,
