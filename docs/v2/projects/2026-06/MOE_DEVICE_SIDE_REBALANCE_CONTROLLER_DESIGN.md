@@ -228,6 +228,10 @@ Implemented or partially implemented:
   for a compact `[expert][participant]` split table. CUDA and ROCm plan split
   counts once, then fill per-route participant assignments in parallel, avoiding
   the older serial `num_experts * route_slots` walk.
+- Transfer-backed LLEP now feeds the same graph-capturable compact-arrival path
+  as Dynamic. The shared transfer-only LLEP planner emits foreign whole-expert
+  arrivals, and CUDA/ROCm controller kernels publish `ExpertPayloadArrival`
+  commands without enabling the hot-cache policy.
 - `SocketAwareRebalancer` now delegates Dynamic ownership-swap selection to the
   same shared helper used by CUDA and ROCm device-side planning, preserving the
   host proposal/apply API while removing policy drift.
@@ -267,11 +271,10 @@ Still incomplete:
 - Dynamic, LLEP, and hot-cache admission are conceptually separated in code and
   tests. Dynamic now has an explicit sweep surface; LLEP and cache admission
   still need the same level of public config cleanup.
-- Transfer-backed LLEP is still incomplete. The resident-span bridge never
-  routes to a participant that lacks the expert weights. Full LLEP still needs
-  to consume `LeastLoadedExpertAssignment` foreign spans, schedule compact
-  same-backend arrivals, apply them to the runtime bank, and then execute the
-  span assignment in the same graph-capturable prefill/batched-decode path.
+- LLEP is mechanically transfer-backed but not yet performance-proven. Current
+  public plumbing still expresses it as routed assignment plus Dynamic
+  maintenance; promote it to a first-class strategy only after parity and
+  repeated clean benchmark matrices.
 - Hot-cache policy economics are inconsistent. The cache is mechanically visible
   to routing, but persistent hot10 alone is not a reliable speedup.
 
@@ -286,6 +289,8 @@ keeps only the current design signal:
 | ROCm2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 66.13 vs 65.63 tok/s decode; prefill 1145.22 vs 1144.90 tok/s | ROCm stayed healthy after the shared rebind guard. This sample also had no movement, so policy tuning still needs movement-positive traces. |
 | CUDA2 1024, seed 303, recent clean static vs dynamic-hot10 | 126.83 vs 124.81 tok/s | Router/cache mechanics work, but hot10 maintenance was net negative in this run. |
 | CUDA2 Dynamic knob sweep, seed 303, 1024/2048, 1 measured iter, perfstats on, `benchmark_results/qwen36_moe_cuda_dynamic_knob_sweep_seed303_20260630_210138/` | 1024: static 123.87, no-op Dynamic 123.49, default Dynamic 123.77, threshold1100 125.53, threshold1100+min0 123.77, aggressive 123.70 tok/s. 2048: static 124.98, no-op 125.21, default 124.68, threshold1100 124.14, threshold1100+min0 124.82, aggressive 124.23 tok/s. | No-op controller overhead was small in this run (`~4 ms` maintenance GPU elapsed at 1024, `~8 ms` at 2048, no movement). Lowering threshold to 1100 induced payload movement and produced the only 1024 positive signal (+1.34%), but movement was neutral/negative at 2048. Generated token streams diverged before the first maintenance window, so this bounds end-to-end behavior rather than replaying identical histogram inputs. Repeat candidates with more reps and/or trace replay before treating this as a policy win. |
+| CUDA2 transfer-backed LLEP probe, seed 303, 1024, perfstats + trace, `benchmark_results/qwen36_moe_cuda_llep_transfer_probe_seed303_20260630_234622/` | static 123.91 vs dynamic LLEP 124.11 tok/s decode; prefill 1953.23 vs 1942.05 tok/s. Trace planned/applied two arrivals around token 323 and one arrival around token 835. | The transfer-backed path is real: `ExpertPayloadArrival` commands are planned, compact payload slots move useful bytes, runtime-table apply makes new residents visible, and router residency counters become nonzero. Payback was essentially flat in this one-run diagnostic, and the maintenance lane is still dedicated rather than fully fused into main decode collectives. |
+| ROCm2 transfer-backed LLEP probe, seed 303, 1024, perfstats + trace, `benchmark_results/qwen36_moe_rocm_llep_transfer_probe_seed303_20260630_235145/` | static 66.08 vs dynamic LLEP 65.22 tok/s decode; prefill 524.69 vs 525.68 tok/s. Trace planned two reciprocal arrivals around token 324 and one later arrival around token 836. | ROCm matches CUDA mechanically but was negative in this one-run sample. This points to shared policy/cost-gate economics rather than a CUDA-only or ROCm-only wiring issue. |
 | ROCm2 1024, current clean static vs dynamic-hot10 | 68.99 vs 66.56 tok/s | Persistent hot10 cache is not automatically economic. |
 | ROCm2 2048, current clean static vs dynamic-hot10 | 65.75 vs 58.97 tok/s | Longer generation did not rescue this cache policy sample. |
 | Earlier CUDA/ROCm plumbing recovery samples | static and no-work dynamic near 125-127 CUDA tok/s, dynamic sometimes positive by noise to a few percent | The remaining problem is policy economics, not basic decode plumbing. |
@@ -366,19 +371,22 @@ Performance gates:
 
 1. Clean up the remaining public policy surface so `LLEP` and
    `HotExpertReplicaCache` are explicit and independent of `Dynamic`.
-2. Use the new Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at
+2. Run transfer-backed LLEP through CUDA2 and ROCm2 parity, then clean repeated
+   benchmark matrices. Include both no-cache and hot-cache-admission variants so
+   LLEP, Dynamic, and cache effects stay separable.
+3. Use the new Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at
    1024 and 2048 tokens: lower imbalance thresholds, lower improvement floors,
    larger per-layer swap counts, larger per-wave command caps, and smaller
    minimum-window activation gates.
-3. Extend Dynamic, if needed, with an explicit hot-set variant
+4. Extend Dynamic, if needed, with an explicit hot-set variant
    (`hotset_expert_count=20`), configurable window schedule, variable domain
    size, and cost-gated non-empty moves while keeping the shared helper as the
    single policy implementation used by CPU, CUDA, and ROCm.
-4. Keep LLEP modular behind the shared routed-assignment surface so additional
+5. Keep LLEP modular behind the shared routed-assignment surface so additional
    algorithms can be added without backend drift.
-5. Wire production prefill and batched decode to run LLEP only when row count
+6. Wire production prefill and batched decode to run LLEP only when row count
    and cost gates make it worthwhile.
-6. Run parity, E2E prefix-cache/server tests, full unit tests, then clean
+7. Run parity, E2E prefix-cache/server tests, full unit tests, then clean
    CUDA2/ROCm2 benchmark matrices before making a policy the default.
 
 Historical checkpoint notes were intentionally removed from this file. Use the
