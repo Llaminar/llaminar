@@ -114,6 +114,7 @@ namespace llaminar2
 
         int32_t *route_expert_ids = nullptr;
         float *route_weights = nullptr;
+        int32_t *route_participant_ids = nullptr;
         int32_t *expert_counts = nullptr;
         int32_t *expert_offsets = nullptr;
         int32_t *grouped_token_ids = nullptr;
@@ -231,6 +232,7 @@ namespace llaminar2
         {
             int32_t *route_expert_ids = nullptr;
             float *route_weights = nullptr;
+            int32_t *route_participant_ids = nullptr;
             int32_t *expert_counts = nullptr;
             int32_t *expert_offsets = nullptr;
             int32_t *grouped_token_ids = nullptr;

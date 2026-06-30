@@ -160,18 +160,17 @@ namespace llaminar2
             lease.projections.push_back(std::move(projection));
         }
 
-        StagingLeaseToken *token = new StagingLeaseToken{
+        auto token = std::make_shared<StagingLeaseToken>(StagingLeaseToken{
             slot_index,
             expert_id,
             orchestrator_,
-            weak_from_this()};
+            weak_from_this()});
         lease.lifetime = std::shared_ptr<void>(
-            token,
-            [](void *ptr)
+            token.get(),
+            [token = std::move(token)](void *) mutable
             {
-                std::unique_ptr<StagingLeaseToken> owned(static_cast<StagingLeaseToken *>(ptr));
-                if (auto pool = owned->pool.lock())
-                    pool->releaseSlot(owned->slot_index, owned->expert_id);
+                if (auto pool = token->pool.lock())
+                    pool->releaseSlot(token->slot_index, token->expert_id);
             });
 
         PerfStatsCollector::addCounter(

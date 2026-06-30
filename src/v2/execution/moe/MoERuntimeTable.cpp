@@ -322,6 +322,7 @@ namespace llaminar2
                state.prefill_route_capacity >= route_count &&
                state.route_expert_ids &&
                state.route_weights &&
+               state.route_participant_ids &&
                state.expert_counts &&
                state.expert_offsets &&
                state.grouped_token_ids &&
@@ -531,6 +532,7 @@ namespace llaminar2
             resetLayer(state);
             state.route_expert_ids = scratch.route_expert_ids;
             state.route_weights = scratch.route_weights;
+            state.route_participant_ids = scratch.route_participant_ids;
             state.expert_counts = scratch.expert_counts;
             state.expert_offsets = scratch.expert_offsets;
             state.grouped_token_ids = scratch.grouped_token_ids;
@@ -717,6 +719,7 @@ namespace llaminar2
                allocation.expert_capacity >= static_cast<uint32_t>(num_experts_) &&
                allocation.route_expert_ids &&
                allocation.route_weights &&
+               allocation.route_participant_ids &&
                allocation.expert_counts &&
                allocation.expert_offsets &&
                allocation.grouped_token_ids &&
@@ -744,6 +747,8 @@ namespace llaminar2
                 freeMirror(device_id_, scratch.route_expert_ids, layerPrefix(layer_idx) + "free prefill route_expert_ids");
             if (scratch.route_weights)
                 freeMirror(device_id_, scratch.route_weights, layerPrefix(layer_idx) + "free prefill route_weights");
+            if (scratch.route_participant_ids)
+                freeMirror(device_id_, scratch.route_participant_ids, layerPrefix(layer_idx) + "free prefill route_participant_ids");
             if (scratch.expert_counts)
                 freeMirror(device_id_, scratch.expert_counts, layerPrefix(layer_idx) + "free prefill expert_counts");
             if (scratch.expert_offsets)
@@ -769,6 +774,7 @@ namespace llaminar2
         {
             allocate(&allocation.route_expert_ids, route_capacity, "prefill route_expert_ids");
             allocate(&allocation.route_weights, route_capacity, "prefill route_weights");
+            allocate(&allocation.route_participant_ids, route_capacity, "prefill route_participant_ids");
             allocate(&allocation.expert_counts, static_cast<size_t>(num_experts_), "prefill expert_counts");
             allocate(&allocation.expert_offsets, static_cast<size_t>(num_experts_), "prefill expert_offsets");
             allocate(&allocation.grouped_token_ids, route_capacity, "prefill grouped_token_ids");
@@ -787,6 +793,7 @@ namespace llaminar2
         auto &state = host_layers_[static_cast<size_t>(layer_idx)];
         state.route_expert_ids = allocation.route_expert_ids;
         state.route_weights = allocation.route_weights;
+        state.route_participant_ids = allocation.route_participant_ids;
         state.expert_counts = allocation.expert_counts;
         state.expert_offsets = allocation.expert_offsets;
         state.grouped_token_ids = allocation.grouped_token_ids;
@@ -805,6 +812,8 @@ namespace llaminar2
                 freeMirror(device_id_, allocation.route_expert_ids, "[MoERuntimeTable] free prefill route_expert_ids");
             if (allocation.route_weights)
                 freeMirror(device_id_, allocation.route_weights, "[MoERuntimeTable] free prefill route_weights");
+            if (allocation.route_participant_ids)
+                freeMirror(device_id_, allocation.route_participant_ids, "[MoERuntimeTable] free prefill route_participant_ids");
             if (allocation.expert_counts)
                 freeMirror(device_id_, allocation.expert_counts, "[MoERuntimeTable] free prefill expert_counts");
             if (allocation.expert_offsets)

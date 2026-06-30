@@ -529,7 +529,7 @@ TEST(Test__OrchestrationConfigParser, MoEOverlayDensePolicyNamesDecodeMirroredEm
                     "--moe-expert-overlay-base-domain", "cuda_hot",
                     "--moe-expert-overlay-shared-domain", "cuda_hot",
                     "--moe-expert-overlay-dense-policy", "tensor-parallel-decode-mirrored-embedding",
-                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=expert_parallel;owner=0",
+                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=apportioned_experts;owner=0",
                     "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
 
     const auto config = parser.parseArgs(args.argc(), args.argv());
@@ -580,6 +580,20 @@ TEST(Test__OrchestrationConfigParser, MoEParallelPolicyDerivesPhaseSplitHybrid)
             DenseParallelPolicy::Replicated,
             RoutedExpertParallelPolicy::ApportionedExperts),
         MoEParallelPolicy::ApportionedExperts);
+
+    EXPECT_EQ(
+        deriveMoEParallelPolicy(
+            DenseParallelPolicy::PhaseSplitHybridTP_AE,
+            RoutedExpertParallelPolicy::ApportionedExperts,
+            RoutedExpertAssignmentPolicy::LeastLoadedEP),
+        MoEParallelPolicy::PhaseSplitHybridTP_LLEP);
+
+    EXPECT_EQ(
+        deriveMoEParallelPolicy(
+            DenseParallelPolicy::TensorParallel,
+            RoutedExpertParallelPolicy::ApportionedExperts,
+            RoutedExpertAssignmentPolicy::LeastLoadedEP),
+        MoEParallelPolicy::HybridTP_LLEP);
 }
 
 TEST(Test__OrchestrationConfigParser, MoEParallelPolicyNamesHybridTPRE)
@@ -609,6 +623,57 @@ TEST(Test__OrchestrationConfigParser, MoEParallelPolicyNamesApportionedAndHybrid
     const auto hybrid_ae = parseMoEParallelPolicy("hybrid-tp-ae");
     ASSERT_TRUE(hybrid_ae.has_value());
     EXPECT_EQ(*hybrid_ae, MoEParallelPolicy::HybridTP_AE);
+}
+
+TEST(Test__OrchestrationConfigParser, MoEOverlayDomainParsesLeastLoadedAssignmentSeparatelyFromCompute)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{"llaminar2",
+                    "--moe-expert-overlay", "tiered",
+                    "--moe-expert-overlay-continuation", "cuda_hot",
+                    "--moe-expert-overlay-shared-domain", "cuda_hot",
+                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=apportioned_experts;assignment=least_loaded_ep;owner=0",
+                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+
+    const auto config = parser.parseArgs(args.argc(), args.argv());
+
+    ASSERT_NE(config.moe_expert_parallel_plan, nullptr);
+    ASSERT_EQ(config.moe_expert_parallel_plan->domains.size(), 1u);
+    EXPECT_EQ(config.moe_expert_parallel_plan->domains[0].compute_kind,
+              ExpertDomainComputeKind::ApportionedExperts);
+    EXPECT_EQ(config.moe_expert_parallel_plan->domains[0].assignment_policy,
+              RoutedExpertAssignmentPolicy::LeastLoadedEP);
+
+    const auto inventory = config.executionDomainDefinitions();
+    ASSERT_EQ(inventory.size(), 1u);
+    EXPECT_EQ(inventory[0].compute_kind, ExecutionDomainComputeKind::APPORTIONED_EXPERTS);
+    EXPECT_EQ(inventory[0].assignment_kind, ExecutionDomainAssignmentKind::LEAST_LOADED_EP);
+}
+
+TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLeastLoadedAsComputeKind)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{"llaminar2",
+                    "--moe-expert-overlay", "tiered",
+                    "--moe-expert-overlay-continuation", "cuda_hot",
+                    "--moe-expert-overlay-shared-domain", "cuda_hot",
+                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=least_loaded_ep;owner=0",
+                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+}
+
+TEST(Test__OrchestrationConfigParser, MoEOverlayDomainRejectsLegacyExpertParallelComputeAlias)
+{
+    OrchestrationConfigParser parser;
+    ArgvHelper args{"llaminar2",
+                    "--moe-expert-overlay", "tiered",
+                    "--moe-expert-overlay-continuation", "cuda_hot",
+                    "--moe-expert-overlay-shared-domain", "cuda_hot",
+                    "--moe-expert-overlay-domain", "cuda_hot=0:cuda:0,0:cuda:1;scope=local;backend=nccl;compute=expert_parallel;owner=0",
+                    "--moe-expert-overlay-tier", "hot@cuda_hot;priority=0;max-experts-per-layer=256"};
+
+    EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
 }
 
 TEST(Test__OrchestrationConfigParser, Phase9B_DomainIdentityIsNameScopedForSharedParticipants)
@@ -990,6 +1055,11 @@ moe:
     rebalance_window: 64
     rebalance_max_window: 512
     rebalance_window_growth: 2.5
+    dynamic_imbalance_threshold_permille: 1125
+    dynamic_min_improvement_permille: 20
+    dynamic_max_swaps_per_layer: 6
+    dynamic_max_plan_entries_per_wave: 24
+    dynamic_min_window_activations: 32
     release_raw_expert_weights: true
     )";
 
@@ -1003,6 +1073,11 @@ moe:
     EXPECT_EQ(config.moe_rebalance.window_size, 64);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 512);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.5f);
+    EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1125u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 20u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 6u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 24u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 32u);
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
 }
 
@@ -1017,6 +1092,11 @@ moe_rebalance: off
 moe_rebalance_window: 128
 moe_rebalance_max_window: 1024
 moe_rebalance_window_growth: 1.25
+moe_dynamic_imbalance_threshold_permille: 1050
+moe_dynamic_min_improvement_permille: 0
+moe_dynamic_max_swaps_per_layer: 8
+moe_dynamic_max_plan_entries_per_wave: 32
+moe_dynamic_min_window_activations: 16
 moe_release_raw_expert_weights: false
     )";
 
@@ -1030,6 +1110,11 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 1024);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 1.25f);
+    EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1050u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 0u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 8u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 32u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 16u);
     EXPECT_FALSE(config.moe_rebalance.release_raw_expert_weights);
 }
 
@@ -1595,6 +1680,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-rebalance-window", "128",
                     "--moe-rebalance-max-window", "2048",
                     "--moe-rebalance-window-growth", "2.0",
+                    "--moe-dynamic-imbalance-threshold-permille", "1100",
+                    "--moe-dynamic-min-improvement-permille", "10",
+                    "--moe-dynamic-max-swaps-per-layer", "7",
+                    "--moe-dynamic-max-plan-entries-per-wave", "28",
+                    "--moe-dynamic-min-window-activations", "48",
                     "--moe-release-raw-expert-weights"};
     OrchestrationConfigParser parser;
 
@@ -1604,6 +1694,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(config.moe_rebalance.window_size, 128);
     EXPECT_EQ(config.moe_rebalance.max_window_size, 2048);
     EXPECT_FLOAT_EQ(config.moe_rebalance.window_growth_factor, 2.0f);
+    EXPECT_EQ(config.moe_rebalance.dynamic_imbalance_threshold_per_mille, 1100u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_min_improvement_per_mille, 10u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 7u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 28u);
+    EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 48u);
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
 }
 
@@ -1626,6 +1721,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
     }
     {
         ArgvHelper args{"llaminar2", "--moe-rebalance", "mystery"};
+        OrchestrationConfigParser parser;
+        EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
+    }
+    {
+        ArgvHelper args{"llaminar2", "--moe-dynamic-max-swaps-per-layer", "-1"};
         OrchestrationConfigParser parser;
         EXPECT_THROW(parser.parseArgs(args.argc(), args.argv()), std::invalid_argument);
     }

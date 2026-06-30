@@ -738,6 +738,7 @@ namespace llaminar2
             fields.push_back({prefix + ".scope", executionDomainScopeToString(domain.scope)});
             fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
             fields.push_back({prefix + ".compute_kind", executionDomainComputeKindToString(domain.compute_kind)});
+            fields.push_back({prefix + ".assignment_kind", executionDomainAssignmentKindToString(domain.assignment_kind)});
             fields.push_back({prefix + ".owner_rank", domain.owner_rank ? std::to_string(*domain.owner_rank) : "-1"});
             appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
             appendRankVectorFields(fields, prefix + ".rank", domain.ranks);
@@ -753,6 +754,7 @@ namespace llaminar2
             fields.push_back({prefix + ".kind", toString(domain.kind)});
             fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
             fields.push_back({prefix + ".compute_kind", toString(domain.compute_kind)});
+            fields.push_back({prefix + ".assignment_policy", routedExpertAssignmentPolicyToString(domain.assignment_policy)});
             fields.push_back({prefix + ".owner_rank", std::to_string(domain.owner_rank)});
             appendAddressVectorFields(fields, prefix + ".participant", domain.participants);
             appendRankVectorFields(fields, prefix + ".rank", domain.world_ranks);
@@ -839,6 +841,7 @@ namespace llaminar2
                 fields.push_back({prefix + ".kind", toString(domain.kind)});
                 fields.push_back({prefix + ".backend", collectiveBackendTypeToString(domain.backend)});
                 fields.push_back({prefix + ".compute_kind", toString(domain.compute_kind)});
+                fields.push_back({prefix + ".assignment_policy", routedExpertAssignmentPolicyToString(domain.assignment_policy)});
                 fields.push_back({prefix + ".primary_participant", domain.primary_participant.toString()});
                 fields.push_back({prefix + ".primary_device", domain.primary_device.to_string()});
                 fields.push_back({prefix + ".primary_world_rank", std::to_string(domain.primary_world_rank)});
@@ -1013,7 +1016,8 @@ namespace llaminar2
         std::optional<DeviceMoERebalanceTransferMode> selectGraphRebalanceTransferMode(
             const ILocalTPContext &tp_ctx,
             const DeviceId &destination_device,
-            uint32_t max_hot_replicas_per_participant)
+            uint32_t max_hot_replicas_per_participant,
+            bool requires_expert_payload_movement)
         {
             const auto &moe_env = debugEnv().moe_rebalance;
             if (moe_env.device_rebalance_payload_sideband ||
@@ -1026,11 +1030,12 @@ namespace llaminar2
                 return std::nullopt;
             }
 
-            if (max_hot_replicas_per_participant == 0)
+            if (max_hot_replicas_per_participant == 0 &&
+                !requires_expert_payload_movement)
             {
                 LOG_DEBUG("[Qwen35MoEGraph] Device-side MoE rebalance for "
                           << destination_device.to_string()
-                          << " is resident-only because hot replica capacity is zero; "
+                          << " is resident-only because no expert payload movement is enabled; "
                              "host publish/apply fallback remains disabled");
                 return DeviceMoERebalanceTransferMode::ResidentOnly;
             }
@@ -1742,7 +1747,6 @@ namespace llaminar2
             local_decode_layer &&
             env.moe_rebalance.device_rebalance_graph_controller &&
             config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC &&
-            env.moe_rebalance.gpu_cache_experts_per_layer <= 0 &&
             local_tp_ctx &&
             isHomogeneousGpuLocalTPRebalanceDomain(
                 *local_tp_ctx,
@@ -1791,8 +1795,7 @@ namespace llaminar2
             total_tokens == 1 &&
             use_expert_overlay &&
             overlay_plan &&
-            canUseLocalTPApportionedExpertsFastPath(*overlay_plan, device) &&
-            debugEnv().moe_rebalance.gpu_cache_experts_per_layer <= 0;
+            canUseLocalTPApportionedExpertsFastPath(*overlay_plan, device);
         const bool masked_local_tp_apportioned_decode_runtime_table =
             device_side_graph_rebalance_candidate &&
             !use_expert_overlay &&
@@ -1891,6 +1894,18 @@ namespace llaminar2
                 std::max(1, config_.moe.rebalance_config.window_size));
             rebalance_config.max_hot_replicas_per_participant = static_cast<uint32_t>(
                 std::min(hot_replica_cap, config_.moe.num_experts));
+            rebalance_config.dynamic_imbalance_threshold_per_mille =
+                config_.moe.rebalance_config.dynamic_imbalance_threshold_per_mille;
+            rebalance_config.dynamic_min_improvement_per_mille =
+                config_.moe.rebalance_config.dynamic_min_improvement_per_mille;
+            rebalance_config.dynamic_max_swaps_per_layer =
+                config_.moe.rebalance_config.dynamic_max_swaps_per_layer;
+            rebalance_config.dynamic_max_plan_entries_per_wave =
+                config_.moe.rebalance_config.dynamic_max_plan_entries_per_wave;
+            rebalance_config.dynamic_min_window_activations =
+                static_cast<uint32_t>(std::min<uint64_t>(
+                    config_.moe.rebalance_config.dynamic_min_window_activations,
+                    static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())));
             rebalance_config.min_load_spread_improvement = static_cast<uint32_t>(
                 std::max(0, env.moe_rebalance.device_rebalance_min_load_spread_improvement));
             rebalance_config.min_load_spread_improvement_divisor = static_cast<uint32_t>(
@@ -1899,6 +1914,8 @@ namespace llaminar2
                 std::max(0, env.moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot));
             rebalance_config.min_router_spread_improvement_per_payload_slot = static_cast<uint32_t>(
                 std::max(0, env.moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot));
+            rebalance_config.max_post_wave_load_spread_per_mille = static_cast<uint32_t>(
+                std::max(0, env.moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille));
             rebalance_config.flags =
                 static_cast<uint32_t>(DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
             if (rebalance_config.max_hot_replicas_per_participant > 0)
@@ -1981,12 +1998,15 @@ namespace llaminar2
 
             if (!graph_rebalance_transfer_mode.has_value())
             {
+                const bool dynamic_ownership_transfers =
+                    config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC;
                 graph_rebalance_transfer_mode =
                     selectGraphRebalanceTransferMode(
                         *local_tp_ctx,
                         device,
                         static_cast<uint32_t>(
-                            std::min(hot_replica_cap, config_.moe.num_experts)));
+                            std::min(hot_replica_cap, config_.moe.num_experts)),
+                        dynamic_ownership_transfers);
             }
             if (!graph_rebalance_transfer_mode.has_value())
             {
@@ -2913,6 +2933,8 @@ namespace llaminar2
                     local_tp_ctx && local_tp_ctx->degree() > 0
                         ? local_tp_ctx->degree()
                         : std::max(1, expert_params.my_socket_id + 1);
+                expert_params.routed_expert_assignment_policy =
+                    config_.moe.routed_expert_assignment_policy;
 
                 if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts &&
                     expert_params.expert_mask.empty())
@@ -3161,6 +3183,42 @@ namespace llaminar2
                 {
                     graph_rebalance_transfer_specs =
                         transferSlotSpecsFromExpertParams(expert_params, config_.moe.num_experts);
+                }
+
+                const bool least_loaded_prefill_runtime_grouping =
+                    moe_runtime_table &&
+                    total_tokens > 1 &&
+                    config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
+                if (least_loaded_prefill_runtime_grouping)
+                {
+                    const int participant_count = expert_params.participant_count;
+                    const auto owner_participants =
+                        ownerParticipantsFromMap(
+                            *owner_map_lifetime,
+                            layer_idx,
+                            config_.moe.num_experts);
+                    if (!initializeMaskedLocalDecodeRuntimeTable(
+                            moe_runtime_table,
+                            layer_idx,
+                            config_.moe.num_experts,
+                            config_.moe.top_k,
+                            config_.d_model,
+                            expert_intermediate,
+                            expert_params.expert_mask,
+                            local_participant,
+                            participant_count,
+                            owner_participants,
+                            expert_params.prepared_gate_gemm,
+                            expert_params.prepared_up_gemm,
+                            expert_params.prepared_down_gemm,
+                            nullptr,
+                            "LocalTP apportioned-experts LLEP grouped prefill runtime bank"))
+                    {
+                        throw std::runtime_error(
+                            "Qwen35 MoE graph failed to initialize masked LocalTP LLEP prefill runtime table for layer " +
+                            std::to_string(layer_idx) + " on " + device.to_string());
+                    }
+                    expert_params.use_runtime_prefill_grouping = true;
                 }
 
                 if (moe_runtime_table &&

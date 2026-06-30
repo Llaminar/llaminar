@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -819,6 +820,16 @@ extern "C"
         int current_slots, int max_slots, int num_experts, int top_k,
         int device_idx, void *stream);
 
+    bool hipMoE_regroup_prefill_routes_runtime_assignments(
+        void *runtime,
+        int current_slots, int max_slots, int num_experts, int top_k,
+        int device_idx, void *stream);
+
+    bool hipMoE_assign_prefill_routes_least_loaded_resident(
+        void *runtime,
+        int current_slots, int max_slots, int num_experts, int top_k,
+        int device_idx, void *stream);
+
     bool hipMoE_prefill_gather_expert_runtime(
         const void *runtime,
         const float *hidden,
@@ -1241,10 +1252,31 @@ namespace llaminar2
     {
         const uint64_t new_workspace_id = workspace ? workspace->id() : 0;
         if (workspace_ == workspace && bound_workspace_id_ == new_workspace_id)
+        {
+            const bool needs_descriptor_rebind =
+                workspace_ &&
+                (std::any_of(grouped_down_desc_tables_.begin(), grouped_down_desc_tables_.end(),
+                             [](const GroupedDownDescriptorTable &table)
+                             {
+                                 return table.valid && !table.host_descs.empty() && !table.device_descs;
+                             }) ||
+                 std::any_of(grouped_gateup_desc_tables_.begin(), grouped_gateup_desc_tables_.end(),
+                             [](const GroupedGateUpDescriptorTable &table)
+                             {
+                                 return table.valid &&
+                                        !table.host_gate_descs.empty() &&
+                                        !table.host_up_descs.empty() &&
+                                        (!table.device_gate_descs || !table.device_up_descs);
+                             }));
+            if (needs_descriptor_rebind)
+                (void)rebindGroupedDescriptorTablesToWorkspace("bindWorkspace");
             return;
+        }
         ROCmKernelBase::bindWorkspace(workspace);
         bound_workspace_id_ = new_workspace_id;
         clearWorkspaceScratchBindings();
+        if (workspace_)
+            (void)rebindGroupedDescriptorTablesToWorkspace("bindWorkspace");
     }
 
     bool ROCmMoEKernel::bindWorkspaceBuffer(
@@ -1277,6 +1309,8 @@ namespace llaminar2
 
     void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        d_histogram_ = nullptr;
+        d_expert_mask_ = nullptr;
         d_write_heads_ = nullptr;
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
@@ -1319,6 +1353,8 @@ namespace llaminar2
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
 
+        max_experts_ = 0;
+        max_layers_ = 0;
         max_write_heads_experts_ = 0;
         staging_capacity_ = 0;
         grouped_decode_active_cap_ = 0;
@@ -1344,6 +1380,23 @@ namespace llaminar2
         prefill_slots_cap_ = 0;
         prefill_d_model_cap_ = 0;
         prefill_intermediate_cap_ = 0;
+        router_fp16_gate_cache_.clear();
+        router_q8_gate_cache_.clear();
+        for (auto &table : grouped_down_desc_tables_)
+        {
+            table.device_descs = nullptr;
+            table.workspace_slot = 0;
+        }
+        for (auto &table : grouped_gateup_desc_tables_)
+        {
+            table.device_gate_descs = nullptr;
+            table.device_up_descs = nullptr;
+            table.workspace_slot = 0;
+        }
+        next_grouped_down_desc_workspace_slot_ = 0;
+        next_grouped_gateup_desc_workspace_slot_ = 0;
+        next_router_q8_gate_workspace_slot_ = 0;
+        next_router_fp16_gate_workspace_slot_ = 0;
         grouped_gateup_cached_expert_ids_.clear();
         grouped_down_cached_expert_ids_.clear();
         grouped_down_cached_weights_.clear();
@@ -1352,262 +1405,136 @@ namespace llaminar2
         scratch_workspace_bound_ = false;
     }
 
+    bool ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace(const char *context)
+    {
+        if (grouped_down_desc_tables_.empty() && grouped_gateup_desc_tables_.empty())
+            return true;
+        if (!setMoEDevice(device_ordinal_, context ? context : "rebindGroupedDescriptorTablesToWorkspace"))
+            return false;
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] explicit HIP stream is required");
+            return false;
+        }
+
+        next_grouped_down_desc_workspace_slot_ = 0;
+        for (auto &table : grouped_down_desc_tables_)
+        {
+            if (!table.valid || table.host_descs.empty() || table.num_experts <= 0)
+                continue;
+            const std::size_t slot = next_grouped_down_desc_workspace_slot_;
+            if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+            {
+                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] down descriptor slots exhausted");
+                table.device_descs = nullptr;
+                return false;
+            }
+            const size_t desc_bytes =
+                static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            void *base = nullptr;
+            const size_t table_bytes =
+                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+            if (!bindWorkspaceBuffer(&base,
+                                     MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
+                                     table_bytes,
+                                     "ROCm grouped down descriptor table rebind"))
+            {
+                table.device_descs = nullptr;
+                return false;
+            }
+            auto *device_descs =
+                static_cast<DeviceNativeVNNIMatrixDesc *>(base) +
+                slot * static_cast<std::size_t>(table.num_experts);
+            const hipError_t err = hipMemcpyAsync(device_descs,
+                                                  table.host_descs.data(),
+                                                  desc_bytes,
+                                                  hipMemcpyHostToDevice,
+                                                  stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] down descriptor upload failed: "
+                          << hipGetErrorString(err));
+                table.device_descs = nullptr;
+                return false;
+            }
+            table.device_descs = device_descs;
+            table.workspace_slot = slot;
+            next_grouped_down_desc_workspace_slot_ = slot + 1;
+        }
+
+        next_grouped_gateup_desc_workspace_slot_ = 0;
+        for (auto &table : grouped_gateup_desc_tables_)
+        {
+            if (!table.valid || table.host_gate_descs.empty() ||
+                table.host_up_descs.empty() || table.num_experts <= 0)
+            {
+                continue;
+            }
+            const std::size_t slot = next_grouped_gateup_desc_workspace_slot_;
+            if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
+            {
+                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] gate/up descriptor slots exhausted");
+                table.device_gate_descs = nullptr;
+                table.device_up_descs = nullptr;
+                return false;
+            }
+            const size_t desc_bytes =
+                static_cast<size_t>(table.num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+            const size_t table_bytes =
+                static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+            void *gate_base = nullptr;
+            void *up_base = nullptr;
+            if (!bindWorkspaceBuffer(&gate_base,
+                                     MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
+                                     table_bytes,
+                                     "ROCm grouped gate descriptor table rebind") ||
+                !bindWorkspaceBuffer(&up_base,
+                                     MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
+                                     table_bytes,
+                                     "ROCm grouped up descriptor table rebind"))
+            {
+                table.device_gate_descs = nullptr;
+                table.device_up_descs = nullptr;
+                return false;
+            }
+            auto *device_gate_descs =
+                static_cast<DeviceNativeVNNIMatrixDesc *>(gate_base) +
+                slot * static_cast<std::size_t>(table.num_experts);
+            auto *device_up_descs =
+                static_cast<DeviceNativeVNNIMatrixDesc *>(up_base) +
+                slot * static_cast<std::size_t>(table.num_experts);
+            hipError_t err = hipMemcpyAsync(device_gate_descs,
+                                            table.host_gate_descs.data(),
+                                            desc_bytes,
+                                            hipMemcpyHostToDevice,
+                                            stream);
+            if (err == hipSuccess)
+                err = hipMemcpyAsync(device_up_descs,
+                                     table.host_up_descs.data(),
+                                     desc_bytes,
+                                     hipMemcpyHostToDevice,
+                                     stream);
+            if (err != hipSuccess)
+            {
+                LOG_ERROR("[ROCmMoEKernel::rebindGroupedDescriptorTablesToWorkspace] gate/up descriptor upload failed: "
+                          << hipGetErrorString(err));
+                table.device_gate_descs = nullptr;
+                table.device_up_descs = nullptr;
+                return false;
+            }
+            table.device_gate_descs = device_gate_descs;
+            table.device_up_descs = device_up_descs;
+            table.workspace_slot = slot;
+            next_grouped_gateup_desc_workspace_slot_ = slot + 1;
+        }
+        return true;
+    }
+
     ROCmMoEKernel::~ROCmMoEKernel()
     {
         (void)setMoEDevice(device_ordinal_, "destructor");
-        if (scratch_workspace_bound_)
-            clearWorkspaceScratchBindings();
-        if (d_histogram_)
-        {
-            (void)hipFree(d_histogram_);
-            d_histogram_ = nullptr;
-        }
-        if (d_expert_mask_)
-        {
-            (void)hipFree(d_expert_mask_);
-            d_expert_mask_ = nullptr;
-        }
-        if (d_group_expert_mask_)
-        {
-            (void)hipFree(d_group_expert_mask_);
-            d_group_expert_mask_ = nullptr;
-        }
-        if (d_write_heads_)
-        {
-            (void)hipFree(d_write_heads_);
-            d_write_heads_ = nullptr;
-        }
-        if (d_staging_indices_)
-        {
-            (void)hipFree(d_staging_indices_);
-            d_staging_indices_ = nullptr;
-        }
-        if (d_staging_weights_)
-        {
-            (void)hipFree(d_staging_weights_);
-            d_staging_weights_ = nullptr;
-        }
-        if (d_grouped_gate_ptrs_)
-        {
-            (void)hipFree(d_grouped_gate_ptrs_);
-            d_grouped_gate_ptrs_ = nullptr;
-        }
-        if (d_grouped_up_ptrs_)
-        {
-            (void)hipFree(d_grouped_up_ptrs_);
-            d_grouped_up_ptrs_ = nullptr;
-        }
-        if (d_grouped_expert_ids_)
-        {
-            (void)hipFree(d_grouped_expert_ids_);
-            d_grouped_expert_ids_ = nullptr;
-        }
-        if (d_grouped_decode_weights_)
-        {
-            (void)hipFree(d_grouped_decode_weights_);
-            d_grouped_decode_weights_ = nullptr;
-        }
-        if (d_grouped_down_descs_)
-        {
-            (void)hipFree(d_grouped_down_descs_);
-            d_grouped_down_descs_ = nullptr;
-        }
-        if (d_grouped_swiglu_int8_)
-        {
-            (void)hipFree(d_grouped_swiglu_int8_);
-            d_grouped_swiglu_int8_ = nullptr;
-        }
-        if (d_grouped_swiglu_scales_)
-        {
-            (void)hipFree(d_grouped_swiglu_scales_);
-            d_grouped_swiglu_scales_ = nullptr;
-        }
-        if (d_grouped_gate_output_ptrs_)
-        {
-            (void)hipFree(d_grouped_gate_output_ptrs_);
-            d_grouped_gate_output_ptrs_ = nullptr;
-        }
-        if (d_grouped_up_output_ptrs_)
-        {
-            (void)hipFree(d_grouped_up_output_ptrs_);
-            d_grouped_up_output_ptrs_ = nullptr;
-        }
-        if (d_grouped_gateup_expert_ids_)
-        {
-            (void)hipFree(d_grouped_gateup_expert_ids_);
-            d_grouped_gateup_expert_ids_ = nullptr;
-        }
-        if (d_grouped_hidden_int8_)
-        {
-            (void)hipFree(d_grouped_hidden_int8_);
-            d_grouped_hidden_int8_ = nullptr;
-        }
-        if (d_grouped_hidden_scales_)
-        {
-            (void)hipFree(d_grouped_hidden_scales_);
-            d_grouped_hidden_scales_ = nullptr;
-        }
-        if (d_grouped_gateup_gate_partials_)
-        {
-            (void)hipFree(d_grouped_gateup_gate_partials_);
-            d_grouped_gateup_gate_partials_ = nullptr;
-        }
-        if (d_grouped_gateup_up_partials_)
-        {
-            (void)hipFree(d_grouped_gateup_up_partials_);
-            d_grouped_gateup_up_partials_ = nullptr;
-        }
-        if (d_shared_gate_scratch_)
-        {
-            (void)hipFree(d_shared_gate_scratch_);
-            d_shared_gate_scratch_ = nullptr;
-        }
-        if (d_route_logits_)
-        {
-            (void)hipFree(d_route_logits_);
-            d_route_logits_ = nullptr;
-        }
-        if (d_route_logits_partials_)
-        {
-            (void)hipFree(d_route_logits_partials_);
-            d_route_logits_partials_ = nullptr;
-        }
-        if (d_router_q8_hidden_)
-        {
-            (void)hipFree(d_router_q8_hidden_);
-            d_router_q8_hidden_ = nullptr;
-        }
-        if (d_router_q8_hidden_scales_)
-        {
-            (void)hipFree(d_router_q8_hidden_scales_);
-            d_router_q8_hidden_scales_ = nullptr;
-        }
-        if (d_route_indices_)
-        {
-            (void)hipFree(d_route_indices_);
-            d_route_indices_ = nullptr;
-        }
-        if (d_route_weights_)
-        {
-            (void)hipFree(d_route_weights_);
-            d_route_weights_ = nullptr;
-        }
-        if (d_group_int_indices_)
-        {
-            (void)hipFree(d_group_int_indices_);
-            d_group_int_indices_ = nullptr;
-        }
-        if (d_group_offsets_)
-        {
-            (void)hipFree(d_group_offsets_);
-            d_group_offsets_ = nullptr;
-        }
-        if (d_group_counts_)
-        {
-            (void)hipFree(d_group_counts_);
-            d_group_counts_ = nullptr;
-        }
-        if (d_group_max_tokens_)
-        {
-            (void)hipFree(d_group_max_tokens_);
-            d_group_max_tokens_ = nullptr;
-        }
-        if (d_group_token_indices_)
-        {
-            (void)hipFree(d_group_token_indices_);
-            d_group_token_indices_ = nullptr;
-        }
-        if (d_group_original_to_grouped_)
-        {
-            (void)hipFree(d_group_original_to_grouped_);
-            d_group_original_to_grouped_ = nullptr;
-        }
-        if (d_group_weights_)
-        {
-            (void)hipFree(d_group_weights_);
-            d_group_weights_ = nullptr;
-        }
-        if (d_group_active_expert_ids_)
-        {
-            (void)hipFree(d_group_active_expert_ids_);
-            d_group_active_expert_ids_ = nullptr;
-        }
-        for (auto &entry : router_fp16_gate_cache_)
-        {
-            if (entry.d_gate_weights_fp16)
-            {
-                (void)hipFree(entry.d_gate_weights_fp16);
-                entry.d_gate_weights_fp16 = nullptr;
-            }
-        }
-        router_fp16_gate_cache_.clear();
-        for (auto &entry : router_q8_gate_cache_)
-        {
-            if (entry.d_gate_weights_q8)
-            {
-                (void)hipFree(entry.d_gate_weights_q8);
-                entry.d_gate_weights_q8 = nullptr;
-            }
-            if (entry.d_gate_scales)
-            {
-                (void)hipFree(entry.d_gate_scales);
-                entry.d_gate_scales = nullptr;
-            }
-        }
-        router_q8_gate_cache_.clear();
-        for (auto &table : grouped_down_desc_tables_)
-        {
-            if (table.device_descs)
-            {
-                (void)hipFree(table.device_descs);
-                table.device_descs = nullptr;
-            }
-        }
-        for (auto &table : grouped_gateup_desc_tables_)
-        {
-            if (table.device_gate_descs)
-            {
-                (void)hipFree(table.device_gate_descs);
-                table.device_gate_descs = nullptr;
-            }
-            if (table.device_up_descs)
-            {
-                (void)hipFree(table.device_up_descs);
-                table.device_up_descs = nullptr;
-            }
-        }
-
-        // Phase 5: grouped prefill scratch
-        if (d_prefill_A_int8_)
-        {
-            (void)hipFree(d_prefill_A_int8_);
-            d_prefill_A_int8_ = nullptr;
-        }
-        if (d_prefill_A_scales_)
-        {
-            (void)hipFree(d_prefill_A_scales_);
-            d_prefill_A_scales_ = nullptr;
-        }
-        if (d_prefill_swiglu_int8_)
-        {
-            (void)hipFree(d_prefill_swiglu_int8_);
-            d_prefill_swiglu_int8_ = nullptr;
-        }
-        if (d_prefill_swiglu_scales_)
-        {
-            (void)hipFree(d_prefill_swiglu_scales_);
-            d_prefill_swiglu_scales_ = nullptr;
-        }
-        if (d_prefill_gate_)
-        {
-            (void)hipFree(d_prefill_gate_);
-            d_prefill_gate_ = nullptr;
-        }
-        if (d_prefill_up_)
-        {
-            (void)hipFree(d_prefill_up_);
-            d_prefill_up_ = nullptr;
-        }
+        clearWorkspaceScratchBindings();
     }
 
     void ROCmMoEKernel::resetDynamicState()
@@ -1835,10 +1762,6 @@ namespace llaminar2
                 it->num_experts == num_experts &&
                 it->source_device_ptr != device_ptr_key)
             {
-                if (it->d_gate_weights_q8)
-                    (void)hipFree(it->d_gate_weights_q8);
-                if (it->d_gate_scales)
-                    (void)hipFree(it->d_gate_scales);
                 it = router_q8_gate_cache_.erase(it);
             }
             else
@@ -1847,29 +1770,43 @@ namespace llaminar2
             }
         }
 
-        int8_t *d_gate_weights_q8 = nullptr;
-        float *d_gate_scales = nullptr;
-        hipError_t err = hipMalloc(&d_gate_weights_q8, element_count * sizeof(int8_t));
-        if (err == hipSuccess)
+        const std::size_t slot = next_router_q8_gate_workspace_slot_;
+        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots))
         {
-            err = hipMalloc(&d_gate_scales, scale_count * sizeof(float));
-        }
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] hipMalloc Q8 router gate failed: "
-                      << hipGetErrorString(err));
-            if (d_gate_weights_q8)
-                (void)hipFree(d_gate_weights_q8);
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] Q8 router gate workspace slots exhausted: "
+                      << slot << " capacity=" << MoEWorkspaceBuffers::kRouterGateCacheSlots);
             return nullptr;
         }
+
+        void *gate_weights_base = nullptr;
+        void *gate_scales_base = nullptr;
+        const size_t weights_bytes =
+            static_cast<size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots) *
+            element_count * sizeof(int8_t);
+        const size_t scales_bytes =
+            static_cast<size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots) *
+            scale_count * sizeof(float);
+        if (!bindWorkspaceBuffer(&gate_weights_base,
+                                 MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_WEIGHTS,
+                                 weights_bytes,
+                                 "ROCm Q8 router gate weights") ||
+            !bindWorkspaceBuffer(&gate_scales_base,
+                                 MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_SCALES,
+                                 scales_bytes,
+                                 "ROCm Q8 router gate scales"))
+        {
+            return nullptr;
+        }
+        int8_t *d_gate_weights_q8 =
+            static_cast<int8_t *>(gate_weights_base) + slot * element_count;
+        float *d_gate_scales =
+            static_cast<float *>(gate_scales_base) + slot * scale_count;
 
         if (!hipMoE_quantize_router_gate_q8(gate_device_ptr, d_gate_weights_q8, d_gate_scales,
                                             d_model, num_experts,
                                             device_ordinal_, stream))
         {
             LOG_ERROR("[ROCmMoEKernel::getOrCreateQ8RouterGateCache] FP32->Q8 router gate conversion launch failed");
-            (void)hipFree(d_gate_weights_q8);
-            (void)hipFree(d_gate_scales);
             return nullptr;
         }
 
@@ -1883,7 +1820,9 @@ namespace llaminar2
         entry.scale_count = scale_count;
         entry.d_gate_weights_q8 = d_gate_weights_q8;
         entry.d_gate_scales = d_gate_scales;
+        entry.workspace_slot = slot;
         router_q8_gate_cache_.push_back(entry);
+        next_router_q8_gate_workspace_slot_ = slot + 1;
 
         LOG_DEBUG("[ROCmMoEKernel] Cached Q8 router gate tensor="
                   << reinterpret_cast<const void *>(tensor_key)
@@ -1902,7 +1841,10 @@ namespace llaminar2
         if (!debugEnv().rocm.moe_router_fp16)
             return nullptr;
         if (!gate_weights || !gate_device_ptr || d_model <= 0 || num_experts <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] invalid FP16 router gate request");
             return nullptr;
+        }
 
         const auto tensor_key = reinterpret_cast<std::uintptr_t>(gate_weights);
         const auto device_ptr_key = reinterpret_cast<std::uintptr_t>(gate_device_ptr);
@@ -1930,7 +1872,12 @@ namespace llaminar2
         }
         if (capture_active || capture_status == hipStreamCaptureStatusActive)
         {
-            LOG_DEBUG("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] cache miss during graph capture; falling back to FP32 router");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP16 router cache miss during graph capture");
+            return nullptr;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] explicit HIP stream is required");
             return nullptr;
         }
 
@@ -1938,14 +1885,14 @@ namespace llaminar2
         const size_t experts_sz = static_cast<size_t>(num_experts);
         if (d_model_sz > std::numeric_limits<size_t>::max() / experts_sz)
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] router gate size overflow");
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] router gate size overflow");
             return nullptr;
         }
         const size_t element_count = d_model_sz * experts_sz;
         if (element_count > static_cast<size_t>(std::numeric_limits<int>::max()))
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] router gate too large for conversion kernel: elements="
-                     << element_count);
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] router gate too large for conversion kernel: elements="
+                      << element_count);
             return nullptr;
         }
 
@@ -1959,8 +1906,6 @@ namespace llaminar2
                 it->num_experts == num_experts &&
                 it->source_device_ptr != device_ptr_key)
             {
-                if (it->d_gate_weights_fp16)
-                    (void)hipFree(it->d_gate_weights_fp16);
                 it = router_fp16_gate_cache_.erase(it);
             }
             else
@@ -1969,21 +1914,32 @@ namespace llaminar2
             }
         }
 
-        void *d_gate_weights_fp16 = nullptr;
-        hipError_t err = hipMalloc(&d_gate_weights_fp16, element_count * sizeof(uint16_t));
-        if (err != hipSuccess)
+        const std::size_t slot = next_router_fp16_gate_workspace_slot_;
+        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots))
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] hipMalloc FP16 router gate failed: "
-                     << hipGetErrorString(err));
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP16 router gate workspace slots exhausted: "
+                      << slot << " capacity=" << MoEWorkspaceBuffers::kRouterGateCacheSlots);
             return nullptr;
         }
+        void *gate_weights_base = nullptr;
+        const size_t weights_bytes =
+            static_cast<size_t>(MoEWorkspaceBuffers::kRouterGateCacheSlots) *
+            element_count * sizeof(uint16_t);
+        if (!bindWorkspaceBuffer(&gate_weights_base,
+                                 MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS,
+                                 weights_bytes,
+                                 "ROCm FP16 router gate weights"))
+        {
+            return nullptr;
+        }
+        void *d_gate_weights_fp16 =
+            static_cast<uint16_t *>(gate_weights_base) + slot * element_count;
 
         if (!hipMoE_fp32_to_fp16(gate_device_ptr, d_gate_weights_fp16,
                                  static_cast<int>(element_count),
-                                 device_ordinal_, getStream()))
+                                 device_ordinal_, stream))
         {
-            LOG_WARN("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP32->FP16 router gate conversion launch failed; falling back to FP32 router");
-            (void)hipFree(d_gate_weights_fp16);
+            LOG_ERROR("[ROCmMoEKernel::getOrCreateFP16RouterGateCache] FP32->FP16 router gate conversion launch failed");
             return nullptr;
         }
 
@@ -1994,7 +1950,9 @@ namespace llaminar2
         entry.num_experts = num_experts;
         entry.element_count = element_count;
         entry.d_gate_weights_fp16 = d_gate_weights_fp16;
+        entry.workspace_slot = slot;
         router_fp16_gate_cache_.push_back(entry);
+        next_router_fp16_gate_workspace_slot_ = slot + 1;
 
         LOG_DEBUG("[ROCmMoEKernel] Cached FP16 router gate tensor="
                   << reinterpret_cast<const void *>(tensor_key)
@@ -2324,34 +2282,50 @@ namespace llaminar2
 
     void ROCmMoEKernel::allocateHistogramBuffers(int num_layers, int num_experts)
     {
+        if (num_layers <= 0 || num_experts <= 0)
+            return;
+
         // Already allocated with sufficient dimensions?
         if (d_histogram_ && max_layers_ >= num_layers && max_experts_ >= num_experts)
             return;
 
         if (!setMoEDevice(device_ordinal_, "allocateHistogramBuffers"))
             return;
-
-        // Free old if dimensions grew
-        if (d_histogram_)
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
         {
-            (void)hipFree(d_histogram_);
-            d_histogram_ = nullptr;
-        }
-
-        max_layers_ = num_layers;
-        max_experts_ = num_experts;
-
-        const size_t total = static_cast<size_t>(max_layers_) * max_experts_;
-        hipError_t err = hipMalloc(&d_histogram_, total * sizeof(uint64_t));
-        if (err != hipSuccess)
-        {
-            LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] hipMalloc histogram failed: "
-                      << hipGetErrorString(err));
-            d_histogram_ = nullptr;
+            LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] explicit HIP stream is required");
             return;
         }
 
-        err = hipMemset(d_histogram_, 0, total * sizeof(uint64_t));
+        if (num_layers > MoEWorkspaceBuffers::kHistogramLayerSlots)
+        {
+            LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] requested histogram layer count "
+                      << num_layers << " exceeds workspace capacity "
+                      << MoEWorkspaceBuffers::kHistogramLayerSlots);
+            return;
+        }
+
+        void *histogram = nullptr;
+        const size_t total = static_cast<size_t>(MoEWorkspaceBuffers::kHistogramLayerSlots) *
+                             static_cast<size_t>(num_experts);
+        if (!bindWorkspaceBuffer(&histogram,
+                                 MoEWorkspaceBuffers::ROCM_HISTOGRAM_COUNTS,
+                                 total * sizeof(uint64_t),
+                                 "ROCm MoE histogram counts"))
+        {
+            d_histogram_ = nullptr;
+            max_layers_ = 0;
+            max_experts_ = 0;
+            return;
+        }
+
+        d_histogram_ = static_cast<uint64_t *>(histogram);
+        max_layers_ = num_layers;
+        max_experts_ = num_experts;
+
+        hipError_t err = hipMemsetAsync(d_histogram_, 0, total * sizeof(uint64_t),
+                                        stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::allocateHistogramBuffers] hipMemset failed: "
@@ -2463,27 +2437,27 @@ namespace llaminar2
 
         if (!setMoEDevice(device_ordinal_, "updateExpertMaskDevice"))
             return;
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        if (!stream)
+        {
+            LOG_ERROR("[ROCmMoEKernel::updateExpertMaskDevice] explicit HIP stream is required");
+            return;
+        }
 
-        // Allocate or reallocate if needed
         if (!d_expert_mask_ || num_experts > max_experts_)
         {
-            if (d_expert_mask_)
-                (void)hipFree(d_expert_mask_);
-
-            hipError_t err = hipMalloc(&d_expert_mask_, num_experts * sizeof(bool));
-            if (err != hipSuccess)
+            if (!bindWorkspaceBuffer(reinterpret_cast<void **>(&d_expert_mask_),
+                                     MoEWorkspaceBuffers::ROCM_EXPERT_MASK,
+                                     static_cast<size_t>(num_experts) * sizeof(bool),
+                                     "ROCm MoE expert mask"))
             {
-                LOG_ERROR("[ROCmMoEKernel::updateExpertMaskDevice] hipMalloc mask failed: "
-                          << hipGetErrorString(err));
                 d_expert_mask_ = nullptr;
                 return;
             }
-            // Update max_experts_ if the mask required more
             if (num_experts > max_experts_)
                 max_experts_ = num_experts;
         }
 
-        hipStream_t stream = static_cast<hipStream_t>(getStream());
         hipError_t err = hipMemcpyAsync(
             d_expert_mask_, mask,
             num_experts * sizeof(bool),
@@ -4776,6 +4750,26 @@ namespace llaminar2
         if (codebook_mask & (codebook_mask - 1u))
             codebook_id = kROCmMoEMixedCodebookSentinel;
 
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
+        {
+            const auto &existing = grouped_down_desc_tables_[index];
+            if (!existing.valid ||
+                !existing.device_descs ||
+                existing.num_experts != num_experts ||
+                existing.d_model != d_model ||
+                existing.intermediate != intermediate ||
+                existing.codebook_id != codebook_id ||
+                existing.codebook_mask != codebook_mask ||
+                existing.host_descs.size() != static_cast<size_t>(num_experts))
+            {
+                continue;
+            }
+            if (std::memcmp(existing.host_descs.data(), down_descs, desc_bytes) == 0)
+                return static_cast<int>(index);
+        }
+
         GroupedDownDescriptorTable table;
         table.host_descs.assign(down_descs, down_descs + num_experts);
         table.num_experts = num_experts;
@@ -4784,31 +4778,47 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
 
-        DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
-        hipError_t err = hipMalloc(&device_descs,
-                                   static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
-        if (err != hipSuccess)
+        const std::size_t slot = next_grouped_down_desc_workspace_slot_;
+        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
         {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] hipMalloc failed: "
-                      << hipGetErrorString(err));
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] descriptor workspace slots exhausted: "
+                      << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
             return -1;
         }
+        void *device_desc_base = nullptr;
+        const size_t table_bytes =
+            static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+        hipError_t err = hipSuccess;
+        if (!bindWorkspaceBuffer(&device_desc_base,
+                                 MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,
+                                 table_bytes,
+                                 "ROCm grouped down descriptor tables"))
+        {
+            err = hipErrorInvalidValue;
+        }
+        DeviceNativeVNNIMatrixDesc *device_descs =
+            err == hipSuccess
+                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_desc_base) +
+                      slot * static_cast<std::size_t>(num_experts)
+                : nullptr;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
-        err = hipMemcpyAsync(device_descs, table.host_descs.data(),
-                             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
-                             hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(device_descs, table.host_descs.data(),
+                                 desc_bytes,
+                                 hipMemcpyHostToDevice, stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertDownDescriptorTable] H2D descriptor table upload failed: "
                       << hipGetErrorString(err));
-            (void)hipFree(device_descs);
             return -1;
         }
 
         table.device_descs = device_descs;
+        table.workspace_slot = slot;
         table.valid = true;
         grouped_down_desc_tables_.push_back(std::move(table));
+        next_grouped_down_desc_workspace_slot_ = slot + 1;
         return static_cast<int>(grouped_down_desc_tables_.size() - 1);
     }
 
@@ -4876,6 +4886,29 @@ namespace llaminar2
         if (codebook_mask & (codebook_mask - 1u))
             codebook_id = kROCmMoEMixedCodebookSentinel;
 
+        const size_t desc_bytes =
+            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc);
+        for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
+        {
+            const auto &existing = grouped_gateup_desc_tables_[index];
+            if (!existing.valid ||
+                !existing.device_gate_descs ||
+                !existing.device_up_descs ||
+                existing.num_experts != num_experts ||
+                existing.d_model != d_model ||
+                existing.intermediate != intermediate ||
+                existing.codebook_id != codebook_id ||
+                existing.codebook_mask != codebook_mask ||
+                existing.host_gate_descs.size() != static_cast<size_t>(num_experts) ||
+                existing.host_up_descs.size() != static_cast<size_t>(num_experts))
+            {
+                continue;
+            }
+            if (std::memcmp(existing.host_gate_descs.data(), gate_descs, desc_bytes) == 0 &&
+                std::memcmp(existing.host_up_descs.data(), up_descs, desc_bytes) == 0)
+                return static_cast<int>(index);
+        }
+
         GroupedGateUpDescriptorTable table;
         table.host_gate_descs.assign(gate_descs, gate_descs + num_experts);
         table.host_up_descs.assign(up_descs, up_descs + num_experts);
@@ -4885,45 +4918,62 @@ namespace llaminar2
         table.codebook_id = codebook_id;
         table.codebook_mask = codebook_mask;
 
-        DeviceNativeVNNIMatrixDesc *device_gate_descs = nullptr;
-        DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
-        hipError_t err = hipMalloc(&device_gate_descs,
-                                   static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
-        if (err == hipSuccess)
-            err = hipMalloc(&device_up_descs,
-                            static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc));
-        if (err != hipSuccess)
+        const std::size_t slot = next_grouped_gateup_desc_workspace_slot_;
+        if (slot >= static_cast<std::size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots))
         {
-            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] hipMalloc failed: "
-                      << hipGetErrorString(err));
-            if (device_gate_descs)
-                (void)hipFree(device_gate_descs);
-            if (device_up_descs)
-                (void)hipFree(device_up_descs);
+            LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] descriptor workspace slots exhausted: "
+                      << slot << " capacity=" << MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
             return -1;
         }
+        void *device_gate_desc_base = nullptr;
+        void *device_up_desc_base = nullptr;
+        const size_t table_bytes =
+            static_cast<size_t>(MoEWorkspaceBuffers::kGroupedDescriptorTableSlots) * desc_bytes;
+        hipError_t err = hipSuccess;
+        if (!bindWorkspaceBuffer(&device_gate_desc_base,
+                                 MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,
+                                 table_bytes,
+                                 "ROCm grouped gate descriptor tables") ||
+            !bindWorkspaceBuffer(&device_up_desc_base,
+                                 MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,
+                                 table_bytes,
+                                 "ROCm grouped up descriptor tables"))
+        {
+            err = hipErrorInvalidValue;
+        }
+        DeviceNativeVNNIMatrixDesc *device_gate_descs =
+            err == hipSuccess
+                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_gate_desc_base) +
+                      slot * static_cast<std::size_t>(num_experts)
+                : nullptr;
+        DeviceNativeVNNIMatrixDesc *device_up_descs =
+            err == hipSuccess
+                ? static_cast<DeviceNativeVNNIMatrixDesc *>(device_up_desc_base) +
+                      slot * static_cast<std::size_t>(num_experts)
+                : nullptr;
 
         hipStream_t stream = static_cast<hipStream_t>(getStream());
-        err = hipMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
-                             static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
-                             hipMemcpyHostToDevice, stream);
+        if (err == hipSuccess)
+            err = hipMemcpyAsync(device_gate_descs, table.host_gate_descs.data(),
+                                 desc_bytes,
+                                 hipMemcpyHostToDevice, stream);
         if (err == hipSuccess)
             err = hipMemcpyAsync(device_up_descs, table.host_up_descs.data(),
-                                 static_cast<size_t>(num_experts) * sizeof(DeviceNativeVNNIMatrixDesc),
+                                 desc_bytes,
                                  hipMemcpyHostToDevice, stream);
         if (err != hipSuccess)
         {
             LOG_ERROR("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] H2D descriptor upload failed: "
                       << hipGetErrorString(err));
-            (void)hipFree(device_gate_descs);
-            (void)hipFree(device_up_descs);
             return -1;
         }
 
         table.device_gate_descs = device_gate_descs;
         table.device_up_descs = device_up_descs;
+        table.workspace_slot = slot;
         table.valid = true;
         grouped_gateup_desc_tables_.push_back(std::move(table));
+        next_grouped_gateup_desc_workspace_slot_ = slot + 1;
         return static_cast<int>(grouped_gateup_desc_tables_.size() - 1);
     }
 
@@ -6341,6 +6391,76 @@ namespace llaminar2
             getStream());
     }
 
+    bool ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::regroupPrefillRoutesFromRuntimeAssignments] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "regroupPrefillRoutesFromRuntimeAssignments"))
+            return false;
+
+        return hipMoE_regroup_prefill_routes_runtime_assignments(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            getStream());
+    }
+
+    bool ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens, int num_experts, int top_k)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (!getStream())
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesLeastLoadedResident] explicit stream is required");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesLeastLoadedResident"))
+            return false;
+
+        return hipMoE_assign_prefill_routes_least_loaded_resident(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            getStream());
+    }
+
     bool ROCmMoEKernel::gatherPrefillExpertBatchFromRuntime(
         DeviceMoELayerRuntime *runtime_layer,
         ITensor *hidden, ITensor *batch_buffer,
@@ -7347,6 +7467,140 @@ namespace llaminar2
                     {"gateup_route", use_gateup_kpart ? "kpart_prefill" : "fused_prefill"},
                     {"gateup_kparts", std::to_string(use_gateup_kpart ? gateup_k_partitions : 0)}});
         }
+        return true;
+    }
+
+    bool ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime(
+        const DeviceMoELayerRuntime &runtime_layer,
+        ITensor *hidden, ITensor *output,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        int seq_len, int d_model, int intermediate,
+        int num_experts, int top_k)
+    {
+        if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "executeGroupedPrefillPipelineFromRuntime"))
+            return false;
+        if (runtime_layer.expert_count != static_cast<uint32_t>(num_experts) ||
+            runtime_layer.top_k != static_cast<uint32_t>(top_k) ||
+            runtime_layer.prefill_token_capacity < static_cast<uint32_t>(seq_len) ||
+            runtime_layer.prefill_route_capacity < static_cast<uint32_t>(seq_len * top_k) ||
+            !runtime_layer.expert_counts ||
+            !runtime_layer.expert_offsets ||
+            !runtime_layer.grouped_token_ids ||
+            !runtime_layer.grouped_route_weights)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid runtime scratch contract"
+                      << " expert_count=" << runtime_layer.expert_count
+                      << " expected_experts=" << num_experts
+                      << " top_k=" << runtime_layer.top_k
+                      << " expected_top_k=" << top_k
+                      << " token_capacity=" << runtime_layer.prefill_token_capacity
+                      << " seq_len=" << seq_len
+                      << " route_capacity=" << runtime_layer.prefill_route_capacity
+                      << " total_slots=" << (seq_len * top_k));
+            return false;
+        }
+        if (gateup_desc_table_id < 0 ||
+            gateup_desc_table_id >= static_cast<int>(grouped_gateup_desc_tables_.size()) ||
+            down_desc_table_id < 0 ||
+            down_desc_table_id >= static_cast<int>(grouped_down_desc_tables_.size()))
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] invalid descriptor table id");
+            return false;
+        }
+
+        const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
+        const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if (!gateup_table.valid || !down_table.valid ||
+            gateup_table.num_experts != num_experts ||
+            down_table.num_experts != num_experts ||
+            gateup_table.d_model != d_model ||
+            down_table.d_model != d_model ||
+            gateup_table.intermediate != intermediate ||
+            down_table.intermediate != intermediate)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] descriptor table shape mismatch");
+            return false;
+        }
+
+        const int total_slots = seq_len * top_k;
+        const int max_tokens_per_expert = seq_len;
+        if (!ensureGroupedPrefillScratchCapacity(total_slots, d_model, intermediate))
+            return false;
+
+        hidden->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+        output->ensureOnDevice(DeviceId::rocm(device_ordinal_));
+
+        const float *d_hidden = static_cast<const float *>(hidden->gpu_data_ptr());
+        float *d_output = static_cast<float *>(output->gpu_data_ptr());
+        if (!d_hidden || !d_output)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] null device pointers");
+            return false;
+        }
+
+        hipStream_t stream = static_cast<hipStream_t>(getStream());
+        hipError_t memset_err = hipMemsetAsync(
+            d_output,
+            0,
+            static_cast<size_t>(seq_len) * d_model * sizeof(float),
+            stream);
+        if (memset_err != hipSuccess)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] output zero failed: "
+                      << hipGetErrorString(memset_err));
+            return false;
+        }
+
+        const bool ok = rocmMoE_grouped_prefill_pipeline(
+            d_hidden,
+            gateup_table.device_gate_descs,
+            gateup_table.device_up_descs,
+            down_table.device_descs,
+            runtime_layer.expert_counts,
+            runtime_layer.expert_offsets,
+            runtime_layer.grouped_token_ids,
+            nullptr,
+            runtime_layer.grouped_route_weights,
+            nullptr,
+            d_prefill_A_int8_,
+            d_prefill_A_scales_,
+            d_prefill_gate_,
+            d_prefill_up_,
+            nullptr,
+            nullptr,
+            d_prefill_swiglu_int8_,
+            d_prefill_swiglu_scales_,
+            d_prefill_gate_,
+            d_output,
+            num_experts,
+            d_model,
+            intermediate,
+            max_tokens_per_expert,
+            total_slots,
+            top_k,
+            0,
+            gateup_table.codebook_id,
+            down_table.codebook_id,
+            gateup_table.codebook_mask,
+            down_table.codebook_mask,
+            debugEnv().rocm.moe_prefill_tile_m,
+            0,
+            device_ordinal_,
+            getStream());
+        if (!ok)
+        {
+            LOG_ERROR("[ROCmMoEKernel::executeGroupedPrefillPipelineFromRuntime] grouped ROCm pipeline failed");
+            return false;
+        }
+
+        output->transitionTo(TensorCoherenceState::DEVICE_AUTHORITATIVE,
+                             DeviceId::rocm(device_ordinal_));
         return true;
     }
 

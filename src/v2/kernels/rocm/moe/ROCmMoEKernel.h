@@ -479,6 +479,16 @@ namespace llaminar2
             int current_tokens, int max_tokens,
             int num_experts, int top_k) override;
 
+        bool regroupPrefillRoutesFromRuntimeAssignments(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
+        bool assignPrefillRoutesLeastLoadedResident(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
         bool gatherPrefillExpertBatchFromRuntime(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *batch_buffer,
@@ -527,6 +537,14 @@ namespace llaminar2
         bool prepareSharedExpertPrefillGroup(int seq_len) override;
 
         bool executeGroupedPrefillPipeline(
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k) override;
+
+        bool executeGroupedPrefillPipelineFromRuntime(
+            const DeviceMoELayerRuntime &runtime_layer,
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
@@ -630,6 +648,7 @@ namespace llaminar2
         bool ensureRouterQ8HiddenScratchCapacity(int d_model);
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
         void clearWorkspaceScratchBindings() noexcept;
+        bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
         struct RouterQ8GateCacheEntry;
         const RouterQ8GateCacheEntry *getOrCreateQ8RouterGateCache(
             ITensor *gate_weights,
@@ -643,7 +662,7 @@ namespace llaminar2
             int num_experts);
 
         /// Core GPU routing: gate logits GEMM + softmax + top-k.
-        /// Returns device buffers (caller must D2H and hipFree).
+        /// Returns workspace-owned device buffers.
         struct DeviceRouteBuffers
         {
             float *d_logits = nullptr;  ///< [seq_len * num_experts]
@@ -674,6 +693,7 @@ namespace llaminar2
             int intermediate = 0;
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
+            std::size_t workspace_slot = 0;
             bool valid = false;
         };
 
@@ -688,6 +708,7 @@ namespace llaminar2
             int intermediate = 0;
             uint8_t codebook_id = 0;
             uint32_t codebook_mask = 0;
+            std::size_t workspace_slot = 0;
             bool valid = false;
         };
 
@@ -699,6 +720,7 @@ namespace llaminar2
             int num_experts = 0;
             size_t element_count = 0;
             void *d_gate_weights_fp16 = nullptr;
+            std::size_t workspace_slot = 0;
         };
 
         struct RouterQ8GateCacheEntry
@@ -712,6 +734,7 @@ namespace llaminar2
             size_t scale_count = 0;
             int8_t *d_gate_weights_q8 = nullptr;
             float *d_gate_scales = nullptr;
+            std::size_t workspace_slot = 0;
         };
 
         /**
@@ -801,6 +824,10 @@ namespace llaminar2
         int router_q8_hidden_blocks_cap_ = 0;
         std::vector<RouterFP16GateCacheEntry> router_fp16_gate_cache_;
         std::vector<RouterQ8GateCacheEntry> router_q8_gate_cache_;
+        std::size_t next_grouped_down_desc_workspace_slot_ = 0;
+        std::size_t next_grouped_gateup_desc_workspace_slot_ = 0;
+        std::size_t next_router_q8_gate_workspace_slot_ = 0;
+        std::size_t next_router_fp16_gate_workspace_slot_ = 0;
 
         // Phase 4: GPU-side expert grouping state (for prepareExpertGroups)
         int *d_group_int_indices_ = nullptr;   ///< float→int converted routing indices

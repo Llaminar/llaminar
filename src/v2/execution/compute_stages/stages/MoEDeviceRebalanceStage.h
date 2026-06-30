@@ -215,6 +215,9 @@ namespace llaminar2
         DeviceWorkspaceManager *getWorkspace() const override { return bound_workspace_; }
 
         const Params &getParams() const { return params_; }
+        size_t traceHistogramLayerCount() const { return histogramLayerCount(); }
+        size_t traceLocalHistogramEntries() const { return localHistogramEntries(); }
+        size_t traceGatheredHistogramEntries() const { return gatheredHistogramEntries(); }
 
     private:
         Params params_;

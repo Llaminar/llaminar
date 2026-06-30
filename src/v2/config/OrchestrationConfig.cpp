@@ -250,7 +250,8 @@ namespace llaminar2
                    normalizedScope(lhs) == normalizedScope(rhs) &&
                    lhs.owner_rank == rhs.owner_rank &&
                    lhs.ranks == rhs.ranks &&
-                   lhs.compute_kind == rhs.compute_kind;
+                   lhs.compute_kind == rhs.compute_kind &&
+                   lhs.assignment_kind == rhs.assignment_kind;
         }
 
         void addUniqueName(std::vector<std::string> &names, const std::string &name)
@@ -317,6 +318,7 @@ namespace llaminar2
         domain.owner_rank = owner_rank;
         domain.ranks = explicit_ranks;
         domain.compute_kind = compute_kind;
+        domain.assignment_kind = assignment_kind;
         return domain;
     }
 
@@ -328,6 +330,7 @@ namespace llaminar2
         def.weights = domain.weights;
         def.backend = domain.backend;
         def.compute_kind = domain.compute_kind;
+        def.assignment_kind = domain.assignment_kind;
         def.scope = toTPScope(domain.scope);
         def.owner_rank = domain.owner_rank;
         def.explicit_ranks = domain.ranks;
@@ -1057,6 +1060,16 @@ namespace llaminar2
         oss << "    rebalance_window: " << moe_rebalance.window_size << "\n";
         oss << "    rebalance_max_window: " << moe_rebalance.max_window_size << "\n";
         oss << "    rebalance_window_growth: " << moe_rebalance.window_growth_factor << "\n";
+        oss << "    dynamic_imbalance_threshold_permille: "
+            << moe_rebalance.dynamic_imbalance_threshold_per_mille << "\n";
+        oss << "    dynamic_min_improvement_permille: "
+            << moe_rebalance.dynamic_min_improvement_per_mille << "\n";
+        oss << "    dynamic_max_swaps_per_layer: "
+            << moe_rebalance.dynamic_max_swaps_per_layer << "\n";
+        oss << "    dynamic_max_plan_entries_per_wave: "
+            << moe_rebalance.dynamic_max_plan_entries_per_wave << "\n";
+        oss << "    dynamic_min_window_activations: "
+            << moe_rebalance.dynamic_min_window_activations << "\n";
         oss << "    release_raw_expert_weights: "
             << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
 

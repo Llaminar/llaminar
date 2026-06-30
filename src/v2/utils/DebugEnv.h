@@ -9,9 +9,11 @@
 #include <atomic>
 #include <cctype>
 #include <cstring>
+#include <cstdint>
 #include <optional>
 
 #include "utils/PrefillGraphBucketDefaults.h"
+#include "execution/moe/DeviceMoERebalancePolicyShared.h"
 
 /**
  * @file DebugEnv.h
@@ -87,6 +89,11 @@ namespace llaminar2
                 "LLAMINAR_MOE_REBALANCE_WINDOW",
                 "LLAMINAR_MOE_REBALANCE_MAX_WINDOW",
                 "LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH",
+                "LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE",
+                "LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE",
+                "LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER",
+                "LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE",
+                "LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS",
                 "LLAMINAR_MOE_REBALANCE_REPLICAS",
             };
             return names;
@@ -107,6 +114,8 @@ namespace llaminar2
         bool no_color_output = false;         ///< Disable ANSI color when NO_COLOR or LLAMINAR_NO_COLOR is present.
         bool assert_thread_affinity = false;  ///< Fail affinity verification only when LLAMINAR_ASSERT_THREAD_AFFINITY=1.
         bool benchmark_memory_log = false;    ///< Emit benchmark GPU memory snapshots when LLAMINAR_BENCH_MEM_LOG is present.
+        int benchmark_iterations = 3;         ///< Measured benchmark iterations (LLAMINAR_BENCHMARK_ITERATIONS, default 3).
+        int benchmark_warmup_iterations = 1;  ///< Benchmark warmup iterations (LLAMINAR_BENCHMARK_WARMUP_ITERATIONS, default 1).
         bool rope_on_read = true;             ///< Enable RoPE-on-read unless LLAMINAR_ROPE_ON_READ parses to 0.
         bool sync_after_stage = false;        ///< Synchronize GPU after every stage when LLAMINAR_SYNC_AFTER_STAGE is present.
         bool serialize_tp_forward = false;    ///< Serialize local TP forwards when LLAMINAR_SERIALIZE_TP_FORWARD is present.
@@ -130,6 +139,8 @@ namespace llaminar2
             no_color_output = isPresent("NO_COLOR") || isPresent("LLAMINAR_NO_COLOR");
             assert_thread_affinity = isExactlyOne("LLAMINAR_ASSERT_THREAD_AFFINITY");
             benchmark_memory_log = isPresent("LLAMINAR_BENCH_MEM_LOG");
+            benchmark_iterations = readIntClamped("LLAMINAR_BENCHMARK_ITERATIONS", 3, 1, 100);
+            benchmark_warmup_iterations = readIntClamped("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", 1, 0, 100);
             rope_on_read = readBoolDefaultTrue("LLAMINAR_ROPE_ON_READ");
             sync_after_stage = isPresent("LLAMINAR_SYNC_AFTER_STAGE");
             serialize_tp_forward = isPresent("LLAMINAR_SERIALIZE_TP_FORWARD");
@@ -182,6 +193,19 @@ namespace llaminar2
         {
             const char *value = std::getenv(name);
             return value != nullptr ? std::string(value) : std::string{};
+        }
+
+        /// @brief Read an integer environment override and clamp to a conservative range.
+        static int readIntClamped(const char *name, int default_value, int min_value, int max_value)
+        {
+            const char *value = std::getenv(name);
+            if (!value || value[0] == '\0')
+                return default_value;
+            char *end = nullptr;
+            const long parsed = std::strtol(value, &end, 10);
+            if (end == value)
+                return default_value;
+            return std::clamp(static_cast<int>(parsed), min_value, max_value);
         }
     };
 
@@ -3434,6 +3458,29 @@ namespace llaminar2
             int max_window_size = 4096;
             /// Window growth factor after each rebalance (from LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH)
             float window_growth_factor = 1.5f;
+            /// Shared Dynamic policy imbalance trigger, in permille max_load/min_load.
+            /// 1300 means the overloaded participant must be at least 1.3x the underloaded
+            /// participant. (env: LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE)
+            int dynamic_imbalance_threshold_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille);
+            /// Shared Dynamic policy minimum ratio improvement for an ownership swap.
+            /// 50 means the projected ratio must improve by at least 5%.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE)
+            int dynamic_min_improvement_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille);
+            /// Shared Dynamic policy paired ownership swaps per layer.
+            /// One accepted swap emits two expert movements.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER)
+            int dynamic_max_swaps_per_layer =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
+            /// Shared Dynamic policy command entries per wave/cycle.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE)
+            int dynamic_max_plan_entries_per_wave =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
+            /// Minimum routed activations in a window before Dynamic considers movement.
+            /// (env: LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS)
+            uint64_t dynamic_min_window_activations =
+                moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
             /// Max experts to replicate per socket (0 = auto: 2×top_k) (from LLAMINAR_MOE_REBALANCE_REPLICAS)
             int max_replicas = 0;
             /// Routed experts per layer to cache on GPU in mixed CPU/GPU MoE domains.
@@ -3474,11 +3521,12 @@ namespace llaminar2
             /// LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND)
             bool device_rebalance_payload_sideband = false;
             /// Layers planned by each captured device-side rebalance replay.
-            /// 0 means the whole configured layer window; the production
-            /// default is a one-layer rolling wave until transfer/compute
-            /// overlap is strong enough to hide larger waves. (env:
+            /// 0 means the whole configured layer window. The default is a
+            /// small bounded wave so the controller can see useful early
+            /// layers in long one-shot generations without turning each
+            /// maintenance replay into a full-model policy pass. (env:
             /// LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE)
-            int device_rebalance_layer_wave_count = 1;
+            int device_rebalance_layer_wave_count = 4;
             /// Captured compact payload slots per maintenance replay. This is
             /// separate from the physical staging pool so the pool can remain
             /// double-buffered while the graph-captured NCCL/RCCL payload lane
@@ -3530,34 +3578,44 @@ namespace llaminar2
             /// it adds per-expert policy work on the rebalance path. (env:
             /// LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS)
             bool device_rebalance_collect_load_stats = false;
-            /// Minimum absolute hot-replica spread improvement required before
-            /// scheduling a GPU rebalance arrival. CUDA2 Qwen3.6 decode
-            /// windows are now dense enough that 64 keeps the useful
-            /// hot-cache moves while rejecting lower-value transfer churn.
-            /// Set to 0 to allow any positive
-            /// improvement. (env:
+            /// Additional absolute spread improvement required before
+            /// scheduling a GPU rebalance arrival. The default is zero so
+            /// Dynamic uses the shared admission floor
+            /// `max(2, window/16)`. Set this only as an extra GPU cost gate.
+            /// (env:
             /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT)
-            int device_rebalance_min_load_spread_improvement = 64;
+            int device_rebalance_min_load_spread_improvement = 0;
             /// Additional relative spread-improvement floor:
             /// required >= current_total / divisor. Set to 0 to disable.
             /// (env: LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR)
-            int device_rebalance_min_load_spread_improvement_divisor = 128;
+            int device_rebalance_min_load_spread_improvement_divisor = 0;
             /// Optional wave-level transfer value gate. When nonzero, a
             /// transfer-backed maintenance wave must have at least this much
             /// accepted load-spread improvement per requested compact payload
-            /// slot before publishing arrivals. Set to 0 to disable while
-            /// backend economics are still being tuned. (env:
+            /// slot before publishing arrivals. CUDA2/ROCm2 Qwen3.6 probes
+            /// showed 256 keeps high-value ROCm 2048 transfers while pruning
+            /// CUDA 1024 hot-cache transfer churn. (env:
             /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT)
-            int device_rebalance_min_wave_spread_improvement_per_payload_slot = 0;
+            int device_rebalance_min_wave_spread_improvement_per_payload_slot = 256;
             /// Realized router-benefit gate. When nonzero and the
             /// current wave already has active local hot-cache replicas, the
             /// previous router window must have produced at least this much
             /// spread improvement per requested compact payload slot before
             /// scheduling another transfer-backed wave. This keeps bootstrap
-            /// arrivals allowed while rejecting steady-state hot-cache churn
-            /// that the router is not using. (env:
+            /// arrivals allowed while rejecting steady-state transfer churn
+            /// that the router is not using. Qwen3.6 CUDA2/ROCm2 traces showed
+            /// low-value hot-cache transfer waves regressing 1024/2048 decode,
+            /// while resident-only hot assignments remained the cheap path to
+            /// preserve. (env:
             /// LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT)
-            int device_rebalance_min_router_spread_improvement_per_payload_slot = 1;
+            int device_rebalance_min_router_spread_improvement_per_payload_slot = 128;
+            /// Maximum projected post-policy participant-load spread for a
+            /// transfer-backed maintenance wave, measured in permille of the
+            /// projected routed load. This rejects moves that improve spread
+            /// numerically but still leave the domain badly imbalanced after
+            /// paying transfer cost. Set to 0 to disable. (env:
+            /// LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE)
+            int device_rebalance_max_post_wave_load_spread_per_mille = 100;
             /// Release raw expert weight data after eager packed-weight preparation.
             /// Enabled by default; set LLAMINAR_MOE_RELEASE_RAW_WEIGHTS=0 to opt out.
             bool release_raw_weights = true;
@@ -3814,6 +3872,32 @@ namespace llaminar2
             const char *moe_reb_growth = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH");
             if (moe_reb_growth)
                 moe_rebalance.window_growth_factor = std::atof(moe_reb_growth);
+            if (const char *moe_dynamic_threshold =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE"))
+                moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_threshold));
+            if (const char *moe_dynamic_improvement =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE"))
+                moe_rebalance.dynamic_min_improvement_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_improvement));
+            if (const char *moe_dynamic_swaps =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER"))
+                moe_rebalance.dynamic_max_swaps_per_layer =
+                    std::max(0, std::atoi(moe_dynamic_swaps));
+            if (const char *moe_dynamic_entries =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE"))
+                moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    std::max(0, std::atoi(moe_dynamic_entries));
+            if (const char *moe_dynamic_min_activations =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed =
+                    std::strtoull(moe_dynamic_min_activations, &end, 10);
+                if (end != moe_dynamic_min_activations)
+                    moe_rebalance.dynamic_min_window_activations =
+                        static_cast<uint64_t>(parsed);
+            }
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
                 moe_rebalance.max_replicas = std::atoi(moe_reb_replicas);
@@ -3886,6 +3970,10 @@ namespace llaminar2
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
                 moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot =
                     std::max(0, std::atoi(moe_min_router_improvement));
+            if (const char *moe_max_post_spread =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE"))
+                moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille =
+                    std::max(0, std::atoi(moe_max_post_spread));
             const char *moe_reb_release_ctor = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release_ctor)
                 moe_rebalance.release_raw_weights = (std::atoi(moe_reb_release_ctor) != 0);
@@ -3956,6 +4044,42 @@ namespace llaminar2
             const char *moe_reb_growth = std::getenv("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH");
             if (moe_reb_growth)
                 moe_rebalance.window_growth_factor = std::atof(moe_reb_growth);
+            moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille);
+            if (const char *moe_dynamic_threshold =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE"))
+                moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_threshold));
+            moe_rebalance.dynamic_min_improvement_per_mille =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille);
+            if (const char *moe_dynamic_improvement =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE"))
+                moe_rebalance.dynamic_min_improvement_per_mille =
+                    std::max(0, std::atoi(moe_dynamic_improvement));
+            moe_rebalance.dynamic_max_swaps_per_layer =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
+            if (const char *moe_dynamic_swaps =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER"))
+                moe_rebalance.dynamic_max_swaps_per_layer =
+                    std::max(0, std::atoi(moe_dynamic_swaps));
+            moe_rebalance.dynamic_max_plan_entries_per_wave =
+                static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
+            if (const char *moe_dynamic_entries =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE"))
+                moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    std::max(0, std::atoi(moe_dynamic_entries));
+            moe_rebalance.dynamic_min_window_activations =
+                moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
+            if (const char *moe_dynamic_min_activations =
+                    std::getenv("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
+            {
+                char *end = nullptr;
+                const unsigned long long parsed =
+                    std::strtoull(moe_dynamic_min_activations, &end, 10);
+                if (end != moe_dynamic_min_activations)
+                    moe_rebalance.dynamic_min_window_activations =
+                        static_cast<uint64_t>(parsed);
+            }
             moe_rebalance.max_replicas = 0;
             const char *moe_reb_replicas = std::getenv("LLAMINAR_MOE_REBALANCE_REPLICAS");
             if (moe_reb_replicas)
@@ -3990,7 +4114,7 @@ namespace llaminar2
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND"))
                 moe_rebalance.device_rebalance_payload_sideband =
                     (std::atoi(moe_payload_sideband) != 0);
-            moe_rebalance.device_rebalance_layer_wave_count = 1;
+            moe_rebalance.device_rebalance_layer_wave_count = 4;
             if (const char *moe_layer_wave = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LAYER_WAVE"))
                 moe_rebalance.device_rebalance_layer_wave_count =
                     std::max(0, std::atoi(moe_layer_wave));
@@ -4028,26 +4152,31 @@ namespace llaminar2
             if (const char *moe_load_stats = std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"))
                 moe_rebalance.device_rebalance_collect_load_stats =
                     (std::atoi(moe_load_stats) != 0);
-            moe_rebalance.device_rebalance_min_load_spread_improvement = 64;
+            moe_rebalance.device_rebalance_min_load_spread_improvement = 0;
             if (const char *moe_min_improvement =
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT"))
                 moe_rebalance.device_rebalance_min_load_spread_improvement =
                     std::max(0, std::atoi(moe_min_improvement));
-            moe_rebalance.device_rebalance_min_load_spread_improvement_divisor = 128;
+            moe_rebalance.device_rebalance_min_load_spread_improvement_divisor = 0;
             if (const char *moe_min_improvement_divisor =
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"))
                 moe_rebalance.device_rebalance_min_load_spread_improvement_divisor =
                     std::max(0, std::atoi(moe_min_improvement_divisor));
-            moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot = 0;
+            moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot = 256;
             if (const char *moe_min_wave_improvement =
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
                 moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot =
                     std::max(0, std::atoi(moe_min_wave_improvement));
-            moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot = 1;
+            moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot = 128;
             if (const char *moe_min_router_improvement =
                     std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT"))
                 moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot =
                     std::max(0, std::atoi(moe_min_router_improvement));
+            moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille = 100;
+            if (const char *moe_max_post_spread =
+                    std::getenv("LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE"))
+                moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille =
+                    std::max(0, std::atoi(moe_max_post_spread));
             moe_rebalance.release_raw_weights = true;
             const char *moe_reb_release = std::getenv("LLAMINAR_MOE_RELEASE_RAW_WEIGHTS");
             if (moe_reb_release)

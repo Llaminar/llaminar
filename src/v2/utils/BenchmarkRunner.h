@@ -52,6 +52,9 @@ namespace llaminar2
      */
     struct BenchmarkResult
     {
+        int measurement_iterations = 3; ///< Number of measured benchmark iterations averaged.
+        int warmup_iterations = 1;      ///< Number of pre-measurement warmup iterations.
+
         // Prefill phase
         int prefill_tokens = 0;              ///< Number of tokens in prefill
         double prefill_time_ms = 0.0;        ///< Time for prefill phase (ms)

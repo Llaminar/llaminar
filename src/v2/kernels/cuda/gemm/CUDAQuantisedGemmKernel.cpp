@@ -446,6 +446,16 @@ namespace llaminar2
 
         namespace
         {
+            namespace workspace_prefill_dispatch
+            {
+#include "kernels/cuda/gemm/CUDANativeVNNIPrefillDispatchGenerated.inc"
+            } // namespace workspace_prefill_dispatch
+
+            int ceilDivPositive(int value, int divisor)
+            {
+                return (value + divisor - 1) / divisor;
+            }
+
             size_t paddedNativePrefillM(int m)
             {
                 return (m > 1) ? static_cast<size_t>((m + 127) & ~127) : static_cast<size_t>(m);
@@ -466,6 +476,129 @@ namespace llaminar2
                        paddedNativePrefillM(m) *
                        static_cast<size_t>(n) *
                        sizeof(float);
+            }
+
+            int workspacePlanningSmCount(int cuda_device_id)
+            {
+                int sm_count = 0;
+                if (cudaDeviceGetAttribute(
+                        &sm_count,
+                        cudaDevAttrMultiProcessorCount,
+                        cuda_device_id) == cudaSuccess &&
+                    sm_count > 0)
+                {
+                    return sm_count;
+                }
+
+                // Requirement planning must be safe in no-hardware unit tests and
+                // before CUDA context setup. Use a high-SM fallback so underfilled
+                // prompt/expert sub-batches reserve enough split-K scratch.
+                return 132;
+            }
+
+            int generatedNativePrefillSplitK(uint8_t codebook_id, int rows, int n, int k)
+            {
+                uint8_t tile_id = 0;
+                uint8_t split_k = 1;
+                bool found = false;
+                switch (codebook_id)
+                {
+                case 0:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<0>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 4:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<4>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 5:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<5>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 6:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<6>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 7:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<7>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 8:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<8>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 11:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<11>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                case 19:
+                    found = workspace_prefill_dispatch::selectPrefillTileGenerated<19>(
+                        rows, n, k, tile_id, split_k);
+                    break;
+                default:
+                    break;
+                }
+                return found ? static_cast<int>(split_k) : 1;
+            }
+
+            int conservativeNativePrefillSplitK(uint8_t codebook_id, int rows, int n, int k, int cuda_device_id)
+            {
+                if (rows <= 1 || n <= 0 || k <= 0)
+                    return 1;
+
+                const int generated_split_k = generatedNativePrefillSplitK(codebook_id, rows, n, k);
+                if (generated_split_k > 1)
+                    return generated_split_k;
+
+                const int sm_count = workspacePlanningSmCount(cuda_device_id);
+                const int ki = std::max(1, k / 128);
+                const int t64 = ceilDivPositive(rows, 64) * ceilDivPositive(n, 64);
+                const int t64x128 = ceilDivPositive(rows, 64) * ceilDivPositive(n, 128);
+                const int t128 = ceilDivPositive(rows, 128) * ceilDivPositive(n, 128);
+
+                if (t128 >= sm_count && rows >= 128)
+                    return 1;
+
+                if (t64x128 >= sm_count)
+                {
+                    return (t64x128 < ((3 * sm_count) / 2) && ki >= 28) ? 2 : 1;
+                }
+
+                if (t64 >= sm_count)
+                {
+                    if (ki < 14 || t64x128 < 28)
+                        return 1;
+
+                    const int target = (3 * sm_count) / 2;
+                    int split_k = 1;
+                    for (int candidate = 1; candidate <= 4; candidate *= 2)
+                    {
+                        if (ki < candidate * 7)
+                            break;
+                        split_k = candidate;
+                        if (t64x128 * candidate >= target)
+                            break;
+                    }
+                    return split_k;
+                }
+
+                int base_tiles = t64;
+                if (t128 >= 16 && ki >= 40 && rows >= 128)
+                    base_tiles = t128;
+                else if (t64x128 >= 8 && ki >= 8)
+                    base_tiles = t64x128;
+
+                const int target = (3 * sm_count) / 2;
+                int split_k = 1;
+                for (int candidate = 1; candidate <= 8; candidate *= 2)
+                {
+                    if (base_tiles >= 8 && ki < candidate)
+                        break;
+                    split_k = candidate;
+                    if (base_tiles * candidate >= target)
+                        break;
+                }
+                return split_k;
             }
 
             struct NativePrefillWorkspaceBounds
@@ -575,6 +708,18 @@ namespace llaminar2
                         &planned_streamk))
                 {
                     return bounds;
+                }
+
+                if (!cudaNativeVNNIPrefill_getDeterministicMode())
+                {
+                    planned_split_k = std::max(
+                        planned_split_k,
+                        conservativeNativePrefillSplitK(
+                            codebook_id,
+                            rows,
+                            n,
+                            k,
+                            cuda_device_id));
                 }
 
                 bounds.valid = true;

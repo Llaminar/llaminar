@@ -50,23 +50,39 @@ namespace llaminar2
         constexpr const char *CUDA_DECODE_GATEUP_UP_PTRS = "cuda_moe_decode_gateup_up_ptrs";
         constexpr const char *CUDA_DECODE_DOWN_GATE_PTRS = "cuda_moe_decode_down_gate_ptrs";
         constexpr const char *CUDA_DECODE_DOWN_UP_PTRS = "cuda_moe_decode_down_up_ptrs";
+        constexpr const char *CUDA_GROUPED_GATE_DESC_TABLES = "cuda_moe_grouped_gate_desc_tables";
+        constexpr const char *CUDA_GROUPED_UP_DESC_TABLES = "cuda_moe_grouped_up_desc_tables";
+        constexpr const char *CUDA_GROUPED_DOWN_DESC_TABLES = "cuda_moe_grouped_down_desc_tables";
+        constexpr const char *CUDA_ROUTER_Q8_GATE_WEIGHTS = "cuda_moe_router_q8_gate_weights";
+        constexpr const char *CUDA_ROUTER_Q8_GATE_SCALES = "cuda_moe_router_q8_gate_scales";
 
         constexpr const char *ROCM_SHARED_GATE = "rocm_moe_shared_gate";
         constexpr const char *ROCM_ROUTE_LOGITS_PARTIALS = "rocm_moe_route_logits_partials";
+        constexpr const char *ROCM_HISTOGRAM_COUNTS = "rocm_moe_histogram_counts";
+        constexpr const char *ROCM_EXPERT_MASK = "rocm_moe_expert_mask";
         constexpr const char *ROCM_ROUTER_Q8_HIDDEN = "rocm_moe_router_q8_hidden";
         constexpr const char *ROCM_ROUTER_Q8_SCALES = "rocm_moe_router_q8_scales";
+        constexpr const char *ROCM_ROUTER_Q8_GATE_WEIGHTS = "rocm_moe_router_q8_gate_weights";
+        constexpr const char *ROCM_ROUTER_Q8_GATE_SCALES = "rocm_moe_router_q8_gate_scales";
+        constexpr const char *ROCM_ROUTER_FP16_GATE_WEIGHTS = "rocm_moe_router_fp16_gate_weights";
         constexpr const char *ROCM_GROUP_MAX_TOKENS = "rocm_moe_group_max_tokens";
         constexpr const char *ROCM_DECODE_GATE_PTRS = "rocm_moe_decode_gate_ptrs";
         constexpr const char *ROCM_DECODE_UP_PTRS = "rocm_moe_decode_up_ptrs";
         constexpr const char *ROCM_DECODE_GATE_OUTPUT_PTRS = "rocm_moe_decode_gate_output_ptrs";
         constexpr const char *ROCM_DECODE_UP_OUTPUT_PTRS = "rocm_moe_decode_up_output_ptrs";
         constexpr const char *ROCM_DECODE_DOWN_DESCS = "rocm_moe_decode_down_descs";
+        constexpr const char *ROCM_GROUPED_GATE_DESC_TABLES = "rocm_moe_grouped_gate_desc_tables";
+        constexpr const char *ROCM_GROUPED_UP_DESC_TABLES = "rocm_moe_grouped_up_desc_tables";
+        constexpr const char *ROCM_GROUPED_DOWN_DESC_TABLES = "rocm_moe_grouped_down_desc_tables";
 
         constexpr int kRuntimePointerTableSlots = 1024;
         constexpr int kRuntimePointerWorkspaceScopes = 3;
         constexpr int kRuntimePointerWorkspaceEntries =
             kRuntimePointerTableSlots * kRuntimePointerWorkspaceScopes;
         constexpr int kRuntimePointerArrayMaxTopK = 16;
+        constexpr int kGroupedDescriptorTableSlots = 128;
+        constexpr int kRouterGateCacheSlots = 128;
+        constexpr int kHistogramLayerSlots = 128;
 
         inline int ceilDiv(int value, int divisor)
         {
@@ -190,6 +206,24 @@ namespace llaminar2
         {
             WorkspaceRequirements reqs = routing(max_seq_len, num_experts, top_k);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
+            d_model = std::max(1, d_model);
+            num_experts = std::max(1, num_experts);
+            const int d_model_blocks = ceilDiv(d_model, 32);
+            const std::size_t table_descs =
+                static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
+                static_cast<std::size_t>(num_experts) *
+                sizeof(DeviceNativeVNNIMatrixDesc);
+            add(reqs, CUDA_GROUPED_GATE_DESC_TABLES, table_descs);
+            add(reqs, CUDA_GROUPED_UP_DESC_TABLES, table_descs);
+            add(reqs, CUDA_GROUPED_DOWN_DESC_TABLES, table_descs);
+            add(reqs, CUDA_ROUTER_Q8_GATE_WEIGHTS,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, CUDA_ROUTER_Q8_GATE_SCALES,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
             return reqs;
         }
 
@@ -210,8 +244,24 @@ namespace llaminar2
 
             add(reqs, ROCM_ROUTE_LOGITS_PARTIALS,
                 static_cast<std::size_t>(num_experts) * kMaxRouterPartitions * sizeof(float));
+            add(reqs, ROCM_HISTOGRAM_COUNTS,
+                static_cast<std::size_t>(kHistogramLayerSlots) *
+                    static_cast<std::size_t>(num_experts) * sizeof(uint64_t));
+            add(reqs, ROCM_EXPERT_MASK, static_cast<std::size_t>(num_experts) * sizeof(bool));
             add(reqs, ROCM_ROUTER_Q8_HIDDEN, static_cast<std::size_t>(d_model) * sizeof(int8_t));
             add(reqs, ROCM_ROUTER_Q8_SCALES, static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            add(reqs, ROCM_ROUTER_Q8_GATE_WEIGHTS,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model) * sizeof(int8_t));
+            add(reqs, ROCM_ROUTER_Q8_GATE_SCALES,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model_blocks) * sizeof(float));
+            add(reqs, ROCM_ROUTER_FP16_GATE_WEIGHTS,
+                static_cast<std::size_t>(kRouterGateCacheSlots) *
+                    static_cast<std::size_t>(num_experts) *
+                    static_cast<std::size_t>(d_model) * sizeof(uint16_t));
             return reqs;
         }
 
@@ -252,6 +302,13 @@ namespace llaminar2
                     kRuntimePointerArrayMaxTopK * sizeof(float *));
             add(reqs, ROCM_DECODE_DOWN_DESCS,
                 decode_slots * sizeof(DeviceNativeVNNIMatrixDesc));
+            const std::size_t table_descs =
+                static_cast<std::size_t>(kGroupedDescriptorTableSlots) *
+                static_cast<std::size_t>(num_experts) *
+                sizeof(DeviceNativeVNNIMatrixDesc);
+            add(reqs, ROCM_GROUPED_GATE_DESC_TABLES, table_descs);
+            add(reqs, ROCM_GROUPED_UP_DESC_TABLES, table_descs);
+            add(reqs, ROCM_GROUPED_DOWN_DESC_TABLES, table_descs);
             return reqs;
         }
     } // namespace MoEWorkspaceBuffers

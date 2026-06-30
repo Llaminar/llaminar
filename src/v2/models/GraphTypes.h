@@ -460,6 +460,11 @@ namespace llaminar2
             RoutedExpertParallelPolicy routed_expert_parallel_policy =
                 RoutedExpertParallelPolicy::ApportionedExperts;
 
+            /// Explicit semantic policy for assigning router-selected rows to
+            /// participants that can execute the selected routed expert.
+            RoutedExpertAssignmentPolicy routed_expert_assignment_policy =
+                RoutedExpertAssignmentPolicy::StaticOwner;
+
             /// Composite MoE policy derived from dense/shared and routed expert axes.
             MoEParallelPolicy parallel_policy = MoEParallelPolicy::HybridTP_AE;
 
@@ -527,7 +532,8 @@ namespace llaminar2
                 routedExpertParallelPolicyFromMode(moe.expert_mode);
             moe.parallel_policy = deriveMoEParallelPolicy(
                 dense_parallel_policy,
-                moe.routed_expert_parallel_policy);
+                moe.routed_expert_parallel_policy,
+                moe.routed_expert_assignment_policy);
             moe.expert_replica_policy =
                 expertReplicaPolicyFromHotExpertCache(moe.hot_expert_cache);
         }

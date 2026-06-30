@@ -72,19 +72,14 @@ namespace llaminar2
      * ReplicatedExperts means every participant owns every routed expert.
      * ApportionedExperts means whole routed expert ids are divided across
      * participants. ShardedExperts means each selected expert's GEMMs are
-     * sharded across a multi-participant domain-scoped TP context.
+     * sharded across a multi-participant domain-scoped TP context. Current-row
+     * assignment algorithms such as LLEP live on ExpertComputeDomain::assignment_policy.
      */
     enum class ExpertDomainComputeKind
     {
         ReplicatedExperts,
         ApportionedExperts,
         ShardedExperts,
-
-        // Compatibility aliases for older config plumbing. "ExpertIdSharded"
-        // historically meant apportioned whole experts, not per-expert tensor
-        // shards.
-        ExpertIdSharded = ApportionedExperts,
-        TensorParallelExperts = ShardedExperts,
     };
 
     struct ExpertComputeDomain
@@ -101,6 +96,7 @@ namespace llaminar2
         std::vector<int> world_ranks;
         int owner_rank = -1;
         ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        RoutedExpertAssignmentPolicy assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
         std::vector<float> weights;
 
         ExecutionDomainDefinition toExecutionDomainDefinition() const
@@ -136,6 +132,15 @@ namespace llaminar2
                 break;
             case ExpertDomainComputeKind::ShardedExperts:
                 domain.compute_kind = ExecutionDomainComputeKind::SHARDED_EXPERTS;
+                break;
+            }
+
+            switch (assignment_policy)
+            {
+            case RoutedExpertAssignmentPolicy::StaticOwner:
+                break;
+            case RoutedExpertAssignmentPolicy::LeastLoadedEP:
+                domain.assignment_kind = ExecutionDomainAssignmentKind::LEAST_LOADED_EP;
                 break;
             }
 
@@ -186,6 +191,17 @@ namespace llaminar2
                 break;
             }
 
+            switch (domain.assignment_kind)
+            {
+            case ExecutionDomainAssignmentKind::UNSPECIFIED:
+            case ExecutionDomainAssignmentKind::STATIC_OWNER:
+                result.assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+                break;
+            case ExecutionDomainAssignmentKind::LEAST_LOADED_EP:
+                result.assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+                break;
+            }
+
             return result;
         }
 
@@ -209,15 +225,12 @@ namespace llaminar2
             return !participants.empty();
         }
 
-        bool supportsDomainScopedTensorParallelExperts() const
+        bool supportsLeastLoadedEP() const
         {
-            return supportsDomainScopedShardedExperts();
+            return compute_kind == ExpertDomainComputeKind::ApportionedExperts &&
+                   supportsDomainScopedShardedExperts();
         }
 
-        bool supportsExpertIdSharding() const
-        {
-            return supportsApportionedExperts();
-        }
     };
 
     struct ExpertRoutedTier
@@ -500,6 +513,7 @@ namespace llaminar2
                 appendDevices(out, domain.participants);
                 out << " kind=" << toString(domain.kind)
                     << " compute=" << toString(domain.compute_kind)
+                    << " assignment=" << routedExpertAssignmentPolicyToString(domain.assignment_policy)
                     << " backend=" << collectiveBackendTypeToString(domain.backend);
                 if (domain.owner_rank >= 0)
                     out << " owner=" << domain.owner_rank;
@@ -814,6 +828,18 @@ namespace llaminar2
             if (domain.compute_kind == ExpertDomainComputeKind::ApportionedExperts && !domain.supportsApportionedExperts())
             {
                 addError("expert compute domain '" + domain.name + "' uses ApportionedExperts but declares no participants");
+            }
+
+            if (domain.assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
+                domain.compute_kind != ExpertDomainComputeKind::ApportionedExperts)
+            {
+                addError("expert compute domain '" + domain.name + "' uses LeastLoadedEP assignment but is not an ApportionedExperts domain");
+            }
+
+            if (domain.assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
+                !domain.supportsLeastLoadedEP())
+            {
+                addError("expert compute domain '" + domain.name + "' uses LeastLoadedEP assignment but is not a multi-participant domain-scoped TP domain");
             }
 
             if (domain.compute_kind == ExpertDomainComputeKind::ShardedExperts && !domain.supportsDomainScopedShardedExperts())

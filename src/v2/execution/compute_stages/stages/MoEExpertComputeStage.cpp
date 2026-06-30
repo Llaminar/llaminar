@@ -1015,6 +1015,14 @@ namespace llaminar2
             return false;
         }
 
+        if (!supportsRequestedRoutedAssignmentPolicy())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Routed expert assignment policy "
+                      << routedExpertAssignmentPolicyToString(params_.routed_expert_assignment_policy)
+                      << " is not wired for this execution path. Refusing to execute as StaticOwner.");
+            return false;
+        }
+
         // Fast path for ordinary decode (seq_len=1): eliminates gather/scatter
         // overhead. MTP verifier correction replay explicitly opts into the
         // grouped prefill route so rejected-token replay stays on the same
@@ -3174,7 +3182,71 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedPrefill()
     {
-        return false;
+        moe_prefill_runtime_grouping_available_ = false;
+        const bool static_owner_runtime_grouping =
+            params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner &&
+            hasFullLocalExpertOwnership() &&
+            expertMaskAllEnabled();
+        const bool least_loaded_runtime_grouping =
+            params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP &&
+            hasFixedTopologyPrefillExpertMask();
+        if (!params_.use_runtime_prefill_grouping ||
+            !params_.moe_runtime_table ||
+            params_.layer_idx < 0 ||
+            params_.seq_len <= 1 ||
+            params_.num_experts <= 0 ||
+            params_.top_k <= 0 ||
+            !supportsGroupedPrefillExecutionBackend(params_.device_id) ||
+            (!static_owner_runtime_grouping && !least_loaded_runtime_grouping))
+        {
+            return false;
+        }
+
+        auto *runtime_table = dynamic_cast<DeviceMoERuntimeTable *>(params_.moe_runtime_table);
+        if (!runtime_table)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Runtime prefill grouping requires DeviceMoERuntimeTable"
+                      << " layer=" << params_.layer_idx
+                      << " device=" << params_.device_id.to_string());
+            return false;
+        }
+
+        if (!runtime_table->hasPrefillRouteScratchCapacity(params_.layer_idx, params_.seq_len))
+        {
+            if (isGraphCaptureActive())
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Runtime prefill scratch was not warmed before graph capture"
+                          << " layer=" << params_.layer_idx
+                          << " seq_len=" << params_.seq_len);
+                return false;
+            }
+            runtime_table->ensurePrefillRouteScratchCapacity(params_.seq_len, gpuStream());
+        }
+
+        if (!runtime_table->hasPrefillRouteScratchCapacity(params_.layer_idx, params_.seq_len))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Runtime prefill scratch capacity check failed"
+                      << " layer=" << params_.layer_idx
+                      << " seq_len=" << params_.seq_len);
+            return false;
+        }
+
+        moe_runtime_layer_ = runtime_table->deviceLayerState(params_.layer_idx);
+        const auto &state = runtime_table->hostLayerState(params_.layer_idx);
+        moe_prefill_runtime_grouping_available_ =
+            moe_runtime_layer_ &&
+            state.expert_count == static_cast<uint32_t>(params_.num_experts) &&
+            state.top_k == static_cast<uint32_t>(params_.top_k) &&
+            state.prefill_token_capacity >= static_cast<uint32_t>(params_.seq_len) &&
+            state.prefill_route_capacity >= static_cast<uint32_t>(params_.seq_len * params_.top_k) &&
+            state.route_expert_ids &&
+            state.route_weights &&
+            state.route_participant_ids &&
+            state.expert_counts &&
+            state.expert_offsets &&
+            state.grouped_token_ids &&
+            state.grouped_route_weights;
+        return moe_prefill_runtime_grouping_available_;
     }
 
     bool MoEExpertComputeStage::initializeFixedTopologyGroupedPrefill()
@@ -3237,8 +3309,45 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEExpertComputeStage::supportsRequestedRoutedAssignmentPolicy() const
+    {
+        if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
+            return true;
+
+        if (params_.routed_expert_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedEP)
+            return false;
+
+        const bool supports_llep_prefill =
+            params_.seq_len > 1 &&
+            params_.use_runtime_prefill_grouping &&
+            params_.moe_runtime_table &&
+            supportsGroupedPrefillExecutionBackend(params_.device_id);
+        if (supports_llep_prefill)
+            return true;
+
+        return params_.seq_len == 1 &&
+               !params_.force_grouped_verifier_prefill_for_decode &&
+               params_.moe_runtime_table &&
+               params_.layer_idx >= 0 &&
+               params_.num_experts > 0 &&
+               params_.top_k > 0 &&
+               supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id);
+    }
+
     bool MoEExpertComputeStage::canUseRuntimePrefillGrouping() const
     {
+        if (!params_.use_runtime_prefill_grouping ||
+            !moe_prefill_runtime_grouping_available_ ||
+            !params_.moe_runtime_table ||
+            !moe_runtime_layer_ ||
+            params_.seq_len <= 1)
+        {
+            return false;
+        }
+        if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner)
+            return hasFullLocalExpertOwnership() && expertMaskAllEnabled();
+        if (params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+            return hasFixedTopologyPrefillExpertMask();
         return false;
     }
 
@@ -3484,14 +3593,58 @@ namespace llaminar2
         const int top_k = params_.top_k;
         const int d_model = params_.d_model;
         const int intermediate = params_.expert_intermediate;
+        if (params_.use_runtime_prefill_grouping && !canUseRuntimePrefillGrouping())
+        {
+            auto *self = const_cast<MoEExpertComputeStage *>(this);
+            if (!self->initializeMoERuntimeTableForGroupedPrefill())
+            {
+                LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                          "runtime prefill grouping requested but runtime scratch is unavailable");
+                return false;
+            }
+        }
+        const bool runtime_grouping = canUseRuntimePrefillGrouping();
 
         // Async grouping (no D2H, no sync). Masked LocalTP overlays exclude
         // non-local experts from this participant's grouping scratch while
         // preserving the original routing tensors for rebalance histograms.
-        const bool masked_grouping = usesMaskedFixedTopologyPrefill();
+        const bool masked_grouping = !runtime_grouping && usesMaskedFixedTopologyPrefill();
         std::vector<uint8_t> expert_mask;
         bool groups_prepared = false;
-        if (masked_grouping)
+        if (runtime_grouping)
+        {
+            groups_prepared = kernel->groupPrefillRoutes(
+                moe_runtime_layer_,
+                params_.routing_indices,
+                params_.routing_weights,
+                seq_len,
+                seq_len,
+                num_experts,
+                top_k);
+            if (groups_prepared &&
+                params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+            {
+                groups_prepared = kernel->assignPrefillRoutesLeastLoadedResident(
+                    moe_runtime_layer_,
+                    seq_len,
+                    seq_len,
+                    num_experts,
+                    top_k);
+                if (!groups_prepared)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                              "assignPrefillRoutesLeastLoadedResident failed");
+                    return false;
+                }
+                groups_prepared = kernel->regroupPrefillRoutesFromRuntimeAssignments(
+                    moe_runtime_layer_,
+                    seq_len,
+                    seq_len,
+                    num_experts,
+                    top_k);
+            }
+        }
+        else if (masked_grouping)
         {
             expert_mask = fixedTopologyPrefillExpertMaskBytes();
             groups_prepared = kernel->prepareExpertGroupsAsyncMasked(
@@ -3508,19 +3661,43 @@ namespace llaminar2
 
         if (!groups_prepared)
         {
+            const char *grouping_name = runtime_grouping
+                                            ? "groupPrefillRoutes"
+                                            : (masked_grouping ? "prepareExpertGroupsAsyncMasked"
+                                                               : "prepareExpertGroupsAsync");
             LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                      << (masked_grouping ? "prepareExpertGroupsAsyncMasked" : "prepareExpertGroupsAsync")
-                      << " failed");
+                      << grouping_name << " failed");
             return false;
         }
 
         // Execute the full grouped pipeline (5 kernel launches, zero sync)
-        if (!kernel->executeGroupedPrefillPipeline(
+        bool pipeline_ok = false;
+        if (runtime_grouping)
+        {
+            const auto &runtime_state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+            pipeline_ok = kernel->executeGroupedPrefillPipelineFromRuntime(
+                runtime_state,
+                params_.input,
+                params_.output,
+                grouped_gateup_desc_table_id_,
+                grouped_down_desc_table_id_,
+                seq_len,
+                d_model,
+                intermediate,
+                num_experts,
+                top_k);
+        }
+        else
+        {
+            pipeline_ok = kernel->executeGroupedPrefillPipeline(
                 params_.input, params_.output,
                 grouped_gateup_desc_table_id_,
                 grouped_down_desc_table_id_,
                 seq_len, d_model, intermediate,
-                num_experts, top_k))
+                num_experts, top_k);
+        }
+
+        if (!pipeline_ok)
         {
             LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
                       "grouped prefill pipeline failed");
@@ -3598,6 +3775,8 @@ namespace llaminar2
 
         // MoE kernel must exist and have pre-allocated grouping + scratch
         if (!moe_kernel_)
+            return false;
+        if (params_.use_runtime_prefill_grouping && !canUseRuntimePrefillGrouping())
             return false;
 
         return true;
@@ -4039,7 +4218,7 @@ namespace llaminar2
         const int workspace_top_k = params_.top_k;
         if (params_.device_id.is_cuda())
         {
-            combined.merge(MoEWorkspaceBuffers::expertExecution(
+            combined.merge(MoEWorkspaceBuffers::cudaMoE(
                 params_.seq_len,
                 params_.d_model,
                 params_.expert_intermediate,

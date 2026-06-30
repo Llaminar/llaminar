@@ -175,6 +175,32 @@ namespace llaminar2
             int *d_grouped_token_indices,
             float *d_grouped_weights) override;
 
+        bool groupPrefillRoutes(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *routing_indices, ITensor *routing_weights,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
+        bool regroupPrefillRoutesFromRuntimeAssignments(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
+        bool assignPrefillRoutesLeastLoadedResident(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
+        bool gatherPrefillExpertBatchFromRuntime(
+            DeviceMoELayerRuntime *runtime_layer,
+            ITensor *hidden, ITensor *batch_buffer,
+            int expert_id, int max_tokens, int d_model) override;
+
+        bool scatterPrefillExpertResultsFromRuntime(
+            ITensor *output, ITensor *expert_results,
+            DeviceMoELayerRuntime *runtime_layer,
+            int expert_id, int max_tokens, int d_model) override;
+
         bool prepareExpertGroups(
             ITensor *routing_indices, ITensor *routing_weights,
             int seq_len, int num_experts, int top_k) override;
@@ -228,6 +254,14 @@ namespace llaminar2
 
         /// @brief Execute fixed-topology grouped MoE prefill without host synchronization.
         bool executeGroupedPrefillPipeline(
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k) override;
+
+        bool executeGroupedPrefillPipelineFromRuntime(
+            const DeviceMoELayerRuntime &runtime_layer,
             ITensor *hidden, ITensor *output,
             int gateup_desc_table_id,
             int down_desc_table_id,
@@ -572,6 +606,7 @@ namespace llaminar2
             std::size_t *workspace_slot,
             const char *context) const;
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
+        bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
         void clearWorkspaceScratchBindings() noexcept;
         void releaseDeviceBuffers() noexcept;
         struct RouterQ8GateCacheEntry;
@@ -593,6 +628,7 @@ namespace llaminar2
         {
             DeviceNativeVNNIMatrixDesc *device_descs = nullptr;
             std::vector<DeviceNativeVNNIMatrixDesc> host_descs;
+            std::size_t workspace_slot = 0;
             int num_experts = 0;
             int d_model = 0;
             int intermediate = 0;
@@ -607,6 +643,7 @@ namespace llaminar2
             DeviceNativeVNNIMatrixDesc *device_up_descs = nullptr;
             std::vector<DeviceNativeVNNIMatrixDesc> host_gate_descs;
             std::vector<DeviceNativeVNNIMatrixDesc> host_up_descs;
+            std::size_t workspace_slot = 0;
             int num_experts = 0;
             int d_model = 0;
             int intermediate = 0;
@@ -627,6 +664,7 @@ namespace llaminar2
             size_t scale_count = 0;
             int8_t *d_gate_weights_q8 = nullptr;
             float *d_gate_scales = nullptr;
+            std::size_t workspace_slot = 0;
         };
 
         int device_ordinal_ = 0;
@@ -660,6 +698,9 @@ namespace llaminar2
 
         std::vector<GroupedDownDescriptorTable> grouped_down_desc_tables_;
         std::vector<GroupedGateUpDescriptorTable> grouped_gateup_desc_tables_;
+        std::size_t next_grouped_down_desc_workspace_slot_ = 0;
+        std::size_t next_grouped_gateup_desc_workspace_slot_ = 0;
+        std::size_t next_router_q8_gate_workspace_slot_ = 0;
         /**
          * @brief Warmup readiness for graph-owned grouped-decode pointer slots.
          *

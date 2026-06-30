@@ -150,6 +150,7 @@ namespace llaminar2
             resolved.kind = domain.kind;
             resolved.backend = canonical.backend;
             resolved.compute_kind = domain.compute_kind;
+            resolved.assignment_policy = domain.assignment_policy;
             resolved.owner_rank = canonical.owner_rank.value_or(-1);
 
             resolved.participants.reserve(canonical.participants.size());
@@ -323,6 +324,7 @@ namespace llaminar2
                 << ": kind=" << toString(domain.kind)
                 << " backend=" << collectiveBackendTypeToString(domain.backend)
                 << " compute=" << toString(domain.compute_kind)
+                << " assignment=" << routedExpertAssignmentPolicyToString(domain.assignment_policy)
                 << " participants=" << domain.participants.size()
                 << " primary=" << domain.primary_participant.toShortString()
                 << " primary_device=" << domain.primary_device.to_string()

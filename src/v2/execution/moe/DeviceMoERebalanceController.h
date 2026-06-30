@@ -32,8 +32,9 @@ namespace llaminar2
     enum class DeviceMoERebalancePlanOp : uint32_t
     {
         None = 0,
-        HotReplicaArrival = 1,
-        ResidentHotReplica = 2,
+        ExpertPayloadArrival = 1,
+        ResidentExpertAssignment = 2,
+        OwnershipTransfer = 3,
     };
 
     enum class DeviceMoERebalancePipelinePhase : uint32_t
@@ -90,7 +91,7 @@ namespace llaminar2
         /**
          * Compact same-backend GPU arrival mode.
          *
-         * The controller may plan HotReplicaArrival commands for experts that
+         * The controller may plan ExpertPayloadArrival commands for experts that
          * are not yet resident on this participant. The graph gathers compact
          * command metadata, each source packs only planned non-empty arrivals
          * into a fixed-capacity staging lane, and NCCL/RCCL grouped collectives
@@ -279,7 +280,8 @@ namespace llaminar2
         uint32_t changed_layers = 0;
         uint32_t copied_arrivals = 0;
         uint32_t copy_incomplete = 0;
-        uint32_t reserved[3] = {};
+        uint32_t post_apply_multi_resident_experts = 0;
+        uint32_t reserved[2] = {};
     };
 
     constexpr DeviceMoERebalanceFlags operator|(DeviceMoERebalanceFlags lhs,
@@ -336,6 +338,17 @@ namespace llaminar2
         uint32_t min_load_spread_improvement_divisor = 0;
         uint32_t min_wave_spread_improvement_per_payload_slot = 0;
         uint32_t min_router_spread_improvement_per_payload_slot = 0;
+        uint32_t max_post_wave_load_spread_per_mille = 0;
+        uint32_t dynamic_imbalance_threshold_per_mille =
+            moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;
+        uint32_t dynamic_min_improvement_per_mille =
+            moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille;
+        uint32_t dynamic_max_swaps_per_layer =
+            moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer;
+        uint32_t dynamic_max_plan_entries_per_wave =
+            moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave;
+        uint32_t dynamic_min_window_activations =
+            static_cast<uint32_t>(moe_rebalance_policy::kDefaultDynamicMinWindowActivations);
     };
 
     struct DeviceMoERebalanceStatus
@@ -358,6 +371,9 @@ namespace llaminar2
         uint32_t payload_bucket_index = 0;
         uint32_t payload_bucket_overflow = 0;
         uint32_t skipped_no_improvement = 0;
+        uint32_t dynamic_ownership_swap_attempts = 0;
+        uint32_t dynamic_ownership_swap_accepts = 0;
+        uint32_t dynamic_ownership_swap_rejections = 0;
         uint32_t candidate_arrivals_considered = 0;
         uint32_t candidate_arrivals_below_floor = 0;
         uint32_t candidate_arrivals_pruned_by_count_bound = 0;
@@ -392,9 +408,12 @@ namespace llaminar2
         uint32_t window_required_slots = 0;
         uint32_t skipped_wave_cost_floor = 0;
         uint32_t skipped_low_router_benefit = 0;
+        uint32_t skipped_post_load_spread_ceiling = 0;
         uint32_t payload_source_participant_mask = 0;
         uint32_t payload_destination_participant_mask = 0;
         uint64_t payload_edge_mask = 0;
+        uint64_t post_wave_load_total = 0;
+        uint64_t post_wave_load_spread = 0;
     };
 
     static_assert(std::is_trivially_copyable_v<DeviceMoERebalanceConfig>);
@@ -1103,13 +1122,15 @@ namespace llaminar2
         const uint32_t *planned_replicas_per_participant,
         uint32_t max_replicas_per_participant) noexcept
     {
-        return moe_rebalance_policy::bestMissingResidentDestination(
+        return moe_rebalance_policy::bestDynamicMissingResidentDestination(
             current_participant_load,
             expert_count,
             current_resident_mask,
             config.participant_count,
+            -1,
             planned_replicas_per_participant,
             max_replicas_per_participant,
+            config.window_size_tokens,
             config.min_load_spread_improvement,
             config.min_load_spread_improvement_divisor);
     }
@@ -1252,8 +1273,9 @@ namespace llaminar2
             const auto &plan = plan_entries[i];
             if (plan.op == static_cast<uint32_t>(DeviceMoERebalancePlanOp::None))
                 continue;
-            if ((plan.op != static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival) &&
-                 plan.op != static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentHotReplica)) ||
+            if ((plan.op != static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival) &&
+                 plan.op != static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment) &&
+                 plan.op != static_cast<uint32_t>(DeviceMoERebalancePlanOp::OwnershipTransfer)) ||
                 plan.layer >= config.num_layers ||
                 plan.expert >= config.num_experts ||
                 plan.source_participant >= config.participant_count ||
@@ -1287,7 +1309,12 @@ namespace llaminar2
                  plan.source_resident_mask |
                  destination_bit) &
                 valid_mask;
-            if (plan.op == static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival) &&
+            const bool ownership_transfer =
+                plan.op == static_cast<uint32_t>(DeviceMoERebalancePlanOp::OwnershipTransfer);
+            if (ownership_transfer)
+                resident_mask = destination_bit & valid_mask;
+            if ((plan.op == static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival) ||
+                 ownership_transfer) &&
                 destination_local)
             {
                 if (!gathered_directory || !local_transfer_slots)
@@ -1347,10 +1374,14 @@ namespace llaminar2
                     continue;
                 }
                 desc = slot_entry.descriptor;
-                desc.owner_participant = bank.experts[plan.expert].owner_participant;
-                resident_mask |= participant_bit;
+                desc.owner_participant = ownership_transfer
+                                             ? static_cast<int32_t>(plan.destination_participant)
+                                             : bank.experts[plan.expert].owner_participant;
+                resident_mask = ownership_transfer
+                                    ? destination_bit & valid_mask
+                                    : resident_mask | participant_bit;
             }
-            else if (plan.op == static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentHotReplica) &&
+            else if (plan.op == static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment) &&
                      destination_local &&
                      (resident_mask & participant_bit) == 0u)
             {
@@ -1358,8 +1389,15 @@ namespace llaminar2
                     ++status->missing_source_descriptors;
                 continue;
             }
+            else if (ownership_transfer)
+            {
+                desc.owner_participant = static_cast<int32_t>(plan.destination_participant);
+            }
 
-            desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+            if (ownership_transfer)
+                desc.flags &= ~toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+            else
+                desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
             if (destination_local)
             {
                 desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
@@ -1367,11 +1405,20 @@ namespace llaminar2
                                                DeviceMoEExpertFlags::LocalCompute);
                 bank.local_compute_mask[plan.expert] = 1u;
                 bank.replica_role[plan.expert] =
-                    desc.owner_participant == static_cast<int32_t>(config.participant_id)
+                    ownership_transfer ||
+                            desc.owner_participant == static_cast<int32_t>(config.participant_id)
                         ? static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)
                         : static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
                 if (status)
                     ++status->applied_arrivals;
+            }
+            else if (ownership_transfer)
+            {
+                desc.flags &= ~toMoEExpertFlags(DeviceMoEExpertFlags::Resident |
+                                                DeviceMoEExpertFlags::LocalCompute);
+                bank.local_compute_mask[plan.expert] = 0u;
+                bank.replica_role[plan.expert] =
+                    static_cast<uint8_t>(DeviceMoEReplicaRole::None);
             }
             bank.experts[plan.expert] = desc;
             bank.resident_participant_mask[plan.expert] =
@@ -1383,7 +1430,26 @@ namespace llaminar2
         if (status)
         {
             for (uint32_t layer = 0; layer < config.num_layers && layer < kDeviceMoEMaxExperts; ++layer)
-                status->changed_layers += changed_layer[layer] != 0u ? 1u : 0u;
+            {
+                if (changed_layer[layer] == 0u)
+                    continue;
+
+                auto &bank = runtime_layers[layer].banks[runtime_layers[layer].active_bank];
+                uint32_t multi_resident = 0;
+                for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                {
+                    const uint32_t resident_mask =
+                        bank.resident_participant_mask[expert] & valid_mask;
+                    if (moe_rebalance_policy::residentCount(
+                            resident_mask, config.participant_count) > 1u)
+                    {
+                        ++multi_resident;
+                    }
+                }
+                bank.reserved[0] = multi_resident;
+                ++status->changed_layers;
+                status->post_apply_multi_resident_experts += multi_resident;
+            }
             status->status_code = static_cast<uint32_t>(DeviceMoERebalanceApplyStatusCode::Ok);
         }
         return true;
@@ -1530,6 +1596,9 @@ namespace llaminar2
         uint32_t selected_replicas = 0;
         uint32_t skipped_no_resident = 0;
         uint32_t skipped_no_improvement = 0;
+        uint32_t dynamic_ownership_swap_attempts = 0;
+        uint32_t dynamic_ownership_swap_accepts = 0;
+        uint32_t dynamic_ownership_swap_rejections = 0;
         uint32_t candidate_arrivals_considered = 0;
         uint32_t candidate_arrivals_below_floor = 0;
         uint32_t candidate_arrivals_pruned_by_count_bound = 0;
@@ -1547,6 +1616,8 @@ namespace llaminar2
         uint64_t router_hot_cache_miss_dispatches = 0;
         uint64_t router_hot_cache_selected_expert_slots = 0;
         uint64_t router_hot_cache_replicated_selected_expert_slots = 0;
+        uint64_t post_wave_load_total = 0;
+        uint64_t post_wave_load_spread = 0;
         uint32_t hot_cache_active_layers = 0;
         uint32_t last_epoch = 0;
         uint64_t pre_policy_load[kDeviceMoEMaxParticipants] = {};
@@ -1664,19 +1735,40 @@ namespace llaminar2
             for (uint32_t expert = 0; expert < config.num_experts; ++expert)
             {
                 auto &desc = next.experts[expert];
-                desc.flags &= ~toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
-                const bool owner_local = desc.owner_participant == static_cast<int32_t>(config.participant_id);
-                next.local_compute_mask[expert] = owner_local ? 1u : 0u;
-                next.replica_role[expert] = owner_local
-                                                ? static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)
-                                                : static_cast<uint8_t>(DeviceMoEReplicaRole::None);
-                next.resident_participant_mask[expert] &= valid_mask;
+                uint32_t resident_mask = next.resident_participant_mask[expert] & valid_mask;
                 if (desc.owner_participant >= 0 &&
                     desc.owner_participant < static_cast<int32_t>(config.participant_count))
                 {
-                    next.resident_participant_mask[expert] |=
+                    resident_mask |=
                         deviceMoEParticipantBit(static_cast<uint32_t>(desc.owner_participant));
                 }
+                const bool owner_local = desc.owner_participant == static_cast<int32_t>(config.participant_id);
+                const bool local_resident = (resident_mask & participant_bit) != 0u;
+                const bool multi_resident =
+                    moe_rebalance_policy::residentCount(
+                        resident_mask, config.participant_count) > 1u;
+                if (multi_resident)
+                    desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+                else
+                    desc.flags &= ~toMoEExpertFlags(DeviceMoEExpertFlags::Replicated);
+                if (local_resident)
+                {
+                    desc.flags |= toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                                  DeviceMoEExpertFlags::Resident |
+                                                  DeviceMoEExpertFlags::LocalCompute);
+                }
+                else
+                {
+                    desc.flags &= ~toMoEExpertFlags(DeviceMoEExpertFlags::LocalCompute);
+                }
+                next.local_compute_mask[expert] = local_resident ? 1u : 0u;
+                next.replica_role[expert] =
+                    local_resident
+                        ? (owner_local
+                               ? static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)
+                               : static_cast<uint8_t>(DeviceMoEReplicaRole::Replica))
+                        : static_cast<uint8_t>(DeviceMoEReplicaRole::None);
+                next.resident_participant_mask[expert] = resident_mask;
                 post_policy_resident_mask[expert] =
                     next.resident_participant_mask[expert] & valid_mask;
             }
@@ -1784,17 +1876,27 @@ namespace llaminar2
                             ++skipped_no_improvement;
                             continue;
                         }
-                        const uint32_t proposed_resident_mask =
-                            (candidate_resident_mask | participant_bit) & valid_mask;
-                        const auto delta =
-                            moe_rebalance_policy::evaluateAddingResidentLoadSpread(
-                                current_policy_load,
-                                count,
-                                candidate_resident_mask,
-                                proposed_resident_mask,
-                                config.participant_count,
-                                config.min_load_spread_improvement,
-                                config.min_load_spread_improvement_divisor);
+                        const int32_t source_participant = deviceMoEFirstResidentParticipant(
+                            candidate_resident_mask,
+                            config.participant_count,
+                            candidate_desc.owner_participant,
+                            static_cast<int32_t>(config.participant_id));
+	                        const uint32_t proposed_resident_mask =
+	                            (candidate_resident_mask | participant_bit) & valid_mask;
+	                        const auto delta =
+	                            source_participant >= 0
+	                                ? moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
+	                                      current_policy_load,
+	                                      count,
+	                                      candidate_resident_mask,
+	                                      proposed_resident_mask,
+	                                      config.participant_count,
+	                                      static_cast<uint32_t>(source_participant),
+	                                      config.participant_id,
+	                                      config.window_size_tokens,
+	                                      config.min_load_spread_improvement,
+	                                      config.min_load_spread_improvement_divisor)
+	                                : moe_rebalance_policy::LoadSpreadDelta{};
                         ++candidate_arrivals_considered;
                         candidate_load_spread_improvement_total += delta.improvement;
                         candidate_load_spread_improvement_max =
@@ -1843,27 +1945,40 @@ namespace llaminar2
                         (resident_mask | participant_bit) & valid_mask;
                     const uint64_t count = deviceMoEGlobalExpertCount(
                         gathered_histograms, config, window_index, best_expert);
-                        const auto delta =
-                            moe_rebalance_policy::evaluateAddingResidentLoadSpread(
-                                current_policy_load,
-                                count,
-                            resident_mask,
-                            proposed_resident_mask,
-                                config.participant_count,
-                                config.min_load_spread_improvement,
-                                config.min_load_spread_improvement_divisor);
+                    const int32_t source_participant = deviceMoEFirstResidentParticipant(
+                        resident_mask,
+                        config.participant_count,
+                        desc.owner_participant,
+                        static_cast<int32_t>(config.participant_id));
+	                    const auto delta =
+	                        source_participant >= 0
+	                            ? moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
+	                                  current_policy_load,
+	                                  count,
+	                                  resident_mask,
+	                                  proposed_resident_mask,
+	                                  config.participant_count,
+	                                  static_cast<uint32_t>(source_participant),
+	                                  config.participant_id,
+	                                  config.window_size_tokens,
+	                                  config.min_load_spread_improvement,
+	                                  config.min_load_spread_improvement_divisor)
+	                            : moe_rebalance_policy::LoadSpreadDelta{};
                     if (!delta.meets_floor)
                     {
                         ++skipped_no_improvement;
                         continue;
                     }
-                    if (!moe_rebalance_policy::addingResidentImprovesLoadSpread(
+                    if (!moe_rebalance_policy::addingResidentImprovesDynamicSpread(
                             current_policy_load,
                             count,
                             resident_mask,
                             proposed_resident_mask,
                             config.participant_count,
+                            static_cast<uint32_t>(source_participant),
+                            config.participant_id,
                             candidate_policy_load,
+                            config.window_size_tokens,
                             config.min_load_spread_improvement,
                             config.min_load_spread_improvement_divisor))
                     {
@@ -1871,13 +1986,8 @@ namespace llaminar2
                         continue;
                     }
 
-                    const int32_t source_participant = deviceMoEFirstResidentParticipant(
-                        resident_mask,
-                        config.participant_count,
-                        desc.owner_participant,
-                        static_cast<int32_t>(config.participant_id));
                     DeviceMoERebalancePlanEntry entry;
-                    entry.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival);
+                    entry.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
                     entry.layer = layer;
                     entry.expert = best_expert;
                     entry.source_participant = static_cast<uint32_t>(std::max<int32_t>(0, source_participant));
@@ -1941,6 +2051,18 @@ namespace llaminar2
                           0ULL);
             }
 
+            uint64_t layer_post_total = 0;
+            uint64_t layer_post_min = 0;
+            uint64_t layer_post_max = 0;
+            moe_rebalance_policy::finalizeLoadSpread(
+                current_policy_load,
+                config.participant_count,
+                layer_post_total,
+                layer_post_min,
+                layer_post_max);
+            post_wave_load_total += layer_post_total;
+            post_wave_load_spread += layer_post_max - layer_post_min;
+
             if (collect_load_stats)
             {
                 for (uint32_t expert = 0; expert < config.num_experts; ++expert)
@@ -1999,6 +2121,9 @@ namespace llaminar2
             status->selected_replicas = selected_replicas;
             status->skipped_no_resident = skipped_no_resident;
             status->skipped_no_improvement = skipped_no_improvement;
+            status->dynamic_ownership_swap_attempts = dynamic_ownership_swap_attempts;
+            status->dynamic_ownership_swap_accepts = dynamic_ownership_swap_accepts;
+            status->dynamic_ownership_swap_rejections = dynamic_ownership_swap_rejections;
             status->candidate_arrivals_considered = candidate_arrivals_considered;
             status->candidate_arrivals_below_floor = candidate_arrivals_below_floor;
             status->candidate_arrivals_pruned_by_count_bound =
@@ -2037,6 +2162,8 @@ namespace llaminar2
                     deviceMoEWindowObservedSlots(gathered_histograms, config));
             status->window_required_slots =
                 deviceMoEClampU64ToU32(deviceMoEWindowRequiredSlots(config));
+            status->post_wave_load_total = post_wave_load_total;
+            status->post_wave_load_spread = post_wave_load_spread;
             if (collect_load_stats)
             {
                 status->pre_policy_load_total = pre_total;

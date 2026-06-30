@@ -1,15 +1,17 @@
 /**
  * @file SocketAwareRebalancer.h
- * @brief Socket-load-aware expert rebalancer using decode histograms
+ * @brief Participant-load-aware Dynamic expert ownership rebalancer.
  *
  * Analyzes per-layer expert activation histograms from DecodeExpertHistogram
- * and proposes expert-swap movements between CPU sockets to reduce
- * decode load imbalance. Uses hysteresis and cooldowns to prevent thrashing.
+ * and proposes whole-expert ownership swaps between domain participants to
+ * reduce decode load imbalance. The class name is legacy; the policy is shared
+ * with CUDA/ROCm device-side Dynamic planning.
  */
 
 #pragma once
 
 #include "DecodeExpertHistogram.h"
+#include "DeviceMoERebalancePolicyShared.h"
 #include <string>
 #include <vector>
 
@@ -18,26 +20,31 @@ namespace llaminar2
 
     struct SocketRebalanceConfig
     {
-        /// Minimum socket imbalance ratio to trigger rebalancing (e.g., 1.3 = 30% imbalance)
-        float imbalance_threshold = 1.3f;
+        /// Minimum participant imbalance ratio to trigger rebalancing (e.g., 1.3 = 30% imbalance)
+        float imbalance_threshold =
+            moe_rebalance_policy::kDefaultDynamicImbalanceThresholdRatio;
 
         /// Maximum expert swaps per rebalance cycle per layer
-        int max_swaps_per_layer = 4;
+        int max_swaps_per_layer =
+            static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
 
         /// Maximum total expert swaps per cycle across all layers
-        int max_total_swaps = 16;
+        int max_total_swaps =
+            static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
 
         /// Minimum improvement required to accept a swap (prevent marginal moves)
-        float min_improvement_ratio = 0.05f;
+        float min_improvement_ratio =
+            moe_rebalance_policy::kDefaultDynamicMinImprovementRatio;
 
         /// Cooldown: minimum window generations between rebalancing the same layer
         int layer_cooldown_generations = 2;
 
         /// Minimum activations in a window before considering rebalancing
-        uint64_t min_window_activations = 64;
+        uint64_t min_window_activations =
+            moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
     };
 
-    /// A proposed swap: move expert from overloaded socket to underloaded socket
+    /// One side of a paired Dynamic ownership swap between two participants.
     struct ExpertSwap
     {
         int layer_idx;

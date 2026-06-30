@@ -8,6 +8,7 @@
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoERebalanceController.h"
 #include <algorithm>
+#include <array>
 #include <iterator>
 #include <utility>
 #include <vector>
@@ -166,6 +167,159 @@ TEST(Test__MoERebalanceController, DeviceSideProjectedLoadSpreadTracksReplicaBen
     EXPECT_LT(replicated_max - replicated_min, single_max - single_min);
 }
 
+TEST(Test__MoERebalanceController, DeviceSideLeastLoadedReplicaPaybackUsesDestinationLoad)
+{
+    uint64_t current_load[3] = {90, 10, 10};
+    const uint32_t owner_mask = moe_rebalance_policy::participantBit(0);
+    const uint32_t add_participant_one =
+        owner_mask | moe_rebalance_policy::participantBit(1);
+
+    const auto uniform_delta =
+        moe_rebalance_policy::evaluateAddingResidentLoadSpread(
+            current_load,
+            /*expert_count=*/30,
+            owner_mask,
+            add_participant_one,
+            /*participant_count=*/3,
+            /*min_improvement=*/20,
+            /*min_improvement_divisor=*/0);
+    const auto llep_delta =
+        moe_rebalance_policy::evaluateAddingResidentLeastLoadedSpread(
+            current_load,
+            /*expert_count=*/30,
+            owner_mask,
+            add_participant_one,
+            /*participant_count=*/3,
+            /*min_improvement=*/20,
+            /*min_improvement_divisor=*/0);
+
+    EXPECT_EQ(uniform_delta.improvement, 15u);
+    EXPECT_FALSE(uniform_delta.meets_floor)
+        << "Uniform resident splitting underestimates what the least-loaded router can do.";
+    EXPECT_EQ(llep_delta.improvement, 30u);
+    EXPECT_TRUE(llep_delta.meets_floor);
+
+    uint64_t scratch[3] = {};
+    ASSERT_TRUE(moe_rebalance_policy::addingResidentImprovesLeastLoadedSpread(
+        current_load,
+        /*expert_count=*/30,
+        owner_mask,
+        add_participant_one,
+        /*participant_count=*/3,
+        scratch,
+        /*min_improvement=*/20,
+        /*min_improvement_divisor=*/0));
+    EXPECT_EQ(scratch[0], 60u);
+    EXPECT_EQ(scratch[1], 40u);
+    EXPECT_EQ(scratch[2], 10u);
+}
+
+TEST(Test__MoERebalanceController, DeviceSideLeastLoadedDestinationRejectsEmptyExperts)
+{
+    uint64_t current_load[3] = {90, 10, 10};
+    const uint32_t owner_mask = moe_rebalance_policy::participantBit(0);
+
+    const auto empty_choice =
+        moe_rebalance_policy::bestLeastLoadedMissingResidentDestination(
+            current_load,
+            /*expert_count=*/0,
+            owner_mask,
+            /*participant_count=*/3);
+    EXPECT_FALSE(empty_choice.valid);
+
+    const auto choice =
+        moe_rebalance_policy::bestLeastLoadedMissingResidentDestination(
+            current_load,
+            /*expert_count=*/30,
+            owner_mask,
+            /*participant_count=*/3,
+            nullptr,
+            0,
+            /*min_improvement=*/20,
+            /*min_improvement_divisor=*/0);
+    ASSERT_TRUE(choice.valid);
+    EXPECT_EQ(choice.destination_participant, 1u);
+    EXPECT_EQ(choice.delta.improvement, 30u);
+}
+
+TEST(Test__MoERebalanceController, SharedDynamicPolicyUsesWindowFloorAndLeastLoadedTarget)
+{
+    uint64_t current_load[3] = {90, 10, 30};
+    const uint32_t owner_mask = moe_rebalance_policy::participantBit(0);
+
+    const auto tiny =
+        moe_rebalance_policy::bestDynamicMissingResidentDestination(
+            current_load,
+            /*expert_count=*/8,
+            owner_mask,
+            /*participant_count=*/3,
+            /*preferred_source_participant=*/0,
+            nullptr,
+            0,
+            /*window_size_tokens=*/256);
+    EXPECT_FALSE(tiny.valid)
+        << "Dynamic keeps the shared max(2, window/16) admission floor.";
+
+    const auto choice =
+        moe_rebalance_policy::bestDynamicMissingResidentDestination(
+            current_load,
+            /*expert_count=*/30,
+            owner_mask,
+            /*participant_count=*/3,
+            /*preferred_source_participant=*/0,
+            nullptr,
+            0,
+            /*window_size_tokens=*/256);
+    ASSERT_TRUE(choice.valid);
+    EXPECT_EQ(choice.source_participant, 0u);
+    EXPECT_EQ(choice.destination_participant, 1u);
+    EXPECT_EQ(choice.projected_shift, 30u);
+    EXPECT_EQ(choice.delta.improvement, 30u);
+
+    uint64_t scratch[3] = {};
+    ASSERT_TRUE(moe_rebalance_policy::addingResidentImprovesDynamicSpread(
+        current_load,
+        /*expert_count=*/30,
+        owner_mask,
+        owner_mask | moe_rebalance_policy::participantBit(choice.destination_participant),
+        /*participant_count=*/3,
+        choice.source_participant,
+        choice.destination_participant,
+        scratch,
+        /*window_size_tokens=*/256));
+    EXPECT_EQ(scratch[0], 60u);
+    EXPECT_EQ(scratch[1], 40u);
+    EXPECT_EQ(scratch[2], 30u);
+}
+
+TEST(Test__MoERebalanceController, DynamicPolicyDefaultsAreSharedAcrossCpuAndDevice)
+{
+    SocketRebalanceConfig cpu_config;
+    DeviceMoERebalanceConfig device_config;
+
+    EXPECT_FLOAT_EQ(cpu_config.imbalance_threshold,
+                    moe_rebalance_policy::kDefaultDynamicImbalanceThresholdRatio);
+    EXPECT_FLOAT_EQ(cpu_config.min_improvement_ratio,
+                    moe_rebalance_policy::kDefaultDynamicMinImprovementRatio);
+    EXPECT_EQ(cpu_config.max_swaps_per_layer,
+              static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer));
+    EXPECT_EQ(cpu_config.max_total_swaps,
+              static_cast<int>(moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave));
+    EXPECT_EQ(cpu_config.min_window_activations,
+              moe_rebalance_policy::kDefaultDynamicMinWindowActivations);
+
+    EXPECT_EQ(device_config.dynamic_imbalance_threshold_per_mille,
+              moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille);
+    EXPECT_EQ(device_config.dynamic_min_improvement_per_mille,
+              moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille);
+    EXPECT_EQ(device_config.dynamic_max_swaps_per_layer,
+              moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer);
+    EXPECT_EQ(device_config.dynamic_max_plan_entries_per_wave,
+              moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave);
+    EXPECT_EQ(device_config.dynamic_min_window_activations,
+              moe_rebalance_policy::kDefaultDynamicMinWindowActivations);
+}
+
 TEST(Test__MoERebalanceController, DeviceSidePayloadBucketsRoundToPowerOfTwoCapacity)
 {
     EXPECT_EQ(deviceMoERebalancePayloadBucketSlots(0, 8), 0u);
@@ -203,6 +357,193 @@ TEST(Test__MoERebalanceController, DeviceSideTransferWaveValueGateUsesPayloadSlo
         511, 2, 256));
     EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsSpreadImprovementFloor(
         512, 2, 256));
+}
+
+TEST(Test__MoERebalanceController, DeviceSideTransferWavePostLoadSpreadCeilingUsesPermille)
+{
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+        999, 10000, 0, 100))
+        << "Resident-only waves have no transfer cost to amortize.";
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+        1001, 10000, 1, 0))
+        << "A zero configured ceiling disables the residual-spread gate.";
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+        1000, 10000, 1, 100));
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+        1001, 10000, 1, 100));
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveMeetsPostLoadSpreadCeiling(
+        0, 0, 1, 100))
+        << "No projected load means there is no residual imbalance to reject.";
+}
+
+TEST(Test__MoERebalanceController, DeviceSideTransferWaveRequiresAggregateSpreadImprovement)
+{
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+        200, 300, 10000, 10000, 0))
+        << "Resident-only waves do not pay payload transfer cost.";
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+        200, 199, 10000, 10000, 1));
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+        200, 200, 10000, 10000, 1))
+        << "A paid transfer wave must do more than tie the aggregate projected spread.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+        200, 201, 10000, 10000, 1))
+        << "A paid transfer wave must never worsen aggregate projected spread.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+        200, 199, 10000, 9999, 1))
+        << "Projected transfer waves should preserve total routed work.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveImprovesAggregateLoadSpread(
+        0, 0, 0, 0, 1))
+        << "No projected load cannot justify a payload transfer.";
+}
+
+TEST(Test__MoERebalanceController, DeviceSideTransferWaveRejectsWorseParticipantSpreadWithoutRouterPayback)
+{
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        200, 300, 10000, 10000, 0, false))
+        << "Resident-only waves do not pay payload transfer cost.";
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        200, 199, 10000, 10000, 1, false));
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        200, 200, 10000, 10000, 1, false))
+        << "Paid waves should not merely tie projected participant spread.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        200, 201, 10000, 10000, 1, false))
+        << "Paid waves should not worsen projected participant spread without measured router payback.";
+    EXPECT_TRUE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        200, 201, 10000, 10000, 1, true))
+        << "Measured cache-aware routing payback can justify accepting the next paid wave.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        200, 199, 10000, 9999, 1, true))
+        << "Router payback must not paper over inconsistent projected totals.";
+    EXPECT_FALSE(moe_rebalance_policy::transferWaveParticipantSpreadIsAcceptable(
+        0, 0, 0, 0, 1, true))
+        << "No projected load cannot justify a payload transfer.";
+}
+
+TEST(Test__MoERebalanceController, DeviceSideTransferWavePrunePreservesResidentAssignmentCommands)
+{
+    std::vector<DeviceMoERebalancePlanEntry> entries(5);
+    entries[0].op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    entries[0].expert = 10;
+    entries[1].op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment);
+    entries[1].expert = 11;
+    entries[2].op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    entries[2].expert = 12;
+    entries[3].op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment);
+    entries[3].expert = 13;
+    entries[4].op = 0u;
+    entries[4].expert = 14;
+
+    uint32_t resident_count = 0;
+    const uint32_t compacted =
+        moe_rebalance_policy::prunePayloadArrivalsPreservingResidentAssignments(
+            entries.data(),
+            static_cast<uint32_t>(entries.size()),
+            &resident_count);
+
+    EXPECT_EQ(compacted, 2u);
+    EXPECT_EQ(resident_count, 2u);
+    EXPECT_EQ(entries[0].op,
+              static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment));
+    EXPECT_EQ(entries[0].expert, 11u);
+    EXPECT_EQ(entries[1].op,
+              static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment));
+    EXPECT_EQ(entries[1].expert, 13u);
+
+    entries[0].op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    entries[1].op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
+    EXPECT_EQ(moe_rebalance_policy::prunePayloadArrivalsPreservingResidentAssignments(
+                  entries.data(),
+                  2u,
+                  &resident_count),
+              0u);
+    EXPECT_EQ(resident_count, 0u);
+}
+
+TEST(Test__MoERebalanceController, SharedDynamicPolicyChoosesPairedOwnershipSwap)
+{
+    uint64_t participant_load[2] = {100u, 10u};
+    uint64_t expert_counts[4] = {70u, 30u, 1u, 9u};
+    int32_t expert_owner[4] = {0, 0, 1, 1};
+
+    const auto choice = moe_rebalance_policy::bestDynamicOwnershipSwap(
+        participant_load,
+        expert_counts,
+        expert_owner,
+        /*num_experts=*/4,
+        /*participant_count=*/2,
+        /*imbalance_threshold_per_mille=*/1300,
+        /*min_improvement_per_mille=*/50,
+        /*min_window_activations=*/64);
+
+    ASSERT_TRUE(choice.valid);
+    EXPECT_EQ(choice.overloaded_participant, 0u);
+    EXPECT_EQ(choice.underloaded_participant, 1u);
+    EXPECT_EQ(choice.heavy_expert, 0u);
+    EXPECT_EQ(choice.light_expert, 2u);
+    EXPECT_EQ(choice.heavy_count, 70u);
+    EXPECT_EQ(choice.light_count, 1u);
+    EXPECT_EQ(choice.old_min_load, 10u);
+    EXPECT_EQ(choice.old_max_load, 100u);
+    EXPECT_EQ(choice.new_min_load, 31u);
+    EXPECT_EQ(choice.new_max_load, 79u);
+
+    ASSERT_TRUE(moe_rebalance_policy::applyDynamicOwnershipSwap(
+        participant_load,
+        expert_owner,
+        choice));
+    EXPECT_EQ(participant_load[0], 31u);
+    EXPECT_EQ(participant_load[1], 79u);
+    EXPECT_EQ(expert_owner[0], 1);
+    EXPECT_EQ(expert_owner[2], 0);
+}
+
+TEST(Test__MoERebalanceController, HostApplyRefreshesMultiResidentVisibility)
+{
+    DeviceMoERebalanceConfig config;
+    config.num_layers = 1;
+    config.num_experts = 4;
+    config.top_k = 2;
+    config.participant_id = 0;
+    config.participant_count = 2;
+    config.root_participant = 0;
+    config.window_size_tokens = 1;
+
+    std::array<DeviceMoELayerRuntime, 1> runtime_layers{
+        makeDeviceRuntimeLayerForLoadStats()};
+
+    DeviceMoERebalancePlanEntry plan;
+    plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ResidentExpertAssignment);
+    plan.layer = 0;
+    plan.expert = 1;
+    plan.source_participant = 1;
+    plan.destination_participant = config.participant_id;
+    plan.source_resident_mask = 0b10u;
+    plan.destination_slot = kDeviceMoEInvalidSlot;
+    plan.payload_slot = kDeviceMoEInvalidSlot;
+
+    DeviceMoERebalanceApplyStatus status;
+    ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+        runtime_layers.data(),
+        &plan,
+        1,
+        nullptr,
+        nullptr,
+        0,
+        config,
+        &status));
+
+    const auto &runtime = runtime_layers[0];
+    const auto &bank = runtime.banks[runtime.active_bank];
+    EXPECT_EQ(status.status_code,
+              static_cast<uint32_t>(DeviceMoERebalanceApplyStatusCode::Ok));
+    EXPECT_EQ(status.applied_arrivals, 1u);
+    EXPECT_EQ(status.changed_layers, 1u);
+    EXPECT_EQ(status.post_apply_multi_resident_experts, 1u);
+    EXPECT_EQ(bank.resident_participant_mask[1], 0b11u);
+    EXPECT_EQ(bank.reserved[0], 1u)
+        << "host mirror must refresh the cheap hot-cache visibility gate.";
 }
 
 TEST(Test__MoERebalanceController, DeviceSideLoadSpreadStatusIsOptIn)

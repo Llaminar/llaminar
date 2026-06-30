@@ -340,7 +340,10 @@ namespace llaminar2
             uint32_t transfer_copied_arrivals,
             uint32_t transfer_applied_arrivals,
             uint32_t transfer_payload_bucket_slots,
-            uint64_t transfer_payload_edge_mask)
+            uint64_t transfer_payload_edge_mask,
+            const std::vector<uint64_t> &trace_gathered_histograms,
+            uint32_t trace_histogram_layer_count,
+            const std::vector<int32_t> &trace_owner_participants)
         {
             static std::mutex trace_mutex;
             std::ostringstream out;
@@ -384,6 +387,7 @@ namespace llaminar2
             appendJsonNumberField(out, config_first, "min_load_spread_improvement_divisor", params.config.min_load_spread_improvement_divisor);
             appendJsonNumberField(out, config_first, "min_wave_spread_improvement_per_payload_slot", params.config.min_wave_spread_improvement_per_payload_slot);
             appendJsonNumberField(out, config_first, "min_router_spread_improvement_per_payload_slot", params.config.min_router_spread_improvement_per_payload_slot);
+            appendJsonNumberField(out, config_first, "max_post_wave_load_spread_per_mille", params.config.max_post_wave_load_spread_per_mille);
             out << '}';
 
             if (!first)
@@ -398,6 +402,11 @@ namespace llaminar2
             appendJsonNumberField(out, status_first, "changed_layers", status.changed_layers);
             appendJsonNumberField(out, status_first, "selected_replicas", status.selected_replicas);
             appendJsonNumberField(out, status_first, "planned_arrivals", status.planned_arrivals);
+            appendJsonNumberField(out, status_first, "skipped_no_resident", status.skipped_no_resident);
+            appendJsonNumberField(out, status_first, "skipped_no_improvement", status.skipped_no_improvement);
+            appendJsonNumberField(out, status_first, "dynamic_ownership_swap_attempts", status.dynamic_ownership_swap_attempts);
+            appendJsonNumberField(out, status_first, "dynamic_ownership_swap_accepts", status.dynamic_ownership_swap_accepts);
+            appendJsonNumberField(out, status_first, "dynamic_ownership_swap_rejections", status.dynamic_ownership_swap_rejections);
             appendJsonNumberField(out, status_first, "candidate_arrivals_considered", status.candidate_arrivals_considered);
             appendJsonNumberField(out, status_first, "candidate_arrivals_below_floor", status.candidate_arrivals_below_floor);
             appendJsonNumberField(out, status_first, "candidate_arrivals_pruned_by_count_bound", status.candidate_arrivals_pruned_by_count_bound);
@@ -411,16 +420,25 @@ namespace llaminar2
             appendJsonNumberField(out, status_first, "router_hot_cache_default_load_spread_total", status.router_hot_cache_default_load_spread_total);
             appendJsonNumberField(out, status_first, "router_hot_cache_actual_load_spread_total", status.router_hot_cache_actual_load_spread_total);
             appendJsonNumberField(out, status_first, "router_hot_cache_load_spread_improvement_total", status.router_hot_cache_load_spread_improvement_total);
+            appendJsonNumberField(out, status_first, "router_hot_cache_active_dispatches", status.router_hot_cache_active_dispatches);
+            appendJsonNumberField(out, status_first, "router_hot_cache_miss_dispatches", status.router_hot_cache_miss_dispatches);
+            appendJsonNumberField(out, status_first, "router_hot_cache_selected_expert_slots", status.router_hot_cache_selected_expert_slots);
+            appendJsonNumberField(out, status_first, "router_hot_cache_replicated_selected_expert_slots", status.router_hot_cache_replicated_selected_expert_slots);
             appendJsonNumberField(out, status_first, "pre_policy_load_total", status.pre_policy_load_total);
             appendJsonNumberField(out, status_first, "pre_policy_load_min", status.pre_policy_load_min);
             appendJsonNumberField(out, status_first, "pre_policy_load_max", status.pre_policy_load_max);
             appendJsonNumberField(out, status_first, "post_policy_load_total", status.post_policy_load_total);
             appendJsonNumberField(out, status_first, "post_policy_load_min", status.post_policy_load_min);
             appendJsonNumberField(out, status_first, "post_policy_load_max", status.post_policy_load_max);
+            appendJsonNumberField(out, status_first, "post_wave_load_total", status.post_wave_load_total);
+            appendJsonNumberField(out, status_first, "post_wave_load_spread", status.post_wave_load_spread);
             appendJsonNumberField(out, status_first, "window_ready_slots", status.window_ready_slots);
             appendJsonNumberField(out, status_first, "window_required_slots", status.window_required_slots);
             appendJsonNumberField(out, status_first, "payload_bucket_requested_slots", status.payload_bucket_requested_slots);
             appendJsonNumberField(out, status_first, "payload_bucket_slots", status.payload_bucket_slots);
+            appendJsonNumberField(out, status_first, "skipped_wave_cost_floor", status.skipped_wave_cost_floor);
+            appendJsonNumberField(out, status_first, "skipped_low_router_benefit", status.skipped_low_router_benefit);
+            appendJsonNumberField(out, status_first, "skipped_post_load_spread_ceiling", status.skipped_post_load_spread_ceiling);
             appendJsonNumberField(out, status_first, "payload_edge_mask", status.payload_edge_mask);
             out << '}';
 
@@ -442,6 +460,139 @@ namespace llaminar2
             };
             append_load_array("pre_policy_participant_load", status.pre_policy_participant_load);
             append_load_array("post_policy_participant_load", status.post_policy_participant_load);
+
+            if (!trace_gathered_histograms.empty() &&
+                trace_histogram_layer_count > 0u &&
+                params.config.num_experts > 0u &&
+                params.config.participant_count > 0u)
+            {
+                const uint32_t participant_count =
+                    std::min<uint32_t>(params.config.participant_count, kDeviceMoEMaxParticipants);
+                const uint32_t expert_count =
+                    std::min<uint32_t>(params.config.num_experts, kDeviceMoEMaxExperts);
+                const size_t layer_stride = static_cast<size_t>(expert_count);
+                const size_t participant_stride =
+                    static_cast<size_t>(trace_histogram_layer_count) * layer_stride;
+
+                if (!first)
+                    out << ',';
+                first = false;
+                out << "\"gathered_histogram\":{";
+                bool histogram_first = true;
+                appendJsonStringField(out,
+                                      histogram_first,
+                                      "layout",
+                                      "participant,wave_layer,expert");
+                appendJsonNumberField(out,
+                                      histogram_first,
+                                      "participant_count",
+                                      participant_count);
+                appendJsonNumberField(out,
+                                      histogram_first,
+                                      "wave_layer_count",
+                                      trace_histogram_layer_count);
+                appendJsonNumberField(out,
+                                      histogram_first,
+                                      "num_experts",
+                                      expert_count);
+
+                if (!histogram_first)
+                    out << ',';
+                histogram_first = false;
+                out << "\"nonzero\":[";
+                bool first_histogram_entry = true;
+                for (uint32_t participant = 0; participant < participant_count; ++participant)
+                {
+                    for (uint32_t wave_layer = 0; wave_layer < trace_histogram_layer_count; ++wave_layer)
+                    {
+                        for (uint32_t expert = 0; expert < expert_count; ++expert)
+                        {
+                            const size_t idx =
+                                static_cast<size_t>(participant) * participant_stride +
+                                static_cast<size_t>(wave_layer) * layer_stride +
+                                static_cast<size_t>(expert);
+                            if (idx >= trace_gathered_histograms.size())
+                                continue;
+                            const uint64_t count = trace_gathered_histograms[idx];
+                            if (count == 0u)
+                                continue;
+                            if (!first_histogram_entry)
+                                out << ',';
+                            first_histogram_entry = false;
+                            out << '{';
+                            bool entry_first = true;
+                            appendJsonNumberField(out, entry_first, "participant", participant);
+                            appendJsonNumberField(out, entry_first, "wave_layer", wave_layer);
+                            appendJsonNumberField(out, entry_first, "expert", expert);
+                            appendJsonNumberField(out, entry_first, "count", count);
+                            out << '}';
+                        }
+                    }
+                }
+                out << "],\"global_expert_loads\":[";
+                bool first_global_entry = true;
+                for (uint32_t wave_layer = 0; wave_layer < trace_histogram_layer_count; ++wave_layer)
+                {
+                    for (uint32_t expert = 0; expert < expert_count; ++expert)
+                    {
+                        uint64_t count = 0;
+                        for (uint32_t participant = 0; participant < participant_count; ++participant)
+                        {
+                            const size_t idx =
+                                static_cast<size_t>(participant) * participant_stride +
+                                static_cast<size_t>(wave_layer) * layer_stride +
+                                static_cast<size_t>(expert);
+                            if (idx < trace_gathered_histograms.size())
+                                count += trace_gathered_histograms[idx];
+                        }
+                        if (count == 0u)
+                            continue;
+                        if (!first_global_entry)
+                            out << ',';
+                        first_global_entry = false;
+                        out << '{';
+                        bool entry_first = true;
+                        appendJsonNumberField(out, entry_first, "wave_layer", wave_layer);
+                        appendJsonNumberField(out, entry_first, "expert", expert);
+                        appendJsonNumberField(out, entry_first, "count", count);
+                        out << '}';
+                    }
+                }
+                out << "]}";
+            }
+
+            if (!trace_owner_participants.empty() &&
+                trace_histogram_layer_count > 0u &&
+                params.config.num_experts > 0u)
+            {
+                const uint32_t expert_count =
+                    std::min<uint32_t>(params.config.num_experts, kDeviceMoEMaxExperts);
+                if (!first)
+                    out << ',';
+                first = false;
+                out << "\"expert_owner_participants\":[";
+                for (uint32_t wave_layer = 0; wave_layer < trace_histogram_layer_count; ++wave_layer)
+                {
+                    if (wave_layer != 0u)
+                        out << ',';
+                    out << "{\"wave_layer\":" << wave_layer << ",\"owners\":[";
+                    for (uint32_t expert = 0; expert < expert_count; ++expert)
+                    {
+                        if (expert != 0u)
+                            out << ',';
+                        const size_t idx =
+                            static_cast<size_t>(wave_layer) * static_cast<size_t>(expert_count) +
+                            static_cast<size_t>(expert);
+                        const int32_t owner =
+                            idx < trace_owner_participants.size()
+                                ? trace_owner_participants[idx]
+                                : -1;
+                        out << owner;
+                    }
+                    out << "]}";
+                }
+                out << ']';
+            }
 
             if (!first)
                 out << ',';
@@ -485,6 +636,10 @@ namespace llaminar2
             appendJsonNumberField(out, apply_first, "copied_arrivals", apply_status.copied_arrivals);
             appendJsonNumberField(out, apply_first, "copy_incomplete", apply_status.copy_incomplete);
             appendJsonNumberField(out, apply_first, "changed_layers", apply_status.changed_layers);
+            appendJsonNumberField(out,
+                                  apply_first,
+                                  "post_apply_multi_resident_experts",
+                                  apply_status.post_apply_multi_resident_experts);
             out << '}';
 
             if (!first)
@@ -541,6 +696,7 @@ namespace llaminar2
             first = false;
             out << "\"commands\":[";
             bool first_command = true;
+            uint32_t noop_command_entries = 0;
             for (uint32_t buffer = 0; buffer < command_headers.size(); ++buffer)
             {
                 const uint32_t header_count = command_headers[buffer].command_count;
@@ -559,6 +715,11 @@ namespace llaminar2
                     if (flat_index >= plan_entries.size())
                         break;
                     const auto &entry = plan_entries[flat_index];
+                    if (entry.op == 0u)
+                    {
+                        ++noop_command_entries;
+                        continue;
+                    }
                     if (!first_command)
                         out << ',';
                     first_command = false;
@@ -579,6 +740,7 @@ namespace llaminar2
                 }
             }
             out << ']';
+            appendJsonNumberField(out, first, "noop_command_entries", noop_command_entries);
             out << "}\n";
 
             std::lock_guard<std::mutex> lock(trace_mutex);
@@ -2284,8 +2446,7 @@ namespace llaminar2
 
         const auto &config = graph_builder_->config();
         if (!config.isMoE() ||
-            config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC ||
-            debugEnv().moe_rebalance.gpu_cache_experts_per_layer > 0)
+            config.moe.rebalance_mode != MoERebalanceMode::DYNAMIC)
         {
             return false;
         }
@@ -3742,6 +3903,16 @@ namespace llaminar2
         std::vector<DeviceMoERebalancePlanEntry> trace_plan_entries(
             static_cast<size_t>(command_buffer_count) *
             static_cast<size_t>(trace_plan_capacity));
+        const uint32_t trace_histogram_layer_count =
+            export_trace
+                ? static_cast<uint32_t>(std::min<size_t>(
+                      rebalance_stage->traceHistogramLayerCount(),
+                      static_cast<size_t>(std::numeric_limits<uint32_t>::max())))
+                : 0u;
+        std::vector<uint64_t> trace_gathered_histograms(
+            export_trace
+                ? rebalance_stage->traceGatheredHistogramEntries()
+                : 0u);
 
         if (!copy_required(&status,
                            buffer_name(MoEDeviceRebalanceStage::WS_STATUS),
@@ -3779,6 +3950,25 @@ namespace llaminar2
                                    trace_plan_entries.size() * sizeof(trace_plan_entries.front())))
                 {
                     return false;
+                }
+            }
+            if (export_trace && !trace_gathered_histograms.empty())
+            {
+                const std::string histogram_name =
+                    buffer_name(MoEDeviceRebalanceStage::WS_GATHERED_HISTOGRAM);
+                if (workspace->getBuffer(histogram_name))
+                {
+                    if (!copy_required(trace_gathered_histograms.data(),
+                                       histogram_name,
+                                       trace_gathered_histograms.size() *
+                                           sizeof(trace_gathered_histograms.front())))
+                    {
+                        return false;
+                    }
+                }
+                else
+                {
+                    trace_gathered_histograms.clear();
                 }
             }
         }
@@ -3823,6 +4013,47 @@ namespace llaminar2
         }
         if (!export_diagnostics)
             return true;
+
+        std::vector<int32_t> trace_owner_participants;
+        if (export_trace &&
+            trace_histogram_layer_count > 0u &&
+            params.moe_runtime_table != nullptr &&
+            params.config.num_layers > 0u &&
+            params.config.num_experts > 0u)
+        {
+            const uint32_t expert_count =
+                std::min<uint32_t>(params.config.num_experts, kDeviceMoEMaxExperts);
+            trace_owner_participants.assign(
+                static_cast<size_t>(trace_histogram_layer_count) *
+                    static_cast<size_t>(expert_count),
+                -1);
+            const uint32_t layer_window_count =
+                params.config.layer_window_count == 0u
+                    ? params.config.num_layers
+                    : std::min(params.config.layer_window_count,
+                               params.config.num_layers);
+            const uint32_t layer_window_start =
+                params.config.layer_window_start % params.config.num_layers;
+            for (uint32_t wave_layer = 0; wave_layer < trace_histogram_layer_count; ++wave_layer)
+            {
+                const uint32_t layer =
+                    (layer_window_start +
+                     (layer_window_count == 0u ? wave_layer : wave_layer % layer_window_count)) %
+                    params.config.num_layers;
+                const auto &runtime = params.moe_runtime_table->hostLayerState(
+                    static_cast<int>(layer));
+                if (runtime.active_bank > 1u)
+                    continue;
+                const auto &bank = runtime.banks[runtime.active_bank];
+                for (uint32_t expert = 0; expert < expert_count; ++expert)
+                {
+                    trace_owner_participants[
+                        static_cast<size_t>(wave_layer) * static_cast<size_t>(expert_count) +
+                        static_cast<size_t>(expert)] =
+                        bank.experts[expert].owner_participant;
+                }
+            }
+        }
 
         if (export_perfstats && cache.timing_start_event && cache.timing_stop_event)
         {
@@ -3883,6 +4114,16 @@ namespace llaminar2
             std::to_string(params.config.min_wave_spread_improvement_per_payload_slot);
         tags["min_router_spread_improvement_per_payload_slot"] =
             std::to_string(params.config.min_router_spread_improvement_per_payload_slot);
+        tags["max_post_wave_load_spread_per_mille"] =
+            std::to_string(params.config.max_post_wave_load_spread_per_mille);
+        tags["dynamic_imbalance_threshold_per_mille"] =
+            std::to_string(params.config.dynamic_imbalance_threshold_per_mille);
+        tags["dynamic_min_improvement_per_mille"] =
+            std::to_string(params.config.dynamic_min_improvement_per_mille);
+        tags["dynamic_max_swaps_per_layer"] =
+            std::to_string(params.config.dynamic_max_swaps_per_layer);
+        tags["dynamic_min_window_activations"] =
+            std::to_string(params.config.dynamic_min_window_activations);
 
         auto emit_u64 = [&](const std::string &name, uint64_t value)
         {
@@ -3943,10 +4184,18 @@ namespace llaminar2
         emit_u32("device_rebalance_window_required_slots", status.window_required_slots);
         emit_u32("device_rebalance_skipped_no_resident", status.skipped_no_resident);
         emit_u32("device_rebalance_skipped_no_improvement", status.skipped_no_improvement);
+        emit_u32("device_rebalance_dynamic_ownership_swap_attempts",
+                 status.dynamic_ownership_swap_attempts);
+        emit_u32("device_rebalance_dynamic_ownership_swap_accepts",
+                 status.dynamic_ownership_swap_accepts);
+        emit_u32("device_rebalance_dynamic_ownership_swap_rejections",
+                 status.dynamic_ownership_swap_rejections);
         emit_u32("device_rebalance_skipped_wave_cost_floor",
                  status.skipped_wave_cost_floor);
         emit_u32("device_rebalance_skipped_low_router_benefit",
                  status.skipped_low_router_benefit);
+        emit_u32("device_rebalance_skipped_post_load_spread_ceiling",
+                 status.skipped_post_load_spread_ceiling);
         emit_u32("device_rebalance_candidate_arrivals_considered",
                  status.candidate_arrivals_considered);
         emit_u32("device_rebalance_candidate_arrivals_below_floor",
@@ -3961,6 +4210,10 @@ namespace llaminar2
                  status.accepted_load_spread_improvement_total);
         emit_u64("device_rebalance_accepted_load_spread_improvement_max",
                  status.accepted_load_spread_improvement_max);
+        emit_u64("device_rebalance_post_wave_load_total",
+                 status.post_wave_load_total);
+        emit_u64("device_rebalance_post_wave_load_spread",
+                 status.post_wave_load_spread);
         emit_u64("device_rebalance_router_hot_cache_eligible_dispatches",
                  status.router_hot_cache_eligible_dispatches);
         emit_u64("device_rebalance_router_hot_cache_used_dispatches",
@@ -4285,6 +4538,9 @@ namespace llaminar2
         emit_double("device_rebalance_policy_accepted_spread_improvement_per_arrival",
                     safe_ratio(status.accepted_load_spread_improvement_total,
                                std::max<uint32_t>(1u, status.planned_arrivals)));
+        emit_double("device_rebalance_post_wave_load_spread_fraction",
+                    safe_ratio(status.post_wave_load_spread,
+                               status.post_wave_load_total));
         emit_double("device_rebalance_router_hot_cache_spread_improvement_ratio",
                     safe_ratio(status.router_hot_cache_load_spread_improvement_total,
                                status.router_hot_cache_default_load_spread_total));
@@ -4367,7 +4623,10 @@ namespace llaminar2
                     transfer_copied_arrivals,
                     transfer_applied_arrivals,
                     transfer_payload_bucket_slots,
-                    transfer_payload_edge_mask))
+                    transfer_payload_edge_mask,
+                    trace_gathered_histograms,
+                    trace_histogram_layer_count,
+                    trace_owner_participants))
             {
                 return false;
             }
@@ -4382,6 +4641,8 @@ namespace llaminar2
         emit_u32("device_rebalance_apply_changed_layers", apply_status.changed_layers);
         emit_u32("device_rebalance_apply_copied_arrivals", apply_status.copied_arrivals);
         emit_u32("device_rebalance_apply_copy_incomplete", apply_status.copy_incomplete);
+        emit_u32("device_rebalance_apply_post_apply_multi_resident_experts",
+                 apply_status.post_apply_multi_resident_experts);
         emit_u32("device_rebalance_apply_missing_source_descriptors",
                  apply_status.missing_source_descriptors);
         emit_u32("device_rebalance_apply_missing_destination_slots",

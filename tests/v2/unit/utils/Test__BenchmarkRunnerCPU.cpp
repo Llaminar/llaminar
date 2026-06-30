@@ -1593,6 +1593,7 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_EQ(doc.at("schema"), "llaminar.benchmark.v1");
     EXPECT_TRUE(doc.at("success").get<bool>());
     EXPECT_EQ(doc.at("measurement_iterations"), 3);
+    EXPECT_EQ(doc.at("warmup_iterations"), 1);
     EXPECT_EQ(doc.at("tokens").at("prefill"), 10);
     EXPECT_EQ(doc.at("tokens").at("decode"), 2);
     EXPECT_DOUBLE_EQ(doc.at("timing_ms").at("total").get<double>(), 6.0);
@@ -1708,6 +1709,21 @@ TEST(Test__BenchmarkRunnerCPU, SerializesMachineReadableBenchmarkJson)
     EXPECT_TRUE(saw_full_graph_replay);
     EXPECT_FALSE(saw_filtered_mtp);
     PerfStatsCollector::reset();
+}
+
+TEST(Test__BenchmarkRunnerCPU, RuntimeDebugParsesBenchmarkIterationOverrides)
+{
+    {
+        ScopedEnv iterations("LLAMINAR_BENCHMARK_ITERATIONS", "1");
+        ScopedEnv warmups("LLAMINAR_BENCHMARK_WARMUP_ITERATIONS", "0");
+        mutableDebugEnv().runtime_debug.reload();
+
+        EXPECT_EQ(debugEnv().runtime_debug.benchmark_iterations, 1);
+        EXPECT_EQ(debugEnv().runtime_debug.benchmark_warmup_iterations, 0);
+    }
+    mutableDebugEnv().runtime_debug.reload();
+    EXPECT_EQ(debugEnv().runtime_debug.benchmark_iterations, 3);
+    EXPECT_EQ(debugEnv().runtime_debug.benchmark_warmup_iterations, 1);
 }
 
 TEST(Test__BenchmarkRunnerCPU, PreservesMemoryBOMAcrossMeasuredReset)

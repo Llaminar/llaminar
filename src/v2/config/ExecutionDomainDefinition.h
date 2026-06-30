@@ -34,18 +34,21 @@ namespace llaminar2
         REPLICATED_EXPERTS,
         APPORTIONED_EXPERTS,
         SHARDED_EXPERTS,
+    };
 
-        // Compatibility aliases for older configs/tests.  "Expert id sharded"
-        // meant whole expert ids apportioned across participants, not tensor
-        // shards of an expert.
-        EXPERT_ID_SHARDED = APPORTIONED_EXPERTS,
-        TENSOR_PARALLEL_EXPERTS = SHARDED_EXPERTS,
+    enum class ExecutionDomainAssignmentKind
+    {
+        UNSPECIFIED,
+        STATIC_OWNER,
+        LEAST_LOADED_EP,
     };
 
     const char *executionDomainScopeToString(ExecutionDomainScope scope);
     const char *executionDomainComputeKindToString(ExecutionDomainComputeKind kind);
+    const char *executionDomainAssignmentKindToString(ExecutionDomainAssignmentKind kind);
     std::optional<ExecutionDomainScope> parseExecutionDomainScope(const std::string &value);
     std::optional<ExecutionDomainComputeKind> parseExecutionDomainComputeKind(const std::string &value);
+    std::optional<ExecutionDomainAssignmentKind> parseExecutionDomainAssignmentKind(const std::string &value);
 
     struct ExecutionDomainParseOptions
     {
@@ -68,6 +71,7 @@ namespace llaminar2
         std::optional<int> owner_rank;
         std::vector<int> ranks;
         ExecutionDomainComputeKind compute_kind = ExecutionDomainComputeKind::UNSPECIFIED;
+        ExecutionDomainAssignmentKind assignment_kind = ExecutionDomainAssignmentKind::UNSPECIFIED;
 
         static ExecutionDomainDefinition parse(
             const std::string &spec,
@@ -79,12 +83,12 @@ namespace llaminar2
 
         bool hasWeights() const { return !weights.empty(); }
         bool hasComputeKind() const { return compute_kind != ExecutionDomainComputeKind::UNSPECIFIED; }
+        bool hasAssignmentKind() const { return assignment_kind != ExecutionDomainAssignmentKind::UNSPECIFIED; }
         bool hasMultipleParticipants() const { return participants.size() > 1; }
         bool isDomainScopedTP() const;
         bool supportsApportionedExperts() const;
+        bool supportsLeastLoadedEP() const;
         bool supportsShardedExperts() const;
-        bool supportsTensorParallelExperts() const;
-        bool supportsExpertIdSharding() const;
 
         std::string logicalIdentity() const { return name; }
         bool samePhysicalParticipants(const ExecutionDomainDefinition &other) const;

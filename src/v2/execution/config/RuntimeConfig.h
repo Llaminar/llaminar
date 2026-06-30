@@ -13,6 +13,7 @@
 #include "../../backends/ComputeBackend.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/Logger.h"
+#include "../moe/DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
@@ -799,6 +800,16 @@ namespace llaminar2
         ShardedExperts,     ///< Each routed expert GEMM is internally sharded across participants
     };
 
+    enum class RoutedExpertAssignmentPolicy
+    {
+        /// Router-selected rows execute on the canonical owner/resident participant.
+        StaticOwner,
+
+        /// Preserve router top-k choices, but assign selected rows to the
+        /// least-loaded resident participant for the same expert when possible.
+        LeastLoadedEP,
+    };
+
     /**
      * @brief Derived composite summary of dense/shared and routed-expert policy axes.
      *
@@ -823,9 +834,18 @@ namespace llaminar2
         /// an owner computes the complete selected expert output.
         ApportionedExperts,
 
+        /// Dense/shared: replicated on every participant.
+        /// Routed experts: Least-Loaded EP current-window row assignment over
+        /// apportioned whole-expert ownership.
+        LeastLoadedEP,
+
         /// Dense/shared: tensor-parallel sharded with collectives as needed.
         /// Routed experts: apportioned as whole expert ids across participants.
         HybridTP_AE,
+
+        /// Dense/shared: tensor-parallel sharded with collectives as needed.
+        /// Routed experts: Least-Loaded EP current-window row assignment.
+        HybridTP_LLEP,
 
         /// Dense/shared: tensor-parallel sharded with collectives as needed.
         /// Routed experts: replicated on every participant.
@@ -835,6 +855,11 @@ namespace llaminar2
         /// Decode dense/shared: replicated to avoid tiny decode collectives.
         /// Routed experts: apportioned as whole expert ids across participants.
         PhaseSplitHybridTP_AE,
+
+        /// Prefill dense/shared: tensor-parallel sharded with collectives.
+        /// Decode dense/shared: replicated to avoid tiny decode collectives.
+        /// Routed experts: Least-Loaded EP current-window row assignment.
+        PhaseSplitHybridTP_LLEP,
     };
 
     enum class ExpertReplicaPolicy
@@ -952,6 +977,35 @@ namespace llaminar2
         return std::nullopt;
     }
 
+    inline const char *routedExpertAssignmentPolicyToString(RoutedExpertAssignmentPolicy policy)
+    {
+        switch (policy)
+        {
+        case RoutedExpertAssignmentPolicy::StaticOwner:
+            return "static-owner";
+        case RoutedExpertAssignmentPolicy::LeastLoadedEP:
+            return "least-loaded-ep";
+        default:
+            return "unknown";
+        }
+    }
+
+    inline std::optional<RoutedExpertAssignmentPolicy> parseRoutedExpertAssignmentPolicy(const std::string &value)
+    {
+        const std::string lower = normalizeParallelPolicyToken(value);
+        if (lower == "static-owner" ||
+            lower == "static" ||
+            lower == "owner" ||
+            lower == "canonical-owner")
+            return RoutedExpertAssignmentPolicy::StaticOwner;
+        if (lower == "least-loaded-ep" ||
+            lower == "least-loaded-experts" ||
+            lower == "least-loaded" ||
+            lower == "llep")
+            return RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        return std::nullopt;
+    }
+
     inline RoutedExpertParallelPolicy routedExpertParallelPolicyFromMode(MoEExpertMode mode)
     {
         switch (mode)
@@ -976,12 +1030,18 @@ namespace llaminar2
             return "tensor-parallel";
         case MoEParallelPolicy::ApportionedExperts:
             return "apportioned-experts";
+        case MoEParallelPolicy::LeastLoadedEP:
+            return "least-loaded-ep";
         case MoEParallelPolicy::HybridTP_AE:
             return "hybrid-tp-ae";
+        case MoEParallelPolicy::HybridTP_LLEP:
+            return "hybrid-tp-llep";
         case MoEParallelPolicy::HybridTP_RE:
             return "hybrid-tp-re";
         case MoEParallelPolicy::PhaseSplitHybridTP_AE:
             return "phase-split-hybrid-tp-ae";
+        case MoEParallelPolicy::PhaseSplitHybridTP_LLEP:
+            return "phase-split-hybrid-tp-llep";
         default:
             return "unknown";
         }
@@ -997,9 +1057,16 @@ namespace llaminar2
         if (lower == "apportioned-experts" ||
             lower == "apportioned")
             return MoEParallelPolicy::ApportionedExperts;
+        if (lower == "least-loaded-ep" ||
+            lower == "least-loaded-experts" ||
+            lower == "llep")
+            return MoEParallelPolicy::LeastLoadedEP;
         if (lower == "hybrid-tp-ae" ||
             lower == "hybridtpae")
             return MoEParallelPolicy::HybridTP_AE;
+        if (lower == "hybrid-tp-llep" ||
+            lower == "hybridtpllep")
+            return MoEParallelPolicy::HybridTP_LLEP;
         if (lower == "hybrid-tp-re" ||
             lower == "hybridtpre")
             return MoEParallelPolicy::HybridTP_RE;
@@ -1007,12 +1074,16 @@ namespace llaminar2
             lower == "phase-split" ||
             lower == "phasesplithybridtp-ae")
             return MoEParallelPolicy::PhaseSplitHybridTP_AE;
+        if (lower == "phase-split-hybrid-tp-llep" ||
+            lower == "phasesplithybridtp-llep")
+            return MoEParallelPolicy::PhaseSplitHybridTP_LLEP;
         return std::nullopt;
     }
 
     inline MoEParallelPolicy deriveMoEParallelPolicy(
         DenseParallelPolicy dense_policy,
-        RoutedExpertParallelPolicy routed_policy)
+        RoutedExpertParallelPolicy routed_policy,
+        RoutedExpertAssignmentPolicy assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner)
     {
         if (routed_policy == RoutedExpertParallelPolicy::ShardedExperts)
             return MoEParallelPolicy::TensorParallel;
@@ -1020,6 +1091,15 @@ namespace llaminar2
             return dense_policy == DenseParallelPolicy::Replicated
                        ? MoEParallelPolicy::ReplicatedExperts
                        : MoEParallelPolicy::HybridTP_RE;
+        if (routed_policy == RoutedExpertParallelPolicy::ApportionedExperts &&
+            assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+        {
+            if (dense_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE)
+                return MoEParallelPolicy::PhaseSplitHybridTP_LLEP;
+            return denseParallelPolicyEnablesTP(dense_policy)
+                       ? MoEParallelPolicy::HybridTP_LLEP
+                       : MoEParallelPolicy::LeastLoadedEP;
+        }
         if (dense_policy == DenseParallelPolicy::PhaseSplitHybridTP_AE)
             return MoEParallelPolicy::PhaseSplitHybridTP_AE;
         if (denseParallelPolicyEnablesTP(dense_policy))
@@ -1153,6 +1233,16 @@ namespace llaminar2
         int window_size = 256;
         int max_window_size = 4096;
         float window_growth_factor = 1.5f;
+        uint32_t dynamic_imbalance_threshold_per_mille =
+            moe_rebalance_policy::kDefaultDynamicImbalanceThresholdPerMille;
+        uint32_t dynamic_min_improvement_per_mille =
+            moe_rebalance_policy::kDefaultDynamicMinImprovementPerMille;
+        uint32_t dynamic_max_swaps_per_layer =
+            moe_rebalance_policy::kDefaultDynamicMaxSwapsPerLayer;
+        uint32_t dynamic_max_plan_entries_per_wave =
+            moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave;
+        uint64_t dynamic_min_window_activations =
+            moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
         bool release_raw_expert_weights = false;
     };
 

@@ -229,6 +229,16 @@ namespace llaminar2
                 graph_config.moe.num_experts,
                 static_cast<int>(ctrl_config.sockets.size()));
             ctrl_config.rebalance_config = SocketRebalanceConfig{};
+            ctrl_config.rebalance_config.imbalance_threshold =
+                static_cast<float>(rebalance_config.dynamic_imbalance_threshold_per_mille) / 1000.0f;
+            ctrl_config.rebalance_config.min_improvement_ratio =
+                static_cast<float>(rebalance_config.dynamic_min_improvement_per_mille) / 1000.0f;
+            ctrl_config.rebalance_config.max_swaps_per_layer =
+                static_cast<int>(rebalance_config.dynamic_max_swaps_per_layer);
+            ctrl_config.rebalance_config.max_total_swaps =
+                static_cast<int>(rebalance_config.dynamic_max_plan_entries_per_wave);
+            ctrl_config.rebalance_config.min_window_activations =
+                rebalance_config.dynamic_min_window_activations;
             const bool homogeneous_gpu_domain =
                 ctrl_config.sockets.size() > 1 &&
                 std::all_of(ctrl_config.sockets.begin(),
@@ -368,6 +378,43 @@ namespace llaminar2
             return true;
         }
 
+        std::optional<RoutedExpertAssignmentPolicy> routedOverlayAssignmentPolicy(
+            const MoEExpertParallelPlan &plan,
+            std::string *error)
+        {
+            RoutedExpertAssignmentPolicy policy = RoutedExpertAssignmentPolicy::StaticOwner;
+            bool saw_policy = false;
+
+            for (const auto &tier : plan.routed_tiers)
+            {
+                const auto *domain = findMoEExpertDomain(plan, tier.domain);
+                if (!domain)
+                    continue;
+
+                if (!saw_policy)
+                {
+                    policy = domain->assignment_policy;
+                    saw_policy = true;
+                    continue;
+                }
+
+                if (domain->assignment_policy != policy)
+                {
+                    if (error)
+                    {
+                        *error = "mixed routed expert assignment policies are not supported in one graph-native overlay: " +
+                                 std::string(routedExpertAssignmentPolicyToString(policy)) +
+                                 " and " +
+                                 routedExpertAssignmentPolicyToString(domain->assignment_policy);
+                    }
+                    return std::nullopt;
+                }
+            }
+
+            return saw_policy ? std::optional<RoutedExpertAssignmentPolicy>(policy)
+                              : std::optional<RoutedExpertAssignmentPolicy>(RoutedExpertAssignmentPolicy::StaticOwner);
+        }
+
         bool overlayPlanDisablesDenseTP(const MoEExpertParallelPlan &plan)
         {
             return plan.isTieredOverlay() &&
@@ -494,13 +541,24 @@ namespace llaminar2
                                                    ? config.moe_expert_overlay_mpi_ctx
                                                    : runner_mpi_ctx;
             graph_config.dense_tp_enabled = !overlayPlanDisablesDenseTP(*plan);
-        graph_config.dense_tp_decode_replicated =
-            graph_config.dense_tp_enabled &&
-            plan->continuation_domain_spec.dense_decode_replicated;
-        graph_config.dense_tp_decode_mirrored_embedding =
-            graph_config.dense_tp_enabled &&
-            plan->continuation_domain_spec.dense_decode_mirrored_embedding;
-        graph_config.refreshMoEParallelPolicies();
+            graph_config.dense_tp_decode_replicated =
+                graph_config.dense_tp_enabled &&
+                plan->continuation_domain_spec.dense_decode_replicated;
+            graph_config.dense_tp_decode_mirrored_embedding =
+                graph_config.dense_tp_enabled &&
+                plan->continuation_domain_spec.dense_decode_mirrored_embedding;
+
+            std::string assignment_error;
+            auto assignment_policy = routedOverlayAssignmentPolicy(*plan, &assignment_error);
+            if (!assignment_policy)
+            {
+                LOG_ERROR(log_prefix << " invalid MoE overlay routed assignment policy: "
+                                     << assignment_error);
+                return false;
+            }
+
+            graph_config.moe.routed_expert_assignment_policy = *assignment_policy;
+            graph_config.refreshMoEParallelPolicies();
 
             if (plan->isTieredOverlay())
             {
@@ -508,6 +566,12 @@ namespace llaminar2
                 {
                     graph_config.moe.expert_mode = MoEExpertMode::ReplicatedExperts;
                     graph_config.refreshMoEParallelPolicies();
+                    graph_config.moe.routed_expert_parallel_policy =
+                        RoutedExpertParallelPolicy::ApportionedExperts;
+                    graph_config.moe.parallel_policy = deriveMoEParallelPolicy(
+                        graph_config.dense_parallel_policy,
+                        graph_config.moe.routed_expert_parallel_policy,
+                        graph_config.moe.routed_expert_assignment_policy);
                 }
                 graph_config.moe.expert_overlay_runtime_plan.reset();
                 graph_config.moe.expert_overlay_execution_plan.reset();
@@ -1335,6 +1399,25 @@ namespace llaminar2
             result.max_window_size = env.moe_rebalance.max_window_size;
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH"))
             result.window_growth_factor = env.moe_rebalance.window_growth_factor;
+        if (env.presence.has("LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE"))
+            result.dynamic_imbalance_threshold_per_mille =
+                static_cast<uint32_t>(
+                    std::max(0, env.moe_rebalance.dynamic_imbalance_threshold_per_mille));
+        if (env.presence.has("LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE"))
+            result.dynamic_min_improvement_per_mille =
+                static_cast<uint32_t>(
+                    std::max(0, env.moe_rebalance.dynamic_min_improvement_per_mille));
+        if (env.presence.has("LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER"))
+            result.dynamic_max_swaps_per_layer =
+                static_cast<uint32_t>(
+                    std::max(0, env.moe_rebalance.dynamic_max_swaps_per_layer));
+        if (env.presence.has("LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE"))
+            result.dynamic_max_plan_entries_per_wave =
+                static_cast<uint32_t>(
+                    std::max(0, env.moe_rebalance.dynamic_max_plan_entries_per_wave));
+        if (env.presence.has("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
+            result.dynamic_min_window_activations =
+                env.moe_rebalance.dynamic_min_window_activations;
         result.release_raw_expert_weights = result.release_raw_expert_weights ||
                                             env.moe_rebalance.release_raw_weights;
 
@@ -1889,6 +1972,7 @@ namespace llaminar2
                   << moeParallelPolicyToString(graph_config.moe.parallel_policy)
                   << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
                   << " routed=" << routedExpertParallelPolicyToString(graph_config.moe.routed_expert_parallel_policy)
+                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_expert_assignment_policy)
                   << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try
@@ -3489,6 +3573,7 @@ namespace llaminar2
                   << moeParallelPolicyToString(graph_config.moe.parallel_policy)
                   << " dense=" << denseParallelPolicyToString(graph_config.dense_parallel_policy)
                   << " routed=" << routedExpertParallelPolicyToString(graph_config.moe.routed_expert_parallel_policy)
+                  << " assignment=" << routedExpertAssignmentPolicyToString(graph_config.moe.routed_expert_assignment_policy)
                   << " replicas=" << expertReplicaPolicyToString(graph_config.moe.expert_replica_policy));
 
         try

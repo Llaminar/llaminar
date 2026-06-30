@@ -317,7 +317,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
         "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTQ.cu",
         "src/v2/kernels/cuda/kvcache/CUDARingKVCacheTensorAdapter.cpp",
         "src/v2/kernels/cuda/kvcache/CUDATurboQuantKernels.cu",
-        "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp",
         "src/v2/kernels/cuda/ops/CUDACastKernels.cu",
         "src/v2/kernels/cuda/ops/CUDARoPEKernels.cu",
         "src/v2/kernels/cuda/ops/CUDARowSelectKernels.cu",
@@ -326,7 +325,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
         "src/v2/kernels/rocm/gemm/ROCmQuantisedGemmKernel.cpp",
         "src/v2/kernels/rocm/kvcache/ROCmRingKVCache.cpp",
         "src/v2/kernels/rocm/kvcache/ROCmRingKVCacheBase.cpp",
-        "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp",
         "src/v2/kernels/rocm/ops/ROCmEmbeddingKernelT.cpp",
     };
 
@@ -355,6 +353,17 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
     }();
 }
 
+TEST(Test__GpuWorkspaceAllocationPolicy, MoEKernelsDoNotOwnRawGpuAllocations)
+{
+    const auto root = repoRoot();
+    expectNoRawGpuAllocationCalls(
+        readFile(root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp"),
+        "CUDA MoE kernel");
+    expectNoRawGpuAllocationCalls(
+        readFile(root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp"),
+        "ROCm MoE kernel");
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExperts)
 {
     const int max_seq_len = 9;
@@ -373,6 +382,32 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MoEWorkspaceActiveExpertIdsCoversAllExp
     EXPECT_GE(expert_mask->size_bytes, static_cast<size_t>(num_experts) * sizeof(uint8_t));
     EXPECT_GT(static_cast<size_t>(num_experts), static_cast<size_t>(max_seq_len) * top_k)
         << "fixture must cover the small-token, many-expert regression";
+}
+
+TEST(Test__GpuWorkspaceAllocationPolicy, ROCmMoEWorkspaceOwnsRoutingStateAndMetadataCaches)
+{
+    const int max_seq_len = 9;
+    const int d_model = 2048;
+    const int intermediate = 512;
+    const int num_experts = 256;
+    const int top_k = 8;
+
+    const auto reqs = llaminar2::MoEWorkspaceBuffers::rocmMoE(
+        max_seq_len, d_model, intermediate, num_experts, top_k);
+    const auto *histogram = reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_HISTOGRAM_COUNTS);
+    ASSERT_NE(histogram, nullptr);
+    EXPECT_GE(histogram->size_bytes,
+              static_cast<size_t>(llaminar2::MoEWorkspaceBuffers::kHistogramLayerSlots) *
+                  static_cast<size_t>(num_experts) * sizeof(uint64_t));
+    const auto *expert_mask = reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_EXPERT_MASK);
+    ASSERT_NE(expert_mask, nullptr);
+    EXPECT_GE(expert_mask->size_bytes, static_cast<size_t>(num_experts) * sizeof(bool));
+    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES), nullptr);
+    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES), nullptr);
+    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES), nullptr);
+    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_WEIGHTS), nullptr);
+    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_ROUTER_Q8_GATE_SCALES), nullptr);
+    EXPECT_NE(reqs.find(llaminar2::MoEWorkspaceBuffers::ROCM_ROUTER_FP16_GATE_WEIGHTS), nullptr);
 }
 
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDAKernelProfilingScopesUseExplicitStreams)

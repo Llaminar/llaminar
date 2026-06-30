@@ -41,7 +41,12 @@ namespace llaminar2::test
         class TestExpertGemm : public ITensorGemm
         {
         public:
-            explicit TestExpertGemm(int tag) : tag_(tag) {}
+            TestExpertGemm(int tag, ExpertGemmRegistry::WeightRole role)
+                : tag_(tag), role_(role)
+            {
+                payload_[0] = static_cast<uint8_t>(tag_ & 0xff);
+                scale_[0] = 1.0f;
+            }
 
             bool supports_device(int /*device_idx*/) const override { return true; }
 
@@ -63,8 +68,31 @@ namespace llaminar2::test
                 return false;
             }
 
+            bool exportNativeVNNIMatrixDesc(DeviceNativeVNNIMatrixDesc &out) override
+            {
+                out = {};
+                out.payload = payload_;
+                out.scales = scale_;
+                out.blocks_per_row = 1;
+                out.codebook_id = 1;
+                if (role_ == ExpertGemmRegistry::WeightRole::DOWN)
+                {
+                    out.n = kDModel;
+                    out.k = kIntermediate;
+                }
+                else
+                {
+                    out.n = kIntermediate;
+                    out.k = kDModel;
+                }
+                return true;
+            }
+
         private:
             int tag_ = 0;
+            ExpertGemmRegistry::WeightRole role_ = ExpertGemmRegistry::WeightRole::GATE;
+            uint8_t payload_[16] = {};
+            float scale_[1] = {};
         };
 
         using ExpertRole = ExpertGemmRegistry::WeightRole;
@@ -253,7 +281,7 @@ namespace llaminar2::test
             ExpertRole role,
             int tag)
         {
-            auto engine = std::make_shared<TestExpertGemm>(tag);
+            auto engine = std::make_shared<TestExpertGemm>(tag, role);
             registry.registerEngineForDomain(
                 domain_name,
                 device,
@@ -491,6 +519,96 @@ namespace llaminar2::test
         EXPECT_NE(graph.getNode("layer0_moe_expert_overlay_fast_allreduce"), nullptr)
             << "Graph-local owner subsets must be rejoined through the continuation TP domain";
         EXPECT_EQ(countStagesOfType(graph, ComputeStageType::ALLREDUCE), 1u);
+    }
+
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPApportionedLeastLoadedAssignmentIsStampedOntoFastExpertStage)
+    {
+        auto plan = makeLocalTPApportionedHotPlan();
+        ASSERT_FALSE(plan->domains.empty());
+        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        GraphConfig config = makeConfig(plan);
+        config.default_device = DeviceId::rocm(0);
+        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        config.tp_ctx = &tp_ctx;
+        config.tp_device_idx = 0;
+
+        TensorArena weight_arena;
+        auto layer = makeLayerWeights(weight_arena);
+        TensorArena activation_arena;
+        auto buffers = makeActivationBuffers(activation_arena);
+
+        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+
+        const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(expert_node, nullptr);
+        const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(expert_node->stage.get());
+        ASSERT_NE(expert_stage, nullptr);
+        EXPECT_EQ(expert_stage->routedExpertAssignmentPolicyForTesting(),
+                  RoutedExpertAssignmentPolicy::LeastLoadedEP)
+            << "assignment=least_loaded_ep must reach the production expert stage; otherwise "
+               "the graph can silently execute StaticOwner under an LLEP label.";
+        EXPECT_TRUE(expert_stage->usesRuntimePrefillGroupingForTesting())
+            << "LeastLoadedEP prefill must use runtime grouping so the device-side "
+               "route-participant assignment kernel is reachable in production graphs.";
+        EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
+    }
+
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPApportionedLeastLoadedSingleTokenDecodeIsSupported)
+    {
+        auto plan = makeLocalTPApportionedHotPlan();
+        ASSERT_FALSE(plan->domains.empty());
+        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        GraphConfig config = makeConfig(plan);
+        config.default_device = DeviceId::rocm(0);
+        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        config.tp_ctx = &tp_ctx;
+        config.tp_device_idx = 0;
+
+        TensorArena weight_arena;
+        auto layer = makeLayerWeights(weight_arena);
+        TensorArena activation_arena;
+        auto buffers = makeActivationBuffers(activation_arena);
+
+        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer, buffers, 0, 1, kBatchSize, DeviceId::rocm(0));
+
+        const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(expert_node, nullptr);
+        const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(expert_node->stage.get());
+        ASSERT_NE(expert_stage, nullptr);
+        EXPECT_EQ(expert_stage->routedExpertAssignmentPolicyForTesting(),
+                  RoutedExpertAssignmentPolicy::LeastLoadedEP);
+        EXPECT_FALSE(expert_stage->usesRuntimePrefillGroupingForTesting())
+            << "Single-token decode uses the runtime decode table, not the multi-token prefill grouper.";
+        EXPECT_TRUE(expert_stage->hasMoERuntimeTableForTesting())
+            << "LeastLoadedEP decode must be given the runtime placement table; without it "
+               "production decode fails closed before the device-routed path can run.";
+#if defined(ENABLE_PIPELINE_SNAPSHOTS)
+        EXPECT_FALSE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting())
+            << "Snapshot-enabled Integration builds intentionally disable runtime-table "
+               "decode capture; production builds cover the supported device-routed path.";
+#else
+        EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting())
+            << "LeastLoadedEP decode must be allowed to enter the existing device-routed "
+               "runtime table path instead of failing before executeSingleToken().";
+#endif
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,

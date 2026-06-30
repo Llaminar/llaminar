@@ -114,6 +114,20 @@ namespace llaminar2
         return "unknown";
     }
 
+    const char *executionDomainAssignmentKindToString(ExecutionDomainAssignmentKind kind)
+    {
+        switch (kind)
+        {
+        case ExecutionDomainAssignmentKind::UNSPECIFIED:
+            return "unspecified";
+        case ExecutionDomainAssignmentKind::STATIC_OWNER:
+            return "static_owner";
+        case ExecutionDomainAssignmentKind::LEAST_LOADED_EP:
+            return "least_loaded_ep";
+        }
+        return "unknown";
+    }
+
     std::optional<ExecutionDomainScope> parseExecutionDomainScope(const std::string &value)
     {
         const std::string normalized = normalizeToken(value);
@@ -141,17 +155,28 @@ namespace llaminar2
             return ExecutionDomainComputeKind::REPLICATED_EXPERTS;
         if (normalized == "apportioned_experts" ||
             normalized == "apportioned_routed_experts" ||
-            normalized == "whole_experts_apportioned" ||
-            normalized == "expert_id_sharded" ||
-            normalized == "expert_parallel" ||
-            normalized == "routed_expert_parallel" ||
-            normalized == "whole_expert_parallel")
+            normalized == "whole_experts_apportioned")
             return ExecutionDomainComputeKind::APPORTIONED_EXPERTS;
         if (normalized == "sharded_experts" ||
-            normalized == "tensor_parallel_experts" ||
-            normalized == "tensor_parallel" ||
             normalized == "intra_expert_tensor_parallel")
             return ExecutionDomainComputeKind::SHARDED_EXPERTS;
+        return std::nullopt;
+    }
+
+    std::optional<ExecutionDomainAssignmentKind> parseExecutionDomainAssignmentKind(const std::string &value)
+    {
+        const std::string normalized = normalizeToken(value);
+        if (normalized == "static_owner" ||
+            normalized == "static" ||
+            normalized == "owner" ||
+            normalized == "canonical_owner")
+            return ExecutionDomainAssignmentKind::STATIC_OWNER;
+        if (normalized == "least_loaded_ep" ||
+            normalized == "least_loaded_experts" ||
+            normalized == "least_loaded" ||
+            normalized == "llep" ||
+            normalized == "least_loaded_expert_parallel")
+            return ExecutionDomainAssignmentKind::LEAST_LOADED_EP;
         return std::nullopt;
     }
 
@@ -170,7 +195,7 @@ namespace llaminar2
         if (eq_pos == std::string::npos)
         {
             throw std::invalid_argument("Invalid " + options.context + " spec: '" + spec +
-                                        "' (expected name=devices[;scope=...][;backend=...][;compute=...])");
+                                        "' (expected name=devices[;scope=...][;backend=...][;compute=...][;assignment=...])");
         }
 
         ExecutionDomainDefinition domain;
@@ -261,6 +286,16 @@ namespace llaminar2
                 domain.compute_kind = *compute;
                 saw_compute = true;
             }
+            else if (key == "assignment" ||
+                     key == "assignment_policy" ||
+                     key == "dispatch" ||
+                     key == "dispatch_policy")
+            {
+                auto assignment = parseExecutionDomainAssignmentKind(value);
+                if (!assignment)
+                    throw std::invalid_argument("Invalid " + options.context + " assignment kind: '" + value + "'");
+                domain.assignment_kind = *assignment;
+            }
             else
             {
                 throw std::invalid_argument("Unknown " + options.context + " option: '" + key + "'");
@@ -299,19 +334,14 @@ namespace llaminar2
         return !participants.empty();
     }
 
-    bool ExecutionDomainDefinition::supportsShardedExperts() const
+    bool ExecutionDomainDefinition::supportsLeastLoadedEP() const
     {
         return isDomainScopedTP() && hasMultipleParticipants();
     }
 
-    bool ExecutionDomainDefinition::supportsTensorParallelExperts() const
+    bool ExecutionDomainDefinition::supportsShardedExperts() const
     {
-        return supportsShardedExperts();
-    }
-
-    bool ExecutionDomainDefinition::supportsExpertIdSharding() const
-    {
-        return supportsApportionedExperts();
+        return isDomainScopedTP() && hasMultipleParticipants();
     }
 
     bool ExecutionDomainDefinition::samePhysicalParticipants(const ExecutionDomainDefinition &other) const
@@ -378,6 +408,17 @@ namespace llaminar2
             errors.push_back("Domain '" + name + "' uses apportioned_experts but is not a multi-participant domain-scoped TP domain");
         }
 
+        if (assignment_kind == ExecutionDomainAssignmentKind::LEAST_LOADED_EP &&
+            compute_kind != ExecutionDomainComputeKind::APPORTIONED_EXPERTS)
+        {
+            errors.push_back("Domain '" + name + "' uses assignment=least_loaded_ep but does not use compute=apportioned_experts");
+        }
+
+        if (assignment_kind == ExecutionDomainAssignmentKind::LEAST_LOADED_EP && !supportsLeastLoadedEP())
+        {
+            errors.push_back("Domain '" + name + "' uses assignment=least_loaded_ep but is not a multi-participant domain-scoped TP domain");
+        }
+
         if ((compute_kind == ExecutionDomainComputeKind::SHARDED_EXPERTS) && !supportsShardedExperts())
         {
             errors.push_back("Domain '" + name + "' uses sharded_experts but is not a multi-participant domain-scoped TP domain");
@@ -429,6 +470,8 @@ namespace llaminar2
             oss << " backend=" << collectiveBackendTypeToString(backend);
         if (compute_kind != ExecutionDomainComputeKind::UNSPECIFIED)
             oss << " compute=" << executionDomainComputeKindToString(compute_kind);
+        if (assignment_kind != ExecutionDomainAssignmentKind::UNSPECIFIED)
+            oss << " assignment=" << executionDomainAssignmentKindToString(assignment_kind);
 
         return oss.str();
     }

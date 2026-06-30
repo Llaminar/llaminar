@@ -20,6 +20,7 @@
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../loaders/WeightPlan.h"
 #include "../../../loaders/ExpertSlabTypes.h"
+#include "../../config/RuntimeConfig.h"
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/MoEExpertWeightService.h"
@@ -105,6 +106,13 @@ namespace llaminar2
             /// Number of participants in the routed expert domain. Zero means
             /// infer from replica metadata for legacy single-device paths.
             int participant_count = 0;
+
+            /// Policy for assigning already-selected routed expert rows to
+            /// domain participants. StaticOwner follows the placement owner;
+            /// LeastLoadedEP preserves router top-k choices and balances rows
+            /// across resident owners/replicas through runtime prefill grouping.
+            RoutedExpertAssignmentPolicy routed_expert_assignment_policy =
+                RoutedExpertAssignmentPolicy::StaticOwner;
 
             // Per-expert 2D tensor views — used by GPU path
             // Each vector has num_experts entries; each entry is a 2D view
@@ -193,6 +201,7 @@ namespace llaminar2
             // Stable graph-facing MoE runtime placement state. Owned by the graph/model
             // layer; stages only cache the per-layer device pointer.
             IMoERuntimeTable *moe_runtime_table = nullptr;
+            bool use_runtime_prefill_grouping = false;
 
             /*
              * Runtime decode always consumes runtime top-k ids/weights. This
@@ -242,6 +251,19 @@ namespace llaminar2
         /// Test-only visibility for replica metadata stamped onto rebuilt graphs.
         int replicaCountForTesting() const { return params_.replica_set.num_replicated; }
         int replicaParticipantForTesting() const { return params_.my_socket_id; }
+        RoutedExpertAssignmentPolicy routedExpertAssignmentPolicyForTesting() const
+        {
+            return params_.routed_expert_assignment_policy;
+        }
+        bool usesRuntimePrefillGroupingForTesting() const
+        {
+            return params_.use_runtime_prefill_grouping;
+        }
+        bool supportsRequestedRoutedAssignmentPolicyForTesting() const
+        {
+            return supportsRequestedRoutedAssignmentPolicy();
+        }
+        bool hasMoERuntimeTableForTesting() const { return params_.moe_runtime_table != nullptr; }
 
         /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
         /// when no selected experts fall in its local range. The downstream
@@ -569,6 +591,7 @@ namespace llaminar2
         bool initializeMoERuntimeTableForGroupedPrefill();
         bool initializeFixedTopologyGroupedPrefill();
         bool runtimeTableHasActiveGroupedDecodeBank() const;
+        bool supportsRequestedRoutedAssignmentPolicy() const;
         bool canUseRuntimePrefillGrouping() const;
         bool canUseFixedTopologyGroupedPrefill() const;
         /**

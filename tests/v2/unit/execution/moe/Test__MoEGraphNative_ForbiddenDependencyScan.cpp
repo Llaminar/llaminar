@@ -253,6 +253,11 @@ namespace llaminar2::test
         EXPECT_NE(shared_contents.find("candidateCanAffectLocalCompute"), std::string::npos);
         EXPECT_NE(shared_contents.find("evaluateAddingResidentLoadSpread"), std::string::npos);
         EXPECT_NE(shared_contents.find("addingResidentImprovesLoadSpread"), std::string::npos);
+        EXPECT_NE(shared_contents.find("evaluateAddingResidentLeastLoadedSpread"), std::string::npos);
+        EXPECT_NE(shared_contents.find("addingResidentImprovesLeastLoadedSpread"), std::string::npos);
+        EXPECT_NE(shared_contents.find("evaluateAddingResidentDynamicSpread"), std::string::npos);
+        EXPECT_NE(shared_contents.find("addingResidentImprovesDynamicSpread"), std::string::npos);
+        EXPECT_NE(shared_contents.find("dynamicMinimumProjectedShift"), std::string::npos);
         EXPECT_NE(shared_contents.find("expertCountCanMeetLoadSpreadFloor"),
                   std::string::npos);
         EXPECT_NE(shared_contents.find("requiredLoadSpreadImprovement"),
@@ -262,6 +267,8 @@ namespace llaminar2::test
         EXPECT_NE(shared_contents.find("isRootParticipant"), std::string::npos);
         EXPECT_NE(shared_contents.find("DestinationChoice"), std::string::npos);
         EXPECT_NE(shared_contents.find("bestMissingResidentDestination"), std::string::npos);
+        EXPECT_NE(shared_contents.find("bestLeastLoadedMissingResidentDestination"), std::string::npos);
+        EXPECT_NE(shared_contents.find("bestDynamicMissingResidentDestination"), std::string::npos);
         EXPECT_NE(shared_contents.find("candidateCanAffectDomainCompute"), std::string::npos);
         EXPECT_NE(shared_contents.find("transferWaveMeetsSpreadImprovementFloor"), std::string::npos);
         EXPECT_NE(shared_contents.find("!plan_missing_arrivals || local_resident || owner_local"),
@@ -288,14 +295,14 @@ namespace llaminar2::test
                       std::string::npos)
                 << relative_path
                 << " must call the shared resident-only candidate filter.";
-            EXPECT_NE(contents.find("moe_rebalance_policy::addingResidentImprovesLoadSpread"),
+            EXPECT_NE(contents.find("moe_rebalance_policy::addingResidentImprovesDynamicSpread"),
                       std::string::npos)
                 << relative_path
-                << " must gate arrivals through the shared load-spread improvement helper.";
-            EXPECT_NE(contents.find("moe_rebalance_policy::evaluateAddingResidentLoadSpread"),
+                << " must gate Dynamic arrivals through the shared Dynamic load-spread helper.";
+            EXPECT_NE(contents.find("moe_rebalance_policy::evaluateAddingResidentDynamicSpread"),
                       std::string::npos)
                 << relative_path
-                << " must evaluate missing-arrival transfer candidates through the shared projected load-spread helper.";
+                << " must evaluate missing-arrival transfer candidates through the shared Dynamic projected load-spread helper.";
             EXPECT_NE(contents.find("moe_rebalance_policy::candidateValueIsBetter"),
                       std::string::npos)
                 << relative_path
@@ -304,10 +311,10 @@ namespace llaminar2::test
                       std::string::npos)
                 << relative_path
                 << " must expose root-domain candidate filtering for graph-captured rebalance.";
-            EXPECT_NE(contents.find("moe_rebalance_policy::bestMissingResidentDestination"),
+            EXPECT_NE(contents.find("moe_rebalance_policy::bestDynamicMissingResidentDestination"),
                       std::string::npos)
                 << relative_path
-                << " must select a destination participant by projected domain load improvement.";
+                << " must select Dynamic missing-arrival destinations by the shared Dynamic policy.";
             if (relative_path.extension() == ".h")
             {
                 EXPECT_NE(contents.find("moe_rebalance_policy::expertCountCanMeetLoadSpreadFloor"),
@@ -390,10 +397,10 @@ namespace llaminar2::test
                 EXPECT_NE(contents.find("payloadBucketSlots("), std::string::npos)
                     << relative_path
                     << " must use the shared bucket rounding helper.";
-                EXPECT_NE(contents.find("plan.op == kDeviceMoERebalancePlanHotReplicaArrival"),
+                EXPECT_NE(contents.find("rebalance_plan_requires_payload(plan.op)"),
                           std::string::npos)
                     << relative_path
-                    << " must size payload buckets from real arrivals, not resident metadata commands.";
+                    << " must size payload buckets from payload-bearing expert movement, not resident metadata commands.";
             }
 
             size_t body_start = contents.find("applyDeviceMoERebalancePolicyHost(");
@@ -490,8 +497,7 @@ namespace llaminar2::test
             ASSERT_FALSE(contents.empty()) << path;
 
             const size_t root_choice =
-                contents.find("const auto destination_choice =\n"
-                              "                                            llaminar2::moe_rebalance_policy::bestMissingResidentDestination");
+                contents.find("llaminar2::moe_rebalance_policy::bestDynamicMissingResidentDestination");
             ASSERT_NE(root_choice, std::string::npos) << relative_path;
             const std::string root_ranking = contents.substr(root_choice, 3400);
             const size_t root_slot_gate = root_ranking.find("destination_has_transfer_slot");
@@ -519,8 +525,7 @@ namespace llaminar2::test
                 << " root-domain ranking must use dense per-source payload-slot counts.";
 
             const size_t local_delta =
-                contents.find("const auto delta =\n"
-                              "                                            llaminar2::moe_rebalance_policy::evaluateAddingResidentLoadSpread");
+                contents.find("llaminar2::moe_rebalance_policy::evaluateAddingResidentDynamicSpread");
             ASSERT_NE(local_delta, std::string::npos) << relative_path;
             const std::string local_ranking = contents.substr(local_delta, 2600);
             const size_t local_slot_gate =
@@ -539,16 +544,27 @@ namespace llaminar2::test
 
             const size_t bucket_slots = contents.find("payloadBucketSlots(\n                    requested_payload_slots");
             const size_t wave_floor = contents.find("transferWaveMeetsSpreadImprovementFloor");
+            const size_t post_spread_ceiling = contents.find("transferWaveMeetsPostLoadSpreadCeiling");
+            const size_t prune_arrivals =
+                contents.find("prunePayloadArrivalsPreservingResidentAssignments");
             const size_t header_epoch = contents.find("command_header->epoch = defer_runtime_apply && command_count > 0u");
             ASSERT_NE(bucket_slots, std::string::npos) << relative_path;
             ASSERT_NE(wave_floor, std::string::npos) << relative_path;
+            ASSERT_NE(post_spread_ceiling, std::string::npos) << relative_path;
+            ASSERT_NE(prune_arrivals, std::string::npos) << relative_path;
             ASSERT_NE(header_epoch, std::string::npos) << relative_path;
             EXPECT_LT(bucket_slots, wave_floor)
                 << relative_path
                 << " transfer-wave value gating must happen after payload-slot request sizing.";
-            EXPECT_LT(wave_floor, header_epoch)
+            EXPECT_LT(wave_floor, post_spread_ceiling)
                 << relative_path
-                << " rejected transfer waves must be zeroed before command header publication.";
+                << " residual post-policy imbalance gating must run with the same payload-slot economics.";
+            EXPECT_LT(post_spread_ceiling, prune_arrivals)
+                << relative_path
+                << " rejected transfer waves must be value-gated before resident-only compaction.";
+            EXPECT_LT(prune_arrivals, header_epoch)
+                << relative_path
+                << " rejected transfer waves must be compacted to resident-only commands before command header publication.";
             EXPECT_NE(contents.find("status->skipped_wave_cost_floor"), std::string::npos)
                 << relative_path
                 << " perfstats must expose wave-level value-gate skips.";
@@ -558,6 +574,157 @@ namespace llaminar2::test
             EXPECT_NE(contents.find("status->skipped_low_router_benefit"), std::string::npos)
                 << relative_path
                 << " perfstats must expose realized-router-benefit gate skips.";
+            EXPECT_NE(contents.find("status->skipped_post_load_spread_ceiling"), std::string::npos)
+                << relative_path
+                << " perfstats must expose residual post-policy load-spread gate skips.";
+        }
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, RebalanceSlotLeasesUseRAIINotRawTokens)
+    {
+        const fs::path root = findRepoRoot();
+        const std::vector<fs::path> files = {
+            "src/v2/execution/moe/GpuExpertSlotPool.cpp",
+            "src/v2/execution/moe/GpuExpertTransferStagingPool.cpp",
+        };
+
+        for (const auto &relative_path : files)
+        {
+            const fs::path path = root / relative_path;
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string contents = readFile(path);
+            ASSERT_FALSE(contents.empty()) << path;
+
+            EXPECT_EQ(contents.find("new SlotLeaseToken"), std::string::npos)
+                << relative_path
+                << " must not allocate active/transfer slot lease tokens manually.";
+            EXPECT_EQ(contents.find("new StagingLeaseToken"), std::string::npos)
+                << relative_path
+                << " must not allocate transfer staging lease tokens manually.";
+            EXPECT_EQ(contents.find("unique_ptr<SlotLeaseToken>"), std::string::npos)
+                << relative_path
+                << " lease release should be tied directly to shared lifetime, not a raw-token deleter.";
+            EXPECT_EQ(contents.find("unique_ptr<StagingLeaseToken>"), std::string::npos)
+                << relative_path
+                << " lease release should be tied directly to shared lifetime, not a raw-token deleter.";
+            EXPECT_NE(contents.find("std::make_shared<"), std::string::npos)
+                << relative_path
+                << " lease tokens should be created through RAII shared ownership.";
+        }
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, DynamicOwnershipSwapPolicyCountersStaySymmetric)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path shared_path =
+            root / "src/v2/execution/moe/DeviceMoERebalanceController.h";
+        const fs::path perf_path =
+            root / "src/v2/execution/local_execution/orchestrators/DeviceGraphOrchestrator.cpp";
+        ASSERT_TRUE(fs::exists(shared_path)) << shared_path;
+        ASSERT_TRUE(fs::exists(perf_path)) << perf_path;
+
+        const std::string shared = readFile(shared_path);
+        const std::string perf = readFile(perf_path);
+        ASSERT_FALSE(shared.empty()) << shared_path;
+        ASSERT_FALSE(perf.empty()) << perf_path;
+
+        for (const auto &token : {
+                 "dynamic_ownership_swap_attempts",
+                 "dynamic_ownership_swap_accepts",
+                 "dynamic_ownership_swap_rejections",
+             })
+        {
+            EXPECT_NE(shared.find(token), std::string::npos)
+                << "Device rebalance status must expose " << token;
+            EXPECT_NE(perf.find(token), std::string::npos)
+                << "Maintenance trace JSON must expose " << token;
+            EXPECT_NE(perf.find("device_rebalance_" + std::string(token)),
+                      std::string::npos)
+                << "Perfstats must expose " << token;
+        }
+
+        const std::vector<fs::path> kernel_files = {
+            "src/v2/kernels/cuda/moe/CUDAMoEKernels.cu",
+            "src/v2/kernels/rocm/moe/ROCmMoEKernels.hip",
+        };
+        for (const auto &relative_path : kernel_files)
+        {
+            const fs::path path = root / relative_path;
+            ASSERT_TRUE(fs::exists(path)) << path;
+            const std::string contents = readFile(path);
+            ASSERT_FALSE(contents.empty()) << path;
+
+            EXPECT_NE(contents.find("++dynamic_ownership_swap_attempts"), std::string::npos)
+                << relative_path << " must count Dynamic ownership policy attempts.";
+            EXPECT_NE(contents.find("++dynamic_ownership_swap_accepts"), std::string::npos)
+                << relative_path << " must count accepted Dynamic ownership moves.";
+            EXPECT_NE(contents.find("++dynamic_ownership_swap_rejections"), std::string::npos)
+                << relative_path << " must count policy-declined Dynamic ownership attempts.";
+        }
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, SharedDynamicPolicyKnobsReachGpuGraphConfig)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path runtime_config_path = root / "src/v2/execution/config/RuntimeConfig.h";
+        const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
+        const fs::path parser_path = root / "src/v2/config/OrchestrationConfigParser.cpp";
+        const fs::path factory_path = root / "src/v2/execution/factory/InferenceRunnerFactory.cpp";
+        const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+
+        const std::string runtime_config = readFile(runtime_config_path);
+        const std::string debug_env = readFile(debug_env_path);
+        const std::string parser = readFile(parser_path);
+        const std::string factory = readFile(factory_path);
+        const std::string graph = readFile(graph_path);
+
+        ASSERT_FALSE(runtime_config.empty()) << runtime_config_path;
+        ASSERT_FALSE(debug_env.empty()) << debug_env_path;
+        ASSERT_FALSE(parser.empty()) << parser_path;
+        ASSERT_FALSE(factory.empty()) << factory_path;
+        ASSERT_FALSE(graph.empty()) << graph_path;
+
+        for (const auto &token : {
+                 "dynamic_imbalance_threshold_per_mille",
+                 "dynamic_min_improvement_per_mille",
+                 "dynamic_max_swaps_per_layer",
+                 "dynamic_max_plan_entries_per_wave",
+                 "dynamic_min_window_activations",
+             })
+        {
+            EXPECT_NE(runtime_config.find(token), std::string::npos)
+                << "Runtime config must carry shared Dynamic policy field " << token;
+            EXPECT_NE(factory.find(token), std::string::npos)
+                << "Inference runner factory must thread " << token
+                << " into CPU/host rebalance config.";
+            EXPECT_NE(graph.find("rebalance_config." + std::string(token)),
+                      std::string::npos)
+                << "Qwen35 graph must thread " << token
+                << " into DeviceMoERebalanceConfig for CUDA/ROCm.";
+        }
+
+        for (const auto &env_name : {
+                 "LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE",
+                 "LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE",
+                 "LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER",
+                 "LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE",
+                 "LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS",
+             })
+        {
+            EXPECT_NE(debug_env.find(env_name), std::string::npos)
+                << "DebugEnv must expose " << env_name;
+        }
+
+        for (const auto &cli_flag : {
+                 "--moe-dynamic-imbalance-threshold-permille",
+                 "--moe-dynamic-min-improvement-permille",
+                 "--moe-dynamic-max-swaps-per-layer",
+                 "--moe-dynamic-max-plan-entries-per-wave",
+                 "--moe-dynamic-min-window-activations",
+             })
+        {
+            EXPECT_NE(parser.find(cli_flag), std::string::npos)
+                << "CLI parser must expose " << cli_flag;
         }
     }
 
@@ -1293,7 +1460,8 @@ namespace llaminar2::test
         EXPECT_NE(ffn_body.find("config_.moe.rebalance_mode == MoERebalanceMode::DYNAMIC"), std::string::npos);
         EXPECT_EQ(ffn_body.find("hot_replica_cap > 0"), std::string::npos)
             << "Homogeneous GPU dynamic rebalance must not fall back to host publish/apply just because hot cache is off.";
-        EXPECT_NE(ffn_body.find("env.moe_rebalance.gpu_cache_experts_per_layer <= 0"), std::string::npos);
+        EXPECT_EQ(ffn_body.find("env.moe_rebalance.gpu_cache_experts_per_layer <= 0"), std::string::npos)
+            << "Homogeneous GPU dynamic rebalance must not leave hot-cache decode on the host path.";
         EXPECT_NE(ffn_body.find("isHomogeneousGpuLocalTPRebalanceDomain"), std::string::npos);
         EXPECT_EQ(contents.find("#include \"../../execution/moe/GPUExpertTransfer.h\""),
                   std::string::npos);
@@ -1676,7 +1844,7 @@ namespace llaminar2::test
             << "Async maintenance must plan on its stream and defer runtime-table mutation to decode apply.";
         EXPECT_NE(controller_header.find("CollectLoadStats"), std::string::npos)
             << "Projected load-spread diagnostics must be an explicit controller flag.";
-        EXPECT_NE(controller_header.find("ResidentHotReplica"), std::string::npos)
+        EXPECT_NE(controller_header.find("ResidentExpertAssignment"), std::string::npos)
             << "Resident-only maintenance needs a command op that applies local replicas without transfer slots.";
         EXPECT_NE(controller_header.find("DeviceMoERebalanceCommandBufferHeader"),
                   std::string::npos)
@@ -2009,7 +2177,7 @@ namespace llaminar2::test
                  "start_offset + layer_wave_count",
                  "kDeviceMoERebalanceFlagDeferRuntimeApply",
                  "kDeviceMoERebalanceFlagCollectLoadStats",
-                 "kDeviceMoERebalancePlanResidentHotReplica",
+                 "kDeviceMoERebalancePlanResidentExpertAssignment",
                  "rebalance_layer_wave_count",
                  "rebalance_actual_layer_for_wave_index",
                  "pre_policy_imbalance_numerator",
@@ -2024,8 +2192,8 @@ namespace llaminar2::test
                  "shared_post_policy_load",
                  "shared_current_policy_load",
                  "shared_candidate_policy_load",
-                 "evaluateAddingResidentLoadSpread",
-                 "addingResidentImprovesLoadSpread",
+	                 "evaluateAddingResidentDynamicSpread",
+	                 "addingResidentImprovesDynamicSpread",
                  "requiredLoadSpreadImprovement",
                  "shared_required_load_spread_improvement",
                  "skipped_no_improvement",
@@ -2351,6 +2519,9 @@ namespace llaminar2::test
         EXPECT_EQ(device_controller_predicate.find("hot_replica_cap <= 0"),
                   std::string::npos)
             << "Homogeneous GPU dynamic rebalance must stay device-owned when --moe-hot-expert-cache is off.";
+        EXPECT_EQ(device_controller_predicate.find("gpu_cache_experts_per_layer > 0"),
+                  std::string::npos)
+            << "Homogeneous GPU dynamic rebalance must stay device-owned when --moe-hot-expert-cache is on.";
         EXPECT_EQ(device_controller_predicate.find("resolveCap("),
                   std::string::npos)
             << "The runner-side device-controller predicate must not depend on hot replica capacity.";
@@ -2559,6 +2730,10 @@ namespace llaminar2::test
             << "Perfstats must expose whether hot-cache dispatch is materially reducing spread.";
         EXPECT_NE(dgo.find("\"device_rebalance_skipped_low_router_benefit\""), std::string::npos)
             << "Perfstats must expose waves rejected because prior hot-cache routing did not pay off.";
+        EXPECT_NE(dgo.find("\"device_rebalance_skipped_post_load_spread_ceiling\""), std::string::npos)
+            << "Perfstats must expose transfer waves rejected because residual projected imbalance stayed too high.";
+        EXPECT_NE(dgo.find("\"device_rebalance_post_wave_load_spread_fraction\""), std::string::npos)
+            << "Perfstats must expose the controller-visible residual imbalance signal used by the policy gate.";
         EXPECT_NE(dgo.find("\"device_rebalance_router_hot_cache_spread_improvement_per_requested_payload_slot\""), std::string::npos)
             << "Perfstats must expose realized router benefit in the same units used by the payload-slot gate.";
         EXPECT_NE(dgo.find("\"device_rebalance_transfer_payload_gathered_capacity_bytes\""), std::string::npos)
@@ -2663,6 +2838,10 @@ namespace llaminar2::test
             << "Perfstats must distinguish no-op policy gates from missing transfer sources.";
         EXPECT_NE(dgo.find("\"device_rebalance_apply_changed_layers\""), std::string::npos)
             << "Perfstats must show whether decode-side apply actually changed runtime placement.";
+        EXPECT_NE(dgo.find("\"device_rebalance_apply_post_apply_multi_resident_experts\""), std::string::npos)
+            << "Perfstats must show whether apply produced hot-cache-visible multi-resident experts.";
+        EXPECT_NE(dgo.find("\"post_apply_multi_resident_experts\""), std::string::npos)
+            << "Trace JSON must expose post-apply hot-cache visibility for CUDA/ROCm diagnosis.";
         EXPECT_NE(dgo.find("MoEDeviceRebalanceStage::WS_STATUS"), std::string::npos);
         EXPECT_NE(dgo.find("MoEDeviceRebalanceStage::WS_COMMAND_HEADER"), std::string::npos);
         EXPECT_NE(dgo.find("MoEDeviceRebalanceStage::WS_CONTROLLER_STATE"), std::string::npos);
@@ -2969,6 +3148,9 @@ namespace llaminar2::test
             EXPECT_LT(bind_base, assign_id);
             EXPECT_LT(assign_id, clear_bind)
                 << "Scratch caches must be invalidated after binding the new workspace identity.";
+            EXPECT_NE(bind_body.find("rebindGroupedDescriptorTablesToWorkspace(\"bindWorkspace\")"),
+                      std::string::npos)
+                << "Workspace rebinding must preserve and reupload graph-stable grouped descriptor tables.";
 
             const std::string reset_signature =
                 "void " + backend.class_name + "::resetDynamicState()";
@@ -3009,6 +3191,16 @@ namespace llaminar2::test
                 EXPECT_NE(clear_body.find(member_reset), std::string::npos)
                     << "Workspace lifetime handoff must invalidate " << member_reset;
             }
+            EXPECT_EQ(clear_body.find("grouped_down_desc_tables_.clear()"), std::string::npos)
+                << "Workspace handoff must preserve host grouped down descriptors; release/reset may clear them explicitly.";
+            EXPECT_EQ(clear_body.find("grouped_gateup_desc_tables_.clear()"), std::string::npos)
+                << "Workspace handoff must preserve host grouped gate/up descriptors; release/reset may clear them explicitly.";
+            EXPECT_NE(clear_body.find("table.device_descs = nullptr"), std::string::npos)
+                << "Workspace handoff should invalidate only the device down descriptor pointer.";
+            EXPECT_NE(clear_body.find("table.device_gate_descs = nullptr"), std::string::npos)
+                << "Workspace handoff should invalidate only the device gate descriptor pointer.";
+            EXPECT_NE(clear_body.find("table.device_up_descs = nullptr"), std::string::npos)
+                << "Workspace handoff should invalidate only the device up descriptor pointer.";
             EXPECT_NE(clear_body.find("scratch_workspace_bound_ = false"), std::string::npos);
         }
     }

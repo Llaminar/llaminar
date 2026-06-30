@@ -30,9 +30,7 @@
 namespace llaminar2
 {
 
-    // Number of benchmark iterations (after warmup)
-    static constexpr int BENCHMARK_ITERATIONS = 3;
-    static constexpr int WARMUP_ITERATIONS = 1;
+    // Prefill graph capture warmup is separate from request warmup and remains fixed.
     static constexpr int PREFILL_GRAPH_WARMUP_ITERATIONS = 3;
 
     // Log GPU memory on all GPUs (enabled via LLAMINAR_BENCH_MEM_LOG=1).
@@ -503,7 +501,8 @@ namespace llaminar2
             {"failure_reason", result.failure_reason},
             {"prefill_success", result.prefill_success},
             {"decode_success", result.decode_success},
-            {"measurement_iterations", BENCHMARK_ITERATIONS},
+            {"measurement_iterations", result.measurement_iterations},
+            {"warmup_iterations", result.warmup_iterations},
             {"tokens", {{"prefill", result.prefill_tokens},
                          {"decode", result.decode_tokens},
                          {"total", result.prefill_tokens + result.decode_tokens}}},
@@ -1268,6 +1267,12 @@ namespace llaminar2
     BenchmarkResult BenchmarkRunner::run(const OrchestrationConfig &config)
     {
         BenchmarkResult result;
+        const int benchmark_iterations =
+            std::max(1, debugEnv().runtime_debug.benchmark_iterations);
+        const int warmup_iterations =
+            std::max(0, debugEnv().runtime_debug.benchmark_warmup_iterations);
+        result.measurement_iterations = benchmark_iterations;
+        result.warmup_iterations = warmup_iterations;
         last_failure_reason_.clear();
         PrefixRuntimeStateSnapshot measured_mtp_state;
         bool has_measured_mtp_state = false;
@@ -1375,8 +1380,8 @@ namespace llaminar2
             LOG_DEBUG("Benchmark configuration:");
             LOG_DEBUG("  Prefill tokens: " << token_count);
             LOG_DEBUG("  Decode tokens:  " << n_decode);
-            LOG_DEBUG("  Warmup runs:    " << WARMUP_ITERATIONS);
-            LOG_DEBUG("  Benchmark runs: " << BENCHMARK_ITERATIONS);
+            LOG_DEBUG("  Warmup runs:    " << warmup_iterations);
+            LOG_DEBUG("  Benchmark runs: " << benchmark_iterations);
             LOG_DEBUG("");
         }
 
@@ -1403,16 +1408,12 @@ namespace llaminar2
         }
 
         // ========================================================================
-        // Warmup Phase - Run once to warm up caches, JIT, etc.
+        // Warmup Phase - Run before measurement to warm caches, JIT, etc.
         // ========================================================================
-        if (mpi_ctx_->rank() == 0)
+        if (mpi_ctx_->rank() == 0 && warmup_iterations > 0)
         {
             LOG_INFO("Running warmup...");
         }
-
-        // Reset pipeline state before warmup
-        runner_->clear_cache();
-        logGPUMemorySnapshot("before-warmup");
 
         // Suppress GPU stage timeline during warmup — warmup includes one-time costs
         // (weight H2D transfers, buffer allocation, kernel JIT) that inflate overhead
@@ -1492,42 +1493,46 @@ namespace llaminar2
         }
         runner_->clear_cache();
 
-        // Warmup prefill
-        auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
-        if (!warmup_prefill_success)
+        for (int iter = 0; iter < warmup_iterations; ++iter)
         {
-            if (mpi_ctx_->rank() == 0)
-            {
-                LOG_ERROR("Warmup prefill failed");
-            }
-            if (last_failure_reason_.empty())
-                last_failure_reason_ = "warmup prefill failed";
-            return capture_and_return();
-        }
+            runner_->clear_cache();
+            logGPUMemorySnapshot(("before-warmup iter=" + std::to_string(iter + 1)).c_str());
 
-        // Warmup decode (if requested)
-        if (n_decode > 0)
-        {
-            int eos_token = tokenizer_->eos_token();
-            auto warmup_decode = runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
-            if (!warmup_decode.success)
+            auto [warmup_prefill_success, warmup_prefill_time] = runPrefill(tokens);
+            if (!warmup_prefill_success)
             {
                 if (mpi_ctx_->rank() == 0)
                 {
-                    LOG_ERROR("Warmup decode failed");
-                    if (!last_failure_reason_.empty())
-                    {
-                        LOG_ERROR("Warmup decode failure reason: "
-                                  << last_failure_reason_);
-                    }
+                    LOG_ERROR("Warmup prefill failed on iteration " << (iter + 1));
                 }
                 if (last_failure_reason_.empty())
-                    last_failure_reason_ = "warmup decode failed";
+                    last_failure_reason_ = "warmup prefill failed";
                 return capture_and_return();
+            }
+
+            if (n_decode > 0)
+            {
+                int eos_token = tokenizer_->eos_token();
+                auto warmup_decode = runDecode(n_decode, eos_token, /*ignore_stop_tokens=*/true);
+                if (!warmup_decode.success)
+                {
+                    if (mpi_ctx_->rank() == 0)
+                    {
+                        LOG_ERROR("Warmup decode failed on iteration " << (iter + 1));
+                        if (!last_failure_reason_.empty())
+                        {
+                            LOG_ERROR("Warmup decode failure reason: "
+                                      << last_failure_reason_);
+                        }
+                    }
+                    if (last_failure_reason_.empty())
+                        last_failure_reason_ = "warmup decode failed";
+                    return capture_and_return();
+                }
             }
         }
 
-        if (mpi_ctx_->rank() == 0)
+        if (mpi_ctx_->rank() == 0 && warmup_iterations > 0)
         {
             LOG_INFO("Warmup complete.");
         }
@@ -1562,7 +1567,7 @@ namespace llaminar2
 
         if (mpi_ctx_->rank() == 0)
         {
-            LOG_INFO("Running " << BENCHMARK_ITERATIONS << " benchmark iterations...");
+            LOG_INFO("Running " << benchmark_iterations << " benchmark iterations...");
         }
 
         // Reset profiling after warmup (only track actual benchmark iterations)
@@ -1603,7 +1608,7 @@ namespace llaminar2
 
         logGPUMemorySnapshot("pre-iter-loop");
 
-        for (int iter = 0; iter < BENCHMARK_ITERATIONS; ++iter)
+        for (int iter = 0; iter < benchmark_iterations; ++iter)
         {
             // Reset pipeline state before each iteration
             runner_->clear_cache();
@@ -1611,7 +1616,7 @@ namespace llaminar2
 
             if (mpi_ctx_->rank() == 0)
             {
-                LOG_DEBUG("  Iteration " << (iter + 1) << "/" << BENCHMARK_ITERATIONS << "...");
+                LOG_DEBUG("  Iteration " << (iter + 1) << "/" << benchmark_iterations << "...");
             }
 
             // Run prefill
@@ -1755,6 +1760,7 @@ namespace llaminar2
         {
             return; // Only rank 0 prints
         }
+        const int measurement_iterations = std::max(1, result.measurement_iterations);
 
         std::print("\n");
 
@@ -1763,7 +1769,7 @@ namespace llaminar2
             fort::utf8_table title;
             title.set_border_style(FT_DOUBLE2_STYLE);
             std::ostringstream title_ss;
-            title_ss << "BENCHMARK RESULTS (average of " << BENCHMARK_ITERATIONS << " runs after warmup)";
+            title_ss << "BENCHMARK RESULTS (average of " << measurement_iterations << " runs after warmup)";
             title << title_ss.str() << fort::endr;
             title[0][0].set_cell_text_align(fort::text_align::center);
             title.row(0).set_cell_row_type(fort::row_type::header);
@@ -2063,11 +2069,11 @@ namespace llaminar2
             // but result.prefill_time_ms/decode_time_ms are averages.
             // Scale wall clocks and token counts by iteration count so %
             // calculations use the total accumulated wall clock as denominator.
-            uint64_t total_tokens = (result.prefill_tokens + result.decode_tokens) * BENCHMARK_ITERATIONS;
-            double total_prefill_ms = result.prefill_time_ms * BENCHMARK_ITERATIONS;
-            double total_decode_ms = result.decode_time_ms * BENCHMARK_ITERATIONS;
-            uint64_t total_prefill_tokens = result.prefill_tokens * BENCHMARK_ITERATIONS;
-            uint64_t total_decode_tokens = result.decode_tokens * BENCHMARK_ITERATIONS;
+            uint64_t total_tokens = (result.prefill_tokens + result.decode_tokens) * measurement_iterations;
+            double total_prefill_ms = result.prefill_time_ms * measurement_iterations;
+            double total_decode_ms = result.decode_time_ms * measurement_iterations;
+            uint64_t total_prefill_tokens = result.prefill_tokens * measurement_iterations;
+            uint64_t total_decode_tokens = result.decode_tokens * measurement_iterations;
 
             KernelProfiler::printSummary(total_tokens, total_prefill_ms, total_decode_ms,
                                          total_prefill_tokens, total_decode_tokens);
@@ -2105,8 +2111,8 @@ namespace llaminar2
             const auto *stats = runner_->executorStats();
             if (stats && stats->total_stages_executed > 0)
             {
-                uint64_t ep_prefill = result.prefill_tokens * BENCHMARK_ITERATIONS;
-                uint64_t ep_decode = result.decode_tokens * BENCHMARK_ITERATIONS;
+                uint64_t ep_prefill = result.prefill_tokens * measurement_iterations;
+                uint64_t ep_decode = result.decode_tokens * measurement_iterations;
                 stats->printProfilingSummary(ep_prefill, ep_decode);
             }
         }
@@ -2131,7 +2137,7 @@ namespace llaminar2
             if (avg_other_us < 0)
                 avg_other_us = 0;
             double decode_wall_ms = result.decode_time_ms;
-            double inter_step_pct = (dlp.inter_step_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0;
+            double inter_step_pct = (dlp.inter_step_total_us / 1000.0 / measurement_iterations) / decode_wall_ms * 100.0;
 
             fort::utf8_table tbl;
             tbl.set_border_style(FT_DOUBLE2_STYLE);
@@ -2141,7 +2147,7 @@ namespace llaminar2
                 s << std::fixed << std::setprecision(1) << avg_sampler_us << " μs";
                 std::ostringstream p;
                 p << std::fixed << std::setprecision(1)
-                  << (dlp.sampler_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
+                  << (dlp.sampler_total_us / 1000.0 / measurement_iterations) / decode_wall_ms * 100.0 << "%";
                 tbl << "  Sampling (argmax)" << s.str() << p.str() << fort::endr;
             }
             {
@@ -2152,7 +2158,7 @@ namespace llaminar2
                 if (other_total_us < 0)
                     other_total_us = 0;
                 p << std::fixed << std::setprecision(1)
-                  << (other_total_us / 1000.0 / BENCHMARK_ITERATIONS) / decode_wall_ms * 100.0 << "%";
+                  << (other_total_us / 1000.0 / measurement_iterations) / decode_wall_ms * 100.0 << "%";
                 tbl << "  Other (broadcast, prep)" << s.str() << p.str() << fort::endr;
             }
             tbl << fort::separator;

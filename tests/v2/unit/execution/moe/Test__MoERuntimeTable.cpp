@@ -1037,7 +1037,7 @@ namespace llaminar2::test
             << "window wait must not reset runtime counters";
     }
 
-    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyPlansMissingHotReplicaArrivals)
+    TEST(Test__MoERuntimeTable, DeviceRebalancePolicyPlansMissingExpertPayloadArrivals)
     {
         MoERuntimeTable table(DeviceId::cpu(), 1, 4, 2);
         auto update = updateForEpoch(1, 4);
@@ -1115,7 +1115,7 @@ namespace llaminar2::test
         EXPECT_EQ(status.accepted_load_spread_improvement_total, 3u);
         EXPECT_EQ(status.accepted_load_spread_improvement_max, 3u);
         ASSERT_EQ(plan_count, 1u);
-        EXPECT_EQ(plan[0].op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival));
+        EXPECT_EQ(plan[0].op, static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival));
         EXPECT_EQ(plan[0].layer, 0u);
         EXPECT_EQ(plan[0].expert, 0u);
         EXPECT_EQ(plan[0].source_participant, 0u);
@@ -1183,10 +1183,12 @@ namespace llaminar2::test
         EXPECT_EQ(status.planned_arrivals, 1u);
         EXPECT_EQ(status.candidate_arrivals_considered, 3u);
         EXPECT_EQ(status.candidate_arrivals_below_floor, 0u);
-        EXPECT_EQ(status.candidate_load_spread_improvement_total, 130u);
-        EXPECT_EQ(status.candidate_load_spread_improvement_max, 45u);
-        EXPECT_EQ(status.accepted_load_spread_improvement_total, 45u);
-        EXPECT_EQ(status.accepted_load_spread_improvement_max, 45u);
+        EXPECT_EQ(status.candidate_load_spread_improvement_total, 140u)
+            << "Dynamic scores payload movement by the equalizing shift the "
+               "least-loaded router can use, not by uniform resident splitting.";
+        EXPECT_EQ(status.candidate_load_spread_improvement_max, 50u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_total, 50u);
+        EXPECT_EQ(status.accepted_load_spread_improvement_max, 50u);
         ASSERT_EQ(plan_count, 1u);
         EXPECT_EQ(plan[0].expert, 0u)
             << "expert 3 is hotter, but moving expert 0 to participant 1 reduces projected "
@@ -1525,7 +1527,7 @@ namespace llaminar2::test
                                             /*participant=*/1, /*participants=*/3,
                                             /*window_tokens=*/1, /*max_hot_replicas=*/1);
         DeviceMoERebalancePlanEntry plan;
-        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival);
+        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
         plan.layer = 0;
         plan.expert = 0;
         plan.source_participant = 0;
@@ -1694,7 +1696,7 @@ namespace llaminar2::test
                                             /*participant=*/0, /*participants=*/3,
                                             /*window_tokens=*/1, /*max_hot_replicas=*/1);
         DeviceMoERebalancePlanEntry plan;
-        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::HotReplicaArrival);
+        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::ExpertPayloadArrival);
         plan.layer = 0;
         plan.expert = 0;
         plan.source_participant = 0;
@@ -1727,6 +1729,140 @@ namespace llaminar2::test
         EXPECT_EQ(bank.resident_participant_mask[0], 0b011u);
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::Replicated));
         EXPECT_TRUE(hasMoEExpertFlag(bank.experts[0].flags, DeviceMoEExpertFlags::LocalCompute));
+    }
+
+    TEST(Test__MoERuntimeTable, DeviceRebalanceOwnershipTransferMovesPrimaryResidency)
+    {
+        DeviceMoERebalancePlanEntry plan;
+        plan.op = static_cast<uint32_t>(DeviceMoERebalancePlanOp::OwnershipTransfer);
+        plan.layer = 0;
+        plan.expert = 0;
+        plan.source_participant = 0;
+        plan.destination_participant = 1;
+        plan.source_resident_mask = 0b001u;
+        plan.destination_slot = 0;
+        plan.payload_slot = 0;
+
+        MoERuntimeTable destination_table(DeviceId::cpu(), 1, 4, 2);
+        auto destination_update = updateForEpoch(1, 4);
+        destination_update.participant_id = 1;
+        destination_update.participant_count = 2;
+        destination_update.experts[0].owner_participant = 0;
+        destination_update.local_compute_mask = {0, 1, 0, 1};
+        destination_update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+        };
+        destination_update.resident_participant_mask = {0b001u, 0b010u, 0b001u, 0b010u};
+        ASSERT_TRUE(destination_table.prepareInactiveBank(0, destination_update));
+        ASSERT_TRUE(destination_table.flipActiveBank(0, 1, nullptr));
+
+        auto destination_config =
+            rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                            /*participant=*/1, /*participants=*/2,
+                            /*window_tokens=*/1, /*max_hot_replicas=*/0);
+        std::vector<DeviceMoEExpertDirectoryEntry> gathered_directory(
+            static_cast<size_t>(destination_config.participant_count) *
+            static_cast<size_t>(destination_config.num_layers) *
+            static_cast<size_t>(destination_config.num_experts));
+        auto &source_entry = gathered_directory[
+            deviceMoEDirectoryIndex(destination_config, 0, 0, 0)];
+        source_entry.descriptor = expertDesc(0, 0, 0);
+        source_entry.layer = 0;
+        source_entry.expert = 0;
+        source_entry.participant = 0;
+        source_entry.resident_mask = 0b001u;
+        source_entry.flags =
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::LocalCompute);
+        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(source_entry));
+
+        std::vector<DeviceMoEExpertDirectoryEntry> transfer_slots(1);
+        auto &slot = transfer_slots[0];
+        slot.descriptor = expertDesc(0, 1, 23);
+        slot.layer = plan.layer;
+        slot.expert = plan.expert;
+        slot.participant = 1;
+        slot.resident_mask = 0b010u;
+        slot.slot_index = 23;
+        slot.flags =
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Valid) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::Resident) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::TransferSlot) |
+            static_cast<uint32_t>(DeviceMoERebalanceDirectoryFlags::CopyComplete);
+        ASSERT_TRUE(deviceMoEPopulateDirectoryFormat(slot));
+
+        DeviceMoERebalanceApplyStatus destination_status;
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            destination_table.deviceLayerState(0),
+            &plan,
+            1,
+            gathered_directory.data(),
+            transfer_slots.data(),
+            static_cast<uint32_t>(transfer_slots.size()),
+            destination_config,
+            &destination_status));
+
+        const auto &destination_bank =
+            destination_table.hostLayerState(0).banks[destination_table.hostLayerState(0).active_bank];
+        EXPECT_EQ(destination_status.applied_arrivals, 1u);
+        EXPECT_EQ(destination_bank.experts[0].owner_participant, 1);
+        EXPECT_EQ(destination_bank.experts[0].local_slot, 23);
+        EXPECT_EQ(destination_bank.local_compute_mask[0], 1u);
+        EXPECT_EQ(destination_bank.replica_role[0],
+                  static_cast<uint8_t>(DeviceMoEReplicaRole::Primary));
+        EXPECT_EQ(destination_bank.resident_participant_mask[0], 0b010u);
+        EXPECT_FALSE(hasMoEExpertFlag(destination_bank.experts[0].flags,
+                                      DeviceMoEExpertFlags::Replicated));
+
+        MoERuntimeTable source_table(DeviceId::cpu(), 1, 4, 2);
+        auto source_update = updateForEpoch(1, 4);
+        source_update.participant_id = 0;
+        source_update.participant_count = 2;
+        source_update.experts[0].owner_participant = 0;
+        source_update.local_compute_mask = {1, 0, 1, 0};
+        source_update.replica_role = {
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::Primary),
+            static_cast<uint8_t>(DeviceMoEReplicaRole::None),
+        };
+        source_update.resident_participant_mask = {0b001u, 0b010u, 0b001u, 0b010u};
+        ASSERT_TRUE(source_table.prepareInactiveBank(0, source_update));
+        ASSERT_TRUE(source_table.flipActiveBank(0, 1, nullptr));
+
+        auto source_config =
+            rebalanceConfig(/*layers=*/1, /*experts=*/4, /*top_k=*/2,
+                            /*participant=*/0, /*participants=*/2,
+                            /*window_tokens=*/1, /*max_hot_replicas=*/0);
+        DeviceMoERebalanceApplyStatus source_status;
+        ASSERT_TRUE(applyDeviceMoERebalanceArrivalsHost(
+            source_table.deviceLayerState(0),
+            &plan,
+            1,
+            nullptr,
+            nullptr,
+            0,
+            source_config,
+            &source_status));
+
+        const auto &source_bank =
+            source_table.hostLayerState(0).banks[source_table.hostLayerState(0).active_bank];
+        EXPECT_EQ(source_status.applied_arrivals, 0u);
+        EXPECT_EQ(source_bank.experts[0].owner_participant, 1);
+        EXPECT_EQ(source_bank.local_compute_mask[0], 0u);
+        EXPECT_EQ(source_bank.replica_role[0],
+                  static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+        EXPECT_EQ(source_bank.resident_participant_mask[0], 0b010u);
+        EXPECT_FALSE(hasMoEExpertFlag(source_bank.experts[0].flags,
+                                      DeviceMoEExpertFlags::Resident));
+        EXPECT_FALSE(hasMoEExpertFlag(source_bank.experts[0].flags,
+                                      DeviceMoEExpertFlags::LocalCompute));
+        EXPECT_FALSE(hasMoEExpertFlag(source_bank.experts[0].flags,
+                                      DeviceMoEExpertFlags::Replicated));
     }
 
     TEST(Test__MoERuntimeTable, DeviceRebalancePolicyReportsTransferPlanOverflow)

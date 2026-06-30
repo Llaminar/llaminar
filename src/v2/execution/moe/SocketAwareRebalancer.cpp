@@ -5,6 +5,7 @@
 
 #include "SocketAwareRebalancer.h"
 #include "../../utils/Logger.h"
+#include "DeviceMoERebalancePolicyShared.h"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -13,6 +14,37 @@
 
 namespace llaminar2
 {
+    namespace
+    {
+        uint32_t ratioToPerMille(float ratio, uint32_t fallback)
+        {
+            if (!std::isfinite(ratio) || ratio < 0.0f)
+                return fallback;
+            const double value = static_cast<double>(ratio) * 1000.0;
+            if (value <= 0.0)
+                return 0u;
+            if (value >= static_cast<double>(std::numeric_limits<uint32_t>::max()))
+                return std::numeric_limits<uint32_t>::max();
+            return static_cast<uint32_t>(std::llround(value));
+        }
+
+        float imbalanceRatio(uint64_t max_load, uint64_t min_load)
+        {
+            if (min_load > 0)
+                return static_cast<float>(max_load) / static_cast<float>(min_load);
+            return max_load > 0 ? std::numeric_limits<float>::infinity() : 1.0f;
+        }
+
+        float expectedRatioReduction(
+            const moe_rebalance_policy::OwnershipSwapChoice &choice)
+        {
+            const float before = imbalanceRatio(choice.old_max_load, choice.old_min_load);
+            const float after = imbalanceRatio(choice.new_max_load, choice.new_min_load);
+            if (std::isfinite(before) && std::isfinite(after))
+                return before - after;
+            return static_cast<float>(choice.improvement);
+        }
+    }
 
     // ── SocketRebalanceProposal ───────────────────────
 
@@ -108,10 +140,9 @@ namespace llaminar2
                 simulated_placement[swap.expert_id] = swap.to_socket;
             }
 
-            // Actually, swaps come in pairs (heavy from overloaded ↔ light from underloaded)
-            // The proposeForLayer already handles the pair logic; we need to apply
-            // the full swap set. Each ExpertSwap represents one side of a swap.
-            // Let's recompute loads with simulated placement.
+            // Each accepted Dynamic ownership move is represented as paired entries:
+            // heavy overloaded owner -> underloaded participant, light underloaded
+            // owner -> overloaded participant.
             std::vector<uint64_t> sim_loads(num_sockets, 0);
             for (int e = 0; e < static_cast<int>(expert_counts.size()); ++e) {
                 sim_loads[simulated_placement[e]] += expert_counts[e];
@@ -166,123 +197,58 @@ namespace llaminar2
         std::vector<ExpertSwap> swaps;
         const int num_experts = static_cast<int>(expert_counts.size());
 
-        // Working copy of placement and loads (we mutate as we accept swaps)
-        std::vector<int> placement = expert_to_socket;
+        // Working copy of placement and loads. The selection step delegates to
+        // the shared Dynamic policy used by the graph-captured GPU controller.
+        std::vector<int32_t> placement(static_cast<size_t>(num_experts), -1);
         std::vector<uint64_t> socket_loads(num_sockets, 0);
         for (int e = 0; e < num_experts; ++e) {
-            socket_loads[placement[e]] += expert_counts[e];
+            const int owner =
+                e < static_cast<int>(expert_to_socket.size()) ? expert_to_socket[e] : -1;
+            if (owner < 0 || owner >= num_sockets)
+                continue;
+            placement[static_cast<size_t>(e)] = owner;
+            socket_loads[static_cast<size_t>(owner)] += expert_counts[e];
         }
 
+        const uint32_t imbalance_threshold_per_mille =
+            ratioToPerMille(config_.imbalance_threshold, 1300u);
+        const uint32_t min_improvement_per_mille =
+            ratioToPerMille(config_.min_improvement_ratio, 50u);
+
         for (int swap_iter = 0; swap_iter < config_.max_swaps_per_layer; ++swap_iter) {
-            // Find overloaded (max) and underloaded (min) sockets
-            auto max_it = std::max_element(socket_loads.begin(), socket_loads.end());
-            auto min_it = std::min_element(socket_loads.begin(), socket_loads.end());
-            int overloaded = static_cast<int>(std::distance(socket_loads.begin(), max_it));
-            int underloaded = static_cast<int>(std::distance(socket_loads.begin(), min_it));
-
-            if (overloaded == underloaded)
+            const auto choice = moe_rebalance_policy::bestDynamicOwnershipSwap(
+                socket_loads.data(),
+                expert_counts.data(),
+                placement.data(),
+                static_cast<uint32_t>(num_experts),
+                static_cast<uint32_t>(num_sockets),
+                imbalance_threshold_per_mille,
+                min_improvement_per_mille,
+                config_.min_window_activations);
+            if (!choice.valid)
                 break;
 
-            // Check imbalance threshold
-            uint64_t max_load = *max_it;
-            uint64_t min_load = *min_it;
-            if (min_load == 0) {
-                if (max_load == 0) break; // no activations at all
-                // Infinite imbalance — proceed
-            } else {
-                float imbalance = static_cast<float>(max_load) / static_cast<float>(min_load);
-                if (imbalance < config_.imbalance_threshold)
-                    break; // already balanced enough
-            }
+            const float load_reduction = expectedRatioReduction(choice);
+            swaps.push_back({layer_idx,
+                             static_cast<int>(choice.heavy_expert),
+                             static_cast<int>(choice.overloaded_participant),
+                             static_cast<int>(choice.underloaded_participant),
+                             choice.heavy_count,
+                             load_reduction});
+            swaps.push_back({layer_idx,
+                             static_cast<int>(choice.light_expert),
+                             static_cast<int>(choice.underloaded_participant),
+                             static_cast<int>(choice.overloaded_participant),
+                             choice.light_count,
+                             load_reduction});
 
-            // Gather experts on overloaded socket, sorted by count DESC
-            std::vector<int> over_experts;
-            for (int e = 0; e < num_experts; ++e) {
-                if (placement[e] == overloaded)
-                    over_experts.push_back(e);
-            }
-            std::sort(over_experts.begin(), over_experts.end(),
-                      [&](int a, int b) { return expert_counts[a] > expert_counts[b]; });
-
-            // Gather experts on underloaded socket, sorted by count ASC
-            std::vector<int> under_experts;
-            for (int e = 0; e < num_experts; ++e) {
-                if (placement[e] == underloaded)
-                    under_experts.push_back(e);
-            }
-            std::sort(under_experts.begin(), under_experts.end(),
-                      [&](int a, int b) { return expert_counts[a] < expert_counts[b]; });
-
-            if (over_experts.empty() || under_experts.empty())
+            if (!moe_rebalance_policy::applyDynamicOwnershipSwap(
+                    socket_loads.data(),
+                    placement.data(),
+                    choice))
+            {
                 break;
-
-            // Pick heaviest from overloaded, lightest from underloaded
-            int heavy_expert = over_experts[0];
-            int light_expert = under_experts[0];
-
-            // Compute expected load after swap
-            uint64_t heavy_count = expert_counts[heavy_expert];
-            uint64_t light_count = expert_counts[light_expert];
-
-            uint64_t new_over_load = max_load - heavy_count + light_count;
-            uint64_t new_under_load = min_load - light_count + heavy_count;
-
-            // Compute new imbalance across ALL sockets (not just these two)
-            std::vector<uint64_t> new_loads = socket_loads;
-            new_loads[overloaded] = new_over_load;
-            new_loads[underloaded] = new_under_load;
-
-            auto new_max_it = std::max_element(new_loads.begin(), new_loads.end());
-            auto new_min_it = std::min_element(new_loads.begin(), new_loads.end());
-            uint64_t new_max = *new_max_it;
-            uint64_t new_min = *new_min_it;
-
-            float old_imbalance = (min_load > 0)
-                ? static_cast<float>(max_load) / static_cast<float>(min_load)
-                : std::numeric_limits<float>::infinity();
-            float new_imbalance = (new_min > 0)
-                ? static_cast<float>(new_max) / static_cast<float>(new_min)
-                : std::numeric_limits<float>::infinity();
-
-            // Check if the swap improves things enough
-            if (std::isfinite(old_imbalance) && std::isfinite(new_imbalance)) {
-                float improvement = (old_imbalance - new_imbalance) / old_imbalance;
-                if (improvement < config_.min_improvement_ratio)
-                    break; // marginal improvement, stop
-
-                float load_reduction = old_imbalance - new_imbalance;
-
-                // Accept the swap — emit two ExpertSwap entries
-                swaps.push_back({layer_idx, heavy_expert, overloaded, underloaded,
-                                 heavy_count, load_reduction});
-                swaps.push_back({layer_idx, light_expert, underloaded, overloaded,
-                                 light_count, load_reduction});
-            } else if (!std::isfinite(old_imbalance) && std::isfinite(new_imbalance)) {
-                // Going from infinite to finite is always an improvement
-                swaps.push_back({layer_idx, heavy_expert, overloaded, underloaded,
-                                 heavy_count, new_imbalance});
-                swaps.push_back({layer_idx, light_expert, underloaded, overloaded,
-                                 light_count, new_imbalance});
-            } else if (!std::isfinite(old_imbalance) && !std::isfinite(new_imbalance)) {
-                // Both infinite (e.g., 3+ sockets where some have 0 load).
-                // Accept if the max load decreased (spreading work toward balance).
-                if (new_max < max_load) {
-                    swaps.push_back({layer_idx, heavy_expert, overloaded, underloaded,
-                                     heavy_count, 0.0f});
-                    swaps.push_back({layer_idx, light_expert, underloaded, overloaded,
-                                     light_count, 0.0f});
-                } else {
-                    break;
-                }
-            } else {
-                break; // can't improve
             }
-
-            // Update working state
-            placement[heavy_expert] = underloaded;
-            placement[light_expert] = overloaded;
-            socket_loads[overloaded] = new_over_load;
-            socket_loads[underloaded] = new_under_load;
         }
 
         return swaps;

@@ -23,6 +23,7 @@ defer_captured_collective_sync="${LLAMINAR_GPU_MOE_REBALANCE_DEFER_CAPTURED_COLL
 dense_tp="${LLAMINAR_GPU_MOE_REBALANCE_DENSE_TP:-0}"
 dense_decode_replicated="${LLAMINAR_GPU_MOE_REBALANCE_DENSE_DECODE_REPLICATED:-0}"
 dense_policy="${LLAMINAR_GPU_MOE_REBALANCE_DENSE_POLICY:-}"
+routed_assignment_policy="${LLAMINAR_GPU_MOE_REBALANCE_ASSIGNMENT_POLICY:-}"
 allreduce_precision="${LLAMINAR_GPU_MOE_REBALANCE_ALLREDUCE_PRECISION:-}"
 allreduce_fp16_min_elements="${LLAMINAR_GPU_MOE_REBALANCE_ALLREDUCE_FP16_MIN_ELEMENTS:-}"
 small_gpu_allreduce="${LLAMINAR_GPU_MOE_REBALANCE_SMALL_GPU_ALLREDUCE:-0}"
@@ -31,7 +32,7 @@ require_prefill_graph="${LLAMINAR_GPU_MOE_REBALANCE_REQUIRE_PREFILL_GRAPH:-1}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--small-gpu-allreduce] [--small-gpu-allreduce-max-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
+Usage: $0 [--backend cuda|rocm|both] [--placement single|twocard|both] [--cases LIST] [--bin PATH] [--model PATH] [--out DIR] [--reps N] [--context-length N] [--n-predict N] [--n-predict-list LIST] [--seeds LIST] [--rebalance-window N] [--perfstats] [--stage-gpu-stats] [--rebalance-trace] [--capture-collectives] [--defer-captured-collective-sync] [--dense-tp] [--dense-decode-replicated] [--dense-policy POLICY] [--assignment-policy static-owner|least-loaded-ep] [--allreduce-precision fp16|fp32|bf16] [--allreduce-fp16-min-elements N] [--small-gpu-allreduce] [--small-gpu-allreduce-max-elements N] [--require-prefill-graph|--no-require-prefill-graph] [--dry-run]
 
 Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   static placement
@@ -61,6 +62,9 @@ Use --rebalance-trace for policy-lab data collection. It writes
 rebalance_trace.jsonl beside each run with one JSON object per maintenance
 export, including aggregate imbalance economics plus the selected command
 buffer entries. This is a diagnostic run mode, not a clean throughput row.
+Trace mode enables LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS=1 by default so
+the trace includes pre/post projected participant-load features; explicitly set
+LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS=0 to disable those extra counters.
 
 Dynamic/observe cases default to --moe-rebalance-window 64 so the standard
 128-token sprint proof crosses at least one rebalance decision window. Override
@@ -86,6 +90,10 @@ prefill. Routed expert reductions remain controlled by the MoE overlay.
 Use --dense-policy to pass an explicit --moe-expert-overlay-dense-policy value,
 for example tensor-parallel-decode-mirrored-embedding. This overrides
 --dense-tp/--dense-decode-replicated for two-card runs.
+
+Use --assignment-policy least-loaded-ep to request LLEP row assignment on top
+of apportioned whole-expert ownership. The default leaves assignment implicit,
+which is equivalent to static-owner.
 
 Use --allreduce-precision fp16|fp32|bf16 to force the collective transport
 precision for diagnostic/performance A/B runs. Omit it to use the model schema's
@@ -220,6 +228,14 @@ while [[ $# -gt 0 ]]; do
       dense_policy=""
       shift
       ;;
+    --assignment-policy|--routed-assignment-policy)
+      routed_assignment_policy="${2:?missing --assignment-policy value}"
+      shift 2
+      ;;
+    --no-assignment-policy|--no-routed-assignment-policy)
+      routed_assignment_policy=""
+      shift
+      ;;
     --allreduce-precision)
       allreduce_precision="${2:?missing --allreduce-precision value}"
       shift 2
@@ -337,7 +353,9 @@ fi
 
 mkdir -p "${out_dir}"
 summary="${out_dir}/summary.tsv"
-printf 'backend\tplacement\tcase\tn_predict\tseed\trep\texit_code\tbenchmark_json\tperf_json\tperf_csv\trebalance_trace_jsonl\tlog\n' > "${summary}"
+if [[ ! -s "${summary}" ]]; then
+  printf 'backend\tplacement\tcase\tn_predict\tseed\trep\texit_code\tbenchmark_json\tperf_json\tperf_csv\trebalance_trace_jsonl\tlog\n' > "${summary}"
+fi
 
 selected_backends=()
 if [[ "${backend}" == "both" || "${backend}" == "cuda" ]]; then
@@ -420,7 +438,7 @@ single_device_args() {
 
 twocard_overlay_args() {
   local be="$1"
-  local domain devices collective
+  local domain devices collective assignment_suffix
   case "${be}" in
     cuda)
       domain="qwen36_moe_cuda_hot"
@@ -433,6 +451,10 @@ twocard_overlay_args() {
       collective="rccl"
       ;;
   esac
+  assignment_suffix=""
+  if [[ -n "${routed_assignment_policy}" && "${routed_assignment_policy}" != "static-owner" && "${routed_assignment_policy}" != "static_owner" ]]; then
+    assignment_suffix=";assignment=${routed_assignment_policy}"
+  fi
 
   printf '%s\n' \
     --moe-expert-overlay tiered \
@@ -440,7 +462,7 @@ twocard_overlay_args() {
     --moe-expert-overlay-base-domain "${domain}" \
     --moe-expert-overlay-shared-domain "${domain}" \
     --moe-expert-overlay-residency static-by-id \
-    --moe-expert-overlay-domain "${domain}=${devices};scope=local;backend=${collective};compute=apportioned_experts;owner=0" \
+    --moe-expert-overlay-domain "${domain}=${devices};scope=local;backend=${collective};compute=apportioned_experts${assignment_suffix};owner=0" \
     --moe-expert-overlay-tier "hot@${domain};priority=0;max-experts-per-layer=256;memory-mb=8192"
 }
 
@@ -528,6 +550,14 @@ run_one() {
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT
   inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT
+  inherit_env_if_set LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE
+  inherit_env_if_set LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE
+  inherit_env_if_set LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE
+  inherit_env_if_set LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER
+  inherit_env_if_set LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE
+  inherit_env_if_set LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS
+  inherit_env_if_set LLAMINAR_BENCHMARK_ITERATIONS
+  inherit_env_if_set LLAMINAR_BENCHMARK_WARMUP_ITERATIONS
   if [[ -n "${allreduce_fp16_min_elements}" ]]; then
     run_env+=("LLAMINAR_ALLREDUCE_FP16_MIN_ELEMENTS=${allreduce_fp16_min_elements}")
   fi
@@ -544,6 +574,9 @@ run_one() {
   fi
   if [[ "${rebalance_trace}" != "0" && "${rebalance_trace}" != "false" && "${rebalance_trace}" != "off" ]]; then
     run_env+=("LLAMINAR_MOE_REBALANCE_TRACE_JSONL=${rebalance_trace_jsonl}")
+    if [[ -z "${LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS+x}" ]]; then
+      run_env+=("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS=1")
+    fi
   fi
   if [[ "${place}" == "twocard" ]]; then
     if [[ "${require_prefill_graph}" != "0" && "${require_prefill_graph}" != "false" && "${require_prefill_graph}" != "off" ]]; then

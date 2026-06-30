@@ -38,6 +38,7 @@ namespace llaminar2
         ExpertDomainKind kind = ExpertDomainKind::SingleDevice;
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
         ExpertDomainComputeKind compute_kind = ExpertDomainComputeKind::ApportionedExperts;
+        RoutedExpertAssignmentPolicy assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
 
         std::vector<MoEOverlayDomainParticipant> participants;
         GlobalDeviceAddress primary_participant;

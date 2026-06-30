@@ -111,6 +111,41 @@ namespace llaminar2::test
         EXPECT_TRUE(plan.isTieredOverlay());
     }
 
+    TEST(Test__MoEExpertParallelPlan, AcceptsLeastLoadedAssignmentOnApportionedDomainScopedTPDomains)
+    {
+        auto plan = validTwoTierPlan();
+        for (auto &domain : plan.domains)
+            domain.assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        const auto result = validateMoEExpertParallelPlan(plan, twoLayerFourExpertOptions());
+
+        EXPECT_TRUE(result.ok()) << (result.errors.empty() ? "" : result.errors.front());
+    }
+
+    TEST(Test__MoEExpertParallelPlan, RejectsLeastLoadedAssignmentOnSingleParticipantDomains)
+    {
+        auto plan = validTwoTierPlan();
+        plan.domains[0] = singleGpuDomain("gpu_hot");
+        plan.domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        const auto result = validateMoEExpertParallelPlan(plan, twoLayerFourExpertOptions());
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(hasErrorContaining(result, "LeastLoadedEP assignment"));
+    }
+
+    TEST(Test__MoEExpertParallelPlan, RejectsLeastLoadedAssignmentOnNonApportionedDomains)
+    {
+        auto plan = validTwoTierPlan();
+        plan.domains[0].compute_kind = ExpertDomainComputeKind::ShardedExperts;
+        plan.domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        const auto result = validateMoEExpertParallelPlan(plan, twoLayerFourExpertOptions());
+
+        EXPECT_FALSE(result.ok());
+        EXPECT_TRUE(hasErrorContaining(result, "not an ApportionedExperts domain"));
+    }
+
     TEST(Test__MoEExpertParallelPlan, AcceptsValidThreeTierTieredExpertOverlayPlan)
     {
         auto plan = validTwoTierPlan();

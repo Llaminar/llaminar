@@ -2,1209 +2,357 @@
 
 ## Goal
 
-For homogeneous GPU LocalTP MoE domains (`cuda+nccl` or `rocm+rccl`, degree 2+),
-rebalance publish/apply must be graph-capturable and device-owned. The host may
-initialize topology, enable peer access, allocate slots, and poll diagnostics,
-but it must not participate in the per-window histogram sync, placement
-decision, transfer publication, or runtime-table apply path.
+For homogeneous GPU LocalTP MoE domains (`cuda+nccl` or `rocm+rccl`, degree
+2+), rebalance publish/apply must be graph-capturable and device-owned. The
+host may initialize topology, allocate slots, prewarm graphs, and poll
+diagnostics, but it must not participate in the steady-state histogram sync,
+placement decision, transfer publication, or runtime-table apply path.
 
-This is separate from mixed-backend migration. Cross-vendor movement remains a
-host-mediated fallback until we add a backend-neutral fabric contract.
+This design is for same-backend domains only. Cross-vendor movement and mixed
+CUDA/ROCm expert domains remain out of scope for this controller.
 
-## Target Controller Shape
+## Policy Taxonomy
 
-The target is a device-scheduled command-buffer pipeline split across captured
-graph lanes:
+Expert ownership, rebalance strategy, routed-row assignment, and optional cache
+residency are separate axes.
 
-- The steady decode graph owns routed expert compute and histogram updates. It
-  applies ready waves once at the last-local-layer routed-expert boundary.
-- A separate async maintenance graph owns histogram collection, root planning,
-  and transfer staging at rebalance-window boundaries. Its captured sequence is
-  currently `CollectState -> PlanAssignments/StageArrivals`. Collection
-  snapshots the just-finished decode histogram before planning the next command
-  buffer; route-boundary apply publishes completed waves before later routed
-  expert dispatch observes the placement bank.
+Base routed-expert storage for this sprint is `ApportionedExperts`: every routed
+expert has one whole-expert owner in the domain. `ReplicatedExperts` means every
+participant owns every expert. `ShardedExperts` means every participant owns a
+shard of each expert and must combine partial outputs. These are storage
+policies, not rebalance algorithms.
 
-This keeps histogram traffic and payload movement off the per-token decode
-collective critical path. The host may request maintenance graph replay at the
-normal window cadence today; the steady-state target is a device-side scheduler
-that gates maintenance replay, chooses the transfer bucket, and chains the same
-maintenance work without host publish/apply scheduling.
+`Static`
+: Experts are apportioned once and never moved by runtime policy. Histograms may
+  still be collected for diagnostics. This is the correctness and performance
+  baseline.
 
-1. `CollectLocalState`: each participant keeps runtime histograms and local
-   resident descriptor metadata in graph-stable device memory. The host may
-   initialize peer pointer and sideband tables at graph build time, but it does
-   not gather or inspect this state after replay starts.
+`Dynamic`
+: One shared strategy across CPU, CUDA, and ROCm. It observes decode histogram
+  windows and periodically rebalances the hottest routed experts so participant
+  load is closer to even. CPU applies the policy through the host controller;
+  homogeneous GPU domains apply the same policy through the device-side
+  controller, async compact payload transfer, and arrival machinery. The current
+  controller defaults start with a 256-token window, grow by
+  `window_growth_factor=1.5`, and cap at `max_window_size=4096`. If we want a
+  strict quadratic/power schedule, make it an explicit `window_schedule`
+  setting. The current implementation uses the shared paired ownership-swap
+  helper and rejects empty/no-payback moves.
+
+`LLEP`
+: Least-Loaded Expert Parallelism from arXiv:2601.17111. LLEP preserves the
+  router's exact top-k expert choices and route weights, then assigns current
+  routed row spans to least-loaded participants under capacity, minimum-chunk,
+  and transfer-cost constraints. It can import foreign expert payloads for the
+  current batch/window without changing long-lived ownership.
+
+`Observe`
+: A measurement mode, not a rebalance strategy. It should exercise the same
+  histogram and perfstat path as the selected strategy but must not mutate
+  placement or cache state.
+
+`HotExpertReplicaCache`
+: An optional residency layer, not an algorithm choice. A top-10 or
+  percentage-based cache can retain additional whole-expert copies after Dynamic
+  or LLEP decides an expert is worth importing. The router may use resident cache
+  contents to choose the least-loaded valid participant for an already-selected
+  expert, but it must never change router top-k choices. Cache admission and
+  retention need separate payback thresholds.
+
+The target configuration shape is:
+
+- `expert_rebalance_strategy = static | dynamic | llep`
+- `hot_expert_cache = off | top_k:N | percent:P`
+- `rebalance_observe = true|false`
+
+## Target Graph Shape
+
+The controller is a graph-visible state machine split across decode and
+maintenance lanes.
+
+1. `CollectLocalState`: each participant keeps histograms, resident descriptors,
+   command buffers, wave state, and transfer-slot metadata in graph-stable
+   device memory.
 2. `AsyncWaveHistogramGather`: at a rebalance-window boundary, the maintenance
-   graph packs histogram state for the active rolling layer wave and gathers it
-   on an explicit maintenance stream. The packed tensor is
-   `[participant][wave_layer][expert]`, not the full model
-   `[participant][model_layer][expert]` tensor. The full-model layout remains
-   valid only when layer-wave mode is disabled for diagnostics.
-3. `RootPlanAssignments`: the elected root participant for the homogeneous MoE
-   domain consumes gathered histogram state, computes the placement policy on
-   device, and publishes compact epoch-stamped command buffers. Non-root
-   participants run the same graph node as a no-op or validate the received
-   epoch. The command header is the production publish/apply ABI; legacy
-   `plan_count` mailboxes are test compatibility only and must not be required
-   by graph-side copy/apply.
-4. `ScheduleTransferBucket`: the root/device scheduler reduces the planned
-   arrival count to the smallest pre-captured power-of-two transfer bucket
-   (`1,2,4,...,slot_capacity`) that can hold the wave. The host must not
-   inspect command buffers to choose the bucket in steady state. Until device
-   graph launch is available, the host may submit a prewarmed bucket replay from
-   device-published scheduler state, but it does not compute policy or mutate
-   placement.
-5. `StageArrivals`: each participant polls its local command buffer and, when a
-   new command epoch targets it, packs only locally sourced planned arrivals
-   into contiguous staging slots on the context-owned transfer stream. NCCL/RCCL
-   grouped collectives move the selected bucket lane; destination kernels unpack
-   the received NativeVNNI bytes into preallocated local transfer slots. Device
-   kernels must not dereference peer device pointers directly, and no ad hoc
-   VRAM allocations or CPU-native serialized blobs are allowed on this path.
-6. `RouteBoundaryApply`: the last local routed-expert routing kernel polls
-   device controller state for a ready wave, then thread 0 publishes arrived or
-   already-resident descriptors into the mirrored runtime table before the
-   current token's top-k runtime dispatch state is written. A miss is a device
-   no-op, and the route kernel must not pay an extra block-wide barrier on the
-   miss path.
+   graph packs histogram rows for the active rolling layer wave and gathers them
+   on an explicit maintenance stream. The production payload is
+   `[participant][wave_layer][expert]`, not the full
+   `[participant][model_layer][expert]` tensor.
+3. `RootPlanAssignments`: the elected root participant consumes gathered state,
+   computes the selected strategy on device, and publishes epoch-stamped command
+   buffers. Non-root participants execute graph-symmetric no-op/validation work.
+4. `ScheduleTransferBucket`: the root/device scheduler chooses the smallest
+   pre-captured payload bucket that can hold the planned arrivals. Until device
+   graph launch or graph conditionals are available, host code may submit an
+   already-captured bucket graph from device-published scheduler state, but it
+   must not compute policy or mutate placement.
+5. `StageArrivals`: sources pack only planned, non-empty NativeVNNI payloads
+   into compact staging slots. NCCL/RCCL grouped collectives move the selected
+   bucket lane. Destinations unpack into local preallocated transfer slots.
+6. `RouteBoundaryApply`: the last local routed-expert dispatch polls ready wave
+   state and publishes arrived or already-resident descriptors into the mirrored
+   runtime table before later dispatch observes placement. A miss is a device
+   no-op.
 
-This makes rebalance a graph-visible state machine instead of a host callback.
-The host constructs the machine and prewarms the bucket graph variants once;
-steady replay advances it through device memory, explicit streams, events,
-kernels, and grouped collectives.
+The steady-state decode graph owns routed expert compute and histogram updates.
+The async maintenance graph owns histogram collection, root planning, and
+transfer staging. The host constructs and prewarms the machine; replay advances
+through device memory, explicit streams, events, kernels, and grouped
+collectives.
 
-## Bucketed Transfer Graphs
+## Transfer Contract
 
-NCCL/RCCL graph capture records a concrete collective count and participant
-schedule. It cannot safely accept an arbitrary device-generated byte count on a
-single captured collective replay. The transfer lane therefore uses bucketed
-graph variants:
+The active GPU packed format is backend-neutral NativeVNNI for same-backend
+domains: payload, scales, mins, emins, codebook/block metadata, and matrix
+dimensions. Same-backend GPU arrivals copy descriptor-described bytes directly;
+they do not serialize to CPU-native blobs and do not repack on arrival.
 
-- Capture one maintenance transfer graph per power-of-two expert-arrival bucket
-  up to the reserved staging-slot capacity.
-- The controller emits planned arrivals with compact per-destination payload-slot
-  ordinals. Payload staging is indexed by `[destination][payload_slot]`, not the
-  sparse command-buffer plan index, so a one-expert arrival wave does not move a
-  plan-capacity arena full of empty slots.
-- A device-side scheduler state records the selected bucket, active command
-  wave, epoch, and ready/completed status. This state is the only interface
-  between policy and graph replay.
-- Today, host code may read only this scheduler state to submit an already
-  captured bucket graph. The target is device-side graph launch or graph
-  conditional nodes so the host does not participate after warmup.
-- Perfstats must report requested arrivals, selected bucket, reserved payload
-  bytes, useful payload bytes, and utilization. A policy change cannot claim a
-  speedup unless the chosen bucket makes transfer bytes proportional to useful
-  arrivals within bounded alignment/header overhead.
+NCCL/RCCL graph capture records concrete collective counts and participant
+schedules. The transfer lane therefore uses bucketed graph variants:
 
-## Current State
+- Capture one payload graph per power-of-two expert-arrival bucket up to the
+  reserved staging-slot capacity.
+- Use compact payload slots indexed by `[destination][payload_slot]`, not sparse
+  plan capacity. A one-expert wave must not move an arena full of empty slots.
+- Skip the payload graph entirely when a completed plan has no arrivals.
+- Report requested arrivals, selected bucket, reserved bytes, useful bytes,
+  wasted bytes, and utilization in PerfStats.
 
-The device-side path now has resident-only hot replica selection, compact
-same-backend transfer-slot arrivals, and the first graph-visible device-owned
-rebalance ABI:
+Explicit peer-copy branches are not part of the target path. NCCL/RCCL should
+choose the available transport internally.
 
-- Production decode graphs instantiate `MoEDeviceRebalanceStage` as a
-  first-local-layer `PlanAndCopy` producer plus per-layer `Apply` consumers at
-  routed-expert boundaries. The older single-stage `PlanCopyApply` mode remains
-  only as a compatibility/test shape.
-- All-position prefill and verifier graphs are excluded from this hook; they do
-  not collect transfer-slot specs or enqueue rebalance stages.
-- The stage packs decode histograms from the mirrored `DeviceMoERuntimeTable`.
-  In rolling-wave mode, CUDA and ROCm pack only the active
-  `[wave_layer][expert]` rows selected by `DeviceMoERebalanceWaveState`.
-- LocalTP raw allgather gathers `[participant][wave_layer][expert]`
-  histograms on the maintenance graph stream. Full `[participant][layer][expert]`
-  gather is retained only for diagnostics or when layer-wave mode is disabled.
-- CUDA/ROCm `device_rebalance_controller_kernel` can still do the old inline
-  bank flip for compatibility modes, but async maintenance sets
-  `DeviceMoERebalanceFlags::DeferRuntimeApply`. In that mode the controller
-  emits `ResidentHotReplica` commands and leaves `active_bank` untouched until a
-  route-boundary apply poll commits the ready wave inside the last local routed
-  expert dispatch.
-- The controller emits missing-arrival plan entries with deterministic
-  per-destination `destination_slot` ordinals reserved from a device-side payload
-  slot counter. Graph-side copy/apply still runs without host slot assignment,
-  but command metadata capacity no longer dictates payload transfer bytes.
-- `DeviceMoERebalanceConfig` now carries an explicit `root_participant`; the
-  host config, CUDA view, and ROCm view validate it through the shared policy
-  helper. Graph-captured rebalance sidebands use this configured root rather
-  than assuming participant zero.
-- In deferred transfer-slot mode, only the configured root participant runs the
-  graph-side policy search. Non-root participants still execute the same
-  captured controller node, publish an empty local command header, and advance
-  the rolling wave cursor so the next histogram pack remains aligned, but they
-  skip candidate ranking that would be discarded when
-  `project_rebalance_domain_commands` broadcasts the root command buffer into
-  every participant's apply ABI.
-- CUDA/ROCm can pack local resident descriptor directories for diagnostics and
-  legacy fixed-payload scaffolding. The compact production path instead packs
-  plan-sized source descriptor responses after command/header allgather, copies
-  planned arrivals into transfer slots, and applies copied transfer slots into
-  the mirrored runtime table on explicit streams.
-- CUDA/ROCm grouped runtime decode now reads the active placement-bank
-  descriptors from `DeviceMoELayerRuntime` directly. The older persistent
-  descriptor tables remain as graph-stable shape/codebook metadata for runtime
-  dispatch, but their per-expert pointer contents are no longer authoritative
-  for runtime decode.
-- `DeviceMoERebalanceController.h` now names the captured command-buffer ABI
-  explicitly: `CollectState`, `PlanAssignments`, `StageArrivals`, and
-  `ApplyLayer`. The plan buffer now has double-buffered device-written
-  `DeviceMoERebalanceCommandBufferHeader`, plan-count, plan-entry, and
-  `DeviceMoERebalanceWaveState` slots; host code may allocate and inspect
-  these buffers, but homogeneous GPU replay must produce and consume them on
-  device.
-- CUDA/ROCm now expose graph-capturable controller-state kernels:
-  initialize/preserve `DeviceMoERebalanceGraphControllerState`, publish
-  transfer completion from the transfer stream with a device fence, and poll a
-  ready wave from the decode apply path. A poll miss is a device no-op, not a
-  host branch.
-- `MoEDeviceRebalanceStage` has an opt-in transfer-slot mode that adds
-  plan-sized local/gathered source descriptor responses plus an apply-status
-  mailbox to workspace. The two captured maintenance stages share one workspace
-  namespace and one `DeviceMoERebalanceTransferState`; the route kernel consumes
-  ready-wave state later, without a host callback.
-- Maintenance stages also share a persistent graph-controller-state workspace.
-  The transfer stream publishes `ReadyToApply`; the route-boundary apply poll
-  consumes `applyReadyDeviceRebalanceWave()` instead of directly trusting a
-  host-visible completion path.
-- Ready-wave apply now has two command classes. `HotReplicaArrival` consumes a
-  preallocated transfer slot, while `ResidentHotReplica` applies an already
-  local descriptor and may run with no transfer-slot directory at all. CUDA,
-  ROCm, and the shared host helper all use this same command vocabulary.
-- CUDA/ROCm ready-wave apply is no longer a one-lane runtime-table mutation.
-  The apply kernel still lets thread 0 preserve ordered command validation and
-  descriptor publication, but launches a full 256-lane block and parallelizes
-  the chunky per-expert work: inactive-bank copy, local/resident mask reset,
-  multi-resident recount, and histogram/router-stat reset. Regression tests
-  assert the full-block launch and reject the old `threadIdx.x != 0` early-exit
-  shape. A later experiment moved `changed_layer` scratch initialization after
-  the ready-wave miss check, but it did not improve throughput or maintenance
-  GPU elapsed, so the simpler pre-setup initialization order is retained.
-- Qwen3.6 async maintenance is now split into two captured graph bodies. The
-  plan body is `moe_device_rebalance_maintenance_collect ->
-  moe_device_rebalance_maintenance_plan_commands_after_snapshot`; it gathers
-  histogram state, runs device policy, gathers/projects command metadata, and
-  stops before payload movement. A separate
-  `moe_device_rebalance_maintenance_copy_prepared_payload` graph body is
-  enqueued only after the completed plan reports nonzero `payload_bucket_slots`.
-  No-work maintenance waves therefore do not execute the captured payload
-  bucket. The steady decode graph still applies ready waves inside the
-  last-local-layer routing kernel. Collection must precede planning so the
-  planning window cannot be erased by route-boundary ready-wave histogram reset.
-  The old maintenance apply/drain stages were removed after route-boundary apply
-  became the sole runtime-table publication path.
-- Transfer-slot arrivals run on a context-owned auxiliary transfer stream. The
-  producer prepares stable stream/event handles before graph capture, records
-  the compute-to-transfer dependency with checked `IWorkerGPUContext` event
-  APIs, and records transfer completion without joining the compute stream.
-  Inline `PlanCopyApply` keeps a graph event dependency for the transfer it just
-  queued; split decode `Apply` consumes device ready-wave state without an
-  unconditional transfer-done event wait.
-- Standalone maintenance-graph collectives now use a graph-owned dedicated
-  LocalTP context/communicator with the same participants, weights, and backend
-  as the decode domain. Decode-side inline sidebands still use the decode lane,
-  but maintenance-mode raw allgathers run on the maintenance lane and may stay
-  in flight while the next decode replay enqueues its own NCCL/RCCL collectives.
-  DGO retains a shared-lane sync fallback only for maintenance graphs whose
-  `MoEDeviceRebalanceStage` params still point at the decode TP context.
-- CUDA/ROCm `StageArrivals` and route-boundary apply prefer the device
-  command-buffer header for command count/capacity. The older `plan_count`
-  pointer is retained for low-level direct kernel tests, but production graph
-  replay consumes the header written by `PlanAssignments`.
-- Compact transfer-slot staging first allgathers command/header metadata, then
-  each participant writes plan-sized local source descriptor scratch only for
-  plans where it is the source. The source then scans the active command buffer
-  and packs NativeVNNI bytes into a rolling payload lane indexed by
-  `[destination][payload_slot]`; the transfer stream allgathers that compact lane
-  with the same grouped NCCL/RCCL maintenance wave and each destination unpacks
-  only planned `HotReplicaArrival` commands into local preallocated slots. There
-  is no separate source-descriptor collective and no destination-side peer
-  pointer dereference. The old fixed payload pack/unpack kernels remain isolated
-  behind rejected diagnostic modes.
-- Command metadata capacity and payload transfer capacity are separate. The
-  command buffer remains large enough for planning and diagnostics, while the
-  payload lane is bounded by `payload_slot_capacity = min(plan_capacity,
-  local_transfer_slot_count)`. Bucket request sizing is the maximum number of
-  arrivals needed by any destination participant, not the total command count.
-- The captured compact payload lane now has an explicit
-  `collective_payload_slot_capacity` separate from the local staging pool. The
-  default is one captured payload slot per participant, while the device still
-  reserves a double-buffered staging pool for rolling async waves. This halves
-  the current CUDA2 gathered payload capacity from 11.54 MiB to 5.77 MiB per
-  maintenance replay. It is a mitigation, not the final bucket scheduler: a
-  zero-arrival replay still has a fixed captured collective count until
-  prewarmed bucket graph bodies or device-selected conditional graph bodies own
-  the payload lane.
-- Command metadata is wave-aware, not full-model by default. The shared capacity
-  rule is `layer_wave_count * hot_replica_cap` for resident-only commands and
-  `layer_wave_count * hot_replica_cap * participant_count^2` for compact
-  transfer-slot commands, giving root-domain projection enough headroom without
-  sizing every maintenance replay by all model layers.
-- Request-boundary reset preserves the captured maintenance graph and explicit
-  maintenance stream, but drops stale in-flight completion bookkeeping after the
-  runner has synchronized the device. Warmup or previous-request waves must not
-  force diagnostic D2H readback in the next measured/served request; device-side
-  placement effects have already happened in graph replay, and perfstats export
-  is diagnostics only.
-- When perfstats are enabled, request-boundary reset first drains any completed
-  in-flight maintenance wave after the device sync and before preserving graph
-  replay state. This keeps the last measured request's policy/apply counters
-  visible without deferring their host diagnostic readback into the following
-  request.
-- Maintenance status now distinguishes three readiness outcomes instead of
-  collapsing them into `WindowNotReady`: aggregate `skipped_not_ready`,
-  `skipped_busy_wave` when both transfer/apply wave slots are still active, and
-  `skipped_histogram_not_ready` when the gathered rolling-wave histogram does
-  not yet meet the policy window. The status also exports
-  `window_ready_slots` and `window_required_slots` so cadence bugs are visible
-  numerically on CUDA, ROCm, and the CPU mirror.
-- Transfer-complete publication now clears the active graph-controller wave when
-  the command header has epoch zero or command count zero. This prevents a
-  no-op or histogram-not-ready maintenance replay from preserving stale
-  `copied_arrivals` and payload-bucket metadata into the next perfstats export
-  or scheduler decision. CUDA and ROCm have matching regression tests for this
-  publish no-op path.
-- Controller publication no longer marks transfer-backed waves
-  `ReadyToApply` immediately after planning. If the root plans arrivals that
-  require compact payload transfer slots, CUDA and ROCm leave the graph wave in
-  `Planning` with zero copied arrivals until the transfer stream publishes
-  completion. Resident-only/no-transfer waves can still publish directly to
-  `ReadyToApply`. This keeps the state machine compatible with future
-  plan-only/bucket-transfer graph splitting and is covered by a shared source
-  regression plus focused CUDA/ROCm copy/apply tests.
-- Perfstats transfer-cost accounting now distinguishes lifecycle wave totals
-  from the current replay. `device_rebalance_wave_*_total` may include older
-  applied waves, but `device_rebalance_transfer_useful_payload_bytes` is charged
-  only when the current maintenance status applied work and a command header
-  matches the exported status epoch. Skipped/no-op exports therefore report
-  current copied arrivals and useful payload as zero even if older applied waves
-  remain visible for diagnostics.
-- The host-scheduled maintenance cadence has an explicit diagnostic slack knob,
-  `LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS`. The default is `1`
-  because zero slack repeatedly launched at 2047/2048 routed slots on the
-  CUDA2 Qwen3.6 probe, producing underfilled no-op maintenance windows. Setting
-  it can intentionally delay launch to test underfilled rolling-wave histograms
-  without changing the device-side statistical window.
-- The host-scheduled maintenance cadence now defaults to a delayed first replay:
-  `LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=321` and
-  `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS=512`. The
-  policy window still controls readiness; these knobs only prevent poorly-timed
-  host-scheduled maintenance replays until the device-side scheduler owns graph
-  replay. Set the initial period to `0` to use the regular cadence from token
-  zero. Clean CUDA2/ROCm2 512-token probes favored `321/512`: CUDA decoded at
-  119.97 tok/s, while ROCm recovered from default dynamic 64.24 tok/s to 65.01
-  tok/s against a 64.91 tok/s static reference.
-- Benchmark perfstats reset the `moe_rebalance` domain before measured
-  iterations, even when a host post-warmup callback exists. Warmup graph
-  capture, workspace allocation, and setup placement are lifecycle diagnostics;
-  measured `moe_rebalance` records are reserved for steady-state decode
-  maintenance overhead and policy effectiveness.
-- `OrchestrationRunner::maybeApplyMoERebalance()` bypasses host histogram sync
-  and host publish/apply when `usesDeviceSideMoERebalanceController()` is true.
-  It returns before looking up the host controller, so direct decode loops do
-  not pay host-controller bookkeeping overhead in device-side mode.
-- Qwen3.6 parity direct-decode loops use the same device-side-aware maintenance
-  gate as chat/generate paths. They continue to exercise host maintenance for
-  non-device-side runs, but skip it when captured graph stages own rebalance.
-- Runtime tables for every local decode layer covered by the device-side path do
-  not register the legacy host decode-histogram sync callback; histogram
-  collection is owned by `CollectState` inside the captured graph.
-- Masked LocalTP decode runtime tables now carry full-domain routed-expert
-  ownership metadata for every expert, even though only local resident experts
-  carry valid NativeVNNI payload descriptors. This is required for the device
-  controller to plan hot-replica arrivals from remote owner participants. Local
-  compute stages also carry explicit `participant_id` and `participant_count`,
-  so participant 1+ cannot silently reinitialize the mirrored table as
-  participant 0 or infer a smaller-than-domain participant count.
-- Decode graph construction no longer attaches histogram sidebands when the
-  async maintenance graph is selected. Maintenance mode requires
-  graph-capturable raw NCCL/RCCL allgather on an explicit stream and fails
-  closed otherwise.
-- Production device-side graph rebalance no longer falls back to decode-side
-  histogram sidebands just because the backend can capture grouped sidebands.
-- ROCm maintenance currently keeps graph-captured transfer-slot work on the
-  captured stage stream. A June 29 probe that forced the CUDA-style auxiliary
-  transfer stream on ROCm replayed successfully but regressed to the bad
-  signature: only two arrivals and zero router hot-cache dispatches. Until HIP
-  multi-stream graph replay is fixed and covered by parity/perf tests, ROCm
-  uses the stage-stream fallback for correctness and records the path in
-  `device_rebalance_transfer_stream_path`.
-  `LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH=1` is the production
-  histogram transport requirement: counters move on the async rolling-wave
-  maintenance lane, and host publish/apply fallback is refused.
-- Fixed-size expert payload arenas are now refused, not treated as a diagnostic
-  escape hatch. Perfstats showed the old collective payload path moving hundreds
-  of MiB of gathered arena capacity for only a few MiB of useful arrivals in a
-  512-token CUDA2 run. `LLAMINAR_MOE_DEVICE_REBALANCE_PAYLOAD_SIDEBAND=1` and
-  `LLAMINAR_MOE_ALLOW_LEGACY_COLLECTIVE_REBALANCE_TRANSFER=1` therefore fail
-  closed in graph-side rebalance; the compact lane enumerates real arrivals and
-  moves only the configured rolling payload slots, not sparse empty command
-  entries.
-- Homogeneous backend `sendrecvMulti()` is no longer a dead-end TODO. CUDA/NCCL
-  and ROCm/RCCL both translate typed counts to byte-exact transfers and delegate
-  to the grouped coordinator copy path. Non-zero same-GPU requests fail instead
-  of being treated as a pretend no-op. This is an enabling primitive for the
-  compact non-empty arrival lane; it does not re-enable the fixed arena.
-- The remaining source-visible sideband/legacy payload helpers are obsolete
-  implementation scaffolding. They must not be selected by the production graph
-  transfer selector, and any future payload mode must prove through perfstats
-  that transferred payload bytes are bounded by real arrival slots plus bucket
-  slack, not by sparse command-buffer capacity.
-- The maintenance graph hook is now the preferred place for histogram movement:
-  `LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_GRAPH=1` collects histogram state
-  asynchronously instead of sideband-gathering it on every decode token.
-  Resident-only planning now uses the same route-boundary ready-wave publish
-  path as payload-capable transfers. Wave-scoped histogram packing is now the
-  default shape for layer-wave mode; the remaining blocker before enabling this
-  path by default is the steady-state device gate and policy/perf tuning, not
-  the runtime-table race.
-- Resident-only maintenance is a no-op for the current `static-by-id`
-  apportioned-expert overlay when no experts are already resident on multiple
-  participants. Perfstats now makes that visible: zero selected replicas, zero
-  planned arrivals, and zero applied windows. This mode should either be skipped
-  or fail closed for hot-replica proof runs unless a true resident-replica pool
-  exists.
-- `--moe-hot-expert-cache off` no longer disables the device-side controller
-  for homogeneous GPU `DYNAMIC` domains. It now selects explicit
-  `ResidentOnly` transfer mode, skips transfer-slot allocation, and refuses the
-  old host publish/apply fallback. This fixes the previous dynamic/no-hot
-  warmup failure where `RankOrchestrator` tried to prepare a full host-side
-  LocalTP mask transfer and exhausted the GPU-direct staging pool. True
-  replicas-off ownership migration is still a missing first-class device op; it
-  should be added as an explicit ownership/apportioned-expert move command
-  rather than encoded as a hot-replica side effect.
-- Missing-arrival planning now ranks transfer candidates by projected
-  load-spread improvement instead of raw route count. Already-resident/free
-  candidates keep count-based value, while missing-arrival transfers must pass
-  the absolute/relative spread-improvement floor before they can win a transfer
-  slot. CUDA, ROCm, and the CPU mirror share the same
-  `candidateValueIsBetter()` and `evaluateAddingResidentLoadSpread()` helpers.
-  Regression coverage pins the case where a hotter expert is correctly rejected
-  in favor of a lower-count expert that reduces participant load spread more.
-- Decode routing now emits hot-cache dispatch-balance counters:
-  `device_rebalance_router_hot_cache_eligible_dispatches`,
-  `device_rebalance_router_hot_cache_used_dispatches`,
-  `device_rebalance_router_hot_cache_improved_dispatches`,
-  `device_rebalance_router_hot_cache_default_load_spread_total`,
-  `device_rebalance_router_hot_cache_actual_load_spread_total`, and
-  `device_rebalance_router_hot_cache_load_spread_improvement_total`. These
-  prove whether the router saw replicated resident experts, used a non-owner
-  replica, and reduced participant load spread versus default owner dispatch.
-- The router hot-cache counters are gated by the active placement bank's
-  multi-resident expert count (`DeviceMoEPlacementBank::reserved[0]`). Static
-  apportioned-expert decode has zero multi-resident experts, so it must not pay
-  the extra default-vs-actual dispatch walk. Device-side bank flips recompute
-  this count before publishing the inactive bank.
-- CUDA and ROCm decode routing use the same two-phase publish rule: first
-  record the hot-cache benefit against the pre-token runtime state and choose
-  every local top-k slot, then update `decode_histogram` and
-  `decode_local_histogram`. This fixed an order-dependent bug where an earlier
-  selected expert in the same token could perturb a later expert's replica
-  choice and make the hot-cache counter disagree with actual dispatch.
-- CUDA and ROCm now resolve hot-cache local-compute flags and dispatch-balance
-  counters in one fused top-k pass. The previous CUDA path walked selected
-  experts once for balance accounting and again for local-compute publication.
-  Layers with zero multi-resident experts also return through a no-replica fast
-  path before load simulation, so static apportioned-expert layers do not pay
-  hot-cache routing overhead.
-- Ready-wave apply is currently piggybacked on decode routing only at the
-  last-local-layer routed-expert boundary. The first per-layer piggyback
-  experiment was functionally correct but paid a poll in every routed layer
-  (`~91,970` decode apply polls per device on a CUDA2 512-token probe). Boundary
-  piggyback drops that to `~2,309` polls per device and keeps the host out of
-  publish/apply. The route kernels must not add an unconditional block barrier
-  after the ready-wave poll; the normal top-k reduction already provides the
-  required ordering before thread 0 publishes runtime top-k state.
-- Decode apply-poll accounting is now gated by
-  `DeviceMoERebalanceFlags::CollectLoadStats`. Clean runs do not pay a global
-  instrumentation write on every boundary poll; PerfStats and the explicit
-  load-stats debug env still collect the counter when diagnostics need it.
-- CUDA decode-runtime routing now matches ROCm's structural top-k shape for
-  Qwen-sized expert counts: after softmax, a block-wide argmax helper selects
-  top-k experts and only the final runtime-table publication remains on thread
-  0. This removed the old `top_k * num_experts` serial thread-0 walk from the
-  hot-cache route/apply path.
-- The NCCL/RCCL coordinator sideband path is structurally symmetric: both
-  backends issue the anchor allreduce and sideband collectives inside a grouped
-  operation on explicit streams. The current CUDA/ROCm economics gap does not
-  look like a CUDA-only extra collective.
-- CUDA and ROCm decode routing now both have cached Q8 router-gate paths for
-  FP32 gates, and CUDA reuses the router's Q8 hidden vector for the following
-  grouped gate/up decode path just like ROCm. Once Q8 routing is enabled for a
-  FP32 decode router, it is mandatory: unsupported alignment, cache miss during
-  graph capture, hidden scratch failure, conversion failure, allocation failure,
-  or logits-kernel failure returns an error instead of silently falling through
-  to K-part, FP16, FP32, or CPU paths. Focused CUDA/ROCm regressions assert the
-  successful Q8 route, the capture-time cache-miss hard failure, and the
-  unsupported-shape hard failure. With the router-cache asymmetry closed,
-  the leading remaining CUDA economics suspect is collective payload/cadence
-  cost versus the useful hot-cache imbalance improvement.
-- CUDA Q8 router-gate cache identity now includes the source host storage
-  pointer in addition to tensor/device pointer and shape. A full-suite
-  regression showed short-lived test/request tensors can recycle both C++
-  object addresses and CUDA device pointers, causing a stale Q8 gate cache hit
-  that masks the intended graph-capture cache-miss hard failure. Persistent
-  model tensors still get the cache win, but recycled storage is pruned instead
-  of silently reusing old router weights.
-- ROCm Q8/INT8 prefill now follows the same fail-fast rule: a selected wide-tile
-  or grid-kpar launch failure returns an error instead of cascading to another
-  prefill kernel family, startup H2D upload requires an explicit async stream,
-  and pinned staging allocation failure refuses pageable-host fallback. Native
-  packed upload failures and selected native-VNNI+bias launch failures are also
-  terminal; they no longer publish partial state or fall through to an alternate
-  INT8 GEMM route. A CPU-only source regression guards these contracts.
-- The CUDA prefill router instrumentation was mislabeled as a cuBLAS path even
-  though the active implementation is the native tiled router. The dead
-  `routeLogitsCuBLAS()` bridge and handle were removed, and the perf counter/test
-  names now report `cuda_moe_router_tiled_prefill_calls`.
-- Current-wave perfstats export must not leak unsigned sentinels. The internal
-  "no matched wave" state is exported as
-  `device_rebalance_transfer_current_wave_matched=0` with index 0, not as
-  `UINT32_MAX`, so policy dashboards can safely aggregate participant metrics.
+## LLEP Algorithm Target
 
-In transfer-capable mode, graph construction attaches a graph-owned
-`DeviceMoETransferSlotDirectory` to `MoEDeviceRebalanceStage` for homogeneous
-GPU LocalTP decode. The directory contains generic preallocated NativeVNNI
-transfer slots; the device copy kernel binds a slot to the planned
-`layer/expert` only after a successful copy. The resident-only diagnostic mode
-does not allocate payload transfer slots.
+LLEP is a routed-row assignment strategy, not a hot-cache policy.
 
-## Latest Measurements
+1. Gather current MoE layer global expert row counts for the active batch.
+   Prefill should reuse grouped-prefill routing/sort scratch. Batched decode
+   should use the effective request batch rows.
+2. If imbalance is below `lambda`, use standard `ApportionedExperts`.
+3. Run shared LLA/LLAS logic over measured expert loads. Llaminar must use the
+   runtime owner map, not a contiguous `expert / experts_per_device` assumption,
+   because Dynamic may make ownership non-contiguous.
+4. Emit assignment spans:
+   `(layer, expert, owner_participant, destination_participant,
+   route_row_begin, route_row_end, needs_foreign_weight)`.
+5. Transfer only required token rows, route weights, and foreign expert payloads.
+   Compute native plus foreign chunks, reverse-combine outputs to original route
+   rows, and preserve exact top-k semantics.
 
-Unless otherwise noted, rows are Qwen3.6 35B MoE, phase-split dense TP/AE,
-captured NCCL/RCCL collectives, one 2-card LocalTP expert domain:
+Shared policy code should live outside CUDA/ROCm-specific files. The current
+direction is `LeastLoadedExpertAssignment.h` plus a common routed-assignment
+dispatch surface, with CUDA, ROCm, and CPU tests sharing semantics.
 
-| Mode | Decode tok/s | Notes |
-| --- | ---: | --- |
-| ROCm dynamic-hot10 shared-communicator guard | 64.70 | ROCm2, ctx 2048, 512 decode tokens, clean run after synchronizing same-communicator maintenance collectives. This fixes the previous ROCm dynamic hang/near-hang at the first maintenance boundary. Same-build static was 63.23 tok/s, so ROCm dynamic is now functional and slightly speed-positive in this sample. |
-| CUDA dynamic-hot10 shared-communicator guard | 120.63 | CUDA2, ctx 2048, 512 decode tokens, clean smoke after the same guard. CUDA remains in the recovered ~120 tok/s dynamic regime, so the ordering guard did not reintroduce the earlier CUDA dynamic regression. |
-| Dynamic no-hot resident-only fix | 117.65 | CUDA2, ctx 2048, 512 decode tokens, one measured script run. Confirms `dynamic` with `--moe-hot-expert-cache off` no longer falls into the host LocalTP staging path or fails warmup. This is graph-owned/no-transfer resident-only behavior, not yet true ownership migration. |
-| Root-only planning static/dynamic | 121.95 / 120.38 | Clean CUDA2 pair after non-root participants stopped running discarded root-domain candidate search. Static remains recovered; dynamic still trailed by about 1.6 tok/s. |
-| Payload-slot-aware ranking | 120.80 clean dynamic | Candidate ranking now refuses transfer-backed candidates when the destination compact payload lane is full. Perfstats confirmed `device_rebalance_plan_overflow=0` and `device_rebalance_payload_bucket_overflow=0` across exported windows, while useful one-slot arrivals still applied. |
-| Compact payload slots=2 | 120.13 clean dynamic | Doubling the captured compact payload lane was worse for the current sparse-benefit policy. One slot remains the default until a real bucket scheduler can choose larger lanes only when queued value justifies them. |
-| Maintenance min period=128 | 118.73 clean dynamic | More frequent maintenance was clearly worse even after payload-slot-aware ranking. This originally motivated a 256-token floor; later CUDA2/ROCm2 clean probes moved the default to delayed `321/512`. |
-| Load-spread floor=64 | 120.32 clean dynamic | Stricter absolute load-spread gating was worse than the default floor of 32. The marginal moves still help enough that removing them loses speed. |
-| Dynamic without hot cache | 120.11 clean dynamic | Hot replicas are useful: disabling the hot cache is slower than dynamic-hot10, so the remaining gap is not caused solely by hot-cache dispatch overhead. |
-| Observe mode control | 97.68 clean observe | Not a valid overhead control yet. Observe currently falls back to the older host/controller path because graph-side device rebalance is gated on `DYNAMIC`; this should become a graph-side observe/no-mutate mode before using it in perf conclusions. |
-| Compact payload cap=1 static | 121.43 | Current clean CUDA2 static after compact payload cap and no-op wave clearing groundwork. |
-| Compact payload cap=1 dynamic hot10 | 119.65 | Current clean CUDA2 dynamic-hot10 sample. Static speed is recovered, but dynamic remains about 1.8 tok/s below same-run static. |
-| Compact payload cap=1 perfstats dynamic | 118.00 under perfstats | Confirmed `device_rebalance_transfer_payload_slot_capacity=1`, local capacity 2.88 MiB, gathered capacity 5.77 MiB, and nonzero router hot-cache balancing. Remaining wasted payload capacity is the fixed captured collective tax plus true bucket slack. |
-| Current-wave accounting perfstats dynamic | 117.50 under perfstats | Diagnostic-only rerun after no-op wave clearing and current-replay accounting. Skipped/reset exports on both CUDA cards now report `device_rebalance_transfer_current_copied_arrivals=0` and `device_rebalance_transfer_useful_payload_bytes=0` even when lifetime wave totals remain nonzero. |
-| Default slack=1 static/dynamic | 121.13 / 120.54 | Clean CUDA2 paired run after making one-token maintenance slack the default. The slack removes 2047/2048 underfilled maintenance windows seen at zero slack and recovers the dynamic path to within 0.59 tok/s of same-run static, but dynamic is not speed-positive yet. |
-| Maintenance GPU elapsed instrumentation | 118.13 under perfstats | Four-node maintenance graph with backend timing events measured host launch envelope at ~0.19 ms/launch/card, direct graph launch at ~0.034 ms/launch/card, and captured maintenance graph device work at ~1.37-4.70 ms/launch/card. The remaining overhead is device graph work and policy value, not host enqueue time. |
-| Rejected three-node maintenance graph | 120.16 clean dynamic | Earlier experiment removing only `moe_device_rebalance_maintenance_apply_drain` kept focused CUDA/ROCm MoE tests green and improved diagnostic perfstats to 118.71 tok/s, but clean CUDA2 dynamic regressed versus the then-current 120.54 default while static remained 121.21. The later route-boundary design removed both maintenance apply/drain nodes and superseded this row. |
-| Rejected apply miss fast path | 120.24 clean dynamic | Moving full-block apply scratch initialization behind the ready-wave miss check kept focused CUDA/ROCm MoE tests green, but did not improve wall-clock dynamic decode and worsened sampled maintenance GPU elapsed from ~3.02 ms to ~3.91 ms average. Reverted the experiment and kept the full-block parallel apply guard only. |
-| Per-layer route piggyback | 114.35 under perfstats | Functionally correct but too expensive. It applied ready waves inside every routed layer's top-k kernel and produced ~91,970 decode apply polls per device over the CUDA2 512-token diagnostic run. Rejected in favor of boundary-scoped piggyback. |
-| Boundary route piggyback | 115.20 under perfstats / 116.24 clean | Current host-free apply shape before redundant barrier removal. It polls once at the last local routed-expert boundary with `target_layer=-1`, reducing polls to ~2,309 per device. Clean throughput is still below the no-poll dynamic baseline, so the route-kernel no-op path remains the active optimization target. |
-| Boundary route piggyback, no redundant barrier | 120.95 / 120.31 static/dynamic | Correct phase-split dense policy run after removing the unconditional post-piggyback block barrier from CUDA/ROCm route kernels. This recovered the route-piggyback regression and left dynamic_hot10 about 0.64 tok/s behind same-run static. |
-| Two-node maintenance graph | 121.36 / 120.53 static/dynamic | Removed maintenance apply/drain because route-boundary apply is now the only runtime-table publisher. Perfstats confirmed captured maintenance graph `stage_count=2`; diagnostic throughput improved, but measured maintenance GPU elapsed remained ~10-12 ms over three 512-token measured iterations, so collect/plan/copy and payload lane cost dominate. |
-| Dynamic no-hot, two-node maintenance | 121.33 | With `--moe-hot-expert-cache off`, dynamic resident-only mode is effectively static-speed on the same tree. This confirms the remaining hot10 gap is transfer/payload-policy cost, not generic device-side controller overhead. |
-| Early first maintenance at 65 tokens | 120.26 | New opt-in scheduler knob `LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=65` tested the "move once early, then sparse" idea. It was slower than the default two-node hot10 run, so the knob remains default-off. |
-| ROCm2 default dynamic rerun | 65.59 under perfstats | Current ROCm dynamic path is no longer a no-op: planned/applied arrivals 5, router hot-cache used/improved dispatches 37, and decode matched the 65.49 tok/s static reference within noise. Maintenance GPU elapsed remains high at ~39.0 ms, so ROCm's next gap is transfer/capture overhead rather than router invisibility. |
-| Rejected ROCm auxiliary transfer-stream capture | 64.50 under perfstats | Forcing ROCm to use the CUDA-style auxiliary transfer stream during captured maintenance replay completed but reproduced the bad signature: planned/applied arrivals 2 and router hot-cache used/improved dispatches 0. The ROCm stage-stream fallback stays until HIP multi-stream graph replay is made functionally equivalent. |
-| Shared delayed maintenance 321/512 | CUDA 119.97, ROCm 65.01 clean dynamic | New default cadence. ROCm clean default dynamic was 64.24 tok/s versus 64.91 tok/s static; delaying the first replay to token 321 and using a 512-token floor recovered ROCm to static-speed while the same clean CUDA2 schedule held near the current dynamic target. |
-| Long generation 1024, ctx 4096 | CUDA static/dynamic 121.76 / 118.76; ROCm static/dynamic 61.73 / 65.34 | Clean one-rep amortization probe. ROCm dynamic-hot10 is speed-positive by +3.61 tok/s (+5.85%) and has better p50/p90 than static, so ROCm is considered healthy for now. CUDA remains negative by -3.00 tok/s (-2.47%), so CUDA economics are the active tuning target. |
-| Long generation 2048, ctx 4096 | CUDA static/dynamic 119.36 / 117.35 | Clean one-rep CUDA-only useful rows from the interrupted all-backend matrix. Longer amortization narrows but does not close the gap: dynamic-hot10 remains -2.01 tok/s (-1.68%) behind static. The remaining problem is not short-run startup noise; CUDA still needs a better value/cost gate. |
-| CUDA 1024 dynamic hot10, block-parallel decode top-k | 123.14 | Clean CUDA2 ctx 4096, 1024 decode tokens after replacing the serial decode-runtime top-k walk with a block-wide helper. Prefill 2983.97 tok/s, decode 8316.06 ms, p50 7.842 ms, p90 8.473 ms. This beats the earlier 121.76 static reference by +1.37 tok/s (+1.13%) and the poll-gated dynamic run at 120.05 by +3.09 tok/s. Repeat/2048 confirmation and perfstats are still needed before calling policy tuning done. |
-| CUDA 1024 dynamic hot10, poll counter gated | 120.05 | First clean CUDA2 ctx 4096, 1024-token run after gating `decode_apply_polls` behind load-stat collection. This recovered the route-boundary instrumentation tax but was measured before the final ready-mask revert cleanup. |
-| Rejected ready-wave mask shortcut | 92.29 | Attempted to skip ready-wave scans with a device-maintained `ready_wave_mask`. Focused tests passed, but clean CUDA2 dynamic collapsed to 92.29 tok/s; an incomplete revert with leftover fences still measured only 97.44 tok/s. The mask, helper kernels, and extra ready-state fences were fully removed. |
-| CUDA 1024 clean paired static/dynamic after block top-k | 124.99 / 124.50 | Final clean CUDA2 ctx 4096, 1024-token pair after the ready-mask experiment was fully backed out, the poll counter gate remained, and CUDA decode-runtime top-k became block-parallel. Static reps: 125.018 and 124.960 tok/s. Dynamic-hot10 clean rerun: 124.496 tok/s. Dynamic is now only about -0.49 tok/s (-0.39%) behind paired static, so plumbing overhead is near noise; CUDA still needs policy economics to turn positive. |
-| CUDA 1024 economics perfstats after block top-k | 124.00 under perfstats | Diagnostic run with load stats enabled. The controller is doing real useful work: root planned 12 arrivals, copied 11 total current arrivals on CUDA:0 and 1 on CUDA:1, applied 17/7 arrivals, and hot-cache routing improved 203 of 326 eligible dispatches. The economics are still poor: ~8.65 MiB useful payload versus ~34.6 MiB gathered payload capacity across six exports, plus ~24.7 ms / ~18.9 ms maintenance-graph GPU elapsed on CUDA:0/CUDA:1. |
-| CUDA 1024 phase-split load-spread floor sweep | default32 124.58; floor48 124.44; floor64 124.91; floor72 124.10; floor96 124.19 | Corrected CUDA2 ctx 4096, 1024-token dynamic-hot10 sweep with `phase-split-hybrid-tp-ae`. A prior quick sweep without the phase-split dense policy was discarded as a configuration mismatch. Floor 64 was the best sampled value and became the `DebugEnv.h` default. |
-| CUDA 1024 floor64 default paired static/dynamic | 125.74 / 125.37 | Clean CUDA2 ctx 4096, 1024-token pair after rebuilding Release with floor 64 as the default. Dynamic-hot10 is now only -0.37 tok/s (-0.30%) behind same-run static, so the default gate recovers near-static CUDA behavior without an env override, but it still does not produce a positive CUDA payoff. |
-| CUDA 1024 floor64 default perfstats | 123.87 under perfstats | Diagnostic CUDA2 ctx 4096, 1024-token dynamic-hot10 run with phase-split dense policy. Across the three measured benchmark iterations, request-reset exports showed 7 planned arrivals, 5 selected replicas, and 694 accepted spread-improvement units. Router hot-cache dispatch is real: 203 used/improved dispatches out of 412 eligible, reducing default spread 606 to actual spread 200. The cost side is still poor: only 4.33 MiB useful payload moved against 34.61 MiB combined gathered payload capacity, with maintenance graph GPU elapsed totaling ~20.4 ms on CUDA:0 and ~16.7 ms on CUDA:1 over six measured maintenance replays. This points at payload/cadence economics, not a router no-op. |
-| CUDA 1024 floor64 first-wave-only probe | 125.51 clean dynamic | Clean CUDA2 ctx 4096, 1024-token dynamic-hot10 with `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS=2048`, so the default first replay at token 321 remains but later 1024-token replays are suppressed. This improves over default dynamic 125.37 but is still slightly below same-run static 125.74. Late-wave suppression is a promising CUDA economics signal, but not enough to change the shared default without ROCm and longer-generation checks. |
-| Current-tree CUDA 2048 refresh attempt | invalid | A paired static/dynamic CUDA2 ctx 4096, 2048-token refresh was attempted after the floor-64 default change, but both legs failed VRAM preflight while another CUDA benchmark process held ~14 GiB on each 3090. This is an environment/resource contention failure, not a throughput datapoint; rerun once the CUDA cards are clear. |
-| CUDA 2048 floor64 current-tree check | static 125.34; dynamic 124.85 | Clean CUDA2 ctx 4096, 2048-token refresh after the floor-64 default change. The first static leg in the paired run measured an anomalous 101.50 tok/s, but an immediate same-config static repeat measured 125.34 tok/s, so the 101.50 sample is rejected as an outlier. Against the valid repeat static, dynamic-hot10 remains slightly negative at -0.49 tok/s (-0.39%). Longer generation does not by itself make CUDA speed-positive. |
-| CUDA 1024 transfer-backed lifecycle fix | static 125.98; dynamic 125.17 | Clean CUDA2 ctx 4096, 1024-token pair after making transfer-backed controller waves stay in `Planning` until payload-copy completion. This is the correct async state machine, but it is not a speed win by itself: dynamic-hot10 is -0.81 tok/s (-0.64%) behind same-run static. The next CUDA work remains economics, not ROCm health or basic lifecycle correctness. |
-| CUDA 1024 lifecycle no-maintenance controls | first-wave-only 125.64; no-maintenance hot10 125.95; floor128 125.62 | Clean CUDA2 ctx 4096 controls against the same 125.98 static reference. Disabling scheduled maintenance while leaving the hot10 route path active is effectively static-speed, so the current CUDA gap is maintenance/payload economics rather than generic hot-cache route bloat. First-wave-only helps but remains slightly negative; candidate-level floor128 is not enough. |
-| CUDA 1024 wave ROI gate 192 | static 126.03; dynamic 125.01 | Clean CUDA2 ctx 4096 pair after adding the shared `min_wave_spread_improvement_per_payload_slot` gate. The gate is functionally wired, but 192 units per payload slot still accepts enough transfer work to remain -1.02 tok/s (-0.81%) behind same-run static. |
-| CUDA 1024 wave ROI gate 256 | 124.96 clean dynamic; 124.11 under perfstats | Raising the gate to 256 did not recover speed. Perfstats showed the gate fired (`skipped_wave_cost_floor=3`) but still accepted 2 arrivals, moved 2.88 MiB useful payload, selected a 5.77 MiB gathered payload bucket, and spent ~25.1 ms of maintenance-graph GPU time. Scalar gating reduced work but did not change the fixed captured payload-lane cost enough. |
-| CUDA 1024 wave ROI gate 1024 | 125.07 clean dynamic; 124.40 under perfstats | High-floor diagnostic forced zero selected replicas, zero planned arrivals, zero copied/applied arrivals, and zero useful payload. It still reported ~34.6 MiB of wasted gathered payload capacity and ~16.3 ms of maintenance-graph GPU elapsed across measured replays. This proves a zero-arrival maintenance replay still executes the captured payload lane; the next CUDA economics fix must split/skip/bucket the payload graph body, not keep tuning scalar policy thresholds. |
-| CUDA 1024 compact dense outgoing payload slots | static 126.16; dynamic 125.31; dynamic perfstats 124.48 | Plan entries now separate receiver `destination_slot` from sender `payload_slot`, and compact payload allgather uses dense `[source_participant][payload_slot]` layout instead of `[source][destination][slot]`. Focused CUDA/ROCm tests pass. Selected payload economics improved to 7.21 MiB useful against 14.42 MiB selected gathered capacity, exactly 50% utilization for a two-card allgather. Total captured gathered capacity still sums to 34.61 MiB because no-work maintenance graph replays execute the fixed payload bucket; the next CUDA fix needs a graph-capturable conditional/bucketed payload body, not another scalar policy threshold. |
-| Split plan/payload maintenance graphs | static 125.69; dynamic 126.29 | CUDA2 ctx 4096, 1024-token clean pair after Release rebuild. Maintenance now captures a plan graph and a payload graph separately. DGO enqueues the payload graph only when the completed plan reports `payload_bucket_slots > 0`; no-work/rejected waves stay on the plan graph and skip the fixed payload bucket. A refreshed 512-token perfstats run showed six plan launches and zero payload launches; the terminal plan selected one real payload bucket too late to launch before generation end, while subsequent no-work exports reported selected payload slots and wasted selected-payload bytes at zero. Telemetry now charges wasted payload capacity and bytes-per-benefit to selected buckets, not to skipped payload graph capacity. |
-| Forced no-work payload-skip probe | 123.79 under perfstats | CUDA2 ctx 2048, 512-token dynamic-hot10 with `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=1000000` forwarded through the sprint wrapper. Perfstats reported six maintenance launches, all `maintenance_graph_kind=plan`, zero payload-kind rows, zero planned arrivals/selected replicas, zero selected payload bucket slots, zero selected gathered payload bytes, zero useful payload bytes, and zero wasted payload capacity. Plan-only maintenance GPU elapsed totaled ~3.80 ms across both cards, so the fixed payload bucket no longer runs on no-work waves. |
-| CUDA 1024 dynamic no-hot | 121.37 | Clean run with `--moe-hot-expert-cache off`. This is effectively static-speed against the 121.76 static reference, so the generic device-side controller and dynamic resident-only plumbing are not the current CUDA bottleneck. |
-| CUDA 1024 dynamic hot10, min period 1024 | 119.45 | Sparse maintenance cadence improves over the default 118.76 dynamic-hot10 run, but remains well short of static. The policy cannot recover CUDA just by running maintenance less often. |
-| CUDA 1024 hot10, maintenance disabled | 118.60 | Clean run with the first/min maintenance periods pushed out past the generation. Enabling hot10 still selects the heavier transfer-slot/route-apply decode path even when no maintenance wave can arrive, so the CUDA gap is partly structural in the hot-cache route path, not only transfer work. |
-| Rejected noinline ready-wave helper | 118.10 | Marking the route-boundary ready-wave apply helper noinline made the no-maintenance hot10 CUDA run worse. Reverted; the fix should split or gate the route/apply shape structurally instead of hiding the helper from the compiler. |
-| Rejected split Apply graph stage | 117.52 | Added a backend-neutral A/B knob that kept routing on the plain top-k path and inserted the existing graph-captured `Apply` stage before routing. It was worse than same-tree route piggyback at 119.10 tok/s, so the knob was removed. A separate per-token apply launch costs more than the fused route/apply bloat on CUDA. |
-| Static after static-path gates | 121.50-121.59 | Recovered the previous 121 tok/s CUDA2 baseline. Clean no-env run decoded at 121.591 tok/s; same run with graph-controller env knobs decoded at 121.497 tok/s. |
-| CUDA 1024 prefill graph capture verified | static 125.97; dynamic 125.72 | Current-tree clean CUDA2 ctx 4096 pair after split plan/payload maintenance. Both cases required and used prefill graph capture (`captured_or_replayed=true`, two entries, four captures, ten/twelve replays). Dynamic was still slightly negative before the decode-route cleanup. |
-| CUDA 1024 fused hot-cache resolver | static 125.97; dynamic 125.72 -> gap nearly closed | CUDA/ROCm routing now chooses local-compute flags and records hot-cache balance in one pass instead of duplicate top-k walks. The same-tree CUDA dynamic gap shrank from roughly -1.4 tok/s in the earlier clean pair to about -0.25 tok/s. A router-benefit floor probe at 256 was rejected because dynamic fell to 125.24 tok/s. |
-| CUDA 1024 no-replica resolver fast path | static 127.33; dynamic 127.64 | Clean CUDA2 ctx 4096 pair after adding a backend-symmetric fast path for placement banks with zero multi-resident experts. Prefill graph capture remained active in both legs. Dynamic-hot10 is now speed-positive by +0.31 tok/s (+0.24%) over same-run static; p50 decode improved from 7.797 ms to 7.576 ms, while p90 was 8.183/8.313 ms. |
-| CUDA 1024 fast-path perfstats | 125.40 under perfstats | Diagnostic CUDA2 dynamic-hot10 after the fast path. Router work remains real: 238 eligible dispatches, 178 used/improved dispatches, and 356 spread-improvement units. Policy accepted 1,924 spread-delta units. Payload economics are still the next structural target: 11.54 MiB useful payload versus 46.15 MiB selected gathered capacity across measured exports, with the remaining 2-card allgather empty-slot tax visible as wasted capacity. |
-| CUDA 1024 header-clear/projection fix | static 124.44; dynamic 125.05 | Clean CUDA2 ctx 4096 pair after restoring domain-symmetric root-header projection and clearing applied command headers on device. Prefill graph capture was required and active. Dynamic-hot10 was speed-positive by +0.61 tok/s (+0.49%) over same-run static; p50/p90 decode improved from 7.991/8.140 ms to 7.804/8.053 ms. |
-| CUDA 1024 useful-payload accounting repair | 124.63 dynamic under perfstats | Diagnostic rerun after export matching switched from live command headers to persistent wave epoch/state, so applied waves still price useful bytes after command headers are cleared. Useful payload is nonzero again: four copied one-slot payload rows, 5.77 MiB useful payload total. This fixes the perfstats readout only; device execution had already applied the waves. |
-| ROCm 1024 no-replica resolver fast path | static 63.14; dynamic 66.15 | Clean ROCm2 ctx 4096 pair on the same backend-symmetric resolver fast path. Prefill graph capture remained active in both legs. Dynamic-hot10 is speed-positive by +3.01 tok/s (+4.76%), with p50/p90 decode improving from 15.344/16.624 ms to 14.800/15.199 ms. |
-| Dynamic hot10 after static-path gates | 120.74 | Clean CUDA2 dynamic-hot10 run with graph-controller and maintenance-graph env knobs, no perfstats. This recovers past the 119.5 tok/s pre-regression target and leaves about 0.8 tok/s overhead versus same-tree static. |
-| Static | 120.65-120.67 | Same-build clean baseline. |
-| Graph maintenance, resident-only | 120.22 | Near-static but no real rebalance: selected/planned/applied all zero. |
-| Graph maintenance + collective payload transfer, window 64 | 119.80 | Real actions occurred, but not enough to pay for maintenance/transfer cost. Perfstats: CUDA0/CUDA1 windows applied 9/5, copied arrivals 6/3, selected replicas 1/0, skipped-no-improvement 3324/3437. |
-| Accept-gate value counters, hotness-first ranker | 118.94 | Same current tree after adding selected-candidate value counters. Static same-run was 121.13. Perfstats run decoded at 115.89 with CUDA0/CUDA1 planned arrivals 12/8, accepted spread improvement 1252/842 routed-token units, selected replicas 2/1, and below-floor selected candidates 3366/3464. |
-| Benefit-ranked transfers, floor 128 | 120.50 | Current best action-producing CUDA2 sample after ranking missing-arrival transfers by projected spread improvement. Perfstats diagnostic: planned arrivals 5/2, no overflows, accepted spread improvement 658/160, router hot-cache used 72/1 dispatches and improved all 73 used dispatches. |
-| Benefit-ranked transfers, floor 256 | 119.75 | Stricter gate was worse in the single clean sample after benefit ranking, so the default remains 128. |
-| Same transfer path, threshold zero | 115.04 under perfstats | More actions but much worse overhead; loosening the gate is not sufficient. |
-| Same transfer path, window 16 | 115.39 clean | Higher maintenance cadence overwhelms any earlier benefit. |
-| 128-token CUDA2 diagnostic, window 64 | 114.13 | Added readiness counters. The skipped middle launch was histogram cadence, not a busy wave: 407 observed slots versus 512 required. Maintenance host window was about 0.44 ms total per device over 3 launches; direct graph replay about 0.10 ms total. |
-| 128-token CUDA2 diagnostic, window 64 + 16 slack | 111.11 | Slack removed histogram-not-ready launches and all observed windows exceeded 512 slots, but short-run decode was worse. Slack remains an opt-in diagnostic knob, default off. |
-| 128-token CUDA2 block-parallel apply probe, floor 128 | 111.00 | After changing CUDA/ROCm ready-wave apply to a full-block kernel. Perfstats run selected/planned/applied zero arrivals, so this validates the no-action maintenance path but not transfer benefit. |
-| 128-token CUDA2 block-parallel apply probe, threshold zero | 109.57 | Action-forcing diagnostic only. Planned arrivals summed to 3 and wave-applied arrivals summed to 3, proving the block-parallel apply path still consumes movement, but the over-eager policy remains slower. |
-| 512-token CUDA2 dynamic hot10, maintenance cadence sweep | 118.86 / 118.86 / 119.93 | Clean dynamic decode at rebalance windows 64 / 128 / 256 after block-parallel apply. Static same-tree was 121.49. This was an earlier motivation for a 256-token floor; the newer shared default is delayed `321/512`. |
+Important tunables:
 
-Interpretation: static regression recovery required three hard gates. First,
-device-side maintenance/controller hooks must require dynamic MoE rebalance in
-configuration, not merely an enabled debug/env knob. Second, router hot-cache
-balance counters must be skipped when the active bank has no multi-resident
-experts. Mechanics are close to static when they do no work, and the transfer
-path can move/apply experts. Third, decode apply-poll accounting must be
-diagnostic-only; clean runs should not pay the global counter write. CUDA's
-structural route-kernel gap was also real: ROCm already had a wave/block top-k
-decode runtime path, while CUDA still parked 255 lanes and selected top-k on
-thread 0. With CUDA block-parallel decode top-k, the poll counter gate, and the
-measured floor-64 spread-improvement default, clean paired 1024-token CUDA runs
-are now near static but still negative: 125.37 versus 125.74 tok/s before the
-transfer-backed lifecycle fix, and 125.17 versus 125.98 tok/s after the
-correctness fix. The current-tree 2048-token CUDA repeat is the same shape:
-dynamic is 124.85 tok/s against a valid 125.34 tok/s static repeat, so longer
-generation alone does not make CUDA positive. ROCm remains healthy on the
-long-generation probe and is considered done for this proof slice unless shared
-CUDA fixes need mirrored ROCm coverage. The CUDA wave-level ROI gate is now
-implemented and tested, but the latest 192/256/1024 probes show that scalar
-policy thresholds are insufficient: even a zero-arrival high-floor replay still
-pays the captured compact payload lane. The remaining CUDA target is therefore
-payload graph body economics, not more policy scalar tuning. Hot-cache transfer
-must avoid launching a payload lane when the selected moves do not justify it,
-must choose a real zero/one/two/... bucket body instead of the full captured
-slot capacity, and must apply useful arrivals early enough to amortize transfer
-cost over remaining decode tokens.
-The policy also needs a first-class graph-side observe/no-mutate mode; the
-current `observe` CLI path is a host-controller fallback and should not be used
-as the overhead-control row for this device-side sprint.
+- `lambda`: imbalance threshold for falling back to normal AE.
+- `alpha`: per-participant capacity factor.
+- `min_chunk_tokens`: minimum useful rows for a spilled expert chunk.
+- `max_foreign_experts_per_wave`: transfer-slot and VRAM guard.
+- Cost gates: foreign expert bytes, token collective bytes, grouped-GEMM
+  efficiency by row count, and maintenance graph cost.
 
-## R&D Trace Corpus And Policy Lab Plan
+## Dynamic Algorithm Target
 
-The next policy-tuning pass should stop guessing from scalar sweeps and build a
-small trace corpus that can drive offline oracle/replay experiments. The trace
-mode is intentionally diagnostic-only: production decode remains graph-owned
-and device-side, while the host copies a completed maintenance snapshot after
-the maintenance graph has already finished.
+Dynamic is the simpler whole-expert rebalance strategy and should stay useful
+even if hot-cache or LLEP are disabled.
 
-Trace collection command shape:
+Target behavior:
 
-```bash
-scripts/run_qwen36_moe_gpu_rebalance_sprint.sh \
-  --backend both \
-  --placement twocard \
-  --cases dynamic_hot10 \
-  --dense-policy phase-split-hybrid-tp-ae \
-  --context-length 4096 \
-  --n-predict-list 512,1024,2048 \
-  --seeds 101,202,303,404,505,606 \
-  --reps 1 \
-  --rebalance-trace \
-  --out benchmark_results/qwen36_moe_policy_trace_corpus_$(date +%Y%m%dT%H%M%SZ)
-```
+- Start at a 256-token decode histogram window.
+- Use an explicit window schedule. The current implementation uses adaptive
+  `1.5x` growth to a `4096` cap; a quadratic/power schedule should be added as
+  a named option if desired.
+- Use the shared Dynamic ownership-swap helper to pair a heavy expert from the
+  overloaded participant with a light expert from the underloaded participant.
+  The same helper is called by the host `SocketAwareRebalancer` and the
+  CUDA/ROCm device-side controller.
+- A future hot-set variant may select the hottest `hotset_expert_count` routed
+  experts or layer-expert items, defaulting to 20, but that should be an
+  explicit extension of Dynamic rather than a second strategy name.
+- Reassign selected non-empty experts across all domain participants with a
+  load-spread balance objective.
+- Reject moves that do not improve projected participant load enough to pay for
+  maintenance and transfer.
+- Keep ownership movement and hot-cache admission separate. Dynamic can move
+  owners, create temporary resident replicas, or do no transfer at all depending
+  on the configured execution mode.
 
-Each run writes `rebalance_trace.jsonl` beside `benchmark.json` and optional
-perfstats artifacts. One JSONL row corresponds to one completed maintenance
-export and includes:
+Public sweep knobs now exposed through CLI, YAML, and `DebugEnv`:
 
-- run metadata from `summary.tsv`: backend, placement, case, decode length,
-  seed, rep, and artifact paths.
-- graph/controller metadata: participant id/count, root, layer window/wave,
-  maintenance launch count, wave lifecycle, and status code.
-- imbalance economics: pre/post participant load vectors, pre/post spread,
-  accepted spread improvement, candidate-improvement totals/max, skipped
-  candidates, and hot-cache router eligible/used/improved dispatch counts.
-- transfer economics: copied/applied arrivals, selected payload bucket, useful
-  payload bytes, selected gathered/transport capacity, wasted capacity, and
-  payload edge mask.
-- selected command entries: `(layer, expert, source_participant,
-  destination_participant, source_resident_mask, destination_slot,
-  payload_slot)` for every command in the completed local command buffers.
+- `dynamic_imbalance_threshold_permille`
+  / `--moe-dynamic-imbalance-threshold-permille`
+  / `LLAMINAR_MOE_DYNAMIC_IMBALANCE_THRESHOLD_PERMILLE`
+- `dynamic_min_improvement_permille`
+  / `--moe-dynamic-min-improvement-permille`
+  / `LLAMINAR_MOE_DYNAMIC_MIN_IMPROVEMENT_PERMILLE`
+- `dynamic_max_swaps_per_layer`
+  / `--moe-dynamic-max-swaps-per-layer`
+  / `LLAMINAR_MOE_DYNAMIC_MAX_SWAPS_PER_LAYER`
+- `dynamic_max_plan_entries_per_wave`
+  / `--moe-dynamic-max-plan-entries-per-wave`
+  / `LLAMINAR_MOE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE`
+- `dynamic_min_window_activations`
+  / `--moe-dynamic-min-window-activations`
+  / `LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS`
 
-Corpus policy:
+Defaults live in `DeviceMoERebalancePolicyShared.h` and feed CPU, CUDA, and
+ROCm. Negative CLI/YAML values are rejected. Environment values are clamped to
+non-negative values at runtime config import.
 
-- Treat trace outputs as durable research data. Keep each corpus under a dated
-  `benchmark_results/qwen36_moe_policy_trace_corpus_*` directory and do not
-  rewrite it in place. Derived datasets and notebooks/scripts should write to a
-  separate `analysis/` subdirectory inside that corpus.
-- Use deterministic seed splits before looking at model fit quality. Proposed
-  split: train seeds `101,202,303,404`, validation seed `505`, holdout seed
-  `606`. If we add more seeds, assign by stable hash of `(backend, seed,
-  n_predict)` so CUDA and ROCm keep aligned partitions.
-- Keep all three decode lengths in every split. A policy that only works at
-  512 tokens and fails at 2048 is not a candidate; length is part of the
-  feature vector and part of the acceptance matrix.
-- Use CUDA and ROCm as both separate and joint tasks. First fit backend-local
-  cost models, then test whether a shared decision rule with backend-specific
-  coefficients is adequate. Do not bake a CUDA-only rule into the shared
-  CPU/CUDA/ROCm policy header unless ROCm holdout remains healthy.
+## Current Implementation Status
 
-Offline policy-lab tasks:
+Implemented or partially implemented:
 
-1. Build a trace loader that joins `summary.tsv`, `benchmark.json`, and
-   `rebalance_trace.jsonl` into one window-level table.
-2. Fit empirical cost models:
-   `maintenance_ms ~= f(backend, graph_kind, payload_bucket_slots,
-   payload_edge_count)` and `transfer_bytes/ms ~= f(backend, useful_payload,
-   selected_capacity, edge_count)`.
-3. Fit or simulate benefit:
-   `future_decode_benefit ~= f(pre_spread, post_spread, accepted_spread,
-   router_used/improved, remaining_tokens_after_apply, layer_wave)`.
-   Until per-token route traces exist, treat this as a conservative aggregate
-   estimate and keep uncertainty high.
-4. Implement oracle replay over fixed top-k semantics. The oracle may choose
-   whether/when to move or replicate experts, but it must not alter the router's
-   actual top-k expert choices. It can only choose the participant among
-   resident replicas to minimize load and choose new hot replicas subject to
-   transfer-slot/payload-bucket constraints.
-5. Compare policies on validation and holdout:
-   current device policy, no-maintenance hot10, first-wave-only, threshold
-   sweep, greedy ROI, min-cost-flow/ILP oracle, and any learned lightweight
-   rule. Report regret versus oracle and predicted net token-time savings.
-6. Promote only tiny deterministic rules into C++: generated thresholds or a
-   small coefficient table in the shared policy header. Runtime policy must stay
-   graph-capturable, backend-neutral, and cheap enough for device kernels.
+- GPU packed-format contract uses backend-neutral NativeVNNI descriptors for
+  same-backend arrivals.
+- Production decode has a device-side rebalance ABI with command buffers, wave
+  state, route-boundary apply, explicit streams, and graph-owned state.
+- CUDA and ROCm share the same high-level controller shape and tests for ready
+  wave apply, transfer-slot apply, and router hot-cache accounting.
+- Maintenance is split into plan and payload graph bodies so no-work waves do
+  not run the captured payload bucket.
+- Compact transfer-slot staging moves planned payload slots instead of fixed
+  plan-capacity arenas.
+- `LeastLoadedExpertAssignment` and the shared routed-assignment surface exist
+  for offline/unit validation.
+- `SocketAwareRebalancer` now delegates Dynamic ownership-swap selection to the
+  same shared helper used by CUDA and ROCm device-side planning, preserving the
+  host proposal/apply API while removing policy drift.
+- Dynamic defaults for imbalance threshold, minimum improvement, per-layer swap
+  count, command capacity, and minimum window activations are defined once in
+  the shared policy header and consumed by both CPU and device configs.
+- Dynamic policy knobs are now surfaced through runtime config, CLI, nested and
+  flat YAML, DebugEnv, explain output, CPU controller wiring, and Qwen35 MoE GPU
+  graph wiring.
+- CUDA and ROCm integration tests cover Dynamic ownership-transfer planning
+  with hot-cache disabled, including root-side deferred planning, command
+  buffers, load-spread stats, and unchanged active runtime state before apply.
+- CUDA now preserves grouped descriptor-table host metadata across workspace
+  rebinding, matching ROCm. This fixes a dynamic-path failure where the
+  singleton MoE kernel could lose CUDA shared-expert grouped decode descriptor
+  tables while stages still held cached table ids.
+- Trace tooling exports expert loads, owner maps, apply visibility, router
+  cache-use counters, payload economics, and imbalance metrics.
 
-Acceptance gate for a candidate policy:
+Still incomplete:
 
-- Correctness gates remain unchanged: 2xCUDA and 2xROCm PyTorch parity and the
-  prefix-cache/server E2E tests must pass.
-- Benchmark gate: clean, no-perfstats runs on CUDA2 and ROCm2 for 512, 1024,
-  and 2048 decode tokens, same seed matrix. Candidate must beat same-tree static
-  on median decode tok/s for both backends and must not regress p90 latency.
-- Evidence gate: policy-lab holdout must show lower predicted regret than the
-  current device policy and must explain when it declines to rebalance because
-  expected maintenance cost exceeds expected remaining-token benefit.
+- Device-side graph scheduling still needs a host bridge for launching prewarmed
+  bucket graphs on current CUDA/ROCm APIs.
+- Dynamic, LLEP, and hot-cache admission are conceptually separated in code and
+  tests. Dynamic now has an explicit sweep surface; LLEP and cache admission
+  still need the same level of public config cleanup.
+- Production LLEP assignment is not yet the default execution path for prefill
+  or batched decode.
+- Hot-cache policy economics are inconsistent. The cache is mechanically visible
+  to routing, but persistent hot10 alone is not a reliable speedup.
 
-## Target Graph Sequence
+## Current Measurements
 
-The production shape is a decode graph plus an async maintenance graph. Decode
-must not carry full histograms or fixed payload arenas as per-token sidebands.
-Maintenance must not publish runtime-table mutations that can race with the next
-decode replay; it publishes ready waves that decode applies at layer boundaries.
+Raw run trails live in `benchmark_results/` and commit messages. This document
+keeps only the current design signal:
 
-The two lanes contain the same fixed nodes for every participant:
+| Scenario | Result | Takeaway |
+| --- | --- | --- |
+| CUDA2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 122.74 vs 125.80 tok/s decode; prefill 3235.87 vs 3227.29 tok/s | Dynamic path is healthy after the CUDA descriptor rebind fix. This sample had no payload movement (`payload_bucket_slots=0`, `apply_changed_layers=0`), so it proves overhead recovery, not policy benefit. |
+| ROCm2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 66.13 vs 65.63 tok/s decode; prefill 1145.22 vs 1144.90 tok/s | ROCm stayed healthy after the shared rebind guard. This sample also had no movement, so policy tuning still needs movement-positive traces. |
+| CUDA2 1024, seed 303, recent clean static vs dynamic-hot10 | 126.83 vs 124.81 tok/s | Router/cache mechanics work, but hot10 maintenance was net negative in this run. |
+| CUDA2 Dynamic knob sweep, seed 303, 1024/2048, 1 measured iter, perfstats on, `benchmark_results/qwen36_moe_cuda_dynamic_knob_sweep_seed303_20260630_210138/` | 1024: static 123.87, no-op Dynamic 123.49, default Dynamic 123.77, threshold1100 125.53, threshold1100+min0 123.77, aggressive 123.70 tok/s. 2048: static 124.98, no-op 125.21, default 124.68, threshold1100 124.14, threshold1100+min0 124.82, aggressive 124.23 tok/s. | No-op controller overhead was small in this run (`~4 ms` maintenance GPU elapsed at 1024, `~8 ms` at 2048, no movement). Lowering threshold to 1100 induced payload movement and produced the only 1024 positive signal (+1.34%), but movement was neutral/negative at 2048. Generated token streams diverged before the first maintenance window, so this bounds end-to-end behavior rather than replaying identical histogram inputs. Repeat candidates with more reps and/or trace replay before treating this as a policy win. |
+| ROCm2 1024, current clean static vs dynamic-hot10 | 68.99 vs 66.56 tok/s | Persistent hot10 cache is not automatically economic. |
+| ROCm2 2048, current clean static vs dynamic-hot10 | 65.75 vs 58.97 tok/s | Longer generation did not rescue this cache policy sample. |
+| Earlier CUDA/ROCm plumbing recovery samples | static and no-work dynamic near 125-127 CUDA tok/s, dynamic sometimes positive by noise to a few percent | The remaining problem is policy economics, not basic decode plumbing. |
 
-1. A graph-captured device gate increments a device-resident decode-token
-   counter and marks a rebalance epoch eligible only on configured window
-   boundaries. On other tokens, the rest of the rebalance lane sees an inactive
-   epoch and returns quickly.
-2. Routing chooses all top-k local-compute slots from one stable pre-dispatch
-   histogram snapshot, then records the current token's per-layer expert
-   histogram into device-resident runtime state for the next eligible window.
-   The histogram update must not mutate replica-selection history between
-   top-k slots in the same token.
-3. The async maintenance graph gathers histogram state for the current rolling
-   wave on an explicit maintenance stream. Full-model histogram gather is a
-   diagnostic/legacy mode only; production layer-wave mode moves compact
-   wave-scoped rows.
-4. On the root participant, `RootPlanAssignments` consumes the gathered state,
-   computes a bounded rolling layer wave, and publishes command buffers.
-   Non-root participants run this node as a no-op or validate the received
-   epoch. A one-window delay between observation and command publication is
-   acceptable; avoiding per-token decode collective traffic is worth more than
-   immediate control-loop response.
-5. Each participant's `StageArrivals` node checks its local command-buffer epoch.
-   The steady-state target is a device gate that avoids event/transfer work when
-   no new command targets the participant. The current compact implementation
-   still pays bounded command/header/source-response metadata collectives and
-   bounded payload-lane slack, but it no longer moves a fixed full-model or sparse
-   command-capacity payload arena. `ResidentHotReplica` commands skip transfer
-   slots entirely and can publish `ReadyToApply` once the command buffer is
-   visible. Transfer-backed commands record a graph-captured event,
-   make the transfer stream wait on it, and copy packed NativeVNNI payload,
-   scales, mins, and emins from peer-resident source descriptors into local
-   transfer slots.
-6. A final transfer-stream kernel fences copied slot payloads when payloads
-   exist, then publishes the wave's `copy_complete_epoch` / `ReadyToApply` state
-   in device memory. It does not synchronize the host and does not force the
-   compute stream to wait.
-7. Decode-side apply polls the double-buffered wave state once at the
-   last-local-layer routed-expert boundary with `target_layer=-1`. This applies
-   any ready wave as a unit. A ready matching epoch either consumes copied
-   transfer slots or applies resident descriptors, writes destination-local
-   NativeVNNI descriptors into inactive placement banks, flips the runtime
-   banks, and resets histograms. A miss is a device no-op; there is no host
-   branch or per-layer poll loop.
+Interpretation:
 
-The sequence is fixed-size and graph-stable. Kernels no-op when the window is
-not ready or when no beneficial move is selected.
+- Static speed has been recovered when the rebalance path is inactive or
+  resident-only.
+- The router can see hot-cache residency and can use it without changing top-k
+  choices.
+- Current hot10 maintenance can lose despite correct mechanics, so LLEP,
+  Dynamic, and hot-cache admission should be evaluated independently.
+- A useful policy must predict payback from controller-visible features:
+  post-wave load spread, remaining tokens after apply, selected payload bucket,
+  router eligible/use rates, and expected payload bytes.
+- Fixed benchmark seed alone is not enough to guarantee identical expert
+  histogram streams across policy variants on CUDA. Clean policy A/B work needs
+  either histogram trace replay or a stronger deterministic decode harness.
 
-## Remaining Performance Work
+## Required Perf Counters
 
-- Perfstats confirmed the full-model histogram sideband is about 80 KiB local
-  per participant for Qwen3.6 (`40 layers * 256 experts * uint64`), while the
-  decode allreduce anchor can be only a single-token hidden vector. It is not
-  free decode-side traffic, so histograms belong in the async maintenance wave.
-- Rolling layer-wave mode reduces the Qwen3.6 histogram maintenance payload to
-  `layer_wave_count * 256 * sizeof(uint64_t)` per participant. With the current
-  one-layer wave, that is 2 KiB per participant instead of 80 KiB.
-- Perfstats records `moe_rebalance.device_rebalance_histogram_payload_bytes`
-  with `histogram_layer_count`, local/gathered entries, and local/gathered byte
-  tags. Rebalance tuning must use this metric to distinguish decode-side
-  sideband overhead from async maintenance-lane traffic.
-- `DeviceMoERebalanceStatus` records projected pre-policy and post-policy
-  participant load spread for the active wave:
-  `*_load_total`, `*_load_min`, `*_load_max`, and
-  `*_imbalance_numerator/denominator`. CUDA, ROCm, and the CPU mirror use the
-  shared `DeviceMoERebalancePolicyShared` projection helper so policy-quality
-  metrics do not drift across backends.
-  These fields are diagnostic: `DeviceMoERebalanceFlags::CollectLoadStats` /
-  `LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS=1` must be set to compute them.
-  The default hot path leaves them zero because the first benchmark pass showed
-  the projected spread calculation is measurable in decode throughput.
-- Completed maintenance waves now export a tiny diagnostic readback to
-  PerfStats when PerfStats is enabled: `DeviceMoERebalanceStatus`,
-  command-buffer headers, controller wave state, plan counts, and apply status.
-  This is intentionally not a normal inference dependency; it runs only after
-  the maintenance completion event is already ready and records an explicit
-  `device_rebalance_status_readback` timer for the small D2H handoff.
-- Readiness diagnostics are first-class perfstats:
-  `device_rebalance_skipped_busy_wave`,
-  `device_rebalance_skipped_histogram_not_ready`,
-  `device_rebalance_window_ready_slots`, and
-  `device_rebalance_window_required_slots`. These counters are required before
-  tuning maintenance cadence because the fix differs sharply between a busy
-  wave slot, an underfilled histogram, and a genuinely empty/no-op policy.
-- Rebalance-policy effectiveness is tracked with
-  `device_rebalance_policy_load_imbalance_ratio` (`policy_phase=pre|post`) and
-  `device_rebalance_policy_load_imbalance_delta`. A no-op policy is visible as
-  zero or unchanged pre/post imbalance plus zero
-  `device_rebalance_selected_replicas`, `device_rebalance_command_count`, and
-  `device_rebalance_apply_changed_layers`.
-- Transfer-opportunity quality is tracked with
-  `device_rebalance_candidate_arrivals_considered`,
-  `device_rebalance_candidate_arrivals_below_floor`,
-  `device_rebalance_candidate_load_spread_improvement_total/max`, and
-  `device_rebalance_accepted_load_spread_improvement_total/max`. These counters
-  now describe every missing-arrival candidate that passes the cheap count-bound
-  prefilter in the current wave. High below-floor counts mean the absolute or
-  relative floor is filtering weak transfers before they can win the command
-  slot; high accepted totals mean the selected transfers have enough projected
-  spread improvement to plausibly amortize transfer cost.
-- Router hot-cache effectiveness is tracked separately from controller
-  planning. A useful hot-cache policy should show nonzero
-  `device_rebalance_router_hot_cache_used_dispatches` and a positive
-  `device_rebalance_router_hot_cache_load_spread_improvement_total`; if
-  controller counters show arrivals/replicas but these router counters remain
-  zero, the missing piece is dispatch visibility rather than transfer mechanics.
-- Decode-runtime router stats became measurable in dynamic runs, and the first
-  structural fix was to make CUDA match ROCm's block-parallel top-k selection
-  shape. The next router-side tuning target, if needed, is the default/actual
-  participant-load walk in hot-cache balance accounting. Keep any rewrite
-  parity-gated and backend-symmetric.
-- Wave aggregate counters
-  `device_rebalance_wave_applied_arrivals_total` and
-  `device_rebalance_wave_applied_layer_count_total` are now exported separately
-  from the low-level apply-status mailbox. This avoids confusing apply progress
-  with the plan/copy stage's later reuse of the same status workspace.
-- The first CUDA2 diagnostic run with load stats confirmed the suspected no-op:
-  `selected_replicas`, `command_count`, planned arrivals, and apply changes were
-  all zero, runtime replicas stayed at zero, and pre/post imbalance deltas were
-  zero. The root cause was graph plumbing, not policy tuning: masked decode
-  banks lacked remote owner/resident metadata, and the expert stage could keep
-  or rebuild a table with wrong participant metadata. Tests now pin both cases.
-- The next CUDA2 transfer-capable diagnostic proved the controller was no longer
-  silent, but also exposed a policy bug: locally hot missing arrivals were
-  accepted even when adding the destination participant increased the domain
-  projected load spread. The aggregate imbalance delta was negative on both
-  devices. CUDA, ROCm, and the CPU mirror now gate missing-arrival plans through
-  shared `addingResidentImprovesLoadSpread()` logic and export
-  `device_rebalance_skipped_no_improvement`.
-- After that gate, the same CUDA2 512-token diagnostic produced no worsening
-  pre/post pairs (`positive=34`, `negative=0`, `zero=34`) and positive aggregate
-  deltas (`CUDA:0 +0.816`, `CUDA:1 +0.427`). This proves the policy path is
-  changing projected imbalance in the right direction, although the obsolete
-  fixed-arena transfer path still decodes at about 113 tok/s and is now refused
-  by graph-side rebalance.
-- Last-local-layer boundary apply recovered the CUDA2 dynamic path to static
-  territory while keeping ready-wave apply alive. On the current tree,
-  `--moe-rebalance off` measured 116.01 decode tok/s for a 512-token run;
-  dynamic hot10 with the threshold gate and a two-expert transfer wave measured
-  116.30 tok/s clean and 116.99 tok/s with load stats enabled. The old per-layer
-  apply path measured 112.80 tok/s, while the too-early first-layer boundary
-  poll measured 116.87 tok/s but had zero applied waves.
-- After making the two-expert transfer wave the default and rebuilding Release,
-  a no-env CUDA2 512-token sample measured 117.66 decode tok/s for dynamic
-  hot10 versus 114.67 tok/s for a same-build static sample. Treat this as a
-  promising single-sample signal; the next acceptance run should use multiple
-  reps on both CUDA2 and ROCm2.
-- Load-stats tuning on the last-layer boundary path showed positive projected
-  imbalance movement but sparse decisions: CUDA:0 planned 12 arrivals and moved
-  559 projected routed-token units toward participant 0 across 10 positive
-  windows; CUDA:1 planned 3 arrivals and moved 160 units toward participant 1
-  across 3 positive windows. No negative imbalance deltas were observed in that
-  run.
-- Removing the spread-improvement threshold made the controller too chatty and
-  slower: no-threshold dynamic planned 43/21 arrivals, restored plan overflow,
-  and decoded at 114.76 tok/s. Increasing transfer-wave capacity to the default
-  larger wave removed overflows but decoded at 113.71 tok/s. The tuned default
-  is therefore a one-layer planning wave, two expert transfer slots per wave,
-  and the absolute/relative spread-improvement gate enabled.
-- Benefit-ranked transfer selection fixed the old count-first policy issue and
-  a CUDA/ROCm status-counter bug where below-floor candidates rejected during
-  parallel scan did not increment `skipped_no_improvement`. Focused CUDA and
-  ROCm controller integration tests now cover the counter behavior, while the
-  host runtime-table test covers benefit-over-count ranking.
-- Current benefit-ranked CUDA2 diagnostics show fewer, stronger transfer
-  decisions: 7 planned arrivals total, zero overflows, 818 accepted projected
-  spread-improvement units, and router hot-cache spread improvement of 146
-  aggregate units across 73 used dispatches. Clean decode improved from
-  119.97 tok/s to 120.50 tok/s, still below the 121.50 tok/s static reference.
-- Maintenance perfstats now publish current-wave applied-arrival and applied-layer
-  counts from persistent `DeviceMoERebalanceWaveProgress` state. The transient
-  `ApplyStatus` buffer can be reset by the second drain apply stage, so it is
-  not a reliable aggregate signal for whether a copied wave was consumed.
-- While the interim host-scheduled maintenance hook exists, Perfstats also
-  records `device_maintenance_graph_host_window`,
-  `device_maintenance_graph_event_query`, `device_maintenance_graph_replay_enqueue`,
-  `device_maintenance_graph_completion_record`,
-  `device_maintenance_graph_gpu_elapsed`, `launch_period`, and
-  `maintenance_slack_tokens`. The GPU elapsed counter is recorded with backend
-  timing events on the explicit maintenance stream and read only at the existing
-  perfstats diagnostic completion boundary, so it separates enqueue/host
-  overhead from actual captured maintenance graph work without adding a new
-  production sync. The latest short CUDA2 probe measured the host envelope in
-  microseconds, not tens of milliseconds; the next tuning target is therefore
-  the measured maintenance graph device work and whether the policy earns it.
-- Perfstats then confirmed the fixed payload lane was moving mostly empty slot
-  capacity. In one CUDA2 512-token run, `cuda:0` paid about 392 MB of gathered
-  payload capacity for about 4.3 MB of useful arrivals, while `cuda:1` paid about
-  392 MB for about 1.4 MB useful. The graph selector now rejects both fixed
-  payload lanes until arrivals are compacted so sparse command-capacity empty
-  slots are not moved.
-- A follow-up CUDA2 512-token run with Release defaults and both old payload env
-  knobs unset decoded at 118.60 tok/s. Perfstats showed direct maintenance graph
-  replay and no `device_rebalance_transfer_*payload*` counters, confirming the
-  production path no longer moves fixed full-arena payload capacity. The same run
-  selected zero resident-only replicas, motivating the compact arrival lane.
-- Current implementation target: tune the compact transfer-slot lane.
-  `CompactTransferSlots` now plans missing arrivals, gathers command/header
-  metadata, gathers only plan-sized source descriptor responses, copies
-  non-empty arrivals into a compact `[destination][payload_slot]` lane on the
-  explicit transfer stream, and publishes ready waves through the existing
-  route-boundary apply path. Next work is moving the rebalance-window gate
-  itself onto device and tuning/parallelizing the rolling-wave policy.
+Every rebalance strategy run should expose:
 
-## Required Device ABI
+- Pre/post participant load spread and imbalance ratio.
+- Selected experts, accepted/rejected moves, and rejection reason.
+- Planned, copied, applied, and resident-only arrivals.
+- Payload bucket slots, useful bytes, reserved bytes, wasted bytes, and
+  bytes-per-accepted-spread-unit.
+- Router hot-cache eligible dispatches, used dispatches, improved dispatches,
+  and default-vs-actual load spread.
+- Maintenance graph kind, launch count, GPU elapsed, and no-work/payload-skip
+  counts.
+- LLEP-specific rows: native rows, spilled rows, foreign experts, min-chunk
+  rejects, lambda skips, predicted ROI, and realized spread.
 
-- A device-resident peer table with one entry per participant:
-  stable pointers to runtime histograms, local descriptor directory, command
-  buffers, wave state, and transfer-slot directory. The table is initialized by
-  the host once during graph construction and is then consumed only by device
-  kernels during replay.
-- A graph-captured maintenance collective ABI for rebalance state movement and,
-  separately, a compact sideband ABI for genuinely small control buffers that
-  can ride existing LocalTP synchronization points. In code this is
-  `LocalTPCollectiveSidebandKind` / `LocalTPCollectiveSidebandBuffer` plus
-  `collectiveSidebandOnStream(...)`. Operation kind is explicit:
-  histogram counters move as wave-scoped maintenance gather/sum payloads,
-  participant command contributions require allgather-like semantics, and
-  root-published command metadata requires broadcast-like semantics. Command
-  bytes are not additive, so they must never be appended to an FP activation
-  allreduce payload.
-- A device-resident domain directory with one entry per
-  `[participant][layer][expert]`:
-  active NativeVNNI descriptor triplet, owner, resident mask, slot index, epoch,
-  and generation. Directory entries are valid only when the participant actually
-  owns resident bytes; ownership metadata for a non-local expert is not a usable
-  source descriptor.
-- A local transfer-slot directory with one entry per staged slot. After the
-  peer-copy kernel finishes, the slot entry contains destination-local
-  NativeVNNI descriptors. Apply consumes these descriptors, never peer source
-  descriptors, so an uncopied source cannot accidentally become local compute.
-- A double-buffered per-participant transfer plan buffer sized by the configured
-  rolling wave: entries identify `layer`, `expert`, `src_participant`,
-  `dst_participant`, `dst_transfer_slot`, and source residency. The controller
-  assigns `dst_transfer_slot` from a device-side per-destination payload-slot
-  counter. If command or payload-slot capacity is insufficient, the plan overflows
-  loudly rather than silently falling back.
-- A status mailbox for hard failures:
-  invalid config, missing peer descriptor, no transfer slot, unsupported peer
-  access, descriptor mismatch, and insufficient graph-captured plan capacity.
-- A persistent `DeviceMoERebalanceGraphControllerState` with two
-  `DeviceMoERebalanceWaveProgress` records. The maintenance graph advances one
-  wave from `Idle -> Planning -> TransferInFlight -> ReadyToApply`; decode-side
-  apply advances it through `Applying -> Applied`. Reusing a wave before decode
-  marks it applied is a device-side state-machine error.
+## Required Tests
+
+Correctness gates:
+
+- Unit tests for Static, Dynamic, and LLEP shared policy helpers, including
+  variable domain size, non-contiguous owner maps, capacity overflow, and no-op
+  windows.
+- CUDA and ROCm synthetic assignment/apply tests with identical expected command
+  buffers and runtime-table state.
+- CUDA2 and ROCm2 PyTorch parity suites for expert overlay prefill and decode,
+  using the established parity CSV format and canonical thresholds.
+- Snapshot infrastructure coverage for expert overlay.
+- E2E HTTP server and prefix-cache tests after any cache or runtime-table
+  change.
+- Full unit suite after touching shared policy, prefix cache, graph capture, or
+  device ABI.
+
+Performance gates:
+
+- Static, Observe, Dynamic no-cache, Dynamic plus cache, and LLEP where
+  available.
+- CUDA2 and ROCm2 separately.
+- 512, 1024, 2048, and selected 4096-token continuations with expanded context.
+- At least one warmup plus repeated measured runs for clean speed labels; use
+  single-request trace mode only for policy feature training.
 
 ## Invariants
 
-- No default streams. Every kernel, collective, and copy node uses an explicit
-  graph stream.
-- No per-window host publish/apply. A pending host-prepared publication while
-  device-side mode is active is a state-machine error.
-- No host-scheduled rebalance maintenance graph in homogeneous same-backend
-  steady state. Window gating and command publication are device-kernel work.
-- No host event query or host completion poll for rebalance progress in
-  homogeneous same-backend steady state.
-- No new independent per-token rebalance collective. Sideband payloads must stay
-  compact and share the existing collective ordering surface; histogram rows and
-  packed expert payload bytes move through async maintenance/transfer lanes.
-- Do not mix collective semantics: histogram counters may use sum/gather-like
-  maintenance collectives, while command metadata requires gather/broadcast
-  semantics or a grouped sideband collective.
-- Missing same-backend peer access is a configuration error for this path; host
-  staging is not an acceptable fallback inside homogeneous device-side mode.
-- The domain size is variable (`degree >= 2`), not two-card-specific.
-- CUDA and ROCm follow the same ABI and tests.
-- The active NativeVNNI GPU packed format is treated as backend-neutral within a
-  homogeneous domain; no repack is part of the same-backend path.
-- Cross-vendor movement and mixed CUDA/ROCm domains stay out of this controller.
+- No default streams. Every kernel, collective, and copy uses an explicit stream.
+- No silent CPU fallback in homogeneous GPU device-side mode.
+- No per-window host publish/apply or host policy decision in steady state.
+- No new independent per-token rebalance collective.
+- No fixed two-card assumptions; domain size is `degree >= 2`.
+- CUDA and ROCm must remain aligned in ABI, tests, and feature behavior.
+- Same-backend expert arrivals use descriptor copy, not repack.
+- Empty slots must not be transferred.
+- If graph capture is required and unsupported, fail hard.
+- Router top-k expert ids and route weights must remain exact.
+- Shared experts follow dense policy. Routed experts are the only rebalanced
+  experts.
 
-## Current Implementation Slice
+## Next Work
 
-- Qwen35 MoE graph construction creates a stable transfer-slot directory when a
-  dynamic homogeneous GPU LocalTP rebalance stage is added.
-- Transfer slots are generic over `layer/expert` at graph-build time. Copy-ready
-  means the slot owns valid destination buffers; copy-complete means the slot was
-  stamped to the exact plan entry.
-- `MoEDeviceRebalanceStage` sizes command metadata by the rolling-wave planning
-  capacity and sizes the payload collective lane by actual transfer-slot
-  capacity. For compact transfer slots, metadata keeps participant-squared
-  headroom for root-projected resident commands but is still scoped to the active
-  layer wave. This keeps planning expressive without preallocating or transferring
-  `num_layers * hot_replica_cap` expert payload slots.
-- `DeviceMoERebalanceConfig` carries `layer_window_start` and
-  `layer_window_count`, and the device `DeviceMoERebalanceWaveState` advances
-  planning through that bounded window instead of assuming a single layer or a
-  two-card domain.
-- Histogram workspace sizing follows the rolling wave. `MoEDeviceRebalanceStage`
-  allocates local histograms as `histogram_layer_count * num_experts` and
-  gathered histograms as
-  `participant_count * histogram_layer_count * num_experts`. Compact arrivals do
-  not allocate or allgather the full `[layer][expert]` descriptor directory; they
-  allocate source responses sized by
-  `participant_count * command_buffer_count * plan_capacity`, then allgather
-  that plan-sized response tensor.
-- CUDA and ROCm `packDeviceRebalanceHistograms()` read the active wave cursor
-  from graph-controller state and pack actual model layers into compact
-  wave-layer rows. The controller consumes the gathered compact rows with the
-  same shared policy helper on both backends.
-- `Qwen35MoEGraph` stores a persistent `GraphSideRebalanceBinding` for the
-  first local decode producer. Later local decode layers attach consumers to
-  that producer workspace only for non-boundary compatibility paths. Async
-  maintenance attaches one last-local-layer boundary consumer with
-  `apply_layer_idx=-1` so both resident and transfer-backed waves are applied as
-  ready units after transfer has had a token of compute to overlap with.
-- `MoEDeviceRebalanceStage` also allocates command-buffer headers, plan counts,
-  plan entries, and wave state as double-buffered first-class workspace
-  buffers, plus persistent
-  `DeviceMoERebalanceGraphControllerState` shared by split producer/apply
-  stages. Missing any of these buffers is a hard stage failure, not a host
-  publish/apply fallback.
-- `MoEDeviceRebalanceStage` prepares context-owned auxiliary transfer streams
-  and stable ordering events in `prepareGraphLaunch()`. During capture, the
-  `PlanAndCopy` stage runs controller planning on the compute stream, enqueues
-  arrival copies on the auxiliary stream, and records transfer completion. The
-  transfer stream then publishes `ReadyToApply` with a graph-capturable device
-  kernel. Split decode `Apply` stages poll
-  `applyReadyDeviceRebalanceWave()` against the device controller state and use
-  the ready wave's metadata slot, so the producer can write the next command
-  slot while decode applies the previous one. The event edges use checked
-  worker-context APIs and the stage source intentionally avoids host
-  `synchronizeStream()`.
-- CUDA and ROCm copy kernels clear stale `Resident/CopyComplete` metadata before
-  each attempted copy, so a failed replay cannot publish an old slot arrival.
-- CUDA/NCCL and ROCm/RCCL backend `sendrecvMulti()` now delegates to the shared
-  coordinator copy implementation rather than returning the old unsupported
-  stub. This keeps homogeneous transfer plumbing symmetric while the graph-side
-  compact-arrival command lane is being built.
-- CUDA and ROCm now have symmetric kernels for controller-state initialization,
-  transfer-complete publish, and ready-wave poll/apply. Regression tests assert
-  both backends expose the same ABI.
-- CUDA and ROCm copy/apply integration tests deliberately set the legacy
-  `plan_count` to zero while the command header advertises one command. This
-  proves the graph-side arrival/apply path consumes the command-buffer ABI.
-- CUDA and ROCm copy/apply integration tests also model the production projection
-  path: source packing sees a source-local command header, destination unpack/apply
-  sees a destination-local header, and the gathered payload buffer is laid out as
-  `[source_participant][destination][payload_slot]`. This pins the compact lane
-  against regressing back to sparse command-index payload addressing.
-- Root-domain command projection must aggregate the elected root command header
-  for every gathered wave slot; it must not filter by a participant-local
-  `active_wave` cursor. Local cursors can legitimately diverge while one
-  participant is still applying a ready wave, and letting each device choose a
-  different projection bucket can desynchronize collective graph bodies. CUDA
-  and ROCm regression tests now pin this by projecting a root payload from a
-  non-local wave and requiring the same requested bucket on every participant.
-- Ready-wave apply clears the consumed device command header after successful
-  publication while preserving static capacity/participant fields. This keeps
-  applied resident-only or transfer-backed commands from being re-read by later
-  maintenance exports and prevents stale selected-payload accounting from
-  leaking into no-work waves. CUDA and ROCm tests cover the graph-captured
-  `ResidentHotReplica` apply case and assert the header epoch/command count are
-  zero after apply.
-- The current maintenance-graph implementation is an interim stepping stone, not
-  the final steady-state design. It still has host-side window scheduling and a
-  host-side nonblocking event query to avoid stacking maintenance launches. That
-  reduces overhead, but it does not satisfy the target invariant above.
+1. Clean up the remaining public policy surface so `LLEP` and
+   `HotExpertReplicaCache` are explicit and independent of `Dynamic`.
+2. Use the new Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at
+   1024 and 2048 tokens: lower imbalance thresholds, lower improvement floors,
+   larger per-layer swap counts, larger per-wave command caps, and smaller
+   minimum-window activation gates.
+3. Extend Dynamic, if needed, with an explicit hot-set variant
+   (`hotset_expert_count=20`), configurable window schedule, variable domain
+   size, and cost-gated non-empty moves while keeping the shared helper as the
+   single policy implementation used by CPU, CUDA, and ROCm.
+4. Keep LLEP modular behind the shared routed-assignment surface so additional
+   algorithms can be added without backend drift.
+5. Wire production prefill and batched decode to run LLEP only when row count
+   and cost gates make it worthwhile.
+6. Run parity, E2E prefix-cache/server tests, full unit tests, then clean
+   CUDA2/ROCm2 benchmark matrices before making a policy the default.
 
-## Interim Host-Publish Hardening
-
-Until homogeneous GPU domains are fully device-owned, the host delayed-publish
-path must obey the same stream and cache invariants as the target graph path:
-
-- A prepared LocalTP GPU rebalance publish may not cross a cache reset or the
-  next collective-bearing forward. `OrchestrationRunner` drains pending publish
-  state before `clear_cache()` paths, prefix-cache fallback resets, and decode
-  forwards; failures throw instead of silently dropping staged transfers.
-- Mask publication mutates graph-stable GPU descriptor/runtime-table state
-  outside ordinary stage execution. `DeviceGraphOrchestrator` therefore binds an
-  explicit per-device publication stream to every GPU MoE stage before
-  register/prepare, mask refresh, or hot-replica refresh can reach CUDA/ROCm
-  kernels. A missing stream is a hard error, never a default-stream fallback.
-- Prefix-cache restore and clear-cache paths are part of the production serving
-  surface. The server E2E harness has an opt-in
-  `LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE=1` gate that adds separate
-  CUDA2/NCCL and ROCm2/RCCL Qwen3.6 MoE prefix-cache + dynamic-rebalance probes.
-  The probe requires delayed prepare, clear-cache publish drain, and delayed
-  publish counters in PerfStats, and it rejects dirty server logs.
-
-## Cost-Model Instrumentation
-
-The next tuning pass is driven by three PerfStats questions instead of raw
-decode throughput alone:
-
-- Transfer cost: maintenance export now records command/header bytes, compact
-  source-descriptor response bytes, rolling payload-lane capacity, and useful
-  landed bytes. Key counters are
-  `device_rebalance_transfer_source_descriptor_gathered_bytes`,
-  `device_rebalance_transfer_payload_gathered_capacity_bytes`,
-  `device_rebalance_transfer_useful_payload_bytes`,
-  `device_rebalance_transfer_payload_collective_utilization_ratio`, and
-  `device_rebalance_transfer_collective_bytes_per_accepted_spread_unit`.
-- Imbalance cost: every maintenance export is tagged with `window`,
-  `decode_tokens_seen`, transfer mode, participant count, and slot sizing. It
-  records `device_rebalance_policy_load_spread_units` for pre, post, and delta
-  phases alongside the existing imbalance ratio. These absolute load-spread
-  units are the join key for correlating "n units of imbalance" with lost decode
-  throughput across static, observe, and dynamic runs.
-- Action benefit: accepted spread improvement is now paired with arrival and
-  byte cost through
-  `device_rebalance_policy_accepted_spread_improvement_per_arrival`,
-  `device_rebalance_transfer_useful_bytes_per_accepted_spread_unit`, and
-  `device_rebalance_transfer_collective_bytes_per_accepted_spread_unit`.
-
-These counters intentionally separate useful expert bytes from captured
-collective capacity. If utilization is near zero, policy tuning is secondary; the
-payload lane is still paying too much bucket slack. If spread deltas are near
-zero, the controller/router policy is effectively a no-op even when transfers
-happen.
-
-## Current CUDA2 Root-Domain Findings
-
-The first root-domain planning fix moved the device controller away from
-"local participant plans for itself, then the root buffer is projected
-everywhere." The shared host/device policy now evaluates a hot expert against
-the best missing destination participant, and CUDA/ROCm both emit arrival
-commands with `destination_choice.destination_participant`. Existing resident
-replicas are also represented as resident commands so a root-projected command
-buffer does not collapse the hot cache back toward the root on the next apply.
-
-The 512-token CUDA2 dynamic-hot10 probe after this change shows the foundation
-is now functional:
-
-- Decode throughput: 118.7 tok/s, prefill: 2986.5 tok/s.
-- Accepted policy spread improvement: 232 units per device over three
-  maintenance exports.
-- Router hot-cache signal: 69 eligible dispatches, 47 used/improved dispatches,
-  default spread 158, actual spread 60, spread improvement 98.
-- Wave movement: CUDA:0 copied 2/applied 5 arrivals; CUDA:1 copied 4/applied 7
-  arrivals. The asymmetry is expected with rolling waves and resident commands.
-- Payload accounting is now based on current replay command-header epoch
-  matching, not transient apply-status counters and not an aggregate sum across
-  old wave slots. The latest compact dense-payload run separates sender
-  `payload_slot` from receiver `destination_slot`, so the selected payload lane
-  no longer pays the `[destination][slot]` empty-lane tax. On the CUDA2
-  1024-token perfstats probe, selected gathered capacity was about 14.42 MiB for
-  about 7.21 MiB useful payload, the expected 50% utilization for a two-card
-  allgather. That run still paid about 34.61 MiB of total captured gathered
-  capacity because no-work maintenance replays executed the fixed payload bucket.
-  The current implementation splits maintenance into a plan graph and a payload
-  graph so no-work plan completions skip payload replay. A forced high-floor
-  CUDA2 512-token perfstats probe validated the behavior: all six maintenance
-  launches were plan-only, selected payload bucket slots stayed zero, and
-  selected/wasted payload bytes stayed zero.
-
-So the hot cache is no longer a no-op. Removing the serial decode-runtime top-k
-walk and gating clean-run poll accounting recovered CUDA dynamic-hot10 to within
-0.42% of paired static on the 1024-token run, which means the policy has latent
-value but is not yet paying its full fixed cost. The immediate economics fix is
-now in code: no-work maintenance waves do not launch the payload graph body.
-The next validation target is to quantify how much this reduces CUDA maintenance
-GPU elapsed and whether dynamic-hot10 moves closer to or above paired static.
-
-Prefill graph rejection is now a fail-fast contract. Once a run selects the
-prefill graph path, preflight/capture-readiness rejection must return failure
-before any eager warmup fallback can execute. A June 29 CUDA2 ctx=4096 repro
-confirmed the old slow-prefill case was not a valid captured benchmark:
-benchmark mode disabled padded buckets for the multi-device collective path,
-then exact prefill capture rejected on `layer0_moe_expert_dispatch`
-(`MOE_EXPERT_DISPATCH`) as `StageNotCapturable`. The run now exits nonzero
-instead of reporting a bogus eager-prefill throughput number.
-
-That rejection is a feature gap, not an acceptable steady state. Homogeneous
-GPU LocalTP `ApportionedExperts` prefill must lower through the fixed-topology
-grouped MoE expert path, independent of the dense phase-split policy. The old
-host overlay dispatch stages (`MOE_EXPERT_DISPATCH`, `MOE_SPARSE_DISPATCH`,
-`MOE_LOCAL_EXPERT`, and `MOE_SPARSE_RETURN_REDUCE`) are now regression targets
-for this path; graph construction should produce a masked
-`moe_expert_ffn_overlay_fast` stage plus the shared LocalTP allreduce. The
-shared-expert FFN and shared-expert gate stages are also part of the full
-prefill capture surface when the model has shared experts; they must preflight
-and capture on the same backend-neutral GPU grouped-prefill contract. The
-`LLAMINAR_GPU_MOE_GROUPED_PREFILL` gate is backend-neutral for CUDA and ROCm.
-
-## Next Implementation Slice
-
-- Keep histogram movement off per-token decode collectives. The histogram is
-  large enough relative to single-token decode anchors that it belongs in the
-  async wave lane; compact command metadata may still use grouped collectives
-  only when that proves cheaper than the maintenance lane.
-- Continue optimizing the compact non-empty arrival lane. Plans should enumerate
-  only occupied source descriptors and staged destination slots; perfstats must
-  show transferred payload bytes scale with the selected bucket and useful
-  arrivals, not with sparse command-buffer capacity.
-- Add the graph-stable peer-domain table and root-participant election to the
-  device rebalance ABI, so root planning can read descriptors directly and avoid
-  allgathering full directories.
-- Move decode-window gating into a device kernel and remove
-  `maybeRunDeviceMoERebalanceMaintenanceGraph()` from the homogeneous
-  same-backend steady-state path.
-- Replace the remaining host-scheduled maintenance trigger with a device-side
-  window gate. Root-device peer reads plus fixed command buffers are the
-  intended steady-state publication mechanism for domains where peer access is
-  enabled.
-- Keep `StageArrivals` graph-captured and keep route-boundary apply as a cheap
-  no-op on inactive epochs, so the production decode graph can replay without
-  recapture while rebalance work happens opportunistically.
-- Use the diagnostic readback path to decide whether the current controller is
-  actually improving per-participant expert load imbalance. Tuning should not
-  continue unless PerfStats shows nonzero selected commands and a positive
-  pre/post imbalance delta on real 512-token CUDA2/ROCm2 runs.
-- Use the router hot-cache counters to verify that replicated experts affect
-  dispatch, not just placement. The minimum useful signal is:
-  eligible dispatches > 0, used dispatches > 0, improved dispatches > 0, and
-  actual spread total below default spread total over the same measured window.
-- Keep `device_rebalance_skipped_no_improvement` as a first-class tuning signal:
-  a high value means histogram routing is asking for many locally attractive but
-  globally harmful arrivals, so the next policy work should improve candidate
-  ranking rather than transfer mechanics.
-- Benchmark bounded rolling capacity and tune the wave scheduler only after the
-  policy shows a measurable imbalance improvement. Current CUDA2 evidence says
-  the tight two-expert transfer wave is faster than larger waves even when the
-  larger wave eliminates overflows, so future capacity work should focus on
-  payload compression/true peer-read staging rather than simply increasing the
-  captured payload arena.
-
-Regression gates should assert that graph-side transfer-slot mode performs no
-host `syncRuntimeHistograms()`, no host
-`publishPreparedMoEExpertMasksForAllDevices()`, no delayed host
-`publishPendingMoERebalanceUpdate()` drain, no steady-state host maintenance
-graph launch, and no host event query for homogeneous same-backend rebalance
-progress.
+Historical checkpoint notes were intentionally removed from this file. Use the
+bench artifacts under `benchmark_results/` and commit messages for raw run
+history.

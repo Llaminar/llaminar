@@ -1232,6 +1232,53 @@ namespace llaminar2
         }
 
         /**
+         * @brief Rebuild runtime prefill groups from device-owned route assignments.
+         *
+         * LLEP/device-side assignment kernels may rewrite
+         * DeviceMoELayerRuntime::route_participant_ids after routing while
+         * preserving the original route_expert_ids and route_weights. This
+         * method clears only counts/offsets/grouped scratch, then groups rows
+         * assigned to runtime_layer->participant_id. It must not read route
+         * metadata back to host and must be graph-capturable.
+         */
+        virtual bool regroupPrefillRoutesFromRuntimeAssignments(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k)
+        {
+            (void)runtime_layer;
+            (void)current_tokens;
+            (void)max_tokens;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
+        /**
+         * @brief Assign prefill routes to the least-loaded resident participant.
+         *
+         * This is the graph-capturable hot-cache/LLEP bridge: it preserves the
+         * router's selected experts and weights, then rewrites only
+         * DeviceMoELayerRuntime::route_participant_ids. Candidate destinations
+         * are limited to the active placement bank's resident_participant_mask
+         * for each expert, so this method never schedules a route to a device
+         * that lacks the expert weights and never performs an implicit weight
+         * transfer.
+         */
+        virtual bool assignPrefillRoutesLeastLoadedResident(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k)
+        {
+            (void)runtime_layer;
+            (void)current_tokens;
+            (void)max_tokens;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
+        /**
          * @brief Gather one expert's fixed-capacity prefill batch from runtime grouping.
          *
          * The default returns false; GPU implementations can use runtime_layer
@@ -1434,6 +1481,35 @@ namespace llaminar2
             int seq_len, int d_model, int intermediate,
             int num_experts, int top_k)
         {
+            (void)hidden;
+            (void)output;
+            (void)gateup_desc_table_id;
+            (void)down_desc_table_id;
+            (void)seq_len;
+            (void)d_model;
+            (void)intermediate;
+            (void)num_experts;
+            (void)top_k;
+            return false;
+        }
+
+        /**
+         * @brief Execute grouped MoE prefill from DeviceMoELayerRuntime scratch.
+         *
+         * The runtime host mirror supplies stable device pointer values for
+         * counts, offsets, grouped token ids, and grouped route weights. The
+         * method must not read device-side count values on the host; all route
+         * data remains device-resident and graph-capturable.
+         */
+        virtual bool executeGroupedPrefillPipelineFromRuntime(
+            const DeviceMoELayerRuntime &runtime_layer,
+            ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,
+            int down_desc_table_id,
+            int seq_len, int d_model, int intermediate,
+            int num_experts, int top_k)
+        {
+            (void)runtime_layer;
             (void)hidden;
             (void)output;
             (void)gateup_desc_table_id;

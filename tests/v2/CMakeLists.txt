@@ -1699,6 +1699,33 @@ set_tests_properties(V2_Unit_Qwen36MoEGPURebalanceSprintScript PROPERTIES
     TIMEOUT 30
 )
 
+add_test(NAME V2_Unit_MoERebalanceTraceCorpusAnalyzerScript
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_moe_rebalance_trace_corpus_analyzer.py
+)
+set_tests_properties(V2_Unit_MoERebalanceTraceCorpusAnalyzerScript PROPERTIES
+    LABELS "V2;Unit;MoE;Benchmark;Trace;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_MoERebalancePolicyCorpusComparatorScript
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_moe_rebalance_policy_corpus_comparator.py
+)
+set_tests_properties(V2_Unit_MoERebalancePolicyCorpusComparatorScript PROPERTIES
+    LABELS "V2;Unit;MoE;Benchmark;Policy;Regression"
+    TIMEOUT 30
+)
+
+add_test(NAME V2_Unit_MoELLEPTraceCorpusEvaluatorScript
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_moe_llep_trace_corpus_evaluator.py
+)
+set_tests_properties(V2_Unit_MoELLEPTraceCorpusEvaluatorScript PROPERTIES
+    LABELS "V2;Unit;MoE;Benchmark;Policy;LeastLoadedEP;Regression"
+    TIMEOUT 30
+)
+
 add_test(NAME V2_Unit_CUDAGemvDispatchGeneratorAliases
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/cuda/gemm/validate_cuda_gemv_dispatch_generator.py
@@ -11696,6 +11723,18 @@ target_link_libraries(v2_test_moe_rebalance_controller
 add_v2_test(V2_Unit_MoERebalanceController
     COMMAND $<TARGET_FILE:v2_test_moe_rebalance_controller>
     LABELS "V2;Unit;MoE;Rebalancer;Controller;DynamicPlacement"
+)
+
+# Test: LeastLoadedExpertAssignment — backend-neutral LLEP assignment policy
+add_executable(v2_test_least_loaded_expert_assignment unit/moe/Test__LeastLoadedExpertAssignment.cpp)
+target_link_libraries(v2_test_least_loaded_expert_assignment
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_LeastLoadedExpertAssignment
+    COMMAND $<TARGET_FILE:v2_test_least_loaded_expert_assignment>
+    LABELS "V2;Unit;MoE;ExpertParallel;LeastLoadedEP;DynamicPlacement"
 )
 
 # Test: MoEConfig — configuration validation, isMoELayer()

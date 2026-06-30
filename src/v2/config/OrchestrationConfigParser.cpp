@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cstdint>
 #include <stdexcept>
 #include <set>
 #include <limits>
@@ -138,6 +139,41 @@ namespace llaminar2
                 throw std::invalid_argument(option_name + " is too large");
             }
             return static_cast<size_t>(parsed);
+        }
+
+        uint64_t parseNonNegativeUint64Value(const std::string &value, const std::string &option_name)
+        {
+            const std::string trimmed_value = trim(value);
+            if (trimmed_value.empty() || trimmed_value.front() == '-')
+            {
+                throw std::invalid_argument(option_name + " must be a non-negative integer");
+            }
+
+            size_t parsed_chars = 0;
+            unsigned long long parsed = 0;
+            try
+            {
+                parsed = std::stoull(trimmed_value, &parsed_chars);
+            }
+            catch (const std::exception &)
+            {
+                throw std::invalid_argument("Invalid value for " + option_name + ": '" + value + "'");
+            }
+            if (parsed_chars != trimmed_value.size())
+            {
+                throw std::invalid_argument("Invalid value for " + option_name + ": '" + value + "'");
+            }
+            return static_cast<uint64_t>(parsed);
+        }
+
+        uint32_t parseNonNegativeUint32Value(const std::string &value, const std::string &option_name)
+        {
+            const uint64_t parsed = parseNonNegativeUint64Value(value, option_name);
+            if (parsed > static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))
+            {
+                throw std::invalid_argument(option_name + " is too large");
+            }
+            return static_cast<uint32_t>(parsed);
         }
 
         size_t parseMegabytesToBytes(const std::string &value, const std::string &option_name)
@@ -266,6 +302,31 @@ namespace llaminar2
             else if (normalized_key == "rebalance_window_growth")
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
+            }
+            else if (normalized_key == "dynamic_imbalance_threshold_permille")
+            {
+                config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_imbalance_threshold_permille");
+            }
+            else if (normalized_key == "dynamic_min_improvement_permille")
+            {
+                config.moe_rebalance.dynamic_min_improvement_per_mille =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_min_improvement_permille");
+            }
+            else if (normalized_key == "dynamic_max_swaps_per_layer")
+            {
+                config.moe_rebalance.dynamic_max_swaps_per_layer =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_max_swaps_per_layer");
+            }
+            else if (normalized_key == "dynamic_max_plan_entries_per_wave")
+            {
+                config.moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    parseNonNegativeUint32Value(value, "moe.dynamic_max_plan_entries_per_wave");
+            }
+            else if (normalized_key == "dynamic_min_window_activations")
+            {
+                config.moe_rebalance.dynamic_min_window_activations =
+                    parseNonNegativeUint64Value(value, "moe.dynamic_min_window_activations");
             }
             else if (normalized_key == "release_raw_expert_weights")
             {
@@ -1453,6 +1514,66 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--moe-dynamic-imbalance-threshold-permille",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic rebalance imbalance trigger in permille max/min load (default: 1300 = 1.3x)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-imbalance-threshold-permille");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-min-improvement-permille",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic rebalance minimum ratio improvement in permille (default: 50 = 5%)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_min_improvement_per_mille =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-min-improvement-permille");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-max-swaps-per-layer",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic paired ownership swaps per layer (default: 4; one accepted swap moves two experts)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_max_swaps_per_layer =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-max-swaps-per-layer");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-max-plan-entries-per-wave",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic expert movement command entries per rebalance wave/cycle (default: 16)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_max_plan_entries_per_wave =
+                        parseNonNegativeUint32Value(v, "--moe-dynamic-max-plan-entries-per-wave");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-dynamic-min-window-activations",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Shared Dynamic minimum routed activations in a window before considering movement (default: 64)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.dynamic_min_window_activations =
+                        parseNonNegativeUint64Value(v, "--moe-dynamic-min-window-activations");
+                }),
+        });
+        spec.add({
             .long_name = "--moe-release-raw-expert-weights",
             .category = "MoE Configuration",
             .description = "Release raw routed expert tensors after prepared weights are resident",
@@ -1568,7 +1689,7 @@ namespace llaminar2
             .long_name = "--moe-expert-overlay-domain",
             .category = "MoE Configuration",
             .value_label = "<spec>",
-            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|apportioned_experts|sharded_experts[;owner=N][;ranks=0,1]\"",
+            .description = "Define MoE overlay domain: \"name=devices;scope=single|local|node_local;backend=type;compute=replicated_experts|apportioned_experts|sharded_experts[;assignment=static_owner|least_loaded_ep][;owner=N][;ranks=0,1]\"",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -2611,6 +2732,31 @@ namespace llaminar2
             else if (normalized_key == "moe_rebalance_window_growth")
             {
                 config.moe_rebalance.window_growth_factor = std::stof(value);
+            }
+            else if (normalized_key == "moe_dynamic_imbalance_threshold_permille")
+            {
+                config.moe_rebalance.dynamic_imbalance_threshold_per_mille =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_imbalance_threshold_permille");
+            }
+            else if (normalized_key == "moe_dynamic_min_improvement_permille")
+            {
+                config.moe_rebalance.dynamic_min_improvement_per_mille =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_min_improvement_permille");
+            }
+            else if (normalized_key == "moe_dynamic_max_swaps_per_layer")
+            {
+                config.moe_rebalance.dynamic_max_swaps_per_layer =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_max_swaps_per_layer");
+            }
+            else if (normalized_key == "moe_dynamic_max_plan_entries_per_wave")
+            {
+                config.moe_rebalance.dynamic_max_plan_entries_per_wave =
+                    parseNonNegativeUint32Value(value, "moe_dynamic_max_plan_entries_per_wave");
+            }
+            else if (normalized_key == "moe_dynamic_min_window_activations")
+            {
+                config.moe_rebalance.dynamic_min_window_activations =
+                    parseNonNegativeUint64Value(value, "moe_dynamic_min_window_activations");
             }
             else if (normalized_key == "moe_release_raw_expert_weights")
             {

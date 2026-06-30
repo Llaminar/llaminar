@@ -204,23 +204,22 @@ namespace llaminar2
             acquired.projections.push_back(std::move(projection));
         }
 
-        SlotLeaseToken *token = new SlotLeaseToken{
+        auto token = std::make_shared<SlotLeaseToken>(SlotLeaseToken{
             slot_index,
             expert_id,
             false,
             orchestrator_,
-            weak_from_this()};
+            weak_from_this()});
         acquired.lifetime = std::shared_ptr<void>(
-            token,
-            [](void *ptr)
+            token.get(),
+            [token = std::move(token)](void *) mutable
             {
-                std::unique_ptr<SlotLeaseToken> owned(static_cast<SlotLeaseToken *>(ptr));
-                if (auto pool = owned->pool.lock())
+                if (auto pool = token->pool.lock())
                 {
-                    if (owned->transfer_slot)
-                        pool->releaseTransferSlot(owned->slot_index, owned->expert_id);
+                    if (token->transfer_slot)
+                        pool->releaseTransferSlot(token->slot_index, token->expert_id);
                     else
-                        pool->releaseSlot(owned->slot_index, owned->expert_id);
+                        pool->releaseSlot(token->slot_index, token->expert_id);
                 }
             });
 
@@ -285,23 +284,22 @@ namespace llaminar2
             acquired.projections.push_back(std::move(projection));
         }
 
-        SlotLeaseToken *token = new SlotLeaseToken{
+        auto token = std::make_shared<SlotLeaseToken>(SlotLeaseToken{
             slot_index,
             expert_id,
             true,
             orchestrator_,
-            weak_from_this()};
+            weak_from_this()});
         acquired.lifetime = std::shared_ptr<void>(
-            token,
-            [](void *ptr)
+            token.get(),
+            [token = std::move(token)](void *) mutable
             {
-                std::unique_ptr<SlotLeaseToken> owned(static_cast<SlotLeaseToken *>(ptr));
-                if (auto pool = owned->pool.lock())
+                if (auto pool = token->pool.lock())
                 {
-                    if (owned->transfer_slot)
-                        pool->releaseTransferSlot(owned->slot_index, owned->expert_id);
+                    if (token->transfer_slot)
+                        pool->releaseTransferSlot(token->slot_index, token->expert_id);
                     else
-                        pool->releaseSlot(owned->slot_index, owned->expert_id);
+                        pool->releaseSlot(token->slot_index, token->expert_id);
                 }
             });
 

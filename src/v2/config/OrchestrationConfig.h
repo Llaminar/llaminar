@@ -133,6 +133,7 @@ namespace llaminar2
         std::vector<float> weights;               ///< Optional: proportional weights (must sum to 1.0)
         CollectiveBackendType backend = CollectiveBackendType::AUTO;
         ExecutionDomainComputeKind compute_kind = ExecutionDomainComputeKind::UNSPECIFIED;
+        ExecutionDomainAssignmentKind assignment_kind = ExecutionDomainAssignmentKind::UNSPECIFIED;
 
         // Phase 5: domain scope and rank ownership
         TPScope scope = TPScope::AUTO;   ///< Domain scope (local=single-rank, node_local/global=multi-rank)

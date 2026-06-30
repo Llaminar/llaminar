@@ -5,6 +5,7 @@
 
 #include "MoERebalanceController.h"
 #include "../../utils/Logger.h"
+#include "DeviceMoERebalancePolicyShared.h"
 #include "fort.hpp"
 
 #include <algorithm>
@@ -1046,20 +1047,27 @@ namespace llaminar2
             if (count == 0)
                 return uint64_t{0};
 
-            const uint64_t owner_load =
-                projected_loads[static_cast<size_t>(layer)][static_cast<size_t>(owner)];
-            const uint64_t target_load =
-                projected_loads[static_cast<size_t>(layer)][static_cast<size_t>(target_socket)];
-            if (owner_load <= target_load)
-                return uint64_t{0};
-
-            const uint64_t equalizing_shift = (owner_load - target_load + 1u) / 2u;
-            return std::min(count, equalizing_shift);
+            const uint32_t owner_mask =
+                moe_rebalance_policy::participantBit(static_cast<uint32_t>(owner));
+            const uint32_t target_mask =
+                moe_rebalance_policy::participantBit(static_cast<uint32_t>(target_socket));
+            const auto delta =
+                moe_rebalance_policy::evaluateAddingResidentDynamicSpread(
+                    projected_loads[static_cast<size_t>(layer)].data(),
+                    count,
+                    owner_mask,
+                    owner_mask | target_mask,
+                    static_cast<uint32_t>(num_sockets),
+                    static_cast<uint32_t>(owner),
+                    static_cast<uint32_t>(target_socket),
+                    static_cast<uint32_t>(std::max(1, current_window_size_)));
+            return delta.improvement;
         };
 
-        const uint64_t minimum_replica_shift = std::max<uint64_t>(
-            2,
-            static_cast<uint64_t>(std::max(1, current_window_size_) / 16));
+        const uint64_t minimum_replica_shift =
+            moe_rebalance_policy::dynamicMinimumProjectedShift(
+                static_cast<uint32_t>(std::max(1, current_window_size_)),
+                total_activations);
 
         auto admissible_projected_shift = [&](int layer, int expert, int target_socket)
         {
