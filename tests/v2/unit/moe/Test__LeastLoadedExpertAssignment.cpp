@@ -471,3 +471,55 @@ TEST(Test__LeastLoadedExpertAssignment, ResidentAssignmentSelectsHighestLoadUnas
     assigned[3] = 0;
     EXPECT_EQ(selectHighestLoadUnassignedExpert(expert_loads.data(), assigned.data(), expert_loads.size()), -1);
 }
+
+TEST(Test__LeastLoadedExpertAssignment, ResidentSplitCountsMatchPerRowLeastLoadedAssignment)
+{
+    struct Case
+    {
+        uint64_t rows;
+        uint32_t resident_mask;
+        uint32_t fallback;
+        std::array<uint64_t, 4> initial_loads;
+    };
+
+    const std::array<Case, 4> cases{{
+        {11, 0b111u, 0, {0, 0, 0, 0}},
+        {10, 0b111u, 0, {5, 0, 5, 0}},
+        {6, 0b0101u, 0, {3, 100, 0, 0}},
+        {5, 0u, 2, {9, 4, 7, 0}},
+    }};
+
+    for (const auto &test_case : cases)
+    {
+        std::array<uint64_t, 4> row_loads = test_case.initial_loads;
+        std::array<uint32_t, 4> row_counts{};
+        uint32_t row_mask = test_case.resident_mask & participantMaskLimit(row_loads.size());
+        if (row_mask == 0u)
+            row_mask = 1u << test_case.fallback;
+
+        for (uint64_t row = 0; row < test_case.rows; ++row)
+        {
+            const uint32_t participant =
+                selectLeastLoadedResidentParticipant(
+                    row_mask,
+                    row_loads.data(),
+                    row_loads.size(),
+                    test_case.fallback);
+            ++row_loads[participant];
+            ++row_counts[participant];
+        }
+
+        std::array<uint64_t, 4> chunk_loads = test_case.initial_loads;
+        std::array<uint32_t, 4> chunk_counts{};
+        assignLeastLoadedResidentSplitCounts(
+            test_case.rows,
+            test_case.resident_mask,
+            chunk_loads.data(),
+            chunk_loads.size(),
+            test_case.fallback,
+            chunk_counts.data());
+
+        EXPECT_EQ(chunk_counts, row_counts);
+        EXPECT_EQ(chunk_loads, row_loads);
+    }
+}

@@ -6529,17 +6529,13 @@ namespace
             for (uint32_t participant = 0; participant < kDeviceMoEMaxParticipants; ++participant)
                 destination_counts[participant] = 0u;
 
-            for (int row = 0; row < best_load; ++row)
-            {
-                const uint32_t best_participant =
-                    llaminar2::least_loaded_ep::selectLeastLoadedResidentParticipant(
-                        resident_mask,
-                        participant_load,
-                        participant_count,
-                        fallback);
-                participant_load[best_participant] += 1ULL;
-                destination_counts[best_participant] += 1u;
-            }
+            llaminar2::least_loaded_ep::assignLeastLoadedResidentSplitCounts(
+                static_cast<uint64_t>(best_load),
+                resident_mask,
+                participant_load,
+                participant_count,
+                fallback,
+                destination_counts);
 
             int cumulative = 0;
             const int split_base = best_expert * static_cast<int>(kDeviceMoEMaxParticipants);

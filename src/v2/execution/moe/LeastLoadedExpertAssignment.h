@@ -274,6 +274,108 @@ namespace llaminar2::least_loaded_ep
         return fallback_participant < participant_count ? fallback_participant : 0u;
     }
 
+    LLAMINAR_LLEP_HD void assignLeastLoadedResidentSplitCounts(
+        uint64_t route_rows,
+        uint32_t resident_mask,
+        uint64_t *participant_loads,
+        uint32_t participant_count,
+        uint32_t fallback_participant,
+        uint32_t *destination_counts) noexcept
+    {
+        if (route_rows == 0ULL ||
+            !participant_loads ||
+            !destination_counts ||
+            participant_count == 0u ||
+            participant_count > 32u)
+        {
+            return;
+        }
+
+        resident_mask &= participantMaskLimit(participant_count);
+        if (resident_mask == 0u)
+        {
+            const uint32_t fallback =
+                fallback_participant < participant_count ? fallback_participant : 0u;
+            resident_mask = 1u << fallback;
+        }
+
+        uint64_t remaining = route_rows;
+        while (remaining > 0ULL)
+        {
+            uint64_t min_load = 0ULL;
+            bool have_min = false;
+            for (uint32_t participant = 0; participant < participant_count; ++participant)
+            {
+                if ((resident_mask & (1u << participant)) == 0u)
+                    continue;
+                const uint64_t load = participant_loads[participant];
+                if (!have_min || load < min_load)
+                {
+                    min_load = load;
+                    have_min = true;
+                }
+            }
+            if (!have_min)
+                return;
+
+            uint32_t min_count = 0u;
+            uint64_t next_load = ~0ULL;
+            bool have_next = false;
+            for (uint32_t participant = 0; participant < participant_count; ++participant)
+            {
+                if ((resident_mask & (1u << participant)) == 0u)
+                    continue;
+                const uint64_t load = participant_loads[participant];
+                if (load == min_load)
+                {
+                    ++min_count;
+                }
+                else if (load > min_load && (!have_next || load < next_load))
+                {
+                    next_load = load;
+                    have_next = true;
+                }
+            }
+            if (min_count == 0u)
+                return;
+
+            uint64_t chunk = remaining;
+            if (have_next)
+            {
+                const uint64_t delta = next_load - min_load;
+                const uint64_t fill_to_next =
+                    saturatedMul(delta, static_cast<uint64_t>(min_count));
+                if (fill_to_next > 0ULL && fill_to_next < chunk)
+                    chunk = fill_to_next;
+            }
+            if (chunk == 0ULL)
+                chunk = 1ULL;
+
+            const uint64_t base = chunk / static_cast<uint64_t>(min_count);
+            uint64_t extra = chunk % static_cast<uint64_t>(min_count);
+            for (uint32_t participant = 0; participant < participant_count; ++participant)
+            {
+                if ((resident_mask & (1u << participant)) == 0u ||
+                    participant_loads[participant] != min_load)
+                {
+                    continue;
+                }
+                uint64_t add = base;
+                if (extra > 0ULL)
+                {
+                    ++add;
+                    --extra;
+                }
+                if (add == 0ULL)
+                    continue;
+                participant_loads[participant] += add;
+                destination_counts[participant] += static_cast<uint32_t>(add);
+            }
+
+            remaining -= chunk;
+        }
+    }
+
     LLAMINAR_LLEP_HD void sortExpertsByLoadDescending(
         const uint64_t *expert_loads,
         uint32_t expert_count,
