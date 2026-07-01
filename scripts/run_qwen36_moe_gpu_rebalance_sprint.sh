@@ -12,7 +12,7 @@ reps="${LLAMINAR_GPU_MOE_REBALANCE_REPS:-5}"
 context_length="${LLAMINAR_GPU_MOE_REBALANCE_CONTEXT:-1024}"
 n_predict_csv="${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT_LIST:-${LLAMINAR_GPU_MOE_REBALANCE_N_PREDICT:-128}}"
 seeds_csv="${LLAMINAR_GPU_MOE_REBALANCE_SEEDS:-}"
-cases_csv="${LLAMINAR_GPU_MOE_REBALANCE_CASES:-static,observe,dynamic,dynamic_hot10}"
+cases_csv="${LLAMINAR_GPU_MOE_REBALANCE_CASES:-static,observe,dynamic,llep,dynamic_hot10}"
 rebalance_window="${LLAMINAR_GPU_MOE_REBALANCE_WINDOW:-64}"
 dry_run=0
 perfstats="${LLAMINAR_GPU_MOE_REBALANCE_PERFSTATS:-0}"
@@ -38,6 +38,7 @@ Runs the Qwen3.6 35B MoE GPU expert-rebalance proof matrix:
   static placement
   observe overhead control
   dynamic ownership
+  LLEP least-loaded routed assignment
   dynamic ownership + 10% hot expert replicas
 
 Each run uses one homogeneous 2-card LocalTP routed expert domain owned by MPI rank 0:
@@ -48,7 +49,7 @@ Single-card placement is included for 1x CUDA/ROCm baselines:
   CUDA: -d cuda:0
   ROCm: -d rocm:0
 
-LIST is comma-separated, e.g. --cases static,dynamic_hot10.
+LIST is comma-separated, e.g. --cases static,llep,dynamic_hot10.
 
 Use --n-predict-list 512,1024,2048 and --seeds 101,202,303 to gather a
 decode-length/seed matrix for rebalance policy training. When --seeds is
@@ -91,9 +92,9 @@ Use --dense-policy to pass an explicit --moe-expert-overlay-dense-policy value,
 for example tensor-parallel-decode-mirrored-embedding. This overrides
 --dense-tp/--dense-decode-replicated for two-card runs.
 
-Use --assignment-policy least-loaded-ep to request LLEP row assignment on top
-of apportioned whole-expert ownership. The default leaves assignment implicit,
-which is equivalent to static-owner.
+Use case 'llep' to request LLEP as the first-class rebalance strategy. The
+older --assignment-policy least-loaded-ep flag remains available for diagnostic
+runs that need least-loaded row assignment independent of the rebalance mode.
 
 Use --allreduce-precision fp16|fp32|bf16 to force the collective transport
 precision for diagnostic/performance A/B runs. Omit it to use the model schema's
@@ -413,6 +414,12 @@ case_args() {
       ;;
     dynamic)
       printf '%s\n' --moe-rebalance dynamic --moe-rebalance-window "${rebalance_window}" --moe-hot-expert-cache off
+      ;;
+    llep)
+      printf '%s\n' --moe-rebalance llep --moe-rebalance-window "${rebalance_window}" --moe-hot-expert-cache off
+      ;;
+    llep_hot10)
+      printf '%s\n' --moe-rebalance llep --moe-rebalance-window "${rebalance_window}" --moe-hot-expert-cache 10%
       ;;
     dynamic_hot10)
       printf '%s\n' --moe-rebalance dynamic --moe-rebalance-window "${rebalance_window}" --moe-hot-expert-cache 10%

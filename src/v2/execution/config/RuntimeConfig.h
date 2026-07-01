@@ -1192,7 +1192,8 @@ namespace llaminar2
     {
         Off,
         Observe,
-        Dynamic
+        Dynamic,
+        LLEP
     };
 
     inline const char *moeRebalanceRuntimeModeToString(MoERebalanceRuntimeMode mode)
@@ -1205,6 +1206,8 @@ namespace llaminar2
             return "observe";
         case MoERebalanceRuntimeMode::Dynamic:
             return "dynamic";
+        case MoERebalanceRuntimeMode::LLEP:
+            return "llep";
         default:
             return "unknown";
         }
@@ -1224,6 +1227,8 @@ namespace llaminar2
             return MoERebalanceRuntimeMode::Observe;
         if (lower == "dynamic" || lower == "on" || lower == "true")
             return MoERebalanceRuntimeMode::Dynamic;
+        if (lower == "llep" || lower == "least-loaded-ep" || lower == "least-loaded")
+            return MoERebalanceRuntimeMode::LLEP;
         return std::nullopt;
     }
 

@@ -588,6 +588,40 @@ namespace
         EXPECT_EQ(graph_config.moe.rebalance_mode, active->mode());
     }
 
+    TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, LLEPModeUsesDynamicControllerClock)
+    {
+        GraphConfig graph_config;
+        graph_config.n_layers = kMoELayers;
+        graph_config.moe.num_experts = kMoEExperts;
+        graph_config.moe.top_k = 2;
+        graph_config.moe.rebalance_config.mode = MoERebalanceRuntimeMode::LLEP;
+        graph_config.moe.rebalance_config.window_size = 32;
+        graph_config.moe.hot_expert_cache.kind = MoEHotExpertCacheConfig::Kind::Off;
+        graph_config.moe.expert_overlay_runtime_plan =
+            resolveMoEExpertOverlayRuntimePlan(makeActiveCudaLocalTPReplicatedOverlayPlan());
+
+        auto controllers = createMoERebalanceControllersForGraph(
+            graph_config,
+            nullptr,
+            nullptr);
+
+        ASSERT_EQ(controllers.size(), 2u);
+        ASSERT_EQ(controllers.front()->domainId(), "single");
+
+        auto *active = bindActiveMoERebalanceControllerForGraph(
+            graph_config,
+            controllers);
+
+        ASSERT_NE(active, nullptr);
+        EXPECT_EQ(active->domainId(), "overlay_routed_cuda_hot");
+        EXPECT_EQ(active->mode(), MoERebalanceMode::DYNAMIC)
+            << "LLEP is a first-class public strategy, but it still uses the graph-captured dynamic maintenance clock";
+        EXPECT_EQ(active->maxReplicasPerSocket(), 0)
+            << "LLEP without an explicit hot-cache layer must not implicitly enable replicas";
+        EXPECT_EQ(graph_config.moe.decode_histogram, active->histogram());
+        EXPECT_EQ(graph_config.moe.rebalance_mode, MoERebalanceMode::DYNAMIC);
+    }
+
     TEST(Test__InferenceRunnerFactory_MoEOverlayPlanning, HomogeneousGpuOwnershipMovesAreBoundedByLayerFanout)
     {
         GraphConfig graph_config;

@@ -497,7 +497,9 @@ namespace llaminar2
             /// default for models that do not specify this explicitly.
             int decode_histogram_token_boundary_layer = -1;
 
-            /// MoE rebalancing mode (OFF / OBSERVE / DYNAMIC).
+            /// MoE rebalancing controller mode (OFF / OBSERVE / DYNAMIC).
+            /// Public LLEP strategy uses the dynamic maintenance clock with
+            /// LeastLoadedEP routed assignment selected in rebalance_config.
             /// Set by InferenceRunnerFactory from MoERebalanceController.
             MoERebalanceMode rebalance_mode{}; // default-initialized to OFF (value 0)
 

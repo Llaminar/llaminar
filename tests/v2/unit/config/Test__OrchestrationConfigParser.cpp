@@ -1737,6 +1737,17 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
 }
 
+TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalanceLLEP)
+{
+    ArgvHelper args{"llaminar2", "--moe-rebalance", "llep"};
+    OrchestrationConfigParser parser;
+
+    auto config = parser.parseArgs(args.argc(), args.argv());
+
+    EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::LLEP);
+    EXPECT_STREQ(moeRebalanceRuntimeModeToString(config.moe_rebalance.mode), "llep");
+}
+
 TEST(Test__OrchestrationConfigParser, ParseArgs_InvalidMoEConfig_Throws)
 {
     {

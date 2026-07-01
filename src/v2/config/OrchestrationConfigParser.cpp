@@ -218,7 +218,7 @@ namespace llaminar2
             {
                 throw std::invalid_argument(
                     "Invalid MoE rebalance mode: '" + value +
-                    "' (valid: off, observe, dynamic)");
+                    "' (valid: off, observe, dynamic, llep)");
             }
             return *parsed;
         }
@@ -1501,8 +1501,8 @@ namespace llaminar2
             .long_name = "--moe-rebalance",
             .category = "MoE Configuration",
             .value_label = "<mode>",
-            .description = "MoE decode rebalance mode: off, observe, dynamic (default)",
-            .valid_values = {"off", "observe", "dynamic"},
+            .description = "MoE decode rebalance mode: off, observe, dynamic (default), llep",
+            .valid_values = {"off", "observe", "dynamic", "llep"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {

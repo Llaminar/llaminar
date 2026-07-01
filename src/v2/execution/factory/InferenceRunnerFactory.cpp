@@ -415,6 +415,56 @@ namespace llaminar2
                               : std::optional<RoutedExpertAssignmentPolicy>(RoutedExpertAssignmentPolicy::StaticOwner);
         }
 
+        bool routedOverlayDomainsSupportLeastLoadedEP(
+            const MoEExpertParallelPlan &plan,
+            std::string *error)
+        {
+            if (!plan.isTieredOverlay() || plan.routed_tiers.empty())
+            {
+                if (error)
+                    *error = "LLEP requires a graph-native tiered routed expert overlay";
+                return false;
+            }
+
+            for (const auto &tier : plan.routed_tiers)
+            {
+                const auto *domain = findMoEExpertDomain(plan, tier.domain);
+                if (!domain)
+                {
+                    if (error)
+                        *error = "routed tier '" + tier.name + "' references missing domain '" + tier.domain + "'";
+                    return false;
+                }
+                if (!domain->supportsLeastLoadedEP())
+                {
+                    if (error)
+                    {
+                        *error = "domain '" + domain->name +
+                                 "' must be a multi-participant LocalTP/NodeLocalTP ApportionedExperts domain for LLEP";
+                    }
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        void promoteRoutedOverlayDomainsToLeastLoadedEP(MoEExpertParallelPlan &plan)
+        {
+            for (const auto &tier : plan.routed_tiers)
+            {
+                auto it = std::find_if(
+                    plan.domains.begin(),
+                    plan.domains.end(),
+                    [&](const auto &domain)
+                    {
+                        return domain.name == tier.domain;
+                    });
+                if (it != plan.domains.end())
+                    it->assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+            }
+        }
+
         bool overlayPlanDisablesDenseTP(const MoEExpertParallelPlan &plan)
         {
             return plan.isTieredOverlay() &&
@@ -534,7 +584,27 @@ namespace llaminar2
         {
             auto plan = resolveMoEExpertParallelPlanForModel(model_ctx, config);
             if (!plan)
+            {
+                if (graph_config.moe.enabled() &&
+                    graph_config.moe.rebalance_config.mode == MoERebalanceRuntimeMode::LLEP)
+                {
+                    LOG_ERROR(log_prefix << " LLEP rebalance mode requires a multi-participant MoE expert overlay domain");
+                    return false;
+                }
                 return true;
+            }
+
+            if (graph_config.moe.rebalance_config.mode == MoERebalanceRuntimeMode::LLEP)
+            {
+                std::string llep_error;
+                if (!routedOverlayDomainsSupportLeastLoadedEP(*plan, &llep_error))
+                {
+                    LOG_ERROR(log_prefix << " invalid LLEP overlay: " << llep_error);
+                    return false;
+                }
+                plan = std::make_shared<MoEExpertParallelPlan>(*plan);
+                promoteRoutedOverlayDomainsToLeastLoadedEP(*plan);
+            }
 
             graph_config.moe.expert_parallel_plan = plan;
             graph_config.moe.overlay_mpi_ctx = config.moe_expert_overlay_mpi_ctx
@@ -1372,6 +1442,7 @@ namespace llaminar2
         case MoERebalanceRuntimeMode::Observe:
             return MoERebalanceMode::OBSERVE;
         case MoERebalanceRuntimeMode::Dynamic:
+        case MoERebalanceRuntimeMode::LLEP:
             return MoERebalanceMode::DYNAMIC;
         case MoERebalanceRuntimeMode::Off:
         default:
