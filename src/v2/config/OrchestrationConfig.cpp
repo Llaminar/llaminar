@@ -1076,6 +1076,8 @@ namespace llaminar2
             << moe_rebalance.device_min_load_spread_improvement_divisor << "\n";
         oss << "    device_min_wave_spread_improvement_per_payload_slot: "
             << moe_rebalance.device_min_wave_spread_improvement_per_payload_slot << "\n";
+        oss << "    device_min_foreign_rows_per_transfer: "
+            << moe_rebalance.device_min_foreign_rows_per_transfer << "\n";
         oss << "    device_min_router_spread_improvement_per_payload_slot: "
             << moe_rebalance.device_min_router_spread_improvement_per_payload_slot << "\n";
         oss << "    device_max_post_wave_load_spread_permille: "

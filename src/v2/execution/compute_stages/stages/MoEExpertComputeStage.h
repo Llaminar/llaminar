@@ -25,8 +25,10 @@
 #include "../../moe/MoERebalanceController.h"
 #include "../../moe/MoEExpertWeightService.h"
 #include "../../moe/MoERuntimeTable.h"
+#include "../../moe/DeviceMoERebalanceController.h"
 
 #include <memory>
+#include <string>
 #include <stdexcept>
 #include <vector>
 
@@ -42,6 +44,8 @@ namespace llaminar2
     class ExpertGemmRegistry;
     class GpuExpertSlotPool;
     class GpuExpertTransferStagingPool;
+    class ILocalTPContext;
+    class DeviceMoERebalanceTransferState;
 
     /**
      * @brief Unified MoE FFN stage (router + expert execution + combine)
@@ -204,6 +208,27 @@ namespace llaminar2
             IMoERuntimeTable *moe_runtime_table = nullptr;
             bool use_runtime_prefill_grouping = false;
 
+            /// LocalTP context for future full LLEP current-batch row exchange.
+            /// Required by graph-capturable homogeneous GPU LLEP prefill once
+            /// assignment spans are promoted from planning to execution.
+            ILocalTPContext *prefill_llep_tp_ctx = nullptr;
+
+            /// Optional graph-owned transfer backing for full LLEP prefill.
+            /// These handles let current-batch assignment spans import missing
+            /// expert descriptors on device before route_participant_ids are
+            /// rewritten. The expert stage borrows this memory; it never owns
+            /// or allocates transfer slots.
+            DeviceMoEExpertDirectoryEntry *prefill_llep_transfer_slots = nullptr;
+            uint32_t prefill_llep_transfer_slot_count = 0;
+            uint64_t prefill_llep_payload_slot_bytes = 0;
+            uint32_t prefill_llep_payload_slot_capacity = 0;
+            DeviceMoERebalanceTransferMode prefill_llep_transfer_mode =
+                DeviceMoERebalanceTransferMode::ResidentOnly;
+            bool prefill_llep_require_transfer_backing = false;
+            DeviceMoERebalanceConfig prefill_llep_rebalance_config;
+            std::shared_ptr<DeviceMoERebalanceTransferState> prefill_llep_transfer_state;
+            std::string prefill_llep_workspace_name;
+
             /*
              * Runtime decode always consumes runtime top-k ids/weights. This
              * flag controls where the expert weight descriptors come from:
@@ -265,6 +290,8 @@ namespace llaminar2
             return supportsRequestedRoutedAssignmentPolicy();
         }
         bool hasMoERuntimeTableForTesting() const { return params_.moe_runtime_table != nullptr; }
+        bool hasPrefillLLEPTPContextForTesting() const { return params_.prefill_llep_tp_ctx != nullptr; }
+        bool hasTransferBackedPrefillLLEPForTesting() const { return hasTransferBackedPrefillLLEP(); }
 
         /// In expert-parallel mode, a rank's MoE FFN output can be all zeros
         /// when no selected experts fall in its local range. The downstream
@@ -608,6 +635,8 @@ namespace llaminar2
         TensorBase *effectiveSafeCompositeSharedGateInput() const;
         bool executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
+        bool hasTransferBackedPrefillLLEP() const;
+        bool executeTransferBackedPrefillLLEPMovement(IMoEKernel *kernel) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;

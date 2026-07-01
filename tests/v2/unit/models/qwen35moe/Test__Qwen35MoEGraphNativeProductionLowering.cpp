@@ -20,6 +20,7 @@
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -31,12 +32,58 @@ namespace llaminar2::test
 {
     namespace
     {
-        constexpr int kDModel = 8;
-        constexpr int kIntermediate = 5;
+        constexpr int kDModel = 32;
+        constexpr int kIntermediate = 32;
         constexpr int kNumExperts = 6;
         constexpr int kTopK = 2;
         constexpr int kSeqLen = 3;
         constexpr int kBatchSize = 1;
+
+        class ScopedDebugEnv
+        {
+        public:
+            explicit ScopedDebugEnv(std::initializer_list<std::pair<const char *, const char *>> values)
+            {
+                for (const auto &[name, value] : values)
+                {
+                    Entry entry;
+                    entry.name = name;
+                    if (const char *old_value = std::getenv(name))
+                    {
+                        entry.had_value = true;
+                        entry.old_value = old_value;
+                    }
+                    entries_.push_back(entry);
+                    ::setenv(name, value, 1);
+                }
+                mutableDebugEnv().reload();
+            }
+
+            ~ScopedDebugEnv()
+            {
+                for (const auto &entry : entries_)
+                {
+                    if (entry.had_value)
+                        ::setenv(entry.name.c_str(), entry.old_value.c_str(), 1);
+                    else
+                        ::unsetenv(entry.name.c_str());
+                }
+                mutableDebugEnv().reload();
+            }
+
+            ScopedDebugEnv(const ScopedDebugEnv &) = delete;
+            ScopedDebugEnv &operator=(const ScopedDebugEnv &) = delete;
+
+        private:
+            struct Entry
+            {
+                std::string name;
+                bool had_value = false;
+                std::string old_value;
+            };
+
+            std::vector<Entry> entries_;
+        };
 
         class TestExpertGemm : public ITensorGemm
         {
@@ -74,7 +121,7 @@ namespace llaminar2::test
                 out.payload = payload_;
                 out.scales = scale_;
                 out.blocks_per_row = 1;
-                out.codebook_id = 1;
+                out.codebook_id = 4;
                 if (role_ == ExpertGemmRegistry::WeightRole::DOWN)
                 {
                     out.n = kDModel;
@@ -484,6 +531,7 @@ namespace llaminar2::test
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
         tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        tp_ctx.setRawAllgatherGraphCaptureSupported(true);
         config.tp_ctx = &tp_ctx;
         config.tp_device_idx = 0;
 
@@ -522,8 +570,12 @@ namespace llaminar2::test
     }
 
     TEST(Test__Qwen35MoEGraphNativeProductionLowering,
-         LocalTPApportionedLeastLoadedAssignmentIsStampedOntoFastExpertStage)
+         LocalTPApportionedLeastLoadedTinyPrefillUsesStaticOwnerCostGate)
     {
+        ScopedDebugEnv env({
+            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "8192"},
+        });
         auto plan = makeLocalTPApportionedHotPlan();
         ASSERT_FALSE(plan->domains.empty());
         plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
@@ -535,6 +587,53 @@ namespace llaminar2::test
         MockLocalTPContext tp_ctx;
         tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
         tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        tp_ctx.setRawAllgatherGraphCaptureSupported(true);
+        config.tp_ctx = &tp_ctx;
+        config.tp_device_idx = 0;
+
+        TensorArena weight_arena;
+        auto layer = makeLayerWeights(weight_arena);
+        TensorArena activation_arena;
+        auto buffers = makeActivationBuffers(activation_arena);
+
+        auto model_ctx = makeTestingModelContextWithHotDomainExperts();
+        Qwen35MoEGraph graph_builder(model_ctx, nullptr, config);
+        ComputeGraph graph = graph_builder.buildFFNGraph(
+            layer, buffers, 0, kSeqLen, kBatchSize, DeviceId::rocm(0));
+
+        const auto *expert_node = graph.getNode("layer0_moe_expert_ffn_overlay_fast");
+        ASSERT_NE(expert_node, nullptr);
+        const auto *expert_stage = dynamic_cast<const MoEExpertComputeStage *>(expert_node->stage.get());
+        ASSERT_NE(expert_stage, nullptr);
+        EXPECT_EQ(expert_stage->routedExpertAssignmentPolicyForTesting(),
+                  RoutedExpertAssignmentPolicy::StaticOwner)
+            << "Tiny prefill below the LLEP routed-row gate must lower as standard "
+               "apportioned-expert work instead of paying transfer-backed current-batch movement.";
+        EXPECT_FALSE(expert_stage->usesRuntimePrefillGroupingForTesting());
+        EXPECT_FALSE(expert_stage->hasPrefillLLEPTPContextForTesting());
+        EXPECT_FALSE(expert_stage->hasTransferBackedPrefillLLEPForTesting());
+        EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
+    }
+
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering,
+         LocalTPApportionedLeastLoadedAssignmentIsStampedOntoFastExpertStage)
+    {
+        ScopedDebugEnv env({
+            {"LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE", "full"},
+            {"LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS", "0"},
+        });
+        auto plan = makeLocalTPApportionedHotPlan();
+        ASSERT_FALSE(plan->domains.empty());
+        plan->domains[0].assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        GraphConfig config = makeConfig(plan);
+        config.default_device = DeviceId::rocm(0);
+        config.moe.routed_expert_assignment_policy = RoutedExpertAssignmentPolicy::LeastLoadedEP;
+
+        MockLocalTPContext tp_ctx;
+        tp_ctx.setDevices({GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)});
+        tp_ctx.setBackend(CollectiveBackendType::RCCL);
+        tp_ctx.setRawAllgatherGraphCaptureSupported(true);
         config.tp_ctx = &tp_ctx;
         config.tp_device_idx = 0;
 
@@ -559,6 +658,12 @@ namespace llaminar2::test
         EXPECT_TRUE(expert_stage->usesRuntimePrefillGroupingForTesting())
             << "LeastLoadedEP prefill must use runtime grouping so the device-side "
                "route-participant assignment kernel is reachable in production graphs.";
+        EXPECT_TRUE(expert_stage->hasPrefillLLEPTPContextForTesting())
+            << "LeastLoadedEP prefill must carry its LocalTP context so full "
+               "current-batch row exchange can use grouped NCCL/RCCL collectives.";
+        EXPECT_TRUE(expert_stage->hasTransferBackedPrefillLLEPForTesting())
+            << "LeastLoadedEP prefill must carry compact transfer-slot backing; "
+               "otherwise foreign current-batch spans silently collapse back to resident-only routing.";
         EXPECT_TRUE(expert_stage->supportsRequestedRoutedAssignmentPolicyForTesting());
     }
 

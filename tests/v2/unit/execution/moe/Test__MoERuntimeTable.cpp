@@ -2015,15 +2015,29 @@ namespace llaminar2::test
         EXPECT_NE(state.grouped_route_weights, nullptr);
         EXPECT_NE(state.reserved_ptrs[0], nullptr)
             << "prefill LLEP split-table scratch must be a first-class runtime buffer";
+        EXPECT_NE(state.reserved_ptrs[1], nullptr)
+            << "full current-batch LLEP assignment spans must be first-class runtime scratch";
+        EXPECT_NE(state.reserved_ptrs[2], nullptr)
+            << "full current-batch LLEP transfer plans must be first-class runtime scratch";
+        EXPECT_EQ(state.reserved_u64[0], 4u * kDeviceMoEMaxParticipants);
+        EXPECT_EQ(state.reserved_u64[1], 4u * kDeviceMoEMaxParticipants);
+        EXPECT_EQ(state.reserved_u64[2], 0u);
+        EXPECT_EQ(state.reserved_u64[3], 0u);
         EXPECT_NE(table.deviceLayerState(0), &table.hostLayerState(0));
 
         void *split_scratch_before_reset = state.reserved_ptrs[0];
+        void *span_scratch_before_reset = state.reserved_ptrs[1];
+        void *transfer_scratch_before_reset = state.reserved_ptrs[2];
 
         hipStream_t stream = nullptr;
         ASSERT_EQ(hipStreamCreate(&stream), hipSuccess);
         table.resetDecodeRuntimeState(stream);
         EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[0], split_scratch_before_reset)
             << "decode-runtime reset must preserve prefill LLEP scratch bindings";
+        EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[1], span_scratch_before_reset)
+            << "decode-runtime reset must preserve full current-batch LLEP span scratch";
+        EXPECT_EQ(table.hostLayerState(0).reserved_ptrs[2], transfer_scratch_before_reset)
+            << "decode-runtime reset must preserve full current-batch LLEP transfer scratch";
 
         table.ensurePrefillRouteScratchCapacity(12, stream);
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -2032,6 +2046,10 @@ namespace llaminar2::test
         EXPECT_EQ(table.hostLayerState(0).prefill_token_capacity, 12u);
         EXPECT_EQ(table.hostLayerState(0).prefill_route_capacity, 24u);
         EXPECT_NE(table.hostLayerState(0).reserved_ptrs[0], nullptr);
+        EXPECT_NE(table.hostLayerState(0).reserved_ptrs[1], nullptr);
+        EXPECT_NE(table.hostLayerState(0).reserved_ptrs[2], nullptr);
+        EXPECT_EQ(table.hostLayerState(0).reserved_u64[0], 4u * kDeviceMoEMaxParticipants);
+        EXPECT_EQ(table.hostLayerState(0).reserved_u64[1], 4u * kDeviceMoEMaxParticipants);
     }
 #endif
 

@@ -15,6 +15,7 @@
 #include "../../../execution/moe/MoERuntimeTable.h"
 #include "../../../kernels/IMoEKernel.h"
 #include "../../../kernels/KernelFactory.h"
+#include "../../../utils/DebugEnv.h"
 #include "../../../utils/Logger.h"
 #include "../../../utils/PerfStatsCollector.h"
 
@@ -793,7 +794,6 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx = nullptr;
         DeviceMoERebalanceTransferState *transfer_state = nullptr;
         void *transfer_stream = nullptr;
-        bool transfer_stream_is_stage_stream = false;
         if (usesTransferSlotApply())
         {
             if (!ensureAsyncTransferState())
@@ -810,19 +810,6 @@ namespace llaminar2
             }
 
             transfer_stream = transfer_state->transferStream();
-#ifdef HAVE_ROCM
-            if (isGraphCaptureActive() && params_.device_id.is_rocm())
-            {
-                /*
-                 * HIP stream capture currently does not replay the event-linked
-                 * auxiliary transfer stream reliably for the rebalance graph.
-                 * Keep ROCm captured transfer work on the stage stream until
-                 * the ROCm multi-stream capture path has parity coverage.
-                 */
-                transfer_stream = stream;
-                transfer_stream_is_stage_stream = true;
-            }
-#endif
 
             try
             {
@@ -845,7 +832,7 @@ namespace llaminar2
                     params_.device_id.to_string(),
                     {{"stage", suffixFor(params_.stage_name)},
                      {"phase", phaseName(params_.phase)},
-                     {"path", transfer_stream_is_stage_stream ? "stage_stream_fallback" : "auxiliary_stream"},
+                     {"path", "auxiliary_stream"},
                      {"graph_capture_active", boolString(isGraphCaptureActive())}});
             }
         }
@@ -890,7 +877,7 @@ namespace llaminar2
             return true;
         };
 
-        auto join_transfer_stream_to_stage = [&](const char *context) -> bool
+        auto join_transfer_stream_to_capture_stream = [&](const char *context) -> bool
         {
             if (!usesTransferSlotApply())
                 return true;
@@ -909,7 +896,6 @@ namespace llaminar2
             }
             if (isGraphCaptureActive() &&
                 params_.join_transfer_stream_after_copy &&
-                !transfer_stream_is_stage_stream &&
                 !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join "
@@ -934,7 +920,6 @@ namespace llaminar2
             }
 
             if (!transfer_stream_already_ordered &&
-                !transfer_stream_is_stage_stream &&
                 (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
                  !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
             {
@@ -1099,7 +1084,7 @@ namespace llaminar2
                 return false;
             }
 
-            return join_transfer_stream_to_stage("prepared payload copy");
+            return join_transfer_stream_to_capture_stream("prepared payload copy");
         };
 
         if (params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload)
@@ -1113,8 +1098,7 @@ namespace llaminar2
                 LOG_ERROR("[MoEDeviceRebalanceStage] GatherCommandsAndCopyPreparedPayload requires transfer slots");
                 return false;
             }
-            if (!transfer_stream_is_stage_stream &&
-                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+            if ((!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
                  !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue command-metadata compute-to-transfer dependency");
@@ -1204,8 +1188,7 @@ namespace llaminar2
                 return false;
             }
 
-            if (!transfer_stream_is_stage_stream &&
-                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+            if ((!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
                  !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue sideband payload compute-to-transfer dependency");
@@ -1252,7 +1235,6 @@ namespace llaminar2
             }
             if (isGraphCaptureActive() &&
                 params_.join_transfer_stream_after_copy &&
-                !transfer_stream_is_stage_stream &&
                 !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), stream))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to join sideband transfer stream back to capture stream");
@@ -1335,8 +1317,7 @@ namespace llaminar2
 
                 if (usesTransferSlotApply())
                 {
-                    if (!transfer_stream_is_stage_stream &&
-                        (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+                    if ((!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
                          !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
                     {
                         LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue compute-to-transfer stream dependency");
@@ -1382,7 +1363,7 @@ namespace llaminar2
 
                         if (params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband)
                         {
-                            if (!join_transfer_stream_to_stage("planned command metadata"))
+                            if (!join_transfer_stream_to_capture_stream("planned command metadata"))
                                 return false;
                             return true;
                         }
@@ -1398,7 +1379,6 @@ namespace llaminar2
         {
             const bool must_wait_for_inline_transfer =
                 usesTransferSlotApply() &&
-                !transfer_stream_is_stage_stream &&
                 (params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
                  commandBufferCount() < 2u);
             if (must_wait_for_inline_transfer &&

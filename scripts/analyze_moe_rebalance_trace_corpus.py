@@ -202,6 +202,24 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
             post_load_spread = max(0, post_load_max - post_load_min)
             post_wave_load_total = parse_int(status.get("post_wave_load_total"))
             post_wave_load_spread = parse_int(status.get("post_wave_load_spread"))
+            llep_assignment_spans = parse_int(
+                status.get("llep_assignment_span_count")
+            )
+            llep_weight_transfers = parse_int(
+                status.get("llep_weight_transfer_count")
+            )
+            llep_native_rows = parse_int(status.get("llep_native_rows"))
+            llep_spilled_rows = parse_int(status.get("llep_spilled_rows"))
+            llep_total_rows = llep_native_rows + llep_spilled_rows
+            llep_spilled_row_ratio = load_spread_ratio(
+                llep_spilled_rows,
+                llep_total_rows,
+            )
+            llep_spilled_rows_per_transfer = (
+                None
+                if llep_weight_transfers <= 0
+                else llep_spilled_rows / llep_weight_transfers
+            )
             pre_imbalance_ratio = load_spread_ratio(pre_load_spread, pre_load_total)
             post_imbalance_ratio = load_spread_ratio(post_load_spread, post_load_total)
             post_wave_imbalance_ratio = load_spread_ratio(
@@ -247,6 +265,34 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                 )
                 aggregate["candidate_below_floor"] += parse_int(
                     status.get("candidate_arrivals_below_floor")
+                )
+                aggregate["llep_assignment_spans"] += llep_assignment_spans
+                aggregate["llep_weight_transfers"] += llep_weight_transfers
+                aggregate["llep_native_rows"] += llep_native_rows
+                aggregate["llep_spilled_rows"] += llep_spilled_rows
+                aggregate["llep_standard_ep_selected"] += parse_int(
+                    status.get("llep_standard_ep_selected")
+                )
+                aggregate["llep_skipped_balanced"] += parse_int(
+                    status.get("llep_skipped_balanced")
+                )
+                aggregate["llep_skipped_insufficient_spread_improvement"] += parse_int(
+                    status.get("llep_skipped_insufficient_spread_improvement")
+                )
+                aggregate["llep_skipped_insufficient_foreign_rows"] += parse_int(
+                    status.get("llep_skipped_insufficient_foreign_rows")
+                )
+                aggregate["llep_min_chunk_skips"] += parse_int(
+                    status.get("llep_min_chunk_skips")
+                )
+                aggregate["llep_forced_spills"] += parse_int(
+                    status.get("llep_forced_spills")
+                )
+                aggregate["llep_required_spread_improvement"] += parse_int(
+                    status.get("llep_required_spread_improvement")
+                )
+                aggregate["llep_required_foreign_rows"] += parse_int(
+                    status.get("llep_required_foreign_rows")
                 )
                 aggregate["candidate_improvement"] += parse_int(
                     status.get("candidate_load_spread_improvement_total")
@@ -378,6 +424,40 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                     "candidate_below_floor": parse_int(
                         status.get("candidate_arrivals_below_floor")
                     ),
+                    "llep_assignment_spans": llep_assignment_spans,
+                    "llep_weight_transfers": llep_weight_transfers,
+                    "llep_native_rows": llep_native_rows,
+                    "llep_spilled_rows": llep_spilled_rows,
+                    "llep_spilled_row_ratio": format_optional_float(
+                        llep_spilled_row_ratio
+                    ),
+                    "llep_spilled_rows_per_transfer": format_optional_float(
+                        llep_spilled_rows_per_transfer
+                    ),
+                    "llep_standard_ep_selected": parse_int(
+                        status.get("llep_standard_ep_selected")
+                    ),
+                    "llep_skipped_balanced": parse_int(
+                        status.get("llep_skipped_balanced")
+                    ),
+                    "llep_skipped_insufficient_spread_improvement": parse_int(
+                        status.get("llep_skipped_insufficient_spread_improvement")
+                    ),
+                    "llep_skipped_insufficient_foreign_rows": parse_int(
+                        status.get("llep_skipped_insufficient_foreign_rows")
+                    ),
+                    "llep_min_chunk_skips": parse_int(
+                        status.get("llep_min_chunk_skips")
+                    ),
+                    "llep_forced_spills": parse_int(
+                        status.get("llep_forced_spills")
+                    ),
+                    "llep_required_spread_improvement": parse_int(
+                        status.get("llep_required_spread_improvement")
+                    ),
+                    "llep_required_foreign_rows": parse_int(
+                        status.get("llep_required_foreign_rows")
+                    ),
                     "candidate_improvement": parse_int(
                         status.get("candidate_load_spread_improvement_total")
                     ),
@@ -492,6 +572,7 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
         pre_imbalance_samples = aggregate["pre_policy_imbalance_ratio_samples"]
         post_imbalance_samples = aggregate["post_policy_imbalance_ratio_samples"]
         post_wave_imbalance_samples = aggregate["post_wave_imbalance_ratio_samples"]
+        llep_total_rows = aggregate["llep_native_rows"] + aggregate["llep_spilled_rows"]
 
         run_row = {
             "backend": backend,
@@ -542,6 +623,32 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                 "candidate_pruned_by_count_bound"
             ],
             "candidate_below_floor": aggregate["candidate_below_floor"],
+            "llep_assignment_spans": aggregate["llep_assignment_spans"],
+            "llep_weight_transfers": aggregate["llep_weight_transfers"],
+            "llep_native_rows": aggregate["llep_native_rows"],
+            "llep_spilled_rows": aggregate["llep_spilled_rows"],
+            "llep_spilled_row_ratio": format_optional_float(
+                load_spread_ratio(aggregate["llep_spilled_rows"], llep_total_rows)
+            ),
+            "llep_spilled_rows_per_transfer": format_optional_float(
+                None
+                if aggregate["llep_weight_transfers"] <= 0
+                else aggregate["llep_spilled_rows"] / aggregate["llep_weight_transfers"]
+            ),
+            "llep_standard_ep_selected": aggregate["llep_standard_ep_selected"],
+            "llep_skipped_balanced": aggregate["llep_skipped_balanced"],
+            "llep_skipped_insufficient_spread_improvement": aggregate[
+                "llep_skipped_insufficient_spread_improvement"
+            ],
+            "llep_skipped_insufficient_foreign_rows": aggregate[
+                "llep_skipped_insufficient_foreign_rows"
+            ],
+            "llep_min_chunk_skips": aggregate["llep_min_chunk_skips"],
+            "llep_forced_spills": aggregate["llep_forced_spills"],
+            "llep_required_spread_improvement": aggregate[
+                "llep_required_spread_improvement"
+            ],
+            "llep_required_foreign_rows": aggregate["llep_required_foreign_rows"],
             "candidate_improvement": aggregate["candidate_improvement"],
             "candidate_improvement_max": aggregate["candidate_improvement_max"],
             "accepted_improvement": aggregate["accepted_improvement"],
@@ -663,6 +770,23 @@ def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "accepted_improvement_total": sum(
                     row["accepted_improvement"] for row in rows
                 ),
+                "llep_assignment_spans_total": sum(
+                    row["llep_assignment_spans"] for row in rows
+                ),
+                "llep_weight_transfers_total": sum(
+                    row["llep_weight_transfers"] for row in rows
+                ),
+                "llep_spilled_rows_total": sum(
+                    row["llep_spilled_rows"] for row in rows
+                ),
+                "llep_spilled_row_ratio_avg_mean": average_numeric_field(
+                    rows,
+                    "llep_spilled_row_ratio",
+                ),
+                "llep_spilled_rows_per_transfer_avg_mean": average_numeric_field(
+                    rows,
+                    "llep_spilled_rows_per_transfer",
+                ),
                 "pre_policy_imbalance_ratio_avg_mean": average_numeric_field(
                     rows,
                     "pre_policy_imbalance_ratio_avg",
@@ -699,7 +823,8 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
     header = (
         "backend n_predict split runs decode_tok_s_mean mean_ms_mean "
         "p50_ms_mean p90_ms_mean pre_imbalance_avg post_imbalance_avg "
-        "transfers resident router_used accepted_improvement"
+        "llep_spilled_rows llep_weight_transfers transfers resident router_used "
+        "accepted_improvement"
     )
     print(header)
     for row in rows:
@@ -709,6 +834,8 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
             f"{row['decode_p50_ms_mean']:.3f} {row['decode_p90_ms_mean']:.3f} "
             f"{row['pre_policy_imbalance_ratio_avg_mean']} "
             f"{row['post_policy_imbalance_ratio_avg_mean']} "
+            f"{row['llep_spilled_rows_total']} "
+            f"{row['llep_weight_transfers_total']} "
             f"{row['transfer_arrivals_total']} "
             f"{row['resident_replicas_total']} {row['router_used_total']} "
             f"{row['accepted_improvement_total']}"

@@ -1745,6 +1745,65 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     PerfStatsCollector::reset();
 }
 
+TEST(Test__GraphSegmentCache, CudaDeferredReplayDoesNotSynchronizeCapturedSegment)
+{
+    ScopedEnvVar enable_json("LLAMINAR_PERF_STATS_JSON", "1");
+    ScopedEnvVar disable_stage_timing("LLAMINAR_GPU_STAGE_TIMING", "0");
+    ScopedEnvVar disable_perf_stage_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", "0");
+    PerfStatsCollector::reset();
+
+    ComputeGraph graph;
+    DeviceGraphExecutor::GraphSegmentCache cache;
+
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "moe_rebalance_maintenance";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = true;
+    cache.segments.back().stage_names = {"maintenance_graph"};
+    cache.segments.back().capture = std::make_unique<FakeReplayGraphCapture>();
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        nullptr,
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/false,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/11,
+        hooks,
+        /*force_recapture=*/false,
+        /*defer_final_sync=*/true);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(gpu_ctx.synchronize_stream_checked_calls_, 0)
+        << "Deferred CUDA replay must not synchronize the captured segment; "
+           "callers order completion through stream/event dependencies.";
+    EXPECT_EQ(gpu_ctx.synchronize_stream_calls_, 0);
+    EXPECT_EQ(gpu_ctx.events_synchronized_, 0);
+
+    const auto records = PerfStatsCollector::snapshot({"forward_graph"});
+    const PerfStatsCollector::Tags deferred_tags = {
+        {"context", "moe_rebalance_maintenance"},
+        {"graph_count", "1"},
+        {"stage_count", "1"},
+        {"type", "capturable"}};
+    EXPECT_DOUBLE_EQ(findCounterValue(
+                         records,
+                         "full_graph_replay_final_sync_deferred",
+                         deferred_tags),
+                     1.0);
+
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDoesNotDeferFinalSyncByDefault)
 {
     ScopedEnvVar disable_collective_defer("LLAMINAR_GPU_GRAPH_DEFER_CAPTURED_COLLECTIVE_FINAL_SYNC", "0");

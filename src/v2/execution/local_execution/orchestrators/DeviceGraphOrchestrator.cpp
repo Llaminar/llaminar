@@ -44,6 +44,7 @@
 #include "../../moe/ExpertWeightTransfer.h"
 #include "../../moe/ExpertWeightPayloadProvider.h"
 #include "../../moe/GpuExpertTransferStagingPool.h"
+#include "../../moe/MoEDeviceRebalanceHostRendezvous.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../loaders/WeightPlan.h"
 #include "../../../backends/BackendManager.h"
@@ -164,7 +165,6 @@ namespace llaminar2
 
         void recordMoERebalanceTransferStreamPaths(
             const ComputeGraph *graph,
-            DeviceId device_id,
             const std::string &device_key,
             const PerfStatsCollector::Tags &base_tags)
         {
@@ -194,9 +194,7 @@ namespace llaminar2
                 tags["stage"] = params.stage_name.empty() ? node_name : params.stage_name;
                 tags["phase"] = std::to_string(static_cast<uint32_t>(params.phase));
                 tags["transfer_mode"] = std::to_string(static_cast<uint32_t>(params.transfer_mode));
-                tags["path"] = device_id.is_rocm()
-                                   ? "stage_stream_fallback"
-                                   : "auxiliary_stream";
+                tags["path"] = "auxiliary_stream";
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
                     "device_rebalance_transfer_stream_path",
@@ -386,6 +384,7 @@ namespace llaminar2
             appendJsonNumberField(out, config_first, "min_load_spread_improvement", params.config.min_load_spread_improvement);
             appendJsonNumberField(out, config_first, "min_load_spread_improvement_divisor", params.config.min_load_spread_improvement_divisor);
             appendJsonNumberField(out, config_first, "min_wave_spread_improvement_per_payload_slot", params.config.min_wave_spread_improvement_per_payload_slot);
+            appendJsonNumberField(out, config_first, "min_foreign_rows_per_transfer", params.config.min_foreign_rows_per_transfer);
             appendJsonNumberField(out, config_first, "min_router_spread_improvement_per_payload_slot", params.config.min_router_spread_improvement_per_payload_slot);
             appendJsonNumberField(out, config_first, "max_post_wave_load_spread_per_mille", params.config.max_post_wave_load_spread_per_mille);
             out << '}';
@@ -410,10 +409,22 @@ namespace llaminar2
             appendJsonNumberField(out, status_first, "candidate_arrivals_considered", status.candidate_arrivals_considered);
             appendJsonNumberField(out, status_first, "candidate_arrivals_below_floor", status.candidate_arrivals_below_floor);
             appendJsonNumberField(out, status_first, "candidate_arrivals_pruned_by_count_bound", status.candidate_arrivals_pruned_by_count_bound);
+            appendJsonNumberField(out, status_first, "llep_assignment_span_count", status.llep_assignment_span_count);
+            appendJsonNumberField(out, status_first, "llep_weight_transfer_count", status.llep_weight_transfer_count);
+            appendJsonNumberField(out, status_first, "llep_standard_ep_selected", status.llep_standard_ep_selected);
+            appendJsonNumberField(out, status_first, "llep_skipped_balanced", status.llep_skipped_balanced);
+            appendJsonNumberField(out, status_first, "llep_skipped_insufficient_spread_improvement", status.llep_skipped_insufficient_spread_improvement);
+            appendJsonNumberField(out, status_first, "llep_skipped_insufficient_foreign_rows", status.llep_skipped_insufficient_foreign_rows);
+            appendJsonNumberField(out, status_first, "llep_min_chunk_skips", status.llep_min_chunk_skips);
+            appendJsonNumberField(out, status_first, "llep_forced_spills", status.llep_forced_spills);
             appendJsonNumberField(out, status_first, "candidate_load_spread_improvement_total", status.candidate_load_spread_improvement_total);
             appendJsonNumberField(out, status_first, "candidate_load_spread_improvement_max", status.candidate_load_spread_improvement_max);
             appendJsonNumberField(out, status_first, "accepted_load_spread_improvement_total", status.accepted_load_spread_improvement_total);
             appendJsonNumberField(out, status_first, "accepted_load_spread_improvement_max", status.accepted_load_spread_improvement_max);
+            appendJsonNumberField(out, status_first, "llep_native_rows", status.llep_native_rows);
+            appendJsonNumberField(out, status_first, "llep_spilled_rows", status.llep_spilled_rows);
+            appendJsonNumberField(out, status_first, "llep_required_spread_improvement", status.llep_required_spread_improvement);
+            appendJsonNumberField(out, status_first, "llep_required_foreign_rows", status.llep_required_foreign_rows);
             appendJsonNumberField(out, status_first, "router_hot_cache_eligible_dispatches", status.router_hot_cache_eligible_dispatches);
             appendJsonNumberField(out, status_first, "router_hot_cache_used_dispatches", status.router_hot_cache_used_dispatches);
             appendJsonNumberField(out, status_first, "router_hot_cache_improved_dispatches", status.router_hot_cache_improved_dispatches);
@@ -4113,6 +4124,8 @@ namespace llaminar2
             std::to_string(params.config.min_load_spread_improvement_divisor);
         tags["min_wave_spread_improvement_per_payload_slot"] =
             std::to_string(params.config.min_wave_spread_improvement_per_payload_slot);
+        tags["min_foreign_rows_per_transfer"] =
+            std::to_string(params.config.min_foreign_rows_per_transfer);
         tags["min_router_spread_improvement_per_payload_slot"] =
             std::to_string(params.config.min_router_spread_improvement_per_payload_slot);
         tags["max_post_wave_load_spread_per_mille"] =
@@ -4203,6 +4216,22 @@ namespace llaminar2
                  status.candidate_arrivals_below_floor);
         emit_u32("device_rebalance_candidate_arrivals_pruned_by_count_bound",
                  status.candidate_arrivals_pruned_by_count_bound);
+        emit_u32("device_rebalance_llep_assignment_span_count",
+                 status.llep_assignment_span_count);
+        emit_u32("device_rebalance_llep_weight_transfer_count",
+                 status.llep_weight_transfer_count);
+        emit_u32("device_rebalance_llep_standard_ep_selected",
+                 status.llep_standard_ep_selected);
+        emit_u32("device_rebalance_llep_skipped_balanced",
+                 status.llep_skipped_balanced);
+        emit_u32("device_rebalance_llep_skipped_insufficient_spread_improvement",
+                 status.llep_skipped_insufficient_spread_improvement);
+        emit_u32("device_rebalance_llep_skipped_insufficient_foreign_rows",
+                 status.llep_skipped_insufficient_foreign_rows);
+        emit_u32("device_rebalance_llep_min_chunk_skips",
+                 status.llep_min_chunk_skips);
+        emit_u32("device_rebalance_llep_forced_spills",
+                 status.llep_forced_spills);
         emit_u64("device_rebalance_candidate_load_spread_improvement_total",
                  status.candidate_load_spread_improvement_total);
         emit_u64("device_rebalance_candidate_load_spread_improvement_max",
@@ -4211,6 +4240,14 @@ namespace llaminar2
                  status.accepted_load_spread_improvement_total);
         emit_u64("device_rebalance_accepted_load_spread_improvement_max",
                  status.accepted_load_spread_improvement_max);
+        emit_u64("device_rebalance_llep_native_rows",
+                 status.llep_native_rows);
+        emit_u64("device_rebalance_llep_spilled_rows",
+                 status.llep_spilled_rows);
+        emit_u64("device_rebalance_llep_required_spread_improvement",
+                 status.llep_required_spread_improvement);
+        emit_u64("device_rebalance_llep_required_foreign_rows",
+                 status.llep_required_foreign_rows);
         emit_u64("device_rebalance_post_wave_load_total",
                  status.post_wave_load_total);
         emit_u64("device_rebalance_post_wave_load_spread",
@@ -4542,6 +4579,12 @@ namespace llaminar2
         emit_double("device_rebalance_post_wave_load_spread_fraction",
                     safe_ratio(status.post_wave_load_spread,
                                status.post_wave_load_total));
+        emit_double("device_rebalance_llep_spilled_row_ratio",
+                    safe_ratio(status.llep_spilled_rows,
+                               status.llep_native_rows + status.llep_spilled_rows));
+        emit_double("device_rebalance_llep_spilled_rows_per_transfer",
+                    safe_ratio(status.llep_spilled_rows,
+                               status.llep_weight_transfer_count));
         emit_double("device_rebalance_router_hot_cache_spread_improvement_ratio",
                     safe_ratio(status.router_hot_cache_load_spread_improvement_total,
                                status.router_hot_cache_default_load_spread_total));
@@ -5028,6 +5071,79 @@ namespace llaminar2
         if (!gpu_ctx)
             return false;
 
+        auto resolve_maintenance_tp_ctx =
+            [&](const DeviceMoERebalanceMaintenanceGraphCache &target_cache,
+                const char *kind) -> const ILocalTPContext *
+        {
+            if (!target_cache.graph)
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance " << kind
+                                                        << " maintenance graph is in-flight without a graph for "
+                                                        << device_key);
+                return nullptr;
+            }
+            for (const auto &node_name : target_cache.graph->getExecutionOrder())
+            {
+                const ComputeNode *node = target_cache.graph->getNode(node_name);
+                if (!node || !node->stage)
+                    continue;
+                const auto *rebalance_stage =
+                    dynamic_cast<const MoEDeviceRebalanceStage *>(node->stage.get());
+                if (!rebalance_stage)
+                    continue;
+                const ILocalTPContext *tp_ctx = rebalance_stage->getParams().tp_ctx;
+                if (tp_ctx)
+                    return tp_ctx;
+            }
+            LOG_ERROR("[DGO] Device MoE rebalance " << kind
+                                                    << " maintenance graph could not resolve its collective lane for "
+                                                    << device_key);
+            return nullptr;
+        };
+
+        auto maintenance_rendezvous_timeout_ms =
+            [&]() -> int
+        {
+            int timeout_ms = collective_timeout_policy::effectiveCollectTimeoutMs(
+                env.tp_collect_timeout_ms,
+                /*cold_start_completed=*/false);
+            if (timeout_ms <= 0)
+                timeout_ms = collective_timeout_policy::kColdStartCollectTimeoutMs;
+            return timeout_ms;
+        };
+
+        auto rendezvous_completion_readiness =
+            [&](DeviceMoERebalanceMaintenanceGraphCache &target_cache,
+                const char *kind,
+                uint64_t operation_key,
+                bool local_ready,
+                MoEDeviceRebalanceHostRendezvous::ReadinessDecision &decision) -> bool
+        {
+            const ILocalTPContext *maintenance_tp_ctx =
+                resolve_maintenance_tp_ctx(target_cache, kind);
+            if (!maintenance_tp_ctx)
+                return false;
+
+            std::string rendezvous_error;
+            if (!MoEDeviceRebalanceHostRendezvous::rendezvousCompletionReadiness(
+                    static_cast<const void *>(maintenance_tp_ctx),
+                    target_cache.launch_count,
+                    operation_key,
+                    static_cast<size_t>(maintenance_tp_ctx->degree()),
+                    device_key,
+                    local_ready,
+                    maintenance_rendezvous_timeout_ms(),
+                    &decision,
+                    &rendezvous_error))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance " << kind
+                                                        << " maintenance completion readiness rendezvous failed for "
+                                                        << device_key << ": " << rendezvous_error);
+                return false;
+            }
+            return true;
+        };
+
         for (auto &[edge_mask, payload_cache] :
              device_moe_rebalance_maintenance_payload_graphs_)
         {
@@ -5054,7 +5170,17 @@ namespace llaminar2
                     return false;
                 }
             }
-            if (!previous_payload_ready)
+            MoEDeviceRebalanceHostRendezvous::ReadinessDecision payload_readiness;
+            if (!rendezvous_completion_readiness(
+                    payload_cache,
+                    "metadata_payload",
+                    edge_mask,
+                    previous_payload_ready,
+                    payload_readiness))
+            {
+                return false;
+            }
+            if (!payload_readiness.all_ready)
             {
                 ++payload_cache.skipped_inflight_count;
                 PerfStatsCollector::Tags skip_tags;
@@ -5068,6 +5194,11 @@ namespace llaminar2
                 skip_tags["skipped_inflight_count"] =
                     std::to_string(payload_cache.skipped_inflight_count);
                 skip_tags["maintenance_graph_kind"] = "metadata_payload";
+                skip_tags["local_completion_ready"] = boolTag(previous_payload_ready);
+                skip_tags["domain_completion_ready_count"] =
+                    std::to_string(payload_readiness.ready_count);
+                skip_tags["domain_completion_participant_count"] =
+                    std::to_string(payload_readiness.participant_count);
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
                     "device_maintenance_payload_graph_skipped_inflight",
@@ -5121,7 +5252,17 @@ namespace llaminar2
                     return false;
                 }
             }
-            if (!previous_wave_ready)
+            MoEDeviceRebalanceHostRendezvous::ReadinessDecision probe_readiness;
+            if (!rendezvous_completion_readiness(
+                    cache,
+                    "probe",
+                    /*operation_key=*/0,
+                    previous_wave_ready,
+                    probe_readiness))
+            {
+                return false;
+            }
+            if (!probe_readiness.all_ready)
             {
                 ++cache.skipped_inflight_count;
                 PerfStatsCollector::addCounter(
@@ -5132,7 +5273,10 @@ namespace llaminar2
                     device_key,
                     {{"window", std::to_string(window)},
                      {"launch_count", std::to_string(cache.launch_count)},
-                     {"skipped_inflight_count", std::to_string(cache.skipped_inflight_count)}});
+                     {"skipped_inflight_count", std::to_string(cache.skipped_inflight_count)},
+                     {"local_completion_ready", boolTag(previous_wave_ready)},
+                     {"domain_completion_ready_count", std::to_string(probe_readiness.ready_count)},
+                     {"domain_completion_participant_count", std::to_string(probe_readiness.participant_count)}});
                 return true;
             }
 
@@ -5149,21 +5293,56 @@ namespace llaminar2
             {
                 return false;
             }
+
+            const ILocalTPContext *maintenance_tp_ctx =
+                resolve_maintenance_tp_ctx(cache, "probe");
+            if (!maintenance_tp_ctx)
+                return false;
+
+            MoEDeviceRebalanceHostRendezvous::PayloadDecision domain_decision;
+            std::string rendezvous_error;
+
+            if (!MoEDeviceRebalanceHostRendezvous::rendezvousProbeOutcome(
+                    static_cast<const void *>(maintenance_tp_ctx),
+                    cache.launch_count,
+                    static_cast<size_t>(maintenance_tp_ctx->degree()),
+                    device_key,
+                    MoEDeviceRebalanceHostRendezvous::ProbeOutcome{
+                        outcome.valid,
+                        outcome.useful_work,
+                        outcome.status_code,
+                        outcome.payload_bucket_slots,
+                        outcome.payload_edge_mask},
+                    maintenance_rendezvous_timeout_ms(),
+                    &domain_decision,
+                    &rendezvous_error))
+            {
+                LOG_ERROR("[DGO] Device MoE rebalance maintenance probe outcome rendezvous failed for "
+                          << device_key << ": " << rendezvous_error);
+                return false;
+            }
+
             launch_metadata_payload_graph =
-                outcome.valid &&
-                outcome.status_code ==
-                    static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
-                outcome.payload_bucket_slots != 0u;
+                domain_decision.launchPayloadGraph();
             pending_payload_edge_mask = launch_metadata_payload_graph
-                                            ? outcome.payload_edge_mask
+                                            ? domain_decision.payload_edge_mask
                                             : 0ULL;
-            if (outcome.valid && !outcome.useful_work)
+            if (domain_decision.valid && !domain_decision.useful_work)
             {
                 ++cache.no_work_backoff_streak;
                 const int configured_backoff =
                     std::max(0, env.moe_rebalance.device_rebalance_no_work_backoff_periods);
+                const uint64_t effective_backoff =
+                    configured_backoff == 0
+                        ? 0ULL
+                        : static_cast<uint64_t>(configured_backoff) *
+                              std::max<uint64_t>(
+                                  1ULL,
+                                  std::min<uint64_t>(
+                                      cache.no_work_backoff_streak,
+                                      8ULL));
                 cache.no_work_backoff_remaining =
-                    static_cast<uint64_t>(configured_backoff);
+                    effective_backoff;
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
                     "device_maintenance_graph_no_work_completions",
@@ -5173,14 +5352,15 @@ namespace llaminar2
                     {{"window", std::to_string(window)},
                      {"launch_count", std::to_string(cache.launch_count)},
                      {"no_work_backoff_periods", std::to_string(configured_backoff)},
+                     {"no_work_backoff_effective_periods", std::to_string(effective_backoff)},
                      {"no_work_backoff_streak", std::to_string(cache.no_work_backoff_streak)},
-                     {"status_code", std::to_string(outcome.status_code)},
+                     {"status_code", std::to_string(domain_decision.status_code)},
                      {"windows_applied", std::to_string(outcome.windows_applied)},
                      {"selected_replicas", std::to_string(outcome.selected_replicas)},
                      {"planned_arrivals", std::to_string(outcome.planned_arrivals)},
-                     {"payload_bucket_slots", std::to_string(outcome.payload_bucket_slots)}});
+                     {"payload_bucket_slots", std::to_string(domain_decision.payload_bucket_slots)}});
             }
-            else if (outcome.valid)
+            else if (domain_decision.valid)
             {
                 cache.no_work_backoff_streak = 0;
                 cache.no_work_backoff_remaining = 0;
@@ -5342,7 +5522,6 @@ namespace llaminar2
 
         recordMoERebalanceTransferStreamPaths(
             active_cache.graph.get(),
-            state_.device_id,
             device_key,
             maintenance_tags);
 
@@ -5408,12 +5587,23 @@ namespace llaminar2
         bool used_graph_replay = false;
         bool ok = false;
         {
+            auto replay_tags = maintenance_tags;
+            replay_tags["maintenance_graph_kind"] = active_kind_name;
+            if (launch_metadata_payload_graph && pending_payload_edge_mask != 0ULL)
+            {
+                replay_tags["payload_edge_mask_low32"] =
+                    std::to_string(static_cast<uint32_t>(
+                        pending_payload_edge_mask & 0xffffffffULL));
+                replay_tags["payload_edge_mask_high32"] =
+                    std::to_string(static_cast<uint32_t>(
+                        pending_payload_edge_mask >> 32u));
+            }
             PerfStatsCollector::ScopedTimer replay_timer(
                 "moe_rebalance",
                 "device_maintenance_graph_replay_enqueue",
                 "decode",
                 device_key,
-                maintenance_tags);
+                std::move(replay_tags));
             ok = tryLaunchCapturedMoERebalanceMaintenanceGraphDirect(
                 active_cache.segment_cache,
                 ctx,

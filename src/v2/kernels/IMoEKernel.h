@@ -906,6 +906,29 @@ namespace llaminar2
         }
 
         /**
+         * @brief Materialize current-batch LLEP weight-transfer requirements
+         *        into the standard rebalance command buffer ABI.
+         *
+         * planPrefillRoutesLeastLoadedCurrentBatch() writes Algorithm-4 style
+         * expert-weight transfers into DeviceMoELayerRuntime::reserved_ptrs[2].
+         * This graph-capturable bridge converts those records into
+         * ExpertPayloadArrival commands so the existing compact payload
+         * movement path can stage/import them. It must not rewrite router top-k
+         * choices or perform host readback.
+         */
+        virtual bool materializePrefillLeastLoadedTransferCommands(
+            const DeviceMoELayerRuntime *runtime_layer,
+            DeviceMoERebalancePlanEntry *plan_entries,
+            uint32_t *plan_count,
+            uint32_t plan_capacity,
+            DeviceMoERebalanceCommandBufferHeader *command_header,
+            DeviceMoERebalanceStatus *status,
+            const DeviceMoERebalanceConfig &config,
+            uint32_t payload_slot_capacity,
+            uint32_t layer_idx,
+            uint32_t command_buffer_count = 1);
+
+        /**
          * @brief Pack compact planned-arrival payload slots for a grouped collective.
          *
          * The source descriptor buffer is produced by
@@ -1278,6 +1301,53 @@ namespace llaminar2
             (void)top_k;
             return false;
         }
+
+        /**
+         * @brief Plan full current-batch LLEP route spans without changing top-k.
+         *
+         * This graph-capturable planner materializes Algorithm-4 style
+         * assignment spans and expert-weight transfer requirements into
+         * DeviceMoELayerRuntime::reserved_ptrs[1..2]. It does not execute the
+         * token/weight exchange and must not rewrite route_participant_ids:
+         * callers may consume the plan only through a transfer-aware grouped
+         * collective path.
+         */
+        virtual bool planPrefillRoutesLeastLoadedCurrentBatch(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k,
+            const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config);
+
+        /**
+         * @brief Apply a previously materialized current-batch LLEP plan only
+         * when it does not require missing expert-weight transfers.
+         *
+         * This is the guarded execution bridge for already-resident plans. It
+         * rewrites only route_participant_ids from reserved_ptrs[1] spans and
+         * preserves router-selected expert ids/weights. If reserved_u64[3]
+         * reports any required weight transfers, the kernel deliberately leaves
+         * executable route assignments unchanged; the full transfer-aware path
+         * must import those expert payloads before applying foreign spans.
+         */
+        virtual bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k);
+
+        /**
+         * @brief Apply current-batch LLEP spans after required expert movement
+         * has been staged into the runtime table.
+         *
+         * Unlike the zero-transfer guard above, this method is allowed to
+         * consume spans whose destination participant required an expert
+         * arrival. Callers must only invoke it after the transfer/arrival path
+         * has populated the destination descriptors. It still preserves router
+         * top-k expert ids and weights; only route_participant_ids are balanced.
+         */
+        virtual bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k);
 
         /**
          * @brief Gather one expert's fixed-capacity prefill batch from runtime grouping.

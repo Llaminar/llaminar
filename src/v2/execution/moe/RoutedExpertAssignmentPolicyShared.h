@@ -99,6 +99,7 @@ namespace llaminar2::routed_expert_assignment
                     expert,
                     owner,
                     owner,
+                    owner < 32u ? (1u << owner) : 0u,
                     0ULL,
                     load,
                     false))

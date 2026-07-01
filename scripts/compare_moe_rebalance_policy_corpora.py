@@ -54,6 +54,20 @@ FEATURE_FIELDS = (
     "candidate_improvement",
     "candidate_improvement_max",
     "candidate_below_floor",
+    "llep_assignment_spans",
+    "llep_weight_transfers",
+    "llep_native_rows",
+    "llep_spilled_rows",
+    "llep_spilled_row_ratio",
+    "llep_spilled_rows_per_transfer",
+    "llep_standard_ep_selected",
+    "llep_skipped_balanced",
+    "llep_skipped_insufficient_spread_improvement",
+    "llep_skipped_insufficient_foreign_rows",
+    "llep_min_chunk_skips",
+    "llep_forced_spills",
+    "llep_required_spread_improvement",
+    "llep_required_foreign_rows",
     "selected_replicas",
     "command_entries",
     "pre_policy_load_total",
@@ -83,6 +97,9 @@ DERIVED_FEATURE_FIELDS = (
     "apply_multi_resident_per_transfer",
     "accepted_improvement_per_transfer",
     "accepted_improvement_per_command",
+    "llep_spans_per_weight_transfer",
+    "llep_spilled_rows_per_span",
+    "llep_spilled_rows_per_planned_arrival",
     "router_miss_rate",
     "router_eligible_rate",
     "router_use_rate_active",
@@ -282,6 +299,7 @@ def build_feature_label_rows(
             continue
 
         transfer_arrivals = numeric_value(features, "transfer_arrivals")
+        planned_arrivals = numeric_value(features, "planned_arrivals")
         resident_replicas = numeric_value(features, "resident_replicas")
         command_entries = numeric_value(features, "command_entries")
         apply_multi_resident = numeric_value(
@@ -298,6 +316,9 @@ def build_feature_label_rows(
             "router_replicated_selected_slots",
         )
         accepted_improvement = numeric_value(features, "accepted_improvement")
+        llep_assignment_spans = numeric_value(features, "llep_assignment_spans")
+        llep_weight_transfers = numeric_value(features, "llep_weight_transfers")
+        llep_spilled_rows = numeric_value(features, "llep_spilled_rows")
         router_spread_improvement = numeric_value(features, "router_spread_improvement")
         pre_policy_load_spread = numeric_value(features, "pre_policy_load_spread")
         post_policy_load_spread = numeric_value(features, "post_policy_load_spread")
@@ -338,6 +359,18 @@ def build_feature_label_rows(
         row["accepted_improvement_per_command"] = ratio(
             accepted_improvement,
             max(command_entries, 1.0),
+        )
+        row["llep_spans_per_weight_transfer"] = ratio(
+            llep_assignment_spans,
+            llep_weight_transfers,
+        )
+        row["llep_spilled_rows_per_span"] = ratio(
+            llep_spilled_rows,
+            llep_assignment_spans,
+        )
+        row["llep_spilled_rows_per_planned_arrival"] = ratio(
+            llep_spilled_rows,
+            planned_arrivals,
         )
         row["router_miss_rate"] = ratio(router_miss, router_active)
         row["router_eligible_rate"] = ratio(router_eligible, router_active)

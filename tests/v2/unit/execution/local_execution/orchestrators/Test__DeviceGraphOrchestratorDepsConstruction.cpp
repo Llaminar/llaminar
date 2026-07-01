@@ -288,6 +288,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", nullptr},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", nullptr},
@@ -299,6 +300,8 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 0);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 256)
         << "The wave-level value gate should reject low-value hot-cache transfer churn by default.";
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_foreign_rows_per_transfer, 0)
+        << "The useful-work gate should be available for sweeps without changing existing policy by default.";
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 128)
         << "Steady-state hot-replica transfer waves should require measured realized router benefit by default.";
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille, 100)
@@ -313,6 +316,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "96"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", "12"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "192"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER", "768"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "384"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", "75"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS", "3"},
@@ -322,6 +326,8 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 12);
     EXPECT_TRUE(debugEnv().presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"));
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 192);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_foreign_rows_per_transfer, 768);
+    EXPECT_TRUE(debugEnv().presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER"));
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 384);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille, 75);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_no_work_backoff_periods, 3);

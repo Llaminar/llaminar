@@ -326,7 +326,14 @@ namespace llaminar2
                state.expert_counts &&
                state.expert_offsets &&
                state.grouped_token_ids &&
-               state.grouped_route_weights;
+               state.grouped_route_weights &&
+               state.reserved_ptrs[0] &&
+               state.reserved_ptrs[1] &&
+               state.reserved_ptrs[2] &&
+               state.reserved_u64[0] >=
+                   static_cast<uint64_t>(num_experts_) * static_cast<uint64_t>(kDeviceMoEMaxParticipants) &&
+               state.reserved_u64[1] >=
+                   static_cast<uint64_t>(num_experts_) * static_cast<uint64_t>(kDeviceMoEMaxParticipants);
     }
 
     void DeviceMoERuntimeTable::recordDecodeHistogramProducerStream(void *stream)
@@ -538,6 +545,12 @@ namespace llaminar2
             state.grouped_token_ids = scratch.grouped_token_ids;
             state.grouped_route_weights = scratch.grouped_route_weights;
             state.reserved_ptrs[0] = scratch.llep_split_ends;
+            state.reserved_ptrs[1] = scratch.llep_assignment_spans;
+            state.reserved_ptrs[2] = scratch.llep_weight_transfers;
+            state.reserved_u64[0] = scratch.llep_plan_capacity;
+            state.reserved_u64[1] = scratch.llep_plan_capacity;
+            state.reserved_u64[2] = 0;
+            state.reserved_u64[3] = 0;
             state.prefill_token_capacity = scratch.token_capacity;
             state.prefill_route_capacity = scratch.route_capacity;
         }
@@ -725,7 +738,11 @@ namespace llaminar2
                allocation.expert_offsets &&
                allocation.grouped_token_ids &&
                allocation.grouped_route_weights &&
-               allocation.llep_split_ends;
+               allocation.llep_split_ends &&
+               allocation.llep_assignment_spans &&
+               allocation.llep_weight_transfers &&
+               allocation.llep_plan_capacity >=
+                   static_cast<uint32_t>(num_experts_) * kDeviceMoEMaxParticipants;
     }
 
     void DeviceMoERuntimeTable::allocatePrefillRouteScratchForLayer(int layer_idx, int token_capacity)
@@ -761,6 +778,10 @@ namespace llaminar2
                 freeMirror(device_id_, scratch.grouped_route_weights, layerPrefix(layer_idx) + "free prefill grouped_route_weights");
             if (scratch.llep_split_ends)
                 freeMirror(device_id_, scratch.llep_split_ends, layerPrefix(layer_idx) + "free prefill llep_split_ends");
+            if (scratch.llep_assignment_spans)
+                freeMirror(device_id_, scratch.llep_assignment_spans, layerPrefix(layer_idx) + "free prefill llep_assignment_spans");
+            if (scratch.llep_weight_transfers)
+                freeMirror(device_id_, scratch.llep_weight_transfers, layerPrefix(layer_idx) + "free prefill llep_weight_transfers");
             scratch = {};
         };
 
@@ -776,6 +797,8 @@ namespace llaminar2
 
         try
         {
+            const size_t llep_plan_capacity =
+                static_cast<size_t>(num_experts_) * static_cast<size_t>(kDeviceMoEMaxParticipants);
             allocate(&allocation.route_expert_ids, route_capacity, "prefill route_expert_ids");
             allocate(&allocation.route_weights, route_capacity, "prefill route_weights");
             allocate(&allocation.route_participant_ids, route_capacity, "prefill route_participant_ids");
@@ -786,6 +809,12 @@ namespace llaminar2
             allocate(&allocation.llep_split_ends,
                      static_cast<size_t>(num_experts_) * static_cast<size_t>(kDeviceMoEMaxParticipants),
                      "prefill llep_split_ends");
+            allocate(&allocation.llep_assignment_spans,
+                     llep_plan_capacity,
+                     "prefill llep_assignment_spans");
+            allocate(&allocation.llep_weight_transfers,
+                     llep_plan_capacity,
+                     "prefill llep_weight_transfers");
         }
         catch (...)
         {
@@ -796,6 +825,9 @@ namespace llaminar2
         allocation.token_capacity = static_cast<uint32_t>(token_capacity);
         allocation.route_capacity = route_capacity;
         allocation.expert_capacity = static_cast<uint32_t>(num_experts_);
+        allocation.llep_plan_capacity =
+            static_cast<uint32_t>(static_cast<size_t>(num_experts_) *
+                                  static_cast<size_t>(kDeviceMoEMaxParticipants));
 
         auto &state = host_layers_[static_cast<size_t>(layer_idx)];
         state.route_expert_ids = allocation.route_expert_ids;
@@ -806,6 +838,12 @@ namespace llaminar2
         state.grouped_token_ids = allocation.grouped_token_ids;
         state.grouped_route_weights = allocation.grouped_route_weights;
         state.reserved_ptrs[0] = allocation.llep_split_ends;
+        state.reserved_ptrs[1] = allocation.llep_assignment_spans;
+        state.reserved_ptrs[2] = allocation.llep_weight_transfers;
+        state.reserved_u64[0] = allocation.llep_plan_capacity;
+        state.reserved_u64[1] = allocation.llep_plan_capacity;
+        state.reserved_u64[2] = 0;
+        state.reserved_u64[3] = 0;
         state.prefill_token_capacity = allocation.token_capacity;
         state.prefill_route_capacity = allocation.route_capacity;
     }
@@ -832,6 +870,10 @@ namespace llaminar2
                 freeMirror(device_id_, allocation.grouped_route_weights, "[MoERuntimeTable] free prefill grouped_route_weights");
             if (allocation.llep_split_ends)
                 freeMirror(device_id_, allocation.llep_split_ends, "[MoERuntimeTable] free prefill llep_split_ends");
+            if (allocation.llep_assignment_spans)
+                freeMirror(device_id_, allocation.llep_assignment_spans, "[MoERuntimeTable] free prefill llep_assignment_spans");
+            if (allocation.llep_weight_transfers)
+                freeMirror(device_id_, allocation.llep_weight_transfers, "[MoERuntimeTable] free prefill llep_weight_transfers");
             allocation = {};
         }
         prefill_route_scratch_.clear();

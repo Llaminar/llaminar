@@ -35,6 +35,7 @@ namespace llaminar2::least_loaded_ep
         uint64_t min_spread_improvement = 0;
         uint32_t min_spread_improvement_divisor = 0;
         uint64_t min_spread_improvement_per_transfer = 0;
+        uint64_t min_foreign_rows_per_transfer = 0;
         bool enable_balanced_skip = true;
     };
 
@@ -78,6 +79,7 @@ namespace llaminar2::least_loaded_ep
         uint64_t assigned_load_spread = 0;
         uint64_t assigned_load_spread_improvement = 0;
         uint64_t required_spread_improvement = 0;
+        uint64_t required_foreign_rows = 0;
         uint64_t native_rows = 0;
         uint64_t spilled_rows = 0;
         uint32_t span_count = 0;
@@ -88,6 +90,7 @@ namespace llaminar2::least_loaded_ep
         uint32_t invalid_config = 0;
         uint32_t skipped_balanced = 0;
         uint32_t skipped_insufficient_spread_improvement = 0;
+        uint32_t skipped_insufficient_foreign_rows = 0;
         uint32_t standard_ep_selected = 0;
     };
 
@@ -194,6 +197,31 @@ namespace llaminar2::least_loaded_ep
         if (transfer_component > (~0ULL) - base)
             return ~0ULL;
         return base + transfer_component;
+    }
+
+    LLAMINAR_LLEP_HD uint64_t requiredForeignRows(
+        const LeastLoadedExpertAssignmentConfig &config,
+        uint32_t transfer_count) noexcept
+    {
+        return saturatedMul(
+            static_cast<uint64_t>(transfer_count),
+            config.min_foreign_rows_per_transfer);
+    }
+
+    LLAMINAR_LLEP_HD void selectStandardEP(
+        LeastLoadedExpertAssignmentStatus &status) noexcept
+    {
+        status.span_count = 0u;
+        status.weight_transfer_count = 0u;
+        status.native_rows = 0ULL;
+        status.spilled_rows = 0ULL;
+        status.min_chunk_skips = 0u;
+        status.forced_spills = 0u;
+        status.assigned_load_min = status.standard_load_min;
+        status.assigned_load_max = status.standard_load_max;
+        status.assigned_load_spread = status.standard_load_spread;
+        status.assigned_load_spread_improvement = 0ULL;
+        status.standard_ep_selected = 1u;
     }
 
     LLAMINAR_LLEP_HD uint32_t participantMaskLimit(uint32_t participant_count) noexcept
@@ -454,6 +482,13 @@ namespace llaminar2::least_loaded_ep
         return true;
     }
 
+    LLAMINAR_LLEP_HD void countConceptualAssignmentSpan(
+        LeastLoadedExpertAssignmentStatus &status) noexcept
+    {
+        if (status.span_count != ~0u)
+            ++status.span_count;
+    }
+
     LLAMINAR_LLEP_HD bool appendAssignmentSpan(
         LeastLoadedExpertAssignmentSpan *spans,
         uint32_t span_capacity,
@@ -463,6 +498,7 @@ namespace llaminar2::least_loaded_ep
         uint32_t expert,
         uint32_t owner_participant,
         uint32_t destination_participant,
+        uint32_t resident_participant_mask,
         uint64_t begin,
         uint64_t end,
         bool forced) noexcept
@@ -475,7 +511,12 @@ namespace llaminar2::least_loaded_ep
             return false;
         }
 
-        const bool foreign = destination_participant != owner_participant;
+        uint32_t resident_mask = resident_participant_mask;
+        if (owner_participant < 32u)
+            resident_mask |= (1u << owner_participant);
+        const bool foreign =
+            destination_participant >= 32u ||
+            (resident_mask & (1u << destination_participant)) == 0u;
         spans[status.span_count++] = LeastLoadedExpertAssignmentSpan{
             expert,
             owner_participant,
@@ -539,6 +580,7 @@ namespace llaminar2::least_loaded_ep
         const LeastLoadedExpertAssignmentWorkspace &workspace,
         uint32_t expert,
         uint32_t owner_participant,
+        uint32_t resident_participant_mask,
         uint64_t remaining_rows,
         uint64_t route_row_offset) noexcept
     {
@@ -601,6 +643,7 @@ namespace llaminar2::least_loaded_ep
                         expert,
                         owner_participant,
                         best,
+                        resident_participant_mask,
                         route_row_offset,
                         route_row_offset + chunk,
                         false))
@@ -630,6 +673,7 @@ namespace llaminar2::least_loaded_ep
                         expert,
                         owner_participant,
                         forced_participant,
+                        resident_participant_mask,
                         route_row_offset,
                         route_row_offset + remaining_rows,
                         true))
@@ -655,7 +699,8 @@ namespace llaminar2::least_loaded_ep
         uint32_t span_capacity,
         LeastLoadedExpertWeightTransfer *transfers,
         uint32_t transfer_capacity,
-        LeastLoadedExpertAssignmentStatus *status_out) noexcept
+        LeastLoadedExpertAssignmentStatus *status_out,
+        const uint32_t *expert_resident_participant_masks = nullptr) noexcept
     {
         LeastLoadedExpertAssignmentStatus status{};
         if (status_out)
@@ -747,6 +792,12 @@ namespace llaminar2::least_loaded_ep
                 continue;
 
             const uint32_t owner = expert_owner_participants[expert];
+            uint32_t resident_mask =
+                expert_resident_participant_masks
+                    ? expert_resident_participant_masks[expert]
+                    : 0u;
+            if (owner < 32u)
+                resident_mask |= (1u << owner);
             workspace.pending_load[owner] =
                 workspace.pending_load[owner] >= load
                     ? workspace.pending_load[owner] - load
@@ -767,6 +818,7 @@ namespace llaminar2::least_loaded_ep
                         expert,
                         owner,
                         owner,
+                        resident_mask,
                         0ULL,
                         load,
                         false))
@@ -792,6 +844,7 @@ namespace llaminar2::least_loaded_ep
                         expert,
                         owner,
                         owner,
+                        resident_mask,
                         0ULL,
                         native_available,
                         false))
@@ -815,6 +868,7 @@ namespace llaminar2::least_loaded_ep
                     workspace,
                     expert,
                     owner,
+                    resident_mask,
                     remaining,
                     route_offset))
             {
@@ -839,18 +893,17 @@ namespace llaminar2::least_loaded_ep
         if (required_improvement > 0ULL &&
             status.assigned_load_spread_improvement < required_improvement)
         {
-            status.span_count = 0u;
-            status.weight_transfer_count = 0u;
-            status.native_rows = 0ULL;
-            status.spilled_rows = 0ULL;
-            status.min_chunk_skips = 0u;
-            status.forced_spills = 0u;
-            status.assigned_load_min = status.standard_load_min;
-            status.assigned_load_max = status.standard_load_max;
-            status.assigned_load_spread = status.standard_load_spread;
-            status.assigned_load_spread_improvement = 0ULL;
+            selectStandardEP(status);
             status.skipped_insufficient_spread_improvement = 1u;
-            status.standard_ep_selected = 1u;
+        }
+
+        const uint64_t required_rows =
+            requiredForeignRows(config, status.weight_transfer_count);
+        status.required_foreign_rows = required_rows;
+        if (required_rows > 0ULL && status.spilled_rows < required_rows)
+        {
+            selectStandardEP(status);
+            status.skipped_insufficient_foreign_rows = 1u;
         }
 
         if (status_out)
@@ -971,6 +1024,7 @@ namespace llaminar2::least_loaded_ep
             {
                 workspace.assigned_load[owner] += load;
                 status.native_rows += load;
+                countConceptualAssignmentSpan(status);
                 continue;
             }
 
@@ -979,6 +1033,7 @@ namespace llaminar2::least_loaded_ep
             {
                 workspace.assigned_load[owner] += native_available;
                 status.native_rows += native_available;
+                countConceptualAssignmentSpan(status);
                 remaining -= native_available;
             }
 
@@ -1046,6 +1101,7 @@ namespace llaminar2::least_loaded_ep
                     }
                     workspace.assigned_load[best] += chunk;
                     status.spilled_rows += chunk;
+                    countConceptualAssignmentSpan(status);
                     remaining -= chunk;
                     assigned = true;
                     break;
@@ -1072,6 +1128,7 @@ namespace llaminar2::least_loaded_ep
                     }
                     workspace.assigned_load[forced_participant] += remaining;
                     status.spilled_rows += remaining;
+                    countConceptualAssignmentSpan(status);
                     remaining = 0ULL;
                     ++status.forced_spills;
                 }
@@ -1093,17 +1150,17 @@ namespace llaminar2::least_loaded_ep
         if (required_improvement > 0ULL &&
             status.assigned_load_spread_improvement < required_improvement)
         {
-            status.weight_transfer_count = 0u;
-            status.native_rows = 0ULL;
-            status.spilled_rows = 0ULL;
-            status.min_chunk_skips = 0u;
-            status.forced_spills = 0u;
-            status.assigned_load_min = status.standard_load_min;
-            status.assigned_load_max = status.standard_load_max;
-            status.assigned_load_spread = status.standard_load_spread;
-            status.assigned_load_spread_improvement = 0ULL;
+            selectStandardEP(status);
             status.skipped_insufficient_spread_improvement = 1u;
-            status.standard_ep_selected = 1u;
+        }
+
+        const uint64_t required_rows =
+            requiredForeignRows(config, status.weight_transfer_count);
+        status.required_foreign_rows = required_rows;
+        if (required_rows > 0ULL && status.spilled_rows < required_rows)
+        {
+            selectStandardEP(status);
+            status.skipped_insufficient_foreign_rows = 1u;
         }
 
         if (status_out)

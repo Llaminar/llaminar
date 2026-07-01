@@ -4,7 +4,11 @@
  */
 
 #include "MoEExpertComputeStage.h"
+#include "MoEDeviceRebalanceStage.h"
 #include "../ComputeStageUtils.h"
+#include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../backends/IWorkerGPUContext.h"
+#include "../../../collective/ILocalTPContext.h"
 #include "../../../execution/moe/DecodeExpertHistogram.h"
 #include "../../../execution/moe/ExpertWeightTransfer.h"
 #include "../../../execution/moe/ExpertWeightPayloadProvider.h"
@@ -75,6 +79,25 @@ namespace llaminar2
         const char *perfBool(bool value)
         {
             return value ? "true" : "false";
+        }
+
+        std::string prefillLLEPWorkspaceBufferName(
+            const char *base_name,
+            const std::string &workspace_name)
+        {
+            return MoEDeviceRebalanceStage::workspaceBufferName(
+                base_name,
+                workspace_name.empty()
+                    ? std::string("moe_prefill_llep_transfer")
+                    : workspace_name);
+        }
+
+        uint32_t boundedU32(size_t value)
+        {
+            return static_cast<uint32_t>(
+                std::min<size_t>(
+                    value,
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
         }
 
         void markGpuTensorWritten(TensorBase *output, DeviceId device, void *stream)
@@ -3321,6 +3344,7 @@ namespace llaminar2
             params_.seq_len > 1 &&
             params_.use_runtime_prefill_grouping &&
             params_.moe_runtime_table &&
+            params_.prefill_llep_tp_ctx &&
             supportsGroupedPrefillExecutionBackend(params_.device_id);
         if (supports_llep_prefill)
             return true;
@@ -3582,6 +3606,285 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEExpertComputeStage::hasTransferBackedPrefillLLEP() const
+    {
+        if (params_.routed_expert_assignment_policy != RoutedExpertAssignmentPolicy::LeastLoadedEP ||
+            !params_.prefill_llep_tp_ctx ||
+            !params_.moe_runtime_table ||
+            !params_.prefill_llep_transfer_slots ||
+            params_.prefill_llep_transfer_slot_count == 0 ||
+            params_.prefill_llep_payload_slot_bytes == 0 ||
+            params_.prefill_llep_payload_slot_capacity == 0 ||
+            !params_.prefill_llep_transfer_state ||
+            params_.layer_idx < 0 ||
+            params_.seq_len <= 1)
+        {
+            return false;
+        }
+
+        if (params_.prefill_llep_transfer_mode !=
+            DeviceMoERebalanceTransferMode::CompactTransferSlots)
+        {
+            return false;
+        }
+        if (!validateDeviceMoERebalanceConfig(params_.prefill_llep_rebalance_config))
+            return false;
+        if (params_.prefill_llep_tp_ctx->degree() <= 1 ||
+            params_.prefill_llep_tp_ctx->degree() !=
+                static_cast<int>(params_.prefill_llep_rebalance_config.participant_count))
+        {
+            return false;
+        }
+        return params_.prefill_llep_rebalance_config.participant_id <
+               params_.prefill_llep_rebalance_config.participant_count;
+    }
+
+    bool MoEExpertComputeStage::executeTransferBackedPrefillLLEPMovement(
+        IMoEKernel *kernel) const
+    {
+        if (!kernel)
+            return false;
+        if (!hasTransferBackedPrefillLLEP())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requested without a valid compact transfer binding");
+            return false;
+        }
+        if (!bound_workspace_)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requires bound workspace buffers");
+            return false;
+        }
+
+        void *compute_stream = gpuStream();
+        if (!compute_stream)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requires an explicit compute stream");
+            return false;
+        }
+
+        auto *runtime_layers = params_.moe_runtime_table->deviceLayerState(0);
+        if (!runtime_layers || !moe_runtime_layer_)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requires device runtime layers");
+            return false;
+        }
+
+        const auto &config = params_.prefill_llep_rebalance_config;
+        const uint32_t captured_payload_slots =
+            std::min<uint32_t>(
+                params_.prefill_llep_payload_slot_capacity,
+                params_.prefill_llep_transfer_slot_count);
+        const uint64_t configured_plan_capacity =
+            deviceMoERebalanceCommandPlanCapacity(
+                config,
+                params_.prefill_llep_transfer_mode);
+        const uint32_t plan_capacity =
+            std::max<uint32_t>(
+                std::max<uint32_t>(1u, captured_payload_slots),
+                boundedU32(configured_plan_capacity));
+        const uint32_t payload_slot_count =
+            std::min<uint32_t>(captured_payload_slots, plan_capacity);
+        if (payload_slot_count == 0)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill has zero payload slots");
+            return false;
+        }
+
+        const std::string &workspace_name = params_.prefill_llep_workspace_name;
+        auto *plan_entries = static_cast<DeviceMoERebalancePlanEntry *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_TRANSFER_PLAN,
+                workspace_name)));
+        auto *plan_count = static_cast<uint32_t *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_TRANSFER_PLAN_COUNT,
+                workspace_name)));
+        auto *command_header = static_cast<DeviceMoERebalanceCommandBufferHeader *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_COMMAND_HEADER,
+                workspace_name)));
+        auto *status = static_cast<DeviceMoERebalanceStatus *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_STATUS,
+                workspace_name)));
+        auto *apply_status = static_cast<DeviceMoERebalanceApplyStatus *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_APPLY_STATUS,
+                workspace_name)));
+        auto *local_source_descriptors = static_cast<DeviceMoEExpertDirectoryEntry *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_LOCAL_SOURCE_DESCRIPTORS,
+                workspace_name)));
+        auto *local_payload = static_cast<uint8_t *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_LOCAL_TRANSFER_PAYLOAD,
+                workspace_name)));
+        auto *gathered_payload = static_cast<uint8_t *>(
+            bound_workspace_->getBuffer(prefillLLEPWorkspaceBufferName(
+                MoEDeviceRebalanceStage::WS_GATHERED_TRANSFER_PAYLOAD,
+                workspace_name)));
+
+        if (!plan_entries || !plan_count || !command_header || !status ||
+            !apply_status || !local_source_descriptors ||
+            !local_payload || !gathered_payload)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Missing transfer-backed LLEP prefill workspace buffers"
+                      << " plan_entries=" << static_cast<void *>(plan_entries)
+                      << " plan_count=" << static_cast<void *>(plan_count)
+                      << " command_header=" << static_cast<void *>(command_header)
+                      << " status=" << static_cast<void *>(status)
+                      << " apply_status=" << static_cast<void *>(apply_status)
+                      << " local_source_descriptors=" << static_cast<void *>(local_source_descriptors)
+                      << " local_payload=" << static_cast<void *>(local_payload)
+                      << " gathered_payload=" << static_cast<void *>(gathered_payload));
+            return false;
+        }
+
+        auto *transfer_state = params_.prefill_llep_transfer_state.get();
+        if (!transfer_state ||
+            !transfer_state->ensure(params_.device_id, workspace_name) ||
+            !transfer_state->transferStream() ||
+            !transfer_state->computeReadyEvent() ||
+            !transfer_state->transferDoneEvent())
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill could not initialize transfer stream state");
+            return false;
+        }
+
+        IWorkerGPUContext *gpu_ctx = nullptr;
+        try
+        {
+            gpu_ctx = &GPUDeviceContextPool::instance().getContext(params_.device_id);
+        }
+        catch (const std::exception &e)
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill could not resolve GPU context for "
+                      << params_.device_id.to_string() << ": " << e.what());
+            return false;
+        }
+        if (!gpu_ctx)
+            return false;
+
+        kernel->setGPUStream(compute_stream);
+        if (!kernel->materializePrefillLeastLoadedTransferCommands(
+                moe_runtime_layer_,
+                plan_entries,
+                plan_count,
+                plan_capacity,
+                command_header,
+                status,
+                config,
+                payload_slot_count,
+                static_cast<uint32_t>(params_.layer_idx),
+                1))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill command materialization failed");
+            return false;
+        }
+
+        void *transfer_stream = transfer_state->transferStream();
+        if (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), compute_stream) ||
+            !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill failed to queue compute-to-transfer dependency");
+            return false;
+        }
+
+        kernel->setGPUStream(transfer_stream);
+        if (!kernel->packDeviceRebalanceSourceDescriptors(
+                runtime_layers,
+                plan_entries,
+                command_header,
+                plan_capacity,
+                local_source_descriptors,
+                config,
+                nullptr,
+                1))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill source descriptor pack failed");
+            return false;
+        }
+        if (!kernel->packDeviceRebalanceCompactPayloads(
+                plan_entries,
+                command_header,
+                plan_capacity,
+                local_source_descriptors,
+                local_payload,
+                payload_slot_count,
+                params_.prefill_llep_payload_slot_bytes,
+                config,
+                apply_status,
+                nullptr,
+                1))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill payload pack failed");
+            return false;
+        }
+
+        const size_t local_payload_bytes =
+            static_cast<size_t>(payload_slot_count) *
+            static_cast<size_t>(params_.prefill_llep_payload_slot_bytes);
+        if (!params_.prefill_llep_tp_ctx->allgatherRawOnStream(
+                local_payload,
+                gathered_payload,
+                local_payload_bytes,
+                CollectiveDataType::INT8,
+                static_cast<int>(config.participant_id),
+                transfer_stream,
+                workspace_name.empty()
+                    ? std::string("moe_prefill_llep_transfer_payload")
+                    : workspace_name + "_payload"))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill payload allgather failed");
+            return false;
+        }
+
+        if (!kernel->unpackDeviceRebalanceCollectivePayloads(
+                plan_entries,
+                plan_count,
+                plan_capacity,
+                command_header,
+                gathered_payload,
+                payload_slot_count,
+                params_.prefill_llep_payload_slot_bytes,
+                params_.prefill_llep_transfer_slots,
+                params_.prefill_llep_transfer_slot_count,
+                config,
+                apply_status,
+                nullptr,
+                1))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill payload unpack failed");
+            return false;
+        }
+
+        if (!gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent(), transfer_stream) ||
+            !gpu_ctx->waitEventChecked(transfer_state->transferDoneEvent(), compute_stream))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill failed to queue transfer-to-compute dependency");
+            return false;
+        }
+
+        kernel->setGPUStream(compute_stream);
+        if (!kernel->applyDeviceRebalanceArrivals(
+                runtime_layers,
+                plan_entries,
+                plan_count,
+                plan_capacity,
+                params_.prefill_llep_transfer_slots,
+                params_.prefill_llep_transfer_slot_count,
+                config,
+                apply_status,
+                command_header,
+                params_.layer_idx))
+        {
+            LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill arrival apply failed");
+            return false;
+        }
+
+        return true;
+    }
+
     bool MoEExpertComputeStage::executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const
     {
         (void)max_tokens;
@@ -3624,16 +3927,101 @@ namespace llaminar2
             if (groups_prepared &&
                 params_.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
             {
-                groups_prepared = kernel->assignPrefillRoutesLeastLoadedResident(
+                const auto &runtime_state =
+                    params_.moe_runtime_table->hostLayerState(params_.layer_idx);
+                const auto &moe_env = debugEnv().moe_rebalance;
+                const uint64_t routed_rows =
+                    static_cast<uint64_t>(std::max(0, seq_len)) *
+                    static_cast<uint64_t>(std::max(0, top_k));
+                const uint64_t min_routed_rows =
+                    moe_env.llep_prefill_min_routed_rows;
+                if (min_routed_rows > 0ULL && routed_rows < min_routed_rows)
+                {
+                    PerfStatsCollector::addCounter(
+                        "moe_rebalance",
+                        "device_rebalance_llep_prefill_policy_skips",
+                        1.0,
+                        "prefill",
+                        params_.device_id.toString(),
+                        {{"stage", "moe_expert_grouped_prefill"},
+                         {"reason", "insufficient_routed_rows"},
+                         {"layer", std::to_string(params_.layer_idx)},
+                         {"seq_len", std::to_string(seq_len)},
+                         {"top_k", std::to_string(top_k)},
+                         {"routed_rows", std::to_string(routed_rows)},
+                         {"min_routed_rows", std::to_string(min_routed_rows)}});
+                    return groups_prepared;
+                }
+
+                least_loaded_ep::LeastLoadedExpertAssignmentConfig llep_config;
+                llep_config.expert_count = static_cast<uint32_t>(num_experts);
+                llep_config.participant_count =
+                    runtime_state.participant_count > 0u
+                        ? runtime_state.participant_count
+                        : static_cast<uint32_t>(
+                              std::max(1, params_.participant_count));
+                llep_config.min_spread_improvement =
+                    static_cast<uint64_t>(
+                        std::max(0, moe_env.device_rebalance_min_load_spread_improvement));
+                llep_config.min_spread_improvement_divisor =
+                    static_cast<uint32_t>(
+                        std::max(0, moe_env.device_rebalance_min_load_spread_improvement_divisor));
+                llep_config.min_spread_improvement_per_transfer =
+                    static_cast<uint64_t>(
+                        std::max(0, moe_env.device_rebalance_min_wave_spread_improvement_per_payload_slot));
+                llep_config.min_foreign_rows_per_transfer =
+                    static_cast<uint64_t>(
+                        std::max(0, moe_env.device_rebalance_min_foreign_rows_per_transfer));
+
+                groups_prepared = kernel->planPrefillRoutesLeastLoadedCurrentBatch(
                     moe_runtime_layer_,
                     seq_len,
                     seq_len,
                     num_experts,
-                    top_k);
+                    top_k,
+                    llep_config);
                 if (!groups_prepared)
                 {
                     LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
-                              "assignPrefillRoutesLeastLoadedResident failed");
+                              "planPrefillRoutesLeastLoadedCurrentBatch failed");
+                    return false;
+                }
+                if (hasTransferBackedPrefillLLEP())
+                {
+                    if (!executeTransferBackedPrefillLLEPMovement(kernel))
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                                  "transfer-backed LLEP movement failed");
+                        return false;
+                    }
+                    groups_prepared =
+                        kernel->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+                            moe_runtime_layer_,
+                            seq_len,
+                            seq_len,
+                            num_experts,
+                            top_k);
+                }
+                else
+                {
+                    if (params_.prefill_llep_require_transfer_backing)
+                    {
+                        throw std::runtime_error(
+                            "LeastLoadedEP grouped GPU prefill transfer mode 'full' requires "
+                            "compact transfer-backed current-batch expert movement");
+                    }
+                    groups_prepared =
+                        kernel->assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+                            moe_runtime_layer_,
+                            seq_len,
+                            seq_len,
+                            num_experts,
+                            top_k);
+                }
+                if (!groups_prepared)
+                {
+                    LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                              "least-loaded current-batch route assignment failed");
                     return false;
                 }
                 groups_prepared = kernel->regroupPrefillRoutesFromRuntimeAssignments(
@@ -4286,6 +4674,70 @@ namespace llaminar2
                 params_.device_id,
                 rows,
                 /*projection_count=*/2u);
+        }
+        if (hasTransferBackedPrefillLLEP())
+        {
+            const auto &config = params_.prefill_llep_rebalance_config;
+            const uint32_t captured_payload_slots =
+                std::min<uint32_t>(
+                    params_.prefill_llep_payload_slot_capacity,
+                    params_.prefill_llep_transfer_slot_count);
+            const uint32_t plan_capacity =
+                std::max<uint32_t>(
+                    std::max<uint32_t>(1u, captured_payload_slots),
+                    boundedU32(deviceMoERebalanceCommandPlanCapacity(
+                        config,
+                        params_.prefill_llep_transfer_mode)));
+            const uint32_t payload_slot_count =
+                std::min<uint32_t>(captured_payload_slots, plan_capacity);
+            const size_t local_payload_bytes =
+                static_cast<size_t>(payload_slot_count) *
+                static_cast<size_t>(params_.prefill_llep_payload_slot_bytes);
+            const size_t participant_count =
+                static_cast<size_t>(std::max<uint32_t>(1u, config.participant_count));
+            const std::string &workspace_name = params_.prefill_llep_workspace_name;
+
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_TRANSFER_PLAN, workspace_name),
+                static_cast<size_t>(plan_capacity) * sizeof(DeviceMoERebalancePlanEntry),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_TRANSFER_PLAN_COUNT, workspace_name),
+                sizeof(uint32_t),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_COMMAND_HEADER, workspace_name),
+                sizeof(DeviceMoERebalanceCommandBufferHeader),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_STATUS, workspace_name),
+                sizeof(DeviceMoERebalanceStatus),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_APPLY_STATUS, workspace_name),
+                sizeof(DeviceMoERebalanceApplyStatus),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_LOCAL_SOURCE_DESCRIPTORS, workspace_name),
+                participant_count * static_cast<size_t>(plan_capacity) *
+                    sizeof(DeviceMoEExpertDirectoryEntry),
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_LOCAL_TRANSFER_PAYLOAD, workspace_name),
+                local_payload_bytes,
+                256,
+                true});
+            combined.buffers.push_back({
+                prefillLLEPWorkspaceBufferName(MoEDeviceRebalanceStage::WS_GATHERED_TRANSFER_PAYLOAD, workspace_name),
+                participant_count * local_payload_bytes,
+                256,
+                true});
         }
         return combined;
     }

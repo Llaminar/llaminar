@@ -30,6 +30,7 @@ namespace llaminar2::moe_rebalance_policy
     constexpr uint32_t kDefaultDynamicMaxSwapsPerLayer = 4u;
     constexpr uint32_t kDefaultDynamicMaxPlanEntriesPerWave = 16u;
     constexpr uint64_t kDefaultDynamicMinWindowActivations = 64u;
+    constexpr uint32_t kDefaultDeviceMinLoadSpreadImprovementDivisor = 15u;
     constexpr float kDefaultDynamicImbalanceThresholdRatio =
         static_cast<float>(kDefaultDynamicImbalanceThresholdPerMille) / 1000.0f;
     constexpr float kDefaultDynamicMinImprovementRatio =

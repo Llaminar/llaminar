@@ -262,6 +262,18 @@ protected:
     {
         if (auto blocker = expertOverlayHardwareBlocker(GetParam()))
             GTEST_SKIP() << GetParam().name << " " << *blocker;
+
+        int rank = 0;
+        int world_size = 1;
+        MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+        MPI_Comm_size(MPI_COMM_WORLD, &world_size);
+        if (world_size != 1)
+        {
+            GTEST_SKIP() << "Qwen3.6 homogeneous LocalTP expert overlay parity "
+                         << "must run with -np 1 (got " << world_size << ")";
+        }
+        mpi_ctx_ = std::make_shared<MPIContext>(rank, world_size, MPI_COMM_WORLD);
+
         Base::SetUp();
     }
 

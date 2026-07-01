@@ -401,6 +401,16 @@ namespace llaminar2::test
                           std::string::npos)
                     << relative_path
                     << " must size payload buckets from payload-bearing expert movement, not resident metadata commands.";
+                EXPECT_NE(contents.find("const bool hot_replica_cache"), std::string::npos)
+                    << relative_path
+                    << " must keep LLEP movement semantics separate from the optional hot-cache layer.";
+                EXPECT_NE(contents.find("const bool durable_llep_ownership_wave"), std::string::npos)
+                    << relative_path
+                    << " must keep durable LLEP ownership waves out of the replica/cache post-spread ceiling.";
+                EXPECT_NE(contents.find("ownership_transfer\n                                       ? kDeviceMoERebalancePlanOwnershipTransfer"),
+                          std::string::npos)
+                    << relative_path
+                    << " LeastLoadedEP without HotExpertReplicaCache must publish durable ownership transfers.";
             }
 
             size_t body_start = contents.find("applyDeviceMoERebalancePolicyHost(");
@@ -2056,12 +2066,14 @@ namespace llaminar2::test
                   std::string::npos);
         EXPECT_NE(stage_source.find("moe_kernel->setGPUStream(transfer_stream)"), std::string::npos)
             << "Packed expert payload copies must run on the transfer stream.";
-        EXPECT_NE(stage_source.find("transfer_stream_is_stage_stream"), std::string::npos)
-            << "ROCm currently uses a graph-captured stage-stream fallback until HIP multi-stream replay is fixed.";
-        EXPECT_NE(stage_source.find("HIP stream capture currently does not replay"), std::string::npos)
-            << "The ROCm fallback must stay documented as a parity limitation, not an accidental code path.";
+        EXPECT_EQ(stage_source.find("transfer_stream_is_stage_stream"), std::string::npos)
+            << "CUDA and ROCm production paths must not retain a stage-stream fallback.";
+        EXPECT_EQ(stage_source.find("stage_stream_fallback"), std::string::npos)
+            << "Rebalance transfers should use the context-owned auxiliary stream on all GPU backends.";
+        EXPECT_EQ(stage_source.find("HIP stream capture currently does not replay"), std::string::npos)
+            << "The old ROCm correctness fallback must not reappear.";
         EXPECT_NE(stage_source.find("\"device_rebalance_transfer_stream_path\""), std::string::npos)
-            << "Perfstats must expose whether rebalance transfers use the auxiliary stream or the ROCm fallback.";
+            << "Perfstats must expose that rebalance transfers use the auxiliary stream.";
         EXPECT_NE(stage_source.find("gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent()"),
                   std::string::npos)
             << "The copy producer must record transfer completion.";
@@ -2069,7 +2081,7 @@ namespace llaminar2::test
             << "Graph capture paths must make stream fork/join behavior explicit.";
         EXPECT_NE(stage_source.find("params_.join_transfer_stream_after_copy"), std::string::npos)
             << "Split decode producers must be able to defer the transfer-stream join.";
-        EXPECT_NE(stage_source.find("join_transfer_stream_to_stage"), std::string::npos);
+        EXPECT_NE(stage_source.find("join_transfer_stream_to_capture_stream"), std::string::npos);
         EXPECT_NE(stage_source.find("transfer stream back to capture stream"),
                   std::string::npos);
         EXPECT_NE(stage_source.find("Failed to queue late transfer-stream join"),
@@ -2295,6 +2307,8 @@ namespace llaminar2::test
             root / "src/v2/execution/local_execution/graph/IGraphBuilder.h";
         const fs::path device_rebalance_stage_path =
             root / "src/v2/execution/compute_stages/stages/MoEDeviceRebalanceStage.cpp";
+        const fs::path host_rendezvous_path =
+            root / "src/v2/execution/moe/MoEDeviceRebalanceHostRendezvous.h";
         const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
         const fs::path iface_path = root / "src/v2/execution/local_execution/orchestrators/IInferenceRunner.h";
         const fs::path chat_path = root / "src/v2/app/modes/ChatCompletionHandler.cpp";
@@ -2313,6 +2327,7 @@ namespace llaminar2::test
         ASSERT_TRUE(fs::exists(rank_header_path)) << rank_header_path;
         ASSERT_TRUE(fs::exists(graph_builder_path)) << graph_builder_path;
         ASSERT_TRUE(fs::exists(device_rebalance_stage_path)) << device_rebalance_stage_path;
+        ASSERT_TRUE(fs::exists(host_rendezvous_path)) << host_rendezvous_path;
         ASSERT_TRUE(fs::exists(debug_env_path)) << debug_env_path;
         ASSERT_TRUE(fs::exists(iface_path)) << iface_path;
         ASSERT_TRUE(fs::exists(chat_path)) << chat_path;
@@ -2330,6 +2345,7 @@ namespace llaminar2::test
         const std::string rank_header = readFile(rank_header_path);
         const std::string graph_builder = readFile(graph_builder_path);
         const std::string device_rebalance_stage = readFile(device_rebalance_stage_path);
+        const std::string host_rendezvous = readFile(host_rendezvous_path);
         const std::string debug_env = readFile(debug_env_path);
         const std::string iface = readFile(iface_path);
         const std::string chat = readFile(chat_path);
@@ -2346,6 +2362,7 @@ namespace llaminar2::test
         ASSERT_FALSE(rank_header.empty()) << rank_header_path;
         ASSERT_FALSE(graph_builder.empty()) << graph_builder_path;
         ASSERT_FALSE(device_rebalance_stage.empty()) << device_rebalance_stage_path;
+        ASSERT_FALSE(host_rendezvous.empty()) << host_rendezvous_path;
         ASSERT_FALSE(debug_env.empty()) << debug_env_path;
         ASSERT_FALSE(iface.empty()) << iface_path;
         ASSERT_FALSE(chat.empty()) << chat_path;
@@ -2575,12 +2592,21 @@ namespace llaminar2::test
             << "Async maintenance should not add a per-token decode apply poll by default.";
         EXPECT_NE(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_DECODE_APPLY_POLL"),
                   std::string::npos);
+        EXPECT_EQ(debug_env.find("device_rebalance_captured_transfer_stream"),
+                  std::string::npos)
+            << "Captured maintenance transfer stream selection is no longer configurable.";
+        EXPECT_EQ(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_CAPTURED_TRANSFER_STREAM"),
+                  std::string::npos)
+            << "The obsolete captured transfer stream A/B knob should not be documented.";
         EXPECT_NE(debug_env.find("bool device_rebalance_collect_load_stats = false"),
                   std::string::npos)
             << "Projected load-spread diagnostics must not run by default.";
         EXPECT_NE(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_LOAD_STATS"),
                   std::string::npos)
             << "The explicit env knob for projected load-spread diagnostics should stay documented.";
+        EXPECT_NE(debug_env.find("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER"),
+                  std::string::npos)
+            << "The LLEP useful-work transfer gate should stay documented.";
         EXPECT_NE(debug_env.find("bool allow_legacy_collective_rebalance_transfer = false"),
                   std::string::npos)
             << "The obsolete fixed-arena transfer fallback must stay disabled by default.";
@@ -2589,9 +2615,14 @@ namespace llaminar2::test
         EXPECT_NE(dgo.find("DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload"),
                   std::string::npos)
             << "The maintenance scheduler must have a metadata/payload graph variant.";
-        EXPECT_NE(dgo.find("outcome.payload_bucket_slots != 0u"),
+        EXPECT_NE(dgo.find("domain_decision.launchPayloadGraph()"),
                   std::string::npos)
-            << "Payload graph replay should be scheduled only when the plan requested payload slots.";
+            << "Payload graph replay should be scheduled only through the shared payload-decision predicate.";
+        EXPECT_NE(host_rendezvous.find("payload_bucket_slots != 0u"),
+                  std::string::npos);
+        EXPECT_NE(host_rendezvous.find("payload_edge_mask != 0ULL"),
+                  std::string::npos)
+            << "Payload graph replay must require directed edges so no-work waves do not run payload bodies.";
         EXPECT_NE(dgo.find("device_moe_rebalance_decode_tokens_seen_"), std::string::npos)
             << "Maintenance should run on a rebalance window, not every decode token.";
         EXPECT_NE(dgo.find("active_cache.segment_cache.ensureCaptureStream"), std::string::npos)
@@ -2643,7 +2674,15 @@ namespace llaminar2::test
             << "Maintenance graph completion must be recorded on the explicit maintenance stream.";
         EXPECT_NE(dgo.find("\"device_maintenance_graph_launches\""), std::string::npos);
         EXPECT_NE(dgo.find("\"device_rebalance_transfer_stream_path\""), std::string::npos)
-            << "Measured maintenance replay perfstats must expose auxiliary-stream vs ROCm fallback transfer paths.";
+            << "Measured maintenance replay perfstats must expose transfer path usage.";
+        EXPECT_EQ(dgo.find("stage_stream_fallback"), std::string::npos)
+            << "Orchestrator perfstats must not retain the obsolete ROCm fallback concept.";
+        EXPECT_EQ(dgo.find("device_rebalance_captured_transfer_stream"), std::string::npos)
+            << "The captured transfer stream A/B env knob should be removed now that aux is mandatory.";
+        EXPECT_EQ(dgo.find("\"captured_transfer_stream_mode\""), std::string::npos)
+            << "Perfstats should not tag a removed stream mode.";
+        EXPECT_EQ(device_rebalance_stage.find("captured_transfer_stream_mode"), std::string::npos)
+            << "Perfstats should not tag a removed stream mode.";
         EXPECT_NE(dgo.find("\"device_maintenance_graph_host_window\""), std::string::npos)
             << "Perfstats must time the host-scheduled maintenance boundary while this path exists.";
         EXPECT_NE(dgo.find("device_rebalance_maintenance_slack_tokens"), std::string::npos)
@@ -2816,7 +2855,7 @@ namespace llaminar2::test
         EXPECT_NE(device_rebalance_stage.find("groupedP2PRawOnStream"), std::string::npos)
             << "Directed payload graphs must use grouped NCCL/RCCL send/recv instead of allgathering empty participant buckets.";
         EXPECT_NE(device_rebalance_stage.find("allgatherRawOnStream"), std::string::npos)
-            << "The payload stage should retain the allgather path as an explicit zero-edge fallback.";
+            << "The payload stage should retain the allgather path as an explicit metadata-only zero-edge path.";
         EXPECT_NE(dgo.find("\"device_rebalance_transfer_selected_payload_transport_capacity_bytes\""), std::string::npos)
             << "Perfstats must price directed payload transport by active edge count, not only by allgather capacity.";
         EXPECT_NE(dgo.find("\"device_rebalance_transfer_selected_payload_transport_utilization_ratio\""), std::string::npos)
@@ -2836,6 +2875,10 @@ namespace llaminar2::test
             << "Perfstats must prove when the scheduler avoids replaying an empty payload graph.";
         EXPECT_NE(dgo.find("device_rebalance_no_work_backoff_periods"), std::string::npos)
             << "No-work backoff must be controlled by DebugEnv while bucket graph scheduling is still interim.";
+        EXPECT_NE(dgo.find("\"no_work_backoff_effective_periods\""), std::string::npos)
+            << "No-work backoff perfstats must expose the progressive effective skip count.";
+        EXPECT_NE(dgo.find("std::min<uint64_t>("), std::string::npos)
+            << "Repeated no-work probe completions should progressively increase backoff instead of probing every other window.";
         EXPECT_NE(dgo.find("\"device_rebalance_wave_applied_arrivals_total\""), std::string::npos)
             << "Perfstats must expose wave aggregate apply counters that survive apply-status reuse.";
         EXPECT_NE(dgo.find("\"device_rebalance_selected_replicas\""), std::string::npos)
@@ -3526,6 +3569,279 @@ namespace llaminar2::test
 
         require_projected_commands(readFile(cuda_path), "CUDA");
         require_projected_commands(readFile(rocm_path), "ROCm");
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, ROCmDecodeRouterFastPathsFailHard)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path rocm_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
+
+        const std::string contents = readFile(rocm_path);
+        auto require_strict_router_body =
+            [&](const std::string &begin_marker,
+                const std::string &end_marker,
+                const char *label)
+        {
+            const size_t begin = contents.find(begin_marker);
+            ASSERT_NE(begin, std::string::npos) << label << " body missing";
+            const size_t end = contents.find(end_marker, begin);
+            ASSERT_NE(end, std::string::npos) << label << " end marker missing";
+            const std::string body = contents.substr(begin, end - begin);
+
+            EXPECT_EQ(body.find("falling back to"), std::string::npos)
+                << label << " must not silently choose a different decode router after a selected fast path fails";
+            EXPECT_NE(body.find("K-part router was requested but scratch allocation failed"),
+                      std::string::npos)
+                << label << " must fail hard when explicit K-part routing cannot allocate scratch";
+            EXPECT_NE(body.find("K-part router logits kernel failed"),
+                      std::string::npos)
+                << label << " must fail hard when explicit K-part logits fail";
+            EXPECT_NE(body.find("fused K-part router runtime kernel failed"),
+                      std::string::npos)
+                << label << " must fail hard when explicit K-part top-k/rebalance routing fails";
+            EXPECT_NE(body.find("FP16 router was requested but gate cache is unavailable"),
+                      std::string::npos)
+                << label << " must fail hard when explicit FP16 routing cannot build its cache";
+            EXPECT_NE(body.find("FP16 router logits kernel failed"),
+                      std::string::npos)
+                << label << " must fail hard when explicit FP16 logits fail";
+            EXPECT_NE(body.find("wave64 decode softmax/top-k runtime kernel failed"),
+                      std::string::npos)
+                << label << " must fail hard when the enabled wave top-k runtime path fails";
+        };
+
+        require_strict_router_body(
+            "bool ROCmMoEKernel::decodeRouteSelect(",
+            "bool ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply(",
+            "ROCm decodeRouteSelect");
+        require_strict_router_body(
+            "bool ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply(",
+            "bool ROCmMoEKernel::runDeviceRebalanceController(",
+            "ROCm decodeRouteSelectWithReadyRebalanceApply");
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, GpuGroupedDecodeFastPathsFailHard)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path cuda_path = root / "src/v2/kernels/cuda/moe/CUDAMoEKernel.cpp";
+        const fs::path rocm_path = root / "src/v2/kernels/rocm/moe/ROCmMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(cuda_path)) << cuda_path;
+        ASSERT_TRUE(fs::exists(rocm_path)) << rocm_path;
+
+        auto body_between =
+            [](const std::string &contents,
+               const std::string &begin_marker,
+               const std::string &end_marker,
+               const char *label) -> std::string
+        {
+            const size_t begin = contents.find(begin_marker);
+            EXPECT_NE(begin, std::string::npos) << label << " body missing";
+            if (begin == std::string::npos)
+                return {};
+            const size_t end = end_marker.empty() ? std::string::npos : contents.find(end_marker, begin + 1);
+            EXPECT_TRUE(end_marker.empty() || end != std::string::npos)
+                << label << " end marker missing";
+            if (!end_marker.empty() && end == std::string::npos)
+                return {};
+            return contents.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        };
+        auto require_no_soft_retry =
+            [](const std::string &body, const char *label)
+        {
+            ASSERT_FALSE(body.empty()) << label;
+            EXPECT_EQ(body.find("falling back"), std::string::npos)
+                << label << " must fail hard instead of retrying a serial path";
+            EXPECT_EQ(body.find("using fallback"), std::string::npos)
+                << label << " must not advertise a hidden fallback path";
+            EXPECT_EQ(body.find("fall back"), std::string::npos)
+                << label << " must keep optimized-path failure explicit";
+        };
+
+        const std::string cuda = readFile(cuda_path);
+        const std::string rocm = readFile(rocm_path);
+
+        const std::vector<std::pair<std::string, std::string>> cuda_bodies = {
+            {"bool CUDAMoEKernel::groupedExpertGateUpDecodeFromTable(",
+             "bool CUDAMoEKernel::groupedExpertDownDecodeFromTable("},
+            {"bool CUDAMoEKernel::groupedExpertDownDecodeFromTable(",
+             "bool CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting("},
+            {"bool CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting(",
+             "bool CUDAMoEKernel::groupedExpertDownDecodeFromRouting("},
+            {"bool CUDAMoEKernel::groupedExpertDownDecodeFromRouting(",
+             "bool CUDAMoEKernel::groupedExpertDecodeFromRuntime("},
+            {"bool CUDAMoEKernel::groupedExpertDecodeFromRuntime(",
+             "bool CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime("},
+            {"bool CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime(",
+             "bool CUDAMoEKernel::groupedExpertDownDecodeFromRuntime("},
+            {"bool CUDAMoEKernel::groupedExpertDownDecodeFromRuntime(",
+             "int CUDAMoEKernel::getExpertTokenCount("},
+        };
+        for (const auto &[begin, end] : cuda_bodies)
+            require_no_soft_retry(body_between(cuda, begin, end, begin.c_str()), begin.c_str());
+
+        EXPECT_NE(cuda.find("K-part gate/up decode was requested but scratch allocation failed"),
+                  std::string::npos)
+            << "CUDA grouped decode must fail hard when explicit gate/up K-part scratch is unavailable";
+        EXPECT_NE(cuda.find("K-part down decode was requested but scratch allocation failed"),
+                  std::string::npos)
+            << "CUDA grouped decode must fail hard when explicit down K-part scratch is unavailable";
+
+        const std::vector<std::pair<std::string, std::string>> rocm_bodies = {
+            {"bool ROCmMoEKernel::groupedExpertGateUpDecodeFromTable(",
+             "bool ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting("},
+            {"bool ROCmMoEKernel::groupedExpertGateUpDecodeFromRouting(",
+             "bool ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime("},
+            {"bool ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime(",
+             "bool ROCmMoEKernel::groupedExpertDecodeFromRuntime("},
+            {"bool ROCmMoEKernel::groupedExpertDecodeFromRuntime(",
+             "bool ROCmMoEKernel::groupedExpertDownDecodeFromTable("},
+            {"bool ROCmMoEKernel::groupedExpertDownDecodeFromTable(",
+             "bool ROCmMoEKernel::groupedExpertDownDecodeFromRouting("},
+            {"bool ROCmMoEKernel::groupedExpertDownDecodeFromRouting(",
+             "bool ROCmMoEKernel::groupedExpertDownDecodeFromRuntime("},
+            {"bool ROCmMoEKernel::groupedExpertDownDecodeFromRuntime(",
+             "bool ROCmMoEKernel::groupedExpertDownDecode("},
+            {"bool ROCmMoEKernel::groupedExpertDownDecode(",
+             "bool ROCmMoEKernel::groupPrefillRoutes("},
+        };
+        for (const auto &[begin, end] : rocm_bodies)
+            require_no_soft_retry(body_between(rocm, begin, end, begin.c_str()), begin.c_str());
+
+        EXPECT_NE(rocm.find("K-part gate/up decode was requested but scratch allocation failed"),
+                  std::string::npos)
+            << "ROCm grouped decode must fail hard when explicit gate/up K-part scratch is unavailable";
+        EXPECT_NE(rocm.find("K-part gate/up runtime kernel failed"), std::string::npos)
+            << "ROCm grouped decode must fail hard when explicit K-part gate/up launch fails";
+        EXPECT_NE(rocm.find("parallel down decode was requested but codebook"),
+                  std::string::npos)
+            << "ROCm grouped decode must fail hard when explicit parallel down cannot support the codebook";
+        EXPECT_NE(rocm.find("K-part fused gate/up SwiGLU quant kernel failed"),
+                  std::string::npos)
+            << "ROCm fused grouped decode must fail hard when the explicit fused K-part path fails";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefillLLEPTransferModeIsExplicit)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path graph_path = root / "src/v2/models/qwen35moe/Qwen35MoEGraph.cpp";
+        const fs::path stage_path =
+            root / "src/v2/execution/compute_stages/stages/MoEExpertComputeStage.cpp";
+        ASSERT_TRUE(fs::exists(graph_path)) << graph_path;
+        ASSERT_TRUE(fs::exists(stage_path)) << stage_path;
+
+        const std::string graph = readFile(graph_path);
+        const std::string stage = readFile(stage_path);
+        ASSERT_FALSE(graph.empty()) << graph_path;
+        ASSERT_FALSE(stage.empty()) << stage_path;
+
+        EXPECT_NE(graph.find("LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE"),
+                  std::string::npos)
+            << "LLEP prefill movement must be an explicit mode, not an implicit fallback.";
+        EXPECT_NE(graph.find("parsedLLEPPrefillTransferMode"),
+                  std::string::npos)
+            << "Qwen35 MoE graph must consume a parsed LLEP prefill movement mode.";
+        EXPECT_NE(graph.find("mode < 0 || mode > 1"),
+                  std::string::npos)
+            << "Invalid LLEP prefill movement modes must fail during graph construction.";
+        EXPECT_NE(graph.find("const bool require_full_llep_prefill_transfer"),
+                  std::string::npos)
+            << "The graph must make full transfer-backed prefill an explicit requirement.";
+        EXPECT_NE(graph.find("require_full_llep_prefill_transfer &&"),
+                  std::string::npos)
+            << "Compact transfer binding must only be attached for explicit full mode.";
+
+        const fs::path debug_env_path = root / "src/v2/utils/DebugEnv.h";
+        ASSERT_TRUE(fs::exists(debug_env_path)) << debug_env_path;
+        const std::string debug_env = readFile(debug_env_path);
+        ASSERT_FALSE(debug_env.empty()) << debug_env_path;
+        EXPECT_NE(debug_env.find("int llep_prefill_transfer_mode = 1"),
+                  std::string::npos)
+            << "Production LLEP prefill must default to full transfer-backed movement; "
+               "resident-only is a diagnostic mode.";
+        EXPECT_NE(debug_env.find("moe_rebalance.llep_prefill_transfer_mode = 1"),
+                  std::string::npos)
+            << "DebugEnv reload/reset must preserve the full transfer-backed LLEP default.";
+        EXPECT_NE(debug_env.find("LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS"),
+                  std::string::npos)
+            << "Prefill LLEP must expose an explicit current-batch cost gate.";
+        EXPECT_NE(debug_env.find("uint64_t llep_prefill_min_routed_rows = 8192"),
+                  std::string::npos)
+            << "Prefill LLEP should default to a chunky routed-row gate instead of "
+               "paying transfer-backed movement on tiny batches.";
+        EXPECT_NE(debug_env.find("kDefaultDeviceMinLoadSpreadImprovementDivisor"),
+                  std::string::npos)
+            << "Device-side LLEP/Dynamic movement must share the relative "
+               "load-spread default instead of silently disabling the gate.";
+        EXPECT_NE(stage.find("device_rebalance_llep_prefill_policy_skips"),
+                  std::string::npos)
+            << "Prefill LLEP cost-gate skips must be visible in perfstats.";
+        EXPECT_NE(stage.find("reason\", \"insufficient_routed_rows"),
+                  std::string::npos)
+            << "Prefill LLEP cost-gate skips must report why standard AE was selected.";
+
+        EXPECT_NE(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"),
+                  std::string::npos)
+            << "Resident-only prefill LLEP must use the guarded no-transfer apply kernel.";
+        EXPECT_NE(stage.find("assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"),
+                  std::string::npos)
+            << "Full transfer-backed prefill LLEP must use the after-transfer apply kernel.";
+        EXPECT_NE(stage.find("prefill_llep_require_transfer_backing"),
+                  std::string::npos)
+            << "Full mode must fail hard when transfer backing is unavailable.";
+    }
+
+    TEST(Test__MoEGraphNative_ForbiddenDependencyScan, PrefillLLEPKernelHooksFailFastWhenUnsupported)
+    {
+        const fs::path root = findRepoRoot();
+        const fs::path header_path = root / "src/v2/kernels/IMoEKernel.h";
+        const fs::path impl_path = root / "src/v2/kernels/IMoEKernel.cpp";
+        ASSERT_TRUE(fs::exists(header_path)) << header_path;
+        ASSERT_TRUE(fs::exists(impl_path)) << impl_path;
+
+        const std::string header = readFile(header_path);
+        const std::string impl = readFile(impl_path);
+        ASSERT_FALSE(header.empty()) << header_path;
+        ASSERT_FALSE(impl.empty()) << impl_path;
+
+        const std::vector<std::string> required_hooks = {
+            "materializePrefillLeastLoadedTransferCommands",
+            "planPrefillRoutesLeastLoadedCurrentBatch",
+            "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers",
+            "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers",
+        };
+        for (const auto &hook : required_hooks)
+        {
+            const size_t declaration_start =
+                header.find("virtual bool " + hook + "(");
+            ASSERT_NE(declaration_start, std::string::npos) << hook;
+            const size_t declaration_end =
+                header.find(";", declaration_start);
+            ASSERT_NE(declaration_end, std::string::npos) << hook;
+            const std::string declaration =
+                header.substr(declaration_start,
+                              declaration_end - declaration_start + 1);
+
+            EXPECT_EQ(declaration.find("{"), std::string::npos)
+                << hook
+                << " must not use an inline default body that can become a silent fallback.";
+            EXPECT_EQ(declaration.find("return false"), std::string::npos)
+                << hook
+                << " is a required capability once selected by the graph; unsupported "
+                   "backends must fail explicitly.";
+        }
+
+        EXPECT_NE(impl.find("LeastLoadedEP prefill transfer command materialization is not implemented"),
+                  std::string::npos);
+        EXPECT_NE(impl.find("LeastLoadedEP current-batch prefill route planning is not implemented"),
+                  std::string::npos);
+        EXPECT_NE(impl.find("LeastLoadedEP resident-only current-batch prefill assignment is not implemented"),
+                  std::string::npos);
+        EXPECT_NE(impl.find("LeastLoadedEP transfer-backed current-batch prefill assignment is not implemented"),
+                  std::string::npos);
+        EXPECT_NE(impl.find("throw std::logic_error"),
+                  std::string::npos)
+            << "Unsupported current-batch LeastLoadedEP hooks must fail fast, not return false.";
     }
 
 } // namespace llaminar2::test

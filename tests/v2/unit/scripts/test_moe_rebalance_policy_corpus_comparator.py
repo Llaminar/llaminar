@@ -181,6 +181,20 @@ class MoERebalancePolicyCorpusComparatorTest(unittest.TestCase):
                 "router_spread_improvement": "300",
                 "selected_replicas": "20",
                 "candidate_below_floor": "3",
+                "llep_assignment_spans": "50",
+                "llep_weight_transfers": "5",
+                "llep_native_rows": "900",
+                "llep_spilled_rows": "100",
+                "llep_spilled_row_ratio": "0.1",
+                "llep_spilled_rows_per_transfer": "20",
+                "llep_standard_ep_selected": "0",
+                "llep_skipped_balanced": "0",
+                "llep_skipped_insufficient_spread_improvement": "1",
+                "llep_skipped_insufficient_foreign_rows": "0",
+                "llep_min_chunk_skips": "2",
+                "llep_forced_spills": "1",
+                "llep_required_spread_improvement": "25",
+                "llep_required_foreign_rows": "80",
                 "candidate_improvement": "2600",
                 "candidate_improvement_max": "500",
                 "accepted_improvement_max": "400",
@@ -280,6 +294,14 @@ class MoERebalancePolicyCorpusComparatorTest(unittest.TestCase):
             "1.33333333",
         )
         self.assertEqual(rows[0]["skipped_post_load_spread_ceiling"], "1")
+        self.assertEqual(rows[0]["llep_assignment_spans"], "50")
+        self.assertEqual(rows[0]["llep_weight_transfers"], "5")
+        self.assertEqual(rows[0]["llep_spilled_rows"], "100")
+        self.assertEqual(rows[0]["llep_spilled_row_ratio"], "0.1")
+        self.assertEqual(rows[0]["llep_spilled_rows_per_transfer"], "20")
+        self.assertEqual(rows[0]["llep_spans_per_weight_transfer"], "10")
+        self.assertEqual(rows[0]["llep_spilled_rows_per_span"], "2")
+        self.assertEqual(rows[0]["llep_spilled_rows_per_planned_arrival"], "3.125")
         self.assertEqual(rows[0]["load_spread_delta"], "-60")
         self.assertEqual(rows[0]["router_use_rate"], "0.75")
         self.assertEqual(rows[0]["router_improve_rate"], "0.8")

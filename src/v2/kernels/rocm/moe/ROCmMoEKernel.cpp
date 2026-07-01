@@ -556,6 +556,20 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool hipMoE_materialize_prefill_llep_transfer_commands(
+        const void *runtime_layer,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        void *status,
+        const void *config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
     bool hipMoE_pack_rebalance_compact_payloads(
         const void *plan_entries,
         const void *command_headers,
@@ -826,6 +840,31 @@ extern "C"
         int device_idx, void *stream);
 
     bool hipMoE_assign_prefill_routes_least_loaded_resident(
+        void *runtime,
+        int current_slots, int max_slots, int num_experts, int top_k,
+        int device_idx, void *stream);
+
+    bool hipMoE_plan_prefill_routes_least_loaded_current_batch(
+        void *runtime,
+        int current_slots, int max_slots, int num_experts, int top_k,
+        uint32_t min_chunk_tokens,
+        uint32_t alpha_numerator,
+        uint32_t alpha_denominator,
+        uint32_t lambda_numerator,
+        uint32_t lambda_denominator,
+        uint64_t min_spread_improvement,
+        uint32_t min_spread_improvement_divisor,
+        uint64_t min_spread_improvement_per_transfer,
+        uint64_t min_foreign_rows_per_transfer,
+        int enable_balanced_skip,
+        int device_idx, void *stream);
+
+    bool hipMoE_assign_prefill_routes_from_llep_current_batch_plan_no_transfers(
+        void *runtime,
+        int current_slots, int max_slots, int num_experts, int top_k,
+        int device_idx, void *stream);
+
+    bool hipMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
         int device_idx, void *stream);
@@ -3465,58 +3504,61 @@ namespace llaminar2
         {
             const int k_partitions = rocm_env.moe_router_kparts;
             const size_t partial_count = static_cast<size_t>(num_experts) * static_cast<size_t>(k_partitions);
-            if (ensureRouteLogitsPartialsCapacity(partial_count))
+            if (!ensureRouteLogitsPartialsCapacity(partial_count))
             {
-                const bool partials_ready = hipMoE_gate_logits_single_token_kpart_partials(
-                    h, static_cast<const float *>(g), d_route_logits_partials_,
-                    d_model, num_experts, k_partitions,
-                    device_ordinal_, getStream());
-                if (partials_ready)
-                {
-                    runtime_ready = hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
-                        d_route_logits_partials_,
-                        static_cast<void *>(runtime_layer),
-                        legacy_indices,
-                        legacy_weights,
-                        num_experts,
-                        k_partitions,
-                        top_k,
-                        normalize_weights,
-                        write_legacy_outputs,
-                        update_runtime_histogram,
-                        nullptr,
-                        nullptr,
-                        0u,
-                        nullptr,
-                        nullptr,
-                        0u,
-                        nullptr,
-                        nullptr,
-                        nullptr,
-                        -1,
-                        1u,
-                        device_ordinal_,
-                        getStream());
-                    if (!runtime_ready)
-                    {
-                        LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] fused K-part router runtime kernel failed; falling back to FP16/default router");
-                    }
-                }
-                else
-                {
-                    LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] K-part router logits kernel failed; falling back to FP16/default router");
-                }
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] K-part router was requested but scratch allocation failed");
+                return false;
             }
-            else
+            const bool partials_ready = hipMoE_gate_logits_single_token_kpart_partials(
+                h, static_cast<const float *>(g), d_route_logits_partials_,
+                d_model, num_experts, k_partitions,
+                device_ordinal_, getStream());
+            if (!partials_ready)
             {
-                LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] K-part router scratch unavailable; falling back to FP16/default router");
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] K-part router logits kernel failed");
+                return false;
+            }
+            runtime_ready = hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
+                d_route_logits_partials_,
+                static_cast<void *>(runtime_layer),
+                legacy_indices,
+                legacy_weights,
+                num_experts,
+                k_partitions,
+                top_k,
+                normalize_weights,
+                write_legacy_outputs,
+                update_runtime_histogram,
+                nullptr,
+                nullptr,
+                0u,
+                nullptr,
+                nullptr,
+                0u,
+                nullptr,
+                nullptr,
+                nullptr,
+                -1,
+                1u,
+                device_ordinal_,
+                getStream());
+            if (!runtime_ready)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] fused K-part router runtime kernel failed");
+                return false;
             }
         }
 
         if (!runtime_ready && !logits_ready && gate_is_fp32)
         {
-            if (const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                    gate_weights, static_cast<const float *>(g), d_model, num_experts))
+            const void *g_fp16 = getOrCreateFP16RouterGateCache(
+                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+            if (rocm_env.moe_router_fp16 && !g_fp16)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] FP16 router was requested but gate cache is unavailable");
+                return false;
+            }
+            if (g_fp16)
             {
                 logits_ready = hipMoE_gate_logits_single_token_fp16_weights(
                     h, g_fp16, d_route_logits_,
@@ -3524,7 +3566,8 @@ namespace llaminar2
                     device_ordinal_, getStream());
                 if (!logits_ready)
                 {
-                    LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] FP16 router logits kernel failed; falling back to FP32 router");
+                    LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] FP16 router logits kernel failed");
+                    return false;
                 }
             }
         }
@@ -3566,7 +3609,8 @@ namespace llaminar2
                 getStream());
             if (!runtime_ready)
             {
-                LOG_WARN("[ROCmMoEKernel::decodeRouteSelect] wave64 decode softmax/top-k runtime kernel failed; falling back to default runtime top-k");
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] wave64 decode softmax/top-k runtime kernel failed");
+                return false;
             }
         }
 
@@ -3740,58 +3784,61 @@ namespace llaminar2
         {
             const int k_partitions = rocm_env.moe_router_kparts;
             const size_t partial_count = static_cast<size_t>(num_experts) * static_cast<size_t>(k_partitions);
-            if (ensureRouteLogitsPartialsCapacity(partial_count))
+            if (!ensureRouteLogitsPartialsCapacity(partial_count))
             {
-                const bool partials_ready = hipMoE_gate_logits_single_token_kpart_partials(
-                    h, static_cast<const float *>(g), d_route_logits_partials_,
-                    d_model, num_experts, k_partitions,
-                    device_ordinal_, getStream());
-                if (partials_ready)
-                {
-                    runtime_ready = hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
-                        d_route_logits_partials_,
-                        static_cast<void *>(runtime_layer),
-                        legacy_indices,
-                        legacy_weights,
-                        num_experts,
-                        k_partitions,
-                        top_k,
-                        normalize_weights,
-                        write_legacy_outputs,
-                        update_runtime_histogram,
-                        runtime_layers,
-                        rebalance_plan_entries,
-                        rebalance_plan_capacity,
-                        rebalance_command_header,
-                        rebalance_local_transfer_slots,
-                        rebalance_local_transfer_slot_count,
-                        &rebalance_config,
-                        rebalance_apply_status,
-                        rebalance_controller_state,
-                        rebalance_target_layer,
-                        rebalance_command_buffer_count,
-                        device_ordinal_,
-                        getStream());
-                    if (!runtime_ready)
-                    {
-                        LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] fused K-part router runtime kernel failed; falling back to FP16/default router");
-                    }
-                }
-                else
-                {
-                    LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] K-part router logits kernel failed; falling back to FP16/default router");
-                }
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] K-part router was requested but scratch allocation failed");
+                return false;
             }
-            else
+            const bool partials_ready = hipMoE_gate_logits_single_token_kpart_partials(
+                h, static_cast<const float *>(g), d_route_logits_partials_,
+                d_model, num_experts, k_partitions,
+                device_ordinal_, getStream());
+            if (!partials_ready)
             {
-                LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] K-part router scratch unavailable; falling back to FP16/default router");
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] K-part router logits kernel failed");
+                return false;
+            }
+            runtime_ready = hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
+                d_route_logits_partials_,
+                static_cast<void *>(runtime_layer),
+                legacy_indices,
+                legacy_weights,
+                num_experts,
+                k_partitions,
+                top_k,
+                normalize_weights,
+                write_legacy_outputs,
+                update_runtime_histogram,
+                runtime_layers,
+                rebalance_plan_entries,
+                rebalance_plan_capacity,
+                rebalance_command_header,
+                rebalance_local_transfer_slots,
+                rebalance_local_transfer_slot_count,
+                &rebalance_config,
+                rebalance_apply_status,
+                rebalance_controller_state,
+                rebalance_target_layer,
+                rebalance_command_buffer_count,
+                device_ordinal_,
+                getStream());
+            if (!runtime_ready)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] fused K-part router runtime kernel failed");
+                return false;
             }
         }
 
         if (!runtime_ready && !logits_ready && gate_is_fp32)
         {
-            if (const void *g_fp16 = getOrCreateFP16RouterGateCache(
-                    gate_weights, static_cast<const float *>(g), d_model, num_experts))
+            const void *g_fp16 = getOrCreateFP16RouterGateCache(
+                gate_weights, static_cast<const float *>(g), d_model, num_experts);
+            if (rocm_env.moe_router_fp16 && !g_fp16)
+            {
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router was requested but gate cache is unavailable");
+                return false;
+            }
+            if (g_fp16)
             {
                 logits_ready = hipMoE_gate_logits_single_token_fp16_weights(
                     h, g_fp16, d_route_logits_,
@@ -3799,7 +3846,8 @@ namespace llaminar2
                     device_ordinal_, getStream());
                 if (!logits_ready)
                 {
-                    LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router logits kernel failed; falling back to FP32 router");
+                    LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] FP16 router logits kernel failed");
+                    return false;
                 }
             }
         }
@@ -3841,7 +3889,8 @@ namespace llaminar2
                 getStream());
             if (!runtime_ready)
             {
-                LOG_WARN("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] wave64 decode softmax/top-k runtime kernel failed; falling back to default runtime top-k");
+                LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] wave64 decode softmax/top-k runtime kernel failed");
+                return false;
             }
         }
 
@@ -4071,6 +4120,56 @@ namespace llaminar2
             &config,
             status,
             payload_slot_capacity,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
+    bool ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands(
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layer || !plan_entries || !plan_count || !command_header || !status ||
+            plan_capacity == 0 || payload_slot_capacity == 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands] runtime, command buffers, status, and payload capacity are required");
+            return false;
+        }
+        if (layer_idx >= config.num_layers)
+        {
+            LOG_ERROR("[ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands] layer index out of range"
+                      << " layer=" << layer_idx << " num_layers=" << config.num_layers);
+            return false;
+        }
+        void *stream = requireStream("ROCmMoEKernel::materializePrefillLeastLoadedTransferCommands");
+        if (!setMoEDevice(device_ordinal_, "materializePrefillLeastLoadedTransferCommands"))
+            return false;
+
+        return hipMoE_materialize_prefill_llep_transfer_commands(
+            runtime_layer,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            status,
+            &config,
+            payload_slot_capacity,
+            layer_idx,
             command_buffer_count,
             device_ordinal_,
             stream);
@@ -5500,11 +5599,20 @@ namespace llaminar2
         }
 
         const int k_partitions = debugEnv().rocm.moe_gateup_kparts;
-        const bool use_kpart_gateup =
-            debugEnv().rocm.moe_gateup_kpart_decode &&
-            top_k > 0 &&
-            groupedDecodeSupportsCodebook(table.codebook_id) &&
-            ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate);
+        const bool use_kpart_gateup = debugEnv().rocm.moe_gateup_kpart_decode;
+        if (use_kpart_gateup && !groupedDecodeSupportsCodebook(table.codebook_id))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
+                      "K-part gate/up decode was requested but codebook "
+                      << static_cast<int>(table.codebook_id) << " is unsupported");
+            return false;
+        }
+        if (use_kpart_gateup && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
         const bool reuse_router_q8_hidden =
             debugEnv().rocm.moe_reuse_router_q8_hidden &&
             router_q8_hidden_valid_ &&
@@ -5540,11 +5648,13 @@ namespace llaminar2
                 getStream());
             if (!ok)
             {
-                LOG_DEBUG("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] K-partition gate/up path failed; falling back to serial path");
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
+                          "K-part gate/up runtime kernel failed");
+                return false;
             }
         }
 
-        if (!ok)
+        if (!use_kpart_gateup)
         {
             ok = rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
                 d_hidden,
@@ -5689,10 +5799,21 @@ namespace llaminar2
         }
 
         const int gateup_k_partitions = debugEnv().rocm.moe_gateup_kparts;
-        const bool use_gateup_kpart =
-            debugEnv().rocm.moe_gateup_kpart_decode &&
-            groupedDecodeSupportsCodebook(gateup_table.codebook_id) &&
-            ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate);
+        const bool use_gateup_kpart = debugEnv().rocm.moe_gateup_kpart_decode;
+        if (use_gateup_kpart && !groupedDecodeSupportsCodebook(gateup_table.codebook_id))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "K-part gate/up decode was requested but codebook "
+                      << static_cast<int>(gateup_table.codebook_id) << " is unsupported");
+            return false;
+        }
+        if (use_gateup_kpart &&
+            !ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
         const bool reuse_router_q8_hidden =
             debugEnv().rocm.moe_reuse_router_q8_hidden &&
             router_q8_hidden_valid_ &&
@@ -5705,16 +5826,25 @@ namespace llaminar2
         float *gateup_hidden_scales = reuse_router_q8_hidden ? d_router_q8_hidden_scales_ : d_grouped_hidden_scales_;
         const bool use_runtime_descriptors =
             descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
-        const bool use_parallel_down =
-            debugEnv().rocm.moe_parallel_down_decode &&
-            top_k > 1 &&
-            groupedDecodeSupportsCodebook(down_table.codebook_id);
+        const bool use_parallel_down = debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+        if (use_parallel_down && !groupedDecodeSupportsCodebook(down_table.codebook_id))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "parallel down decode was requested but codebook "
+                      << static_cast<int>(down_table.codebook_id) << " is unsupported");
+            return false;
+        }
         const bool use_gateup_swiglu_quant_fused =
             use_gateup_kpart &&
             debugEnv().rocm.moe_gateup_swiglu_quant_fused &&
-            use_parallel_down &&
-            d_grouped_swiglu_int8_ &&
-            d_grouped_swiglu_scales_;
+            use_parallel_down;
+        if (use_gateup_swiglu_quant_fused &&
+            (!d_grouped_swiglu_int8_ || !d_grouped_swiglu_scales_))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "fused gate/up SwiGLU quant path was requested but scratch is unavailable");
+            return false;
+        }
 
         bool gateup_ok = false;
         bool swiglu_prequantized = false;
@@ -5762,8 +5892,9 @@ namespace llaminar2
             swiglu_prequantized = gateup_ok;
             if (!gateup_ok)
             {
-                LOG_DEBUG("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                          "K-partition fused gate/up SwiGLU quant path failed; falling back");
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "K-part fused gate/up SwiGLU quant kernel failed");
+                return false;
             }
         }
 
@@ -5810,12 +5941,13 @@ namespace llaminar2
                                   stream);
             if (!gateup_ok)
             {
-                LOG_DEBUG("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                          "K-partition gate/up path failed; falling back to serial path");
+                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                          "K-part gate/up kernel failed");
+                return false;
             }
         }
 
-        if (!gateup_ok)
+        if (!gateup_ok && !use_gateup_kpart)
         {
             gateup_ok = use_runtime_descriptors
                             ? rocmMoE_grouped_gate_up_native_vnni_decode_runtime(
@@ -6236,10 +6368,14 @@ namespace llaminar2
             return false;
         }
 
-        const bool use_parallel_down =
-            debugEnv().rocm.moe_parallel_down_decode &&
-            top_k > 1 &&
-            groupedDecodeSupportsCodebook(table.codebook_id);
+        const bool use_parallel_down = debugEnv().rocm.moe_parallel_down_decode && top_k > 1;
+        if (use_parallel_down && !groupedDecodeSupportsCodebook(table.codebook_id))
+        {
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecodeFromRuntime] "
+                      "parallel down decode was requested but codebook "
+                      << static_cast<int>(table.codebook_id) << " is unsupported");
+            return false;
+        }
 
         const bool ok = use_parallel_down
                             ? rocmMoE_grouped_swiglu_down_native_vnni_decode_runtime_parallel(
@@ -6320,8 +6456,8 @@ namespace llaminar2
 
         if (!groupedDecodeSupportsCodebook(codebook_id))
         {
-            LOG_DEBUG("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-VNNI codebook "
-                      << static_cast<int>(codebook_id) << "; using fallback");
+            LOG_ERROR("[ROCmMoEKernel::groupedExpertDownDecode] Unsupported native-VNNI codebook "
+                      << static_cast<int>(codebook_id));
             return false;
         }
 
@@ -6503,6 +6639,140 @@ namespace llaminar2
             return false;
 
         return hipMoE_assign_prefill_routes_least_loaded_resident(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            getStream());
+    }
+
+    bool ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens, int num_experts, int top_k,
+        const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config)
+    {
+        ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
+
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (config.expert_count != static_cast<uint32_t>(num_experts) ||
+            config.participant_count == 0u ||
+            config.alpha_numerator == 0u ||
+            config.alpha_denominator == 0u ||
+            config.lambda_numerator == 0u ||
+            config.lambda_denominator == 0u)
+        {
+            LOG_ERROR("[ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid LLEP config");
+            return false;
+        }
+        if (!getStream())
+        {
+            LOG_ERROR("[ROCmMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] explicit stream is required");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "planPrefillRoutesLeastLoadedCurrentBatch"))
+            return false;
+
+        return hipMoE_plan_prefill_routes_least_loaded_current_batch(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            config.min_chunk_tokens,
+            config.alpha_numerator,
+            config.alpha_denominator,
+            config.lambda_numerator,
+            config.lambda_denominator,
+            config.min_spread_improvement,
+            config.min_spread_improvement_divisor,
+            config.min_spread_improvement_per_transfer,
+            config.min_foreign_rows_per_transfer,
+            config.enable_balanced_skip ? 1 : 0,
+            device_ordinal_,
+            getStream());
+    }
+
+    bool ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (!getStream())
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] explicit stream is required");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers"))
+            return false;
+
+        return hipMoE_assign_prefill_routes_from_llep_current_batch_plan_no_transfers(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            getStream());
+    }
+
+    bool ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (!getStream())
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] explicit stream is required");
+            return false;
+        }
+        if (!setMoEDevice(device_ordinal_, "assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers"))
+            return false;
+
+        return hipMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
             static_cast<void *>(runtime_layer),
             current_tokens * top_k,
             max_tokens * top_k,

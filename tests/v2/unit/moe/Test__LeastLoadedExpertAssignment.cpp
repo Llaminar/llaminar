@@ -58,6 +58,28 @@ namespace
                 &status);
         }
 
+        bool planWithResidency(const std::vector<uint64_t> &loads,
+                               const std::vector<uint32_t> &owners,
+                               const std::vector<uint32_t> &resident_masks,
+                               LeastLoadedExpertAssignmentConfig config)
+        {
+            LeastLoadedExpertAssignmentWorkspace workspace{
+                sorted.data(),
+                pending.data(),
+                assigned.data()};
+            return planLeastLoadedExpertAssignment(
+                loads.data(),
+                owners.data(),
+                config,
+                workspace,
+                spans.data(),
+                static_cast<uint32_t>(spans.size()),
+                transfers.data(),
+                static_cast<uint32_t>(transfers.size()),
+                &status,
+                resident_masks.data());
+        }
+
         bool planPolicy(const std::vector<uint64_t> &loads,
                         const std::vector<uint32_t> &owners,
                         routed_expert_assignment::PolicyConfig config)
@@ -224,6 +246,7 @@ TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerMatchesFullPlannerFor
     EXPECT_EQ(transfer_only.status.assigned_load_spread, full.status.assigned_load_spread);
     EXPECT_EQ(transfer_only.status.assigned_load_spread_improvement,
               full.status.assigned_load_spread_improvement);
+    EXPECT_EQ(transfer_only.status.span_count, full.status.span_count);
     EXPECT_EQ(transfer_only.status.native_rows, full.status.native_rows);
     EXPECT_EQ(transfer_only.status.spilled_rows, full.status.spilled_rows);
     ASSERT_EQ(transfer_only.status.weight_transfer_count, full.status.weight_transfer_count);
@@ -294,6 +317,25 @@ TEST(Test__LeastLoadedExpertAssignment, PartiallyAssignsNativeThenSpillsExcess)
     EXPECT_EQ(fixture.transfers[0].destination_participant, 1u);
 }
 
+TEST(Test__LeastLoadedExpertAssignment, ResidentReplicaDestinationDoesNotRequireWeightTransfer)
+{
+    std::vector<uint64_t> loads{80, 20, 0, 0};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    std::vector<uint32_t> resident_masks{0b11u, 0b01u, 0b10u, 0b10u};
+    auto config = configFor(4, 2);
+
+    PlannerFixture fixture(config.expert_count, config.participant_count);
+    ASSERT_TRUE(fixture.planWithResidency(loads, owners, resident_masks, config));
+
+    ASSERT_EQ(fixture.status.span_count, 3u);
+    EXPECT_EQ(fixture.status.native_rows, 100u);
+    EXPECT_EQ(fixture.status.spilled_rows, 0u);
+    EXPECT_EQ(fixture.status.weight_transfer_count, 0u);
+    EXPECT_EQ(fixture.spans[1].expert, 0u);
+    EXPECT_EQ(fixture.spans[1].destination_participant, 1u);
+    EXPECT_EQ(fixture.spans[1].needs_foreign_weight, 0u);
+}
+
 TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateFallsBackWhenTransferCostDominates)
 {
     std::vector<uint64_t> loads{80, 20, 0, 0};
@@ -336,6 +378,30 @@ TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateCanPriceEachForeign
     EXPECT_EQ(rejected.status.required_spread_improvement, 128u);
     EXPECT_EQ(rejected.status.skipped_insufficient_spread_improvement, 1u);
     EXPECT_EQ(rejected.status.standard_ep_selected, 1u);
+    EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
+}
+
+TEST(Test__LeastLoadedExpertAssignment, ForeignRowsGatePricesUsefulRowsPerTransfer)
+{
+    std::vector<uint64_t> loads{80, 20, 0, 0};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+    config.min_foreign_rows_per_transfer = 50;
+
+    PlannerFixture accepted(config.expert_count, config.participant_count);
+    ASSERT_TRUE(accepted.plan(loads, owners, config));
+    EXPECT_EQ(accepted.status.spilled_rows, 50u);
+    EXPECT_EQ(accepted.status.required_foreign_rows, 50u);
+    EXPECT_EQ(accepted.status.skipped_insufficient_foreign_rows, 0u);
+    EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
+
+    config.min_foreign_rows_per_transfer = 51;
+    PlannerFixture rejected(config.expert_count, config.participant_count);
+    ASSERT_TRUE(rejected.plan(loads, owners, config));
+    EXPECT_EQ(rejected.status.required_foreign_rows, 51u);
+    EXPECT_EQ(rejected.status.skipped_insufficient_foreign_rows, 1u);
+    EXPECT_EQ(rejected.status.standard_ep_selected, 1u);
+    EXPECT_EQ(rejected.status.spilled_rows, 0u);
     EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
 }
 
@@ -385,6 +451,27 @@ TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerHonorsRelativeSpreadI
     EXPECT_EQ(rejected.status.required_spread_improvement, 53u);
     EXPECT_EQ(rejected.status.assigned_load_spread_improvement, 0u);
     EXPECT_EQ(rejected.status.skipped_insufficient_spread_improvement, 1u);
+    EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
+}
+
+TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerHonorsForeignRowsGate)
+{
+    std::vector<uint64_t> loads{80, 20, 0, 0};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+    config.min_foreign_rows_per_transfer = 50;
+
+    PlannerFixture accepted(config.expert_count, config.participant_count);
+    ASSERT_TRUE(accepted.planTransfersOnly(loads, owners, config));
+    EXPECT_EQ(accepted.status.spilled_rows, 50u);
+    EXPECT_EQ(accepted.status.required_foreign_rows, 50u);
+    EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
+
+    config.min_foreign_rows_per_transfer = 51;
+    PlannerFixture rejected(config.expert_count, config.participant_count);
+    ASSERT_TRUE(rejected.planTransfersOnly(loads, owners, config));
+    EXPECT_EQ(rejected.status.required_foreign_rows, 51u);
+    EXPECT_EQ(rejected.status.skipped_insufficient_foreign_rows, 1u);
     EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
 }
 

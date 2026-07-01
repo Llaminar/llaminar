@@ -345,6 +345,13 @@ namespace llaminar2
                         value,
                         "moe.device_min_wave_spread_improvement_per_payload_slot");
             }
+            else if (normalized_key == "device_min_foreign_rows_per_transfer")
+            {
+                config.moe_rebalance.device_min_foreign_rows_per_transfer =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe.device_min_foreign_rows_per_transfer");
+            }
             else if (normalized_key == "device_min_router_spread_improvement_per_payload_slot")
             {
                 config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
@@ -1618,7 +1625,7 @@ namespace llaminar2
             .long_name = "--moe-device-rebalance-min-load-spread-improvement-divisor",
             .category = "MoE Configuration",
             .value_label = "<n>",
-            .description = "Device-side rebalance relative floor: required improvement >= total routed load / n; 0 disables (default: 0)",
+            .description = "Device-side rebalance relative floor: required improvement >= total routed load / n; 0 disables (default: 15)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
                 {
@@ -1640,6 +1647,20 @@ namespace llaminar2
                         parseNonNegativeUint32Value(
                             v,
                             "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-foreign-rows-per-transfer",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Least-loaded device rebalance useful-work floor in foreign routed rows per expert transfer; 0 disables (default: 0)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_foreign_rows_per_transfer =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-foreign-rows-per-transfer");
                 }),
         });
         spec.add({
@@ -2873,6 +2894,13 @@ namespace llaminar2
                     parseNonNegativeUint32Value(
                         value,
                         "moe_device_rebalance_min_wave_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_foreign_rows_per_transfer")
+            {
+                config.moe_rebalance.device_min_foreign_rows_per_transfer =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_foreign_rows_per_transfer");
             }
             else if (normalized_key == "moe_device_rebalance_min_router_spread_improvement_per_payload_slot")
             {

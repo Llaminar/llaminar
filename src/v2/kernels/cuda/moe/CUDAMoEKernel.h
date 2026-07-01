@@ -191,6 +191,22 @@ namespace llaminar2
             int current_tokens, int max_tokens,
             int num_experts, int top_k) override;
 
+        bool planPrefillRoutesLeastLoadedCurrentBatch(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k,
+            const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config) override;
+
+        bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
+        bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+            DeviceMoELayerRuntime *runtime_layer,
+            int current_tokens, int max_tokens,
+            int num_experts, int top_k) override;
+
         bool gatherPrefillExpertBatchFromRuntime(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *batch_buffer,
@@ -396,6 +412,18 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             DeviceMoERebalanceStatus *status = nullptr,
             uint32_t payload_slot_capacity = 0,
+            uint32_t command_buffer_count = 1) override;
+
+        bool materializePrefillLeastLoadedTransferCommands(
+            const DeviceMoELayerRuntime *runtime_layer,
+            DeviceMoERebalancePlanEntry *plan_entries,
+            uint32_t *plan_count,
+            uint32_t plan_capacity,
+            DeviceMoERebalanceCommandBufferHeader *command_header,
+            DeviceMoERebalanceStatus *status,
+            const DeviceMoERebalanceConfig &config,
+            uint32_t payload_slot_capacity,
+            uint32_t layer_idx,
             uint32_t command_buffer_count = 1) override;
 
         bool packDeviceRebalanceCompactPayloads(

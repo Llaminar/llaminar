@@ -25,6 +25,7 @@
 #include "../../loaders/GPUVramPreflight.h"
 #include "../../memory/BufferId.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
+#include "../../tensors/NativeVnniFormatInfo.h"
 #include "../../tensors/Tensors.h"
 #include "../../utils/DebugEnv.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -971,6 +972,18 @@ namespace llaminar2
             return false;
         }
 
+        int parsedLLEPPrefillTransferMode()
+        {
+            const int mode = debugEnv().moe_rebalance.llep_prefill_transfer_mode;
+            if (mode < 0 || mode > 1)
+            {
+                throw std::runtime_error(
+                    "Invalid LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE "
+                    "(valid: resident-only, full)");
+            }
+            return mode;
+        }
+
         bool isHomogeneousGpuLocalTPRebalanceDomain(
             const ILocalTPContext &tp_ctx,
             DeviceId device,
@@ -1075,6 +1088,100 @@ namespace llaminar2
             return -1;
         }
 
+        const NativeVnniFormatInfo *nativeVnniFormatInfoForCodebook(uint8_t codebook_id)
+        {
+            switch (codebook_id)
+            {
+            case 0:
+            {
+                static constexpr NativeVnniFormatInfo info{0, 16, false, false, false, 8.0f};
+                return &info;
+            }
+            case 4:
+            {
+                static constexpr NativeVnniFormatInfo info{4, 16, false, false, false, 127.0f};
+                return &info;
+            }
+            case 5:
+            {
+                static constexpr NativeVnniFormatInfo info{5, 16, true, false, false, 15.0f};
+                return &info;
+            }
+            case 6:
+            {
+                static constexpr NativeVnniFormatInfo info{6, 20, false, false, false, 16.0f};
+                return &info;
+            }
+            case 7:
+            {
+                static constexpr NativeVnniFormatInfo info{7, 20, true, false, false, 31.0f};
+                return &info;
+            }
+            case 8:
+            {
+                static constexpr NativeVnniFormatInfo info{8, 24, true, true, false, 32.0f};
+                return &info;
+            }
+            case 9:
+            {
+                static constexpr NativeVnniFormatInfo info{9, 12, true, true, false, 4.0f};
+                return &info;
+            }
+            case 10:
+            {
+                static constexpr NativeVnniFormatInfo info{10, 8, true, true, true, 3.0f};
+                return &info;
+            }
+            case 11:
+            {
+                static constexpr NativeVnniFormatInfo info{11, 13, false, true, false, 15.0f};
+                return &info;
+            }
+            case 12:
+            {
+                static constexpr NativeVnniFormatInfo info{12, 12, false, true, false, 62.0f};
+                return &info;
+            }
+            case 13:
+            {
+                static constexpr NativeVnniFormatInfo info{13, 9, true, true, false, 43.0f};
+                return &info;
+            }
+            case 14:
+            {
+                static constexpr NativeVnniFormatInfo info{14, 9, true, true, false, 43.0f};
+                return &info;
+            }
+            case 15:
+            {
+                static constexpr NativeVnniFormatInfo info{15, 8, false, true, false, 43.0f};
+                return &info;
+            }
+            case 16:
+            {
+                static constexpr NativeVnniFormatInfo info{16, 6, true, true, false, 1.125f};
+                return &info;
+            }
+            case 17:
+            {
+                static constexpr NativeVnniFormatInfo info{17, 6, true, true, false, 1.125f};
+                return &info;
+            }
+            case 19:
+            {
+                static constexpr NativeVnniFormatInfo info{19, 32, false, false, false, 127.0f};
+                return &info;
+            }
+            case 20:
+            {
+                static constexpr NativeVnniFormatInfo info{20, 32, false, false, false, 127.0f};
+                return &info;
+            }
+            default:
+                return nullptr;
+            }
+        }
+
         std::optional<std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec>>
         transferSlotSpecsFromExpertParams(
             const MoEExpertComputeStage::Params &expert_params,
@@ -1102,6 +1209,30 @@ namespace llaminar2
                 spec.codebook_id = vnni->codebook_id;
                 return spec;
             };
+            auto make_spec_from_gemm =
+                [](const char *label, ITensorGemm *gemm)
+                -> std::optional<DeviceMoETransferSlotDirectory::ProjectionSpec>
+            {
+                if (!gemm)
+                    return std::nullopt;
+                DeviceNativeVNNIMatrixDesc desc;
+                if (!gemm->exportNativeVNNIMatrixDesc(desc) || !desc.valid())
+                    return std::nullopt;
+                const NativeVnniFormatInfo *vnni =
+                    nativeVnniFormatInfoForCodebook(desc.codebook_id);
+                if (!vnni)
+                    return std::nullopt;
+
+                DeviceMoETransferSlotDirectory::ProjectionSpec spec;
+                spec.label = label;
+                spec.N = desc.n;
+                spec.K = desc.k;
+                spec.payload_bytes_per_block = vnni->payload_bytes;
+                spec.is_asymmetric = vnni->is_asymmetric;
+                spec.has_emins = vnni->has_emins;
+                spec.codebook_id = vnni->codebook_id;
+                return spec;
+            };
 
             for (int expert = 0; expert < num_experts; ++expert)
             {
@@ -1115,6 +1246,28 @@ namespace llaminar2
                 auto gate = make_spec("gate", expert_params.expert_gate_views[expert]);
                 auto up = make_spec("up", expert_params.expert_up_views[expert]);
                 auto down = make_spec("down", expert_params.expert_down_views[expert]);
+                if (gate && up && down)
+                {
+                    std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
+                    specs.reserve(3);
+                    specs.push_back(std::move(*gate));
+                    specs.push_back(std::move(*up));
+                    specs.push_back(std::move(*down));
+                    return specs;
+                }
+            }
+            for (int expert = 0; expert < num_experts; ++expert)
+            {
+                if (expert >= static_cast<int>(expert_params.prepared_gate_gemm.size()) ||
+                    expert >= static_cast<int>(expert_params.prepared_up_gemm.size()) ||
+                    expert >= static_cast<int>(expert_params.prepared_down_gemm.size()))
+                {
+                    break;
+                }
+
+                auto gate = make_spec_from_gemm("gate", expert_params.prepared_gate_gemm[expert]);
+                auto up = make_spec_from_gemm("up", expert_params.prepared_up_gemm[expert]);
+                auto down = make_spec_from_gemm("down", expert_params.prepared_down_gemm[expert]);
                 if (gate && up && down)
                 {
                     std::vector<DeviceMoETransferSlotDirectory::ProjectionSpec> specs;
@@ -1741,6 +1894,49 @@ namespace llaminar2
             config_.moe.num_experts,
             /*dynamic_rebalance_enabled=*/true);
         const auto &env = debugEnv();
+        const int llep_prefill_transfer_mode =
+            parsedLLEPPrefillTransferMode();
+        const bool require_full_llep_prefill_transfer =
+            llep_prefill_transfer_mode == 1;
+        const bool llep_prefill_requested =
+            !mtp_sidecar_context &&
+            total_tokens > 1 &&
+            config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
+        const uint64_t llep_prefill_routed_rows =
+            llep_prefill_requested
+                ? static_cast<uint64_t>(std::max(0, total_tokens)) *
+                      static_cast<uint64_t>(std::max(0, config_.moe.top_k))
+                : 0ULL;
+        const uint64_t llep_prefill_min_routed_rows =
+            env.moe_rebalance.llep_prefill_min_routed_rows;
+        const bool llep_prefill_cost_gate_passed =
+            !llep_prefill_requested ||
+            llep_prefill_min_routed_rows == 0ULL ||
+            llep_prefill_routed_rows >= llep_prefill_min_routed_rows;
+        const bool llep_prefill_enabled =
+            llep_prefill_requested &&
+            llep_prefill_cost_gate_passed &&
+            local_tp_ctx != nullptr &&
+            device.is_gpu();
+        const bool llep_prefill_transport_supported =
+            llep_prefill_enabled &&
+            isHomogeneousGpuLocalTPRebalanceDomain(
+                *local_tp_ctx,
+                device,
+                config_.tp_device_idx);
+        if (llep_prefill_enabled &&
+            require_full_llep_prefill_transfer &&
+            !llep_prefill_transport_supported)
+        {
+            throw std::runtime_error(
+                "Qwen35 MoE LeastLoadedEP prefill transfer mode 'full' requires "
+                "a homogeneous graph-capturable NCCL/RCCL LocalTP domain for " +
+                device.to_string() + "; refusing resident-only or host fallback");
+        }
+        const RoutedExpertAssignmentPolicy prefill_routed_expert_assignment_policy =
+            (total_tokens > 1 && !llep_prefill_enabled)
+                ? RoutedExpertAssignmentPolicy::StaticOwner
+                : config_.moe.routed_expert_assignment_policy;
         if (env.presence.has("LLAMINAR_MOE_REBALANCE_REPLICAS"))
             hot_replica_cap = std::max(0, env.moe_rebalance.max_replicas);
         const bool device_side_graph_rebalance_candidate =
@@ -1752,6 +1948,12 @@ namespace llaminar2
                 *local_tp_ctx,
                 device,
                 config_.tp_device_idx);
+        const bool prefill_llep_transfer_candidate =
+            require_full_llep_prefill_transfer &&
+            llep_prefill_transport_supported;
+        const bool graph_rebalance_transport_candidate =
+            device_side_graph_rebalance_candidate ||
+            prefill_llep_transfer_candidate;
         const bool register_runtime_histogram_for_decode =
             register_runtime_histogram &&
             !device_side_graph_rebalance_candidate;
@@ -1931,6 +2133,11 @@ namespace llaminar2
                     config_.moe.rebalance_config.device_min_wave_spread_improvement_per_payload_slot,
                     "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
                     env.moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot);
+            rebalance_config.min_foreign_rows_per_transfer =
+                deviceRebalanceConfigOrEnv(
+                    config_.moe.rebalance_config.device_min_foreign_rows_per_transfer,
+                    "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER",
+                    env.moe_rebalance.device_rebalance_min_foreign_rows_per_transfer);
             rebalance_config.min_router_spread_improvement_per_payload_slot =
                 deviceRebalanceConfigOrEnv(
                     config_.moe.rebalance_config.device_min_router_spread_improvement_per_payload_slot,
@@ -2013,7 +2220,7 @@ namespace llaminar2
         };
         auto graphRebalanceEnsureTransferMode = [&]() -> bool
         {
-            if (!device_side_graph_rebalance_candidate ||
+            if (!graph_rebalance_transport_candidate ||
                 !moe_runtime_table ||
                 !local_tp_ctx)
             {
@@ -2053,7 +2260,6 @@ namespace llaminar2
 
             /*
              * ResidentOnly changes runtime top-k/local-compute masks for
-             * ResidentOnly changes runtime top-k/local-compute masks for
              * experts that already have local resident descriptors, so the
              * immutable grouped descriptor tables remain valid. Compact and
              * fixed-payload transfer-slot modes can publish newly-arrived
@@ -2063,8 +2269,7 @@ namespace llaminar2
         };
         auto ensureGraphRebalanceTransferMode = [&]() -> bool
         {
-            if (!first_local_decode_layer ||
-                !device_side_graph_rebalance_candidate ||
+            if (!graph_rebalance_transport_candidate ||
                 !moe_runtime_table ||
                 !local_tp_ctx)
             {
@@ -2078,6 +2283,194 @@ namespace llaminar2
             if (!ensureGraphRebalanceTransferMode())
                 return false;
             return graphRebalanceUsesTransferSlots();
+        };
+        auto ensureGraphRebalanceTransferBindingOnly =
+            [&](const char *context) -> const GraphSideRebalanceBinding *
+        {
+            if (!graph_rebalance_transport_candidate ||
+                !moe_runtime_table ||
+                !local_tp_ctx)
+            {
+                return nullptr;
+            }
+
+            const std::string domain_key = graphRebalanceDomainKey();
+            const auto existing = moe_graph_rebalance_bindings_.find(domain_key);
+            if (existing != moe_graph_rebalance_bindings_.end())
+                return &existing->second;
+
+            DeviceMoERebalanceConfig rebalance_config = makeGraphRebalanceConfig();
+            if (!validateDeviceMoERebalanceConfig(rebalance_config))
+                return nullptr;
+            if (!ensureGraphRebalanceTransferMode())
+                return nullptr;
+            if (!graphRebalanceUsesTransferSlots())
+                return nullptr;
+            if (prefill_llep_transfer_candidate &&
+                graph_rebalance_transfer_mode.value() !=
+                    DeviceMoERebalanceTransferMode::CompactTransferSlots)
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE LeastLoadedEP prefill requires compact transfer-slot payload movement for " +
+                    device.to_string() + "; refusing fixed-payload/host fallback");
+            }
+            if (deviceMoERebalanceModePlansMissingArrivals(
+                    graph_rebalance_transfer_mode.value()))
+            {
+                rebalance_config.flags |=
+                    static_cast<uint32_t>(DeviceMoERebalanceFlags::PlanMissingArrivals);
+            }
+            if (!graph_rebalance_transfer_specs.has_value())
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE graph-side transfer binding requires NativeVNNI transfer slot specs for layer " +
+                    std::to_string(layer_idx) + " on " + device.to_string() +
+                    (context ? std::string(" (") + context + ")" : std::string{}));
+            }
+
+            IBackend *backend = getBackendFor(device);
+            const int gpu_ordinal = gpuOrdinalForGraphDevice(device);
+            if (!backend || gpu_ordinal < 0)
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE graph-side transfer binding could not resolve backend for " +
+                    device.to_string());
+            }
+
+            const uint32_t effective_layer_wave_count =
+                rebalance_config.layer_wave_count == 0u
+                    ? std::max<uint32_t>(
+                          1u,
+                          rebalance_config.layer_window_count == 0u
+                              ? rebalance_config.num_layers
+                              : rebalance_config.layer_window_count)
+                    : rebalance_config.layer_wave_count;
+            const uint64_t hot_cache_slots =
+                static_cast<uint64_t>(std::max<uint32_t>(
+                    1u,
+                    rebalance_config.max_hot_replicas_per_participant)) *
+                static_cast<uint64_t>(effective_layer_wave_count);
+            const uint64_t prefill_llep_slots =
+                prefill_llep_transfer_candidate
+                    ? static_cast<uint64_t>(
+                          std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots))
+                    : 1ULL;
+            const uint64_t requested_transfer_slots =
+                std::max<uint64_t>(hot_cache_slots, prefill_llep_slots);
+            const uint32_t transfer_slot_count =
+                std::max<uint32_t>(
+                    1u,
+                    std::min<uint32_t>(
+                        static_cast<uint32_t>(
+                            std::min<uint64_t>(
+                                requested_transfer_slots,
+                                static_cast<uint64_t>(std::numeric_limits<uint32_t>::max()))),
+                        static_cast<uint32_t>(
+                            std::max(1, env.moe_rebalance.gpu_direct_transfer_wave_experts))));
+
+            std::ostringstream transfer_key_builder;
+            transfer_key_builder << domain_key
+                                 << ":slots=" << transfer_slot_count;
+            for (const auto &spec : *graph_rebalance_transfer_specs)
+            {
+                transfer_key_builder << ':' << spec.label
+                                     << '=' << spec.N << 'x' << spec.K
+                                     << ":cb" << static_cast<int>(spec.codebook_id)
+                                     << ":pb" << spec.payload_bytes_per_block
+                                     << ":asym" << (spec.is_asymmetric ? 1 : 0)
+                                     << ":emins" << (spec.has_emins ? 1 : 0);
+            }
+            const std::string transfer_key = transfer_key_builder.str();
+            auto &transfer_directory = moe_transfer_slot_directories_[transfer_key];
+            if (!transfer_directory)
+            {
+                transfer_directory = DeviceMoETransferSlotDirectory::create(
+                    backend,
+                    device,
+                    gpu_ordinal,
+                    rebalance_config.participant_id,
+                    transfer_slot_count,
+                    *graph_rebalance_transfer_specs,
+                    gpuDirectRebalanceVramSafetyMarginBytes());
+            }
+
+            const std::string rebalance_workspace =
+                std::string(prefill_llep_transfer_candidate ? "moe_prefill_llep_" : "moe_device_rebalance_") +
+                graphRebalanceCollectiveKey();
+            auto &state_ref =
+                moe_rebalance_transfer_states_[transfer_key + ":workspace=" + rebalance_workspace];
+            if (!state_ref)
+                state_ref = std::make_shared<DeviceMoERebalanceTransferState>();
+
+            const uint32_t collective_payload_slot_capacity =
+                std::min<uint32_t>(
+                    transfer_directory->slotCount(),
+                    static_cast<uint32_t>(
+                        std::max(1, env.moe_rebalance.device_rebalance_compact_payload_slots)));
+            const uint64_t collective_payload_slot_bytes =
+                static_cast<uint64_t>(
+                    ((transfer_directory->slotPayloadBytes() +
+                      sizeof(DeviceMoEExpertDirectoryEntry) + 255u) /
+                     256u) *
+                    256u);
+
+            moe_graph_rebalance_bindings_[domain_key] = GraphSideRebalanceBinding{
+                transfer_key,
+                rebalance_workspace,
+                device,
+                local_tp_ctx,
+                local_tp_ctx,
+                moe_runtime_table,
+                config_.tp_device_idx,
+                rebalance_config,
+                transfer_directory->deviceEntries(),
+                transfer_directory->slotCount(),
+                graph_rebalance_transfer_mode.value(),
+                collective_payload_slot_bytes,
+                collective_payload_slot_capacity,
+                state_ref,
+                layer_idx};
+
+            return &moe_graph_rebalance_bindings_.find(domain_key)->second;
+        };
+        auto attachPrefillLLEPTransferBinding =
+            [&](MoEExpertComputeStage::Params &expert_params,
+                const char *context)
+        {
+            if (!prefill_llep_transfer_candidate)
+                return;
+            if (!graph_rebalance_transfer_specs.has_value())
+            {
+                graph_rebalance_transfer_specs =
+                    transferSlotSpecsFromExpertParams(
+                        expert_params,
+                        config_.moe.num_experts);
+            }
+            const auto *binding =
+                ensureGraphRebalanceTransferBindingOnly(context);
+            if (!binding)
+            {
+                throw std::runtime_error(
+                    "Qwen35 MoE LeastLoadedEP prefill could not create transfer binding for layer " +
+                    std::to_string(layer_idx) + " on " + device.to_string());
+            }
+            expert_params.prefill_llep_tp_ctx = binding->decode_tp_ctx;
+            expert_params.prefill_llep_transfer_slots =
+                binding->local_transfer_slots;
+            expert_params.prefill_llep_transfer_slot_count =
+                binding->local_transfer_slot_count;
+            expert_params.prefill_llep_payload_slot_bytes =
+                binding->collective_payload_slot_bytes;
+            expert_params.prefill_llep_payload_slot_capacity =
+                binding->collective_payload_slot_capacity;
+            expert_params.prefill_llep_transfer_mode =
+                binding->transfer_mode;
+            expert_params.prefill_llep_rebalance_config =
+                binding->config;
+            expert_params.prefill_llep_transfer_state =
+                binding->transfer_state;
+            expert_params.prefill_llep_workspace_name =
+                binding->workspace_name;
         };
 
         bool graph_rebalance_plan_inserted = false;
@@ -2960,7 +3353,15 @@ namespace llaminar2
                         ? local_tp_ctx->degree()
                         : std::max(1, expert_params.my_socket_id + 1);
                 expert_params.routed_expert_assignment_policy =
-                    config_.moe.routed_expert_assignment_policy;
+                    prefill_routed_expert_assignment_policy;
+                if (local_tp_ctx &&
+                    total_tokens > 1 &&
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                {
+                    expert_params.prefill_llep_tp_ctx = local_tp_ctx;
+                    expert_params.prefill_llep_require_transfer_backing =
+                        require_full_llep_prefill_transfer;
+                }
 
                 if (config_.moe.expert_mode == MoEExpertMode::ApportionedExperts &&
                     expert_params.expert_mask.empty())
@@ -3193,6 +3594,14 @@ namespace llaminar2
                     participantCountForGraphNativeOverlay(
                         *owner_map_lifetime,
                         continuationRootParticipant(*overlay_plan));
+                if (local_tp_ctx &&
+                    total_tokens > 1 &&
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                {
+                    expert_params.prefill_llep_tp_ctx = local_tp_ctx;
+                    expert_params.prefill_llep_require_transfer_backing =
+                        require_full_llep_prefill_transfer;
+                }
                 const std::string domain_name = local_tp_fast_tier ? local_tp_fast_tier->domain : std::string{};
                 if (!prepareExpertParams(
                         expert_params,
@@ -3214,7 +3623,7 @@ namespace llaminar2
                 const bool least_loaded_prefill_runtime_grouping =
                     moe_runtime_table &&
                     total_tokens > 1 &&
-                    config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP;
                 if (least_loaded_prefill_runtime_grouping)
                 {
                     const int participant_count = expert_params.participant_count;
@@ -3245,6 +3654,14 @@ namespace llaminar2
                             std::to_string(layer_idx) + " on " + device.to_string());
                     }
                     expert_params.use_runtime_prefill_grouping = true;
+                }
+
+                if (prefill_llep_transfer_candidate &&
+                    expert_params.use_runtime_prefill_grouping)
+                {
+                    attachPrefillLLEPTransferBinding(
+                        expert_params,
+                        "LocalTP apportioned-experts LLEP grouped prefill");
                 }
 
                 if (moe_runtime_table &&
@@ -3736,6 +4153,14 @@ namespace llaminar2
                                                       buffers.idFor(BufferId::MOE_COMBINED_OUTPUT),
                                                       {},
                                                       device);
+                if (local_tp_ctx &&
+                    total_tokens > 1 &&
+                    prefill_routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP)
+                {
+                    expert_params.prefill_llep_tp_ctx = local_tp_ctx;
+                    expert_params.prefill_llep_require_transfer_backing =
+                        require_full_llep_prefill_transfer;
+                }
                 if (!prepareExpertParams(expert_params, device))
                 {
                     throw std::runtime_error(
@@ -3746,6 +4171,14 @@ namespace llaminar2
                 {
                     graph_rebalance_transfer_specs =
                         transferSlotSpecsFromExpertParams(expert_params, config_.moe.num_experts);
+                }
+
+                if (prefill_llep_transfer_candidate &&
+                    expert_params.use_runtime_prefill_grouping)
+                {
+                    attachPrefillLLEPTransferBinding(
+                        expert_params,
+                        "standard routed expert LLEP grouped prefill");
                 }
 
                 if (device.is_gpu() &&

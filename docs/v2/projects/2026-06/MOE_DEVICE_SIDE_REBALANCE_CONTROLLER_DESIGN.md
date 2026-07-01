@@ -43,8 +43,12 @@ policies, not rebalance algorithms.
 : Least-Loaded Expert Parallelism from arXiv:2601.17111. LLEP preserves the
   router's exact top-k expert choices and route weights, then assigns current
   routed row spans to least-loaded participants under capacity, minimum-chunk,
-  and transfer-cost constraints. It can import foreign expert payloads for the
-  current batch/window without changing long-lived ownership.
+  and transfer-cost constraints. The paper-aligned prefill/batched path imports
+  foreign expert payloads for the current batch/window without changing
+  long-lived ownership. The current decode proxy uses the same shared LLEP
+  planner to choose durable whole-expert ownership transfers when
+  `HotExpertReplicaCache` is disabled, or additional resident arrivals when the
+  cache layer is enabled.
 
 `Observe`
 : A measurement mode, not a rebalance strategy. It should exercise the same
@@ -121,6 +125,66 @@ schedules. The transfer lane therefore uses bucketed graph variants:
 Explicit peer-copy branches are not part of the target path. NCCL/RCCL should
 choose the available transport internally.
 
+Captured maintenance transfer stream topology is aux-only in production: pack,
+grouped NCCL/RCCL payload movement, unpack, and publish happen on the
+device-context auxiliary transfer stream, with graph-captured event edges
+to/from the maintenance capture stream. CUDA and ROCm must stay aligned here.
+
+Perfstats tag `device_rebalance_transfer_stream_path` and should report
+`auxiliary_stream` for transfer-slot maintenance work on both backends.
+
+Current stream-overlap evidence:
+
+- 2026-07-01 CUDA fix: captured replay previously forced a CUDA-only
+  per-segment stream sync even when the caller requested deferred final sync.
+  That made aux-stream metadata/payload replay enqueue block for the whole
+  payload graph (`~64 ms` per launch in the earlier 2048-token diagnostic).
+  `DeviceGraphCaptureController` now skips the CUDA segment sync when
+  `defer_final_sync=true`, matching the ROCm deferred path.
+- CUDA2 2048, seed 303, default LLEP after the fix:
+  `benchmark_results/qwen36_moe_overlap_diag_after_deferred_cuda_sync_20260701T070127Z/`.
+  Decode reached `124.03 tok/s`. Metadata/payload replay enqueue fell to
+  `8.22 ms` total over 4 device records, with metadata/payload GPU elapsed
+  `8.41 ms`; probe replay enqueue was `0.53 ms` against `34.72 ms` probe GPU
+  elapsed. The large `64 ms` CUDA enqueue cliff is gone, but CUDA payload
+  replay enqueue still tracks the small payload graph duration (`0.49-3.63 ms`
+  in this run), so the next CUDA-specific question is whether `cudaGraphLaunch`
+  of NCCL payload graphs is still effectively synchronous at this scale.
+- ROCm2 2048, seed 303, default LLEP in the same run launched probes only:
+  `59.05 tok/s`, no payload arrivals accepted. This is a policy-gate outcome,
+  not an overlap-path measurement.
+- ROCm2 2048, seed 303, forced-open movement gates:
+  `benchmark_results/qwen36_moe_rocm_overlap_forced_payload_20260701T070745Z/`.
+  Metadata/payload replay enqueue was `0.52 ms` total over 6 device records,
+  while metadata/payload GPU elapsed was `34.63 ms`. This is the cleanest
+  current proof that RCCL payload graph replay on the aux stream overlaps
+  host/decode work mechanically.
+- The focused CUDA integration probe
+  `NCCLGroupedP2PMaintenanceGraph_AuxiliaryStream_TimingProbe` captures the
+  real grouped NCCL P2P primitive through the auxiliary maintenance stream. For
+  a 4 MiB bidirectional payload over six replays, the probe completes in about
+  `5.26 ms`.
+- The focused ROCm integration probe
+  `RCCLGroupedP2PMaintenanceGraph_AuxiliaryStream_TimingProbe` captures the
+  real grouped RCCL P2P primitive through the auxiliary maintenance stream. For
+  a 4 MiB bidirectional payload over six replays, the probe completes in about
+  `6.46 ms`.
+- The captured decode/maintenance overlap probe
+  `RCCLDecodeMaintenanceOverlap_BarrierAfterMaintenanceLaunch_Completes`
+  replays a decode allreduce graph and maintenance collective graph on separate
+  streams/contexts and completes four overlap iterations in about `1.28 ms`.
+
+Conclusion: auxiliary-stream grouped P2P is not intrinsically slower on either
+CUDA or ROCm. ROCm now demonstrates true payload replay overlap in the full
+model when payload waves are forced. CUDA no longer has the explicit replay
+sync bug, but its full-model NCCL payload graph launch still appears more
+blocking than ROCm's at small payload sizes and needs an Nsight timeline pass
+around `cudaGraphLaunch`/NCCL graph replay. Separately, the current host
+probe-outcome readback/rendezvous still blocks to choose whether to launch a
+payload graph; that remains below the target device-side graph scheduler design.
+LLEP/Dynamic still need first-class cost gates so cheaper maintenance does not
+become over-maintenance.
+
 ## LLEP Algorithm Target
 
 LLEP is a routed-row assignment strategy, not a hot-cache policy.
@@ -143,9 +207,169 @@ Shared policy code should live outside CUDA/ROCm-specific files. The current
 direction is `LeastLoadedExpertAssignment.h` plus a common routed-assignment
 dispatch surface, with CUDA, ROCm, and CPU tests sharing semantics.
 
+Current conformance audit, 2026-07-01:
+
+- The shared `LeastLoadedExpertAssignment` planner matches the core LLA/LLAS
+  policy shape from the paper: sort expert loads descending, reserve pending
+  native work, apply `alpha` capacity, spill overload to least-loaded
+  non-native participants, enforce `lambda`, `min_chunk_tokens`, and transfer
+  cost gates, and use Llaminar's explicit runtime owner map instead of a
+  contiguous `expert / experts_per_device` assumption.
+- The decode maintenance controller currently calls the transfer-only planner
+  and converts foreign expert needs into compact whole-expert movement commands.
+  With `HotExpertReplicaCache=off`, those commands are durable
+  `OwnershipTransfer` operations; with the cache enabled, they are additional
+  resident arrivals. This is useful, graph-capturable residency movement, but it
+  is not the full paper Algorithm 4 current-batch
+  route-row assignment/exchange/compute/combine path.
+- Prefill routing now preserves router top-k choices, plans current-batch
+  LLEP spans, materializes missing foreign whole-expert arrivals through the
+  compact rebalance ABI, gathers compact payload slots on the LocalTP
+  collective stream, applies arrivals into transfer slots, and only then
+  rewrites `route_participant_ids` from the span plan. There is no resident
+  fallback in the production current-batch LLEP path; missing compact transfer
+  backing is a hard configuration error.
+- `LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE` defaults to `full`. The
+  `resident-only` mode remains available only as an explicit diagnostic guard
+  for already-resident spans; it is not the production LLEP default.
+- `LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS` defaults to `8192` routed rows.
+  Below that gate, graph construction stamps the prefill expert stage as
+  standard `StaticOwner` apportioned-expert work and does not attach LLEP
+  runtime grouping or compact transfer backing. The older in-stage skip counter
+  remains as a defensive runtime guard, but production measured replay should
+  avoid lowering the tiny-prefill LLEP path in the first place.
+- Device-side decode movement now defaults the relative load-spread gate to
+  `device_min_load_spread_improvement_divisor=15`. A wave must improve
+  projected participant load spread by at least `current_total / 15`, unless
+  explicitly overridden to `0` for diagnostics. This prunes whole-expert
+  movement waves that have positive but too-small projected benefit.
+- Repeated no-work maintenance probe completions now carry a progressive
+  backoff count in `no_work_backoff_effective_periods`. Useful work resets the
+  streak. In short 1024-token smokes each per-device maintenance cache usually
+  only reaches streak 1, but longer no-work runs should now probe less
+  aggressively.
+- Therefore today's `LLEP` runtime mode is a first transfer-backed
+  current-batch implementation for LocalTP apportioned grouped prefill, plus
+  residency-based decode balancing. It implements the paper's load-aware
+  routed-row assignment against Llaminar's runtime owner map, but the first
+  production slice still imports whole foreign experts rather than exchanging
+  only assigned token rows.
+- PerfStats now exports the audit counters
+  `device_rebalance_llep_assignment_span_count`,
+  `device_rebalance_llep_weight_transfer_count`,
+  `device_rebalance_llep_native_rows`,
+  `device_rebalance_llep_spilled_rows`,
+  `device_rebalance_llep_spilled_row_ratio`, and
+  `device_rebalance_llep_spilled_rows_per_transfer`. These tell us how large
+  the conceptual LLEP row-assignment opportunity was versus how much the
+  current residency path actually moved.
+- CUDA and ROCm now also expose a graph-capturable current-batch prefill
+  planner that writes full LLEP assignment spans to
+  `DeviceMoELayerRuntime::reserved_ptrs[1]` and required expert-transfer
+  records to `reserved_ptrs[2]`, with capacities/counts in `reserved_u64`.
+- CUDA and ROCm also expose explicit span-apply primitives:
+  `NoTransfers` rewrites `route_participant_ids` only when the plan reports
+  zero missing foreign weights, while `AfterTransfers` is valid only after the
+  compact arrival path has populated destination descriptors. The blended
+  current-batch-or-resident helper was removed so unsupported current-batch
+  movement fails fast instead of silently changing strategy.
+- CUDA and ROCm now expose a graph-capturable command-materialization bridge
+  from current-batch LLEP transfer records to the standard compact rebalance
+  ABI. It converts `reserved_ptrs[2]` weight-transfer records into bounded
+  `ExpertPayloadArrival` command buffers, fills payload/destination slot ids,
+  reports the same payload bucket/status counters as the maintenance transfer
+  path, and is consumed by the production grouped-prefill bridge through
+  graph-owned workspace buffers.
+- The shared LLEP planner now accepts per-expert resident masks. A destination
+  that already has a hot-cache/resident copy is treated as executable without a
+  payload transfer, so LLEP and hot-cache residency are decoupled but
+  composable.
+- Durable no-cache LLEP ownership waves are evaluated by actual load-spread
+  improvement and movement-cost floors, but they are not required to satisfy the
+  hot-cache/replica absolute post-spread ceiling after a single wave. The
+  absolute ceiling remains a cache/replica payback gate; otherwise useful
+  durable ownership moves can be rejected simply because one compact wave cannot
+  make the whole domain nearly balanced.
+
+Paper speed-positive reading:
+
+- The paper's speedup claim applies most directly to current-batch routed-row
+  redistribution: when the active batch is large, expert routing is materially
+  imbalanced, spilled chunks are large enough to form efficient GEMMs, and the
+  cost of token/weight movement is amortized by reducing the slowest
+  participant's MoE compute time.
+- Llaminar's shared planner has the right LLA decision surface for that
+  algorithm: `lambda` selects standard EP when routing is balanced enough,
+  `alpha` caps per-participant routed work, `min_chunk_tokens` avoids tiny
+  spill GEMMs, and the spread/foreign-row gates model useful-work floors.
+- Transfer-backed grouped prefill is now the closest implementation to the
+  paper: it plans current-batch spans and imports missing foreign expert
+  payloads before applying the span assignment. It is still an implementation
+  slice, not the full paper Algorithm 4, because it moves whole expert payloads
+  through compact slots and relies on the LocalTP replicated-hidden/allreduce
+  shape instead of doing a general token-row all-to-all plus reverse combine.
+- Single-token decode is not the regime the paper's batch-size speedup curves
+  are proving. Our decode LLEP path is a durable residency/ownership movement
+  policy that uses the LLA transfer plan as an admission heuristic. It can be
+  speed-positive only when routed skew persists for enough remaining decode
+  tokens that future dispatch savings amortize whole-expert movement and
+  maintenance overhead.
+- Therefore we should expect paper-like wins first in chunky prefill and
+  batched decode, not in short single-stream decode. For short decode, the
+  correct behavior is often to choose standard EP and pay near-zero LLEP
+  overhead.
+
+Fresh 1024-token seed-303 audit after adding the counters:
+
+- CUDA2 static: `124.57 tok/s` decode.
+- CUDA2 LLEP: `125.45 tok/s` decode. The planner observed `577`
+  conceptual assignment spans, `746` spilled rows, and `5` foreign weight
+  transfers, but accepted `0` arrivals. Pre/post projected imbalance was
+  unchanged (`0.0411` average), so this row is essentially a no-movement
+  measurement.
+- ROCm2 static: `63.62 tok/s` decode.
+- ROCm2 LLEP: `65.09 tok/s` decode. The planner observed `1391`
+  conceptual assignment spans, `2166` spilled rows, and `16` foreign weight
+  transfers, accepting `6` planned arrivals. Pre/post projected imbalance only
+  moved from `0.04898` to `0.04893`, which is far smaller than the full
+  row-level LLEP opportunity.
+
+Interpretation: current residency-based LLEP can be mildly speed-positive, but
+it is not sufficiently aligned with Algorithm 4 to realize the projected
+current-batch row-balancing benefit. The next speed-positive path should focus
+on full prefill LLEP row assignment and exchange, while keeping decode on
+residency-based balancing unless batched decode provides enough rows to
+amortize current-token exchange.
+
+Next implementation target for paper-aligned LLEP:
+
+1. Prove the transfer-backed grouped-prefill bridge end to end with Qwen3.6
+   PyTorch parity and CUDA2/ROCm2 benchmark rows.
+2. Split the current in-stage bridge into first-class graph stages or a
+   device-side scheduler form so transfer waves can overlap more aggressively
+   with useful compute and avoid any host policy decisions.
+3. Add a graph-capturable zero-arrival skip/bucket scheduler so a no-work LLEP
+   plan does not pay compact payload allgather cost.
+4. For the LocalTP apportioned fast path, use the fact that every participant
+   already has the hidden/routing tensors and the downstream MoE allreduce
+   rejoins partial outputs. The first execution slice can therefore avoid
+   token-row exchange and focus on graph-capturable import of missing foreign
+   expert payloads plus route assignment from the span plan.
+5. For graph shapes where hidden/routing are not replicated, compact and
+   exchange only the assigned token rows and route weights.
+6. Import only missing foreign expert payloads needed by those spans.
+7. Run grouped native plus foreign expert chunks.
+8. Reverse-combine outputs to original routed rows without changing top-k
+   experts or route weights.
+
+Decode can continue to use residency-based balancing unless/until batched
+decode provides enough rows per expert for current-token LLEP chunks to amortize
+the token and weight exchange costs.
+
 Important tunables:
 
-- `lambda`: imbalance threshold for falling back to normal AE.
+- `lambda`: imbalance threshold for selecting standard AE instead of LLEP row
+  reassignment.
 - `alpha`: per-participant capacity factor.
 - `min_chunk_tokens`: minimum useful rows for a spilled expert chunk.
 - `max_foreign_experts_per_wave`: transfer-slot and VRAM guard.
@@ -204,6 +428,7 @@ Device movement-cost gates are also public config now:
 - `device_min_load_spread_improvement_divisor`
   / `--moe-device-rebalance-min-load-spread-improvement-divisor`
   / `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR`
+  (default: 15; set 0 to disable the relative floor)
 - `device_min_wave_spread_improvement_per_payload_slot`
   / `--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot`
   / `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT`
@@ -241,10 +466,11 @@ Implemented or partially implemented:
   the active device runtime bank immediately before execution. CUDA and ROCm
   share this shape, so runtime-table arrivals can be executed without rebuilding
   static host descriptor tables or repacking GPU weights.
-- The GPU prefill LLEP bridge is now span-aware for already-resident experts:
-  repeated rows for a hot expert can be split across the least-loaded resident
-  participants, preserving router top-k and route weights while finally making
-  hot-cache/replica residency visible to grouped prefill load balancing.
+- The GPU prefill LLEP bridge is span-aware and transfer-backed for LocalTP
+  apportioned grouped prefill: repeated rows for a hot expert can be assigned
+  across least-loaded participants, missing foreign experts are staged through
+  compact transfer slots, and route assignments are applied only after arrivals
+  are visible in the runtime table.
 - The resident-span prefill bridge now uses first-class runtime-table scratch
   for a compact `[expert][participant]` split table. CUDA and ROCm use the
   shared LLEP resident water-fill helper to plan split counts in chunks, then
@@ -252,8 +478,9 @@ Implemented or partially implemented:
   single-thread per-row split loop from both backend kernels.
 - Transfer-backed LLEP now feeds the same graph-capturable compact-arrival path
   as Dynamic. The shared transfer-only LLEP planner emits foreign whole-expert
-  arrivals, and CUDA/ROCm controller kernels publish `ExpertPayloadArrival`
-  commands without enabling the hot-cache policy.
+  movement, and CUDA/ROCm controller kernels publish durable
+  `OwnershipTransfer` commands when hot cache is disabled or
+  `ExpertPayloadArrival` commands when the optional cache layer is enabled.
 - CUDA and ROCm now distinguish LLEP candidate span economics from accepted
   runtime economics. Candidate counters report the ideal row-span plan from the
   shared LLEP helper; accepted counters and post-policy imbalance are recomputed
@@ -301,6 +528,70 @@ Implemented or partially implemented:
   `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Unit_LeastLoadedExpertAssignment`,
   `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed;
   full V2 unit suite passed (`514/514`).
+- 2026-07-01 validation after RCCL overlap investigation: graph-captured RCCL
+  decode allreduce and graph-captured RCCL maintenance raw-allgather can replay
+  concurrently on dedicated explicit streams in the LocalTP overlap lab. ROCm
+  does not need a drain path, and request reset must preserve captured graph
+  replay instead of eagerly recapturing.
+- Device maintenance completion now uses a domain-wide readiness rendezvous
+  before exporting probe or metadata/payload diagnostics and before entering
+  the blocking probe-outcome rendezvous. This fixes the ROCm failure where one
+  worker observed its completion event, exported a root/probe row, and blocked
+  while another worker had not yet observed the same maintenance wave as ready.
+- 2026-07-01 validation after wiring transfer-backed current-batch LLEP spans
+  into production grouped prefill: integration build passed;
+  `V2_Unit_LeastLoadedExpertAssignment`,
+  `V2_Unit_MoERuntimeTable`,
+  `V2_Unit_Qwen35MoEGraphNativeProductionLowering`,
+  `V2_Integration_CUDAMoEKernel`, and
+  `V2_Integration_ROCmMoEKernel` passed. Focused CUDA/ROCm kernel tests cover
+  guarded no-transfer apply, after-transfer span apply, materialized compact
+  arrival commands, and resident replica destinations that avoid payload-transfer
+  requirements.
+- 2026-07-01 validation after adding the current-batch LLEP transfer-command
+  bridge: `v2_integration_cuda_moe_kernel` and
+  `v2_integration_rocm_moe_kernel` rebuilt successfully; focused
+  `*RuntimePrefillLeastLoaded*` CUDA and ROCm tests passed. The planner test
+  now asserts that a pending foreign expert payload materializes as a bounded
+  `ExpertPayloadArrival` command with payload bucket/status counters.
+- 2026-07-01 validation after removing the implicit
+  current-batch-or-resident helper: integration build passed;
+  `V2_Unit_LeastLoadedExpertAssignment`, `V2_Unit_MoERuntimeTable`,
+  `V2_Unit_Qwen35MoEGraphNativeProductionLowering`,
+  `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed.
+  Production grouped GPU LLEP prefill now requires compact transfer backing and
+  throws if it is absent.
+- 2026-07-01 Qwen3.6 ExpertOverlay math parity after the explicit-mode cleanup:
+  CUDA2 and ROCm2 `PrefillParity`, `DecodeParity`, and
+  `SnapshotInfrastructure` all passed. The suite also fixed its LocalTP test
+  harness to create an explicit single-rank `MPIContext`, matching older
+  overlay parity suites and preventing a `RankOrchestrator::Config` shared_ptr
+  copy crash before graph construction.
+- 2026-07-01 validation after splitting durable no-cache LLEP ownership waves
+  from the hot-cache post-spread ceiling: integration build passed;
+  `V2_Unit_MoEForbiddenDependencyScan`,
+  `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed.
+  The CUDA/ROCm regression tests set a strict 10% post-spread ceiling and still
+  require no-cache LLEP to publish an improving durable `OwnershipTransfer`.
+- 2026-07-01 validation after fixing device-side ownership-transfer apply:
+  integration build passed; focused CUDA and ROCm ownership-transfer source
+  apply regressions passed; `V2_Unit_MoEForbiddenDependencyScan`,
+  `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed.
+  Root cause: CUDA/ROCm destination-side apply set
+  `owner_participant=destination`, but source/non-destination apply only
+  cleared local flags. The next runtime bank rebuild OR'd the stale source
+  owner back into the resident mask, resurrecting old ownership. Device apply
+  now matches the host mirror and updates `owner_participant` on every
+  participant for `OwnershipTransfer`.
+- 2026-07-01 validation after removing grouped decode soft retries:
+  integration build passed; `V2_Unit_MoEForbiddenDependencyScan`,
+  `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed.
+  CUDA and ROCm grouped decode now treat enabled K-part / parallel fast paths
+  as explicit contracts: if scratch allocation, codebook support, or the
+  selected kernel launch fails, the path fails closed instead of retrying a
+  serial decode path. Serial decode remains available only when the
+  corresponding K-part/parallel knob is explicitly disabled. Post-cleanup
+  CUDA2 and ROCm2 Qwen3.6 ExpertOverlay `DecodeParity` both passed.
 
 Latest evidence:
 
@@ -322,10 +613,19 @@ Still incomplete:
 - Dynamic, LLEP, and hot-cache admission are conceptually separated in code and
   tests. Dynamic now has an explicit sweep surface; LLEP and cache admission
   still need the same level of public config cleanup.
-- LLEP is mechanically transfer-backed but not yet performance-proven. Current
-  public plumbing still expresses it as routed assignment plus Dynamic
-  maintenance; promote it to a first-class strategy only after parity and
-  repeated clean benchmark matrices.
+- Full paper-aligned LLEP still needs the general token-row exchange and reverse
+  combine path for graph shapes where hidden/routing rows are not already
+  participant-local. The current LocalTP prefill slice can prove the planner and
+  compact expert import machinery, but it is not the complete Algorithm 4
+  communication schedule.
+- `alpha`, `lambda`, and `min_chunk_tokens` are available in the shared planner
+  and backend kernels, but the production prefill policy still mostly depends on
+  default planner values plus the higher-level routed-row gate. These need a
+  coherent CLI/DebugEnv surface before serious LLEP sweeps.
+- LLEP is mechanically transfer-backed but not yet performance-proven on the
+  full Qwen3.6 parity/benchmark matrix after the explicit-mode cleanup. Current
+  public plumbing should be exercised as a first-class strategy only after
+  parity and repeated clean benchmark matrices.
 - Hot-cache policy economics are inconsistent. The cache is mechanically visible
   to routing, but persistent hot10 alone is not a reliable speedup.
 
@@ -345,8 +645,17 @@ keeps only the current design signal:
 | CUDA2/ROCm2 resident split chunk-planner probe, seed 303, 1024, `assignment=least-loaded-ep`, perfstats + trace, `benchmark_results/qwen36_moe_llep_chunk_split_probe_20260701_000943/` | CUDA: static 1855.37 prefill / 124.68 decode vs dynamic 1841.16 prefill / 124.51 decode. ROCm: static 537.28 prefill / 67.66 decode vs dynamic 537.47 prefill / 65.48 decode. Both dynamic runs planned 12 arrivals and requested 8 compact payload slots across the two participants; one arrival was applied before run end. Offline full-LLEP replay still predicts large spread reductions at ROI 256: CUDA spread 7015 -> 3955 with 10 transfers, ROCm 5664 -> 2518 with 11 transfers. | The shared chunk planner removes a real single-threaded kernel wart without changing semantics, but current live transfer-backed LLEP is still a coarse whole-expert-arrival/resident-assignment proxy. The remaining speed gap is implementation strategy, not absence of routing imbalance signal. |
 | Compact payload capacity sweep, seed 303, 1024, dynamic LLEP only, `benchmark_results/qwen36_moe_llep_payload_slots2_probe_20260701_001956/` and `benchmark_results/qwen36_moe_llep_payload_slots4_probe_20260701_002406/` | CUDA dynamic: slots1 124.51 decode, slots2 123.86, slots4 118.80 tok/s. ROCm dynamic: slots1 65.48, slots2 64.55, slots4 64.69 tok/s. Slots2/4 planned and applied more arrivals on CUDA, but throughput fell. | Increasing whole-expert arrival capacity does not recover LLEP economics. Keep the compact payload default conservative and focus on true row-span LLEP for prefill/batched work or stronger admission gates for decode hot-cache movement. |
 | CUDA2/ROCm2 current Dynamic load-ratio trace, seeds 303 and 606, 1024/2048, `assignment=least-loaded-ep`, trace mode, `benchmark_results/qwen36_moe_policy_loadratio_current_20260701T004332Z/` | CUDA 1024: Dynamic made no transfers and averaged -0.38 tok/s vs static. CUDA 2048: Dynamic reduced pre/post imbalance ratio from 0.0441 to 0.0344 but averaged -1.19 tok/s. ROCm 1024: no transfers, average -2.37 tok/s with one slow outlier. ROCm 2048: imbalance ratio 0.0409 -> 0.0319 but average -1.83 tok/s; seed 303 was positive (+3.38) and seed 606 negative (-7.05). | The controller can now quantify real imbalance reduction, but these whole-expert transfer waves are not consistently economic. A cost gate based on improvement relative to observed load is needed before more movement-capacity tuning. This run exposed that the LLEP path ignored `min_load_spread_improvement_divisor`; that is now fixed. |
-| Relative LLEP cost-gate probes, seed 303, 2048, `MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=15`, `benchmark_results/qwen36_moe_llep_relative_gate15_cuda_seed303_20260701T012906Z/` and `benchmark_results/qwen36_moe_llep_relative_gate15_rocm_seed303_20260701T013119Z/` | CUDA dynamic moved 4 arrivals, reduced imbalance 0.0434 -> 0.0341, and reached 125.67 tok/s decode versus the same-run static row from the divisor-25 A/B at 125.53 tok/s. ROCm dynamic moved 4 arrivals, reduced imbalance 0.0442 -> 0.0336, and reached 64.90 tok/s decode versus the earlier same-seed static row at 60.18 tok/s. | The relative floor is the right sweep axis: divisor 25 partially pruned CUDA arrivals (20 -> 14) and improved the delta (-1.40 -> -0.40 tok/s), while divisor 15 pruned to a high-value 4-arrival wave and recovered a positive single-row signal. This needs repeated CUDA/ROCm matrices before becoming a default. |
+| Relative LLEP cost-gate probes, seed 303, 2048, `MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=15`, `benchmark_results/qwen36_moe_llep_relative_gate15_cuda_seed303_20260701T012906Z/` and `benchmark_results/qwen36_moe_llep_relative_gate15_rocm_seed303_20260701T013119Z/` | CUDA dynamic moved 4 arrivals, reduced imbalance 0.0434 -> 0.0341, and reached 125.67 tok/s decode versus the same-run static row from the divisor-25 A/B at 125.53 tok/s. ROCm dynamic moved 4 arrivals, reduced imbalance 0.0442 -> 0.0336, and reached 64.90 tok/s decode versus the earlier same-seed static row at 60.18 tok/s. | The relative floor is the right sweep axis: divisor 25 partially pruned CUDA arrivals (20 -> 14) and improved the delta (-1.40 -> -0.40 tok/s), while divisor 15 pruned to a high-value 4-arrival wave and recovered a positive single-row signal. This is now the device-side default so movement must scale with observed routed load; `0` remains the explicit diagnostic override. |
 | CUDA2/ROCm2 no-work maintenance probe split, seed 303, 1024, divisor 15, `benchmark_results/qwen36_moe_probe_split_seed303_20260701T023641Z/` | CUDA: static 1853.63 prefill / 124.75 decode vs Dynamic 1839.74 prefill / 124.67 decode. ROCm: static 535.96 prefill / 62.78 decode vs Dynamic 537.73 prefill / 65.86 decode. Dynamic planned zero arrivals on both backends; traces exported only `probe` stages. No metadata/payload graph launched. | Splitting probe from metadata/payload replay removed command-buffer allgathers from no-work windows. No-work maintenance GPU elapsed fell versus the prior accounting-fix probe from ~45.6 ms to ~32.8 ms on CUDA and ~136.9 ms to ~100.2 ms on ROCm over six maintenance launches. CUDA no-work Dynamic is now effectively neutral to static on this seed; ROCm was positive in this run. Further reduction requires making the probe itself cheaper or less frequent when policy gates keep rejecting work. |
+| RCCL/NCCL maintenance readiness fix, seed 303, divisor 15, `benchmark_results/qwen36_moe_llep_rocm1024_readiness_hardened_20260701T042229Z/`, `benchmark_results/qwen36_moe_llep_rocm2048_readiness_hardened_20260701T042542Z/`, and `benchmark_results/qwen36_moe_llep_cuda1024_readiness_sanity_20260701T041605Z/` | ROCm2 LLEP 1024 passed at 536.58 prefill / 68.16 decode tok/s after rendezvous hardening. ROCm2 LLEP 2048 passed at 538.74 prefill / 64.91 decode tok/s after rendezvous hardening. CUDA2 LLEP 1024 passed at 1850.58 prefill / 125.24 decode tok/s. All runs exited 0 and rebalance traces had paired per-device probe and metadata/payload rows. | The earlier ROCm stuck-worker failure was not an RCCL graph-capture limitation. The root cause was asymmetric host-side completion observation before blocking publish/apply rendezvous. The fix keeps RCCL collectives graph captured, keeps dedicated maintenance overlap enabled, and avoids eager recapture across request reset. |
+| CUDA/ROCm 2048 economics after readiness hardening, seed 303, `benchmark_results/qwen36_moe_rocm2048_static_control_readiness_hardened_20260701T043036Z/`, `benchmark_results/qwen36_moe_llep_rocm2048_readiness_hardened_20260701T042542Z/`, `benchmark_results/qwen36_moe_cuda2048_static_llep_readiness_hardened_20260701T043422Z/`, and `benchmark_results/qwen36_moe_cuda2048_llep_divisor10_20260701T043937Z/` | ROCm static 60.70 decode tok/s vs LLEP divisor15 64.91 (+6.9%) with 15 planned arrivals, 33 transfer arrivals, and pre/post imbalance 0.0449 -> 0.0412. CUDA static 124.50 vs LLEP divisor15 124.18 (-0.25%) with 18 planned arrivals, 44 transfer arrivals, and imbalance 0.0386 -> 0.0329. CUDA divisor10 reduced movement to 3 planned / 5 transfer arrivals and reached 124.39 tok/s, but router-used events collapsed from 7430 to 10. | ROCm is now clearly speed-positive on this seed. CUDA is close to static but does not monetize the same movement policy. Simply making the spread gate stricter reduces overhead but also removes nearly all router benefit. The next CUDA lever should combine remaining-token payback, post-wave imbalance, and router-use benefit prediction rather than only per-arrival spread improvement. |
+| CUDA2/ROCm2 explicit transfer-backed LLEP smoke after removing resident fallback, seed 303, 1024, one measured rep, `benchmark_results/qwen36_moe_llep_explicit_path_smoke_20260701_102100/` | CUDA static 3239.71 prefill / 126.75 decode tok/s vs LLEP 2110.41 prefill / 124.03 decode. ROCm static 1123.78 prefill / 63.12 decode vs LLEP 736.98 prefill / 63.62 decode. All runs exited 0 and required prefill graphs were captured. CUDA prefill graph nodes rose from 1915 static to 2595 LLEP; ROCm rose from 1713 to 2433. | Correctness and graph capture are now healthy on the explicit path, but transfer-backed LLEP prefill currently adds too much graph work for a one-row smoke to pay. The next optimization target is making current-batch LLEP conditional/bucketed without host policy fallback: skip zero-arrival payload work, reduce added prefill graph nodes, and gate the transfer-backed path by expected payback. |
+| CUDA2/ROCm2 no-cache LLEP ownership-transfer smoke after fixing the post-spread ceiling, seed 303, 1024, perfstats on, `benchmark_results/qwen36_moe_llep_ownership_transfer_perfstats_20260701_125537/` | CUDA LLEP reached 2443.75 prefill / 124.54 decode tok/s, with prefill graph replay active, 3 planned arrivals, 3 applied windows, `1.44 MB` useful payload moved, and `660` accepted spread-improvement units. ROCm LLEP reached 814.42 prefill / 65.25 decode tok/s, with prefill graph replay active, 6 planned arrivals, 3 applied windows, `2.88 MB` useful payload moved, and `1600` accepted spread-improvement units. | The LLEP maintenance planner is no longer a no-op: improving no-cache waves now publish durable whole-expert ownership transfers and compact payload movement on both backends. One wave per backend was still rejected by cost/post-spread gates, so the next tuning target is policy economics, not missing movement plumbing. |
+| CUDA2/ROCm2 static vs no-cache LLEP after source-owner apply fix, seed 303, 1024, clean rows, `benchmark_results/qwen36_moe_cuda_static_llep_after_source_owner_fix_20260701_133035/` and `benchmark_results/qwen36_moe_rocm_static_llep_after_source_owner_fix_20260701_133353/` | CUDA static 3254.50 prefill / 127.80 decode vs LLEP 2448.14 prefill / 125.77 decode (`-1.58%` decode). ROCm static 1137.83 prefill / 67.37 decode vs LLEP 789.30 prefill / 61.66 decode (`-8.48%` decode). | Fixing source ownership removed a functional correctness bug and recovered most of the prior CUDA clean-run cliff (`119.95 -> 125.77 tok/s`), but whole-expert LLEP decode movement is still not reliably economic. The current decode proxy needs stronger payback gating, likely using remaining-token/request-horizon estimates and realized post-move load benefit. Paper-aligned row-span LLEP remains the better fit for prefill/batched decode. |
+| CUDA2/ROCm2 post grouped-decode fail-fast smoke, seed 303, 1024, `benchmark_results/qwen36_moe_static_llep_after_failfast_decode_20260701_140905/` and CUDA perfstats rerun `benchmark_results/qwen36_moe_cuda_llep_failfast_perfstats_20260701_141821/` | Clean smoke exited 0: CUDA static 3244.88 prefill / 126.78 decode vs LLEP 2449.22 prefill / 119.31 decode; ROCm static 1147.81 prefill / 63.21 decode vs LLEP 799.36 prefill / 65.70 decode. CUDA LLEP perfstats rerun reached 2442.06 prefill / 124.28 decode with zero planned/applied arrivals and zero payload slots. | The fail-fast cleanup did not trip production Qwen3.6 decode paths and post-cleanup CUDA2/ROCm2 decode parity passed. The one low CUDA LLEP smoke row was not reproduced under perfstats and had no movement counters; treat it as noisy end-to-end evidence, not a policy signal. |
+| CUDA2/ROCm2 graph-level prefill LLEP gate, seed 303, 1024, `benchmark_results/qwen36_moe_static_llep_prefill_graph_gate_20260701_152004/` | Prefill LLEP graphs now match static node counts: CUDA `1915`, ROCm `1713`. CUDA static 3219.13 prefill / 124.57 decode vs LLEP 3208.87 prefill / 115.50 decode. ROCm static 1147.78 prefill / 66.37 decode vs LLEP 1144.06 prefill / 62.19 decode. LLEP still accepted movement: CUDA `12` plan entries / `8.65 MB` selected transport capacity; ROCm `10` plan entries / `8.65 MB`. | The prefill cliff was correctly removed by graph construction, but decode movement remained over-admitted. This separated the problem cleanly: small prefill was fixed, while no-cache whole-expert decode movement needed a stronger relative benefit gate. |
+| CUDA2/ROCm2 relative movement default, seed 303, 1024, `benchmark_results/qwen36_moe_static_llep_relative_default_20260701_154152/` | CUDA static 3219.12 prefill / 124.57 decode vs LLEP 3220.32 prefill / 123.78 decode. ROCm static 1146.62 prefill / 63.58 decode vs LLEP 1145.72 prefill / 65.85 decode. Both backends planned/applied zero arrivals; `device_rebalance_llep_standard_ep_selected=12` and `device_rebalance_llep_skipped_insufficient_spread_improvement=12`. | Default `device_min_load_spread_improvement_divisor=15` pruned the negative movement waves and kept prefill static-shaped. CUDA no-work overhead remained slightly visible in this one-row smoke; ROCm was positive by noise/overhead. |
+| CUDA2/ROCm2 progressive no-work backoff smoke, seed 303, 1024, `benchmark_results/qwen36_moe_static_llep_progressive_backoff_20260701_155341/` | CUDA static 3226.19 prefill / 124.21 decode vs LLEP 3217.30 prefill / 125.26 decode. ROCm static 1147.29 prefill / 62.36 decode vs LLEP 1144.38 prefill / 61.55 decode. Both backends again planned zero arrivals and moved zero payload. `device_maintenance_graph_no_work_completions=6`, `device_maintenance_graph_skipped_no_work_backoff=6`; effective backoff tags remained `1` in this short run because each maintenance cache only reached its first no-work streak. | Progressive backoff is wired and observable but needs longer no-work runs to matter. For 1024-token rows, the remaining LLEP/static delta is mostly measurement noise plus probe overhead, not payload movement. |
 | ROCm2 1024, current clean static vs dynamic-hot10 | 68.99 vs 66.56 tok/s | Persistent hot10 cache is not automatically economic. |
 | ROCm2 2048, current clean static vs dynamic-hot10 | 65.75 vs 58.97 tok/s | Longer generation did not rescue this cache policy sample. |
 | Earlier CUDA/ROCm plumbing recovery samples | static and no-work dynamic near 125-127 CUDA tok/s, dynamic sometimes positive by noise to a few percent | The remaining problem is policy economics, not basic decode plumbing. |
@@ -414,11 +723,15 @@ Performance gates:
 - No silent CPU fallback in homogeneous GPU device-side mode.
 - No per-window host publish/apply or host policy decision in steady state.
 - No new independent per-token rebalance collective.
+- Do not use eager graph recapture as a correctness crutch; request reset should
+  preserve captured graph replay when graph shape and bindings are still valid.
 - No fixed two-card assumptions; domain size is `degree >= 2`.
 - CUDA and ROCm must remain aligned in ABI, tests, and feature behavior.
 - Same-backend expert arrivals use descriptor copy, not repack.
 - Empty slots must not be transferred.
 - If graph capture is required and unsupported, fail hard.
+- If an optimized GPU decode path is enabled, it must either run or fail hard;
+  do not silently retry a different path.
 - Router top-k expert ids and route weights must remain exact.
 - Shared experts follow dense policy. Routed experts are the only rebalanced
   experts.

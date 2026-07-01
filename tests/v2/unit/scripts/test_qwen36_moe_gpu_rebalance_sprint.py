@@ -324,6 +324,7 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS": "128",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS": "65",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT": "4096",
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER": "512",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT": "2048",
                 "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE": "75",
             }
@@ -351,6 +352,10 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
             result.stdout,
         )
         self.assertIn(
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER=512",
+            result.stdout,
+        )
+        self.assertIn(
             "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=2048",
             result.stdout,
         )
@@ -358,7 +363,6 @@ class Qwen36MoEGPURebalanceSprintTest(unittest.TestCase):
             "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE=75",
             result.stdout,
         )
-
     def test_dynamic_policy_env_knobs_are_forwarded_to_benchmark(self) -> None:
         result = self.run_script(
             cases="dynamic",

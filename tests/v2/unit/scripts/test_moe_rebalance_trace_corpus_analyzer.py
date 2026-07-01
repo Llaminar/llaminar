@@ -84,6 +84,18 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
                                     "candidate_arrivals_considered": 5,
                                     "candidate_arrivals_below_floor": 2,
                                     "candidate_arrivals_pruned_by_count_bound": 11,
+                                    "llep_assignment_span_count": 17,
+                                    "llep_weight_transfer_count": 2,
+                                    "llep_native_rows": 90,
+                                    "llep_spilled_rows": 30,
+                                    "llep_standard_ep_selected": 0,
+                                    "llep_skipped_balanced": 0,
+                                    "llep_skipped_insufficient_spread_improvement": 1,
+                                    "llep_skipped_insufficient_foreign_rows": 0,
+                                    "llep_min_chunk_skips": 4,
+                                    "llep_forced_spills": 1,
+                                    "llep_required_spread_improvement": 22,
+                                    "llep_required_foreign_rows": 10,
                                     "candidate_load_spread_improvement_total": 123,
                                     "candidate_load_spread_improvement_max": 77,
                                     "accepted_load_spread_improvement_total": 99,
@@ -142,6 +154,18 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
                                     "candidate_arrivals_considered": 5,
                                     "candidate_arrivals_below_floor": 2,
                                     "candidate_arrivals_pruned_by_count_bound": 11,
+                                    "llep_assignment_span_count": 999,
+                                    "llep_weight_transfer_count": 999,
+                                    "llep_native_rows": 999,
+                                    "llep_spilled_rows": 999,
+                                    "llep_standard_ep_selected": 999,
+                                    "llep_skipped_balanced": 999,
+                                    "llep_skipped_insufficient_spread_improvement": 999,
+                                    "llep_skipped_insufficient_foreign_rows": 999,
+                                    "llep_min_chunk_skips": 999,
+                                    "llep_forced_spills": 999,
+                                    "llep_required_spread_improvement": 999,
+                                    "llep_required_foreign_rows": 999,
                                     "candidate_load_spread_improvement_total": 123,
                                     "candidate_load_spread_improvement_max": 77,
                                     "accepted_load_spread_improvement_total": 99,
@@ -250,6 +274,20 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
         self.assertEqual(run_rows[0]["accepted_improvement"], 99)
         self.assertEqual(run_rows[0]["apply_post_apply_multi_resident_experts"], 2)
         self.assertEqual(run_rows[0]["candidate_below_floor"], 2)
+        self.assertEqual(run_rows[0]["llep_assignment_spans"], 17)
+        self.assertEqual(run_rows[0]["llep_weight_transfers"], 2)
+        self.assertEqual(run_rows[0]["llep_native_rows"], 90)
+        self.assertEqual(run_rows[0]["llep_spilled_rows"], 30)
+        self.assertEqual(run_rows[0]["llep_spilled_row_ratio"], "0.25")
+        self.assertEqual(run_rows[0]["llep_spilled_rows_per_transfer"], "15")
+        self.assertEqual(run_rows[0]["llep_standard_ep_selected"], 0)
+        self.assertEqual(run_rows[0]["llep_skipped_balanced"], 0)
+        self.assertEqual(run_rows[0]["llep_skipped_insufficient_spread_improvement"], 1)
+        self.assertEqual(run_rows[0]["llep_skipped_insufficient_foreign_rows"], 0)
+        self.assertEqual(run_rows[0]["llep_min_chunk_skips"], 4)
+        self.assertEqual(run_rows[0]["llep_forced_spills"], 1)
+        self.assertEqual(run_rows[0]["llep_required_spread_improvement"], 22)
+        self.assertEqual(run_rows[0]["llep_required_foreign_rows"], 10)
         self.assertEqual(run_rows[0]["candidate_improvement"], 123)
         self.assertEqual(run_rows[0]["candidate_improvement_max"], 77)
         self.assertEqual(run_rows[0]["accepted_improvement_max"], 66)
@@ -285,6 +323,13 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
         self.assertEqual(window_rows[0]["applied_arrivals"], 0)
         self.assertEqual(window_rows[0]["applied_remaining_tokens"], -1)
         self.assertEqual(window_rows[0]["candidate_below_floor"], 2)
+        self.assertEqual(window_rows[0]["llep_assignment_spans"], 17)
+        self.assertEqual(window_rows[0]["llep_weight_transfers"], 2)
+        self.assertEqual(window_rows[0]["llep_native_rows"], 90)
+        self.assertEqual(window_rows[0]["llep_spilled_rows"], 30)
+        self.assertEqual(window_rows[0]["llep_spilled_row_ratio"], "0.25")
+        self.assertEqual(window_rows[0]["llep_spilled_rows_per_transfer"], "15")
+        self.assertEqual(window_rows[0]["llep_skipped_insufficient_spread_improvement"], 1)
         self.assertEqual(window_rows[0]["skipped_post_load_spread_ceiling"], 1)
         self.assertEqual(window_rows[0]["router_spread_improvement"], 31)
         self.assertEqual(window_rows[0]["router_active"], 21)
@@ -302,6 +347,7 @@ class MoERebalanceTraceCorpusAnalyzerTest(unittest.TestCase):
         self.assertEqual(window_rows[1]["command_entries"], 2)
         self.assertEqual(window_rows[1]["apply_post_apply_multi_resident_experts"], 9)
         self.assertEqual(window_rows[1]["planned_remaining_tokens"], -1)
+        self.assertEqual(window_rows[1]["llep_spilled_rows"], 999)
         self.assertEqual(window_rows[1]["applied_arrivals"], 1)
         self.assertEqual(window_rows[1]["applied_remaining_tokens"], 701)
 

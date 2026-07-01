@@ -10785,6 +10785,7 @@ message(STATUS "V2 Tests: Added ITPContext LocalTP unit tests (CPU-only)")
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_local_tp_backend_behavior
         integration/collective/Test__LocalTPBackendBehavior.cpp
+        integration/collective/Test__LocalTPNCCLGraphCapture.cpp
         integration/collective/Test__LocalTPRCCLGraphCapture.cpp
     )
     target_link_libraries(v2_integration_local_tp_backend_behavior PRIVATE
@@ -11722,6 +11723,18 @@ target_link_libraries(v2_test_moe_rebalance_controller
 )
 add_v2_test(V2_Unit_MoERebalanceController
     COMMAND $<TARGET_FILE:v2_test_moe_rebalance_controller>
+    LABELS "V2;Unit;MoE;Rebalancer;Controller;DynamicPlacement"
+)
+
+# Test: MoEDeviceRebalanceHostRendezvous — domain-wide maintenance follow-up decisions
+add_executable(v2_test_moe_device_rebalance_host_rendezvous unit/moe/Test__MoEDeviceRebalanceHostRendezvous.cpp)
+target_link_libraries(v2_test_moe_device_rebalance_host_rendezvous
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MoEDeviceRebalanceHostRendezvous
+    COMMAND $<TARGET_FILE:v2_test_moe_device_rebalance_host_rendezvous>
     LABELS "V2;Unit;MoE;Rebalancer;Controller;DynamicPlacement"
 )
 

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -186,6 +187,34 @@ namespace llaminar2
         weightedAdd(output->mutable_data(), input->data(), weight, count);
     }
 
+    bool IMoEKernel::materializePrefillLeastLoadedTransferCommands(
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count)
+    {
+        (void)runtime_layer;
+        (void)plan_entries;
+        (void)plan_count;
+        (void)plan_capacity;
+        (void)command_header;
+        (void)status;
+        (void)config;
+        (void)payload_slot_capacity;
+        (void)layer_idx;
+        (void)command_buffer_count;
+        LOG_ERROR("[IMoEKernel] LeastLoadedEP prefill transfer command materialization "
+                  "was requested on a backend that does not implement it");
+        throw std::logic_error(
+            "LeastLoadedEP prefill transfer command materialization is not implemented by this MoE kernel");
+    }
+
     // =================================================================
     // Phase 4: GPU-side expert dispatch — CPU defaults
     // =================================================================
@@ -228,6 +257,56 @@ namespace llaminar2
 
         prepared_num_experts_ = num_experts;
         return true;
+    }
+
+    bool IMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k,
+        const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config)
+    {
+        (void)runtime_layer;
+        (void)current_tokens;
+        (void)max_tokens;
+        (void)num_experts;
+        (void)top_k;
+        (void)config;
+        LOG_ERROR("[IMoEKernel] LeastLoadedEP prefill route planning was requested "
+                  "on a backend that does not implement current-batch LLEP");
+        throw std::logic_error(
+            "LeastLoadedEP current-batch prefill route planning is not implemented by this MoE kernel");
+    }
+
+    bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k)
+    {
+        (void)runtime_layer;
+        (void)current_tokens;
+        (void)max_tokens;
+        (void)num_experts;
+        (void)top_k;
+        LOG_ERROR("[IMoEKernel] LeastLoadedEP resident-only prefill route assignment "
+                  "was requested on a backend that does not implement current-batch LLEP");
+        throw std::logic_error(
+            "LeastLoadedEP resident-only current-batch prefill assignment is not implemented by this MoE kernel");
+    }
+
+    bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens, int max_tokens,
+        int num_experts, int top_k)
+    {
+        (void)runtime_layer;
+        (void)current_tokens;
+        (void)max_tokens;
+        (void)num_experts;
+        (void)top_k;
+        LOG_ERROR("[IMoEKernel] LeastLoadedEP transfer-backed prefill route assignment "
+                  "was requested on a backend that does not implement current-batch LLEP");
+        throw std::logic_error(
+            "LeastLoadedEP transfer-backed current-batch prefill assignment is not implemented by this MoE kernel");
     }
 
     int IMoEKernel::getExpertTokenCount(int expert_id) const

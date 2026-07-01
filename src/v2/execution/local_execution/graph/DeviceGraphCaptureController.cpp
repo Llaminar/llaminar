@@ -2299,7 +2299,14 @@ namespace llaminar2
         const auto &exec_cfg = debugEnv().execution;
         const bool verify_mode = exec_cfg.gpu_graph_verify;
         const bool recapture_mode = exec_cfg.gpu_graph_recapture || force_recapture;
-        const bool needs_segment_sync = ctx->deviceId().is_cuda();
+        /*
+         * CUDA replay historically synchronized after each captured segment to
+         * make normal replay completion visible immediately to the host. Callers
+         * that explicitly defer final sync are responsible for ordering through
+         * a later stream/event dependency; keeping the CUDA segment sync there
+         * silently destroys aux-stream overlap.
+         */
+        const bool needs_segment_sync = ctx->deviceId().is_cuda() && !defer_final_sync;
 
         const bool stream_only_mode = exec_cfg.gpu_graph_stream_only;
         const bool stream_only_default = exec_cfg.gpu_graph_stream_only_default;

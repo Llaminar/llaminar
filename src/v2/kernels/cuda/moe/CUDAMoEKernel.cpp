@@ -613,6 +613,20 @@ extern "C"
         int device_idx,
         void *stream);
 
+    bool cudaMoE_materialize_prefill_llep_transfer_commands(
+        const void *runtime_layer,
+        void *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        void *command_header,
+        void *status,
+        const void *config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count,
+        int device_idx,
+        void *stream);
+
     bool cudaMoE_pack_rebalance_compact_payloads(
         const void *plan_entries,
         const void *command_headers,
@@ -840,6 +854,43 @@ extern "C"
         void *stream);
 
     bool cudaMoE_assign_prefill_routes_least_loaded_resident(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_plan_prefill_routes_least_loaded_current_batch(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        uint32_t min_chunk_tokens,
+        uint32_t alpha_numerator,
+        uint32_t alpha_denominator,
+        uint32_t lambda_numerator,
+        uint32_t lambda_denominator,
+        uint64_t min_spread_improvement,
+        uint32_t min_spread_improvement_divisor,
+        uint64_t min_spread_improvement_per_transfer,
+        uint64_t min_foreign_rows_per_transfer,
+        int enable_balanced_skip,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_no_transfers(
+        void *runtime,
+        int current_slots,
+        int max_slots,
+        int num_experts,
+        int top_k,
+        int device_idx,
+        void *stream);
+
+    bool cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
         void *runtime,
         int current_slots,
         int max_slots,
@@ -3231,6 +3282,54 @@ namespace llaminar2
             stream);
     }
 
+    bool CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands(
+        const DeviceMoELayerRuntime *runtime_layer,
+        DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t *plan_count,
+        uint32_t plan_capacity,
+        DeviceMoERebalanceCommandBufferHeader *command_header,
+        DeviceMoERebalanceStatus *status,
+        const DeviceMoERebalanceConfig &config,
+        uint32_t payload_slot_capacity,
+        uint32_t layer_idx,
+        uint32_t command_buffer_count)
+    {
+        if (!validateDeviceMoERebalanceConfig(config))
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands] invalid device rebalance config");
+            return false;
+        }
+        if (!runtime_layer || !plan_entries || !plan_count || !command_header || !status ||
+            plan_capacity == 0 || payload_slot_capacity == 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands] runtime, command buffers, status, and payload capacity are required");
+            return false;
+        }
+        if (layer_idx >= config.num_layers)
+        {
+            LOG_ERROR("[CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands] layer index out of range"
+                      << " layer=" << layer_idx << " num_layers=" << config.num_layers);
+            return false;
+        }
+        void *stream = requireStream("CUDAMoEKernel::materializePrefillLeastLoadedTransferCommands");
+        if (!setMoEDevice(device_ordinal_, "materializePrefillLeastLoadedTransferCommands"))
+            return false;
+
+        return cudaMoE_materialize_prefill_llep_transfer_commands(
+            runtime_layer,
+            plan_entries,
+            plan_count,
+            plan_capacity,
+            command_header,
+            status,
+            &config,
+            payload_slot_capacity,
+            layer_idx,
+            command_buffer_count,
+            device_ordinal_,
+            stream);
+    }
+
     bool CUDAMoEKernel::packDeviceRebalanceCompactPayloads(
         const DeviceMoERebalancePlanEntry *plan_entries,
         const DeviceMoERebalanceCommandBufferHeader *command_headers,
@@ -3968,6 +4067,125 @@ namespace llaminar2
         }
         void *stream = requireStream("CUDAMoEKernel::assignPrefillRoutesLeastLoadedResident");
         return cudaMoE_assign_prefill_routes_least_loaded_resident(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k,
+        const least_loaded_ep::LeastLoadedExpertAssignmentConfig &config)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+        if (config.expert_count != static_cast<uint32_t>(num_experts) ||
+            config.participant_count == 0u ||
+            config.alpha_numerator == 0u ||
+            config.alpha_denominator == 0u ||
+            config.lambda_numerator == 0u ||
+            config.lambda_denominator == 0u)
+        {
+            LOG_ERROR("[CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch] invalid LLEP config");
+            return false;
+        }
+
+        void *stream = requireStream("CUDAMoEKernel::planPrefillRoutesLeastLoadedCurrentBatch");
+        return cudaMoE_plan_prefill_routes_least_loaded_current_batch(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            config.min_chunk_tokens,
+            config.alpha_numerator,
+            config.alpha_denominator,
+            config.lambda_numerator,
+            config.lambda_denominator,
+            config.min_spread_improvement,
+            config.min_spread_improvement_divisor,
+            config.min_spread_improvement_per_transfer,
+            config.min_foreign_rows_per_transfer,
+            config.enable_balanced_skip ? 1 : 0,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanNoTransfers");
+        return cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_no_transfers(
+            static_cast<void *>(runtime_layer),
+            current_tokens * top_k,
+            max_tokens * top_k,
+            num_experts,
+            top_k,
+            device_ordinal_,
+            stream);
+    }
+
+    bool CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
+        DeviceMoELayerRuntime *runtime_layer,
+        int current_tokens,
+        int max_tokens,
+        int num_experts,
+        int top_k)
+    {
+        if (!runtime_layer)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
+            return false;
+        }
+        if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
+            num_experts <= 0 || top_k <= 0)
+        {
+            LOG_ERROR("[CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] invalid dimensions current_tokens="
+                      << current_tokens << " max_tokens=" << max_tokens
+                      << " num_experts=" << num_experts << " top_k=" << top_k);
+            return false;
+        }
+
+        void *stream = requireStream(
+            "CUDAMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers");
+        return cudaMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
             static_cast<void *>(runtime_layer),
             current_tokens * top_k,
             max_tokens * top_k,
@@ -5152,8 +5370,13 @@ namespace llaminar2
             return false;
 
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate);
+        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        if (use_kpart && !ensureGroupedGateUpKPartScratchCapacity(num_active, k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromTable] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
         if (!ensureGroupedGateUpDecodeCapacity(num_active, d_model))
             return false;
 
@@ -5347,8 +5570,13 @@ namespace llaminar2
 
         float *d_output = static_cast<float *>(output->gpu_data_ptr());
         const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, num_active);
+        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
+        if (use_kpart && !ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, num_active))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromTable] "
+                      "K-part down decode was requested but scratch allocation failed");
+            return false;
+        }
 
         const bool ok = use_kpart
             ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
@@ -5437,8 +5665,13 @@ namespace llaminar2
         }
 
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate);
+        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        if (use_kpart && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRouting] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
 
         const float *d_hidden = static_cast<const float *>(input->gpu_data_ptr());
         if (!d_hidden && capture_active)
@@ -5687,8 +5920,13 @@ namespace llaminar2
             return false;
 
         const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k);
+        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
+        if (use_kpart && !ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRouting] "
+                      "K-part down decode was requested but scratch allocation failed");
+            return false;
+        }
 
         const bool ok = use_kpart
             ? cudaMoE_grouped_swiglu_down_native_vnni_decode_table_kpart(
@@ -5774,13 +6012,23 @@ namespace llaminar2
             return false;
 
         const int gateup_k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_gateup_kpart =
-            debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-            ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate);
+        const bool use_gateup_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        if (use_gateup_kpart &&
+            !ensureGroupedGateUpKPartScratchCapacity(top_k, gateup_k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
         const int down_k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_down_kpart =
-            debugEnv().gemm.cuda_moe_down_kpart_decode &&
-            ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model, top_k);
+        const bool use_down_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
+        if (use_down_kpart &&
+            !ensureGroupedDownKPartScratchCapacity(down_k_partitions, d_model, top_k))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
+                      "K-part down decode was requested but scratch allocation failed");
+            return false;
+        }
 
         if (!ensureGroupedPrefillScratchCapacity(top_k, d_model, intermediate) ||
             !ensureGroupedGateUpDecodeCapacity(top_k, d_model) ||
@@ -6062,12 +6310,16 @@ namespace llaminar2
         if (!ensureGroupedGateUpDecodeCapacity(top_k, d_model))
             return false;
 
-        // Decide whether to use the split-K (kpart) decode path. It requires
-        // pre-sized partials scratch; if the scratch cannot be ensured (e.g. the
-        // shape grew during graph capture), fall back to the serial kernel.
+        // K-part decode is an explicit contract. If it is enabled and the
+        // partial scratch cannot be sized, fail instead of changing routes.
         const int k_partitions = debugEnv().gemm.cuda_moe_gateup_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode &&
-                               ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate);
+        const bool use_kpart = debugEnv().gemm.cuda_moe_gateup_kpart_decode;
+        if (use_kpart && !ensureGroupedGateUpKPartScratchCapacity(top_k, k_partitions, intermediate))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertGateUpDecodeFromRuntime] "
+                      "K-part gate/up decode was requested but scratch allocation failed");
+            return false;
+        }
 
         if (!setMoEDevice(device_ordinal_, "groupedExpertGateUpDecodeFromRuntime"))
             return false;
@@ -6276,11 +6528,16 @@ namespace llaminar2
         }
 
         // Split-K (K-partition) path raises occupancy by multiplying the block
-        // count by k_partitions; fall back to the serial full-K path when the
-        // toggle is off or the partial scratch cannot be sized.
+        // count by k_partitions. Serial is only used when the K-part toggle is
+        // explicitly off.
         const int k_partitions = debugEnv().gemm.cuda_moe_down_kparts;
-        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode &&
-                               ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k);
+        const bool use_kpart = debugEnv().gemm.cuda_moe_down_kpart_decode;
+        if (use_kpart && !ensureGroupedDownKPartScratchCapacity(k_partitions, d_model, top_k))
+        {
+            LOG_ERROR("[CUDAMoEKernel::groupedExpertDownDecodeFromRuntime] "
+                      "K-part down decode was requested but scratch allocation failed");
+            return false;
+        }
 
         const bool ok = use_kpart
             ? cudaMoE_grouped_swiglu_down_native_vnni_decode_runtime_kpart(

@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "LeastLoadedExpertAssignment.h"
+
 #include "../../backends/DeviceId.h"
 #include "../../tensors/TensorKernels.h"
 
@@ -123,9 +125,15 @@ namespace llaminar2
         float *grouped_up_scratch = nullptr;
         float *grouped_output_partials = nullptr;
         void *decode_scratch = nullptr;
-        // reserved_ptrs[0]: prefill LLEP split-end table,
+        // reserved_ptrs[0]: resident-prefill LLEP split-end table,
         // [expert][participant] int32 cumulative route counts.
+        // reserved_ptrs[1]: full current-batch LLEP assignment spans.
+        // reserved_ptrs[2]: full current-batch LLEP expert-weight transfers.
         void *reserved_ptrs[3] = {};
+        // reserved_u64[0]: current-batch LLEP assignment span capacity.
+        // reserved_u64[1]: current-batch LLEP transfer capacity.
+        // reserved_u64[2]: latest current-batch LLEP assignment span count.
+        // reserved_u64[3]: latest current-batch LLEP transfer count.
         uint64_t reserved_u64[4] = {};
         uint32_t prefill_token_capacity = 0;
         uint32_t prefill_route_capacity = 0;
@@ -240,9 +248,12 @@ namespace llaminar2
             int32_t *grouped_token_ids = nullptr;
             float *grouped_route_weights = nullptr;
             int32_t *llep_split_ends = nullptr;
+            least_loaded_ep::LeastLoadedExpertAssignmentSpan *llep_assignment_spans = nullptr;
+            least_loaded_ep::LeastLoadedExpertWeightTransfer *llep_weight_transfers = nullptr;
             uint32_t token_capacity = 0;
             uint32_t route_capacity = 0;
             uint32_t expert_capacity = 0;
+            uint32_t llep_plan_capacity = 0;
         };
         std::vector<PrefillRouteScratchAllocation> prefill_route_scratch_;
 
