@@ -63,18 +63,28 @@ namespace llaminar2
 
         /**
          * Graph-capturable maintenance producer phase after histogram state has
-         * already been gathered. This runs the device controller and gathers
-         * compact command metadata, but deliberately stops before packing or
-         * moving expert payload bytes. Payload movement is handled by
-         * CopyPreparedPayload only when the completed plan requested payload
-         * slots.
+         * already been gathered. This runs the device controller and writes
+         * local command buffers, but deliberately stops before any command
+         * metadata allgather or expert payload movement. The follow-up
+         * MetadataAndPayload graph runs only when the completed probe requested
+         * non-empty payload slots.
          */
-        PlanCommandsAfterSideband,
+        PlanProbeAfterSideband,
 
         /**
-         * Graph-capturable maintenance payload phase. This consumes command
-         * metadata prepared by PlanCommandsAfterSideband, moves only the compact
-         * payload bucket for the active wave, and publishes transfer completion.
+         * Graph-capturable maintenance follow-up phase. This consumes command
+         * metadata prepared by PlanProbeAfterSideband, gathers/projects command
+         * buffers across the rebalance domain, moves only the compact payload
+         * bucket for the active wave, and publishes transfer completion.
+         */
+        GatherCommandsAndCopyPreparedPayload,
+
+        /**
+         * Graph-capturable maintenance payload phase. This consumes already
+         * gathered/projected command metadata, moves the prepared payload bucket,
+         * and publishes transfer completion. New maintenance replay should use
+         * GatherCommandsAndCopyPreparedPayload so no-work probes do not pay the
+         * command-buffer allgather.
          */
         CopyPreparedPayload,
 

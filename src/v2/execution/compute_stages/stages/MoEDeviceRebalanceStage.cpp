@@ -51,8 +51,10 @@ namespace llaminar2
                 return "plan_and_copy";
             case DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband:
                 return "plan_and_copy_after_sideband";
-            case DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband:
-                return "plan_commands_after_sideband";
+            case DeviceMoERebalanceStagePhase::PlanProbeAfterSideband:
+                return "plan_probe_after_sideband";
+            case DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload:
+                return "gather_commands_and_copy_prepared_payload";
             case DeviceMoERebalanceStagePhase::CopyPreparedPayload:
                 return "copy_prepared_payload";
             case DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband:
@@ -404,14 +406,15 @@ namespace llaminar2
         return params_.phase == DeviceMoERebalanceStagePhase::PlanCopyApply ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopy ||
                params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
-               params_.phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband;
+               params_.phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband;
     }
 
     bool MoEDeviceRebalanceStage::runsPlanning() const
     {
         if (params_.phase == DeviceMoERebalanceStagePhase::JoinTransfer)
             return false;
-        if (params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband ||
+        if (params_.phase == DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload ||
+            params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband ||
             params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload ||
             params_.phase == DeviceMoERebalanceStagePhase::UnpackCollectivePayloadAfterSideband)
         {
@@ -614,22 +617,35 @@ namespace llaminar2
         uint64_t *local = nullptr;
         uint64_t *gathered = nullptr;
         DeviceMoERebalanceStatus *status = nullptr;
-        if (runsPlanning())
+        const bool needs_status_workspace =
+            runsPlanning() ||
+            params_.phase ==
+                DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload;
+        if (needs_status_workspace)
         {
-            local = static_cast<uint64_t *>(
-                bound_workspace_->getBuffer(localHistogramBufferName()));
-            gathered = static_cast<uint64_t *>(
-                bound_workspace_->getBuffer(gatheredHistogramBufferName()));
             status = static_cast<DeviceMoERebalanceStatus *>(
                 bound_workspace_->getBuffer(statusBufferName()));
-            if (!local || !gathered || !status)
+            if (!status)
             {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Missing planning workspace buffers"
-                          << " local=" << static_cast<void *>(local)
-                          << " gathered=" << static_cast<void *>(gathered)
+                LOG_ERROR("[MoEDeviceRebalanceStage] Missing status workspace buffer"
                           << " status=" << static_cast<void *>(status)
                           << " phase=" << phaseName(params_.phase));
                 return false;
+            }
+            if (runsPlanning())
+            {
+                local = static_cast<uint64_t *>(
+                    bound_workspace_->getBuffer(localHistogramBufferName()));
+                gathered = static_cast<uint64_t *>(
+                    bound_workspace_->getBuffer(gatheredHistogramBufferName()));
+                if (!local || !gathered)
+                {
+                    LOG_ERROR("[MoEDeviceRebalanceStage] Missing histogram workspace buffers"
+                              << " local=" << static_cast<void *>(local)
+                              << " gathered=" << static_cast<void *>(gathered)
+                              << " phase=" << phaseName(params_.phase));
+                    return false;
+                }
             }
         }
 
@@ -731,10 +747,11 @@ namespace llaminar2
                 {{"stage", suffixFor(params_.stage_name)},
                  {"phase", phaseName(params_.phase)},
                  {"collects_state", boolString(collectsState())},
-	                 {"gathers_state_inline", boolString(gathersStateInline())},
-	                 {"uses_sideband_state",
-	                  boolString(params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
-	                             params_.phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband)},
+                 {"gathers_state_inline", boolString(gathersStateInline())},
+                 {"uses_sideband_state",
+                  boolString(params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
+                             params_.phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband ||
+                             params_.phase == DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload)},
                  {"uses_transfer_slots", boolString(usesTransferSlotApply())},
                  {"command_buffer_count", std::to_string(commandBufferCount())}});
             if (runsPlanning())
@@ -1088,6 +1105,63 @@ namespace llaminar2
         if (params_.phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload)
             return copy_prepared_payload(/*transfer_stream_already_ordered=*/false);
 
+        if (params_.phase ==
+            DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload)
+        {
+            if (!usesTransferSlotApply())
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] GatherCommandsAndCopyPreparedPayload requires transfer slots");
+                return false;
+            }
+            if (!transfer_stream_is_stage_stream &&
+                (!gpu_ctx->recordEventChecked(transfer_state->computeReadyEvent(), stream) ||
+                 !gpu_ctx->waitEventChecked(transfer_state->computeReadyEvent(), transfer_stream)))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to queue command-metadata compute-to-transfer dependency");
+                return false;
+            }
+
+            moe_kernel->setGPUStream(transfer_stream);
+            static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
+            static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
+            const size_t plan_int32_words =
+                (commandBufferCount() * transferPlanCapacity() *
+                 sizeof(DeviceMoERebalancePlanEntry)) /
+                sizeof(int32_t);
+            const size_t header_int32_words =
+                (commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader)) /
+                sizeof(int32_t);
+            if (!params_.tp_ctx->allgatherRawOnStream(
+                    plan_entries,
+                    gathered_plan_entries,
+                    plan_int32_words,
+                    CollectiveDataType::INT32,
+                    params_.tp_device_idx,
+                    transfer_stream,
+                    workspaceSuffix() + "_transfer_plan"))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-plan allgather failed");
+                return false;
+            }
+            if (!params_.tp_ctx->allgatherRawOnStream(
+                    command_header,
+                    gathered_command_headers,
+                    header_int32_words,
+                    CollectiveDataType::INT32,
+                    params_.tp_device_idx,
+                    transfer_stream,
+                    workspaceSuffix() + "_transfer_header"))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-header allgather failed");
+                return false;
+            }
+
+            if (!project_domain_commands())
+                return false;
+
+            return copy_prepared_payload(/*transfer_stream_already_ordered=*/true);
+        }
+
         if (params_.phase == DeviceMoERebalanceStagePhase::PackCollectivePayloadAfterSideband)
         {
             if (!usesFixedPayloadTransfer())
@@ -1256,6 +1330,9 @@ namespace llaminar2
                     return false;
                 }
 
+                if (params_.phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband)
+                    return true;
+
                 if (usesTransferSlotApply())
                 {
                     if (!transfer_stream_is_stage_stream &&
@@ -1303,7 +1380,7 @@ namespace llaminar2
                         if (!project_domain_commands())
                             return false;
 
-                        if (params_.phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband)
+                        if (params_.phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband)
                         {
                             if (!join_transfer_stream_to_stage("planned command metadata"))
                                 return false;

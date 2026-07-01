@@ -29,8 +29,8 @@ namespace llaminar2
 {
     enum class DeviceMoERebalanceMaintenanceGraphKind
     {
-        Plan,
-        Payload,
+        Probe,
+        MetadataAndPayload,
     };
 
 
@@ -483,7 +483,7 @@ namespace llaminar2
          */
         virtual ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device,
-            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Plan,
+            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Probe,
             uint64_t payload_edge_mask = 0)
         {
             (void)device;

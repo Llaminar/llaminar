@@ -3799,7 +3799,8 @@ namespace llaminar2
             const auto phase = candidate->getParams().phase;
             if (phase == DeviceMoERebalanceStagePhase::PlanAndCopy ||
                 phase == DeviceMoERebalanceStagePhase::PlanAndCopyAfterSideband ||
-                phase == DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband ||
+                phase == DeviceMoERebalanceStagePhase::PlanProbeAfterSideband ||
+                phase == DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload ||
                 phase == DeviceMoERebalanceStagePhase::CopyPreparedPayload ||
                 phase == DeviceMoERebalanceStagePhase::PlanCopyApply)
             {
@@ -4899,7 +4900,7 @@ namespace llaminar2
         for (auto &[edge_mask, payload_cache] :
              device_moe_rebalance_maintenance_payload_graphs_)
         {
-            drain_one(payload_cache, "payload", edge_mask);
+            drain_one(payload_cache, "metadata_payload", edge_mask);
         }
     }
 
@@ -5066,7 +5067,7 @@ namespace llaminar2
                     std::to_string(static_cast<uint32_t>(edge_mask >> 32u));
                 skip_tags["skipped_inflight_count"] =
                     std::to_string(payload_cache.skipped_inflight_count);
-                skip_tags["maintenance_graph_kind"] = "payload";
+                skip_tags["maintenance_graph_kind"] = "metadata_payload";
                 PerfStatsCollector::addCounter(
                     "moe_rebalance",
                     "device_maintenance_payload_graph_skipped_inflight",
@@ -5079,7 +5080,7 @@ namespace llaminar2
 
             payload_cache.completion_event_in_flight = false;
             auto payload_tags = maintenance_tags;
-            payload_tags["maintenance_graph_kind"] = "payload";
+            payload_tags["maintenance_graph_kind"] = "metadata_payload";
             payload_tags["payload_edge_mask_low32"] =
                 std::to_string(static_cast<uint32_t>(
                     edge_mask & 0xffffffffULL));
@@ -5095,7 +5096,7 @@ namespace llaminar2
             }
         }
 
-        bool launch_payload_graph = false;
+        bool launch_metadata_payload_graph = false;
         uint64_t pending_payload_edge_mask = 0;
         if (cache.completion_event_in_flight)
         {
@@ -5138,7 +5139,7 @@ namespace llaminar2
             cache.completion_event_in_flight = false;
             DeviceMoERebalanceMaintenanceOutcome outcome{};
             auto plan_tags = maintenance_tags;
-            plan_tags["maintenance_graph_kind"] = "plan";
+            plan_tags["maintenance_graph_kind"] = "probe";
             if (!exportCompletedDeviceMoERebalanceMaintenanceStats(
                     cache,
                     cache.segment_cache.capture_stream,
@@ -5148,12 +5149,12 @@ namespace llaminar2
             {
                 return false;
             }
-            launch_payload_graph =
+            launch_metadata_payload_graph =
                 outcome.valid &&
                 outcome.status_code ==
                     static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
                 outcome.payload_bucket_slots != 0u;
-            pending_payload_edge_mask = launch_payload_graph
+            pending_payload_edge_mask = launch_metadata_payload_graph
                                             ? outcome.payload_edge_mask
                                             : 0ULL;
             if (outcome.valid && !outcome.useful_work)
@@ -5186,12 +5187,12 @@ namespace llaminar2
             }
         }
 
-        if (!launch_payload_graph && !should_launch)
+        if (!launch_metadata_payload_graph && !should_launch)
         {
             return true;
         }
 
-        if (!launch_payload_graph && cache.no_work_backoff_remaining > 0)
+        if (!launch_metadata_payload_graph && cache.no_work_backoff_remaining > 0)
         {
             --cache.no_work_backoff_remaining;
             PerfStatsCollector::addCounter(
@@ -5208,7 +5209,7 @@ namespace llaminar2
         }
 
         auto *active_cache_ptr = &cache;
-        if (launch_payload_graph)
+        if (launch_metadata_payload_graph)
         {
             auto [it, inserted] =
                 device_moe_rebalance_maintenance_payload_graphs_.try_emplace(
@@ -5218,10 +5219,11 @@ namespace llaminar2
                 active_cache_ptr->payload_edge_mask = pending_payload_edge_mask;
         }
         auto &active_cache = *active_cache_ptr;
-        const auto active_kind = launch_payload_graph
-                                     ? DeviceMoERebalanceMaintenanceGraphKind::Payload
-                                     : DeviceMoERebalanceMaintenanceGraphKind::Plan;
-        const char *active_kind_name = launch_payload_graph ? "payload" : "plan";
+        const auto active_kind = launch_metadata_payload_graph
+                                     ? DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload
+                                     : DeviceMoERebalanceMaintenanceGraphKind::Probe;
+        const char *active_kind_name =
+            launch_metadata_payload_graph ? "metadata_payload" : "probe";
 
         if (!active_cache.graph)
         {
@@ -5239,7 +5241,7 @@ namespace llaminar2
                 graph = graph_builder_->buildDeviceMoERebalanceMaintenanceGraph(
                     state_.device_id,
                     active_kind,
-                    launch_payload_graph ? pending_payload_edge_mask : 0ULL);
+                    launch_metadata_payload_graph ? pending_payload_edge_mask : 0ULL);
             }
             if (graph.size() == 0)
             {
@@ -5271,7 +5273,7 @@ namespace llaminar2
             }
             active_cache.workspace_generation = workspaceGeneration(state_.device_id);
             active_cache.payload_edge_mask =
-                launch_payload_graph ? pending_payload_edge_mask : 0ULL;
+                launch_metadata_payload_graph ? pending_payload_edge_mask : 0ULL;
         }
         else
         {
@@ -5400,8 +5402,8 @@ namespace llaminar2
                 active_cache.segment_cache.consecutive_failures);
         policy.defer_final_sync = true;
         active_cache.segment_cache.perf_context =
-            launch_payload_graph ? "moe_rebalance_maintenance_payload"
-                                 : "moe_rebalance_maintenance_plan";
+            launch_metadata_payload_graph ? "moe_rebalance_maintenance_metadata_payload"
+                                          : "moe_rebalance_maintenance_probe";
 
         bool used_graph_replay = false;
         bool ok = false;

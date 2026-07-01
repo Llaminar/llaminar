@@ -64,7 +64,7 @@ namespace llaminar2
 
         ComputeGraph buildDeviceMoERebalanceMaintenanceGraph(
             DeviceId device,
-            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Plan,
+            DeviceMoERebalanceMaintenanceGraphKind kind = DeviceMoERebalanceMaintenanceGraphKind::Probe,
             uint64_t payload_edge_mask = 0) override;
 
         ComputeGraph buildMTPGraph(

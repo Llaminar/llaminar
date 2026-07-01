@@ -1635,27 +1635,27 @@ namespace llaminar2::test
             << "Maintenance replay must snapshot histograms before planning the next command buffer.";
         EXPECT_NE(contents.find("DeviceMoERebalanceStagePhase::CollectAndGatherState"),
                   std::string::npos);
-        EXPECT_NE(contents.find("moe_device_rebalance_maintenance_plan_commands_after_snapshot"),
+        EXPECT_NE(contents.find("moe_device_rebalance_maintenance_probe_after_snapshot"),
                   std::string::npos)
-            << "Maintenance planning should consume the pre-apply histogram snapshot.";
-        EXPECT_NE(contents.find("moe_device_rebalance_maintenance_copy_prepared_payload"),
+            << "Maintenance probe planning should consume the pre-apply histogram snapshot.";
+        EXPECT_NE(contents.find("moe_device_rebalance_maintenance_metadata_payload"),
                   std::string::npos)
-            << "Maintenance payload movement should be a separate captured graph body.";
+            << "Maintenance command metadata and payload movement should be a separate captured graph body.";
         EXPECT_NE(contents.find("graph.addDependency(plan_params.stage_name, collect_params.stage_name)"),
                   std::string::npos)
-            << "The maintenance plan graph must gather the histogram window before planning commands.";
+            << "The maintenance probe graph must gather the histogram window before planning commands.";
         EXPECT_EQ(contents.find("graph.addDependency(apply_params.stage_name, collect_params.stage_name)"),
                   std::string::npos);
         EXPECT_EQ(contents.find("graph.addDependency(apply_drain_params.stage_name, apply_params.stage_name)"),
                   std::string::npos);
         EXPECT_EQ(contents.find("graph.addDependency(plan_params.stage_name, apply_drain_params.stage_name)"),
                   std::string::npos);
-        EXPECT_NE(contents.find("DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband"),
+        EXPECT_NE(contents.find("DeviceMoERebalanceStagePhase::PlanProbeAfterSideband"),
                   std::string::npos)
-            << "Maintenance planning should reuse the histogram snapshot gathered before apply.";
-        EXPECT_NE(contents.find("DeviceMoERebalanceStagePhase::CopyPreparedPayload"),
+            << "Maintenance probe planning should reuse the histogram snapshot gathered before apply.";
+        EXPECT_NE(contents.find("DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload"),
                   std::string::npos)
-            << "Payload buckets must live in a separate graph so no-work waves skip payload replay.";
+            << "Command metadata and payload buckets must live in a separate graph so no-work waves skip them.";
         EXPECT_NE(ffn_body.find("producer_runs_in_maintenance_graph"),
                   std::string::npos)
             << "The graph builder must keep rolling maintenance ownership explicit instead of hiding host scheduling.";
@@ -1895,7 +1895,8 @@ namespace llaminar2::test
         EXPECT_NE(stage_header.find("enum class DeviceMoERebalanceStagePhase"), std::string::npos);
         EXPECT_NE(stage_header.find("CollectState"), std::string::npos);
         EXPECT_NE(stage_header.find("PlanAndCopyAfterSideband"), std::string::npos);
-        EXPECT_NE(stage_header.find("PlanCommandsAfterSideband"), std::string::npos);
+        EXPECT_NE(stage_header.find("PlanProbeAfterSideband"), std::string::npos);
+        EXPECT_NE(stage_header.find("GatherCommandsAndCopyPreparedPayload"), std::string::npos);
         EXPECT_NE(stage_header.find("CopyPreparedPayload"), std::string::npos);
         EXPECT_NE(stage_header.find("JoinTransfer"), std::string::npos);
         EXPECT_EQ(controller_header.find("PeerRead"), std::string::npos)
@@ -2001,26 +2002,31 @@ namespace llaminar2::test
             << "Decode apply must poll a ready device wave rather than host-published state.";
         EXPECT_NE(stage_source.find("projectDeviceRebalanceDomainCommands("), std::string::npos)
             << "Gathered root command buffers must be projected into every participant's local apply ABI.";
+        const size_t followup_phase =
+            stage_source.find("DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload");
         const size_t command_header_allgather =
-            stage_source.find("workspaceSuffix() + \"_transfer_header\"");
+            stage_source.find("workspaceSuffix() + \"_transfer_header\"", followup_phase);
         const size_t domain_projection =
             stage_source.find("if (!project_domain_commands())", command_header_allgather);
-        const size_t plan_commands_phase =
-            stage_source.find("DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband",
+        const size_t probe_return =
+            stage_source.find("DeviceMoERebalanceStagePhase::PlanProbeAfterSideband",
                               domain_projection);
         const size_t copy_payload_lambda =
             stage_source.find("auto copy_prepared_payload");
         const size_t source_descriptor_pack =
             stage_source.find("packDeviceRebalanceSourceDescriptors(", copy_payload_lambda);
+        ASSERT_NE(followup_phase, std::string::npos);
         ASSERT_NE(command_header_allgather, std::string::npos);
         ASSERT_NE(domain_projection, std::string::npos);
-        ASSERT_NE(plan_commands_phase, std::string::npos);
+        ASSERT_NE(probe_return, std::string::npos);
         ASSERT_NE(copy_payload_lambda, std::string::npos);
         ASSERT_NE(source_descriptor_pack, std::string::npos);
+        EXPECT_LT(followup_phase, command_header_allgather)
+            << "Only the metadata/payload follow-up graph should gather command headers.";
         EXPECT_LT(command_header_allgather, domain_projection)
             << "Command projection must run after command/header allgather.";
-        EXPECT_LT(domain_projection, plan_commands_phase)
-            << "PlanCommandsAfterSideband must stop after projection instead of running payload buckets.";
+        EXPECT_LT(domain_projection, probe_return)
+            << "The probe branch must return before command/header allgather and payload buckets.";
         EXPECT_LT(copy_payload_lambda, source_descriptor_pack)
             << "Source descriptor packing belongs to the payload graph body.";
         const std::string source_descriptor_args =
@@ -2580,9 +2586,9 @@ namespace llaminar2::test
             << "The obsolete fixed-arena transfer fallback must stay disabled by default.";
         EXPECT_NE(dgo.find("buildDeviceMoERebalanceMaintenanceGraph(\n                    state_.device_id"),
                   std::string::npos);
-        EXPECT_NE(dgo.find("DeviceMoERebalanceMaintenanceGraphKind::Payload"),
+        EXPECT_NE(dgo.find("DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload"),
                   std::string::npos)
-            << "The maintenance scheduler must have a payload graph variant.";
+            << "The maintenance scheduler must have a metadata/payload graph variant.";
         EXPECT_NE(dgo.find("outcome.payload_bucket_slots != 0u"),
                   std::string::npos)
             << "Payload graph replay should be scheduled only when the plan requested payload slots.";
@@ -2614,7 +2620,7 @@ namespace llaminar2::test
             const size_t plan_event_query =
                 dgo.find("gpu_ctx->queryEventChecked(cache.completion_event.get(), previous_wave_ready)");
             const size_t off_cadence_after_drain_return =
-                dgo.find("if (!launch_payload_graph && !should_launch)");
+                dgo.find("if (!launch_metadata_payload_graph && !should_launch)");
             ASSERT_NE(inflight_gate, std::string::npos);
             ASSERT_NE(off_cadence_idle_return, std::string::npos);
             ASSERT_NE(plan_event_query, std::string::npos);
@@ -2623,7 +2629,7 @@ namespace llaminar2::test
             EXPECT_LT(off_cadence_idle_return, plan_event_query)
                 << "Only completely idle off-cadence tokens may return before querying completed maintenance.";
             EXPECT_LT(plan_event_query, off_cadence_after_drain_return)
-                << "A completed plan with payload work must be able to launch the payload graph before the next scheduled plan period.";
+                << "A completed probe with payload work must be able to launch the metadata/payload graph before the next scheduled probe period.";
             EXPECT_NE(dgo.find("\"scheduled_plan_launch\""), std::string::npos)
                 << "Perfstats should distinguish an off-cadence completion drain from a scheduled new plan launch.";
         }

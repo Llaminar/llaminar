@@ -2643,11 +2643,16 @@ TEST_F(Test__CUDAMoEKernel, DeviceRebalanceControllerPlansLeastLoadedEPWeightArr
     EXPECT_EQ(status.planned_arrivals, 1u);
     EXPECT_EQ(status.selected_replicas, 1u);
     EXPECT_EQ(status.candidate_arrivals_considered, 1u);
-    EXPECT_EQ(status.accepted_load_spread_improvement_total, 100u);
+    EXPECT_EQ(status.candidate_load_spread_improvement_total, 100u)
+        << "the shared LLEP span planner still reports the ideal row-span assignment";
+    EXPECT_EQ(status.candidate_load_spread_improvement_max, 100u);
+    EXPECT_EQ(status.accepted_load_spread_improvement_total, 80u)
+        << "accepted stats must reflect the actual whole-expert resident-mask proxy";
+    EXPECT_EQ(status.accepted_load_spread_improvement_max, 80u);
     EXPECT_EQ(status.pre_policy_load_min, 0u);
     EXPECT_EQ(status.pre_policy_load_max, 100u);
-    EXPECT_EQ(status.post_policy_load_min, 50u);
-    EXPECT_EQ(status.post_policy_load_max, 50u);
+    EXPECT_EQ(status.post_policy_load_min, 40u);
+    EXPECT_EQ(status.post_policy_load_max, 60u);
     EXPECT_EQ(plan.op, static_cast<uint32_t>(llaminar2::DeviceMoERebalancePlanOp::ExpertPayloadArrival));
     EXPECT_EQ(plan.layer, 0u);
     EXPECT_EQ(plan.expert, 0u);

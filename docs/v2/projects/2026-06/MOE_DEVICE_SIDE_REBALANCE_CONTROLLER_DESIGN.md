@@ -230,8 +230,9 @@ Implemented or partially implemented:
   state, route-boundary apply, explicit streams, and graph-owned state.
 - CUDA and ROCm share the same high-level controller shape and tests for ready
   wave apply, transfer-slot apply, and router hot-cache accounting.
-- Maintenance is split into plan and payload graph bodies so no-work waves do
-  not run the captured payload bucket.
+- Maintenance is split into probe and metadata/payload graph bodies. No-work
+  waves now run only the histogram/controller probe and skip command-buffer
+  allgathers plus compact payload movement.
 - Compact transfer-slot staging moves planned payload slots instead of fixed
   plan-capacity arenas.
 - `LeastLoadedExpertAssignment` and the shared routed-assignment surface exist
@@ -253,6 +254,12 @@ Implemented or partially implemented:
   as Dynamic. The shared transfer-only LLEP planner emits foreign whole-expert
   arrivals, and CUDA/ROCm controller kernels publish `ExpertPayloadArrival`
   commands without enabling the hot-cache policy.
+- CUDA and ROCm now distinguish LLEP candidate span economics from accepted
+  runtime economics. Candidate counters report the ideal row-span plan from the
+  shared LLEP helper; accepted counters and post-policy imbalance are recomputed
+  from the actual whole-expert resident masks published by the live GPU proxy.
+  This prevents partially accepted arrivals, duplicate-resident skips, and the
+  current whole-expert proxy from overstating realized load-balance gains.
 - `SocketAwareRebalancer` now delegates Dynamic ownership-swap selection to the
   same shared helper used by CUDA and ROCm device-side planning, preserving the
   host proposal/apply API while removing policy drift.
@@ -286,6 +293,14 @@ Implemented or partially implemented:
 - 2026-07-01 validation after exposing device movement-cost gates: integration
   and release builds passed; focused config/DebugEnv/LLEP tests passed; full
   unit suite passed (`514/514`).
+- 2026-07-01 validation after fixing LLEP accepted-load accounting:
+  integration build passed; `V2_Unit_LeastLoadedExpertAssignment`,
+  `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed.
+- 2026-07-01 validation after splitting maintenance probe from metadata/payload
+  replay: integration and release builds passed; `V2_Unit_MoEForbiddenDependencyScan`,
+  `V2_Unit_GpuWorkspaceAllocationPolicy`, `V2_Unit_LeastLoadedExpertAssignment`,
+  `V2_Integration_CUDAMoEKernel`, and `V2_Integration_ROCmMoEKernel` passed;
+  full V2 unit suite passed (`514/514`).
 
 Latest evidence:
 
@@ -331,6 +346,7 @@ keeps only the current design signal:
 | Compact payload capacity sweep, seed 303, 1024, dynamic LLEP only, `benchmark_results/qwen36_moe_llep_payload_slots2_probe_20260701_001956/` and `benchmark_results/qwen36_moe_llep_payload_slots4_probe_20260701_002406/` | CUDA dynamic: slots1 124.51 decode, slots2 123.86, slots4 118.80 tok/s. ROCm dynamic: slots1 65.48, slots2 64.55, slots4 64.69 tok/s. Slots2/4 planned and applied more arrivals on CUDA, but throughput fell. | Increasing whole-expert arrival capacity does not recover LLEP economics. Keep the compact payload default conservative and focus on true row-span LLEP for prefill/batched work or stronger admission gates for decode hot-cache movement. |
 | CUDA2/ROCm2 current Dynamic load-ratio trace, seeds 303 and 606, 1024/2048, `assignment=least-loaded-ep`, trace mode, `benchmark_results/qwen36_moe_policy_loadratio_current_20260701T004332Z/` | CUDA 1024: Dynamic made no transfers and averaged -0.38 tok/s vs static. CUDA 2048: Dynamic reduced pre/post imbalance ratio from 0.0441 to 0.0344 but averaged -1.19 tok/s. ROCm 1024: no transfers, average -2.37 tok/s with one slow outlier. ROCm 2048: imbalance ratio 0.0409 -> 0.0319 but average -1.83 tok/s; seed 303 was positive (+3.38) and seed 606 negative (-7.05). | The controller can now quantify real imbalance reduction, but these whole-expert transfer waves are not consistently economic. A cost gate based on improvement relative to observed load is needed before more movement-capacity tuning. This run exposed that the LLEP path ignored `min_load_spread_improvement_divisor`; that is now fixed. |
 | Relative LLEP cost-gate probes, seed 303, 2048, `MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=15`, `benchmark_results/qwen36_moe_llep_relative_gate15_cuda_seed303_20260701T012906Z/` and `benchmark_results/qwen36_moe_llep_relative_gate15_rocm_seed303_20260701T013119Z/` | CUDA dynamic moved 4 arrivals, reduced imbalance 0.0434 -> 0.0341, and reached 125.67 tok/s decode versus the same-run static row from the divisor-25 A/B at 125.53 tok/s. ROCm dynamic moved 4 arrivals, reduced imbalance 0.0442 -> 0.0336, and reached 64.90 tok/s decode versus the earlier same-seed static row at 60.18 tok/s. | The relative floor is the right sweep axis: divisor 25 partially pruned CUDA arrivals (20 -> 14) and improved the delta (-1.40 -> -0.40 tok/s), while divisor 15 pruned to a high-value 4-arrival wave and recovered a positive single-row signal. This needs repeated CUDA/ROCm matrices before becoming a default. |
+| CUDA2/ROCm2 no-work maintenance probe split, seed 303, 1024, divisor 15, `benchmark_results/qwen36_moe_probe_split_seed303_20260701T023641Z/` | CUDA: static 1853.63 prefill / 124.75 decode vs Dynamic 1839.74 prefill / 124.67 decode. ROCm: static 535.96 prefill / 62.78 decode vs Dynamic 537.73 prefill / 65.86 decode. Dynamic planned zero arrivals on both backends; traces exported only `probe` stages. No metadata/payload graph launched. | Splitting probe from metadata/payload replay removed command-buffer allgathers from no-work windows. No-work maintenance GPU elapsed fell versus the prior accounting-fix probe from ~45.6 ms to ~32.8 ms on CUDA and ~136.9 ms to ~100.2 ms on ROCm over six maintenance launches. CUDA no-work Dynamic is now effectively neutral to static on this seed; ROCm was positive in this run. Further reduction requires making the probe itself cheaper or less frequent when policy gates keep rejecting work. |
 | ROCm2 1024, current clean static vs dynamic-hot10 | 68.99 vs 66.56 tok/s | Persistent hot10 cache is not automatically economic. |
 | ROCm2 2048, current clean static vs dynamic-hot10 | 65.75 vs 58.97 tok/s | Longer generation did not rescue this cache policy sample. |
 | Earlier CUDA/ROCm plumbing recovery samples | static and no-work dynamic near 125-127 CUDA tok/s, dynamic sometimes positive by noise to a few percent | The remaining problem is policy economics, not basic decode plumbing. |

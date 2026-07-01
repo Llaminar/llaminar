@@ -1327,7 +1327,7 @@ namespace llaminar2
                 params.collective_payload_slot_bytes = binding.collective_payload_slot_bytes;
                 params.collective_payload_slot_capacity = binding.collective_payload_slot_capacity;
                 params.payload_edge_mask =
-                    kind == DeviceMoERebalanceMaintenanceGraphKind::Payload
+                    kind == DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload
                         ? payload_edge_mask
                         : 0ULL;
                 params.stage_name = stage_name;
@@ -1339,12 +1339,12 @@ namespace llaminar2
             };
 
         ComputeGraph graph;
-        if (kind == DeviceMoERebalanceMaintenanceGraphKind::Payload)
+        if (kind == DeviceMoERebalanceMaintenanceGraphKind::MetadataAndPayload)
         {
             MoEDeviceRebalanceStage::Params payload_params =
                 makeMaintenanceParams(
-                    "moe_device_rebalance_maintenance_copy_prepared_payload",
-                    DeviceMoERebalanceStagePhase::CopyPreparedPayload);
+                    "moe_device_rebalance_maintenance_metadata_payload",
+                    DeviceMoERebalanceStagePhase::GatherCommandsAndCopyPreparedPayload);
             payload_params.join_transfer_stream_after_copy = true;
 
             graph.addNode(payload_params.stage_name,
@@ -1361,8 +1361,8 @@ namespace llaminar2
 
         MoEDeviceRebalanceStage::Params plan_params =
             makeMaintenanceParams(
-                "moe_device_rebalance_maintenance_plan_commands_after_snapshot",
-                DeviceMoERebalanceStagePhase::PlanCommandsAfterSideband);
+                "moe_device_rebalance_maintenance_probe_after_snapshot",
+                DeviceMoERebalanceStagePhase::PlanProbeAfterSideband);
         plan_params.join_transfer_stream_after_copy = true;
 
         graph.addNode(collect_params.stage_name,

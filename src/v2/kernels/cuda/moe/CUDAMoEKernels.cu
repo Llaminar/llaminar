@@ -1679,6 +1679,66 @@ namespace
 
                 if (accepted_transfers > 0u)
                 {
+                    uint64_t accepted_before_total = 0ULL;
+                    uint64_t accepted_before_min = 0ULL;
+                    uint64_t accepted_before_max = 0ULL;
+                    llaminar2::moe_rebalance_policy::finalizeLoadSpread(
+                        shared_current_policy_load,
+                        config.participant_count,
+                        accepted_before_total,
+                        accepted_before_min,
+                        accepted_before_max);
+                    (void)accepted_before_total;
+
+                    for (uint32_t participant = 0;
+                         participant < config.participant_count;
+                         ++participant)
+                    {
+                        shared_candidate_policy_load[participant] = 0ULL;
+                    }
+                    for (uint32_t expert = 0; expert < config.num_experts; ++expert)
+                    {
+                        uint32_t resident_mask =
+                            shared_post_policy_resident_mask[expert] & valid_mask;
+                        const int32_t owner = shared_expert_owners[expert];
+                        if (owner >= 0 && owner < static_cast<int32_t>(config.participant_count))
+                            resident_mask |= runtime_participant_bit(owner);
+                        for (uint32_t participant = 0;
+                             participant < config.participant_count;
+                             ++participant)
+                        {
+                            shared_candidate_policy_load[participant] +=
+                                llaminar2::moe_rebalance_policy::projectedParticipantLoadForExpert(
+                                    shared_expert_counts[expert],
+                                    resident_mask,
+                                    config.participant_count,
+                                    participant);
+                        }
+                    }
+
+                    uint64_t accepted_after_total = 0ULL;
+                    uint64_t accepted_after_min = 0ULL;
+                    uint64_t accepted_after_max = 0ULL;
+                    llaminar2::moe_rebalance_policy::finalizeLoadSpread(
+                        shared_candidate_policy_load,
+                        config.participant_count,
+                        accepted_after_total,
+                        accepted_after_min,
+                        accepted_after_max);
+                    (void)accepted_after_total;
+                    const uint64_t accepted_before_spread =
+                        accepted_before_max >= accepted_before_min
+                            ? accepted_before_max - accepted_before_min
+                            : 0ULL;
+                    const uint64_t accepted_after_spread =
+                        accepted_after_max >= accepted_after_min
+                            ? accepted_after_max - accepted_after_min
+                            : 0ULL;
+                    const uint64_t accepted_improvement =
+                        accepted_before_spread > accepted_after_spread
+                            ? accepted_before_spread - accepted_after_spread
+                            : 0ULL;
+
                     for (uint32_t participant = 0;
                          participant < config.participant_count;
                          ++participant)
@@ -1686,13 +1746,10 @@ namespace
                         shared_current_policy_load[participant] =
                             shared_candidate_policy_load[participant];
                     }
-                    accepted_load_spread_improvement_total +=
-                        llep_status.assigned_load_spread_improvement;
-                    if (llep_status.assigned_load_spread_improvement >
-                        accepted_load_spread_improvement_max)
+                    accepted_load_spread_improvement_total += accepted_improvement;
+                    if (accepted_improvement > accepted_load_spread_improvement_max)
                     {
-                        accepted_load_spread_improvement_max =
-                            llep_status.assigned_load_spread_improvement;
+                        accepted_load_spread_improvement_max = accepted_improvement;
                     }
                     selected_replicas += accepted_transfers;
                 }
