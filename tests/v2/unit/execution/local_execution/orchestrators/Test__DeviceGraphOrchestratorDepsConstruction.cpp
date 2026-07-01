@@ -311,6 +311,7 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
 {
     ScopedEnvVars env({
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT", "96"},
+        {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR", "12"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "192"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT", "384"},
         {"LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE", "75"},
@@ -318,6 +319,8 @@ TEST_F(Test__DeviceGraphOrchestratorDepsConstruction, DeviceMoERebalanceLoadSpre
     });
 
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement, 96);
+    EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_load_spread_improvement_divisor, 12);
+    EXPECT_TRUE(debugEnv().presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR"));
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot, 192);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot, 384);
     EXPECT_EQ(debugEnv().moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille, 75);

@@ -190,9 +190,18 @@ class MoERebalancePolicyCorpusComparatorTest(unittest.TestCase):
                 "post_policy_load_spread": "40",
                 "pre_policy_load_spread_max": "14",
                 "post_policy_load_spread_max": "8",
+                "pre_policy_imbalance_ratio_avg": "0.01",
+                "pre_policy_imbalance_ratio_max": "0.014",
+                "pre_policy_imbalance_ratio_samples": "2",
+                "post_policy_imbalance_ratio_avg": "0.004",
+                "post_policy_imbalance_ratio_max": "0.008",
+                "post_policy_imbalance_ratio_samples": "2",
                 "post_wave_load_total": "10000",
                 "post_wave_load_spread": "40",
                 "post_wave_load_spread_max": "8",
+                "post_wave_imbalance_ratio_avg": "0.006",
+                "post_wave_imbalance_ratio_max": "0.009",
+                "post_wave_imbalance_ratio_samples": "2",
                 "payload_bucket_slots_max": "2",
                 "payload_bucket_requested_slots_max": "1",
             }
@@ -255,6 +264,12 @@ class MoERebalancePolicyCorpusComparatorTest(unittest.TestCase):
         self.assertEqual(rows[0]["post_vs_pre_load_spread_ratio"], "0.4")
         self.assertEqual(rows[0]["pre_policy_load_spread_fraction"], "0.01")
         self.assertEqual(rows[0]["post_policy_load_spread_fraction"], "0.004")
+        self.assertEqual(rows[0]["pre_policy_imbalance_ratio_avg"], "0.01")
+        self.assertEqual(rows[0]["post_policy_imbalance_ratio_avg"], "0.004")
+        self.assertEqual(rows[0]["post_wave_imbalance_ratio_avg"], "0.006")
+        self.assertEqual(rows[0]["post_vs_pre_imbalance_ratio"], "0.4")
+        self.assertEqual(rows[0]["post_wave_vs_pre_imbalance_ratio"], "0.6")
+        self.assertEqual(rows[0]["imbalance_ratio_delta"], "-0.006")
         self.assertEqual(
             rows[0]["post_policy_load_spread_per_transfer"],
             "1.33333333",

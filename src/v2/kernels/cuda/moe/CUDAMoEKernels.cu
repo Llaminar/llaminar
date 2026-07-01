@@ -1561,6 +1561,8 @@ namespace
                 llep_config.participant_count = config.participant_count;
                 llep_config.min_spread_improvement =
                     config.min_load_spread_improvement;
+                llep_config.min_spread_improvement_divisor =
+                    config.min_load_spread_improvement_divisor;
                 llep_config.min_spread_improvement_per_transfer =
                     config.min_wave_spread_improvement_per_payload_slot;
                 llep_config.enable_balanced_skip = true;

@@ -328,6 +328,35 @@ namespace llaminar2
                 config.moe_rebalance.dynamic_min_window_activations =
                     parseNonNegativeUint64Value(value, "moe.dynamic_min_window_activations");
             }
+            else if (normalized_key == "device_min_load_spread_improvement")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement =
+                    parseNonNegativeUint32Value(value, "moe.device_min_load_spread_improvement");
+            }
+            else if (normalized_key == "device_min_load_spread_improvement_divisor")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement_divisor =
+                    parseNonNegativeUint32Value(value, "moe.device_min_load_spread_improvement_divisor");
+            }
+            else if (normalized_key == "device_min_wave_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe.device_min_wave_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "device_min_router_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe.device_min_router_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "device_max_post_wave_load_spread_permille")
+            {
+                config.moe_rebalance.device_max_post_wave_load_spread_per_mille =
+                    parseNonNegativeUint32Value(value, "moe.device_max_post_wave_load_spread_permille");
+            }
             else if (normalized_key == "release_raw_expert_weights")
             {
                 config.moe_rebalance.release_raw_expert_weights = parseBoolValue(value);
@@ -1574,6 +1603,74 @@ namespace llaminar2
                 }),
         });
         spec.add({
+            .long_name = "--moe-device-rebalance-min-load-spread-improvement",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side rebalance absolute load-spread improvement floor before moving experts (default: 0)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_load_spread_improvement =
+                        parseNonNegativeUint32Value(v, "--moe-device-rebalance-min-load-spread-improvement");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-load-spread-improvement-divisor",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side rebalance relative floor: required improvement >= total routed load / n; 0 disables (default: 0)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_load_spread_improvement_divisor =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-load-spread-improvement-divisor");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side transfer wave value floor per requested payload slot (default: 256)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-min-router-spread-improvement-per-payload-slot",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side transfer wave realized-router-benefit floor per requested payload slot (default: 128)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-min-router-spread-improvement-per-payload-slot");
+                }),
+        });
+        spec.add({
+            .long_name = "--moe-device-rebalance-max-post-wave-load-spread-permille",
+            .category = "MoE Configuration",
+            .value_label = "<n>",
+            .description = "Device-side transfer wave post-apply max/min load-spread ceiling in permille; 0 disables (default: 100)",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &c, const std::string &v)
+                {
+                    c.moe_rebalance.device_max_post_wave_load_spread_per_mille =
+                        parseNonNegativeUint32Value(
+                            v,
+                            "--moe-device-rebalance-max-post-wave-load-spread-permille");
+                }),
+        });
+        spec.add({
             .long_name = "--moe-release-raw-expert-weights",
             .category = "MoE Configuration",
             .description = "Release raw routed expert tensors after prepared weights are resident",
@@ -2757,6 +2854,39 @@ namespace llaminar2
             {
                 config.moe_rebalance.dynamic_min_window_activations =
                     parseNonNegativeUint64Value(value, "moe_dynamic_min_window_activations");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_load_spread_improvement")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement =
+                    parseNonNegativeUint32Value(value, "moe_device_rebalance_min_load_spread_improvement");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_load_spread_improvement_divisor")
+            {
+                config.moe_rebalance.device_min_load_spread_improvement_divisor =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_load_spread_improvement_divisor");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_wave_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_wave_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "moe_device_rebalance_min_router_spread_improvement_per_payload_slot")
+            {
+                config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_min_router_spread_improvement_per_payload_slot");
+            }
+            else if (normalized_key == "moe_device_rebalance_max_post_wave_load_spread_permille")
+            {
+                config.moe_rebalance.device_max_post_wave_load_spread_per_mille =
+                    parseNonNegativeUint32Value(
+                        value,
+                        "moe_device_rebalance_max_post_wave_load_spread_permille");
             }
             else if (normalized_key == "moe_release_raw_expert_weights")
             {

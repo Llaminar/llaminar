@@ -196,9 +196,29 @@ Public sweep knobs now exposed through CLI, YAML, and `DebugEnv`:
   / `--moe-dynamic-min-window-activations`
   / `LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS`
 
-Defaults live in `DeviceMoERebalancePolicyShared.h` and feed CPU, CUDA, and
-ROCm. Negative CLI/YAML values are rejected. Environment values are clamped to
-non-negative values at runtime config import.
+Device movement-cost gates are also public config now:
+
+- `device_min_load_spread_improvement`
+  / `--moe-device-rebalance-min-load-spread-improvement`
+  / `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT`
+- `device_min_load_spread_improvement_divisor`
+  / `--moe-device-rebalance-min-load-spread-improvement-divisor`
+  / `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR`
+- `device_min_wave_spread_improvement_per_payload_slot`
+  / `--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot`
+  / `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT`
+- `device_min_router_spread_improvement_per_payload_slot`
+  / `--moe-device-rebalance-min-router-spread-improvement-per-payload-slot`
+  / `LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT`
+- `device_max_post_wave_load_spread_permille`
+  / `--moe-device-rebalance-max-post-wave-load-spread-permille`
+  / `LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE`
+
+Shared Dynamic defaults live in `DeviceMoERebalancePolicyShared.h` and feed CPU,
+CUDA, and ROCm. Device movement-cost gate defaults live in runtime config and
+`DebugEnv`, then feed the Qwen35 MoE GPU graph binding. Negative CLI/YAML values
+are rejected. Environment values are clamped to non-negative values at runtime
+config import.
 
 ## Current Implementation Status
 
@@ -242,6 +262,11 @@ Implemented or partially implemented:
 - Dynamic policy knobs are now surfaced through runtime config, CLI, nested and
   flat YAML, DebugEnv, explain output, CPU controller wiring, and Qwen35 MoE GPU
   graph wiring.
+- Device movement-cost gates are also surfaced through runtime config, CLI,
+  nested and flat YAML, DebugEnv, explain output, and Qwen35 MoE GPU graph
+  wiring. Graph construction honors typed config values by default and only
+  lets `LLAMINAR_MOE_DEVICE_REBALANCE_*` values override them when those env
+  vars were explicitly present at `DebugEnv` reload.
 - CUDA and ROCm integration tests cover Dynamic ownership-transfer planning
   with hot-cache disabled, including root-side deferred planning, command
   buffers, load-spread stats, and unchanged active runtime state before apply.
@@ -250,7 +275,17 @@ Implemented or partially implemented:
   singleton MoE kernel could lose CUDA shared-expert grouped decode descriptor
   tables while stages still held cached table ids.
 - Trace tooling exports expert loads, owner maps, apply visibility, router
-  cache-use counters, payload economics, and imbalance metrics.
+  cache-use counters, payload economics, and imbalance metrics. Analyzer output
+  now includes per-window imbalance ratios plus run-level avg/max/sample fields
+  for pre-policy, post-policy, and post-wave load spread over total load, and
+  the policy comparator can use those fields directly for threshold searches.
+- The LLEP transfer planner now honors the shared relative spread-improvement
+  floor (`min_spread_improvement_divisor`) in addition to the absolute and
+  per-transfer floors. CUDA and ROCm pass the same device rebalance config into
+  LLEP, so the existing cost-gate knob no longer silently misses the LLEP path.
+- 2026-07-01 validation after exposing device movement-cost gates: integration
+  and release builds passed; focused config/DebugEnv/LLEP tests passed; full
+  unit suite passed (`514/514`).
 
 Latest evidence:
 
@@ -294,6 +329,8 @@ keeps only the current design signal:
 | ROCm2 transfer-backed LLEP probe, seed 303, 1024, perfstats + trace, `benchmark_results/qwen36_moe_rocm_llep_transfer_probe_seed303_20260630_235145/` | static 66.08 vs dynamic LLEP 65.22 tok/s decode; prefill 524.69 vs 525.68 tok/s. Trace planned two reciprocal arrivals around token 324 and one later arrival around token 836. | ROCm matches CUDA mechanically but was negative in this one-run sample. This points to shared policy/cost-gate economics rather than a CUDA-only or ROCm-only wiring issue. |
 | CUDA2/ROCm2 resident split chunk-planner probe, seed 303, 1024, `assignment=least-loaded-ep`, perfstats + trace, `benchmark_results/qwen36_moe_llep_chunk_split_probe_20260701_000943/` | CUDA: static 1855.37 prefill / 124.68 decode vs dynamic 1841.16 prefill / 124.51 decode. ROCm: static 537.28 prefill / 67.66 decode vs dynamic 537.47 prefill / 65.48 decode. Both dynamic runs planned 12 arrivals and requested 8 compact payload slots across the two participants; one arrival was applied before run end. Offline full-LLEP replay still predicts large spread reductions at ROI 256: CUDA spread 7015 -> 3955 with 10 transfers, ROCm 5664 -> 2518 with 11 transfers. | The shared chunk planner removes a real single-threaded kernel wart without changing semantics, but current live transfer-backed LLEP is still a coarse whole-expert-arrival/resident-assignment proxy. The remaining speed gap is implementation strategy, not absence of routing imbalance signal. |
 | Compact payload capacity sweep, seed 303, 1024, dynamic LLEP only, `benchmark_results/qwen36_moe_llep_payload_slots2_probe_20260701_001956/` and `benchmark_results/qwen36_moe_llep_payload_slots4_probe_20260701_002406/` | CUDA dynamic: slots1 124.51 decode, slots2 123.86, slots4 118.80 tok/s. ROCm dynamic: slots1 65.48, slots2 64.55, slots4 64.69 tok/s. Slots2/4 planned and applied more arrivals on CUDA, but throughput fell. | Increasing whole-expert arrival capacity does not recover LLEP economics. Keep the compact payload default conservative and focus on true row-span LLEP for prefill/batched work or stronger admission gates for decode hot-cache movement. |
+| CUDA2/ROCm2 current Dynamic load-ratio trace, seeds 303 and 606, 1024/2048, `assignment=least-loaded-ep`, trace mode, `benchmark_results/qwen36_moe_policy_loadratio_current_20260701T004332Z/` | CUDA 1024: Dynamic made no transfers and averaged -0.38 tok/s vs static. CUDA 2048: Dynamic reduced pre/post imbalance ratio from 0.0441 to 0.0344 but averaged -1.19 tok/s. ROCm 1024: no transfers, average -2.37 tok/s with one slow outlier. ROCm 2048: imbalance ratio 0.0409 -> 0.0319 but average -1.83 tok/s; seed 303 was positive (+3.38) and seed 606 negative (-7.05). | The controller can now quantify real imbalance reduction, but these whole-expert transfer waves are not consistently economic. A cost gate based on improvement relative to observed load is needed before more movement-capacity tuning. This run exposed that the LLEP path ignored `min_load_spread_improvement_divisor`; that is now fixed. |
+| Relative LLEP cost-gate probes, seed 303, 2048, `MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=15`, `benchmark_results/qwen36_moe_llep_relative_gate15_cuda_seed303_20260701T012906Z/` and `benchmark_results/qwen36_moe_llep_relative_gate15_rocm_seed303_20260701T013119Z/` | CUDA dynamic moved 4 arrivals, reduced imbalance 0.0434 -> 0.0341, and reached 125.67 tok/s decode versus the same-run static row from the divisor-25 A/B at 125.53 tok/s. ROCm dynamic moved 4 arrivals, reduced imbalance 0.0442 -> 0.0336, and reached 64.90 tok/s decode versus the earlier same-seed static row at 60.18 tok/s. | The relative floor is the right sweep axis: divisor 25 partially pruned CUDA arrivals (20 -> 14) and improved the delta (-1.40 -> -0.40 tok/s), while divisor 15 pruned to a high-value 4-arrival wave and recovered a positive single-row signal. This needs repeated CUDA/ROCm matrices before becoming a default. |
 | ROCm2 1024, current clean static vs dynamic-hot10 | 68.99 vs 66.56 tok/s | Persistent hot10 cache is not automatically economic. |
 | ROCm2 2048, current clean static vs dynamic-hot10 | 65.75 vs 58.97 tok/s | Longer generation did not rescue this cache policy sample. |
 | Earlier CUDA/ROCm plumbing recovery samples | static and no-work dynamic near 125-127 CUDA tok/s, dynamic sometimes positive by noise to a few percent | The remaining problem is policy economics, not basic decode plumbing. |
@@ -377,10 +414,12 @@ Performance gates:
 2. Run transfer-backed LLEP through CUDA2 and ROCm2 parity, then clean repeated
    benchmark matrices. Include both no-cache and hot-cache-admission variants so
    LLEP, Dynamic, and cache effects stay separable.
-3. Use the new Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at
-   1024 and 2048 tokens: lower imbalance thresholds, lower improvement floors,
-   larger per-layer swap counts, larger per-wave command caps, and smaller
-   minimum-window activation gates.
+3. Use the Dynamic CLI/DebugEnv knobs for bounded CUDA2/ROCm2 sweeps at 1024
+   and 2048 tokens, starting with the now-wired relative LLEP cost gate
+   (`LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR`) to
+   reject low-value whole-expert arrivals. Only revisit lower imbalance
+   thresholds, larger per-layer swap counts, and larger per-wave command caps
+   after the high-value-only gate recovers no-movement/static speed.
 4. Extend Dynamic, if needed, with an explicit hot-set variant
    (`hotset_expert_count=20`), configurable window schedule, variable domain
    size, and cost-gated non-empty moves while keeping the shared helper as the

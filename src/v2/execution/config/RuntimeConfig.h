@@ -1243,6 +1243,11 @@ namespace llaminar2
             moe_rebalance_policy::kDefaultDynamicMaxPlanEntriesPerWave;
         uint64_t dynamic_min_window_activations =
             moe_rebalance_policy::kDefaultDynamicMinWindowActivations;
+        uint32_t device_min_load_spread_improvement = 0;
+        uint32_t device_min_load_spread_improvement_divisor = 0;
+        uint32_t device_min_wave_spread_improvement_per_payload_slot = 256;
+        uint32_t device_min_router_spread_improvement_per_payload_slot = 128;
+        uint32_t device_max_post_wave_load_spread_per_mille = 100;
         bool release_raw_expert_weights = false;
     };
 

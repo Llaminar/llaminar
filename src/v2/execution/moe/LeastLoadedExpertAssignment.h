@@ -33,6 +33,7 @@ namespace llaminar2::least_loaded_ep
         uint32_t lambda_numerator = 13;
         uint32_t lambda_denominator = 10;
         uint64_t min_spread_improvement = 0;
+        uint32_t min_spread_improvement_divisor = 0;
         uint64_t min_spread_improvement_per_transfer = 0;
         bool enable_balanced_skip = true;
     };
@@ -176,12 +177,20 @@ namespace llaminar2::least_loaded_ep
 
     LLAMINAR_LLEP_HD uint64_t requiredSpreadImprovement(
         const LeastLoadedExpertAssignmentConfig &config,
+        uint64_t total_load,
         uint32_t transfer_count) noexcept
     {
         const uint64_t transfer_component = saturatedMul(
             static_cast<uint64_t>(transfer_count),
             config.min_spread_improvement_per_transfer);
-        const uint64_t base = config.min_spread_improvement;
+        uint64_t base = config.min_spread_improvement;
+        if (config.min_spread_improvement_divisor > 0u)
+        {
+            const uint64_t relative_floor =
+                total_load / static_cast<uint64_t>(config.min_spread_improvement_divisor);
+            if (relative_floor > base)
+                base = relative_floor;
+        }
         if (transfer_component > (~0ULL) - base)
             return ~0ULL;
         return base + transfer_component;
@@ -825,7 +834,7 @@ namespace llaminar2::least_loaded_ep
             spreadImprovement(status.standard_load_spread, status.assigned_load_spread);
 
         const uint64_t required_improvement =
-            requiredSpreadImprovement(config, status.weight_transfer_count);
+            requiredSpreadImprovement(config, status.total_load, status.weight_transfer_count);
         status.required_spread_improvement = required_improvement;
         if (required_improvement > 0ULL &&
             status.assigned_load_spread_improvement < required_improvement)
@@ -1079,7 +1088,7 @@ namespace llaminar2::least_loaded_ep
             spreadImprovement(status.standard_load_spread, status.assigned_load_spread);
 
         const uint64_t required_improvement =
-            requiredSpreadImprovement(config, status.weight_transfer_count);
+            requiredSpreadImprovement(config, status.total_load, status.weight_transfer_count);
         status.required_spread_improvement = required_improvement;
         if (required_improvement > 0ULL &&
             status.assigned_load_spread_improvement < required_improvement)

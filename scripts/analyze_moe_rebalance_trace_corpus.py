@@ -36,6 +36,16 @@ def parse_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
+def format_optional_float(value: float | None) -> str:
+    return "" if value is None else f"{value:.9g}"
+
+
+def load_spread_ratio(spread: int, total: int) -> float | None:
+    if total <= 0:
+        return None
+    return max(0, spread) / total
+
+
 def seed_split(backend: str, seed: int, n_predict: int) -> str:
     if seed in TRAIN_SEEDS:
         return "train"
@@ -186,8 +196,18 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
             pre_load_max = parse_int(status.get("pre_policy_load_max"))
             post_load_min = parse_int(status.get("post_policy_load_min"))
             post_load_max = parse_int(status.get("post_policy_load_max"))
+            pre_load_total = parse_int(status.get("pre_policy_load_total"))
+            post_load_total = parse_int(status.get("post_policy_load_total"))
+            pre_load_spread = max(0, pre_load_max - pre_load_min)
+            post_load_spread = max(0, post_load_max - post_load_min)
             post_wave_load_total = parse_int(status.get("post_wave_load_total"))
             post_wave_load_spread = parse_int(status.get("post_wave_load_spread"))
+            pre_imbalance_ratio = load_spread_ratio(pre_load_spread, pre_load_total)
+            post_imbalance_ratio = load_spread_ratio(post_load_spread, post_load_total)
+            post_wave_imbalance_ratio = load_spread_ratio(
+                post_wave_load_spread,
+                post_wave_load_total,
+            )
             post_apply_multi_resident_experts = parse_int(
                 apply_status.get("post_apply_multi_resident_experts")
             )
@@ -279,26 +299,39 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                 aggregate["router_replicated_selected_slots"] += parse_int(
                     status.get("router_hot_cache_replicated_selected_expert_slots")
                 )
-                aggregate["pre_policy_load_total"] += parse_int(
-                    status.get("pre_policy_load_total")
-                )
-                aggregate["post_policy_load_total"] += parse_int(
-                    status.get("post_policy_load_total")
-                )
-                aggregate["pre_policy_load_spread"] += max(
-                    0, pre_load_max - pre_load_min
-                )
-                aggregate["post_policy_load_spread"] += max(
-                    0, post_load_max - post_load_min
-                )
+                aggregate["pre_policy_load_total"] += pre_load_total
+                aggregate["post_policy_load_total"] += post_load_total
+                aggregate["pre_policy_load_spread"] += pre_load_spread
+                aggregate["post_policy_load_spread"] += post_load_spread
                 aggregate["pre_policy_load_spread_max"] = max(
                     aggregate["pre_policy_load_spread_max"],
-                    max(0, pre_load_max - pre_load_min),
+                    pre_load_spread,
                 )
                 aggregate["post_policy_load_spread_max"] = max(
                     aggregate["post_policy_load_spread_max"],
-                    max(0, post_load_max - post_load_min),
+                    post_load_spread,
                 )
+                if pre_imbalance_ratio is not None:
+                    aggregate["pre_policy_imbalance_ratio_sum"] += pre_imbalance_ratio
+                    aggregate["pre_policy_imbalance_ratio_samples"] += 1
+                    aggregate["pre_policy_imbalance_ratio_max"] = max(
+                        aggregate["pre_policy_imbalance_ratio_max"],
+                        pre_imbalance_ratio,
+                    )
+                if post_imbalance_ratio is not None:
+                    aggregate["post_policy_imbalance_ratio_sum"] += post_imbalance_ratio
+                    aggregate["post_policy_imbalance_ratio_samples"] += 1
+                    aggregate["post_policy_imbalance_ratio_max"] = max(
+                        aggregate["post_policy_imbalance_ratio_max"],
+                        post_imbalance_ratio,
+                    )
+                if post_wave_imbalance_ratio is not None:
+                    aggregate["post_wave_imbalance_ratio_sum"] += post_wave_imbalance_ratio
+                    aggregate["post_wave_imbalance_ratio_samples"] += 1
+                    aggregate["post_wave_imbalance_ratio_max"] = max(
+                        aggregate["post_wave_imbalance_ratio_max"],
+                        post_wave_imbalance_ratio,
+                    )
                 aggregate["post_wave_load_total"] += post_wave_load_total
                 aggregate["post_wave_load_spread"] += post_wave_load_spread
                 aggregate["post_wave_load_spread_max"] = max(
@@ -402,15 +435,22 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
                     ),
                     "pre_policy_load_min": pre_load_min,
                     "pre_policy_load_max": pre_load_max,
-                    "pre_policy_load_spread": max(0, pre_load_max - pre_load_min),
-                    "post_policy_load_total": parse_int(
-                        status.get("post_policy_load_total")
+                    "pre_policy_load_spread": pre_load_spread,
+                    "pre_policy_imbalance_ratio": format_optional_float(
+                        pre_imbalance_ratio
                     ),
+                    "post_policy_load_total": post_load_total,
                     "post_policy_load_min": post_load_min,
                     "post_policy_load_max": post_load_max,
-                    "post_policy_load_spread": max(0, post_load_max - post_load_min),
+                    "post_policy_load_spread": post_load_spread,
+                    "post_policy_imbalance_ratio": format_optional_float(
+                        post_imbalance_ratio
+                    ),
                     "post_wave_load_total": post_wave_load_total,
                     "post_wave_load_spread": post_wave_load_spread,
+                    "post_wave_imbalance_ratio": format_optional_float(
+                        post_wave_imbalance_ratio
+                    ),
                     "apply_post_apply_multi_resident_experts": (
                         post_apply_multi_resident_experts
                     ),
@@ -449,6 +489,9 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
             if last_applied_decode_token is not None
             else -1
         )
+        pre_imbalance_samples = aggregate["pre_policy_imbalance_ratio_samples"]
+        post_imbalance_samples = aggregate["post_policy_imbalance_ratio_samples"]
+        post_wave_imbalance_samples = aggregate["post_wave_imbalance_ratio_samples"]
 
         run_row = {
             "backend": backend,
@@ -526,9 +569,42 @@ def build_tables(corpus_dir: Path) -> tuple[list[dict[str, Any]], list[dict[str,
             "post_policy_load_spread": aggregate["post_policy_load_spread"],
             "pre_policy_load_spread_max": aggregate["pre_policy_load_spread_max"],
             "post_policy_load_spread_max": aggregate["post_policy_load_spread_max"],
+            "pre_policy_imbalance_ratio_avg": format_optional_float(
+                None
+                if pre_imbalance_samples <= 0
+                else aggregate["pre_policy_imbalance_ratio_sum"] / pre_imbalance_samples
+            ),
+            "pre_policy_imbalance_ratio_max": format_optional_float(
+                None
+                if pre_imbalance_samples <= 0
+                else aggregate["pre_policy_imbalance_ratio_max"]
+            ),
+            "pre_policy_imbalance_ratio_samples": pre_imbalance_samples,
+            "post_policy_imbalance_ratio_avg": format_optional_float(
+                None
+                if post_imbalance_samples <= 0
+                else aggregate["post_policy_imbalance_ratio_sum"] / post_imbalance_samples
+            ),
+            "post_policy_imbalance_ratio_max": format_optional_float(
+                None
+                if post_imbalance_samples <= 0
+                else aggregate["post_policy_imbalance_ratio_max"]
+            ),
+            "post_policy_imbalance_ratio_samples": post_imbalance_samples,
             "post_wave_load_total": aggregate["post_wave_load_total"],
             "post_wave_load_spread": aggregate["post_wave_load_spread"],
             "post_wave_load_spread_max": aggregate["post_wave_load_spread_max"],
+            "post_wave_imbalance_ratio_avg": format_optional_float(
+                None
+                if post_wave_imbalance_samples <= 0
+                else aggregate["post_wave_imbalance_ratio_sum"] / post_wave_imbalance_samples
+            ),
+            "post_wave_imbalance_ratio_max": format_optional_float(
+                None
+                if post_wave_imbalance_samples <= 0
+                else aggregate["post_wave_imbalance_ratio_max"]
+            ),
+            "post_wave_imbalance_ratio_samples": post_wave_imbalance_samples,
             "command_entries": aggregate["command_entries"],
             "transfer_arrivals": aggregate["transfer_arrivals"],
             "resident_replicas": aggregate["resident_replicas"],
@@ -555,6 +631,17 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def average_numeric_field(rows: list[dict[str, Any]], field: str) -> str:
+    values = [
+        parse_float(row[field])
+        for row in rows
+        if field in row and row[field] != ""
+    ]
+    if not values:
+        return ""
+    return f"{sum(values) / len(values):.9g}"
+
+
 def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, int, str], list[dict[str, Any]]] = defaultdict(list)
     for row in run_rows:
@@ -575,6 +662,18 @@ def grouped_summary(run_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "decode_p90_ms_mean": sum(row["decode_p90_ms"] for row in rows) / count,
                 "accepted_improvement_total": sum(
                     row["accepted_improvement"] for row in rows
+                ),
+                "pre_policy_imbalance_ratio_avg_mean": average_numeric_field(
+                    rows,
+                    "pre_policy_imbalance_ratio_avg",
+                ),
+                "post_policy_imbalance_ratio_avg_mean": average_numeric_field(
+                    rows,
+                    "post_policy_imbalance_ratio_avg",
+                ),
+                "post_wave_imbalance_ratio_avg_mean": average_numeric_field(
+                    rows,
+                    "post_wave_imbalance_ratio_avg",
                 ),
                 "transfer_arrivals_total": sum(row["transfer_arrivals"] for row in rows),
                 "resident_replicas_total": sum(row["resident_replicas"] for row in rows),
@@ -599,7 +698,8 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
         return
     header = (
         "backend n_predict split runs decode_tok_s_mean mean_ms_mean "
-        "p50_ms_mean p90_ms_mean transfers resident router_used accepted_improvement"
+        "p50_ms_mean p90_ms_mean pre_imbalance_avg post_imbalance_avg "
+        "transfers resident router_used accepted_improvement"
     )
     print(header)
     for row in rows:
@@ -607,6 +707,8 @@ def print_summary(rows: list[dict[str, Any]]) -> None:
             f"{row['backend']} {row['n_predict']} {row['split']} {row['runs']} "
             f"{row['decode_tok_s_mean']:.3f} {row['decode_mean_ms_mean']:.3f} "
             f"{row['decode_p50_ms_mean']:.3f} {row['decode_p90_ms_mean']:.3f} "
+            f"{row['pre_policy_imbalance_ratio_avg_mean']} "
+            f"{row['post_policy_imbalance_ratio_avg_mean']} "
             f"{row['transfer_arrivals_total']} "
             f"{row['resident_replicas_total']} {row['router_used_total']} "
             f"{row['accepted_improvement_total']}"

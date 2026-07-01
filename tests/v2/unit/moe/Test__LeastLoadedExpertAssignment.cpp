@@ -339,6 +339,55 @@ TEST(Test__LeastLoadedExpertAssignment, SpreadImprovementGateCanPriceEachForeign
     EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
 }
 
+TEST(Test__LeastLoadedExpertAssignment, RelativeSpreadImprovementGatePricesTotalLoad)
+{
+    std::vector<uint64_t> loads{70, 30, 30, 30};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+    config.min_spread_improvement_divisor = 4;
+
+    PlannerFixture accepted(config.expert_count, config.participant_count);
+    ASSERT_TRUE(accepted.plan(loads, owners, config));
+    EXPECT_EQ(accepted.status.total_load, 160u);
+    EXPECT_EQ(accepted.status.standard_load_spread, 40u);
+    EXPECT_EQ(accepted.status.assigned_load_spread_improvement, 40u);
+    EXPECT_EQ(accepted.status.required_spread_improvement, 40u);
+    EXPECT_EQ(accepted.status.skipped_insufficient_spread_improvement, 0u);
+    EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
+
+    config.min_spread_improvement_divisor = 3;
+    PlannerFixture rejected(config.expert_count, config.participant_count);
+    ASSERT_TRUE(rejected.plan(loads, owners, config));
+    EXPECT_EQ(rejected.status.total_load, 160u);
+    EXPECT_EQ(rejected.status.required_spread_improvement, 53u);
+    EXPECT_EQ(rejected.status.assigned_load_spread_improvement, 0u);
+    EXPECT_EQ(rejected.status.skipped_insufficient_spread_improvement, 1u);
+    EXPECT_EQ(rejected.status.standard_ep_selected, 1u);
+    EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
+}
+
+TEST(Test__LeastLoadedExpertAssignment, TransferOnlyPlannerHonorsRelativeSpreadImprovementGate)
+{
+    std::vector<uint64_t> loads{70, 30, 30, 30};
+    std::vector<uint32_t> owners{0, 0, 1, 1};
+    auto config = configFor(4, 2);
+    config.min_spread_improvement_divisor = 4;
+
+    PlannerFixture accepted(config.expert_count, config.participant_count);
+    ASSERT_TRUE(accepted.planTransfersOnly(loads, owners, config));
+    EXPECT_EQ(accepted.status.assigned_load_spread_improvement, 40u);
+    EXPECT_EQ(accepted.status.required_spread_improvement, 40u);
+    EXPECT_EQ(accepted.status.weight_transfer_count, 1u);
+
+    config.min_spread_improvement_divisor = 3;
+    PlannerFixture rejected(config.expert_count, config.participant_count);
+    ASSERT_TRUE(rejected.planTransfersOnly(loads, owners, config));
+    EXPECT_EQ(rejected.status.required_spread_improvement, 53u);
+    EXPECT_EQ(rejected.status.assigned_load_spread_improvement, 0u);
+    EXPECT_EQ(rejected.status.skipped_insufficient_spread_improvement, 1u);
+    EXPECT_EQ(rejected.status.weight_transfer_count, 0u);
+}
+
 TEST(Test__LeastLoadedExpertAssignment, FullySpillsExpertWhenNativeIsReservedForPendingLocalWork)
 {
     std::vector<uint64_t> loads{30, 30, 60, 0};

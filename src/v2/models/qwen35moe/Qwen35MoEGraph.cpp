@@ -1882,6 +1882,14 @@ namespace llaminar2
         };
         auto makeGraphRebalanceConfig = [&]() -> DeviceMoERebalanceConfig
         {
+            auto deviceRebalanceConfigOrEnv =
+                [&](uint32_t config_value, const char *env_name, int env_value) -> uint32_t
+            {
+                if (env.presence.has(env_name))
+                    return static_cast<uint32_t>(std::max(0, env_value));
+                return config_value;
+            };
+
             DeviceMoERebalanceConfig rebalance_config;
             rebalance_config.num_layers = static_cast<uint32_t>(runtime_table_layers);
             rebalance_config.num_experts = static_cast<uint32_t>(config_.moe.num_experts);
@@ -1910,16 +1918,28 @@ namespace llaminar2
                 config_.moe.routed_expert_assignment_policy == RoutedExpertAssignmentPolicy::LeastLoadedEP
                     ? kDeviceMoERebalanceAssignmentLeastLoadedEP
                     : kDeviceMoERebalanceAssignmentStaticOwner;
-            rebalance_config.min_load_spread_improvement = static_cast<uint32_t>(
-                std::max(0, env.moe_rebalance.device_rebalance_min_load_spread_improvement));
-            rebalance_config.min_load_spread_improvement_divisor = static_cast<uint32_t>(
-                std::max(0, env.moe_rebalance.device_rebalance_min_load_spread_improvement_divisor));
-            rebalance_config.min_wave_spread_improvement_per_payload_slot = static_cast<uint32_t>(
-                std::max(0, env.moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot));
-            rebalance_config.min_router_spread_improvement_per_payload_slot = static_cast<uint32_t>(
-                std::max(0, env.moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot));
-            rebalance_config.max_post_wave_load_spread_per_mille = static_cast<uint32_t>(
-                std::max(0, env.moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille));
+            rebalance_config.min_load_spread_improvement = deviceRebalanceConfigOrEnv(
+                config_.moe.rebalance_config.device_min_load_spread_improvement,
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT",
+                env.moe_rebalance.device_rebalance_min_load_spread_improvement);
+            rebalance_config.min_load_spread_improvement_divisor = deviceRebalanceConfigOrEnv(
+                config_.moe.rebalance_config.device_min_load_spread_improvement_divisor,
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR",
+                env.moe_rebalance.device_rebalance_min_load_spread_improvement_divisor);
+            rebalance_config.min_wave_spread_improvement_per_payload_slot =
+                deviceRebalanceConfigOrEnv(
+                    config_.moe.rebalance_config.device_min_wave_spread_improvement_per_payload_slot,
+                    "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
+                    env.moe_rebalance.device_rebalance_min_wave_spread_improvement_per_payload_slot);
+            rebalance_config.min_router_spread_improvement_per_payload_slot =
+                deviceRebalanceConfigOrEnv(
+                    config_.moe.rebalance_config.device_min_router_spread_improvement_per_payload_slot,
+                    "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT",
+                    env.moe_rebalance.device_rebalance_min_router_spread_improvement_per_payload_slot);
+            rebalance_config.max_post_wave_load_spread_per_mille = deviceRebalanceConfigOrEnv(
+                config_.moe.rebalance_config.device_max_post_wave_load_spread_per_mille,
+                "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PERMILLE",
+                env.moe_rebalance.device_rebalance_max_post_wave_load_spread_per_mille);
             rebalance_config.flags =
                 static_cast<uint32_t>(DeviceMoERebalanceFlags::ResetHistogramsAfterApply);
             if (rebalance_config.max_hot_replicas_per_participant > 0)

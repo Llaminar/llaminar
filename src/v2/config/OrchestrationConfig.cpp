@@ -1070,6 +1070,16 @@ namespace llaminar2
             << moe_rebalance.dynamic_max_plan_entries_per_wave << "\n";
         oss << "    dynamic_min_window_activations: "
             << moe_rebalance.dynamic_min_window_activations << "\n";
+        oss << "    device_min_load_spread_improvement: "
+            << moe_rebalance.device_min_load_spread_improvement << "\n";
+        oss << "    device_min_load_spread_improvement_divisor: "
+            << moe_rebalance.device_min_load_spread_improvement_divisor << "\n";
+        oss << "    device_min_wave_spread_improvement_per_payload_slot: "
+            << moe_rebalance.device_min_wave_spread_improvement_per_payload_slot << "\n";
+        oss << "    device_min_router_spread_improvement_per_payload_slot: "
+            << moe_rebalance.device_min_router_spread_improvement_per_payload_slot << "\n";
+        oss << "    device_max_post_wave_load_spread_permille: "
+            << moe_rebalance.device_max_post_wave_load_spread_per_mille << "\n";
         oss << "    release_raw_expert_weights: "
             << (moe_rebalance.release_raw_expert_weights ? "true" : "false") << "\n";
 

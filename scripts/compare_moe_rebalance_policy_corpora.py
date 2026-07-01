@@ -62,9 +62,18 @@ FEATURE_FIELDS = (
     "post_policy_load_spread",
     "pre_policy_load_spread_max",
     "post_policy_load_spread_max",
+    "pre_policy_imbalance_ratio_avg",
+    "pre_policy_imbalance_ratio_max",
+    "pre_policy_imbalance_ratio_samples",
+    "post_policy_imbalance_ratio_avg",
+    "post_policy_imbalance_ratio_max",
+    "post_policy_imbalance_ratio_samples",
     "post_wave_load_total",
     "post_wave_load_spread",
     "post_wave_load_spread_max",
+    "post_wave_imbalance_ratio_avg",
+    "post_wave_imbalance_ratio_max",
+    "post_wave_imbalance_ratio_samples",
     "payload_bucket_slots_max",
     "payload_bucket_requested_slots_max",
 )
@@ -90,6 +99,9 @@ DERIVED_FEATURE_FIELDS = (
     "post_policy_load_spread_per_transfer",
     "post_wave_load_spread_fraction",
     "post_wave_load_spread_per_transfer",
+    "post_vs_pre_imbalance_ratio",
+    "post_wave_vs_pre_imbalance_ratio",
+    "imbalance_ratio_delta",
     "load_spread_delta",
     "first_planned_remaining_fraction",
     "last_planned_remaining_fraction",
@@ -293,6 +305,18 @@ def build_feature_label_rows(
         post_policy_load_total = numeric_value(features, "post_policy_load_total")
         post_wave_load_spread = numeric_value(features, "post_wave_load_spread")
         post_wave_load_total = numeric_value(features, "post_wave_load_total")
+        pre_policy_imbalance_ratio_avg = numeric_value(
+            features,
+            "pre_policy_imbalance_ratio_avg",
+        )
+        post_policy_imbalance_ratio_avg = numeric_value(
+            features,
+            "post_policy_imbalance_ratio_avg",
+        )
+        post_wave_imbalance_ratio_avg = numeric_value(
+            features,
+            "post_wave_imbalance_ratio_avg",
+        )
         n_predict_value = numeric_value(features or hot, "n_predict")
         first_planned_token = numeric_value(features, "first_planned_decode_token")
         last_planned_token = numeric_value(features, "last_planned_decode_token")
@@ -369,6 +393,19 @@ def build_feature_label_rows(
         row["post_wave_load_spread_per_transfer"] = ratio(
             post_wave_load_spread,
             max(transfer_arrivals, 1.0),
+        )
+        row["post_vs_pre_imbalance_ratio"] = ratio(
+            post_policy_imbalance_ratio_avg,
+            pre_policy_imbalance_ratio_avg,
+        )
+        row["post_wave_vs_pre_imbalance_ratio"] = ratio(
+            post_wave_imbalance_ratio_avg,
+            pre_policy_imbalance_ratio_avg,
+        )
+        row["imbalance_ratio_delta"] = (
+            format_float(post_policy_imbalance_ratio_avg - pre_policy_imbalance_ratio_avg)
+            if pre_policy_imbalance_ratio_avg > 0.0
+            else ""
         )
         row["load_spread_delta"] = format_float(
             post_policy_load_spread - pre_policy_load_spread

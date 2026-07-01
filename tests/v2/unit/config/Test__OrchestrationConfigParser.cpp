@@ -79,6 +79,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_EmptyArgs_ReturnsDefaults)
     EXPECT_EQ(config.moe_hot_expert_cache.resolveCap(256, /*dynamic_rebalance_enabled=*/true), 25);
     EXPECT_EQ(config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
     EXPECT_EQ(config.moe_rebalance.window_size, 256);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 0u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 0u);
+    EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 256u);
+    EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 128u);
+    EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 100u);
 }
 
 TEST(Test__OrchestrationConfigParser, ParseArgs_DryRun)
@@ -1060,6 +1065,11 @@ moe:
     dynamic_max_swaps_per_layer: 6
     dynamic_max_plan_entries_per_wave: 24
     dynamic_min_window_activations: 32
+    device_min_load_spread_improvement: 44
+    device_min_load_spread_improvement_divisor: 15
+    device_min_wave_spread_improvement_per_payload_slot: 192
+    device_min_router_spread_improvement_per_payload_slot: 384
+    device_max_post_wave_load_spread_permille: 75
     release_raw_expert_weights: true
     )";
 
@@ -1078,6 +1088,11 @@ moe:
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 6u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 24u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 32u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 44u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 15u);
+    EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 192u);
+    EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 384u);
+    EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 75u);
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
 }
 
@@ -1097,6 +1112,11 @@ moe_dynamic_min_improvement_permille: 0
 moe_dynamic_max_swaps_per_layer: 8
 moe_dynamic_max_plan_entries_per_wave: 32
 moe_dynamic_min_window_activations: 16
+moe_device_rebalance_min_load_spread_improvement: 64
+moe_device_rebalance_min_load_spread_improvement_divisor: 20
+moe_device_rebalance_min_wave_spread_improvement_per_payload_slot: 256
+moe_device_rebalance_min_router_spread_improvement_per_payload_slot: 512
+moe_device_rebalance_max_post_wave_load_spread_permille: 80
 moe_release_raw_expert_weights: false
     )";
 
@@ -1115,6 +1135,11 @@ moe_release_raw_expert_weights: false
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 8u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 32u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 16u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 64u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 20u);
+    EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 256u);
+    EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 512u);
+    EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 80u);
     EXPECT_FALSE(config.moe_rebalance.release_raw_expert_weights);
 }
 
@@ -1685,6 +1710,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
                     "--moe-dynamic-max-swaps-per-layer", "7",
                     "--moe-dynamic-max-plan-entries-per-wave", "28",
                     "--moe-dynamic-min-window-activations", "48",
+                    "--moe-device-rebalance-min-load-spread-improvement", "72",
+                    "--moe-device-rebalance-min-load-spread-improvement-divisor", "25",
+                    "--moe-device-rebalance-min-wave-spread-improvement-per-payload-slot", "144",
+                    "--moe-device-rebalance-min-router-spread-improvement-per-payload-slot", "288",
+                    "--moe-device-rebalance-max-post-wave-load-spread-permille", "90",
                     "--moe-release-raw-expert-weights"};
     OrchestrationConfigParser parser;
 
@@ -1699,6 +1729,11 @@ TEST(Test__OrchestrationConfigParser, ParseArgs_MoERebalance)
     EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, 7u);
     EXPECT_EQ(config.moe_rebalance.dynamic_max_plan_entries_per_wave, 28u);
     EXPECT_EQ(config.moe_rebalance.dynamic_min_window_activations, 48u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement, 72u);
+    EXPECT_EQ(config.moe_rebalance.device_min_load_spread_improvement_divisor, 25u);
+    EXPECT_EQ(config.moe_rebalance.device_min_wave_spread_improvement_per_payload_slot, 144u);
+    EXPECT_EQ(config.moe_rebalance.device_min_router_spread_improvement_per_payload_slot, 288u);
+    EXPECT_EQ(config.moe_rebalance.device_max_post_wave_load_spread_per_mille, 90u);
     EXPECT_TRUE(config.moe_rebalance.release_raw_expert_weights);
 }
 
