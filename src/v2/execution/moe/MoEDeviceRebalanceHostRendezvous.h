@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include "execution/moe/DeviceMoERebalanceController.h"
+
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
@@ -44,6 +46,12 @@ namespace llaminar2
                        payload_edge_mask != 0ULL;
             }
         };
+
+        static bool isNonFatalProbeStatus(uint32_t status_code)
+        {
+            return status_code == static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) ||
+                   status_code == static_cast<uint32_t>(DeviceMoERebalanceStatusCode::WindowNotReady);
+        }
 
         struct ReadinessDecision
         {
@@ -382,19 +390,28 @@ namespace llaminar2
                         state.aggregate.valid = false;
                         state.error = "invalid local probe outcome from " + participant_name;
                     }
-                    if (local.status_code != 0u)
+                    else if (!isNonFatalProbeStatus(local.status_code))
                     {
                         state.failed = true;
                         state.aggregate.status_code = local.status_code;
                         state.error = "non-ok local probe outcome from " + participant_name;
                     }
-
-                    state.aggregate.useful_work =
-                        state.aggregate.useful_work || local.useful_work;
-                    state.aggregate.payload_bucket_slots =
-                        std::max(state.aggregate.payload_bucket_slots,
-                                 local.payload_bucket_slots);
-                    state.aggregate.payload_edge_mask |= local.payload_edge_mask;
+                    else if (local.status_code != 0u)
+                    {
+                        state.aggregate.status_code = local.status_code;
+                        state.aggregate.useful_work = false;
+                        state.aggregate.payload_bucket_slots = 0;
+                        state.aggregate.payload_edge_mask = 0ULL;
+                    }
+                    else if (state.aggregate.status_code == 0u)
+                    {
+                        state.aggregate.useful_work =
+                            state.aggregate.useful_work || local.useful_work;
+                        state.aggregate.payload_bucket_slots =
+                            std::max(state.aggregate.payload_bucket_slots,
+                                     local.payload_bucket_slots);
+                        state.aggregate.payload_edge_mask |= local.payload_edge_mask;
+                    }
 
                     if (state.arrivals == state.expected)
                     {

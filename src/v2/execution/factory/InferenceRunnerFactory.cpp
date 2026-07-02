@@ -1489,6 +1489,15 @@ namespace llaminar2
         if (env.presence.has("LLAMINAR_MOE_DYNAMIC_MIN_WINDOW_ACTIVATIONS"))
             result.dynamic_min_window_activations =
                 env.moe_rebalance.dynamic_min_window_activations;
+        if (env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS"))
+            result.device_maintenance_slack_tokens =
+                env.moe_rebalance.device_rebalance_maintenance_slack_tokens;
+        if (env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS"))
+            result.device_min_maintenance_period_tokens =
+                env.moe_rebalance.device_rebalance_min_maintenance_period_tokens;
+        if (env.presence.has("LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS"))
+            result.device_initial_maintenance_period_tokens =
+                env.moe_rebalance.device_rebalance_initial_maintenance_period_tokens;
         result.release_raw_expert_weights = result.release_raw_expert_weights ||
                                             env.moe_rebalance.release_raw_weights;
 

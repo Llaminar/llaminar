@@ -11896,6 +11896,11 @@ namespace llaminar2
         return runner_ && runner_->usesDeviceSideMoERebalanceController();
     }
 
+    uint64_t OrchestrationRunner::moeRuntimeMovementEpoch() const
+    {
+        return runner_ ? runner_->moeRuntimeMovementEpoch() : 0;
+    }
+
     bool OrchestrationRunner::maybeApplyMoERebalance()
     {
         const std::string device =
@@ -13385,6 +13390,14 @@ namespace llaminar2
         if (runner_)
         {
             runner_->enableSnapshotCapture(output_dir);
+        }
+    }
+
+    void OrchestrationRunner::setSnapshotCaptureFilter(const std::vector<std::string> &keys)
+    {
+        if (runner_)
+        {
+            runner_->setSnapshotCaptureFilter(keys);
         }
     }
 

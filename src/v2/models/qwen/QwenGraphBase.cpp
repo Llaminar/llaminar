@@ -368,6 +368,34 @@ namespace llaminar2
         return !useReplicatedAttentionStateWeights();
     }
 
+    bool QwenGraphBase::needsPhaseSplitPrefillKVCacheHandoff(
+        int total_tokens,
+        IKVCache *kv_cache,
+        DeviceId device) const
+    {
+        if (!kv_cache || !device.is_gpu())
+            return false;
+        if (!config_.dense_tp_enabled ||
+            !config_.dense_tp_decode_replicated ||
+            !hasDecodeReplicatedDenseWeightSource() ||
+            !config_.qkv_column_parallel)
+        {
+            return false;
+        }
+        if (useReplicatedAttentionStateWeights() || useDecodeReplicatedDenseWeights())
+            return false;
+        if (total_tokens <= 1)
+            return false;
+        if (config_.n_kv_heads <= 0 ||
+            config_.head_dim <= 0 ||
+            config_.local_n_kv_heads <= 0 ||
+            config_.local_n_kv_heads >= config_.n_kv_heads)
+        {
+            return false;
+        }
+        return !kv_cache->is_sharded();
+    }
+
     QwenGraphBase::DecodeReplicatedDenseScope::DecodeReplicatedDenseScope(
         QwenGraphBase &owner,
         int total_tokens)
@@ -631,6 +659,8 @@ namespace llaminar2
         lb.Q = toBase(arena_->getTensor(BufferId::Q_PROJ));
         lb.K = toBase(arena_->getTensor(BufferId::K_PROJ));
         lb.V = toBase(arena_->getTensor(BufferId::V_PROJ));
+        lb.K_full_prefill = toBase(arena_->getTensor(BufferId::K_FULL_PREFILL));
+        lb.V_full_prefill = toBase(arena_->getTensor(BufferId::V_FULL_PREFILL));
         lb.attn_output = toBase(arena_->getTensor(BufferId::ATTN_OUTPUT));
         lb.attn_proj = toBase(arena_->getTensor(BufferId::ATTN_PROJ));
         lb.workspace_scores = toBase(arena_->getTensor(BufferId::ATTN_SCORES_WORKSPACE));
@@ -2947,7 +2977,8 @@ namespace llaminar2
         int total_tokens,
         const int *position_ids,
         const void *position_ids_device,
-        DeviceId device)
+        DeviceId device,
+        bool force_apply_rope_to_k)
     {
         const std::string node_name = prefix + "rope";
         int pos_offset = position_ids ? position_ids[0] : 0;
@@ -2972,7 +3003,7 @@ namespace llaminar2
                           .partial_rotary_factor = config_.partial_rotary_factor,
                           .position_ids = position_ids,
                           .position_ids_device = position_ids_device,
-                          .skip_k = config_.rope_on_read,
+                          .skip_k = config_.rope_on_read && !force_apply_rope_to_k,
                           .force_decode_equivalent_verifier_prefill =
                               force_decode_equivalent_rope_verifier_prefill,
                           .q_buffer_id = buffers.idFor(BufferId::Q_PROJ),
@@ -2993,6 +3024,7 @@ namespace llaminar2
         IKVCache *kv_cache,
         DeviceId device,
         const std::string &rope_dependency,
+        const std::vector<std::string> &cache_source_dependencies,
         bool layer_idx_is_cache_local)
     {
         int total_tokens = batch_size * seq_len;
@@ -3001,11 +3033,106 @@ namespace llaminar2
 
         if (kv_cache)
         {
+            const bool phase_split_handoff =
+                needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+            ITensor *append_K = buffers.K;
+            ITensor *append_V = buffers.V;
+            std::optional<BufferId> append_k_buffer_id = buffers.idFor(BufferId::K_PROJ);
+            std::optional<BufferId> append_v_buffer_id = buffers.idFor(BufferId::V_PROJ);
+            std::string append_dependency = rope_dependency;
+
+            if (phase_split_handoff)
+            {
+                if (!buffers.K_full_prefill || !buffers.V_full_prefill)
+                {
+                    LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires K_full_prefill/V_full_prefill buffers");
+                    throw std::runtime_error("phase-split prefill full K/V buffers missing");
+                }
+                auto *local_tp = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
+                if (!local_tp)
+                {
+                    LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires a LocalTP context");
+                    throw std::runtime_error("phase-split prefill KV handoff requires LocalTP context");
+                }
+                if (!local_tp->supportsRawAllgatherOnStreamGraphCapture())
+                {
+                    LOG_ERROR("[QwenGraphBase] Phase-split prefill KV handoff requires graph-capturable raw allgather");
+                    throw std::runtime_error("phase-split prefill KV handoff requires graph-capturable raw allgather");
+                }
+
+                const int local_kv_dim = config_.local_n_kv_heads * config_.head_dim;
+                const int full_kv_dim = config_.n_kv_heads * config_.head_dim;
+                if (!buffers.K || !buffers.V ||
+                    local_kv_dim <= 0 ||
+                    static_cast<int>(buffers.K->cols()) < local_kv_dim ||
+                    static_cast<int>(buffers.V->cols()) < local_kv_dim ||
+                    static_cast<int>(buffers.K_full_prefill->cols()) < full_kv_dim ||
+                    static_cast<int>(buffers.V_full_prefill->cols()) < full_kv_dim)
+                {
+                    LOG_ERROR("[QwenGraphBase] Invalid phase-split prefill K/V handoff dimensions"
+                              << " local_kv_dim=" << local_kv_dim
+                              << " full_kv_dim=" << full_kv_dim);
+                    throw std::runtime_error("invalid phase-split prefill K/V handoff dimensions");
+                }
+
+                const std::string handoff_node = prefix + "tp_kv_state_allgather";
+                graph.addNode(handoff_node,
+                              ComputeStageFactory::createTPKVCacheStateAllGather({
+                                  .device_id = device,
+                                  .tp_ctx = local_tp,
+                                  .local_K = buffers.K,
+                                  .local_V = buffers.V,
+                                  .full_K = buffers.K_full_prefill,
+                                  .full_V = buffers.V_full_prefill,
+                                  .layer_idx = kv_stage_layer,
+                                  .tp_device_idx = config_.tp_device_idx,
+                                  .tokens = total_tokens,
+                                  .local_kv_dim = local_kv_dim,
+                                  .full_kv_dim = full_kv_dim,
+                                  .local_k_stride = local_kv_dim,
+                                  .local_v_stride = local_kv_dim,
+                                  .stage_name = handoff_node,
+                                  .local_k_buffer_id = buffers.idFor(BufferId::K_PROJ),
+                                  .local_v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                                  .full_k_buffer_id = BufferId::K_FULL_PREFILL,
+                                  .full_v_buffer_id = BufferId::V_FULL_PREFILL,
+                              }),
+                              device);
+
+                if (!cache_source_dependencies.empty())
+                {
+                    for (const auto &dep : cache_source_dependencies)
+                    {
+                        if (!dep.empty())
+                            graph.addDependency(handoff_node, dep);
+                    }
+                }
+                else
+                {
+                    graph.addDependency(handoff_node, rope_dependency);
+                }
+
+                /*
+                 * The replicated decode cache stores pre-RoPE K so decode can
+                 * apply rope-on-read with its own logical positions. RoPE still
+                 * mutates buffers.K in-place for local prefill attention, so it
+                 * must wait until the handoff has copied the pre-RoPE rows.
+                 */
+                if (!rope_dependency.empty())
+                    graph.addDependency(rope_dependency, handoff_node);
+
+                append_K = buffers.K_full_prefill;
+                append_V = buffers.V_full_prefill;
+                append_k_buffer_id = BufferId::K_FULL_PREFILL;
+                append_v_buffer_id = BufferId::V_FULL_PREFILL;
+                append_dependency = handoff_node;
+            }
+
             graph.addNode(prefix + "kv_append",
                           ComputeStageFactory::createKVCacheAppend({
                               .device_id = device,
-                              .K = buffers.K,
-                              .V = buffers.V,
+                              .K = append_K,
+                              .V = append_V,
                               .kv_cache = kv_cache,
                               .layer_idx = kv_stage_layer,
                               .seq_idx = 0,
@@ -3017,15 +3144,15 @@ namespace llaminar2
                               .head_dim = config_.head_dim,
                               .turboquant_ctx = config_.turboquant_ctx,
                               .kv_rotation = config_.kv_rotation,
-                              .k_buffer_id = buffers.idFor(BufferId::K_PROJ),
-                              .v_buffer_id = buffers.idFor(BufferId::V_PROJ),
+                              .k_buffer_id = append_k_buffer_id,
+                              .v_buffer_id = append_v_buffer_id,
                           }),
                           device);
 
             // In rope-on-read mode the RoPE stage skips K mutation, but it still
             // carries the Q/K norm dependencies. Appending directly after QKV GEMM
             // can cache pre-normalized K on Qwen3.5 FA layers.
-            graph.addDependency(prefix + "kv_append", rope_dependency);
+            graph.addDependency(prefix + "kv_append", append_dependency);
             return prefix + "kv_append";
         }
 
@@ -3047,12 +3174,15 @@ namespace llaminar2
         DeviceId device,
         bool has_qkv_proj,
         const std::string &rope_dependency,
+        const std::vector<std::string> &cache_source_dependencies,
         bool layer_idx_is_cache_local)
     {
         (void)position_ids_device;
         int total_tokens = batch_size * seq_len;
         const int kv_stage_layer = kvCacheLayerForGraphStage(
             kv_cache, layer_idx, config_.pp_layer_offset, layer_idx_is_cache_local);
+        const bool phase_split_handoff =
+            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
 
         const std::string kv_append_dependency =
             addKVCacheAppend(
@@ -3065,6 +3195,7 @@ namespace llaminar2
                 kv_cache,
                 device,
                 rope_dependency,
+                cache_source_dependencies,
                 layer_idx_is_cache_local);
 
         // --- Determine K/V source for attention ---
@@ -3148,7 +3279,8 @@ namespace llaminar2
             attn_params.workspace_mask = buffers.workspace_mask;
             attn_params.kv_cache = kv_cache;
             attn_params.layer_idx = kv_stage_layer;
-            attn_params.read_kv_from_cache = device.is_gpu() &&
+            attn_params.read_kv_from_cache = !phase_split_handoff &&
+                                             device.is_gpu() &&
                                              (!kv_cache || kv_cache->precision() != ActivationPrecision::Q8_1) &&
                                              (!kv_cache || (kv_cache->precision() != ActivationPrecision::TQ8 &&
                                                             kv_cache->precision() != ActivationPrecision::TQ4));
@@ -3162,7 +3294,7 @@ namespace llaminar2
             attn_params.turboquant_ctx = config_.turboquant_ctx;
             attn_params.kv_rotation = config_.kv_rotation;
 
-            if (config_.rope_on_read)
+            if (config_.rope_on_read && !phase_split_handoff)
             {
                 attn_params.apply_rope_to_k = true;
                 attn_params.rope_theta = config_.rope_theta;
@@ -3176,7 +3308,11 @@ namespace llaminar2
             if (use_gather_stage)
                 graph.addDependency(prefix + "attention", prefix + "kv_gather");
             else if (kv_cache)
+            {
                 graph.addDependency(prefix + "attention", kv_append_dependency);
+                if (phase_split_handoff)
+                    graph.addDependency(prefix + "attention", rope_dependency);
+            }
             else
                 graph.addDependency(prefix + "attention", rope_dependency);
         }

@@ -5987,6 +5987,22 @@ namespace llaminar2
         return epoch;
     }
 
+    uint64_t RankOrchestrator::moeRuntimeMovementEpoch() const
+    {
+        uint64_t epoch = 0;
+        for (const auto &runner : device_runners_)
+        {
+            if (runner)
+                epoch = std::max(epoch, runner->moeRuntimeMovementEpoch());
+        }
+        for (const auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+                epoch = std::max(epoch, runner->moeRuntimeMovementEpoch());
+        }
+        return epoch;
+    }
+
     PrefixLookupResult RankOrchestrator::lookupPrefix(const std::vector<int32_t> &tokens)
     {
         PrefixLookupResult aggregate;
@@ -6399,6 +6415,9 @@ namespace llaminar2
             snapshot.has_hidden = snapshot.has_hidden || child.has_hidden;
             snapshot.has_logits = snapshot.has_logits || child.has_logits;
             snapshot.session_epoch = std::max(snapshot.session_epoch, child.session_epoch);
+            snapshot.moe_runtime_movement_epoch =
+                std::max(snapshot.moe_runtime_movement_epoch,
+                         child.moe_runtime_movement_epoch);
             snapshot.prefix_cache_config_enabled =
                 snapshot.prefix_cache_config_enabled || child.prefix_cache_config_enabled;
             snapshot.prefix_cache_ready = snapshot.prefix_cache_ready || child.prefix_cache_ready;
@@ -6653,6 +6672,21 @@ namespace llaminar2
         }
     }
 
+    void RankOrchestrator::setSnapshotCaptureFilter(const std::vector<std::string> &keys)
+    {
+        for (auto &runner : device_runners_)
+        {
+            if (runner)
+                runner->setSnapshotCaptureFilter(keys);
+        }
+
+        for (auto &runner : pp_stage_runners_)
+        {
+            if (runner)
+                runner->setSnapshotCaptureFilter(keys);
+        }
+    }
+
     void RankOrchestrator::disableSnapshotCapture()
     {
         LOG_DEBUG("RankOrchestrator::disableSnapshotCapture: Disabling on all devices");
@@ -6697,6 +6731,51 @@ namespace llaminar2
                 runner->clearSnapshots();
             }
         }
+    }
+
+    bool RankOrchestrator::phaseSplitReplicatedDecodeSnapshotsActive() const
+    {
+        if (current_padded_seq_len_ != 1)
+            return false;
+
+        const auto &plan = config_.moe_expert_parallel_plan;
+        if (!plan || !plan->isTieredOverlay())
+            return false;
+
+        const auto &dense = plan->continuation_domain_spec;
+        return dense.dense_tp_enabled && dense.dense_decode_replicated;
+    }
+
+    bool RankOrchestrator::isPhaseSplitReplicatedDecodeSnapshotKey(const std::string &key)
+    {
+        const std::string stage_type = extractStageType(key);
+
+        return stage_type == "ATTENTION_OUTPUT" ||
+               stage_type == "FFN_DOWN" ||
+               stage_type == "GDN_OUTPUT" ||
+               stage_type == "MOE_SHARED_EXPERT_OUTPUT" ||
+               stage_type == "MOE_SHARED_GATE_OUTPUT";
+    }
+
+    SnapshotShardingMode RankOrchestrator::resolveSnapshotShardingMode(const std::string &key) const
+    {
+        SnapshotShardingMode mode = getStageShardingMode(key, stage_sharding_map_);
+
+        /*
+         * Phase-split MoE overlay uses DenseTP for prefill but switches dense and
+         * always-on shared decode work to full replicated weights. The schema still
+         * marks dense output projections as ROW_PARALLEL because that is correct
+         * for plain TP. During replicated decode, summing per-device snapshots
+         * doubles the captured tensor and produces false parity failures.
+         */
+        if (mode == SnapshotShardingMode::ROW_PARALLEL &&
+            phaseSplitReplicatedDecodeSnapshotsActive() &&
+            isPhaseSplitReplicatedDecodeSnapshotKey(key))
+        {
+            return SnapshotShardingMode::REPLICATED;
+        }
+
+        return mode;
     }
 
     const float *RankOrchestrator::getSnapshot(const std::string &key, size_t &out_size) const
@@ -6837,7 +6916,7 @@ namespace llaminar2
     {
         TPSnapshot result;
         result.key = key;
-        result.mode = getStageShardingMode(key, stage_sharding_map_);
+        result.mode = resolveSnapshotShardingMode(key);
         result.tp_degree = static_cast<int>(device_runners_.size());
 
         LOG_DEBUG("RankOrchestrator::getTPSnapshot: key=" << key
@@ -6910,7 +6989,7 @@ namespace llaminar2
         // =========================================================================
 
         // Special case: GATHERED stages (e.g., LM_HEAD) with combined logits already gathered
-        if (getStageShardingMode(key, stage_sharding_map_) == SnapshotShardingMode::GATHERED &&
+        if (result.mode == SnapshotShardingMode::GATHERED &&
             device_runners_.size() > 1 && logits_gatherer_ && logits_gatherer_->isAllocated() && tp_ctx_)
         {
             bool has_column_parallel_lm_head = false;
@@ -7034,7 +7113,7 @@ namespace llaminar2
 
         for (const auto &key : keys)
         {
-            result.emplace_back(key, getStageShardingMode(key, stage_sharding_map_));
+            result.emplace_back(key, resolveSnapshotShardingMode(key));
         }
 
         return result;

@@ -4645,6 +4645,31 @@ add_v2_test(V2_Perf_MoEVerifierPrefill
     RESOURCE_LOCK RealModel_Perf
 )
 
+# Focused LLEP deterministic-kernel speedometer.
+# Covers the current-batch span assignment and transfer-command materialization
+# kernels whose atomic compaction was removed for parity-stable expert routing.
+add_executable(v2_perf_moe_llep_determinism
+    performance/kernels/moe/Perf__CUDAMoELLEPDeterminism.cpp
+    performance/kernels/moe/Perf__ROCmMoELLEPDeterminism.cpp
+)
+target_include_directories(v2_perf_moe_llep_determinism PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/moe
+)
+target_link_libraries(v2_perf_moe_llep_determinism
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+if(HAVE_CUDA)
+    target_link_libraries(v2_perf_moe_llep_determinism CUDA::cudart)
+endif()
+add_v2_test(V2_Perf_MoELLEPDeterminism
+    COMMAND $<TARGET_FILE:v2_perf_moe_llep_determinism>
+    LABELS "V2;Performance;Benchmark;MoE;LLEP;Determinism;CUDA;ROCm;Tuning"
+    MPI_PROCS 1
+    RESOURCE_LOCK RealModel_Perf
+)
+
 # Focused GPU speculative-summary speedometer.
 # Isolates the Qwen3.6-sized verifier argmax + compact greedy summary path from
 # full-model graph stream handoff timing, so MoE MTP tuning can tell whether a
@@ -5795,15 +5820,23 @@ if(ZLIB_FOUND)
     set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS
         V2 Integration Parity Qwen36MoE MixtureOfExperts GatedDeltaNet
         CUDA ROCm NCCL RCCL LocalTP ExpertOverlay PhaseSplitHybridTP_AE
-        PyTorch GoldenReference FullModel
+        Dynamic LLEP PyTorch GoldenReference FullModel
     )
     set(QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES
-        PrefillParity          CUDA2 Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport
-        PrefillParity          ROCm2 Qwen36MoE_ExpertOverlay_ROCm2TP_HotOnly_PhaseSplit_FP16Transport
-        DecodeParity           CUDA2 Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport
-        DecodeParity           ROCm2 Qwen36MoE_ExpertOverlay_ROCm2TP_HotOnly_PhaseSplit_FP16Transport
-        SnapshotInfrastructure CUDA2 Qwen36MoE_ExpertOverlay_CUDA2TP_HotOnly_PhaseSplit_FP16Transport
-        SnapshotInfrastructure ROCm2 Qwen36MoE_ExpertOverlay_ROCm2TP_HotOnly_PhaseSplit_FP16Transport
+        PrefillParity          CUDA2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport
+        PrefillParity          ROCm2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport
+        DecodeParity           CUDA2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport
+        DecodeParity           ROCm2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport
+        PrefillParity          CUDA2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_FP16Transport
+        PrefillParity          ROCm2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_FP16Transport
+        DecodeParity           CUDA2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_FP16Transport
+        DecodeParity           ROCm2TP_LLEP_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_FP16Transport
+        LongContextDecodeParity CUDA2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport
+        LongContextDecodeParity ROCm2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_LongDecode_FP16Transport
+        LongContextDecodeParity CUDA2TP_LLEP_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_LLEP_PhaseSplit_LongDecode_FP16Transport
+        LongContextDecodeParity ROCm2TP_LLEP_PhaseSplit_LongDecode_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_LLEP_PhaseSplit_LongDecode_FP16Transport
+        SnapshotInfrastructure CUDA2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_CUDA2TP_Dynamic_PhaseSplit_FP16Transport
+        SnapshotInfrastructure ROCm2TP_Dynamic_PhaseSplit_FP16Transport Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport
     )
     list(LENGTH QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT)
     math(EXPR QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_LAST "${QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASE_COUNT} - 1")
@@ -5811,9 +5844,9 @@ if(ZLIB_FOUND)
         math(EXPR BACKEND_INDEX "${CASE_INDEX} + 1")
         math(EXPR CONFIG_INDEX "${CASE_INDEX} + 2")
         list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${CASE_INDEX} CASE_NAME)
-        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${BACKEND_INDEX} CASE_BACKEND)
+        list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${BACKEND_INDEX} CASE_SUFFIX)
         list(GET QWEN36_MOE_EXPERT_OVERLAY_PARITY_CASES ${CONFIG_INDEX} CASE_CONFIG)
-        add_v2_test(V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_${CASE_NAME}_${CASE_BACKEND}
+        add_v2_test(V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_${CASE_NAME}_${CASE_SUFFIX}
             COMMAND $<TARGET_FILE:v2_integration_parity_qwen36moe_expert_overlay_math>
                     --gtest_filter=Qwen36MoEExpertOverlay/Qwen36MoEExpertOverlayParityTest.${CASE_NAME}/${CASE_CONFIG}
             LABELS ${QWEN36_MOE_EXPERT_OVERLAY_PARITY_LABELS}

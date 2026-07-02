@@ -126,6 +126,8 @@ namespace llaminar2
             return "KV_CACHE_APPEND";
         case ComputeStageType::KV_CACHE_GATHER:
             return "KV_CACHE_GATHER";
+        case ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER:
+            return "TP_KV_CACHE_STATE_ALLGATHER";
         case ComputeStageType::ATTENTION_COMPUTE:
             return "ATTENTION_COMPUTE";
         case ComputeStageType::QUANTIZE_Q16_1:

@@ -618,6 +618,7 @@ namespace llaminar2
         bool initializeMoERuntimeTableForGroupedDecode();
         bool initializeMoERuntimeTableForGroupedPrefill();
         bool initializeFixedTopologyGroupedPrefill();
+        int expectedGroupedDecodeParticipantCount() const;
         bool runtimeTableHasActiveGroupedDecodeBank() const;
         bool supportsRequestedRoutedAssignmentPolicy() const;
         bool canUseRuntimePrefillGrouping() const;
@@ -636,7 +637,9 @@ namespace llaminar2
         bool executeSafeCombinedSharedVerifierComposite(IMoEKernel *kernel) const;
         bool executeFixedTopologyGroupedPrefill(IMoEKernel *kernel, int max_tokens) const;
         bool hasTransferBackedPrefillLLEP() const;
-        bool executeTransferBackedPrefillLLEPMovement(IMoEKernel *kernel) const;
+        bool executeTransferBackedPrefillLLEPMovement(
+            IMoEKernel *kernel,
+            DeviceMoERebalanceStatus **transfer_status_out) const;
         bool isDeviceRoutedDecodeGraphCapturable() const;
         bool supportsFixedTopologyPrefillGraphCapturePreflight() const;
         bool isFixedTopologyPrefillGraphCapturable() const;

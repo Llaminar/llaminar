@@ -43,6 +43,7 @@
 #include <type_traits>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../utils/DebugEnv.h"
 #include "kernels/rocm/gemm/ROCmNativeVNNIPrefillDispatchGenerated.inc"
 
@@ -2145,6 +2146,64 @@ static bool launch_native_vnni_gemm(
     constexpr int BLOCK_SIZE = 256;
 
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    const bool stream_capture_active = [&]() {
+        if (llaminar2::isGraphCaptureActive())
+            return true;
+        if (!hip_stream)
+            return false;
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        const hipError_t err = hipStreamIsCapturing(hip_stream, &status);
+        return err == hipSuccess && status == hipStreamCaptureStatusActive;
+    }();
+
+    auto report_launch_status = [&](const char* route,
+                                    int n_tile,
+                                    int m_tile,
+                                    int min_blocks,
+                                    int unroll,
+                                    hipError_t err) -> bool
+    {
+        if (err != hipSuccess)
+        {
+            fprintf(stderr,
+                    "[rocmGemm_native_vnni_fp32] launch failed: %s "
+                    "route=%s M=%d N=%d K=%d codebook=%u N_TILE=%d M_TILE=%d "
+                    "min_blocks=%d unroll=%d device=%d stream=%p\n",
+                    hipGetErrorString(err),
+                    route ? route : "unknown",
+                    M, N, K,
+                    static_cast<unsigned>(FMT),
+                    n_tile,
+                    m_tile,
+                    min_blocks,
+                    unroll,
+                    device_id,
+                    stream);
+        }
+        return err == hipSuccess;
+    };
+
+    auto clear_launch_error = [&]() {
+        if (!stream_capture_active)
+            (void)hipGetLastError();
+    };
+
+    auto complete_launch = [&](const char* route,
+                               int n_tile,
+                               int m_tile,
+                               int min_blocks,
+                               int unroll) -> bool
+    {
+        if (stream_capture_active)
+            return true;
+        return report_launch_status(
+            route,
+            n_tile,
+            m_tile,
+            min_blocks,
+            unroll,
+            hipGetLastError());
+    };
 
     // Templated launch helper (default 2-wave)
     auto launch = [&](auto n_tile_tag, auto m_tile_tag) -> bool
@@ -2154,12 +2213,13 @@ static bool launch_native_vnni_gemm(
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
 
+        clear_launch_error();
         native_vnni_gemm_kernel<NT, BPT, MT, FMT>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise);
 
-        return hipGetLastError() == hipSuccess;
+        return complete_launch("default", NT, MT, 2, 4);
     };
 
     // 3-wave variant: MIN_BLOCKS=3 tells compiler to target ≤84 VGPRs
@@ -2170,12 +2230,13 @@ static bool launch_native_vnni_gemm(
         dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
         dim3 block(BLOCK_SIZE, 1, 1);
 
+        clear_launch_error();
         native_vnni_gemm_kernel<NT, BPT, MT, FMT, 3>
             <<<grid, block, 0, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, M, N, K, d_scales_A_blockwise);
 
-        return hipGetLastError() == hipSuccess;
+        return complete_launch("three_wave", NT, MT, 3, 4);
     };
 
     // Streaming LM_Head variant: zero barriers, zero LDS, 3-wave occupancy
@@ -2193,12 +2254,13 @@ static bool launch_native_vnni_gemm(
             ? (MT * bpr * sizeof(int32_t))
             : 0;
 
+        clear_launch_error();
         streaming_lm_head_kernel<MT, FMT>
             <<<grid, block, shared_bytes, hip_stream>>>(
                 d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                 d_output, d_scales_A, d_scales_A_blockwise, M, N, K);
 
-        return hipGetLastError() == hipSuccess;
+        return complete_launch("streaming_lm_head", N_PER_WG, MT, 3, 0);
     };
 
     auto launch_config = [&](int n_tile, int m_tile_cfg, int min_blocks, int unroll) -> bool
@@ -2210,11 +2272,12 @@ static bool launch_native_vnni_gemm(
         { \
             dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1); \
             dim3 block(BLOCK_SIZE, 1, 1); \
+            clear_launch_error(); \
             native_vnni_gemm_kernel<NT, BPT, MT, FMT, MB, UG> \
                 <<<grid, block, 0, hip_stream>>>( \
                     d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins, \
                     d_output, d_scales_A, M, N, K, d_scales_A_blockwise); \
-            return hipGetLastError() == hipSuccess; \
+            return complete_launch("configured", NT, MT, MB, UG); \
         }
 
 #define NVNNI_CONFIG_LAUNCH_UG(NT, MT, MB) \
@@ -2355,12 +2418,13 @@ static bool launch_native_vnni_gemm(
             dim3 grid((N + NT - 1) / NT, (M + MT - 1) / MT, 1);
             dim3 block(BLOCK_SIZE, 1, 1);
 
+            clear_launch_error();
             native_vnni_gemm_kernel<NT, BPT, MT, FMT, 1, 2>
                 <<<grid, block, 0, hip_stream>>>(
                     d_A_int8, d_payload, d_block_scales, d_block_mins, d_block_emins,
                     d_output, d_scales_A, M, N, K, d_scales_A_blockwise);
 
-            return hipGetLastError() == hipSuccess;
+            return complete_launch("simple_symmetric_mb1_ug2", NT, MT, 1, 2);
         };
 
         using N64_  = std::integral_constant<int, 64>;

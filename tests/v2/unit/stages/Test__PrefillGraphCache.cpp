@@ -715,7 +715,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsCPUDevice)
     EXPECT_EQ(reason, PrefillGraphRejectReason::NotGPUDevice);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsSnapshots)
+TEST(Test__PrefillGraphCache, Preflight_AllowsSnapshots)
 {
     PrefillGraphConfig config;
     PrefillGraphCache cache(config);
@@ -724,7 +724,7 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsSnapshots)
     auto graph = buildCapturableGraph(key.device_id);
 
     auto reason = cache.preflight(graph, key, nullptr, /*snapshots_active=*/true);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SnapshotsActive);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 TEST(Test__PrefillGraphCache, Preflight_AllowsExactShapeMoERebalancing)
@@ -739,7 +739,7 @@ TEST(Test__PrefillGraphCache, Preflight_AllowsExactShapeMoERebalancing)
     EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketMoERebalancing)
+TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketNonGraphStableMoERebalancing)
 {
     PrefillGraphConfig config;
     config.buckets_enabled = true;
@@ -757,6 +757,29 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsPaddedBucketMoERebalancing)
         /*real_seq_len=*/512,
         /*bucket_seq_len=*/768);
     EXPECT_EQ(reason, PrefillGraphRejectReason::ActiveMoERebalancing);
+}
+
+TEST(Test__PrefillGraphCache, Preflight_AllowsPaddedBucketGraphStableMoERebalancing)
+{
+    PrefillGraphConfig config;
+    config.buckets_enabled = true;
+    PrefillGraphCache cache(config);
+
+    auto key = makeGPUKey(768);
+    auto graph = buildCapturableGraph(key.device_id);
+
+    auto reason = cache.preflight(
+        graph,
+        key,
+        nullptr,
+        /*snapshots_active=*/false,
+        /*moe_rebalancing_active=*/true,
+        /*real_seq_len=*/512,
+        /*bucket_seq_len=*/768,
+        PrefillGraphPreflightMode::Default,
+        /*collectives_graph_capturable=*/false,
+        /*moe_rebalancing_graph_stable=*/true);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 TEST(Test__PrefillGraphCache, Preflight_RejectsCollectives)
@@ -1006,14 +1029,14 @@ TEST(Test__PrefillGraphCache, Preflight_AcceptsColdPaddedRocmMoERoutingBeforeKer
         real_seq_len,
         seq_len);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 #else
     EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
 #endif
 }
 
-TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupported)
+TEST(Test__PrefillGraphCache, Preflight_ColdPaddedMoERoutingHonorsGroupedPrefillAndBackend)
 {
     constexpr int seq_len = 608;
     constexpr int real_seq_len = 595;
@@ -1062,7 +1085,11 @@ TEST(Test__PrefillGraphCache, Preflight_RejectsColdPaddedMoERoutingWhenUnsupport
 
         const auto reason = cache.preflight(
             graph, key, nullptr, false, false, real_seq_len, seq_len);
+#if defined(HAVE_CUDA)
+        EXPECT_EQ(reason, PrefillGraphRejectReason::None);
+#else
         EXPECT_EQ(reason, PrefillGraphRejectReason::StageNotCapturable);
+#endif
     }
 }
 

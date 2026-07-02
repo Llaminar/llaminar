@@ -224,7 +224,8 @@ namespace llaminar2
          * @brief Compute the combined view from per-device data
          *
          * For COLUMN_PARALLEL: Concatenates device outputs along column dimension
-         * For ROW_PARALLEL/REPLICATED: Verifies all devices have same data, uses first
+         * For ROW_PARALLEL: Sums same-shaped per-device partials
+         * For REPLICATED: Uses the first full-device output
          * For GATHERED: Uses already-gathered combined output
          *
          * @return true if combination was successful
@@ -264,10 +265,39 @@ namespace llaminar2
                 combined_valid = true;
                 return true;
             }
-            else if (mode == SnapshotShardingMode::ROW_PARALLEL ||
-                     mode == SnapshotShardingMode::REPLICATED)
+            else if (mode == SnapshotShardingMode::ROW_PARALLEL)
             {
-                // All devices should have same data; use first
+                const auto &first = device_data[0];
+                combined_rows = first.rows;
+                combined_cols = first.cols;
+                const size_t element_count = first.data.size();
+                combined_data.assign(element_count, 0.0f);
+
+                for (const auto &dev : device_data)
+                {
+                    if (dev.rows != combined_rows ||
+                        dev.cols != combined_cols ||
+                        dev.data.size() != element_count)
+                    {
+                        combined_valid = false;
+                        combined_data.clear();
+                        combined_rows = 0;
+                        combined_cols = 0;
+                        return false;
+                    }
+
+                    for (size_t i = 0; i < element_count; ++i)
+                    {
+                        combined_data[i] += dev.data[i];
+                    }
+                }
+
+                combined_valid = true;
+                return true;
+            }
+            else if (mode == SnapshotShardingMode::REPLICATED)
+            {
+                // Replicated stages already contain the full result on each device.
                 const auto &first = device_data[0];
                 combined_rows = first.rows;
                 combined_cols = first.cols;

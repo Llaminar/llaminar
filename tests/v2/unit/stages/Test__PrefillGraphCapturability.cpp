@@ -110,6 +110,58 @@ namespace
         return update;
     }
 
+    MoEPlacementUpdate apportionedRuntimeUpdate(
+        uint32_t epoch,
+        int num_experts,
+        int d_model,
+        int local_participant,
+        int participant_count,
+        const std::vector<int> &owners,
+        const std::vector<bool> &local_mask)
+    {
+        MoEPlacementUpdate update;
+        update.epoch = epoch;
+        update.expert_count = static_cast<uint32_t>(num_experts);
+        update.participant_id = static_cast<uint32_t>(local_participant);
+        update.participant_count = static_cast<uint32_t>(participant_count);
+        update.experts.resize(static_cast<size_t>(num_experts));
+        update.local_compute_mask.assign(static_cast<size_t>(num_experts), 0u);
+        update.replica_role.assign(static_cast<size_t>(num_experts),
+                                   static_cast<uint8_t>(DeviceMoEReplicaRole::None));
+        update.resident_participant_mask.assign(static_cast<size_t>(num_experts), 0u);
+
+        for (int expert = 0; expert < num_experts; ++expert)
+        {
+            const int owner = owners.at(static_cast<size_t>(expert));
+            const bool local = local_mask.at(static_cast<size_t>(expert));
+            auto &desc = update.experts[static_cast<size_t>(expert)];
+            desc.logical_expert_id = expert;
+            desc.owner_participant = owner;
+            desc.local_slot = local ? expert : -1;
+            if (owner >= 0 && owner < participant_count)
+                update.resident_participant_mask[static_cast<size_t>(expert)] =
+                    1u << static_cast<uint32_t>(owner);
+
+            if (!local)
+                continue;
+
+            const uintptr_t base = 0x71000000u + static_cast<uintptr_t>(expert) * 0x10000u;
+            desc.gate = runtimeDesc(base + 0x0100u, d_model, d_model);
+            desc.up = runtimeDesc(base + 0x0200u, d_model, d_model);
+            desc.down = runtimeDesc(base + 0x0300u, d_model, d_model);
+            desc.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
+                                          DeviceMoEExpertFlags::Resident |
+                                          DeviceMoEExpertFlags::LocalCompute);
+            update.local_compute_mask[static_cast<size_t>(expert)] = 1u;
+            update.replica_role[static_cast<size_t>(expert)] =
+                owner == local_participant
+                    ? static_cast<uint8_t>(DeviceMoEReplicaRole::Primary)
+                    : static_cast<uint8_t>(DeviceMoEReplicaRole::Replica);
+        }
+
+        return update;
+    }
+
     // =========================================================================
     // Minimal stub IMoEKernel (no actual compute, just satisfies the interface)
     // =========================================================================
@@ -340,14 +392,14 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillCapturableWhenAllConditionsMet)
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable())
         << "Prefill routing should be capturable on ROCm with valid buffers and kernel";
 #else
     EXPECT_FALSE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_FALSE(stage.isGraphCapturable())
-        << "Prefill routing should not be capturable without ROCm or in snapshot builds";
+        << "Prefill routing should not be capturable without ROCm";
 #endif
 }
 
@@ -359,7 +411,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
     MoERoutingStage stage(params);
     // moe_kernel_ left as nullptr (default)
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight())
         << "Cold padded preflight should allow routing before kernel warmup";
 #else
@@ -367,7 +419,7 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsWithoutKernel)
 #endif
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Prefill routing should not be capturable without cached kernel";
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture());
 #else
     EXPECT_FALSE(stage.supportsWarmupDependentGraphCapture());
@@ -401,7 +453,7 @@ TEST_F(MoERoutingPrefillGraphCapture, CudaForcedVerifierReplaySeqLenOneUsesPrefi
     params.force_grouped_verifier_prefill_for_decode = true;
 
     MoERoutingStage cold_stage(params);
-#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_CUDA)
     EXPECT_TRUE(cold_stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(cold_stage.supportsWarmupDependentGraphCapture());
     EXPECT_FALSE(cold_stage.isGraphCapturable())
@@ -562,7 +614,7 @@ TEST_F(MoERoutingPrefillGraphCapture, NeedsOnGraphReplayedForPrefill)
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsPaddedPrefillGraphCapturePreflight());
     EXPECT_TRUE(stage.isGraphCapturable());
     EXPECT_TRUE(stage.needsOnGraphReplayed());
@@ -884,13 +936,13 @@ TEST_F(MoEExpertPrefillGraphCapture, DeviceRoutedDecodeRequiresFusedRuntimeWarmu
             << device.to_string();
     };
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     expectWarmupContract(DeviceId::rocm(0));
 #endif
-#if defined(HAVE_CUDA) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_CUDA)
     expectWarmupContract(DeviceId::cuda(0));
 #endif
-#if (!defined(HAVE_ROCM) && !defined(HAVE_CUDA)) || defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
     GTEST_SKIP() << "GPU routed MoE decode graph capture is not compiled in this build";
 #endif
 }
@@ -919,9 +971,64 @@ TEST_F(MoEExpertPrefillGraphCapture, RuntimeDecodeDescriptorSourceDefaultsToStat
         << "Device-side graph-stable rebalance must opt into mutable runtime descriptors.";
 }
 
+TEST_F(MoEExpertPrefillGraphCapture, MutableDecodePreservesApportionedRuntimeOwners)
+{
+    auto expect_backend = [&](DeviceId device, bool backend_supported)
+    {
+        MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
+        ASSERT_TRUE(runtime_table.prepareInactiveBank(
+            0,
+            apportionedRuntimeUpdate(
+                1,
+                NUM_EXPERTS,
+                D_MODEL,
+                /*local_participant=*/0,
+                /*participant_count=*/2,
+                {0, 0, 1, 1},
+                {true, true, false, false})));
+        ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
+
+        auto params = makeValidPrefillParams();
+        params.device_id = device;
+        params.seq_len = 1;
+        params.layer_idx = 0;
+        params.moe_runtime_table = &runtime_table;
+        params.my_socket_id = 0;
+        params.participant_count = 2;
+        params.expert_mask = {true, true, false, false};
+        params.runtime_decode_uses_mutable_descriptors = true;
+
+        MoEExpertComputeStage stage(params);
+        stage.setMoEKernelForTesting(&stub_kernel_);
+        stage.setRuntimeGroupedDecodeWarmedForTesting(true);
+
+        const auto &state = runtime_table.hostLayerState(0);
+        const auto &bank = state.banks[state.active_bank];
+        EXPECT_EQ(bank.experts[2].owner_participant, 1)
+            << "Mutable graph decode must not synthesize local ownership for remote apportioned experts";
+        EXPECT_EQ(bank.resident_participant_mask[2], 2u)
+            << "Remote apportioned expert residency must remain on participant 1";
+        EXPECT_EQ(bank.local_compute_mask[2], 0u);
+        EXPECT_EQ(stage.isGraphCapturable(), backend_supported)
+            << "A coherent mutable runtime table should be accepted for graph-captured decode";
+    };
+
+#if defined(HAVE_CUDA)
+    expect_backend(DeviceId::cuda(0), true);
+#else
+    expect_backend(DeviceId::cuda(0), false);
+#endif
+
+#if defined(HAVE_ROCM)
+    expect_backend(DeviceId::rocm(0), true);
+#else
+    expect_backend(DeviceId::rocm(0), false);
+#endif
+}
+
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndFusedDecode)
 {
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
@@ -936,12 +1043,13 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
     MoEExpertComputeStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
     stage.releaseRawExpertWeights();
+    MockDeviceContext ctx(params.device_id, ComputeBackendType::GPU_ROCM);
 
     ASSERT_TRUE(stage.supportsWarmupDependentGraphCapture());
     ASSERT_FALSE(stage.isGraphCapturable())
         << "The cold stage should require one explicit warmup pass.";
 
-    ASSERT_TRUE(stage.execute(nullptr))
+    ASSERT_TRUE(stage.execute(&ctx))
         << "The first warmup after clear_cache() must initialize the runtime "
            "placement bank and immediately use the fused runtime decode path.";
     EXPECT_EQ(stub_kernel_.fused_runtime_decode_calls, 1)
@@ -954,13 +1062,13 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankAndF
         << "After the first warmup token, cached graph capture should be armed "
            "without requiring a fallback decode step.";
 #else
-    GTEST_SKIP() << "Release GPU graph-capture path is disabled in this build";
+    GTEST_SKIP() << "ROCm graph-capture path is not compiled in this build";
 #endif
 }
 
 TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWithReplicas)
 {
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     ScopedMoEGraphCaptureFlags flags(true, true, true);
 
     MoERuntimeTable runtime_table(DeviceId::cpu(), 1, NUM_EXPERTS, TOP_K);
@@ -983,9 +1091,10 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWith
     stage.setMoEKernelForTesting(&stub_kernel_);
     stage.releaseRawExpertWeights();
     stage.setReplicaSet(replicas, /*socket_id=*/0);
+    MockDeviceContext ctx(params.device_id, ComputeBackendType::GPU_ROCM);
 
     ASSERT_TRUE(stage.supportsWarmupDependentGraphCapture());
-    ASSERT_TRUE(stage.execute(nullptr))
+    ASSERT_TRUE(stage.execute(&ctx))
         << "Replicated GPU participants must still use the device runtime "
            "decode path after the first warmup token.";
     EXPECT_EQ(stub_kernel_.fused_runtime_decode_calls, 1);
@@ -1007,7 +1116,7 @@ TEST_F(MoEExpertPrefillGraphCapture, FirstDecodeWarmupInitializesRuntimeBankWith
     EXPECT_TRUE(hasMoEExpertFlag(bank.experts[3].flags, DeviceMoEExpertFlags::Replicated));
     EXPECT_EQ(bank.replica_role[3], static_cast<uint8_t>(DeviceMoEReplicaRole::Replica));
 #else
-    GTEST_SKIP() << "Release GPU graph-capture path is disabled in this build";
+    GTEST_SKIP() << "ROCm graph-capture path is not compiled in this build";
 #endif
 }
 
@@ -1188,7 +1297,7 @@ TEST_F(SharedExpertFFNPrefillGraphCapture, RocmDecodeCapturableAfterWarmupWhenGr
 
     SharedExpertFFNStage stage(params);
 
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_FALSE(stage.isGraphCapturable())
         << "Cold decode still waits for the normal warmup pass to allocate scratch.";
     stage.setScratchSeqLenForTesting(1);
@@ -1607,7 +1716,7 @@ TEST_F(SharedExpertGatePrefillGraphCapture, DecodePlansWarmupDependentCaptureWit
     // moe_kernel_ left nullptr until warmup execution.
 
     EXPECT_FALSE(stage.isGraphCapturable());
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.supportsWarmupDependentGraphCapture())
         << "Decode shared gate should be planned capturable before warmup";
 #else

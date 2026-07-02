@@ -553,6 +553,8 @@ extern "C"
         void *status,
         uint32_t payload_slot_capacity,
         uint32_t command_buffer_count,
+        const void *gathered_wave_states,
+        void *local_wave_states,
         int device_idx,
         void *stream);
 
@@ -628,6 +630,9 @@ extern "C"
         const void *command_header,
         const void *wave_state,
         const void *copy_status,
+        const void *plan_entries,
+        uint32_t plan_capacity,
+        const void *gathered_copy_status,
         const void *config,
         uint32_t command_buffer_count,
         int device_idx,
@@ -867,6 +872,7 @@ extern "C"
     bool hipMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
         void *runtime,
         int current_slots, int max_slots, int num_experts, int top_k,
+        const void *transfer_status,
         int device_idx, void *stream);
 
     bool hipMoE_materialize_runtime_prefill_descriptor_tables(
@@ -3496,8 +3502,16 @@ namespace llaminar2
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router logits kernel failed");
                 return false;
             }
-            router_q8_hidden_source_ = h;
-            router_q8_hidden_valid_ = true;
+            /*
+             * In graph capture this launch is recorded, not completed. Keep the
+             * router-hidden reuse marker invalid until an eager/Phase-2 execution
+             * has actually produced the scratch bytes.
+             */
+            if (!isDecodeGraphCaptureActive())
+            {
+                router_q8_hidden_source_ = h;
+                router_q8_hidden_valid_ = true;
+            }
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -3776,8 +3790,16 @@ namespace llaminar2
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router logits kernel failed");
                 return false;
             }
-            router_q8_hidden_source_ = h;
-            router_q8_hidden_valid_ = true;
+            /*
+             * In graph capture this launch is recorded, not completed. Keep the
+             * router-hidden reuse marker invalid until an eager/Phase-2 execution
+             * has actually produced the scratch bytes.
+             */
+            if (!isDecodeGraphCaptureActive())
+            {
+                router_q8_hidden_source_ = h;
+                router_q8_hidden_valid_ = true;
+            }
         }
 
         if (!logits_ready && gate_is_fp32 && rocm_env.moe_router_kpart_decode)
@@ -4091,7 +4113,9 @@ namespace llaminar2
         const DeviceMoERebalanceConfig &config,
         DeviceMoERebalanceStatus *status,
         uint32_t payload_slot_capacity,
-        uint32_t command_buffer_count)
+        uint32_t command_buffer_count,
+        const DeviceMoERebalanceWaveState *gathered_wave_states,
+        DeviceMoERebalanceWaveState *local_wave_states)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -4121,6 +4145,8 @@ namespace llaminar2
             status,
             payload_slot_capacity,
             command_buffer_count,
+            gathered_wave_states,
+            local_wave_states,
             device_ordinal_,
             stream);
     }
@@ -4399,6 +4425,9 @@ namespace llaminar2
         const DeviceMoERebalanceCommandBufferHeader *command_header,
         const DeviceMoERebalanceWaveState *wave_state,
         const DeviceMoERebalanceApplyStatus *copy_status,
+        const DeviceMoERebalancePlanEntry *plan_entries,
+        uint32_t plan_capacity,
+        const DeviceMoERebalanceApplyStatus *gathered_copy_status,
         const DeviceMoERebalanceConfig &config,
         uint32_t command_buffer_count)
     {
@@ -4409,9 +4438,10 @@ namespace llaminar2
             LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] invalid device rebalance config");
             return false;
         }
-        if (!controller_state || !command_header || !wave_state || !copy_status)
+        if (!controller_state || !command_header || !wave_state || !copy_status ||
+            !plan_entries || plan_capacity == 0u || !gathered_copy_status)
         {
-            LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] controller state, command header, wave state, and copy status must be non-null");
+            LOG_ERROR("[ROCmMoEKernel::publishDeviceRebalanceTransferComplete] controller state, command header, wave state, copy status, plan entries, and gathered copy status must be non-null");
             return false;
         }
         void *stream = requireStream("ROCmMoEKernel::publishDeviceRebalanceTransferComplete");
@@ -4423,6 +4453,9 @@ namespace llaminar2
             command_header,
             wave_state,
             copy_status,
+            plan_entries,
+            plan_capacity,
+            gathered_copy_status,
             &config,
             command_buffer_count,
             device_ordinal_,
@@ -5613,8 +5646,10 @@ namespace llaminar2
                       "K-part gate/up decode was requested but scratch allocation failed");
             return false;
         }
+        const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
             debugEnv().rocm.moe_reuse_router_q8_hidden &&
+            !capture_active &&
             router_q8_hidden_valid_ &&
             router_q8_hidden_source_ == d_hidden &&
             router_q8_hidden_d_model_cap_ >= d_model &&
@@ -5814,8 +5849,10 @@ namespace llaminar2
                       "K-part gate/up decode was requested but scratch allocation failed");
             return false;
         }
+        const bool capture_active = isDecodeGraphCaptureActive();
         const bool reuse_router_q8_hidden =
             debugEnv().rocm.moe_reuse_router_q8_hidden &&
+            !capture_active &&
             router_q8_hidden_valid_ &&
             router_q8_hidden_source_ == d_hidden &&
             router_q8_hidden_d_model_cap_ >= d_model &&
@@ -6749,11 +6786,17 @@ namespace llaminar2
         int current_tokens,
         int max_tokens,
         int num_experts,
-        int top_k)
+        int top_k,
+        const DeviceMoERebalanceStatus *transfer_status)
     {
         if (!runtime_layer)
         {
             LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] null runtime");
+            return false;
+        }
+        if (!transfer_status)
+        {
+            LOG_ERROR("[ROCmMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers] transfer status is required");
             return false;
         }
         if (current_tokens < 0 || max_tokens <= 0 || current_tokens > max_tokens ||
@@ -6778,6 +6821,7 @@ namespace llaminar2
             max_tokens * top_k,
             num_experts,
             top_k,
+            transfer_status,
             device_ordinal_,
             getStream());
     }

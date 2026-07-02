@@ -861,7 +861,7 @@ namespace llaminar2
 
             const char *kv_append_source_snapshot_env = std::getenv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT");
             debug_kv_append_source_snapshot = kv_append_source_snapshot_env && std::atoi(kv_append_source_snapshot_env) != 0;
-            debug_kv_append_source_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_LAYER");
+            debug_kv_append_source_layer = selectedLayerFromEnv("LLAMINAR_DEBUG_KV_APPEND_SOURCE_SNAPSHOT_LAYER");
 
             const char *cuda_fa2_tile_kv_env = std::getenv("LLAMINAR_FA2_TILE_KV");
             cuda_fa2_tile_kv = cuda_fa2_tile_kv_env ? std::atoi(cuda_fa2_tile_kv_env) : 0;

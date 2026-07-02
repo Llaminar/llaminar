@@ -565,6 +565,19 @@ namespace llaminar2::test::parity::qwen2
                 return stage_runners_.front()->architecture();
             }
 
+            uint64_t moeRuntimeMovementEpoch() const override
+            {
+                uint64_t epoch = 0;
+                for (const auto &runner : stage_runners_)
+                {
+                    if (runner)
+                    {
+                        epoch = std::max(epoch, runner->moeRuntimeMovementEpoch());
+                    }
+                }
+                return epoch;
+            }
+
             // ================================================================
             // Snapshot API — aggregate from all stages
             // ================================================================
@@ -573,6 +586,12 @@ namespace llaminar2::test::parity::qwen2
             {
                 for (auto &runner : stage_runners_)
                     runner->enableSnapshotCapture(output_dir);
+            }
+
+            void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override
+            {
+                for (auto &runner : stage_runners_)
+                    runner->setSnapshotCaptureFilter(keys);
             }
 
             void disableSnapshotCapture() override
@@ -836,6 +855,8 @@ namespace llaminar2::test::parity::qwen2
                 config_.token_ids = cfg().token_ids;
             if (cfg().decode_steps > 0)
                 config_.decode_steps = cfg().decode_steps;
+            config_.moe_rebalance_exercise = cfg().moe_rebalance_exercise;
+            config_.graph_snapshot_policy = cfg().graph_snapshot_policy;
         }
 
         std::string getBackendName() override

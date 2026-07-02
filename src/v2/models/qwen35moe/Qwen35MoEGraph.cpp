@@ -2613,6 +2613,7 @@ namespace llaminar2
             {
                 static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
                 static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
+                static_assert((sizeof(DeviceMoERebalanceWaveState) % sizeof(int32_t)) == 0);
 
                 TPAllreduceSidebandWorkspaceBinding plan_sideband;
                 plan_sideband.kind = LocalTPCollectiveSidebandKind::Allgather;
@@ -2653,6 +2654,26 @@ namespace llaminar2
                     static_cast<int>(binding.config.root_participant);
                 header_sideband.name = "moe_rebalance_command_header_sideband";
                 sidebands.push_back(std::move(header_sideband));
+
+                TPAllreduceSidebandWorkspaceBinding wave_sideband;
+                wave_sideband.kind = LocalTPCollectiveSidebandKind::Allgather;
+                wave_sideband.send_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_WAVE_STATE,
+                        binding.workspace_name);
+                wave_sideband.recv_buffer_name =
+                    MoEDeviceRebalanceStage::workspaceBufferName(
+                        MoEDeviceRebalanceStage::WS_GATHERED_WAVE_STATE,
+                        binding.workspace_name);
+                wave_sideband.element_count =
+                    (command_buffer_count *
+                     sizeof(DeviceMoERebalanceWaveState)) /
+                    sizeof(int32_t);
+                wave_sideband.dtype = CollectiveDataType::INT32;
+                wave_sideband.root_device_index =
+                    static_cast<int>(binding.config.root_participant);
+                wave_sideband.name = "moe_rebalance_wave_state_sideband";
+                sidebands.push_back(std::move(wave_sideband));
 
                 graph_rebalance_pack_payload_node =
                     prefix + "moe_device_rebalance_pack_payload_after_command_sideband";

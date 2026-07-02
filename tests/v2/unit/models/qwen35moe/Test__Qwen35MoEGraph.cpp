@@ -8,6 +8,10 @@
 #include "execution/moe/MoEExpertOverlayRuntimePlan.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/compute_stages/stages/GDNLiveStateAllGatherStage.h"
+#include "execution/compute_stages/stages/AttentionComputeStage.h"
+#include "execution/compute_stages/stages/KVCacheAppendStage.h"
+#include "execution/compute_stages/stages/RoPEStage.h"
+#include "execution/compute_stages/stages/TPKVCacheStateAllGatherStage.h"
 #include "execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "kernels/cpu/CPUHybridRingKVCache.h"
 #include "models/qwen35moe/Qwen35MoEGraph.h"
@@ -1593,6 +1597,211 @@ TEST(Test__Qwen35MoEGraph, FARopeOnReadAppendsNormalizedKToCache)
     EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_k_norm"));
     EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_rope"))
         << "rope_on_read stores pre-RoPE K, but it must still wait for K norm";
+}
+
+TEST(Test__Qwen35MoEGraph, PhaseSplitPrefillSeedsReplicatedDecodeKVCacheWithFullKVRows)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+    tp_ctx->setRawAllgatherGraphCaptureSupported(true);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.n_layers = 1;
+    config.total_n_layers = 1;
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.qkv_column_parallel = true;
+    config.local_n_heads = 1;
+    config.local_n_kv_heads = 1;
+    config.n_heads = 2;
+    config.n_kv_heads = 2;
+    config.head_dim = 2;
+    config.rope_on_read = true;
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(makeDecodeDenseBindingSource());
+
+    TensorArena arena;
+    LayerWeights layer;
+    layer.attn_norm = arena.fp32({static_cast<size_t>(config.d_model)});
+    layer.wq = arena.fp32({static_cast<size_t>(config.local_n_heads * config.head_dim * 2),
+                           static_cast<size_t>(config.d_model)});
+    layer.wk = arena.fp32({static_cast<size_t>(config.local_n_kv_heads * config.head_dim),
+                           static_cast<size_t>(config.d_model)});
+    layer.wv = arena.fp32({static_cast<size_t>(config.local_n_kv_heads * config.head_dim),
+                           static_cast<size_t>(config.d_model)});
+    layer.wo = arena.rowParallelFP32({static_cast<size_t>(config.d_model),
+                                      static_cast<size_t>(config.local_n_heads * config.head_dim)});
+    layer.q_norm = arena.fp32({static_cast<size_t>(config.head_dim)});
+    layer.k_norm = arena.fp32({static_cast<size_t>(config.head_dim)});
+
+    constexpr int tokens = 2;
+    const int local_q_dim = config.local_n_heads * config.head_dim;
+    const int local_kv_dim = config.local_n_kv_heads * config.head_dim;
+    const int full_kv_dim = config.n_kv_heads * config.head_dim;
+
+    ActivationBuffers buffers;
+    buffers.current_hidden = arena.fp32({tokens, static_cast<size_t>(config.d_model)});
+    buffers.normalized = arena.fp32({tokens, static_cast<size_t>(config.d_model)});
+    buffers.Q = arena.fp32({tokens, static_cast<size_t>(local_q_dim)});
+    // Production phase-split arenas keep K/V storage wide enough for replicated
+    // decode.  The prefill handoff must still move only the TP-local prefix.
+    buffers.K = arena.fp32({tokens, static_cast<size_t>(full_kv_dim)});
+    buffers.V = arena.fp32({tokens, static_cast<size_t>(full_kv_dim)});
+    buffers.K_full_prefill = arena.fp32({tokens, static_cast<size_t>(full_kv_dim)});
+    buffers.V_full_prefill = arena.fp32({tokens, static_cast<size_t>(full_kv_dim)});
+    buffers.attn_output = arena.fp32({tokens, static_cast<size_t>(local_q_dim)});
+    buffers.attn_proj = arena.fp32({tokens, static_cast<size_t>(config.d_model)});
+    buffers.extensions[BufferId::FA_Q_RAW] =
+        arena.fp32({tokens, static_cast<size_t>(local_q_dim * 2)});
+    buffers.extensions[BufferId::FA_GATE] =
+        arena.fp32({tokens, static_cast<size_t>(local_q_dim)});
+
+    MockMPIContext mpi_ctx;
+    llaminar::v2::kernels::KVCacheConfig kv_config;
+    kv_config.precision = ActivationPrecision::FP16;
+    kv_config.device = DeviceId::cpu();
+    kv_config.num_layers = 1;
+    kv_config.batch_size = 1;
+    kv_config.max_seq_len = 8;
+    kv_config.n_kv_heads = config.n_kv_heads;
+    kv_config.head_dim = config.head_dim;
+    kv_config.mpi_ctx = &mpi_ctx;
+    auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+    ASSERT_NE(kv_cache, nullptr);
+    ASSERT_FALSE(kv_cache->is_sharded());
+
+    int position_ids[tokens] = {0, 1};
+    ComputeGraph graph = graph_builder.buildAttentionGraphForTokenCount(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/tokens,
+        /*batch_size=*/1,
+        kv_cache.get(),
+        position_ids,
+        DeviceId::cuda(0));
+
+    const auto *handoff_node = graph.getNode("layer0_tp_kv_state_allgather");
+    ASSERT_NE(handoff_node, nullptr)
+        << "Phase-split GPU prefill must gather TP-local K/V into full rows before seeding replicated decode cache";
+    const auto *handoff =
+        dynamic_cast<const TPKVCacheStateAllGatherStage *>(handoff_node->stage.get());
+    ASSERT_NE(handoff, nullptr);
+    EXPECT_EQ(handoff->getParams().local_K, buffers.K);
+    EXPECT_EQ(handoff->getParams().local_V, buffers.V);
+    EXPECT_EQ(handoff->getParams().full_K, buffers.K_full_prefill);
+    EXPECT_EQ(handoff->getParams().full_V, buffers.V_full_prefill);
+    EXPECT_EQ(handoff->getParams().local_kv_dim, local_kv_dim);
+    EXPECT_EQ(handoff->getParams().full_kv_dim, full_kv_dim);
+    EXPECT_EQ(handoff->getParams().local_k_stride, local_kv_dim)
+        << "Fused QKV writes packed local K rows even when phase-split storage is full-width";
+    EXPECT_EQ(handoff->getParams().local_v_stride, local_kv_dim)
+        << "Fused QKV writes packed local V rows even when phase-split storage is full-width";
+    EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_q_norm"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_tp_kv_state_allgather", "layer0_k_norm"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_rope", "layer0_tp_kv_state_allgather"))
+        << "Phase-split KV handoff stores pre-RoPE K, so RoPE must wait before mutating K in place.";
+
+    const auto *kv_append_node = graph.getNode("layer0_kv_append");
+    ASSERT_NE(kv_append_node, nullptr);
+    const auto *kv_append =
+        dynamic_cast<const KVCacheAppendStage *>(kv_append_node->stage.get());
+    ASSERT_NE(kv_append, nullptr);
+    EXPECT_EQ(kv_append->getParams().K, buffers.K_full_prefill);
+    EXPECT_EQ(kv_append->getParams().V, buffers.V_full_prefill);
+    EXPECT_TRUE(hasDependency(graph, "layer0_kv_append", "layer0_tp_kv_state_allgather"));
+
+    const auto *rope_node = graph.getNode("layer0_rope");
+    ASSERT_NE(rope_node, nullptr);
+    const auto *rope = dynamic_cast<const RoPEStage *>(rope_node->stage.get());
+    ASSERT_NE(rope, nullptr);
+    EXPECT_FALSE(rope->getParams().skip_k)
+        << "Local prefill attention still needs RoPE-applied K even though the decode cache stores pre-RoPE full K";
+
+    const auto *attention_node = graph.getNode("layer0_attention");
+    ASSERT_NE(attention_node, nullptr);
+    const auto *attention =
+        dynamic_cast<const AttentionComputeStage *>(attention_node->stage.get());
+    ASSERT_NE(attention, nullptr);
+    EXPECT_EQ(attention->getParams().K, buffers.K);
+    EXPECT_EQ(attention->getParams().V, buffers.V);
+    EXPECT_FALSE(attention->getParams().read_kv_from_cache);
+    EXPECT_FALSE(attention->getParams().apply_rope_to_k);
+    EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_kv_append"));
+    EXPECT_TRUE(hasDependency(graph, "layer0_attention", "layer0_rope"))
+        << "Local prefill attention must consume RoPE-applied Q/K after the cache handoff captured pre-RoPE K.";
+}
+
+TEST(Test__Qwen35MoEGraph, DirectAttentionDecodeGraphUsesPhaseSplitReplicatedAttentionPolicy)
+{
+    auto tp_ctx = std::make_unique<MockLocalTPContext>();
+    tp_ctx->setDevices({GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)});
+    tp_ctx->setBackend(CollectiveBackendType::NCCL);
+
+    GraphConfig config = makeMoEConfig(tp_ctx.get());
+    config.default_device = DeviceId::cuda(0);
+    config.n_layers = 1;
+    config.total_n_layers = 1;
+    config.layer_types = {"full_attention"};
+    config.dense_tp_enabled = true;
+    config.dense_tp_decode_replicated = true;
+    config.qkv_column_parallel = true;
+    config.local_n_heads = 1;
+    config.local_n_kv_heads = 1;
+    config.n_heads = 2;
+    config.n_kv_heads = 2;
+    config.head_dim = 2;
+    config.rope_on_read = true;
+
+    TestableQwen35MoEGraph graph_builder(config, nullptr);
+    graph_builder.setDecodeReplicatedDenseWeightBindings(makeDecodeDenseBindingSource());
+
+    TensorArena arena;
+    auto layer = makeFALayerWeights(arena, config);
+    auto buffers = makeFAActivationBuffers(arena, /*tokens=*/1, config);
+
+    MockMPIContext mpi_ctx;
+    llaminar::v2::kernels::KVCacheConfig kv_config;
+    kv_config.precision = ActivationPrecision::FP16;
+    kv_config.device = DeviceId::cpu();
+    kv_config.num_layers = 1;
+    kv_config.batch_size = 1;
+    kv_config.max_seq_len = 8;
+    kv_config.n_kv_heads = config.n_kv_heads;
+    kv_config.head_dim = config.head_dim;
+    kv_config.mpi_ctx = &mpi_ctx;
+    auto kv_cache = llaminar::v2::kernels::KernelFactory::createKVCache(kv_config);
+    ASSERT_NE(kv_cache, nullptr);
+
+    int position_ids[] = {3};
+    ComputeGraph graph = graph_builder.buildAttentionGraph(
+        layer,
+        buffers,
+        /*layer_idx=*/0,
+        /*seq_len=*/1,
+        /*batch_size=*/1,
+        kv_cache.get(),
+        position_ids,
+        DeviceId::cuda(0));
+
+    EXPECT_EQ(graph.getNode("layer0_tp_kv_state_allgather"), nullptr)
+        << "One-token decode must not use the prefill KV handoff.";
+    EXPECT_EQ(graph.getNode("layer0_wo_allreduce"), nullptr)
+        << "Phase-split replicated decode owns full attention output rows and must not allreduce Wo output.";
+
+    const auto *attention_node = graph.getNode("layer0_attention");
+    ASSERT_NE(attention_node, nullptr);
+    const auto *attention =
+        dynamic_cast<const AttentionComputeStage *>(attention_node->stage.get());
+    ASSERT_NE(attention, nullptr);
+    EXPECT_EQ(attention->getParams().n_heads, config.n_heads);
+    EXPECT_EQ(attention->getParams().n_kv_heads, config.n_kv_heads);
+    EXPECT_EQ(attention->getParams().head_start, config.head_start);
+    EXPECT_TRUE(attention->getParams().read_kv_from_cache);
+    EXPECT_TRUE(attention->getParams().apply_rope_to_k);
 }
 
 TEST(Test__Qwen35MoEGraph, PrefixFingerprintMaterialIncludesExpertOverlayTopology)

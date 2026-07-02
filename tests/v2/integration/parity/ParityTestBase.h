@@ -65,6 +65,10 @@
 #include <set>
 #include <string>
 #include <cctype>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
+#include <optional>
 
 // libfort for formatted table output
 #include "fort.hpp"
@@ -124,6 +128,62 @@ namespace llaminar2::test::parity
     // Configuration
     // =============================================================================
 
+    enum class ParityForwardPhase
+    {
+        Prefill,
+        Decode,
+    };
+
+    inline const char *parityForwardPhaseName(ParityForwardPhase phase)
+    {
+        switch (phase)
+        {
+        case ParityForwardPhase::Prefill:
+            return "prefill";
+        case ParityForwardPhase::Decode:
+            return "decode";
+        }
+        return "unknown";
+    }
+
+    /**
+     * @brief Graph/snapshot execution contract for parity forward calls.
+     *
+     * This is intentionally model-agnostic. GPU parity tests can opt into this
+     * contract to exercise the production graph path while still collecting
+     * snapshots through graph-stable copy storage. The base forwards through a
+     * small polymorphic API so future parity suites can reuse the same machinery
+     * instead of hand-rolling stage execution or snapshot publication.
+     */
+    struct ParityGraphSnapshotPolicy
+    {
+        bool enabled = false;
+        bool require_graph_execution_on_gpu = false;
+        bool require_snapshot_publication = true;
+        bool require_prefill_graph_capture_on_gpu = false;
+        bool retry_prefill_after_warmup_for_capture = true;
+        std::vector<std::string> prefill_snapshot_capture_filter;
+        std::vector<std::string> decode_snapshot_capture_filter;
+        std::vector<std::string> required_prefill_snapshot_keys;
+        std::vector<std::string> required_decode_snapshot_keys;
+
+        const std::vector<std::string> &snapshotCaptureFilter(
+            ParityForwardPhase phase) const
+        {
+            return phase == ParityForwardPhase::Prefill
+                       ? prefill_snapshot_capture_filter
+                       : decode_snapshot_capture_filter;
+        }
+
+        const std::vector<std::string> &requiredSnapshotKeys(
+            ParityForwardPhase phase) const
+        {
+            return phase == ParityForwardPhase::Prefill
+                       ? required_prefill_snapshot_keys
+                       : required_decode_snapshot_keys;
+        }
+    };
+
     /**
      * @brief Configuration for parity test thresholds
      *
@@ -165,6 +225,30 @@ namespace llaminar2::test::parity
         /// output, shared expert output) where each rank holds a partial contribution.
         /// Requires mpi_ctx_ to be set. Stages listed here should NOT also be excluded.
         std::vector<std::string> allreduce_stages;
+
+        /**
+         * @brief Declarative MoE rebalance/migration exercise policy.
+         *
+         * Parity tests that need to cover dynamic expert movement can opt in
+         * here without hand-writing maintenance calls in each fixture. For
+         * graph-owned device-side rebalance, maintenance is exercised by the
+         * decode forward itself. For OrchestrationRunner host-owned rebalance,
+         * the base calls maybeApplyMoERebalance() at declared boundaries.
+         */
+        struct MoERebalanceExercise
+        {
+            bool enabled = false;
+            bool require_device_side_controller = false;
+            bool request_after_prefill = false;
+            int request_every_decode_steps = 0;
+            int min_decode_steps = 0;
+            bool require_movement_epoch_advance = false;
+            uint64_t min_movement_epoch_delta = 1;
+        } moe_rebalance_exercise;
+
+        /// Optional execution contract used by GPU parity suites that must run
+        /// production graph replay/capture and collect snapshots from that path.
+        ParityGraphSnapshotPolicy graph_snapshot_policy;
     };
 
     // =============================================================================
@@ -649,6 +733,15 @@ namespace llaminar2::test::parity
 
         /// Decode steps override. 0 means use ParityConfig default (5).
         int decode_steps = 0;
+
+        /// Optional MoE rebalance/migration exercise policy for parity bodies
+        /// that use runPrefillParity()/runDecodeParity().
+        ParityConfig::MoERebalanceExercise moe_rebalance_exercise;
+
+        /// Optional graph execution/snapshot contract for parity bodies that
+        /// must exercise production graph capture/replay while collecting
+        /// snapshots from that path.
+        ParityGraphSnapshotPolicy graph_snapshot_policy;
 
         // Derived accessors
         size_t device_count() const { return devices.size(); }
@@ -1626,12 +1719,93 @@ namespace llaminar2::test::parity
             }
         }
 
+        struct SavedEnvValue
+        {
+            std::string name;
+            std::optional<std::string> previous;
+        };
+
         std::string snapshotCacheKey() const
         {
             return config_.snapshot_dir + "|" + config_.model_path;
         }
 
+        void setParityEnvOverride(const char *name, const std::string &value)
+        {
+            const auto already_saved = std::find_if(
+                parity_env_overrides_.begin(),
+                parity_env_overrides_.end(),
+                [name](const SavedEnvValue &entry)
+                {
+                    return entry.name == name;
+                });
+            if (already_saved == parity_env_overrides_.end())
+            {
+                const char *old_value = std::getenv(name);
+                parity_env_overrides_.push_back(
+                    SavedEnvValue{
+                        name,
+                        old_value ? std::optional<std::string>(old_value)
+                                  : std::nullopt});
+            }
+            setenv(name, value.c_str(), 1);
+        }
+
+        void restoreParityEnvOverrides()
+        {
+            for (auto it = parity_env_overrides_.rbegin();
+                 it != parity_env_overrides_.rend();
+                 ++it)
+            {
+                if (it->previous)
+                    setenv(it->name.c_str(), it->previous->c_str(), 1);
+                else
+                    unsetenv(it->name.c_str());
+            }
+            parity_env_overrides_.clear();
+            mutableDebugEnv().reload();
+        }
+
+        void configureGraphCaptureParityEnvironment()
+        {
+            const auto policy =
+                parityGraphSnapshotPolicy(ParityForwardPhase::Prefill);
+            if (!policy.enabled ||
+                !policy.require_prefill_graph_capture_on_gpu ||
+                config_.token_ids.empty())
+            {
+                return;
+            }
+
+            const DeviceId device = getDevice();
+            if (!device.is_gpu())
+                return;
+
+            const int token_count =
+                static_cast<int>(config_.token_ids.size());
+            const auto &exec = debugEnv().execution;
+            if (token_count >= exec.prefill_graph_min_seq)
+                return;
+
+            const std::string exact_len =
+                std::to_string(std::max(1, token_count));
+            setParityEnvOverride("LLAMINAR_PREFILL_GRAPH_MIN_SEQ", exact_len);
+            setParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
+            setParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", exact_len);
+            mutableDebugEnv().reload();
+
+            LOG_INFO("[Parity] GPU prefill graph snapshots require capture; "
+                     "using exact prefill graph bucket seq_len="
+                     << token_count << " for " << getBackendName());
+        }
+
     protected:
+        void setScopedParityEnvOverride(const char *name, const std::string &value)
+        {
+            setParityEnvOverride(name, value);
+            mutableDebugEnv().reload();
+        }
+
         /**
          * @brief Required snapshot version for compatibility.
          *
@@ -1674,6 +1848,8 @@ namespace llaminar2::test::parity
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
         std::unordered_map<std::string, std::vector<float>> pytorch_snapshots_;
+        mutable std::unordered_map<std::string, std::vector<float>> active_snapshot_combined_cache_;
+        std::vector<SavedEnvValue> parity_env_overrides_;
 
         // MPI context for tensor-parallel tests (optional, null for single-rank)
         std::shared_ptr<IMPIContext> mpi_ctx_;
@@ -1888,6 +2064,7 @@ namespace llaminar2::test::parity
             }
 
             resolveSnapshotDirIfNeeded();
+            configureGraphCaptureParityEnvironment();
 
             // Regenerate snapshots only on rank 0 to avoid race conditions
             // and redundant work. All ranks wait at barrier before proceeding.
@@ -2026,6 +2203,7 @@ namespace llaminar2::test::parity
 
             // Close log file at end of test
             Logger::getInstance().closeLogFile();
+            restoreParityEnvOverrides();
         }
 
         /**
@@ -3224,6 +3402,20 @@ namespace llaminar2::test::parity
             }
             else if (runner_)
             {
+                if (const auto *rank_orchestrator =
+                        dynamic_cast<const RankOrchestrator *>(runner_.get()))
+                {
+                    TPSnapshot tp_snapshot = rank_orchestrator->getTPSnapshot(key);
+                    size_t combined_size = 0;
+                    const float *combined = tp_snapshot.getCombinedData(combined_size);
+                    if (combined && combined_size > 0)
+                    {
+                        auto &cache = active_snapshot_combined_cache_[key];
+                        cache.assign(combined, combined + combined_size);
+                        out_size = cache.size();
+                        return cache.data();
+                    }
+                }
                 return runner_->getSnapshot(key, out_size);
             }
             out_size = 0;
@@ -3248,6 +3440,215 @@ namespace llaminar2::test::parity
             return {};
         }
 
+        static std::string trimParityEnvToken(const std::string &input)
+        {
+            size_t begin = 0;
+            while (begin < input.size() &&
+                   std::isspace(static_cast<unsigned char>(input[begin])))
+            {
+                ++begin;
+            }
+
+            size_t end = input.size();
+            while (end > begin &&
+                   std::isspace(static_cast<unsigned char>(input[end - 1])))
+            {
+                --end;
+            }
+
+            return input.substr(begin, end - begin);
+        }
+
+        static std::vector<std::string> readParityEnvList(const char *name)
+        {
+            std::vector<std::string> values;
+            const char *raw = std::getenv(name);
+            if (!raw || raw[0] == '\0')
+                return values;
+
+            std::stringstream ss(raw);
+            std::string token;
+            while (std::getline(ss, token, ','))
+            {
+                token = trimParityEnvToken(token);
+                if (!token.empty())
+                    values.push_back(token);
+            }
+            return values;
+        }
+
+        static std::set<int> readParityEnvStepSet(const char *name)
+        {
+            std::set<int> steps;
+            for (const std::string &token : readParityEnvList(name))
+            {
+                const size_t dash = token.find('-', token.front() == '-' ? 1 : 0);
+                if (dash != std::string::npos)
+                {
+                    const int begin = std::stoi(token.substr(0, dash));
+                    const int end = std::stoi(token.substr(dash + 1));
+                    const int lo = std::min(begin, end);
+                    const int hi = std::max(begin, end);
+                    for (int value = lo; value <= hi; ++value)
+                        steps.insert(value);
+                    continue;
+                }
+                steps.insert(std::stoi(token));
+            }
+            return steps;
+        }
+
+        static size_t readParityEnvSize(const char *name, size_t default_value)
+        {
+            const char *raw = std::getenv(name);
+            if (!raw || raw[0] == '\0')
+                return default_value;
+
+            char *end = nullptr;
+            const unsigned long long value = std::strtoull(raw, &end, 10);
+            if (end == raw)
+                return default_value;
+            return static_cast<size_t>(value);
+        }
+
+        static bool paritySnapshotKeyMatches(
+            const std::string &key,
+            const std::vector<std::string> &filters)
+        {
+            if (filters.empty())
+                return false;
+
+            return std::any_of(
+                filters.begin(),
+                filters.end(),
+                [&key](const std::string &filter)
+                {
+                    return key.find(filter) != std::string::npos;
+                });
+        }
+
+        static std::string csvEscape(const std::string &value)
+        {
+            const bool needs_quotes =
+                value.find_first_of(",\"\n\r") != std::string::npos;
+            if (!needs_quotes)
+                return value;
+
+            std::string escaped;
+            escaped.reserve(value.size() + 2);
+            escaped.push_back('"');
+            for (char c : value)
+            {
+                if (c == '"')
+                    escaped.push_back('"');
+                escaped.push_back(c);
+            }
+            escaped.push_back('"');
+            return escaped;
+        }
+
+        void exportActiveSnapshotsForParityDiagnostics(
+            ParityForwardPhase phase,
+            int decode_step)
+        {
+            if (!isRank0())
+                return;
+
+            const auto filters =
+                readParityEnvList("LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS");
+            if (filters.empty())
+                return;
+
+            if (phase == ParityForwardPhase::Decode)
+            {
+                const auto allowed_steps =
+                    readParityEnvStepSet("LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS");
+                if (!allowed_steps.empty() &&
+                    allowed_steps.count(decode_step) == 0)
+                {
+                    return;
+                }
+            }
+
+            const size_t max_elements =
+                readParityEnvSize("LLAMINAR_PARITY_EXPORT_SNAPSHOT_MAX_ELEMENTS", 0);
+
+            auto out_dir = ensureResultsDir() / "llaminar_snapshots";
+            std::error_code ec;
+            std::filesystem::create_directories(out_dir, ec);
+            if (ec)
+            {
+                LOG_WARN("[Parity Snapshot Export] Failed to create " << out_dir
+                                                                      << ": " << ec.message());
+                return;
+            }
+
+            auto manifest_path = out_dir / "manifest.csv";
+            ec.clear();
+            const bool manifest_exists = std::filesystem::exists(manifest_path, ec);
+            ec.clear();
+            const bool write_header =
+                !manifest_exists ||
+                std::filesystem::file_size(manifest_path, ec) == 0;
+            std::ofstream manifest(manifest_path, std::ios::app);
+            if (!manifest.is_open())
+            {
+                LOG_WARN("[Parity Snapshot Export] Cannot write " << manifest_path);
+                return;
+            }
+            if (write_header)
+            {
+                manifest << "backend,phase,step,key,elements,exported_elements,file\n";
+            }
+
+            const std::string phase_name = parityForwardPhaseName(phase);
+            const std::string step_name =
+                (phase == ParityForwardPhase::Decode)
+                    ? ("step" + std::to_string(decode_step))
+                    : "prefill";
+
+            for (const auto &key : activeSnapshotKeys())
+            {
+                if (!paritySnapshotKeyMatches(key, filters))
+                    continue;
+
+                size_t elements = 0;
+                const float *data = activeSnapshot(key, elements);
+                if (!data || elements == 0)
+                    continue;
+
+                const size_t exported_elements =
+                    (max_elements > 0) ? std::min(elements, max_elements) : elements;
+                const std::string safe_key = sanitizeSnapshotToken(key);
+                auto file_path = out_dir /
+                                 (phase_name + "_" + step_name + "_" + safe_key + ".f32");
+
+                std::ofstream out(file_path, std::ios::binary);
+                if (!out.is_open())
+                {
+                    LOG_WARN("[Parity Snapshot Export] Cannot write " << file_path);
+                    continue;
+                }
+
+                out.write(
+                    reinterpret_cast<const char *>(data),
+                    static_cast<std::streamsize>(exported_elements * sizeof(float)));
+                if (!out.good())
+                {
+                    LOG_WARN("[Parity Snapshot Export] Failed while writing " << file_path);
+                    continue;
+                }
+
+                manifest << csvEscape(getBackendName()) << ","
+                         << phase_name << ","
+                         << decode_step << ","
+                         << csvEscape(key) << ","
+                         << elements << ","
+                         << exported_elements << ","
+                         << csvEscape(file_path.string()) << "\n";
+            }
+        }
+
         /**
          * @brief Clear KV cache on whichever runner is active
          */
@@ -3268,6 +3669,7 @@ namespace llaminar2::test::parity
          */
         void activeClearSnapshots()
         {
+            active_snapshot_combined_cache_.clear();
             if (orch_runner_)
             {
                 orch_runner_->clearSnapshots();
@@ -3276,6 +3678,357 @@ namespace llaminar2::test::parity
             {
                 runner_->clearSnapshots();
             }
+        }
+
+        void activeSetSnapshotCaptureFilter(const std::vector<std::string> &keys)
+        {
+            if (orch_runner_)
+            {
+                orch_runner_->setSnapshotCaptureFilter(keys);
+            }
+            else if (runner_)
+            {
+                runner_->setSnapshotCaptureFilter(keys);
+            }
+        }
+
+        PrefixRuntimeStateSnapshot activePrefixStateProbe() const
+        {
+            if (orch_runner_)
+                return orch_runner_->prefixStateProbe();
+            if (runner_)
+                return runner_->prefixStateProbe();
+            return {};
+        }
+
+        DeviceId activePrimaryDevice() const
+        {
+            if (orch_runner_)
+                return orch_runner_->primaryDeviceId();
+            if (runner_)
+                return runner_->primaryDeviceId();
+            return DeviceId::invalid();
+        }
+
+        ExecutionPath activeExecutionPath() const
+        {
+            if (runner_)
+                return runner_->executionPath();
+            return ExecutionPath::GRAPH;
+        }
+
+        virtual ParityGraphSnapshotPolicy parityGraphSnapshotPolicy(
+            ParityForwardPhase phase) const
+        {
+            (void)phase;
+            return config_.graph_snapshot_policy;
+        }
+
+        virtual int parityGraphCaptureMinimumPrefillTokens() const
+        {
+            return std::max(1, debugEnv().execution.prefill_graph_min_seq);
+        }
+
+        std::vector<int> makeGraphCaptureEligiblePrefillTokens(
+            const std::vector<int> &seed_tokens,
+            int max_seq_len = 0) const
+        {
+            if (seed_tokens.empty())
+            {
+                throw std::invalid_argument(
+                    "cannot build graph-capture parity prefill input from empty token list");
+            }
+
+            const int required_tokens = parityGraphCaptureMinimumPrefillTokens();
+            if (max_seq_len > 0 && max_seq_len < required_tokens)
+            {
+                throw std::invalid_argument(
+                    "parity graph-capture prefill input requires at least " +
+                    std::to_string(required_tokens) +
+                    " tokens, but max_seq_len is " +
+                    std::to_string(max_seq_len));
+            }
+
+            const size_t required =
+                static_cast<size_t>(required_tokens);
+            const size_t max_allowed =
+                max_seq_len > 0
+                    ? static_cast<size_t>(max_seq_len)
+                    : std::numeric_limits<size_t>::max();
+            const size_t target =
+                std::min(std::max(seed_tokens.size(), required), max_allowed);
+
+            std::vector<int> tokens;
+            tokens.reserve(target);
+            while (tokens.size() < target)
+            {
+                const size_t remaining = target - tokens.size();
+                const size_t take = std::min(remaining, seed_tokens.size());
+                tokens.insert(
+                    tokens.end(),
+                    seed_tokens.begin(),
+                    seed_tokens.begin() + static_cast<std::ptrdiff_t>(take));
+            }
+            return tokens;
+        }
+
+        virtual bool executeActiveParityForward(
+            ParityForwardPhase phase,
+            const int *tokens,
+            int token_count)
+        {
+            if (orch_runner_)
+            {
+                if (phase == ParityForwardPhase::Prefill)
+                {
+                    std::vector<int32_t> input;
+                    input.reserve(static_cast<size_t>(std::max(token_count, 0)));
+                    for (int i = 0; i < token_count; ++i)
+                        input.push_back(static_cast<int32_t>(tokens[i]));
+                    if (!orch_runner_->prefill(input))
+                    {
+                        LOG_ERROR("[Parity] OrchestrationRunner prefill failed: "
+                                  << orch_runner_->lastError());
+                        return false;
+                    }
+                    return true;
+                }
+
+                LOG_ERROR("[Parity] OrchestrationRunner decode parity execution "
+                          "requires a test-specific executeActiveParityForward() override");
+                return false;
+            }
+
+            if (runner_)
+            {
+                return runner_->forward(tokens, token_count);
+            }
+
+            LOG_ERROR("[Parity] No runner available for "
+                      << parityForwardPhaseName(phase)
+                      << " parity forward");
+            return false;
+        }
+
+        bool parityPrefillGraphCapturedOrReplayed(
+            const PrefixRuntimeStateSnapshot &snapshot) const
+        {
+            return std::any_of(
+                snapshot.prefill_graphs.begin(),
+                snapshot.prefill_graphs.end(),
+                [](const PrefillGraphRuntimeProbe &probe)
+                {
+                    return probe.capture_phase == "capture" ||
+                           probe.capture_phase == "replay";
+                });
+        }
+
+        bool parityPrefillGraphWarmedOnly(
+            const PrefixRuntimeStateSnapshot &snapshot) const
+        {
+            return !snapshot.prefill_graphs.empty() &&
+                   std::all_of(
+                       snapshot.prefill_graphs.begin(),
+                       snapshot.prefill_graphs.end(),
+                       [](const PrefillGraphRuntimeProbe &probe)
+                       {
+                           return probe.capture_phase == "warmup" ||
+                                  probe.capture_phase == "unknown";
+                       });
+        }
+
+        bool validateParityGraphSnapshots(
+            ParityForwardPhase phase,
+            const ParityGraphSnapshotPolicy &policy) const
+        {
+            if (!policy.enabled)
+                return true;
+
+            const DeviceId device = activePrimaryDevice();
+            const bool gpu_runner = device.is_gpu();
+
+            if (gpu_runner &&
+                policy.require_graph_execution_on_gpu &&
+                activeExecutionPath() != ExecutionPath::GRAPH)
+            {
+                ADD_FAILURE() << "GPU parity " << parityForwardPhaseName(phase)
+                              << " must use graph execution";
+                return false;
+            }
+
+            if (gpu_runner &&
+                phase == ParityForwardPhase::Prefill &&
+                policy.require_prefill_graph_capture_on_gpu)
+            {
+                const auto probe = activePrefixStateProbe();
+                if (!parityPrefillGraphCapturedOrReplayed(probe))
+                {
+                    std::ostringstream phases;
+                    for (const auto &entry : probe.prefill_graphs)
+                    {
+                        if (phases.tellp() > 0)
+                            phases << ',';
+                        phases << entry.capture_phase;
+                    }
+                    ADD_FAILURE() << "GPU parity prefill required graph capture/replay, "
+                                  << "but observed phases ["
+                                  << (phases.str().empty() ? "none" : phases.str())
+                                  << "]";
+                    return false;
+                }
+            }
+
+            if (policy.require_snapshot_publication)
+            {
+                const auto keys = activeSnapshotKeys();
+                if (keys.empty())
+                {
+                    ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
+                                  << " produced no snapshots";
+                    return false;
+                }
+
+                for (const auto &key : policy.requiredSnapshotKeys(phase))
+                {
+                    if (std::find(keys.begin(), keys.end(), key) == keys.end())
+                    {
+                        ADD_FAILURE() << "Parity " << parityForwardPhaseName(phase)
+                                      << " missing required snapshot '" << key << "'";
+                        return false;
+                    }
+                }
+            }
+
+            return true;
+        }
+
+        bool runParityForwardWithPolicy(
+            ParityForwardPhase phase,
+            const int *tokens,
+            int token_count,
+            const ParityGraphSnapshotPolicy &policy)
+        {
+            if (policy.enabled)
+            {
+                activeSetSnapshotCaptureFilter(policy.snapshotCaptureFilter(phase));
+            }
+            else
+            {
+                activeSetSnapshotCaptureFilter({});
+            }
+            if (!executeActiveParityForward(phase, tokens, token_count))
+                return false;
+
+            if (policy.enabled &&
+                phase == ParityForwardPhase::Prefill &&
+                activePrimaryDevice().is_gpu() &&
+                policy.require_prefill_graph_capture_on_gpu &&
+                policy.retry_prefill_after_warmup_for_capture &&
+                parityPrefillGraphWarmedOnly(activePrefixStateProbe()))
+            {
+                activeClearCache();
+                activeClearSnapshots();
+                if (!executeActiveParityForward(phase, tokens, token_count))
+                    return false;
+            }
+
+            return validateParityGraphSnapshots(phase, policy);
+        }
+
+        bool runParityForward(
+            ParityForwardPhase phase,
+            const int *tokens,
+            int token_count)
+        {
+            return runParityForwardWithPolicy(
+                phase,
+                tokens,
+                token_count,
+                parityGraphSnapshotPolicy(phase));
+        }
+
+        bool activeUsesDeviceSideMoERebalanceController() const
+        {
+            if (orch_runner_)
+                return orch_runner_->usesDeviceSideMoERebalanceController();
+            if (runner_)
+                return runner_->usesDeviceSideMoERebalanceController();
+            return false;
+        }
+
+        uint64_t activeMoEPlacementEpoch() const
+        {
+            if (runner_)
+                return runner_->moePlacementEpoch();
+            return 0;
+        }
+
+        uint64_t activeMoERuntimeMovementEpoch() const
+        {
+            if (orch_runner_)
+                return orch_runner_->moeRuntimeMovementEpoch();
+            if (runner_)
+                return runner_->moeRuntimeMovementEpoch();
+            return 0;
+        }
+
+        bool driveParityMoERebalanceMaintenance(
+            const std::string &phase,
+            int decode_step = -1)
+        {
+            const auto &exercise = config_.moe_rebalance_exercise;
+            if (!exercise.enabled)
+                return true;
+
+            const bool device_side = activeUsesDeviceSideMoERebalanceController();
+            if (exercise.require_device_side_controller && !device_side)
+            {
+                ADD_FAILURE() << "Parity MoE rebalance exercise requires a device-side controller"
+                              << " during " << phase
+                              << (decode_step >= 0 ? (" step " + std::to_string(decode_step)) : "");
+                return false;
+            }
+
+            /*
+             * Device-side rebalance is graph-owned. Each decode forward runs
+             * histogram collection plus any scheduled maintenance; there is no
+             * host apply call to make here.
+             */
+            if (device_side)
+                return true;
+
+            if (orch_runner_)
+            {
+                if (!orch_runner_->maybeApplyMoERebalance())
+                {
+                    ADD_FAILURE() << "Parity MoE rebalance maintenance failed during "
+                                  << phase
+                                  << (decode_step >= 0 ? (" step " + std::to_string(decode_step)) : "")
+                                  << ": " << orch_runner_->lastError();
+                    return false;
+                }
+                return true;
+            }
+
+            ADD_FAILURE() << "Parity MoE rebalance exercise requested during " << phase
+                          << (decode_step >= 0 ? (" step " + std::to_string(decode_step)) : "")
+                          << ", but the active legacy runner does not expose a host rebalance apply hook";
+            return false;
+        }
+
+        void assertParityMoERebalanceExercise(
+            uint64_t initial_movement_epoch,
+            uint64_t final_movement_epoch) const
+        {
+            const auto &exercise = config_.moe_rebalance_exercise;
+            if (!exercise.enabled || !exercise.require_movement_epoch_advance)
+                return;
+
+            ASSERT_GE(final_movement_epoch, initial_movement_epoch)
+                << "MoE runtime movement epoch regressed during parity rebalance exercise";
+            EXPECT_GE(final_movement_epoch - initial_movement_epoch,
+                      exercise.min_movement_epoch_delta)
+                << "Parity rebalance exercise did not observe the requested MoE runtime movement epoch advance";
         }
 
         /**
@@ -3460,10 +4213,19 @@ namespace llaminar2::test::parity
             }
 
             // Run prefill
-            bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());
+            bool success = runParityForward(
+                ParityForwardPhase::Prefill,
+                config_.token_ids.data(),
+                static_cast<int>(config_.token_ids.size()));
             EXPECT_TRUE(success) << "Prefill forward pass failed";
             if (!success)
                 return summary;
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
+            if (config_.moe_rebalance_exercise.request_after_prefill &&
+                !driveParityMoERebalanceMaintenance("prefill"))
+            {
+                return summary;
+            }
 
             int n_layers = parityLayerCount();
 
@@ -3485,7 +4247,7 @@ namespace llaminar2::test::parity
                 "MOE_ROUTER_OUTPUT", "MOE_ROUTING_INDICES", "MOE_ROUTING_WEIGHTS",
                 "MOE_EXPERT_OUTPUT", "MOE_SHARED_EXPERT_OUTPUT", "MOE_SHARED_GATE_OUTPUT", "MOE_COMBINED_OUTPUT",
                 "FFN_RESIDUAL"};
-            auto snapshot_keys = runner_->getSnapshotKeys();
+            auto snapshot_keys = activeSnapshotKeys();
             std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
 
             // Compare embedding
@@ -3493,7 +4255,7 @@ namespace llaminar2::test::parity
             if (available_snapshots.count("EMBEDDING"))
             {
                 size_t llaminar_size;
-                const float *llaminar_data = runner_->getSnapshot("EMBEDDING", llaminar_size);
+                const float *llaminar_data = activeSnapshot("EMBEDDING", llaminar_size);
 
                 // Debug sizes and first values (rank 0 only)
                 if (isRank0())
@@ -3582,7 +4344,7 @@ namespace llaminar2::test::parity
                         continue;
 
                     size_t llaminar_size;
-                    const float *llaminar_data = runner_->getSnapshot(llaminar_key, llaminar_size);
+                    const float *llaminar_data = activeSnapshot(llaminar_key, llaminar_size);
                     if (!llaminar_data)
                         continue;
 
@@ -3611,7 +4373,7 @@ namespace llaminar2::test::parity
                     {
                         std::string idx_key = "layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
                         size_t ll_idx_size;
-                        const float *ll_idx = runner_->getSnapshot(idx_key, ll_idx_size);
+                        const float *ll_idx = activeSnapshot(idx_key, ll_idx_size);
                         auto pt_idx = loadPyTorchSnapshot(idx_key);
                         if (ll_idx && !pt_idx.empty())
                             result = compareRoutingWeights(compare_data, pytorch_data, ll_idx, pt_idx,
@@ -3743,7 +4505,7 @@ namespace llaminar2::test::parity
             if (available_snapshots.count("LM_HEAD") && !pytorch_lm_head.empty())
             {
                 size_t llaminar_size;
-                const float *llaminar_data = runner_->getSnapshot("LM_HEAD", llaminar_size);
+                const float *llaminar_data = activeSnapshot("LM_HEAD", llaminar_size);
                 if (llaminar_data)
                 {
                     size_t vocab_size = model_ctx_->model().vocab_size;
@@ -3873,11 +4635,15 @@ namespace llaminar2::test::parity
 
             // Run prefill
             LOG_INFO("[TP Parity] Calling forward() with " << config_.token_ids.size() << " tokens...");
-            bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());
+            bool success = runParityForward(
+                ParityForwardPhase::Prefill,
+                config_.token_ids.data(),
+                static_cast<int>(config_.token_ids.size()));
             LOG_INFO("[TP Parity] forward() returned: " << (success ? "SUCCESS" : "FAILURE"));
             EXPECT_TRUE(success) << "Prefill forward pass failed";
             if (!success)
                 return summary;
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
 
             int n_layers = parityLayerCount();
             size_t seq_len = config_.token_ids.size();
@@ -3910,7 +4676,7 @@ namespace llaminar2::test::parity
                 {"FFN_RESIDUAL", d_model}};
 
             // Get snapshot keys
-            auto snapshot_keys = runner_->getSnapshotKeys();
+            auto snapshot_keys = activeSnapshotKeys();
             std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
             LOG_INFO("[TP Parity] Got " << snapshot_keys.size() << " snapshot keys after forward()");
             if (snapshot_keys.size() < 50)
@@ -4240,17 +5006,38 @@ namespace llaminar2::test::parity
             }
 
             // Run prefill first (required to initialize KV cache)
-            bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());
+            bool success = runParityForward(
+                ParityForwardPhase::Prefill,
+                config_.token_ids.data(),
+                static_cast<int>(config_.token_ids.size()));
             EXPECT_TRUE(success) << "Prefill failed";
             if (!success)
                 return summary;
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
+            const uint64_t initial_moe_movement_epoch = activeMoERuntimeMovementEpoch();
+            if (config_.moe_rebalance_exercise.request_after_prefill &&
+                !driveParityMoERebalanceMaintenance("prefill"))
+            {
+                return summary;
+            }
 
             size_t vocab_size = model_ctx_->model().vocab_size;
 
             // Process each decode step
             size_t num_decode_steps = std::min(pytorch_decode_tokens.size(),
                                                static_cast<size_t>(config_.decode_steps));
-
+            if (config_.moe_rebalance_exercise.enabled &&
+                config_.moe_rebalance_exercise.min_decode_steps > 0)
+            {
+                EXPECT_GE(num_decode_steps,
+                          static_cast<size_t>(config_.moe_rebalance_exercise.min_decode_steps))
+                    << "Parity MoE rebalance exercise needs more decode snapshots/tokens";
+                if (num_decode_steps <
+                    static_cast<size_t>(config_.moe_rebalance_exercise.min_decode_steps))
+                {
+                    return summary;
+                }
+            }
             float sum_cosine = 0.0f;
             float sum_kl = 0.0f;
 
@@ -4271,17 +5058,33 @@ namespace llaminar2::test::parity
                 int current_token = pytorch_decode_tokens[step];
 
                 // Clear snapshots from previous step
-                runner_->clearSnapshots();
+                activeClearSnapshots();
 
                 // Run single-token decode
                 std::vector<int> decode_token = {current_token};
-                success = runner_->forward(decode_token.data(), 1);
+                success = runParityForward(
+                    ParityForwardPhase::Decode,
+                    decode_token.data(),
+                    1);
                 EXPECT_TRUE(success) << "Decode step " << step << " failed";
                 if (!success)
                     continue;
+                exportActiveSnapshotsForParityDiagnostics(
+                    ParityForwardPhase::Decode,
+                    static_cast<int>(step));
+                if (config_.moe_rebalance_exercise.enabled &&
+                    config_.moe_rebalance_exercise.request_every_decode_steps > 0 &&
+                    ((step + 1) % static_cast<size_t>(
+                                      config_.moe_rebalance_exercise.request_every_decode_steps)) == 0 &&
+                    !driveParityMoERebalanceMaintenance(
+                        "decode",
+                        static_cast<int>(step)))
+                {
+                    continue;
+                }
 
                 // Get Llaminar's logits (RankOrchestrator gathers from all devices)
-                const float *llaminar_logits = runner_->logits();
+                const float *llaminar_logits = getActiveLogits();
                 if (!llaminar_logits)
                 {
                     LOG_WARN("No logits for decode step " << step);
@@ -4398,6 +5201,10 @@ namespace llaminar2::test::parity
                                      (summary.top5_accuracy >= config_.min_top5_accuracy) &&
                                      (summary.avg_cosine >= config_.decode_cosine_threshold) &&
                                      topk_gate;
+
+            assertParityMoERebalanceExercise(
+                initial_moe_movement_epoch,
+                activeMoERuntimeMovementEpoch());
 
             return summary;
         }
@@ -4620,16 +5427,38 @@ namespace llaminar2::test::parity
             }
 
             // Run prefill first (required to initialize KV cache)
-            bool success = runner_->forward(config_.token_ids.data(), config_.token_ids.size());
+            bool success = runParityForward(
+                ParityForwardPhase::Prefill,
+                config_.token_ids.data(),
+                static_cast<int>(config_.token_ids.size()));
             EXPECT_TRUE(success) << "Prefill failed";
             if (!success)
                 return summary;
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
+            const uint64_t initial_moe_movement_epoch = activeMoERuntimeMovementEpoch();
+            if (config_.moe_rebalance_exercise.request_after_prefill &&
+                !driveParityMoERebalanceMaintenance("prefill"))
+            {
+                return summary;
+            }
 
             size_t vocab_size = model_ctx_->model().vocab_size;
 
             // Process each decode step
             size_t num_decode_steps = std::min(pytorch_decode_tokens.size(),
                                                static_cast<size_t>(config_.decode_steps));
+            if (config_.moe_rebalance_exercise.enabled &&
+                config_.moe_rebalance_exercise.min_decode_steps > 0)
+            {
+                EXPECT_GE(num_decode_steps,
+                          static_cast<size_t>(config_.moe_rebalance_exercise.min_decode_steps))
+                    << "Parity MoE rebalance exercise needs more decode snapshots/tokens";
+                if (num_decode_steps <
+                    static_cast<size_t>(config_.moe_rebalance_exercise.min_decode_steps))
+                {
+                    return summary;
+                }
+            }
 
             float sum_cosine = 0.0f;
             float sum_kl = 0.0f;
@@ -4651,18 +5480,34 @@ namespace llaminar2::test::parity
                 int current_token = pytorch_decode_tokens[step];
 
                 // Clear snapshots from previous step
-                runner_->clearSnapshots();
+                activeClearSnapshots();
 
                 // Run single-token decode
                 std::vector<int> decode_token = {current_token};
-                success = runner_->forward(decode_token.data(), 1);
+                success = runParityForward(
+                    ParityForwardPhase::Decode,
+                    decode_token.data(),
+                    1);
                 EXPECT_TRUE(success) << "Decode step " << step << " failed";
                 if (!success)
                     continue;
+                exportActiveSnapshotsForParityDiagnostics(
+                    ParityForwardPhase::Decode,
+                    static_cast<int>(step));
+                if (config_.moe_rebalance_exercise.enabled &&
+                    config_.moe_rebalance_exercise.request_every_decode_steps > 0 &&
+                    ((step + 1) % static_cast<size_t>(
+                                      config_.moe_rebalance_exercise.request_every_decode_steps)) == 0 &&
+                    !driveParityMoERebalanceMaintenance(
+                        "decode",
+                        static_cast<int>(step)))
+                {
+                    continue;
+                }
 
                 // Get Llaminar's LM_HEAD output
                 size_t decode_logits_size;
-                const float *llaminar_logits = runner_->getSnapshot("LM_HEAD", decode_logits_size);
+                const float *llaminar_logits = activeSnapshot("LM_HEAD", decode_logits_size);
                 if (!llaminar_logits)
                 {
                     LOG_WARN("No LM_HEAD snapshot for decode step " << step);
@@ -4691,7 +5536,7 @@ namespace llaminar2::test::parity
                 // ---------------------------------------------------------------
                 {
                     int n_layers = parityLayerCount();
-                    auto snapshot_keys = runner_->getSnapshotKeys();
+                    auto snapshot_keys = activeSnapshotKeys();
                     std::set<std::string> available_snapshots(snapshot_keys.begin(), snapshot_keys.end());
                     const auto gdn_cfg_decode = getGDNHeadConfig();
                     const auto moe_cfg_decode = getMoEConfig();
@@ -4741,7 +5586,7 @@ namespace llaminar2::test::parity
                                 continue;
 
                             size_t llaminar_size;
-                            const float *llaminar_data = runner_->getSnapshot(llaminar_key, llaminar_size);
+                            const float *llaminar_data = activeSnapshot(llaminar_key, llaminar_size);
                             if (!llaminar_data)
                                 continue;
 
@@ -4786,10 +5631,11 @@ namespace llaminar2::test::parity
                             }
                             else if (stage == "MOE_ROUTING_WEIGHTS")
                             {
-                                std::string idx_key = "decode_step" + std::to_string(step) + "_layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
+                                std::string ll_idx_key = "layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
+                                std::string pt_idx_key = "decode_step" + std::to_string(step) + "_layer" + std::to_string(layer_idx) + "_MOE_ROUTING_INDICES";
                                 size_t ll_idx_size;
-                                const float *ll_idx = runner_->getSnapshot(idx_key, ll_idx_size);
-                                auto pt_idx = loadPyTorchSnapshot(idx_key);
+                                const float *ll_idx = activeSnapshot(ll_idx_key, ll_idx_size);
+                                auto pt_idx = loadPyTorchSnapshot(pt_idx_key);
                                 if (ll_idx && !pt_idx.empty())
                                     result = compareRoutingWeights(decode_compare, pytorch_data, ll_idx, pt_idx,
                                                                    llaminar_size, moe_cfg_decode.top_k,
@@ -4949,6 +5795,10 @@ namespace llaminar2::test::parity
                                      (summary.top5_accuracy >= config_.min_top5_accuracy) &&
                                      (summary.avg_cosine >= config_.decode_cosine_threshold) &&
                                      topk_gate;
+
+            assertParityMoERebalanceExercise(
+                initial_moe_movement_epoch,
+                activeMoERuntimeMovementEpoch());
 
             return summary;
         }

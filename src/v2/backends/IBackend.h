@@ -1984,7 +1984,8 @@ namespace llaminar2
         /**
          * @brief Synchronize a specific stream (wait for all queued work to complete)
          *
-         * @param stream Opaque stream handle (nullptr = default stream)
+         * @param stream Opaque stream handle. GPU backends require an explicit,
+         * non-null stream; CPU backends may ignore it.
          * @param device_id GPU device ID (0-based)
          * @return true on success, false on error
          *

@@ -20,6 +20,7 @@
 #include "../../collective/ILocalTPContext.h"
 #include "../../memory/BufferId.h"
 #include <stdexcept>
+#include <vector>
 
 namespace llaminar2
 {
@@ -94,6 +95,7 @@ namespace llaminar2
         ComputeGraph graph;
         std::string prefix = "layer" + std::to_string(layer_idx) + "_";
         int total_tokens = batch_size * seq_len;
+        DecodeReplicatedDenseScope decode_dense_scope(*this, total_tokens);
         LayerWeightBindings layer_bindings = layerWeightBindingsForGraph(layer_idx);
 
         LOG_DEBUG("[buildAttentionGraph] layer_idx=" << layer_idx << " seq_len=" << seq_len
@@ -173,12 +175,25 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
+        const bool phase_split_prefill_kv_handoff =
+            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+        std::vector<std::string> cache_source_dependencies;
+        if (has_qk_norms)
+        {
+            cache_source_dependencies.push_back(prefix + "q_norm");
+            cache_source_dependencies.push_back(prefix + "k_norm");
+        }
+        else if (has_qkv_proj)
+        {
+            cache_source_dependencies.push_back(prefix + "qkv_proj");
+        }
 
         // Stage 3: RoPE on Q and K
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device,
+            phase_split_prefill_kv_handoff);
 
         // Wire RoPE dependencies
         if (has_qk_norms)
@@ -195,7 +210,8 @@ namespace llaminar2
         std::string attn_node = addKVCacheAndAttention(
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
-            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node);
+            kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node,
+            cache_source_dependencies);
 
         // Stage 5: Wo projection + optional TP allreduce
         std::string terminal = addWoProjectionAndAllreduce(

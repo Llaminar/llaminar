@@ -56,6 +56,9 @@ namespace llaminar2
         const std::string &node_name,
         const StageDumpInfo &dump_info)>;
 
+    using StageSnapshotFilter = std::function<bool(
+        const std::string &node_name)>;
+
     using StageFailureCallback = std::function<void(
         const std::string &node_name,
         const std::string &reason)>;
@@ -74,6 +77,9 @@ namespace llaminar2
 
         /// Callback invoked after each stage executes (for snapshot capture)
         StageSnapshotCallback snapshot_callback = nullptr;
+
+        /// Optional stage-level filter for snapshot capture. Empty means all stages.
+        StageSnapshotFilter snapshot_stage_filter = nullptr;
 
         /// Callback invoked immediately when a stage fails. TP runners use this
         /// to abort shared collective contexts before sibling workers enter the

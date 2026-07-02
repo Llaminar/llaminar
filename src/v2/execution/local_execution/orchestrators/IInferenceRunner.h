@@ -2917,6 +2917,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Restrict snapshot capture to a set of published snapshot keys.
+         *
+         * Empty means capture every instrumented stage, preserving the legacy
+         * snapshot-infrastructure behavior. Graph-captured parity tests use this
+         * to avoid allocating point-in-time device copies for irrelevant stages.
+         */
+        virtual void setSnapshotCaptureFilter(const std::vector<std::string> &keys)
+        {
+            (void)keys;
+        }
+
+        /**
          * @brief Disable snapshot capture and clear stored snapshots
          */
         virtual void disableSnapshotCapture() {}
@@ -3128,6 +3140,17 @@ namespace llaminar2
          * ownership, masks, replicas, or runtime-table placement changes.
          */
         virtual uint64_t moePlacementEpoch() const { return 0; }
+
+        /**
+         * @brief Domain-local MoE runtime movement epoch.
+         *
+         * This is the observable "expert placement data changed" epoch. For
+         * CPU/host-applied rebalancing it normally matches moePlacementEpoch().
+         * Graph-stable GPU rebalancing keeps moePlacementEpoch() out of graph
+         * cache keys and increments this value when device-side runtime tables
+         * or transfer-slot backed residency state are updated.
+         */
+        virtual uint64_t moeRuntimeMovementEpoch() const { return moePlacementEpoch(); }
 
         /**
          * @brief Enumerate MoE rebalance controllers owned by this runner.

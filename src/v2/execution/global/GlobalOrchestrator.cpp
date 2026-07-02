@@ -622,6 +622,20 @@ namespace llaminar2
         return epoch;
     }
 
+    uint64_t StageRunnerRegistry::moeRuntimeMovementEpochAll() const
+    {
+        uint64_t epoch = 0;
+        for (const auto &entry : entries_)
+        {
+            epoch = std::max(epoch, entry.runner->moeRuntimeMovementEpoch());
+        }
+        if (compatibility_runner_)
+        {
+            epoch = std::max(epoch, compatibility_runner_->moeRuntimeMovementEpoch());
+        }
+        return epoch;
+    }
+
     PrefixStateSnapshot StageRunnerRegistry::captureLivePrefixStateAll(int seq_idx) const
     {
         PrefixStateSnapshot aggregate;
@@ -1489,6 +1503,11 @@ namespace llaminar2
     uint64_t GlobalOrchestrator::moePlacementEpoch() const
     {
         return stage_runners_.moePlacementEpochAll();
+    }
+
+    uint64_t GlobalOrchestrator::moeRuntimeMovementEpoch() const
+    {
+        return stage_runners_.moeRuntimeMovementEpochAll();
     }
 
     int GlobalOrchestrator::sampleGreedyFromMTPLogitsOnDevice()

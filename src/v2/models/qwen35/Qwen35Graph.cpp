@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <set>
 #include <stdexcept>
+#include <vector>
 
 namespace llaminar2
 {
@@ -726,6 +727,7 @@ namespace llaminar2
         const std::vector<int> *sequence_lengths,
         const void *position_ids_device)
     {
+        DecodeReplicatedDenseScope decode_dense_scope(*this, seq_len * batch_size);
         if (isGDNLayer(layer_idx))
         {
             (void)position_ids_device;
@@ -1222,11 +1224,25 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             prefix + "q_gate_split",
             prefix + "qkv_proj");
+        const bool phase_split_prefill_kv_handoff =
+            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+        std::vector<std::string> cache_source_dependencies;
+        if (has_qk_norms)
+        {
+            cache_source_dependencies.push_back(prefix + "q_norm");
+            cache_source_dependencies.push_back(prefix + "k_norm");
+        }
+        else
+        {
+            cache_source_dependencies.push_back(prefix + "q_gate_split");
+            cache_source_dependencies.push_back(prefix + "qkv_proj");
+        }
 
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device,
+            phase_split_prefill_kv_handoff);
 
         if (has_qk_norms)
         {
@@ -1249,6 +1265,7 @@ namespace llaminar2
             kv_cache,
             device,
             rope_node,
+            cache_source_dependencies,
             layer_idx_is_cache_local);
         graph.setTerminalNode(kv_append);
         return graph;
@@ -1387,6 +1404,20 @@ namespace llaminar2
             local_n_heads, local_n_kv_heads, total_tokens, device,
             prefix + "q_gate_split",
             has_qkv_proj ? prefix + "qkv_proj" : prefix + "attn_norm");
+        const bool phase_split_prefill_kv_handoff =
+            needsPhaseSplitPrefillKVCacheHandoff(total_tokens, kv_cache, device);
+        std::vector<std::string> cache_source_dependencies;
+        if (has_qk_norms)
+        {
+            cache_source_dependencies.push_back(prefix + "q_norm");
+            cache_source_dependencies.push_back(prefix + "k_norm");
+        }
+        else
+        {
+            cache_source_dependencies.push_back(prefix + "q_gate_split");
+            if (has_qkv_proj)
+                cache_source_dependencies.push_back(prefix + "qkv_proj");
+        }
 
         // =================================================================
         // Stage 3: RoPE on Q and K
@@ -1394,7 +1425,8 @@ namespace llaminar2
         std::string rope_node = addRoPE(
             graph, prefix, buffers,
             local_n_heads, local_n_kv_heads, total_tokens,
-            position_ids, position_ids_device, device);
+            position_ids, position_ids_device, device,
+            phase_split_prefill_kv_handoff);
 
         if (has_qk_norms)
         {
@@ -1415,6 +1447,7 @@ namespace llaminar2
             graph, prefix, buffers, layer_idx,
             seq_len, batch_size, local_n_heads, local_n_kv_heads,
             kv_cache, position_ids, position_ids_device, device, has_qkv_proj, rope_node,
+            cache_source_dependencies,
             layer_idx_is_cache_local);
 
         // =================================================================

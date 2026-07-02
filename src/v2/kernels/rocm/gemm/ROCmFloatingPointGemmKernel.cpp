@@ -33,7 +33,7 @@
 #include <atomic>
 #include <hip/hip_runtime.h>
 
-extern "C" bool rocmFp32_tiny_batched_projection(
+extern "C" bool rocmFp32_small_n_batched_projection(
     const float *const *d_A_array,
     const float *const *d_B_array,
     float *const *d_C_array,
@@ -370,24 +370,25 @@ namespace llaminar2
             }
 
             /*
-             * Qwen3.6 GDN alpha/beta verifier projections are tiny FP32 GEMMs
-             * (M<=4, N<=64).  Grouped verifier rows use the local fixed-tree
-             * tiny kernel so their reduction order is stable and graph
-             * capturable.  Serial decode rows must use the same contract when a
-             * graph workspace is bound; otherwise a hipBLAS M=1 reference can
-             * differ by a few FP32 ULPs and the recurrent state amplifies that
-             * into a token-level mismatch.
+             * Qwen3.6 GDN alpha/beta projections are small-output FP32 GEMMs
+             * (N<=64).  Use the local fixed-tree kernel for both decode and
+             * prefill so their reduction order is stable and graph-capturable.
+             * If this explicit route is requested, missing stream/workspace is
+             * a hard failure instead of a quiet hipBLAS detour.
              */
             DeviceWorkspaceManager *effective_workspace = workspace ? workspace : workspace_;
-            const bool can_use_tiny_decode_equivalent =
+            const bool requires_small_n_projection =
                 precision_ == Precision::FP32 &&
                 !d_bias &&
                 transpose_B &&
                 alpha == 1.0f &&
                 beta == 0.0f &&
-                m > 0 && m <= 4 &&
+                m > 0 &&
                 n > 0 && n <= 64 &&
-                k > 0 &&
+                k > 0;
+
+            const bool can_use_small_n_projection =
+                requires_small_n_projection &&
                 d_weights_ &&
                 gpu_stream_ &&
                 effective_workspace &&
@@ -395,7 +396,7 @@ namespace llaminar2
                 effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_B_PTRS) &&
                 effective_workspace->hasBuffer(GemmWorkspaceBuffers::ROCM_FP32_BATCH_C_PTRS);
 
-            if (can_use_tiny_decode_equivalent)
+            if (can_use_small_n_projection)
             {
                 std::vector<const float *> a_ptrs{d_A};
                 std::vector<const float *> b_ptrs{static_cast<const float *>(d_weights_)};
@@ -403,7 +404,7 @@ namespace llaminar2
                 if (!stageBatchedPointers(a_ptrs, b_ptrs, c_ptrs, effective_workspace))
                     return false;
 
-                bool success = rocmFp32_tiny_batched_projection(
+                bool success = rocmFp32_small_n_batched_projection(
                     d_batch_A_ptrs_,
                     d_batch_B_ptrs_,
                     d_batch_C_ptrs_,
@@ -415,7 +416,7 @@ namespace llaminar2
                     gpu_stream_);
                 if (!success)
                 {
-                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Tiny FP32 single projection failed"
+                    LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Small-N FP32 single projection failed"
                               << " M=" << m << " N=" << n << " K=" << k);
                     return false;
                 }
@@ -430,7 +431,7 @@ namespace llaminar2
                         static_cast<hipStream_t>(gpu_stream_));
                     if (copy_status != hipSuccess)
                     {
-                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Tiny FP32 mapped-output copy failed: "
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Small-N FP32 mapped-output copy failed: "
                                   << hipGetErrorString(copy_status));
                         return false;
                     }
@@ -440,7 +441,7 @@ namespace llaminar2
                 {
                     PerfStatsCollector::addCounter(
                         "kernel",
-                        "rocm_fp32_tiny_single_projection_calls",
+                        "rocm_fp32_small_n_single_projection_calls",
                         1.0,
                         "gemm",
                         "rocm:" + std::to_string(rocm_device_id_),
@@ -450,6 +451,15 @@ namespace llaminar2
                             {"k", std::to_string(k)}});
                 }
                 return true;
+            }
+            if (requires_small_n_projection)
+            {
+                LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_tensor] Small-N FP32 projection requires "
+                          << "an explicit stream, device weights, and declared batched pointer workspace"
+                          << " M=" << m << " N=" << n << " K=" << k
+                          << " stream=" << gpu_stream_
+                          << " has_workspace=" << (effective_workspace != nullptr));
+                return false;
             }
 
             // Use fused GEMM+bias when bias is provided, otherwise use regular GEMM
@@ -693,26 +703,22 @@ namespace llaminar2
 
                 const int batch_count = static_cast<int>(group_indices.size());
                 /*
-                 * Verifier-sized GDN alpha/beta projections must use the same
-                 * fixed reduction tree for M=1 and grouped M=2..4 rows.
-                 * hipBLAS may legally choose different reduction schedules for
-                 * those shapes; sub-ULP alpha/beta drift is then amplified by
-                 * quantized projections and recurrence state.  The tiny kernel
-                 * is workspace-backed, graph-capturable, and mirrors the CUDA
-                 * decode-equivalent contract for these small projections.
+                 * GDN alpha/beta projections use the same fixed reduction tree
+                 * for decode and prefill.  hipBLAS may legally choose different
+                 * reduction schedules across shapes, and ROCm graph capture has
+                 * stricter library-call constraints after RCCL.  The small-N
+                 * kernel is workspace-backed and graph-capturable.
                  */
-                constexpr bool kTinyFP32ProjectionDecodeEquivalent = true;
-                const bool use_tiny_fp32 =
-                    kTinyFP32ProjectionDecodeEquivalent &&
-                    m > 0 && m <= 4 &&
+                const bool use_small_n_fp32 =
+                    m > 0 &&
                     seed.n > 0 && seed.n <= 64 &&
                     k > 0 &&
                     batch_count > 0 &&
                     batch_count <= static_cast<int>(MAX_FP32_BATCHED_PROJECTIONS);
 
-                if (use_tiny_fp32)
+                if (use_small_n_fp32)
                 {
-                    if (!rocmFp32_tiny_batched_projection(
+                    if (!rocmFp32_small_n_batched_projection(
                             d_batch_A_ptrs_,
                             d_batch_B_ptrs_,
                             d_batch_C_ptrs_,
@@ -723,7 +729,7 @@ namespace llaminar2
                             rocm_device_id_,
                             gpu_stream_))
                     {
-                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Tiny FP32 batched projection failed"
+                        LOG_ERROR("[ROCmFloatingPointGemmKernel::multiply_fused_tensor] Small-N FP32 batched projection failed"
                                   << " group_size=" << batch_count
                                   << " M=" << m << " N=" << seed.n << " K=" << k);
                         return false;
@@ -733,7 +739,7 @@ namespace llaminar2
                     {
                         PerfStatsCollector::addCounter(
                             "kernel",
-                            "rocm_fp32_tiny_batched_projection_calls",
+                            "rocm_fp32_small_n_batched_projection_calls",
                             1.0,
                             "gemm",
                             "rocm:" + std::to_string(rocm_device_id_),

@@ -2,17 +2,43 @@
 
 #include <cstdio>
 
+#include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
+
 namespace
 {
-    constexpr int TINY_FP32_BLOCK = 256;
-    constexpr int TINY_FP32_MAX_BATCH = 8;
+    constexpr int SMALL_N_FP32_BLOCK = 256;
+    constexpr int SMALL_N_FP32_MAX_BATCH = 8;
+    constexpr int SMALL_N_FP32_MAX_N = 64;
 
     struct Fp32BatchedProjectionPointers
     {
-        const float *A[TINY_FP32_MAX_BATCH];
-        const float *B[TINY_FP32_MAX_BATCH];
-        float *C[TINY_FP32_MAX_BATCH];
+        const float *A[SMALL_N_FP32_MAX_BATCH];
+        const float *B[SMALL_N_FP32_MAX_BATCH];
+        float *C[SMALL_N_FP32_MAX_BATCH];
     };
+
+    bool stream_capture_active(hipStream_t stream)
+    {
+        if (llaminar2::isGraphCaptureActive())
+            return true;
+
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        const hipError_t err = hipStreamIsCapturing(stream, &status);
+        return err == hipSuccess && status != hipStreamCaptureStatusNone;
+    }
+
+    bool complete_kernel_launch(hipStream_t stream, const char *name)
+    {
+        if (stream_capture_active(stream))
+            return true;
+
+        const hipError_t err = hipGetLastError();
+        if (err == hipSuccess)
+            return true;
+
+        std::fprintf(stderr, "[%s] launch failed: %s\n", name, hipGetErrorString(err));
+        return false;
+    }
 
     __global__ void fp32_stage_batched_projection_pointers_kernel(
         const Fp32BatchedProjectionPointers ptrs,
@@ -30,8 +56,8 @@ namespace
         d_C_array[batch] = ptrs.C[batch];
     }
 
-    __global__ __launch_bounds__(TINY_FP32_BLOCK)
-        void fp32_tiny_batched_projection_kernel(
+    __global__ __launch_bounds__(SMALL_N_FP32_BLOCK)
+        void fp32_small_n_batched_projection_kernel(
             const float *const *__restrict__ d_A_array,
             const float *const *__restrict__ d_B_array,
             float *const *__restrict__ d_C_array,
@@ -52,17 +78,17 @@ namespace
             return;
 
         float sum = 0.0f;
-        for (int k = static_cast<int>(threadIdx.x); k < K; k += TINY_FP32_BLOCK)
+        for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
         {
             sum += A[static_cast<size_t>(m) * K + k] *
                    B[static_cast<size_t>(n) * K + k];
         }
 
-        __shared__ float scratch[TINY_FP32_BLOCK];
+        __shared__ float scratch[SMALL_N_FP32_BLOCK];
         scratch[threadIdx.x] = sum;
         __syncthreads();
 
-        for (int stride = TINY_FP32_BLOCK / 2; stride > 0; stride >>= 1)
+        for (int stride = SMALL_N_FP32_BLOCK / 2; stride > 0; stride >>= 1)
         {
             if (threadIdx.x < stride)
                 scratch[threadIdx.x] += scratch[threadIdx.x + stride];
@@ -87,7 +113,7 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
 {
     if (!d_A_array || !d_B_array || !d_C_array ||
         !h_A_ptrs || !h_B_ptrs || !h_C_ptrs ||
-        batch_count <= 0 || batch_count > TINY_FP32_MAX_BATCH ||
+        batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
         !stream)
     {
         std::fprintf(
@@ -114,6 +140,7 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
         ptrs.C[i] = h_C_ptrs[i];
     }
 
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     hipError_t err = hipSetDevice(device_id);
     if (err != hipSuccess)
     {
@@ -124,11 +151,10 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
         return false;
     }
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     hipLaunchKernelGGL(
         fp32_stage_batched_projection_pointers_kernel,
         dim3(1),
-        dim3(TINY_FP32_MAX_BATCH),
+        dim3(SMALL_N_FP32_MAX_BATCH),
         0,
         hip_stream,
         ptrs,
@@ -137,19 +163,10 @@ extern "C" bool rocmFp32_stage_batched_projection_pointers(
         d_C_array,
         batch_count);
 
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp32_stage_batched_projection_pointers] launch failed: %s\n",
-            hipGetErrorString(err));
-        return false;
-    }
-    return true;
+    return complete_kernel_launch(hip_stream, "rocmFp32_stage_batched_projection_pointers");
 }
 
-extern "C" bool rocmFp32_tiny_batched_projection(
+extern "C" bool rocmFp32_small_n_batched_projection(
     const float *const *d_A_array,
     const float *const *d_B_array,
     float *const *d_C_array,
@@ -161,36 +178,38 @@ extern "C" bool rocmFp32_tiny_batched_projection(
     void *stream)
 {
     if (!d_A_array || !d_B_array || !d_C_array ||
-        M <= 0 || M > 4 ||
-        N <= 0 || N > 64 ||
+        M <= 0 ||
+        N <= 0 || N > SMALL_N_FP32_MAX_N ||
         K <= 0 ||
-        batch_count <= 0 || batch_count > 8)
+        batch_count <= 0 || batch_count > SMALL_N_FP32_MAX_BATCH ||
+        !stream)
     {
         std::fprintf(
             stderr,
-            "[rocmFp32_tiny_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d\n",
+            "[rocmFp32_small_n_batched_projection] invalid arguments: M=%d N=%d K=%d batch=%d stream=%p\n",
             M,
             N,
             K,
-            batch_count);
+            batch_count,
+            stream);
         return false;
     }
 
+    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     hipError_t err = hipSetDevice(device_id);
     if (err != hipSuccess)
     {
         std::fprintf(
             stderr,
-            "[rocmFp32_tiny_batched_projection] hipSetDevice failed: %s\n",
+            "[rocmFp32_small_n_batched_projection] hipSetDevice failed: %s\n",
             hipGetErrorString(err));
         return false;
     }
 
-    hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(M), static_cast<unsigned>(batch_count));
-    dim3 block(TINY_FP32_BLOCK);
+    dim3 block(SMALL_N_FP32_BLOCK);
     hipLaunchKernelGGL(
-        fp32_tiny_batched_projection_kernel,
+        fp32_small_n_batched_projection_kernel,
         grid,
         block,
         0,
@@ -202,14 +221,5 @@ extern "C" bool rocmFp32_tiny_batched_projection(
         N,
         K);
 
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        std::fprintf(
-            stderr,
-            "[rocmFp32_tiny_batched_projection] launch failed: %s\n",
-            hipGetErrorString(err));
-        return false;
-    }
-    return true;
+    return complete_kernel_launch(hip_stream, "rocmFp32_small_n_batched_projection");
 }

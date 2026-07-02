@@ -38,102 +38,6 @@ namespace llaminar2
     {
         constexpr int kMTPVerifierSmallDecodeMaxRows = 4;
 
-        size_t debugElementSize(TensorType type)
-        {
-            switch (type)
-            {
-            case TensorType::FP32:
-                return sizeof(float);
-            case TensorType::FP16:
-            case TensorType::BF16:
-                return sizeof(uint16_t);
-            default:
-                return 0;
-            }
-        }
-
-        bool copyTensorBytesForAttentionSnapshot(
-            const ITensor *tensor,
-            DeviceId device,
-            void *stream,
-            std::vector<uint8_t> &bytes)
-        {
-            if (!tensor || bytes.empty())
-                return false;
-
-            if (const void *host = tensor->raw_data())
-            {
-                std::memcpy(bytes.data(), host, bytes.size());
-                return true;
-            }
-
-            const void *device_ptr = tensor->gpu_data_ptr();
-            if (!device_ptr || !device.is_gpu())
-                return false;
-
-            IBackend *backend = getBackendFor(device);
-            if (!backend)
-                return false;
-
-            return backend->deviceToHostFast(
-                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
-        }
-
-        bool tensorToFP32AttentionSnapshot(
-            const ITensor *tensor,
-            DeviceId device,
-            void *stream,
-            size_t rows,
-            size_t cols,
-            std::vector<float> &out)
-        {
-            if (!tensor || rows == 0 || cols == 0)
-            {
-                out.clear();
-                return false;
-            }
-
-            const size_t count = rows * cols;
-            const size_t elem_size = debugElementSize(tensor->native_type());
-            if (elem_size == 0)
-            {
-                out.clear();
-                return false;
-            }
-
-            std::vector<uint8_t> bytes(count * elem_size);
-            if (!copyTensorBytesForAttentionSnapshot(tensor, device, stream, bytes))
-            {
-                out.clear();
-                return false;
-            }
-
-            out.resize(count);
-            switch (tensor->native_type())
-            {
-            case TensorType::FP32:
-                std::memcpy(out.data(), bytes.data(), count * sizeof(float));
-                return true;
-            case TensorType::FP16:
-            {
-                const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-                for (size_t i = 0; i < count; ++i)
-                    out[i] = fp16_to_fp32(src[i]);
-                return true;
-            }
-            case TensorType::BF16:
-            {
-                const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-                for (size_t i = 0; i < count; ++i)
-                    out[i] = simd::bf16_to_fp32(src[i]);
-                return true;
-            }
-            default:
-                out.clear();
-                return false;
-            }
-        }
-
         int rocmAttentionRequestedDecodeSplitCap(int kv_len)
         {
             if (debugEnv().gemm.deterministic)
@@ -1388,21 +1292,16 @@ namespace llaminar2
             const size_t logical_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
             const size_t k_cols = effective_K ? logical_kv_cols : 0;
             const size_t v_cols = effective_V ? logical_kv_cols : 0;
-            const bool have_k = tensorToFP32AttentionSnapshot(
-                effective_K, params_.device_id, gpuStream(), k_rows, k_cols,
-                debug_effective_k_snapshot_);
-            const bool have_v = tensorToFP32AttentionSnapshot(
-                effective_V, params_.device_id, gpuStream(), v_rows, v_cols,
-                debug_effective_v_snapshot_);
-
-            debug_effective_k_rows_ = have_k ? k_rows : 0;
-            debug_effective_k_cols_ = have_k ? k_cols : 0;
-            debug_effective_v_rows_ = have_v ? v_rows : 0;
-            debug_effective_v_cols_ = have_v ? v_cols : 0;
+            debug_effective_k_tensor_ = effective_K;
+            debug_effective_v_tensor_ = effective_V;
+            debug_effective_k_rows_ = (effective_K && k_rows > 0 && k_cols > 0) ? k_rows : 0;
+            debug_effective_k_cols_ = (effective_K && k_rows > 0 && k_cols > 0) ? k_cols : 0;
+            debug_effective_v_rows_ = (effective_V && v_rows > 0 && v_cols > 0) ? v_rows : 0;
+            debug_effective_v_cols_ = (effective_V && v_rows > 0 && v_cols > 0) ? v_cols : 0;
 
             // Snapshot callbacks reuse dump info first built before execute()
             // for coherence. Force post-execute getDumpInfo() to include these
-            // just-captured vectors.
+            // just-resolved tensor-backed diagnostic outputs.
             invalidateDumpInfoCache();
         }
 
@@ -1615,15 +1514,26 @@ namespace llaminar2
         if (debugEnv().attention.debug_effective_kv_snapshot &&
             debugEnv().attention.debugEffectiveKVSnapshotLayerSelected(params_.layer_idx))
         {
-            if (!debug_effective_k_snapshot_.empty() && debug_effective_k_rows_ > 0 && debug_effective_k_cols_ > 0)
+            const size_t expected_kv_rows = total_kv_tokens > 0
+                                                ? total_kv_tokens
+                                                : static_cast<size_t>(params_.seq_len > 0 ? params_.seq_len : 0);
+            const size_t expected_kv_cols = static_cast<size_t>(params_.n_kv_heads * params_.head_dim);
+            const bool recording_graph_snapshot_copy = isGraphCaptureActive();
+            const ITensor *effective_k_tensor =
+                (recording_graph_snapshot_copy && debug_effective_k_tensor_) ? debug_effective_k_tensor_ : dump_K;
+            const ITensor *effective_v_tensor =
+                (recording_graph_snapshot_copy && debug_effective_v_tensor_) ? debug_effective_v_tensor_ : dump_V;
+            const size_t effective_k_rows = debug_effective_k_rows_ > 0 ? debug_effective_k_rows_ : expected_kv_rows;
+            const size_t effective_v_rows = debug_effective_v_rows_ > 0 ? debug_effective_v_rows_ : expected_kv_rows;
+            const size_t effective_k_cols = debug_effective_k_cols_ > 0 ? debug_effective_k_cols_ : expected_kv_cols;
+            const size_t effective_v_cols = debug_effective_v_cols_ > 0 ? debug_effective_v_cols_ : expected_kv_cols;
+            if (effective_k_tensor && effective_k_rows > 0 && effective_k_cols > 0)
             {
-                info.addOutput("effective_k", debug_effective_k_snapshot_.data(),
-                               debug_effective_k_rows_, debug_effective_k_cols_);
+                info.addOutput("effective_k", effective_k_tensor, effective_k_rows, effective_k_cols);
             }
-            if (!debug_effective_v_snapshot_.empty() && debug_effective_v_rows_ > 0 && debug_effective_v_cols_ > 0)
+            if (effective_v_tensor && effective_v_rows > 0 && effective_v_cols > 0)
             {
-                info.addOutput("effective_v", debug_effective_v_snapshot_.data(),
-                               debug_effective_v_rows_, debug_effective_v_cols_);
+                info.addOutput("effective_v", effective_v_tensor, effective_v_rows, effective_v_cols);
             }
         }
 

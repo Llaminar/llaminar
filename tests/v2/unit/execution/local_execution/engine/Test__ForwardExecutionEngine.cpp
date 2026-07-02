@@ -127,6 +127,9 @@ namespace
         PPCopyInfo mock_pp_copy;
         DeviceGraphExecutor::DecodeCapturePolicy mock_capture_policy;
         bool mock_compute_all_position_logits = false;
+        bool mock_moe_rebalancing_active = false;
+        bool mock_moe_rebalancing_graph_stable = false;
+        bool mock_prefill_graph_capture_disabled = false;
         PrefillChunkMaintenanceState mock_maintenance_state{};
         bool mock_maintenance_state_configured = false;
         bool maintenance_should_fail = false;
@@ -248,6 +251,21 @@ namespace
         bool computeAllPositionLogitsEnabled() const override
         {
             return mock_compute_all_position_logits;
+        }
+
+        bool isMoeRebalancingActive() const override
+        {
+            return mock_moe_rebalancing_active;
+        }
+
+        bool isMoeRebalancingGraphStableForPrefillCapture() const override
+        {
+            return mock_moe_rebalancing_graph_stable;
+        }
+
+        bool prefillGraphCaptureDisabledByHost() const override
+        {
+            return mock_prefill_graph_capture_disabled;
         }
 
         uint64_t moePlacementEpoch() const override
@@ -1181,6 +1199,70 @@ TEST_F(Test__ForwardExecutionEngine, Execute_RawBucketedPrefillPadsBeforeBuild)
     EXPECT_EQ(host.last_forward_input.token_offset, 200);
     EXPECT_EQ(host.last_forward_input.position_offset, 200);
     EXPECT_EQ(host.last_workspace_seq_len, 4);
+}
+
+TEST_F(Test__ForwardExecutionEngine, Execute_PaddedBucketedPrefillRejectsActiveNonGraphStableMoE)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_moe_rebalancing_active = true;
+    host.mock_moe_rebalancing_graph_stable = false;
+
+    const std::vector<int> tokens = {80, 81, 82};
+    const std::vector<int> positions = {0, 1, 2};
+    auto input = makeTestInput(3, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+
+    ForwardOutput output{};
+    EXPECT_FALSE(engine.execute(input, output, host))
+        << "Unsafe padded MoE prefill capture must fail fast instead of taking an eager fallback.";
+    EXPECT_EQ(host.ensure_workspace_calls, 0);
+    EXPECT_EQ(host.sync_logits_calls, 0);
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+}
+
+TEST_F(Test__ForwardExecutionEngine, Execute_PaddedBucketedPrefillAllowsActiveGraphStableMoE)
+{
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+        {"LLAMINAR_VALIDATE_BUFFERS", "0"},
+        {"LLAMINAR_VALIDATE_INPUTS", "0"},
+        {"LLAMINAR_FAIL_ON_ZERO", "0"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    llaminar2::testing::MockDeviceContext gpu_ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+    MockForwardExecutionHost host(&gpu_ctx);
+    host.graph_stage_count = 1;
+    host.mock_moe_rebalancing_active = true;
+    host.mock_moe_rebalancing_graph_stable = true;
+
+    const std::vector<int> tokens = {80, 81, 82};
+    const std::vector<int> positions = {0, 1, 2};
+    auto input = makeTestInput(3, 1, DeviceId::cuda(0), tokens.data(), positions.data());
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.execute(input, output, host))
+        << "Graph-stable GPU MoE placement mutates runtime-table data behind stable graph pointers.";
+    ASSERT_TRUE(host.has_last_forward_input);
+    EXPECT_EQ(host.last_forward_input.seq_len, 4);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 3);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 4);
+    EXPECT_EQ(host.ensure_workspace_calls, 1);
 }
 
 TEST_F(Test__ForwardExecutionEngine, Execute_PaddedBucketedPrefillRejectsBeforeEagerFallback)

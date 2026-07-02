@@ -469,6 +469,100 @@ namespace
 #endif
     }
 
+    TEST_F(NativeVNNIGEMMTest, IQ3S_GDNPaddedPrefillFusedProjectionGraphCaptures)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#else
+        if (!has_gpu_)
+        {
+            GTEST_SKIP() << "No ROCm device";
+        }
+
+        const int M = 2560;
+        const int K = 2048;
+        const int N_qkv = 6144;
+        const int N_z = 2048;
+
+        auto w_qkv = TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(N_qkv), static_cast<size_t>(K)});
+        auto w_z = TestTensorFactory::createIQ3_SRandom(
+            {static_cast<size_t>(N_z), static_cast<size_t>(K)});
+        ASSERT_NE(w_qkv, nullptr);
+        ASSERT_NE(w_z, nullptr);
+
+        ROCmPackedWeights packed_qkv;
+        ROCmPackedWeights packed_z;
+        ASSERT_TRUE(packWeightsToROCm(w_qkv.get(), packed_qkv));
+        ASSERT_TRUE(packWeightsToROCm(w_z.get(), packed_z));
+        ASSERT_FALSE(packed_qkv.native_vnni_payload.empty());
+        ASSERT_FALSE(packed_z.native_vnni_payload.empty());
+
+        ROCmQuantisedGemmKernel qkv_kernel(&packed_qkv, 0);
+        ROCmQuantisedGemmKernel z_kernel(&packed_z, 0);
+
+        auto reqs = qkv_kernel.getWorkspaceRequirements(M, N_qkv, K);
+        const size_t workspace_bytes = std::max(
+            static_cast<size_t>(256 * 1024 * 1024),
+            static_cast<size_t>(reqs.total_bytes() * 2));
+        workspace_ = std::make_unique<DeviceWorkspaceManager>(
+            DeviceId::rocm(0), workspace_bytes);
+        ASSERT_TRUE(workspace_->allocate(reqs));
+        qkv_kernel.bindWorkspace(workspace_.get());
+        z_kernel.bindWorkspace(workspace_.get());
+
+        auto input = TestTensorFactory::createFP32Random(
+            {static_cast<size_t>(M), static_cast<size_t>(K)});
+        auto qkv_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N_qkv)});
+        auto z_output = TestTensorFactory::createFP32(
+            {static_cast<size_t>(M), static_cast<size_t>(N_z)});
+
+        ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(qkv_output->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_TRUE(z_output->allocateOnDevice(DeviceId::rocm(0)));
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+
+        hipStream_t stream = nullptr;
+        ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
+        qkv_kernel.setGPUStream(stream);
+        z_kernel.setGPUStream(stream);
+
+        std::vector<ITensorGemm::TensorProjectionDesc> projections;
+        projections.emplace_back(&qkv_kernel, qkv_output.get(), N_qkv, nullptr, "qkv");
+        projections.emplace_back(&z_kernel, z_output.get(), N_z, nullptr, "z");
+
+        ASSERT_TRUE(qkv_kernel.multiply_fused_tensor(input.get(), projections, M, K))
+            << "Packed IQ3_S native-VNNI GDN padded prefill warmup failed";
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        ASSERT_EQ(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal), hipSuccess);
+        const bool launch_ok = qkv_kernel.multiply_fused_tensor(
+            input.get(), projections, M, K);
+        hipGraph_t graph = nullptr;
+        const hipError_t end_capture_status = hipStreamEndCapture(stream, &graph);
+
+        ASSERT_TRUE(launch_ok)
+            << "Packed IQ3_S native-VNNI GDN padded prefill launch failed during graph capture";
+        ASSERT_EQ(end_capture_status, hipSuccess)
+            << hipGetErrorString(end_capture_status);
+        ASSERT_NE(graph, nullptr);
+
+        hipGraphExec_t exec = nullptr;
+        ASSERT_EQ(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), hipSuccess);
+        ASSERT_EQ(hipGraphLaunch(exec, stream), hipSuccess);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+
+        if (exec)
+            (void)hipGraphExecDestroy(exec);
+        if (graph)
+            (void)hipGraphDestroy(graph);
+        (void)hipStreamDestroy(stream);
+        qkv_kernel.unbindWorkspace();
+        z_kernel.unbindWorkspace();
+#endif
+    }
+
     // =============================================================================
     // Test cases — organised by dispatch path
     //

@@ -302,6 +302,14 @@ namespace llaminar2
          */
         virtual bool usesDeviceSideMoERebalanceController() const { return false; }
 
+        /**
+         * @brief Observable MoE expert movement epoch for parity/diagnostics.
+         *
+         * Unlike placement epochs used for graph and prefix-cache keys, this
+         * advances for graph-stable device-side runtime-table mutations too.
+         */
+        virtual uint64_t moeRuntimeMovementEpoch() const { return 0; }
+
         // =====================================================================
         // Configuration
         // =====================================================================
@@ -445,6 +453,16 @@ namespace llaminar2
          * @param output_dir Optional directory to save snapshots
          */
         virtual void enableSnapshotCapture(const std::string &output_dir = "") = 0;
+
+        /**
+         * @brief Restrict snapshot capture to a set of published snapshot keys.
+         *
+         * Empty means capture all snapshots.
+         */
+        virtual void setSnapshotCaptureFilter(const std::vector<std::string> &keys)
+        {
+            (void)keys;
+        }
 
         /**
          * @brief Disable snapshot capture and clear stored snapshots

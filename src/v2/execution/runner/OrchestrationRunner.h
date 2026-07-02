@@ -174,6 +174,7 @@ namespace llaminar2
         void setDecodeStepTokenBudget(int max_tokens) override;
         bool maybeApplyMoERebalance() override;
         bool usesDeviceSideMoERebalanceController() const override;
+        uint64_t moeRuntimeMovementEpoch() const override;
 
         // =====================================================================
         // IOrchestrationRunner: Configuration
@@ -208,6 +209,7 @@ namespace llaminar2
         // =====================================================================
 
         void enableSnapshotCapture(const std::string &output_dir = "") override;
+        void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override;
         void disableSnapshotCapture() override;
         void clearSnapshots() override;
         const float *getSnapshot(const std::string &key, size_t &out_size) const override;

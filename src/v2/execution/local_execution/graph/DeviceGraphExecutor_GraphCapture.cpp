@@ -426,7 +426,10 @@ namespace llaminar2
                 {
                     *used_graph_replay = true;
                 }
-                return true;
+                return publishSnapshotsAfterGraphExecution(
+                    graph,
+                    segment_cache->capture_stream,
+                    "decode_graph_replay");
             }
 
             const char *mode_name =
@@ -439,7 +442,12 @@ namespace llaminar2
             return executeFastDecode(graph, ctx, collective_nodes);
         }
 
-        return executeFastDecode(graph, ctx, collective_nodes);
+        if (!executeFastDecode(graph, ctx, collective_nodes))
+            return false;
+        return publishSnapshotsAfterGraphExecution(
+            graph,
+            gpu_stream,
+            "decode_fast_path");
     }
 
     // =========================================================================
@@ -537,6 +545,32 @@ namespace llaminar2
                 arena_->markWrittenFlagsOnly(id, device);
         };
 
+        auto record_graph_snapshot_copies = [&](ComputeNode &node, void *producer_stream) -> bool
+        {
+            if (!config_.snapshot_callback || !node.stage)
+                return true;
+
+            DeviceId snapshot_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (!snapshot_device.is_valid() && ctx)
+                snapshot_device = ctx->deviceId();
+
+            void *stream = producer_stream ? producer_stream : node.stage->gpuStream();
+            return captureGraphSnapshotCopies(node, snapshot_device, stream);
+        };
+
+        auto prepare_graph_snapshot_copies = [&](ComputeNode &node, void *producer_stream) -> bool
+        {
+            if (!config_.snapshot_callback || !node.stage)
+                return true;
+
+            DeviceId snapshot_device = node.device.is_valid() ? node.device : node.stage->device();
+            if (!snapshot_device.is_valid() && ctx)
+                snapshot_device = ctx->deviceId();
+
+            void *stream = producer_stream ? producer_stream : node.stage->gpuStream();
+            return prepareGraphSnapshotCopies(node, snapshot_device, stream);
+        };
+
         // ===== FAST PATH: Phase 3 (Replay) =====
         // During steady-state replay, only the post_launch hook is invoked
         // (cohere_inputs is skipped for capturable segments, execute_node is
@@ -556,6 +590,8 @@ namespace llaminar2
                 {
                     return executeNode(node, ctx);
                 },
+                prepare_graph_snapshot_copies,
+                record_graph_snapshot_copies,
                 [&](DeviceGraphExecutor::GraphSegment &seg, void *stream)
                 {
                     DeviceGraphCaptureController::postCapturedSegmentLaunch(
@@ -691,6 +727,8 @@ namespace llaminar2
             {
                 return executeNode(node, ctx);
             },
+            prepare_graph_snapshot_copies,
+            record_graph_snapshot_copies,
             [&](GraphSegment &segment, void *stream)
             {
                 post_captured_segment_launch(segment, stream);
@@ -707,6 +745,8 @@ namespace llaminar2
             {
                 return runStage(node, ctx, capture_phase_policy, is_collective_node(node));
             },
+            replay_hooks.prepare_snapshot_copies,
+            record_graph_snapshot_copies,
             [&](GraphSegment &segment, void *stream)
             {
                 DeviceGraphCaptureController::postCapturedSegmentLaunch(

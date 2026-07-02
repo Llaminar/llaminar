@@ -891,7 +891,9 @@ namespace llaminar2
             const DeviceMoERebalanceConfig &config,
             DeviceMoERebalanceStatus *status = nullptr,
             uint32_t payload_slot_capacity = 0,
-            uint32_t command_buffer_count = 1)
+            uint32_t command_buffer_count = 1,
+            const DeviceMoERebalanceWaveState *gathered_wave_states = nullptr,
+            DeviceMoERebalanceWaveState *local_wave_states = nullptr)
         {
             (void)gathered_plan_entries;
             (void)gathered_command_headers;
@@ -902,6 +904,8 @@ namespace llaminar2
             (void)status;
             (void)payload_slot_capacity;
             (void)command_buffer_count;
+            (void)gathered_wave_states;
+            (void)local_wave_states;
             return false;
         }
 
@@ -1055,6 +1059,9 @@ namespace llaminar2
             const DeviceMoERebalanceCommandBufferHeader *command_header,
             const DeviceMoERebalanceWaveState *wave_state,
             const DeviceMoERebalanceApplyStatus *copy_status,
+            const DeviceMoERebalancePlanEntry *plan_entries,
+            uint32_t plan_capacity,
+            const DeviceMoERebalanceApplyStatus *gathered_copy_status,
             const DeviceMoERebalanceConfig &config,
             uint32_t command_buffer_count = 1)
         {
@@ -1062,6 +1069,9 @@ namespace llaminar2
             (void)command_header;
             (void)wave_state;
             (void)copy_status;
+            (void)plan_entries;
+            (void)plan_capacity;
+            (void)gathered_copy_status;
             (void)config;
             (void)command_buffer_count;
             return false;
@@ -1347,7 +1357,8 @@ namespace llaminar2
         virtual bool assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
             DeviceMoELayerRuntime *runtime_layer,
             int current_tokens, int max_tokens,
-            int num_experts, int top_k);
+            int num_experts, int top_k,
+            const DeviceMoERebalanceStatus *transfer_status);
 
         /**
          * @brief Gather one expert's fixed-capacity prefill batch from runtime grouping.

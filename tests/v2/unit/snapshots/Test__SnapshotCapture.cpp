@@ -7,6 +7,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <numeric>
@@ -83,7 +84,8 @@ TEST(Test__SnapshotCapture_KeyConversion, AttentionLayerStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_k_rope"), "layer0_K_ROPE");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_attention"), "layer0_ATTENTION_CONTEXT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_proj"), "layer0_ATTENTION_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_allreduce"), "layer0_ATTENTION_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_allreduce"),
+              "layer0_ATTENTION_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_attn_residual"), "layer0_ATTENTION_RESIDUAL");
 }
 
@@ -94,7 +96,8 @@ TEST(Test__SnapshotCapture_KeyConversion, FFNLayerStages)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_ffn_up"), "layer0_FFN_UP");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_swiglu"), "layer0_FFN_SWIGLU");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_down_proj"), "layer0_FFN_DOWN");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_down_allreduce"), "layer0_FFN_DOWN");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_down_allreduce"),
+              "layer0_FFN_DOWN_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_ffn_residual"), "layer0_FFN_RESIDUAL");
 }
 
@@ -108,18 +111,34 @@ TEST(Test__SnapshotCapture_KeyConversion, MoEStages)
 {
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_ffn"), "layer0_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_ffn"), "layer0_MOE_EXPERT_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_allreduce"), "layer0_MOE_EXPERT_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_overlay_fast_allreduce"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_allreduce"),
+              "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_overlay_fast_allreduce"),
+              "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_expert_parallel_reduce"), "layer0_MOE_EXPERT_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_sparse_return_reduce_tier0_hot_p0_allreduce"), "layer0_MOE_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_sparse_return_reduce_tier0_hot_p0_allreduce"),
+              "layer0_MOE_EXPERT_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert"), "layer0_MOE_SHARED_EXPERT_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_allreduce"), "layer0_MOE_SHARED_EXPERT_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_allreduce"),
+              "layer0_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_shared_expert_gate"), "layer0_MOE_SHARED_GATE_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_add"), "layer0_MOE_COMBINED_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combine"), "layer0_MOE_COMBINED_OUTPUT");
-    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combined_allreduce"), "layer0_MOE_COMBINED_OUTPUT");
+    EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_moe_combined_allreduce"),
+              "layer0_MOE_COMBINED_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_ffn"), "layer39_MOE_EXPERT_OUTPUT");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer39_moe_add"), "layer39_MOE_COMBINED_OUTPUT");
+}
+
+TEST(Test__SnapshotCapture_KeyConversion, PossibleKeysIncludeFusedMoECombinedOutput)
+{
+    auto expert_keys = SnapshotCapture::possibleKeysForStageName("layer0_moe_expert_ffn");
+    EXPECT_NE(std::find(expert_keys.begin(), expert_keys.end(), "layer0_MOE_EXPERT_OUTPUT"), expert_keys.end());
+    EXPECT_NE(std::find(expert_keys.begin(), expert_keys.end(), "layer0_MOE_COMBINED_OUTPUT"), expert_keys.end());
+
+    auto shared_gate_keys = SnapshotCapture::possibleKeysForStageName("layer0_shared_expert_gate");
+    EXPECT_NE(std::find(shared_gate_keys.begin(), shared_gate_keys.end(), "layer0_MOE_SHARED_GATE_OUTPUT"), shared_gate_keys.end());
+    EXPECT_NE(std::find(shared_gate_keys.begin(), shared_gate_keys.end(), "layer0_MOE_COMBINED_OUTPUT"), shared_gate_keys.end());
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, MTPSidecarStages)
@@ -439,6 +458,31 @@ TEST(Test__SnapshotCapture_Capture, MTPSidecarMoERoutingUsesMTPKeys)
     EXPECT_EQ(weights_snapshot->data, weights);
 }
 
+TEST(Test__SnapshotCapture_Capture, MoERoutingTensorOnlyDumpUsesCanonicalKeys)
+{
+    std::vector<float> indices = {2.0f, 1.0f, 3.0f, 0.0f};
+    std::vector<float> weights = {0.75f, 0.25f, 0.60f, 0.40f};
+
+    StageDumpInfo dump;
+    dump.outputs.push_back(
+        makeFP32Output("output_indices_tensor", indices.data(), 2, 2));
+    dump.outputs.push_back(
+        makeFP32Output("output_weights_tensor", weights.data(), 2, 2));
+
+    SnapshotCapture capture;
+    capture.captureStage("layer7_moe_routing", dump);
+
+    const auto *router_snapshot = capture.get("layer7_MOE_ROUTER_OUTPUT");
+    const auto *indices_snapshot = capture.get("layer7_MOE_ROUTING_INDICES");
+    const auto *weights_snapshot = capture.get("layer7_MOE_ROUTING_WEIGHTS");
+
+    EXPECT_EQ(router_snapshot, nullptr);
+    ASSERT_NE(indices_snapshot, nullptr);
+    ASSERT_NE(weights_snapshot, nullptr);
+    EXPECT_EQ(indices_snapshot->data, indices);
+    EXPECT_EQ(weights_snapshot->data, weights);
+}
+
 TEST(Test__SnapshotCapture_Capture, ContextQualifiedMTPKeysRemainDisambiguated)
 {
     std::vector<float> decode_embedding = {1.0f, 2.0f};
@@ -675,8 +719,8 @@ TEST_F(Test__SnapshotCapture_Routing, ShapeMetadataPreserved)
 // Bug: SnapshotCapture used an unordered_map for suffix→key mapping.
 // The stage name "layer0_gdn_wo_allreduce" matched the shorter suffix
 // "_wo_allreduce" first (hash order), extracting prefix "layer0_gdn"
-// → key "layer0_gdn_ATTENTION_OUTPUT" instead of the correct
-// "layer0_ATTENTION_OUTPUT".
+// → key "layer0_gdn_ATTENTION_OUTPUT_ALLREDUCED" instead of the correct
+// "layer0_ATTENTION_OUTPUT_ALLREDUCED".
 //
 // Fix: Changed to ordered vector with longest-suffix-first matching,
 // so "_gdn_wo_allreduce" matches before "_wo_allreduce".
@@ -700,23 +744,24 @@ TEST(Test__SnapshotCapture_KeyConversion, GDNWoAllreduceSuffixMatchesBeforeWoAll
     // THE regression test: "_gdn_wo_allreduce" must match BEFORE "_wo_allreduce"
     // so the prefix is "layer0" (not "layer0_gdn")
     auto key = SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_wo_allreduce");
-    EXPECT_EQ(key, "layer0_ATTENTION_OUTPUT")
+    EXPECT_EQ(key, "layer0_ATTENTION_OUTPUT_ALLREDUCED")
         << "Bug: '_gdn_wo_allreduce' matched '_wo_allreduce' suffix, "
-           "producing 'layer0_gdn_ATTENTION_OUTPUT' instead of 'layer0_ATTENTION_OUTPUT'";
+           "producing 'layer0_gdn_ATTENTION_OUTPUT_ALLREDUCED' instead of "
+           "'layer0_ATTENTION_OUTPUT_ALLREDUCED'";
 
     // Also verify the shorter suffix still works for non-GDN stages
     auto key2 = SnapshotCapture::convertStageNameToSnapshotKey("layer0_wo_allreduce");
-    EXPECT_EQ(key2, "layer0_ATTENTION_OUTPUT")
-        << "'_wo_allreduce' should still map to ATTENTION_OUTPUT for FA layers";
+    EXPECT_EQ(key2, "layer0_ATTENTION_OUTPUT_ALLREDUCED")
+        << "'_wo_allreduce' should still map to ATTENTION_OUTPUT_ALLREDUCED for FA layers";
 }
 
 TEST(Test__SnapshotCapture_KeyConversion, GDNSuffixMatchingAcrossLayers)
 {
     // Verify suffix ordering works for all layer indices, not just layer0
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer5_gdn_wo_allreduce"),
-              "layer5_ATTENTION_OUTPUT");
+              "layer5_ATTENTION_OUTPUT_ALLREDUCED");
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer23_gdn_wo_allreduce"),
-              "layer23_ATTENTION_OUTPUT");
+              "layer23_ATTENTION_OUTPUT_ALLREDUCED");
 
     // The bug was visible across ALL GDN layers, not just layer 0
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer17_gdn_proj"),
@@ -730,7 +775,7 @@ TEST(Test__SnapshotCapture_KeyConversion, LongestSuffixMatchesFirst)
     // Verify that the longest/most-specific suffix always wins.
     // "_down_allreduce" must match before "_allreduce" (if such shorter suffix existed)
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_down_allreduce"),
-              "layer0_FFN_DOWN");
+              "layer0_FFN_DOWN_ALLREDUCED");
 
     // "_gdn_out_proj" must match before "_out_proj" or "_proj"
     EXPECT_EQ(SnapshotCapture::convertStageNameToSnapshotKey("layer0_gdn_out_proj"),

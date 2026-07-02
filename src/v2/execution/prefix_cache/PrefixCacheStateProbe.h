@@ -109,6 +109,7 @@ namespace llaminar2
         DeviceId primary_device = DeviceId::cpu();
         int current_position = 0;
         uint64_t session_epoch = 0;
+        uint64_t moe_runtime_movement_epoch = 0;
         uint64_t live_state_epoch = 0;
         uint64_t live_state_mutations = 0;
         std::string last_live_state_mutation_reason;

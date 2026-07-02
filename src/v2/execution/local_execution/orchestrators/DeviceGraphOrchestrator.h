@@ -440,6 +440,16 @@ namespace llaminar2
                 if (tensor)
                     lb.extensions[id] = tensor.get();
             }
+            if (auto it = extension_buffers.find(BufferId::K_FULL_PREFILL);
+                it != extension_buffers.end() && it->second)
+            {
+                lb.K_full_prefill = it->second.get();
+            }
+            if (auto it = extension_buffers.find(BufferId::V_FULL_PREFILL);
+                it != extension_buffers.end() && it->second)
+            {
+                lb.V_full_prefill = it->second.get();
+            }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
             lb.context_snapshot = context_snapshot.get();
@@ -2291,12 +2301,14 @@ namespace llaminar2
          */
         IDeviceContext *getDeviceContext(DeviceId device) override;
 
-        /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
+        /** Check whether MoE dynamic rebalancing is active for this forward domain. */
         bool isMoeRebalancingActive() const override;
+        bool isMoeRebalancingGraphStableForPrefillCapture() const override;
         bool prefillGraphCaptureDisabledByHost() const override;
 
         /** Return the active MoE placement epoch for graph-cache keying. */
         uint64_t moePlacementEpoch() const override;
+        uint64_t moeRuntimeMovementEpoch() const override;
         std::string prefillGraphDomainId() const override;
         int prefillGraphParticipantId() const override;
 
@@ -2530,7 +2542,21 @@ namespace llaminar2
             for (auto &[dev, ctx] : device_contexts_)
             {
                 if (ctx && dev.is_gpu())
+                {
                     ctx->synchronize();
+                    try
+                    {
+                        GPUDeviceContextPool::instance()
+                            .getContext(dev)
+                            .clearLastError();
+                    }
+                    catch (const std::exception &e)
+                    {
+                        LOG_WARN("[DeviceGraphOrchestrator] Failed to clear sticky GPU error "
+                                 "after request-boundary sync on "
+                                 << dev.to_string() << ": " << e.what());
+                    }
+                }
             }
             drainCompletedDeviceMoERebalanceMaintenanceForRequestReset();
             for (auto &entry : layer_graph_cache_)
@@ -2727,6 +2753,7 @@ namespace llaminar2
             snapshot_enabled_ = true;
 
             LOG_DEBUG("[DeviceGraphOrchestrator::enableSnapshotCapture] Setting callback on executor_");
+            applySnapshotCaptureFilter();
             executor_.setSnapshotCallback(
                 [this](const std::string &name, const StageDumpInfo &dump)
                 {
@@ -2736,10 +2763,24 @@ namespace llaminar2
                 });
         }
 
+        void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override
+        {
+            snapshot_capture_filter_.clear();
+            snapshot_capture_filter_.reserve(keys.size());
+            for (const auto &key : keys)
+            {
+                if (!key.empty())
+                    snapshot_capture_filter_.insert(key);
+            }
+            applySnapshotCaptureFilter();
+        }
+
         void disableSnapshotCapture() override
         {
             snapshot_enabled_ = false;
             snapshot_capture_.clear();
+            snapshot_capture_filter_.clear();
+            executor_.setSnapshotStageFilter(nullptr);
             executor_.setSnapshotCallback(nullptr);
         }
 
@@ -2782,6 +2823,32 @@ namespace llaminar2
         static std::string convertStageNameToSnapshotKey(const std::string &stage_name)
         {
             return SnapshotCapture::convertStageNameToSnapshotKey(stage_name);
+        }
+
+        bool snapshotStageMatchesFilter(const std::string &stage_name) const
+        {
+            if (snapshot_capture_filter_.empty())
+                return true;
+            for (const auto &key : SnapshotCapture::possibleKeysForStageName(stage_name))
+            {
+                if (snapshot_capture_filter_.count(key) > 0)
+                    return true;
+            }
+            return false;
+        }
+
+        void applySnapshotCaptureFilter()
+        {
+            if (snapshot_capture_filter_.empty())
+            {
+                executor_.setSnapshotStageFilter(nullptr);
+                return;
+            }
+            executor_.setSnapshotStageFilter(
+                [this](const std::string &stage_name)
+                {
+                    return snapshotStageMatchesFilter(stage_name);
+                });
         }
 
         // =========================================================================
@@ -3432,6 +3499,8 @@ namespace llaminar2
             uint32_t windows_applied = 0;
             uint32_t selected_replicas = 0;
             uint32_t planned_arrivals = 0;
+            uint32_t runtime_changed_layers = 0;
+            uint32_t runtime_applied_arrivals = 0;
             uint32_t payload_bucket_slots = 0;
             uint32_t payload_source_participant_mask = 0;
             uint32_t payload_destination_participant_mask = 0;
@@ -4195,6 +4264,7 @@ namespace llaminar2
 
         /// Snapshot capture engine (owns storage + routing logic)
         SnapshotCapture snapshot_capture_;
+        std::unordered_set<std::string> snapshot_capture_filter_;
 
         // =========================================================================
         // Graph Buffer Management Members (Phase 3 - moved from QwenStandardGraph)
@@ -4714,6 +4784,7 @@ namespace llaminar2
         /// MoE-sensitive graph cache keys after non-replica ownership changes.
         std::vector<std::vector<bool>> current_expert_masks_;
         uint64_t current_expert_mask_epoch_ = 0;
+        uint64_t moe_runtime_movement_epoch_ = 0;
 
         /// Optional expert weight payload provider for metadata-based host retention (owned)
         std::unique_ptr<ExpertWeightPayloadProvider> expert_payload_provider_;

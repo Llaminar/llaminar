@@ -139,6 +139,16 @@ namespace llaminar2
          */
         static std::string convertStageNameToSnapshotKey(const std::string &stage_name);
 
+        /**
+         * @brief Return all snapshot keys a stage may publish.
+         *
+         * Some graph stages publish multiple semantic snapshots from one
+         * callback, or select a key based on output names. Snapshot filters use
+         * this conservative key set to decide whether a stage is relevant before
+         * allocating graph-stable device copies.
+         */
+        static std::vector<std::string> possibleKeysForStageName(const std::string &stage_name);
+
     private:
         void storeOutput(const std::string &key, const StageDumpInfo::OutputBuffer &out);
 

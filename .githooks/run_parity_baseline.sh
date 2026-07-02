@@ -1,11 +1,12 @@
 #!/bin/bash
-# Focused parity baseline — 48 tests covering all model families.
+# Focused parity baseline — 56 tests covering all model families.
 #
 # Covers: Qwen2, Qwen3, Qwen3.5 (dense), Qwen3.6 (dense),
 #         Qwen3.5 27B LocalPP (dense Q4_K_M),
 #         Qwen3.5 MoE (sparse), NodeLocalTP (multi-device),
 #         HybridPPTP (pipeline+tensor parallel),
-#         and ExpertOverlay (tiered same-layer expert residency).
+#         and ExpertOverlay (tiered same-layer expert residency, Qwen3.6 GPU
+#         Dynamic/LLEP rebalance).
 #
 # Tests run sequentially (parity tests share GPU resources and use
 # RESOURCE_LOCK for serialization within CTest).
@@ -87,6 +88,15 @@ TESTS=(
   "Qwen35MoEExpertOverlayTopology_OverlayPlanTopology_CUDA1_SharedHot_ROCm2TP_Hot_CPU2NodeLocalTP_Cold$"
   "Qwen35MoEExpertOverlay_PrefillParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
   "Qwen35MoEExpertOverlay_DecodeParity_ROCm2TP_SharedHot_CPU2NodeLocalTP_Cold$"
+  # Qwen3.6 MoE ExpertOverlay GPU Dynamic/LLEP routed-domain parity (8)
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_PrefillParity_CUDA2TP_Dynamic_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_DecodeParity_CUDA2TP_Dynamic_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_PrefillParity_ROCm2TP_Dynamic_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_DecodeParity_ROCm2TP_Dynamic_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_PrefillParity_CUDA2TP_LLEP_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_DecodeParity_CUDA2TP_LLEP_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_PrefillParity_ROCm2TP_LLEP_PhaseSplit_FP16Transport$"
+  "V2_Integration_Parity_Qwen36MoE_ExpertOverlay_Math_DecodeParity_ROCm2TP_LLEP_PhaseSplit_FP16Transport$"
 )
 
 TOTAL=${#TESTS[@]}

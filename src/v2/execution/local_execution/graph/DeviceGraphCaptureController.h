@@ -88,6 +88,10 @@ namespace llaminar2
             std::function<bool(const DeviceGraphExecutor::GraphSegment &)> cohere_inputs;
             /// Executes one stage through executor's canonical node path.
             std::function<bool(ComputeNode &)> execute_node;
+            /// Preallocates point-in-time snapshot copy descriptors/storage before capture.
+            std::function<bool(ComputeNode &, void *)> prepare_snapshot_copies;
+            /// Records point-in-time snapshot copies after direct stage execution.
+            std::function<bool(ComputeNode &, void *)> record_snapshot_copies;
             /// Runs post-launch lifecycle hooks (dirty marking, callbacks, step bookkeeping).
             std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> post_launch;
         };
@@ -227,7 +231,8 @@ namespace llaminar2
             bool has_collective_nodes,
             bool needs_segment_sync,
             uint64_t current_step,
-            const std::function<bool(ComputeNode &)> &execute_node_cb);
+            const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb);
 
         /**
          * @brief Launch one capturable segment in normal replay mode.
@@ -252,6 +257,7 @@ namespace llaminar2
             IWorkerGPUContext *gpu_ctx,
             void *capture_stream,
             int segment_index,
+            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -282,6 +288,7 @@ namespace llaminar2
             bool has_collective_nodes,
             uint64_t current_step,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -295,7 +302,8 @@ namespace llaminar2
             void *capture_stream,
             bool has_collective_nodes,
             uint64_t current_step,
-            const std::function<bool(ComputeNode &)> &execute_node_cb);
+            const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb);
 
         /**
          * @brief Run stage-owned dynamic metadata uploads before capture/replay.
@@ -322,6 +330,7 @@ namespace llaminar2
             int segment_index,
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**
@@ -343,6 +352,7 @@ namespace llaminar2
             const std::string &perf_context,
             const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
             const std::function<bool(ComputeNode &)> &execute_node_cb,
+            const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
             const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb);
 
         /**

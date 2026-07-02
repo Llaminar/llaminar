@@ -341,6 +341,7 @@ if(HAVE_CUDA)
         kernels/cuda/ops/CUDAVectorAddKernels.cu      # Vector add kernels (for collective reductions)
         kernels/cuda/ops/CUDASamplingKernels.cu        # Argmax + Top-K kernels for GPU-side sampling
         kernels/cuda/ops/CUDACastKernels.cu            # FP32↔FP16 cast kernels for mixed-precision allreduce
+        kernels/cuda/ops/CUDATPKVStateKernels.cu       # TP-local K/V state deinterleave for phase-split decode caches
         kernels/cuda/attention/CUDAFlashAttentionKernels.cu  # Flash Attention 2 and Flash Decoding kernels
         kernels/cuda/kvcache/CUDARingKVCache.cu       # Ring buffer KV cache with O(1) eviction
         kernels/cuda/kvcache/CUDATurboQuantKernels.cu  # TurboQuant quantize/dequant/RoPE GPU kernels
@@ -557,7 +558,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmGemvKernel_INT8_VNNI.hip    # INT8 VNNI GEMV/GEMM kernels for decode + prefill (gfx906)
         kernels/rocm/gemm/ROCmGemvKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMV kernels (gfx906)
         kernels/rocm/gemm/ROCmQuantisedGemmKernel_native_VNNI.hip  # Native-VNNI 4-bit (Q4_0/IQ4_NL) GEMM kernels for M>1 prefill (gfx906)
-        kernels/rocm/gemm/ROCmTinyFP32ProjectionKernels.hip # Tiny graph-capturable FP32 small-M projection kernels
+        kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/attention/ROCmFlashAttentionKernels.hip  # Flash Attention 2 + Flash Decoding for MI50
         kernels/rocm/kvcache/ROCmRingKVCacheKernels.hip       # Ring buffer KV cache kernels
@@ -573,6 +574,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmSamplingKernels.hip              # Top-K kernel for GPU-side top-k/top-p sampling
         kernels/rocm/ops/ROCmFusedOpsKernels.hip              # Fused Residual+RMSNorm, Fused SwiGLU+Quant kernels
         kernels/rocm/ops/ROCmCastKernels.hip                  # FP32↔FP16 cast kernels for mixed-precision allreduce
+        kernels/rocm/ops/ROCmTPKVStateKernels.hip             # TP-local K/V state deinterleave for phase-split decode caches
         # GDN (Gated Delta Net) kernels for Qwen 3.5
         kernels/rocm/gdn/ROCmGatedDeltaNetKernels.hip        # GDN recurrence, conv1d, GatedRMSNorm, OutputGate
         # MoE (Mixture of Experts) kernels
@@ -1324,6 +1326,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
+    execution/compute_stages/stages/TPKVCacheStateAllGatherStage.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp
     execution/compute_stages/stages/MTPConcatStage.cpp
     execution/moe/IMoERouter.cpp

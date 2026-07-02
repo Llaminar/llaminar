@@ -153,6 +153,10 @@ namespace llaminar2
         uint32_t command_capacity = 0;
         uint32_t participant_id = 0;
         uint32_t participant_count = 1;
+        uint32_t requested_payload_slots = 0;
+        uint32_t payload_bucket_slots = 0;
+        uint32_t payload_bucket_index = 0;
+        uint32_t payload_bucket_overflow = 0;
         uint32_t reserved[3] = {};
     };
 
@@ -306,6 +310,7 @@ namespace llaminar2
         InvalidConfig = 2,
         InvalidRuntime = 3,
         MissingHistogram = 4,
+        MissingTransferCompletion = 5,
     };
 
     struct DeviceMoERebalanceConfig

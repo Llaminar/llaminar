@@ -296,13 +296,15 @@ namespace llaminar2
     bool IMoEKernel::assignPrefillRoutesFromLeastLoadedCurrentBatchPlanAfterTransfers(
         DeviceMoELayerRuntime *runtime_layer,
         int current_tokens, int max_tokens,
-        int num_experts, int top_k)
+        int num_experts, int top_k,
+        const DeviceMoERebalanceStatus *transfer_status)
     {
         (void)runtime_layer;
         (void)current_tokens;
         (void)max_tokens;
         (void)num_experts;
         (void)top_k;
+        (void)transfer_status;
         LOG_ERROR("[IMoEKernel] LeastLoadedEP transfer-backed prefill route assignment "
                   "was requested on a backend that does not implement current-batch LLEP");
         throw std::logic_error(

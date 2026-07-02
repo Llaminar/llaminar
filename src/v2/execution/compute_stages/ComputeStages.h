@@ -27,6 +27,7 @@
 // Attention stages
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
+#include "stages/TPKVCacheStateAllGatherStage.h"
 #include "stages/AttentionComputeStage.h"
 
 // FFN and residual

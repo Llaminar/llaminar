@@ -3055,9 +3055,26 @@ namespace llaminar2
     bool CUDABackend::deviceCopyAsync(void *dst, const void *src, size_t bytes,
                                       int device_id, void *stream)
     {
+        if (bytes == 0)
+            return true;
+        if (!dst || !src)
+        {
+            LOG_ERROR("[CUDABackend::deviceCopyAsync] null pointer for non-empty copy"
+                      << " dst=" << dst << " src=" << src << " bytes=" << bytes);
+            return false;
+        }
+        if (!stream)
+        {
+            LOG_ERROR("[CUDABackend::deviceCopyAsync] refused to use CUDA null stream");
+            return false;
+        }
         cudaError_t err = cudaSetDevice(device_id);
         if (err != cudaSuccess)
+        {
+            LOG_ERROR("[CUDABackend::deviceCopyAsync] cudaSetDevice(" << device_id
+                                                                      << ") failed: " << cudaGetErrorString(err));
             return false;
+        }
         err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice,
                               static_cast<cudaStream_t>(stream));
         if (err != cudaSuccess)

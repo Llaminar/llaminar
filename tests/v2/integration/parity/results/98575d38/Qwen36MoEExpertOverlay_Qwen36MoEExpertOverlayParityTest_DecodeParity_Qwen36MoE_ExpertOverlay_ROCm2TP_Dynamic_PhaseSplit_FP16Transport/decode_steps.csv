@@ -1,0 +1,4 @@
+backend,step,cosine,kl_divergence,top1_overlap,top5_overlap,llaminar_token,pytorch_token,token_match,top3_match,top5_match,passed
+Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport,0,0.999321,0.00345154,1,1,271,271,true,true,true,true
+Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport,1,0.998814,0.00648988,0,1,760,71093,false,true,true,true
+Qwen36MoE_ExpertOverlay_ROCm2TP_Dynamic_PhaseSplit_FP16Transport,2,0.999711,0.000947641,1,1,12305,12305,true,true,true,true

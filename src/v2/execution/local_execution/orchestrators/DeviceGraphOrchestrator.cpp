@@ -328,6 +328,8 @@ namespace llaminar2
             const MoEDeviceRebalanceStage::Params &params,
             const DeviceMoERebalanceStatus &status,
             const DeviceMoERebalanceGraphControllerState &controller_state,
+            const DeviceMoERebalanceApplyStatus &copy_status,
+            bool valid_copy_status,
             const DeviceMoERebalanceApplyStatus &apply_status,
             const std::vector<DeviceMoERebalanceCommandBufferHeader> &command_headers,
             const std::vector<DeviceMoERebalanceWaveState> &wave_states,
@@ -639,6 +641,44 @@ namespace llaminar2
             if (!first)
                 out << ',';
             first = false;
+            out << "\"copy_status\":{";
+            bool copy_first = true;
+            appendJsonNumberField(out, copy_first, "valid", valid_copy_status ? 1u : 0u);
+            appendJsonNumberField(out, copy_first, "status_code", copy_status.status_code);
+            appendJsonNumberField(out, copy_first, "plan_entries_seen", copy_status.plan_entries_seen);
+            appendJsonNumberField(out, copy_first, "applied_arrivals", copy_status.applied_arrivals);
+            appendJsonNumberField(out, copy_first, "copied_arrivals", copy_status.copied_arrivals);
+            appendJsonNumberField(out, copy_first, "copy_incomplete", copy_status.copy_incomplete);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "missing_source_descriptors",
+                                  copy_status.missing_source_descriptors);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "missing_destination_slots",
+                                  copy_status.missing_destination_slots);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "descriptor_mismatches",
+                                  copy_status.descriptor_mismatches);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "invalid_plan_entries",
+                                  copy_status.invalid_plan_entries);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "skipped_wrong_destination",
+                                  copy_status.skipped_wrong_destination);
+            appendJsonNumberField(out, copy_first, "changed_layers", copy_status.changed_layers);
+            appendJsonNumberField(out,
+                                  copy_first,
+                                  "post_apply_multi_resident_experts",
+                                  copy_status.post_apply_multi_resident_experts);
+            out << '}';
+
+            if (!first)
+                out << ',';
+            first = false;
             out << "\"apply_status\":{";
             bool apply_first = true;
             appendJsonNumberField(out, apply_first, "status_code", apply_status.status_code);
@@ -646,6 +686,26 @@ namespace llaminar2
             appendJsonNumberField(out, apply_first, "applied_arrivals", apply_status.applied_arrivals);
             appendJsonNumberField(out, apply_first, "copied_arrivals", apply_status.copied_arrivals);
             appendJsonNumberField(out, apply_first, "copy_incomplete", apply_status.copy_incomplete);
+            appendJsonNumberField(out,
+                                  apply_first,
+                                  "missing_source_descriptors",
+                                  apply_status.missing_source_descriptors);
+            appendJsonNumberField(out,
+                                  apply_first,
+                                  "missing_destination_slots",
+                                  apply_status.missing_destination_slots);
+            appendJsonNumberField(out,
+                                  apply_first,
+                                  "descriptor_mismatches",
+                                  apply_status.descriptor_mismatches);
+            appendJsonNumberField(out,
+                                  apply_first,
+                                  "invalid_plan_entries",
+                                  apply_status.invalid_plan_entries);
+            appendJsonNumberField(out,
+                                  apply_first,
+                                  "skipped_wrong_destination",
+                                  apply_status.skipped_wrong_destination);
             appendJsonNumberField(out, apply_first, "changed_layers", apply_status.changed_layers);
             appendJsonNumberField(out,
                                   apply_first,
@@ -673,6 +733,7 @@ namespace llaminar2
                 appendJsonNumberField(out, wave_first, "command_count", wave.command_count);
                 appendJsonNumberField(out, wave_first, "copied_arrivals", wave.copied_arrivals);
                 appendJsonNumberField(out, wave_first, "applied_arrivals", wave.applied_arrivals);
+                appendJsonNumberField(out, wave_first, "applied_layer_count", wave.applied_layer_count);
                 appendJsonNumberField(out, wave_first, "requested_payload_slots", wave.requested_payload_slots);
                 appendJsonNumberField(out, wave_first, "payload_bucket_slots", wave.payload_bucket_slots);
                 appendJsonNumberField(out, wave_first, "error_code", wave.error_code);
@@ -2432,6 +2493,11 @@ namespace llaminar2
         return moe_rebalance_controller_->mode() == MoERebalanceMode::DYNAMIC;
     }
 
+    bool DeviceGraphOrchestrator::isMoeRebalancingGraphStableForPrefillCapture() const
+    {
+        return usesGraphStableGpuMoERebalance();
+    }
+
     bool DeviceGraphOrchestrator::prefillGraphCaptureDisabledByHost() const
     {
         return false;
@@ -2612,6 +2678,11 @@ namespace llaminar2
         if (!moe_rebalance_controller_)
             return epoch;
         return std::max(epoch, moe_rebalance_controller_->placementEpoch());
+    }
+
+    uint64_t DeviceGraphOrchestrator::moeRuntimeMovementEpoch() const
+    {
+        return std::max(moePlacementEpoch(), moe_runtime_movement_epoch_);
     }
 
     std::string DeviceGraphOrchestrator::prefillGraphDomainId() const
@@ -3132,6 +3203,43 @@ namespace llaminar2
             if (!arena_->registerBuffer(id, rows, cols, dtype, desc.device))
             {
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to register layer buffer: " << desc.name);
+                return false;
+            }
+        }
+
+        // Phase-split dense execution keeps prefill Q/K/V projections TP-local
+        // but seeds a replicated decode KV cache. Register explicit full-width
+        // K/V rows only for that handoff so non-phase-split runs do not pay the
+        // extra activation memory.
+        const bool needs_phase_split_prefill_kv_handoff =
+            state_.device_id.is_gpu() &&
+            config.dense_tp_enabled &&
+            config.dense_tp_decode_replicated &&
+            config.qkv_column_parallel &&
+            config.n_kv_heads > 0 &&
+            config.head_dim > 0;
+        if (needs_phase_split_prefill_kv_handoff)
+        {
+            const size_t kv_cols =
+                static_cast<size_t>(config.n_kv_heads) *
+                static_cast<size_t>(config.head_dim);
+            if (kv_cols == 0)
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Invalid full KV width for phase-split prefill handoff");
+                return false;
+            }
+            if (!arena_->registerBuffer(BufferId::K_FULL_PREFILL,
+                                        static_cast<size_t>(seq_len),
+                                        kv_cols,
+                                        "FP32",
+                                        state_.device_id) ||
+                !arena_->registerBuffer(BufferId::V_FULL_PREFILL,
+                                        static_cast<size_t>(seq_len),
+                                        kv_cols,
+                                        "FP32",
+                                        state_.device_id))
+            {
+                LOG_ERROR("[DeviceGraphOrchestrator] Failed to register phase-split full prefill K/V buffers");
                 return false;
             }
         }
@@ -3908,6 +4016,7 @@ namespace llaminar2
 
         DeviceMoERebalanceStatus status{};
         DeviceMoERebalanceGraphControllerState controller_state{};
+        DeviceMoERebalanceApplyStatus copy_status{};
         DeviceMoERebalanceApplyStatus apply_status{};
         std::vector<DeviceMoERebalanceCommandBufferHeader> command_headers(command_buffer_count);
         std::vector<DeviceMoERebalanceWaveState> wave_states(command_buffer_count);
@@ -3934,7 +4043,7 @@ namespace llaminar2
         }
 
         const bool export_perfstats = PerfStatsCollector::isEnabled();
-        const bool export_diagnostics = export_perfstats || export_trace;
+        const bool export_diagnostics = export_perfstats || export_trace || outcome;
         if (export_diagnostics)
         {
             if (!copy_required(&controller_state,
@@ -3949,6 +4058,9 @@ namespace llaminar2
                 !copy_required(plan_counts.data(),
                                buffer_name(MoEDeviceRebalanceStage::WS_TRANSFER_PLAN_COUNT),
                                plan_counts.size() * sizeof(plan_counts.front())) ||
+                !copy_optional(&copy_status,
+                               buffer_name(MoEDeviceRebalanceStage::WS_COPY_STATUS),
+                               sizeof(copy_status)) ||
                 !copy_optional(&apply_status,
                                buffer_name(MoEDeviceRebalanceStage::WS_APPLY_STATUS),
                                sizeof(apply_status)))
@@ -4008,6 +4120,15 @@ namespace llaminar2
             outcome->windows_applied = status.windows_applied;
             outcome->selected_replicas = status.selected_replicas;
             outcome->planned_arrivals = status.planned_arrivals;
+            const bool apply_status_valid =
+                apply_status.magic == kDeviceMoERebalanceMagic &&
+                apply_status.version == kDeviceMoERebalanceVersion &&
+                apply_status.status_code ==
+                    static_cast<uint32_t>(DeviceMoERebalanceApplyStatusCode::Ok);
+            outcome->runtime_changed_layers =
+                apply_status_valid ? apply_status.changed_layers : status.changed_layers;
+            outcome->runtime_applied_arrivals =
+                apply_status_valid ? apply_status.applied_arrivals : 0u;
             outcome->payload_bucket_slots = status.payload_bucket_slots;
             outcome->payload_source_participant_mask =
                 status.payload_source_participant_mask;
@@ -4019,9 +4140,41 @@ namespace llaminar2
                 status.status_code ==
                     static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok) &&
                 (status.windows_applied != 0u ||
+                 status.changed_layers != 0u ||
                  status.selected_replicas != 0u ||
                  status.planned_arrivals != 0u ||
+                 outcome->runtime_changed_layers != 0u ||
+                 outcome->runtime_applied_arrivals != 0u ||
                  status.payload_bucket_slots != 0u);
+        }
+        const bool valid_status =
+            status.magic == kDeviceMoERebalanceMagic &&
+            status.version == kDeviceMoERebalanceVersion &&
+            status.status_code ==
+                static_cast<uint32_t>(DeviceMoERebalanceStatusCode::Ok);
+        const bool valid_apply_status =
+            apply_status.magic == kDeviceMoERebalanceMagic &&
+            apply_status.version == kDeviceMoERebalanceVersion &&
+            apply_status.status_code ==
+                static_cast<uint32_t>(DeviceMoERebalanceApplyStatusCode::Ok);
+        const bool valid_copy_status =
+            copy_status.magic == kDeviceMoERebalanceMagic &&
+            copy_status.version == kDeviceMoERebalanceVersion &&
+            copy_status.status_code ==
+                static_cast<uint32_t>(DeviceMoERebalanceApplyStatusCode::Ok);
+        const bool runtime_moved =
+            valid_status &&
+            (status.windows_applied != 0u ||
+             status.changed_layers != 0u ||
+             status.selected_replicas != 0u ||
+             status.planned_arrivals != 0u ||
+             status.payload_bucket_slots != 0u ||
+             (valid_apply_status &&
+              (apply_status.changed_layers != 0u ||
+               apply_status.applied_arrivals != 0u)));
+        if (runtime_moved)
+        {
+            ++moe_runtime_movement_epoch_;
         }
         if (!export_diagnostics)
             return true;
@@ -4657,6 +4810,8 @@ namespace llaminar2
                     params,
                     status,
                     controller_state,
+                    copy_status,
+                    valid_copy_status,
                     apply_status,
                     command_headers,
                     wave_states,
@@ -4693,6 +4848,17 @@ namespace llaminar2
                  apply_status.missing_destination_slots);
         emit_u32("device_rebalance_apply_descriptor_mismatches",
                  apply_status.descriptor_mismatches);
+        emit_u32("device_rebalance_copy_status_valid", valid_copy_status ? 1u : 0u);
+        emit_u32("device_rebalance_copy_plan_entries_seen", copy_status.plan_entries_seen);
+        emit_u32("device_rebalance_copy_copied_arrivals", copy_status.copied_arrivals);
+        emit_u32("device_rebalance_copy_missing_source_descriptors",
+                 copy_status.missing_source_descriptors);
+        emit_u32("device_rebalance_copy_missing_destination_slots",
+                 copy_status.missing_destination_slots);
+        emit_u32("device_rebalance_copy_descriptor_mismatches",
+                 copy_status.descriptor_mismatches);
+        emit_u32("device_rebalance_copy_invalid_plan_entries",
+                 copy_status.invalid_plan_entries);
 
         emit_u32("device_rebalance_controller_maintenance_launches",
                  controller_state.maintenance_launches);
@@ -4980,16 +5146,22 @@ namespace llaminar2
                                           : env.moe_rebalance.window_size;
         const int window = std::max(1, configured_window);
         const int maintenance_slack =
-            std::max(0, env.moe_rebalance.device_rebalance_maintenance_slack_tokens);
+            graph_config.moe.rebalance_config.device_maintenance_slack_tokens >= 0
+                ? std::max(0, graph_config.moe.rebalance_config.device_maintenance_slack_tokens)
+                : std::max(0, env.moe_rebalance.device_rebalance_maintenance_slack_tokens);
         const int requested_launch_period = std::max(1, window + maintenance_slack);
         const int min_maintenance_period =
-            std::max(0, env.moe_rebalance.device_rebalance_min_maintenance_period_tokens);
+            graph_config.moe.rebalance_config.device_min_maintenance_period_tokens >= 0
+                ? std::max(0, graph_config.moe.rebalance_config.device_min_maintenance_period_tokens)
+                : std::max(0, env.moe_rebalance.device_rebalance_min_maintenance_period_tokens);
         const int launch_period =
             min_maintenance_period > 0
                 ? std::max(requested_launch_period, min_maintenance_period)
                 : requested_launch_period;
         const int initial_maintenance_period =
-            std::max(0, env.moe_rebalance.device_rebalance_initial_maintenance_period_tokens);
+            graph_config.moe.rebalance_config.device_initial_maintenance_period_tokens >= 0
+                ? std::max(0, graph_config.moe.rebalance_config.device_initial_maintenance_period_tokens)
+                : std::max(0, env.moe_rebalance.device_rebalance_initial_maintenance_period_tokens);
         ++device_moe_rebalance_decode_tokens_seen_;
         const uint64_t decode_tokens_seen = device_moe_rebalance_decode_tokens_seen_;
         bool should_launch = false;
@@ -6093,9 +6265,7 @@ namespace llaminar2
         DeviceGraphExecutor::DecodeCapturePolicy policy;
 
         const auto &env = debugEnv();
-        policy.allow_fast_decode =
-            env.execution.fast_decode &&
-            !executor_.config().snapshot_callback;
+        policy.allow_fast_decode = env.execution.fast_decode;
 
         if (!policy.allow_fast_decode)
         {
@@ -17928,6 +18098,7 @@ namespace llaminar2
         snapshot.primary_device = state_.device_id;
         snapshot.current_position = getPosition(0);
         snapshot.session_epoch = session_epoch_;
+        snapshot.moe_runtime_movement_epoch = moeRuntimeMovementEpoch();
         snapshot.live_state_epoch = live_replay_state_epoch_;
         snapshot.live_state_mutations = live_state_mutation_count_;
         snapshot.last_live_state_mutation_reason =

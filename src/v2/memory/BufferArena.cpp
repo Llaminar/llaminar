@@ -219,6 +219,23 @@ namespace llaminar2
         }
     }
 
+    static bool shouldUseMappedMemoryForBuffer(BufferId id)
+    {
+        switch (id)
+        {
+        case BufferId::LOGITS:
+        case BufferId::LOGITS_LOCAL:
+        case BufferId::ALL_POSITION_LOGITS:
+        case BufferId::ALL_POSITION_LOGITS_LOCAL:
+        case BufferId::PREFIX_TERMINAL_LOGITS:
+        case BufferId::STOCHASTIC_PROCESSED_LOGITS:
+        case BufferId::MTP_LOGITS:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     /// Map buffer name string (from BufferDescriptor/BufferNames) to BufferId.
     /// Returns BufferId::_COUNT if no mapping exists.
     BufferId BufferArena::bufferNameToId(const std::string &name)
@@ -234,6 +251,10 @@ namespace llaminar2
             return BufferId::K_PROJ;
         if (name == "V")
             return BufferId::V_PROJ;
+        if (name == "K_full_prefill")
+            return BufferId::K_FULL_PREFILL;
+        if (name == "V_full_prefill")
+            return BufferId::V_FULL_PREFILL;
         if (name == "attn_output")
             return BufferId::ATTN_OUTPUT;
         if (name == "attn_proj")
@@ -376,13 +397,20 @@ namespace llaminar2
         const ManagedBuffer &b, BufferId id) const
     {
         std::vector<size_t> shape{b.rows, b.cols};
+        const std::string dtype = b.dtype ? std::string(b.dtype) : "FP32";
+        const bool is_fp32 = dtype == "FP32";
+        const bool mapped_requested =
+            config_.use_mapped_memory && b.home_device.is_gpu() && is_fp32;
+        const bool mapped_allowed =
+            mapped_requested && shouldUseMappedMemoryForBuffer(id);
 
         // ── Factory-based allocation (NUMA-aware, dtype-aware) ──────────
         if (config_.factory)
         {
-            // Mapped memory for GPU FP32 tensors in snapshot/debugging mode
-            if (config_.use_mapped_memory && b.home_device.is_gpu() &&
-                b.dtype && std::string(b.dtype) == "FP32")
+            // Mapped memory is only safe for host-visible publication buffers.
+            // Scratch activations must stay in device memory so graph-captured
+            // GPU paths do not smuggle in mapped-output copies.
+            if (mapped_allowed)
             {
                 auto mapped = FP32Tensor::createMapped(shape, b.home_device);
                 if (mapped && mapped->isMapped())
@@ -396,35 +424,46 @@ namespace llaminar2
             }
 
             // Dispatch by dtype string
-            if (!b.dtype || std::string(b.dtype) == "FP32")
+            if (is_fp32)
             {
+                if (mapped_requested && !mapped_allowed)
+                {
+                    LOG_TRACE("[BufferArena] Keeping GPU FP32 scratch buffer '"
+                              << bufferIdName(id) << "' in device memory on "
+                              << b.home_device.toString());
+                    return std::make_shared<FP32Tensor>(shape, b.home_device);
+                }
                 return config_.factory->createFP32(shape, b.home_device);
             }
-            else if (std::string(b.dtype) == "FP16")
+            else if (dtype == "FP16")
             {
                 return config_.factory->createFP16(shape);
             }
-            else if (std::string(b.dtype) == "BF16")
+            else if (dtype == "BF16")
             {
                 return config_.factory->createBF16(shape);
             }
-            else if (std::string(b.dtype) == "Q8_1")
+            else if (dtype == "Q8_1")
             {
                 return config_.factory->createQ8_1(shape, b.home_device);
             }
-            else if (std::string(b.dtype) == "Q16_1")
+            else if (dtype == "Q16_1")
             {
                 return config_.factory->createQ16_1(shape, b.home_device);
             }
-            else if (std::string(b.dtype) == "INT32")
+            else if (dtype == "INT32")
             {
                 return config_.factory->createINT32(shape);
             }
             else
             {
-                LOG_DEBUG("[BufferArena] Unknown dtype '" << b.dtype
+                LOG_DEBUG("[BufferArena] Unknown dtype '" << dtype
                                                           << "' for " << bufferIdName(id)
                                                           << ", defaulting to FP32");
+                if (mapped_requested && !mapped_allowed)
+                {
+                    return std::make_shared<FP32Tensor>(shape, b.home_device);
+                }
                 return config_.factory->createFP32(shape, b.home_device);
             }
         }

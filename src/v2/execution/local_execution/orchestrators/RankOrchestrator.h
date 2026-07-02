@@ -814,6 +814,7 @@ namespace llaminar2
          */
         const char *architecture() const override;
         uint64_t moePlacementEpoch() const override;
+        uint64_t moeRuntimeMovementEpoch() const override;
 
         /**
          * @brief Aggregate per-runner runtime state for prefix-cache/MTP probes.
@@ -879,6 +880,7 @@ namespace llaminar2
          * @param output_dir Directory for snapshot output
          */
         void enableSnapshotCapture(const std::string &output_dir = "") override;
+        void setSnapshotCaptureFilter(const std::vector<std::string> &keys) override;
 
         /**
          * @brief Disable snapshot capture on all device runners
@@ -1188,6 +1190,10 @@ namespace llaminar2
          * @brief Aggregate stats from all device runners
          */
         void aggregateStats() const;
+
+        SnapshotShardingMode resolveSnapshotShardingMode(const std::string &key) const;
+        bool phaseSplitReplicatedDecodeSnapshotsActive() const;
+        static bool isPhaseSplitReplicatedDecodeSnapshotKey(const std::string &key);
 
         /**
          * @brief Replay rank-level logits gather policy into gatherers/children.

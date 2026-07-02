@@ -259,10 +259,10 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsCPUDevice)
 }
 
 // =============================================================================
-// Test: Preflight rejects when snapshots are active
+// Test: Preflight allows snapshots because capture is drained after graph launch
 // =============================================================================
 
-TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsSnapshots)
+TEST(Test__PrefillGraphCacheIntegration, PreflightAllowsSnapshots)
 {
     PrefillGraphConfig config;
     config.enabled = true;
@@ -279,7 +279,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsSnapshots)
     std::unordered_set<std::string> no_collectives;
     auto reason = cache.preflight(graph, key, &no_collectives,
                                   /*snapshots_active=*/true, false);
-    EXPECT_EQ(reason, PrefillGraphRejectReason::SnapshotsActive);
+    EXPECT_EQ(reason, PrefillGraphRejectReason::None);
 }
 
 // =============================================================================
@@ -387,6 +387,7 @@ TEST(Test__PrefillGraphCacheIntegration, PreflightRejectsNonCapturableStage)
         512,
         512,
         PrefillGraphPreflightMode::Default,
+        false,
         false,
         &reject_stage_name,
         &reject_stage_type);
@@ -509,6 +510,7 @@ TEST(Test__PrefillGraphCacheIntegration, DefaultHostMoERebalancingReturnsFalse)
 {
     MinimalTestHost host;
     EXPECT_FALSE(host.isMoeRebalancingActive());
+    EXPECT_FALSE(host.isMoeRebalancingGraphStableForPrefillCapture());
     EXPECT_FALSE(host.prefillGraphCaptureDisabledByHost());
     EXPECT_EQ(host.moePlacementEpoch(), 0u);
 }

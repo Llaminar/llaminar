@@ -1255,6 +1255,9 @@ namespace llaminar2
         uint32_t device_min_foreign_rows_per_transfer = 0;
         uint32_t device_min_router_spread_improvement_per_payload_slot = 128;
         uint32_t device_max_post_wave_load_spread_per_mille = 100;
+        int device_maintenance_slack_tokens = -1;
+        int device_min_maintenance_period_tokens = -1;
+        int device_initial_maintenance_period_tokens = -1;
         bool release_raw_expert_weights = false;
     };
 

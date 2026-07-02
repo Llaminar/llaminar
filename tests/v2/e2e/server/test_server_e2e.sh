@@ -102,6 +102,9 @@
 #   LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE Enable CUDA2/ROCm2 Qwen3.6
 #                       MoE prefix-cache + dynamic-rebalance clear-cache probes
 #                       in the default suite list (default: 0).
+#   LLAMINAR_E2E_ENABLE_QWEN36_MOE_REBALANCE_E2E Enable CUDA2/ROCm2 Qwen3.6
+#                       MoE Dynamic/LLEP long-context rebalance suites in the
+#                       default list (default: 1).
 # =============================================================================
 
 set -euo pipefail
@@ -155,6 +158,7 @@ GPU_RELEASE_TIMEOUT_SECONDS="${LLAMINAR_E2E_GPU_RELEASE_TIMEOUT_SECONDS:-30}"
 TRACE_TOKENS="${LLAMINAR_E2E_TRACE_TOKENS:-0}"
 REMOTE_EXPERT_OVERLAY_E2E="${LLAMINAR_E2E_ENABLE_REMOTE_EXPERT_OVERLAY:-0}"
 MOE_REBALANCE_CLEAR_PROBE_E2E="${LLAMINAR_E2E_ENABLE_MOE_REBALANCE_CLEAR_PROBE:-0}"
+QWEN36_MOE_REBALANCE_E2E="${LLAMINAR_E2E_ENABLE_QWEN36_MOE_REBALANCE_E2E:-1}"
 PERF_STATS_ENABLED="${LLAMINAR_E2E_PERF_STATS:-1}"
 PERF_STATS_GPU_STAGE_TIMING="${LLAMINAR_E2E_PERF_STATS_GPU_STAGE_TIMING:-1}"
 # Thinking-capable Qwen models may spend hundreds of tokens deliberating before
@@ -178,6 +182,8 @@ THINKING_BUDGET_TOKENS="${LLAMINAR_E2E_THINKING_BUDGET_TOKENS-16}"
 #   require-prefill-graph-capture  Fail unless perfstats record prefill capture/replay.
 #   prefix-cache-rebalance-clear-probe  Exercise HTTP prefix-cache requests while
 #                       dynamic MoE rebalance leaves a prepared publish for request cleanup.
+#   moe-rebalance-movement-probe  Fail unless PerfStats prove the MoE rebalance
+#                       path planned and applied or imported at least one expert.
 # If the 3rd field is non-numeric, it's treated as extra_flags (max_tokens defaults to 200).
 # Each --suite flag appends to the list. If none given, defaults are used.
 declare -a SUITES=()
@@ -335,6 +341,9 @@ if [ ${#SUITES[@]} -eq 0 ]; then
     S9_TP_ROCM2_FLAGS="--tp-devices rocm:0,rocm:1"
     S9_TP_ROCM4_FLAGS="--tp-devices rocm:0,rocm:1,rocm:2,rocm:3"
     S9_REBALANCE_FLAGS="--moe-rebalance dynamic --moe-hot-expert-cache 2 --moe-rebalance-window 8 --moe-rebalance-max-window 8 --moe-rebalance-window-growth 1 --moe-release-raw-expert-weights"
+    S9_REBALANCE_MOVEMENT_FLAGS="--moe-hot-expert-cache off --moe-rebalance-window 4 --moe-rebalance-max-window 4 --moe-rebalance-window-growth 1 --moe-dynamic-imbalance-threshold-permille 0 --moe-dynamic-min-improvement-permille 0 --moe-dynamic-max-swaps-per-layer 20 --moe-dynamic-max-plan-entries-per-wave 20 --moe-dynamic-min-window-activations 0 --moe-device-rebalance-min-load-spread-improvement 0 --moe-device-rebalance-min-load-spread-improvement-divisor 0 --moe-device-rebalance-min-wave-spread-improvement-per-payload-slot 0 --moe-device-rebalance-min-foreign-rows-per-transfer 0 --moe-device-rebalance-min-router-spread-improvement-per-payload-slot 0 --moe-device-rebalance-max-post-wave-load-spread-permille 1000 --moe-release-raw-expert-weights"
+    S9_OVERLAY_CUDA2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_cuda_hot --moe-expert-overlay-base-domain qwen36_moe_cuda_hot --moe-expert-overlay-shared-domain qwen36_moe_cuda_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-dense-policy phase-split-hybrid-tp-ae --moe-expert-overlay-domain qwen36_moe_cuda_hot=cuda:0,cuda:1;scope=local;backend=nccl;compute=apportioned_experts;owner=0 --moe-expert-overlay-tier hot@qwen36_moe_cuda_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
+    S9_OVERLAY_ROCM2_FLAGS="--moe-expert-overlay tiered --moe-expert-overlay-continuation qwen36_moe_rocm_hot --moe-expert-overlay-base-domain qwen36_moe_rocm_hot --moe-expert-overlay-shared-domain qwen36_moe_rocm_hot --moe-expert-overlay-residency static-by-id --moe-expert-overlay-dense-policy phase-split-hybrid-tp-ae --moe-expert-overlay-domain qwen36_moe_rocm_hot=rocm:0,rocm:1;scope=local;backend=rccl;compute=apportioned_experts;owner=0 --moe-expert-overlay-tier hot@qwen36_moe_rocm_hot;priority=0;max-experts-per-layer=256;memory-mb=8192"
     # Remote NodeLocal CPU-cold ExpertOverlay shapes are the production target,
     # but they must not run in the default gate until non-root participant ranks
     # execute matched MPI sparse dispatch/local-expert/return-reduce stages.
@@ -351,6 +360,12 @@ if [ ${#SUITES[@]} -eq 0 ]; then
         SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM2_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm2tp|no-long-context,no-prefill-graph-buckets")
         SUITES+=("${S9_MODEL}|tp|200|${S9_PREFIX_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-prefix-ram-rocm4tp|no-long-context,no-prefill-graph-buckets")
         SUITES+=("${S9_MODEL}|tp|200|${S9_MTP_FLAGS} ${S9_TP_ROCM4_FLAGS}|qwen36-moe-mtp-greedy-d2-rocm4tp|no-long-context,no-prefill-graph-buckets")
+        if [[ "$QWEN36_MOE_REBALANCE_E2E" == "1" ]]; then
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance dynamic ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-dynamic-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_CUDA2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-cuda2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+            SUITES+=("${S9_MODEL}|tp|64|${S9_OVERLAY_ROCM2_FLAGS} --moe-rebalance llep ${S9_REBALANCE_MOVEMENT_FLAGS}|qwen36-moe-llep-rocm2tp|no-prefill-graph-buckets,non-thinking-only,moe-rebalance-movement-probe")
+        fi
         if [[ "$MOE_REBALANCE_CLEAR_PROBE_E2E" == "1" ]]; then
             SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_CUDA2_FLAGS} --backend nccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-cuda2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
             SUITES+=("${S9_MODEL}|tp|16|${S9_PREFIX_FLAGS} ${S9_TP_ROCM2_FLAGS} --backend rccl ${S9_REBALANCE_FLAGS}|qwen36-moe-prefix-rebalance-clear-rocm2tp|no-long-context,no-prefill-graph-buckets,non-thinking-only,prefix-cache-rebalance-clear-probe")
@@ -977,6 +992,11 @@ suite_runs_prefill_graph_probe() {
 suite_runs_prefix_cache_rebalance_clear_probe() {
     local suite_options="$1"
     [[ ",${suite_options}," == *",prefix-cache-rebalance-clear-probe,"* ]]
+}
+
+suite_runs_moe_rebalance_movement_probe() {
+    local suite_options="$1"
+    [[ ",${suite_options}," == *",moe-rebalance-movement-probe,"* ]]
 }
 
 is_gpu_backend() {
@@ -1705,6 +1725,7 @@ validate_perf_stats() {
     local validation
     validation=$(python3 - "$perf_path" "$backend" "$extra_flags" "$long_context_run" "$suite_options" <<'PY'
 import json
+import shlex
 import sys
 
 path, backend, extra_flags, long_context_run, suite_options = sys.argv[1:6]
@@ -1726,6 +1747,7 @@ require_prefill_capture = (
 )
 require_prefill_replay = "prefill-graph-probe" in suite_option_set
 require_prefix_rebalance_clear = "prefix-cache-rebalance-clear-probe" in suite_option_set
+require_moe_rebalance_movement = "moe-rebalance-movement-probe" in suite_option_set
 expect_decode_replay = (
     is_mtp
     or long_context_run == "true"
@@ -1751,6 +1773,51 @@ def has_record(name=None, domain=None, tags=None):
         if all(record_tags.get(key) == value for key, value in tags.items()):
             return True
     return False
+
+def numeric(value):
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+def record_value_sum(names, domain=None):
+    wanted = set(names)
+    total = 0.0
+    for record in records:
+        if record.get("name") not in wanted:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        total += numeric(record.get("value", record.get("count", 0.0)))
+    return total
+
+def tag_value_sum(keys, names=None, domain=None):
+    wanted_names = set(names or [])
+    wanted_keys = set(keys)
+    total = 0.0
+    for record in records:
+        if wanted_names and record.get("name") not in wanted_names:
+            continue
+        if domain is not None and record.get("domain") != domain:
+            continue
+        for key, value in (record.get("tags") or {}).items():
+            if key in wanted_keys:
+                total += numeric(value)
+    return total
+
+def flag_value(flag):
+    try:
+        tokens = shlex.split(extra_flags)
+    except ValueError:
+        tokens = extra_flags.split()
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+        if token.startswith(flag + "="):
+            return token.split("=", 1)[1]
+    return None
 
 decode_graph_captured = (
     has_record("decode_graph_phase", "forward_graph", {"phase": "capture"})
@@ -1838,6 +1905,77 @@ if require_prefix_rebalance_clear:
         if not has_record(name, "moe_rebalance"):
             print(f"FAIL: prefix-cache rebalance clear probe emitted no {name} counter")
             sys.exit(0)
+
+if require_moe_rebalance_movement:
+    if not is_gpu:
+        print("FAIL: MoE rebalance movement probe requires a GPU TP/PP backend")
+        sys.exit(0)
+    mode = flag_value("--moe-rebalance")
+    if mode not in {"dynamic", "llep"}:
+        print("FAIL: MoE rebalance movement probe requires --moe-rebalance dynamic or llep")
+        sys.exit(0)
+    if not has_record(domain="moe_rebalance"):
+        print("FAIL: MoE rebalance movement probe emitted no moe_rebalance counters")
+        sys.exit(0)
+
+    planned_score = (
+        record_value_sum(
+            (
+                "device_rebalance_planned_arrivals",
+                "device_rebalance_dynamic_ownership_swap_accepts",
+                "device_rebalance_llep_weight_transfer_count",
+                "device_rebalance_llep_assignment_span_count",
+                "replica_arrivals",
+                "new_placement_entries",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "planned_arrivals",
+                "dynamic_ownership_swap_accepts",
+                "llep_weight_transfer_count",
+                "llep_assignment_span_count",
+                "selected_replicas",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    applied_score = (
+        record_value_sum(
+            (
+                "device_rebalance_apply_applied_arrivals",
+                "device_rebalance_transfer_current_applied_arrivals",
+                "device_rebalance_transfer_useful_payload_bytes",
+                "device_rebalance_wave_applied_arrivals",
+                "device_rebalance_wave_applied_arrivals_total",
+                "device_rebalance_windows_applied",
+                "device_rebalance_llep_weight_transfer_count",
+                "gpu_direct_transfer_count",
+                "gpu_direct_transfer_bytes",
+                "gpu_direct_transfer_slot_publish_experts",
+                "replica_arrivals",
+                "new_placement_entries",
+            ),
+            "moe_rebalance",
+        )
+        + tag_value_sum(
+            (
+                "applied_arrivals",
+                "copied_arrivals",
+                "windows_applied",
+                "payload_bucket_slots",
+                "llep_weight_transfer_count",
+            ),
+            domain="moe_rebalance",
+        )
+    )
+    if planned_score <= 0.0:
+        print("FAIL: MoE rebalance movement probe saw no planned expert movement")
+        sys.exit(0)
+    if applied_score <= 0.0:
+        print("FAIL: MoE rebalance movement probe saw planned work but no applied/imported expert movement")
+        sys.exit(0)
 
 print(f"ok {len(records)}")
 PY
@@ -2314,6 +2452,34 @@ run_backend_tests() {
         local probe_gpu_cache_experts="${LLAMINAR_E2E_PREFIX_REBALANCE_GPU_CACHE_EXPERTS_PER_LAYER:-2}"
         echo -e "  ${BLUE}INFO${NC} [${tag}] Prefix-cache rebalance clear probe: gpu_cache_experts_per_layer=${probe_gpu_cache_experts}"
         server_env+=("LLAMINAR_MOE_GPU_CACHE_EXPERTS_PER_LAYER=${probe_gpu_cache_experts}")
+    fi
+    if suite_runs_moe_rebalance_movement_probe "$suite_options"; then
+        local probe_transfer_slots="${LLAMINAR_E2E_MOE_REBALANCE_COMPACT_PAYLOAD_SLOTS:-32}"
+        echo -e "  ${BLUE}INFO${NC} [${tag}] MoE rebalance movement probe: forcing short windows, zero movement floors, compact_payload_slots=${probe_transfer_slots}"
+        server_env+=(
+            "LLAMINAR_MOE_REBALANCE_WINDOW=4"
+            "LLAMINAR_MOE_REBALANCE_MAX_WINDOW=4"
+            "LLAMINAR_MOE_REBALANCE_WINDOW_GROWTH=1"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_IMBALANCE_THRESHOLD_PER_MILLE=0"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_IMPROVEMENT_PER_MILLE=0"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_SWAPS_PER_LAYER=20"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MAX_PLAN_ENTRIES_PER_WAVE=20"
+            "LLAMINAR_MOE_REBALANCE_DYNAMIC_MIN_WINDOW_ACTIVATIONS=0"
+            "LLAMINAR_MOE_LLEP_PREFILL_MIN_ROUTED_ROWS=0"
+            "LLAMINAR_MOE_LLEP_PREFILL_TRANSFER_MODE=full"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_INITIAL_MAINTENANCE_PERIOD_TOKENS=4"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_MAINTENANCE_PERIOD_TOKENS=4"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAINTENANCE_SLACK_TOKENS=1"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_NO_WORK_BACKOFF_PERIODS=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_LOAD_SPREAD_IMPROVEMENT_DIVISOR=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_WAVE_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_FOREIGN_ROWS_PER_TRANSFER=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MIN_ROUTER_SPREAD_IMPROVEMENT_PER_PAYLOAD_SLOT=0"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_MAX_POST_WAVE_LOAD_SPREAD_PER_MILLE=1000"
+            "LLAMINAR_MOE_GPU_DIRECT_TRANSFER_WAVE_EXPERTS=${probe_transfer_slots}"
+            "LLAMINAR_MOE_DEVICE_REBALANCE_COMPACT_PAYLOAD_SLOTS=${probe_transfer_slots}"
+        )
     fi
     if [ "$PERF_STATS_ENABLED" = "1" ]; then
         server_env+=("LLAMINAR_PERF_STATS_JSON=$perf_path")

@@ -75,8 +75,8 @@ namespace llaminar2
         FeatureDisabled,        ///< LLAMINAR_GPU_GRAPHS=0
         SeqLenBelowMinimum,     ///< seq_len < LLAMINAR_PREFILL_GRAPH_MIN_SEQ
         NotGPUDevice,           ///< CPU device
-        SnapshotsActive,        ///< ENABLE_PIPELINE_SNAPSHOTS build
-        ActiveMoERebalancing,   ///< Dynamic MoE rebalance is active for a padded bucket
+        SnapshotsActive,        ///< Obsolete: snapshots are post-graph diagnostics.
+        ActiveMoERebalancing,   ///< Non-graph-stable dynamic MoE rebalance is active for a padded bucket
         CollectiveNodesPresent, ///< Graph has TP/PP collective stages
         StageNotCapturable,     ///< One or more stages return isGraphCapturable()=false
         GDNWithPaddedBucket,    ///< GDN/short-conv state would advance through padding rows
@@ -152,6 +152,7 @@ namespace llaminar2
             int bucket_seq_len = 0,
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
             bool collectives_graph_capturable = false,
+            bool moe_rebalancing_graph_stable = false,
             std::string *reject_stage_name = nullptr,
             std::string *reject_stage_type = nullptr) const;
 
@@ -172,6 +173,10 @@ namespace llaminar2
         /// End graph capture, instantiate the executable graph.
         /// Transitions Capturing → Ready. Returns false on failure.
         bool endCaptureAndInstantiate(const PrefillGraphCacheKey &key);
+
+        /// Abort an in-progress capture for a key, exiting stream capture if needed.
+        /// Returns true when the cache is no longer in Capturing phase.
+        bool abortCapture(const PrefillGraphCacheKey &key);
 
         /// Launch (replay) the cached graph.
         /// Returns false if not Ready or launch fails.

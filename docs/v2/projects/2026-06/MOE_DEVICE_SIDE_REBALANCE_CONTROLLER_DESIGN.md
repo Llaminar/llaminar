@@ -517,6 +517,17 @@ Implemented or partially implemented:
   floor (`min_spread_improvement_divisor`) in addition to the absolute and
   per-transfer floors. CUDA and ROCm pass the same device rebalance config into
   LLEP, so the existing cost-gate knob no longer silently misses the LLEP path.
+- Current-batch LLEP assignment now reuses grouped-prefill route metadata instead
+  of scanning every route slot per expert. The planner publishes per-expert span
+  bounds in runtime scratch, and CUDA/ROCm assignment kernels apply only the
+  local span slice. Transfer-command materialization also avoids dead plan-buffer
+  zero-fill and uses a deterministic parallel no-overflow fast path with shared
+  transfer staging and parallel status bookkeeping.
+- 2026-07-02 validation after tuning current-batch LLEP assignment and
+  materialization: `V2_Perf_MoELLEPDeterminism`,
+  `V2_Integration_CUDAMoEKernel`, `V2_Integration_ROCmMoEKernel`, and focused
+  CUDA2/ROCm2 Qwen3.6 LLEP `PrefillParity`, `DecodeParity`, and
+  `LongContextDecodeParity` passed.
 - 2026-07-01 validation after exposing device movement-cost gates: integration
   and release builds passed; focused config/DebugEnv/LLEP tests passed; full
   unit suite passed (`514/514`).
@@ -636,6 +647,7 @@ keeps only the current design signal:
 
 | Scenario | Result | Takeaway |
 | --- | --- | --- |
+| CUDA/ROCm current-batch LLEP deterministic kernel perf, 512 tokens, 256 experts, top-k 8, 4 participants, 2026-07-02 | `V2_Perf_MoELLEPDeterminism`: CUDA assignment `4.28 us`, CUDA transfer-command materialization `5.58 us`; ROCm assignment `11.55 us`, ROCm materialization `34.70 us`. Hashes matched across backends: route assignment `9513987820616991619`, transfer plan `345862852378021593`. | Assignment no longer has the single-thread/per-expert route-slot walk (`~415 us` CUDA and `~1285 us` ROCm before tuning). ROCm materialization dropped from `~86 us` to `~35 us` by removing dead zero-fill and parallelizing the no-overflow command path, while preserving deterministic command order. |
 | CUDA2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 122.74 vs 125.80 tok/s decode; prefill 3235.87 vs 3227.29 tok/s | Dynamic path is healthy after the CUDA descriptor rebind fix. This sample had no payload movement (`payload_bucket_slots=0`, `apply_changed_layers=0`), so it proves overhead recovery, not policy benefit. |
 | ROCm2 512, seed 303, static vs Dynamic no-cache, 2026-06-30 | 66.13 vs 65.63 tok/s decode; prefill 1145.22 vs 1144.90 tok/s | ROCm stayed healthy after the shared rebind guard. This sample also had no movement, so policy tuning still needs movement-positive traces. |
 | CUDA2 1024, seed 303, recent clean static vs dynamic-hot10 | 126.83 vs 124.81 tok/s | Router/cache mechanics work, but hot10 maintenance was net negative in this run. |

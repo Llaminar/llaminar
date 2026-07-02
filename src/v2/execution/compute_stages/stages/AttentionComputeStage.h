@@ -158,8 +158,8 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
-            debug_effective_k_snapshot_.clear();
-            debug_effective_v_snapshot_.clear();
+            debug_effective_k_tensor_ = nullptr;
+            debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;
             debug_effective_k_cols_ = 0;
             debug_effective_v_rows_ = 0;
@@ -186,8 +186,8 @@ namespace llaminar2
             prefill_replay_params_set_ = false;
             prefill_effective_seq_len_ = 0;
             prefill_bucket_seq_len_ = 0;
-            debug_effective_k_snapshot_.clear();
-            debug_effective_v_snapshot_.clear();
+            debug_effective_k_tensor_ = nullptr;
+            debug_effective_v_tensor_ = nullptr;
             debug_effective_k_rows_ = 0;
             debug_effective_k_cols_ = 0;
             debug_effective_v_rows_ = 0;
@@ -227,11 +227,11 @@ namespace llaminar2
         ITensorAttention *cached_kernel_ = nullptr;
         int cached_kernel_tensor_type_ = -1;
 
-        /// Debug-only FP32 copies of the effective K/V tensors passed to the
-        /// attention kernel. Populated only when
-        /// LLAMINAR_DEBUG_EFFECTIVE_KV_SNAPSHOT is enabled.
-        mutable std::vector<float> debug_effective_k_snapshot_;
-        mutable std::vector<float> debug_effective_v_snapshot_;
+        /// Debug-only effective K/V tensor metadata for graph snapshots. The
+        /// executor performs graph-captured D2D snapshot copies and post-graph
+        /// host materialization; attention execute() never performs D2H reads.
+        mutable const ITensor *debug_effective_k_tensor_ = nullptr;
+        mutable const ITensor *debug_effective_v_tensor_ = nullptr;
         mutable size_t debug_effective_k_rows_ = 0;
         mutable size_t debug_effective_k_cols_ = 0;
         mutable size_t debug_effective_v_rows_ = 0;

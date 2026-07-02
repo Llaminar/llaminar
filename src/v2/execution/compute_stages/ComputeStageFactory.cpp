@@ -218,6 +218,12 @@ namespace llaminar2
         return std::make_unique<KVCacheGatherStage>(params);
     }
 
+    std::unique_ptr<IComputeStage> ComputeStageFactory::createTPKVCacheStateAllGather(
+        const TPKVCacheStateAllGatherStage::Params &params)
+    {
+        return std::make_unique<TPKVCacheStateAllGatherStage>(params);
+    }
+
     std::unique_ptr<IComputeStage> ComputeStageFactory::createAttentionCompute(
         const AttentionComputeStage::Params &params)
     {

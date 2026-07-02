@@ -1425,6 +1425,8 @@ TEST(Test__GraphSegmentCache, ReplayPhasePerfStatsSplitFinalStreamSync)
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1524,6 +1526,8 @@ TEST(Test__GraphSegmentCache, ReplayPhasePreparesGraphLaunchMetadataOnExplicitCa
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1563,6 +1567,8 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeCapturePhase(
@@ -1585,6 +1591,112 @@ TEST(Test__GraphSegmentCache, CapturePhasePreparesGraphLaunchMetadataBeforeRecor
     EXPECT_EQ(prep_stage->last_stream_, cache.capture_stream);
     EXPECT_NE(prep_stage->last_stream_, nullptr);
     EXPECT_EQ(prep_stage->stream_seen_by_stage_, cache.capture_stream);
+}
+
+TEST(Test__GraphSegmentCache, CaptureManualSegmentRecordsSnapshotsAfterExecuteNodeCallback)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "manual_stage", false);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = false;
+    cache.segments.back().stage_names = {"manual_stage"};
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::cuda(0), ComputeBackendType::GPU_CUDA);
+
+    int execute_calls = 0;
+    int prepare_snapshot_calls = 0;
+    int record_snapshot_calls = 0;
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        [&](ComputeNode &node)
+        {
+            ++execute_calls;
+            return node.stage && node.stage->execute(&ctx);
+        },
+        [&](ComputeNode &, void *stream)
+        {
+            ++prepare_snapshot_calls;
+            return stream == cache.capture_stream;
+        },
+        [&](ComputeNode &, void *stream)
+        {
+            ++record_snapshot_calls;
+            return stream == cache.capture_stream;
+        },
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeCapturePhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*current_step=*/2,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(execute_calls, 1);
+    EXPECT_EQ(prepare_snapshot_calls, 0);
+    EXPECT_EQ(record_snapshot_calls, 1)
+        << "Manual capture segments must snapshot even when they execute through execute_node.";
+}
+
+TEST(Test__GraphSegmentCache, ReplayManualSegmentRecordsSnapshotsAfterExecuteNodeCallback)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "manual_stage", false);
+
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    FakeReplayGPUContext gpu_ctx;
+    ASSERT_TRUE(cache.ensureCaptureStream(&gpu_ctx));
+    cache.perf_context = "manual_snapshot_regression";
+    cache.segments.emplace_back();
+    cache.segments.back().capturable = false;
+    cache.segments.back().stage_names = {"manual_stage"};
+
+    llaminar2::testing::MockDeviceContext ctx(DeviceId::rocm(0), ComputeBackendType::GPU_ROCM);
+
+    int execute_calls = 0;
+    int prepare_snapshot_calls = 0;
+    int record_snapshot_calls = 0;
+    DeviceGraphCaptureController::ReplayHooks hooks{
+        nullptr,
+        [&](ComputeNode &node)
+        {
+            ++execute_calls;
+            return node.stage && node.stage->execute(&ctx);
+        },
+        [&](ComputeNode &, void *stream)
+        {
+            ++prepare_snapshot_calls;
+            return stream == cache.capture_stream;
+        },
+        [&](ComputeNode &, void *stream)
+        {
+            ++record_snapshot_calls;
+            return stream == cache.capture_stream;
+        },
+        [](DeviceGraphExecutor::GraphSegment &, void *) {}};
+
+    const auto result = DeviceGraphCaptureController::executeReplayPhase(
+        graph,
+        cache,
+        &ctx,
+        &gpu_ctx,
+        /*has_collective_nodes=*/true,
+        /*collectives_graph_capturable=*/false,
+        /*current_step=*/3,
+        hooks);
+
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(execute_calls, 1);
+    EXPECT_EQ(prepare_snapshot_calls, 0);
+    EXPECT_EQ(record_snapshot_calls, 1)
+        << "Manual replay segments must snapshot even when they execute through execute_node.";
 }
 
 TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapturedEvents)
@@ -1611,6 +1723,8 @@ TEST(Test__GraphSegmentCache, ReplayPhaseStageGpuPerfStatsCanRequestGraphCapture
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1681,6 +1795,8 @@ TEST(Test__GraphSegmentCache, DeferredReplayStageGpuStatsUseSynchronizedGpuEvent
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1768,6 +1884,8 @@ TEST(Test__GraphSegmentCache, CudaDeferredReplayDoesNotSynchronizeCapturedSegmen
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1828,6 +1946,8 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayDoesNotDeferFinalSyncByDef
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -1885,6 +2005,8 @@ TEST(Test__GraphSegmentCache, CapturedCollectiveReplayCanDeferFinalSyncWithOptIn
     DeviceGraphCaptureController::ReplayHooks hooks{
         nullptr,
         nullptr,
+        [](ComputeNode &, void *) { return true; },
+        [](ComputeNode &, void *) { return true; },
         [](DeviceGraphExecutor::GraphSegment &, void *) {}};
 
     const auto result = DeviceGraphCaptureController::executeReplayPhase(
@@ -2002,6 +2124,10 @@ TEST(Test__GraphSegmentCache, ROCmRecaptureSkipsInPlaceGraphUpdate)
         &gpu_ctx,
         &capture_stream,
         /*segment_index=*/0,
+        [](ComputeNode &, void *)
+        {
+            return true;
+        },
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;
@@ -2037,6 +2163,10 @@ TEST(Test__GraphSegmentCache, CUDARecaptureStillUsesInPlaceGraphUpdate)
         &gpu_ctx,
         &capture_stream,
         /*segment_index=*/0,
+        [](ComputeNode &, void *)
+        {
+            return true;
+        },
         [&](DeviceGraphExecutor::GraphSegment &, void *)
         {
             post_launch_called = true;

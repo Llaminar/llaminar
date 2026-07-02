@@ -353,6 +353,10 @@ namespace llaminar2
         bool denseDecodeMirroredEmbeddingActiveForTokens(int total_tokens) const;
         bool replicatedAttentionStateActiveForTokens(int total_tokens) const;
         bool attentionTPAllreduceEnabledForCurrentGraph() const;
+        bool needsPhaseSplitPrefillKVCacheHandoff(
+            int total_tokens,
+            IKVCache *kv_cache,
+            DeviceId device) const;
 
         class DecodeReplicatedDenseScope
         {
@@ -486,7 +490,8 @@ namespace llaminar2
             int total_tokens,
             const int *position_ids,
             const void *position_ids_device,
-            DeviceId device);
+            DeviceId device,
+            bool force_apply_rope_to_k = false);
 
         /**
          * @brief Add a KV cache append stage.
@@ -511,6 +516,7 @@ namespace llaminar2
             IKVCache *kv_cache,
             DeviceId device,
             const std::string &rope_dependency,
+            const std::vector<std::string> &cache_source_dependencies = {},
             bool layer_idx_is_cache_local = false);
 
         /**
@@ -537,6 +543,7 @@ namespace llaminar2
             DeviceId device,
             bool has_qkv_proj,
             const std::string &rope_dependency,
+            const std::vector<std::string> &cache_source_dependencies = {},
             bool layer_idx_is_cache_local = false);
 
         /**

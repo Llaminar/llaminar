@@ -185,7 +185,7 @@ namespace llaminar2
 
         bool supportsDeviceRoutedDecodeGraphCaptureBackend(DeviceId device)
         {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
             (void)device;
             return false;
 #else
@@ -247,8 +247,7 @@ namespace llaminar2
         /**
          * @brief True when GPU kernels can consume explicit routing tensors.
          *
-         * Integration builds define ENABLE_PIPELINE_SNAPSHOTS, which disables
-         * graph-capture capability helpers so parity can keep richer dumps.
+         * Snapshot-enabled parity drains tensor outputs after captured replay.
          * The underlying CUDA/ROCm grouped `FromRouting` kernels are still the
          * correct execution path for verifier row replay because the routing
          * row is device-owned and has no reliable host mirror.
@@ -1612,12 +1611,6 @@ namespace llaminar2
                 runtimeTableHasActiveGroupedDecodeBank();
         }
 
-        // Snapshot-enabled builds keep legacy routing tensors authoritative for
-        // parity dumps, so MoERoutingStage does not populate the runtime top-k
-        // table. Consuming that table here would use stale/zero routing data.
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-        const bool can_try_device_routed_decode = false;
-#else
         const bool can_try_device_routed_decode =
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
             params_.moe_runtime_table &&
@@ -1625,7 +1618,6 @@ namespace llaminar2
             moe_runtime_table_initialized_ &&
             runtime_decode_bank_active_for_expert_stage &&
             top_k > 0 && top_k <= 16;
-#endif
 
         if (params_.device_id.is_gpu() &&
             params_.seq_len == 1 &&
@@ -1920,7 +1912,6 @@ namespace llaminar2
             return false;
         }
 
-#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
         if (is_gpu && isGraphCaptureActive())
         {
             LOG_ERROR("[MoEExpertComputeStage] GPU MoE decode entered graph capture without "
@@ -1947,7 +1938,6 @@ namespace llaminar2
                 return false;
             }
         }
-#endif
 
         if (!params_.routing_indices || !params_.routing_weights)
         {
@@ -3063,6 +3053,14 @@ namespace llaminar2
             }
 
             const bool has_replicas = params_.replica_set.num_replicated > 0;
+            if (params_.runtime_decode_uses_mutable_descriptors)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Cannot synthesize MoE runtime decode bank for layer "
+                          << params_.layer_idx
+                          << ": mutable descriptor decode requires a graph-initialized "
+                          << "placement table with explicit owner/resident metadata");
+                return false;
+            }
             if (has_replicas &&
                 (params_.replica_set.is_replicated.size() != static_cast<size_t>(params_.num_experts) ||
                  params_.replica_set.owner_socket.size() != static_cast<size_t>(params_.num_experts)))
@@ -3073,16 +3071,7 @@ namespace llaminar2
                 return false;
             }
 
-            int participant_count = params_.participant_count;
-            if (participant_count <= 0 && has_replicas)
-                participant_count = params_.replica_set.num_sockets;
-            if (participant_count <= 0 && has_replicas)
-            {
-                for (int owner : params_.replica_set.owner_socket)
-                    participant_count = std::max(participant_count, owner + 1);
-            }
-            if (participant_count <= 0)
-                participant_count = std::max(1, params_.my_socket_id + 1);
+            const int participant_count = expectedGroupedDecodeParticipantCount();
             if (params_.my_socket_id < 0 ||
                 params_.my_socket_id >= participant_count ||
                 participant_count > static_cast<int>(kDeviceMoEMaxParticipants))
@@ -3090,6 +3079,15 @@ namespace llaminar2
                 LOG_ERROR("[MoEExpertComputeStage] Cannot initialize MoE runtime decode bank for layer "
                           << params_.layer_idx << ": invalid participant metadata id="
                           << params_.my_socket_id << " count=" << participant_count);
+                return false;
+            }
+            if (!has_replicas &&
+                !expertMaskAllEnabled() &&
+                participant_count > 1)
+            {
+                LOG_ERROR("[MoEExpertComputeStage] Cannot synthesize masked multi-participant "
+                          << "MoE runtime decode bank for layer " << params_.layer_idx
+                          << ": explicit owner metadata is required");
                 return false;
             }
 
@@ -3203,6 +3201,22 @@ namespace llaminar2
         }
     }
 
+    int MoEExpertComputeStage::expectedGroupedDecodeParticipantCount() const
+    {
+        int participant_count = params_.participant_count;
+        const bool has_replicas = params_.replica_set.num_replicated > 0;
+        if (participant_count <= 0 && has_replicas)
+            participant_count = params_.replica_set.num_sockets;
+        if (participant_count <= 0 && has_replicas)
+        {
+            for (int owner : params_.replica_set.owner_socket)
+                participant_count = std::max(participant_count, owner + 1);
+        }
+        if (participant_count <= 0)
+            participant_count = std::max(1, params_.my_socket_id + 1);
+        return participant_count;
+    }
+
     bool MoEExpertComputeStage::initializeMoERuntimeTableForGroupedPrefill()
     {
         moe_prefill_runtime_grouping_available_ = false;
@@ -3283,13 +3297,32 @@ namespace llaminar2
         if (!bank || !moe_runtime_layer_)
             return false;
 
+        const bool mutable_runtime_descriptors =
+            params_.runtime_decode_uses_mutable_descriptors;
+        const bool has_replicas = params_.replica_set.num_replicated > 0;
+        int participant_count = 0;
         try
         {
             const auto &state = params_.moe_runtime_table->hostLayerState(params_.layer_idx);
             if (state.participant_id != static_cast<uint32_t>(params_.my_socket_id))
                 return false;
-            if (params_.participant_count > 0 &&
-                state.participant_count != static_cast<uint32_t>(params_.participant_count))
+            if (state.expert_count != static_cast<uint32_t>(params_.num_experts) ||
+                state.top_k != static_cast<uint32_t>(params_.top_k))
+            {
+                return false;
+            }
+            if (has_replicas &&
+                (params_.replica_set.is_replicated.size() != static_cast<size_t>(params_.num_experts) ||
+                 params_.replica_set.owner_socket.size() != static_cast<size_t>(params_.num_experts)))
+            {
+                return false;
+            }
+            participant_count = expectedGroupedDecodeParticipantCount();
+            if (params_.my_socket_id < 0 ||
+                params_.my_socket_id >= participant_count ||
+                participant_count <= 0 ||
+                participant_count > static_cast<int>(kDeviceMoEMaxParticipants) ||
+                state.participant_count != static_cast<uint32_t>(participant_count))
             {
                 return false;
             }
@@ -3299,26 +3332,105 @@ namespace llaminar2
             return false;
         }
 
+        const uint32_t valid_mask =
+            participant_count >= static_cast<int>(kDeviceMoEMaxParticipants)
+                ? ((1u << kDeviceMoEMaxParticipants) - 1u)
+                : ((1u << static_cast<uint32_t>(participant_count)) - 1u);
+        const uint32_t local_participant_bit =
+            1u << static_cast<uint32_t>(params_.my_socket_id);
+
         for (int expert_id = 0; expert_id < params_.num_experts; ++expert_id)
         {
-            const bool expected_local = expertComputesLocally(expert_id);
-            const auto mask = bank->local_compute_mask[static_cast<size_t>(expert_id)];
-            if (mask != (expected_local ? 1u : 0u))
-                return false;
             const uint32_t resident_mask =
                 bank->resident_participant_mask[static_cast<size_t>(expert_id)];
-            if (expected_local &&
-                (resident_mask & (1u << static_cast<uint32_t>(params_.my_socket_id))) == 0u)
+            const auto &expert = bank->experts[static_cast<size_t>(expert_id)];
+            int owner_participant = expert.owner_participant;
+            bool replicated = false;
+
+            if (mutable_runtime_descriptors)
+            {
+                if ((resident_mask & ~valid_mask) != 0u ||
+                    resident_mask == 0u ||
+                    expert.logical_expert_id != expert_id ||
+                    owner_participant < 0 ||
+                    owner_participant >= participant_count)
+                {
+                    return false;
+                }
+                if ((resident_mask & (1u << static_cast<uint32_t>(owner_participant))) == 0u)
+                    return false;
+                replicated = (resident_mask & (resident_mask - 1u)) != 0u;
+            }
+            else
+            {
+                owner_participant = params_.my_socket_id;
+                if (has_replicas)
+                    owner_participant = params_.replica_set.owner_socket[static_cast<size_t>(expert_id)];
+                replicated =
+                    has_replicas &&
+                    params_.replica_set.isReplicatedForLayer(params_.layer_idx, expert_id);
+            }
+
+            const bool expected_local =
+                mutable_runtime_descriptors
+                    ? ((resident_mask & local_participant_bit) != 0u)
+                    : expertComputesLocally(expert_id);
+            if (bank->local_compute_mask[static_cast<size_t>(expert_id)] !=
+                (expected_local ? 1u : 0u))
             {
                 return false;
+            }
+
+            uint32_t expected_resident_mask = 0u;
+            if (owner_participant >= 0 && owner_participant < participant_count)
+                expected_resident_mask |= (1u << static_cast<uint32_t>(owner_participant));
+            if (!mutable_runtime_descriptors && replicated)
+            {
+                for (int participant = 0; participant < participant_count; ++participant)
+                {
+                    if (params_.replica_set.hasReplicaOnParticipant(
+                            params_.layer_idx,
+                            expert_id,
+                            participant))
+                    {
+                        expected_resident_mask |= (1u << static_cast<uint32_t>(participant));
+                    }
+                }
+            }
+            if (expected_local)
+                expected_resident_mask |= (1u << static_cast<uint32_t>(params_.my_socket_id));
+            if (!mutable_runtime_descriptors && resident_mask != expected_resident_mask)
+            {
+                return false;
+            }
+
+            if (expert.logical_expert_id != expert_id ||
+                expert.owner_participant != owner_participant)
+            {
+                return false;
+            }
+
+            if (!mutable_runtime_descriptors)
+            {
+                if (replicated != hasMoEExpertFlag(expert.flags, DeviceMoEExpertFlags::Replicated))
+                    return false;
+                const auto expected_role =
+                    replicated
+                        ? (owner_participant == params_.my_socket_id
+                               ? DeviceMoEReplicaRole::Primary
+                               : DeviceMoEReplicaRole::Replica)
+                        : (expected_local ? DeviceMoEReplicaRole::Primary : DeviceMoEReplicaRole::None);
+                if (bank->replica_role[static_cast<size_t>(expert_id)] !=
+                    static_cast<uint8_t>(expected_role))
+                {
+                    return false;
+                }
             }
 
             if (!expected_local)
                 continue;
 
-            const auto &expert = bank->experts[static_cast<size_t>(expert_id)];
-            if (expert.logical_expert_id != expert_id ||
-                expert.local_slot < 0 ||
+            if (expert.local_slot < 0 ||
                 !expert.gate.valid() ||
                 !expert.up.valid() ||
                 !expert.down.valid() ||
@@ -3640,10 +3752,13 @@ namespace llaminar2
     }
 
     bool MoEExpertComputeStage::executeTransferBackedPrefillLLEPMovement(
-        IMoEKernel *kernel) const
+        IMoEKernel *kernel,
+        DeviceMoERebalanceStatus **transfer_status_out) const
     {
         if (!kernel)
             return false;
+        if (transfer_status_out)
+            *transfer_status_out = nullptr;
         if (!hasTransferBackedPrefillLLEP())
         {
             LOG_ERROR("[MoEExpertComputeStage] Transfer-backed LLEP prefill requested without a valid compact transfer binding");
@@ -3739,6 +3854,8 @@ namespace llaminar2
                       << " gathered_payload=" << static_cast<void *>(gathered_payload));
             return false;
         }
+        if (transfer_status_out)
+            *transfer_status_out = status;
 
         auto *transfer_state = params_.prefill_llep_transfer_state.get();
         if (!transfer_state ||
@@ -3988,10 +4105,17 @@ namespace llaminar2
                 }
                 if (hasTransferBackedPrefillLLEP())
                 {
-                    if (!executeTransferBackedPrefillLLEPMovement(kernel))
+                    DeviceMoERebalanceStatus *transfer_status = nullptr;
+                    if (!executeTransferBackedPrefillLLEPMovement(kernel, &transfer_status))
                     {
                         LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
                                   "transfer-backed LLEP movement failed");
+                        return false;
+                    }
+                    if (!transfer_status)
+                    {
+                        LOG_ERROR("[MoEExpertComputeStage::executeFixedTopologyGroupedPrefill] "
+                                  "transfer-backed LLEP movement did not publish a status buffer");
                         return false;
                     }
                     groups_prepared =
@@ -4000,7 +4124,8 @@ namespace llaminar2
                             seq_len,
                             seq_len,
                             num_experts,
-                            top_k);
+                            top_k,
+                            transfer_status);
                 }
                 else
                 {
@@ -4098,7 +4223,7 @@ namespace llaminar2
 
     bool MoEExpertComputeStage::isDeviceRoutedDecodeGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
         return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
@@ -4478,13 +4603,11 @@ namespace llaminar2
         if (params_.force_grouped_verifier_prefill_for_decode)
             return isFixedTopologyPrefillGraphCapturable();
 
-#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
         // Device-routed grouped decode path: after warmup, all descriptor tables
         // are built and execution is pure kernel launches reading routing info
         // from the device-resident MoE runtime table.
         if (isDeviceRoutedDecodeGraphCapturable())
             return true;
-#endif
 
         // Fixed-topology grouped prefill path
         return isFixedTopologyPrefillGraphCapturable();
@@ -4497,7 +4620,6 @@ namespace llaminar2
         return false;
 #else
         bool decode_supported = false;
-#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
         decode_supported =
             !params_.force_grouped_verifier_prefill_for_decode &&
             supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
@@ -4512,7 +4634,6 @@ namespace llaminar2
             params_.output &&
             params_.moe_runtime_table &&
             params_.layer_idx >= 0;
-#endif
 
         return decode_supported || supportsFixedTopologyPrefillGraphCapturePreflight();
 #endif
@@ -6173,12 +6294,6 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        if (params_.seq_len <= 1)
-        {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-            return false;
-#endif
-        }
         // Single kernel call (sigmoid gating) — pure kernel launch after warmup.
         // Capturable for both decode (seq_len==1) and prefill (seq_len>1) on supported GPU backends
         // because the stage is just a kernel launch with stable device pointers.
@@ -6194,12 +6309,6 @@ namespace llaminar2
 #if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
-        if (params_.seq_len <= 1)
-        {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-            return false;
-#endif
-        }
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                params_.seq_len > 0 &&
                params_.d_model > 0 &&

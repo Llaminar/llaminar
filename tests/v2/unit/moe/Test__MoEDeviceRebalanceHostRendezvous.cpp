@@ -4,6 +4,7 @@
  */
 
 #include "execution/moe/MoEDeviceRebalanceHostRendezvous.h"
+#include "execution/moe/DeviceMoERebalanceController.h"
 
 #include <gtest/gtest.h>
 
@@ -15,6 +16,13 @@ using namespace llaminar2;
 
 namespace
 {
+    struct ProbeResult
+    {
+        bool ok = false;
+        MoEDeviceRebalanceHostRendezvous::PayloadDecision decision;
+        std::string error;
+    };
+
     MoEDeviceRebalanceHostRendezvous::ProbeOutcome okNoWork()
     {
         MoEDeviceRebalanceHostRendezvous::ProbeOutcome outcome;
@@ -29,6 +37,13 @@ namespace
         outcome.useful_work = true;
         outcome.payload_bucket_slots = slots;
         outcome.payload_edge_mask = edge_mask;
+        return outcome;
+    }
+
+    MoEDeviceRebalanceHostRendezvous::ProbeOutcome statusNoWork(DeviceMoERebalanceStatusCode status)
+    {
+        auto outcome = okNoWork();
+        outcome.status_code = static_cast<uint32_t>(status);
         return outcome;
     }
 } // namespace
@@ -131,6 +146,114 @@ TEST(Test__MoEDeviceRebalanceHostRendezvous, NoWorkIsDomainWide)
     EXPECT_FALSE(result1.second.launchPayloadGraph());
     EXPECT_FALSE(result0.second.useful_work);
     EXPECT_FALSE(result1.second.useful_work);
+}
+
+TEST(Test__MoEDeviceRebalanceHostRendezvous, WindowNotReadyIsDomainWideNoWork)
+{
+    int domain_key;
+    constexpr uint64_t generation = 212;
+    constexpr int timeout_ms = 1000;
+
+    auto participant0 = std::async(std::launch::async, [&]()
+                                   {
+                                       ProbeResult result;
+                                       result.ok = MoEDeviceRebalanceHostRendezvous::rendezvousProbeOutcome(
+                                           &domain_key,
+                                           generation,
+                                           2,
+                                           "cuda:0",
+                                           okPayload(/*slots=*/2, /*edge_mask=*/0x3ULL),
+                                           timeout_ms,
+                                           &result.decision,
+                                           &result.error);
+                                       return result;
+                                   });
+
+    auto participant1 = std::async(std::launch::async, [&]()
+                                   {
+                                       ProbeResult result;
+                                       result.ok = MoEDeviceRebalanceHostRendezvous::rendezvousProbeOutcome(
+                                           &domain_key,
+                                           generation,
+                                           2,
+                                           "cuda:1",
+                                           statusNoWork(DeviceMoERebalanceStatusCode::WindowNotReady),
+                                           timeout_ms,
+                                           &result.decision,
+                                           &result.error);
+                                       return result;
+                                   });
+
+    const auto result0 = participant0.get();
+    const auto result1 = participant1.get();
+
+    ASSERT_TRUE(result0.ok) << result0.error;
+    ASSERT_TRUE(result1.ok) << result1.error;
+    EXPECT_TRUE(result0.decision.valid);
+    EXPECT_TRUE(result1.decision.valid);
+    EXPECT_EQ(result0.decision.status_code,
+              static_cast<uint32_t>(DeviceMoERebalanceStatusCode::WindowNotReady));
+    EXPECT_EQ(result1.decision.status_code,
+              static_cast<uint32_t>(DeviceMoERebalanceStatusCode::WindowNotReady));
+    EXPECT_FALSE(result0.decision.launchPayloadGraph());
+    EXPECT_FALSE(result1.decision.launchPayloadGraph());
+    EXPECT_FALSE(result0.decision.useful_work);
+    EXPECT_FALSE(result1.decision.useful_work);
+    EXPECT_EQ(result0.decision.payload_bucket_slots, 0u);
+    EXPECT_EQ(result1.decision.payload_bucket_slots, 0u);
+    EXPECT_EQ(result0.decision.payload_edge_mask, 0ULL);
+    EXPECT_EQ(result1.decision.payload_edge_mask, 0ULL);
+}
+
+TEST(Test__MoEDeviceRebalanceHostRendezvous, FatalProbeStatusFailsFast)
+{
+    int domain_key;
+    constexpr uint64_t generation = 222;
+    constexpr int timeout_ms = 1000;
+
+    auto participant0 = std::async(std::launch::async, [&]()
+                                   {
+                                       ProbeResult result;
+                                       result.ok = MoEDeviceRebalanceHostRendezvous::rendezvousProbeOutcome(
+                                           &domain_key,
+                                           generation,
+                                           2,
+                                           "rocm:0",
+                                           statusNoWork(DeviceMoERebalanceStatusCode::InvalidRuntime),
+                                           timeout_ms,
+                                           &result.decision,
+                                           &result.error);
+                                       return result;
+                                   });
+
+    auto participant1 = std::async(std::launch::async, [&]()
+                                   {
+                                       ProbeResult result;
+                                       result.ok = MoEDeviceRebalanceHostRendezvous::rendezvousProbeOutcome(
+                                           &domain_key,
+                                           generation,
+                                           2,
+                                           "rocm:1",
+                                           okNoWork(),
+                                           timeout_ms,
+                                           &result.decision,
+                                           &result.error);
+                                       return result;
+                                   });
+
+    const auto result0 = participant0.get();
+    const auto result1 = participant1.get();
+
+    EXPECT_FALSE(result0.ok);
+    EXPECT_FALSE(result1.ok);
+    EXPECT_NE(result0.error.find("non-ok local probe outcome"), std::string::npos);
+    EXPECT_NE(result1.error.find("non-ok local probe outcome"), std::string::npos);
+    EXPECT_FALSE(result0.decision.valid);
+    EXPECT_FALSE(result1.decision.valid);
+    EXPECT_EQ(result0.decision.status_code,
+              static_cast<uint32_t>(DeviceMoERebalanceStatusCode::InvalidRuntime));
+    EXPECT_EQ(result1.decision.status_code,
+              static_cast<uint32_t>(DeviceMoERebalanceStatusCode::InvalidRuntime));
 }
 
 TEST(Test__MoEDeviceRebalanceHostRendezvous, MissingParticipantFailsFast)

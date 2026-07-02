@@ -17,6 +17,7 @@
 #include "execution/local_execution/orchestrators/IInferenceRunner.h"
 #include "execution/local_execution/orchestrators/RankOrchestrator.h"
 #include "execution/debug/TPSnapshot.h"
+#include "execution/moe/MoEExpertParallelPlan.h"
 #include "execution/mtp/MTPSpecStateContract.h"
 #include "collective/ILocalTPContext.h"
 #include "backends/GlobalDeviceAddress.h"
@@ -35,6 +36,7 @@
 #include <mutex>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <memory>
 #include <stdexcept>
@@ -870,6 +872,45 @@ public:
         return config_.architecture.c_str();
     }
 
+    const float *getSnapshot(const std::string &key, size_t &out_size) const override
+    {
+        auto it = snapshots_.find(key);
+        if (it == snapshots_.end())
+        {
+            out_size = 0;
+            return nullptr;
+        }
+        out_size = it->second.size();
+        return it->second.data();
+    }
+
+    SnapshotInfo getSnapshotWithShape(const std::string &key) const override
+    {
+        auto it = snapshots_.find(key);
+        if (it == snapshots_.end())
+            return {};
+
+        const auto shape_it = snapshot_shapes_.find(key);
+        if (shape_it == snapshot_shapes_.end())
+            return {};
+
+        return SnapshotInfo{
+            it->second.data(),
+            it->second.size(),
+            shape_it->second.first,
+            shape_it->second.second};
+    }
+
+    std::vector<std::string> getSnapshotKeys() const override
+    {
+        std::vector<std::string> keys;
+        keys.reserve(snapshots_.size());
+        for (const auto &entry : snapshots_)
+            keys.push_back(entry.first);
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+
     uint64_t moePlacementEpoch() const override
     {
         return moe_placement_epoch_;
@@ -1018,6 +1059,18 @@ public:
             DeviceId::cpu());
         std::memcpy(all_position_logits_local_->mutable_data(), logits.data(),
                     logits.size() * sizeof(float));
+    }
+
+    void set_mock_snapshot(
+        const std::string &key,
+        size_t rows,
+        size_t cols,
+        std::vector<float> data)
+    {
+        if (data.size() != rows * cols)
+            throw std::invalid_argument("mock snapshot size does not match rows*cols");
+        snapshots_[key] = std::move(data);
+        snapshot_shapes_[key] = {rows, cols};
     }
 
     void set_vocab_size(int size)
@@ -1205,6 +1258,8 @@ private:
     std::vector<float> logits_;
     std::vector<float> mtp_logits_;
     std::vector<float> all_position_logits_;
+    std::unordered_map<std::string, std::vector<float>> snapshots_;
+    std::unordered_map<std::string, std::pair<size_t, size_t>> snapshot_shapes_;
     std::shared_ptr<FP32Tensor> mtp_logits_local_;
     std::shared_ptr<FP32Tensor> all_position_logits_local_;
     std::shared_ptr<ForwardMTPRendezvous> forward_mtp_rendezvous_;
@@ -5364,6 +5419,193 @@ TEST_F(Test__RankOrchestrator, TPSnapshot_ColumnParallel_ProportionalWeights)
     EXPECT_FLOAT_EQ(snapshot.combined_data[653], 1.0f);            // Last col from dev0
     EXPECT_FLOAT_EQ(snapshot.combined_data[654], 2.0f);            // First col from dev1
     EXPECT_FLOAT_EQ(snapshot.combined_data[total_cols - 1], 2.0f); // Last col from dev1
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_RowParallel_SumsDevicePartials)
+{
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_ATTENTION_OUTPUT";
+    snapshot.mode = SnapshotShardingMode::ROW_PARALLEL;
+    snapshot.tp_degree = 3;
+
+    DeviceSnapshotData dev0;
+    dev0.device_index = 0;
+    dev0.rows = 2;
+    dev0.cols = 3;
+    dev0.data = {1.0f, 2.0f, 3.0f,
+                 4.0f, 5.0f, 6.0f};
+
+    DeviceSnapshotData dev1;
+    dev1.device_index = 1;
+    dev1.rows = 2;
+    dev1.cols = 3;
+    dev1.data = {10.0f, 20.0f, 30.0f,
+                 40.0f, 50.0f, 60.0f};
+
+    DeviceSnapshotData dev2;
+    dev2.device_index = 2;
+    dev2.rows = 2;
+    dev2.cols = 3;
+    dev2.data = {100.0f, 200.0f, 300.0f,
+                 400.0f, 500.0f, 600.0f};
+
+    snapshot.device_data.push_back(std::move(dev0));
+    snapshot.device_data.push_back(std::move(dev1));
+    snapshot.device_data.push_back(std::move(dev2));
+
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, 2);
+    EXPECT_EQ(snapshot.combined_cols, 3);
+    EXPECT_EQ(snapshot.combined_data,
+              (std::vector<float>{111.0f, 222.0f, 333.0f,
+                                  444.0f, 555.0f, 666.0f}));
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeTreatsDenseOutputsAsReplicated)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_mock_snapshot(
+        "layer0_ATTENTION_OUTPUT",
+        1,
+        4,
+        {1.0f, 2.0f, 3.0f, 4.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_mock_snapshot(
+        "layer0_ATTENTION_OUTPUT",
+        1,
+        4,
+        {1.0f, 2.0f, 3.0f, 4.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setArchitecture("qwen35moe");
+
+    auto plan = std::make_shared<MoEExpertParallelPlan>();
+    plan->enabled = true;
+    plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+    plan->continuation_domain_spec.dense_tp_enabled = true;
+    plan->continuation_domain_spec.dense_decode_replicated = true;
+    plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+
+    RankOrchestrator::Config rank_config;
+    rank_config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+    rank_config.weights = {0.5f, 0.5f};
+    rank_config.moe_expert_parallel_plan = plan;
+
+    MockLocalTPContext::Config tp_config;
+    tp_config.devices = rank_config.devices;
+    tp_config.weights = rank_config.weights;
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        model_ctx,
+        std::move(runners),
+        std::make_unique<MockLocalTPContext>(tp_config),
+        rank_config);
+
+    int token = 42;
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+
+    auto snapshot = orchestrator->getTPSnapshot("layer0_ATTENTION_OUTPUT");
+    EXPECT_EQ(snapshot.mode, SnapshotShardingMode::REPLICATED);
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, 1);
+    EXPECT_EQ(snapshot.combined_cols, 4);
+    EXPECT_EQ(snapshot.combined_data,
+              (std::vector<float>{1.0f, 2.0f, 3.0f, 4.0f}));
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_PhaseSplitDecodeKeepsMoECombinedOutputRowParallel)
+{
+    auto runner0 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner0_ptr = runner0.get();
+    runner0_ptr->set_mock_snapshot(
+        "layer0_MOE_COMBINED_OUTPUT",
+        1,
+        4,
+        {1.0f, 2.0f, 3.0f, 4.0f});
+
+    auto runner1 = std::make_unique<MockDeviceGraphOrchestrator>();
+    auto *runner1_ptr = runner1.get();
+    runner1_ptr->set_mock_snapshot(
+        "layer0_MOE_COMBINED_OUTPUT",
+        1,
+        4,
+        {10.0f, 20.0f, 30.0f, 40.0f});
+
+    std::vector<std::unique_ptr<IInferenceRunner>> runners;
+    runners.push_back(std::move(runner0));
+    runners.push_back(std::move(runner1));
+
+    auto model_ctx = llaminar2::test::MockModelContext::createMinimal();
+    model_ctx->setArchitecture("qwen35moe");
+
+    auto plan = std::make_shared<MoEExpertParallelPlan>();
+    plan->enabled = true;
+    plan->execution_kind = MoEExpertExecutionKind::TieredExpertOverlay;
+    plan->continuation_domain_spec.dense_tp_enabled = true;
+    plan->continuation_domain_spec.dense_decode_replicated = true;
+    plan->continuation_domain_spec.refreshDensePolicyFromFlags();
+
+    RankOrchestrator::Config rank_config;
+    rank_config.devices = {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::cuda(1)};
+    rank_config.weights = {0.5f, 0.5f};
+    rank_config.moe_expert_parallel_plan = plan;
+
+    MockLocalTPContext::Config tp_config;
+    tp_config.devices = rank_config.devices;
+    tp_config.weights = rank_config.weights;
+
+    auto orchestrator = RankOrchestrator::createForTest(
+        model_ctx,
+        std::move(runners),
+        std::make_unique<MockLocalTPContext>(tp_config),
+        rank_config);
+
+    int token = 42;
+    ASSERT_TRUE(orchestrator->forward(&token, 1));
+
+    auto snapshot = orchestrator->getTPSnapshot("layer0_MOE_COMBINED_OUTPUT");
+    EXPECT_EQ(snapshot.mode, SnapshotShardingMode::ROW_PARALLEL);
+    ASSERT_TRUE(snapshot.computeCombined());
+    EXPECT_EQ(snapshot.combined_rows, 1);
+    EXPECT_EQ(snapshot.combined_cols, 4);
+    EXPECT_EQ(snapshot.combined_data,
+              (std::vector<float>{11.0f, 22.0f, 33.0f, 44.0f}));
+}
+
+TEST_F(Test__RankOrchestrator, TPSnapshot_RowParallel_RejectsMismatchedPartialShapes)
+{
+    TPSnapshot snapshot;
+    snapshot.key = "layer0_FFN_DOWN";
+    snapshot.mode = SnapshotShardingMode::ROW_PARALLEL;
+    snapshot.tp_degree = 2;
+
+    DeviceSnapshotData dev0;
+    dev0.device_index = 0;
+    dev0.rows = 1;
+    dev0.cols = 4;
+    dev0.data = {1.0f, 2.0f, 3.0f, 4.0f};
+
+    DeviceSnapshotData dev1;
+    dev1.device_index = 1;
+    dev1.rows = 2;
+    dev1.cols = 2;
+    dev1.data = {5.0f, 6.0f, 7.0f, 8.0f};
+
+    snapshot.device_data.push_back(std::move(dev0));
+    snapshot.device_data.push_back(std::move(dev1));
+
+    EXPECT_FALSE(snapshot.computeCombined());
+    EXPECT_FALSE(snapshot.combined_valid);
+    EXPECT_TRUE(snapshot.combined_data.empty());
+    EXPECT_EQ(snapshot.combined_rows, 0);
+    EXPECT_EQ(snapshot.combined_cols, 0);
 }
 
 TEST_F(Test__RankOrchestrator, TPSnapshot_Replicated_SingleRowMultipleDevices)

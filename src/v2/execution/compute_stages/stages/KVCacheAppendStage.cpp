@@ -68,97 +68,6 @@ namespace
         }
     }
 
-    static bool copyTensorBytesForDebugSnapshot(
-        const llaminar2::ITensor *tensor,
-        llaminar2::DeviceId device,
-        void *stream,
-        std::vector<uint8_t> &bytes)
-    {
-        if (!tensor || bytes.empty())
-        {
-            return false;
-        }
-
-        const void *device_ptr = tensor->gpu_data_ptr();
-        if (device_ptr && device.is_gpu())
-        {
-            llaminar2::IBackend *backend = llaminar2::getBackendFor(device);
-            if (!backend)
-            {
-                return false;
-            }
-
-            return backend->deviceToHostFast(
-                bytes.data(), device_ptr, bytes.size(), device.toKernelDeviceIndex(), stream);
-        }
-
-        if (const void *host = tensor->raw_data())
-        {
-            std::memcpy(bytes.data(), host, bytes.size());
-            return true;
-        }
-
-        return false;
-    }
-
-    static bool tensorToFP32DebugSnapshot(
-        const llaminar2::ITensor *tensor,
-        llaminar2::DeviceId device,
-        void *stream,
-        size_t rows,
-        size_t cols,
-        std::vector<float> &out)
-    {
-        if (!tensor || rows == 0 || cols == 0)
-        {
-            out.clear();
-            return false;
-        }
-
-        const size_t count = rows * cols;
-        const size_t elem_size = elementSizeForTensorType(tensor->native_type());
-        if (elem_size == 0)
-        {
-            out.clear();
-            return false;
-        }
-
-        std::vector<uint8_t> bytes(count * elem_size);
-        if (!copyTensorBytesForDebugSnapshot(tensor, device, stream, bytes))
-        {
-            out.clear();
-            return false;
-        }
-
-        out.resize(count);
-        switch (tensor->native_type())
-        {
-        case llaminar2::TensorType::FP32:
-            std::memcpy(out.data(), bytes.data(), count * sizeof(float));
-            return true;
-        case llaminar2::TensorType::FP16:
-        {
-            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-            for (size_t i = 0; i < count; ++i)
-            {
-                out[i] = llaminar2::fp16_to_fp32(src[i]);
-            }
-            return true;
-        }
-        case llaminar2::TensorType::BF16:
-        {
-            const auto *src = reinterpret_cast<const uint16_t *>(bytes.data());
-            for (size_t i = 0; i < count; ++i)
-            {
-                out[i] = llaminar2::simd::bf16_to_fp32(src[i]);
-            }
-            return true;
-        }
-        default:
-            out.clear();
-            return false;
-        }
-    }
 }
 
 namespace llaminar2
@@ -269,25 +178,13 @@ namespace llaminar2
             if (debugEnv().attention.debug_kv_append_source_snapshot &&
                 debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
             {
-                const size_t rows = static_cast<size_t>(num_tokens);
-                const size_t k_cols = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
-                const size_t v_cols = v_tensor->shape().size() > 1 ? v_tensor->shape()[1] : v_tensor->cols();
-                const bool have_k = tensorToFP32DebugSnapshot(
-                    k_tensor, params_.device_id, stream, rows, k_cols,
-                    debug_append_source_k_snapshot_);
-                const bool have_v = tensorToFP32DebugSnapshot(
-                    v_tensor, params_.device_id, stream, rows, v_cols,
-                    debug_append_source_v_snapshot_);
-
-                debug_append_source_k_rows_ = have_k ? rows : 0;
-                debug_append_source_k_cols_ = have_k ? k_cols : 0;
-                debug_append_source_v_rows_ = have_v ? rows : 0;
-                debug_append_source_v_cols_ = have_v ? v_cols : 0;
+                debug_append_source_k_rows_ = static_cast<size_t>(num_tokens);
+                debug_append_source_k_cols_ = k_tensor->shape().size() > 1 ? k_tensor->shape()[1] : k_tensor->cols();
+                debug_append_source_v_rows_ = static_cast<size_t>(num_tokens);
+                debug_append_source_v_cols_ = v_tensor->shape().size() > 1 ? v_tensor->shape()[1] : v_tensor->cols();
             }
             else
             {
-                debug_append_source_k_snapshot_.clear();
-                debug_append_source_v_snapshot_.clear();
                 debug_append_source_k_rows_ = 0;
                 debug_append_source_k_cols_ = 0;
                 debug_append_source_v_rows_ = 0;
@@ -1572,17 +1469,22 @@ namespace llaminar2
         if (debugEnv().attention.debug_kv_append_source_snapshot &&
             debugEnv().attention.debugKVAppendSourceLayerSelected(params_.layer_idx))
         {
-            if (!debug_append_source_k_snapshot_.empty() &&
-                debug_append_source_k_rows_ > 0 && debug_append_source_k_cols_ > 0)
+            const size_t rows = debug_append_source_k_rows_ > 0
+                                    ? debug_append_source_k_rows_
+                                    : static_cast<size_t>(params_.num_tokens > 0 ? params_.num_tokens : 0);
+            const size_t k_cols = debug_append_source_k_cols_ > 0
+                                      ? debug_append_source_k_cols_
+                                      : (params_.K->shape().size() > 1 ? params_.K->shape()[1] : params_.K->cols());
+            const size_t v_cols = debug_append_source_v_cols_ > 0
+                                      ? debug_append_source_v_cols_
+                                      : (params_.V->shape().size() > 1 ? params_.V->shape()[1] : params_.V->cols());
+            if (rows > 0 && k_cols > 0)
             {
-                info.addOutput("source_k", debug_append_source_k_snapshot_.data(),
-                               debug_append_source_k_rows_, debug_append_source_k_cols_);
+                info.addOutput("source_k", params_.K, rows, k_cols);
             }
-            if (!debug_append_source_v_snapshot_.empty() &&
-                debug_append_source_v_rows_ > 0 && debug_append_source_v_cols_ > 0)
+            if (rows > 0 && v_cols > 0)
             {
-                info.addOutput("source_v", debug_append_source_v_snapshot_.data(),
-                               debug_append_source_v_rows_, debug_append_source_v_cols_);
+                info.addOutput("source_v", params_.V, rows, v_cols);
             }
         }
 
@@ -1600,20 +1502,29 @@ namespace llaminar2
                 const size_t rows = static_cast<size_t>(kv_len);
                 const size_t k_cols = cache_k->cols();
                 const size_t v_cols = cache_v->cols();
-                void *stream = gpuStream();
-                const bool have_k = tensorToFP32DebugSnapshot(
-                    cache_k, params_.device_id, stream, rows, k_cols, debug_cache_k_snapshot_);
-                const bool have_v = tensorToFP32DebugSnapshot(
-                    cache_v, params_.device_id, stream, rows, v_cols, debug_cache_v_snapshot_);
-
-                if (have_k)
+                if (rows > 0 && k_cols > 0)
                 {
-                    info.addOutput("cache_k", debug_cache_k_snapshot_.data(), rows, k_cols);
+                    info.addOutput("cache_k", cache_k, rows, k_cols);
                 }
-                if (have_v)
+                if (rows > 0 && v_cols > 0)
                 {
-                    info.addOutput("cache_v", debug_cache_v_snapshot_.data(), rows, v_cols);
+                    info.addOutput("cache_v", cache_v, rows, v_cols);
                 }
+            }
+            else
+            {
+                const int cached_tokens =
+                    params_.kv_cache->get_cached_tokens(params_.layer_idx, params_.seq_idx);
+                const int append_tokens =
+                    params_.num_tokens > 0 ? params_.num_tokens : static_cast<int>(params_.K->rows());
+                const size_t expected_rows =
+                    static_cast<size_t>(std::max(0, cached_tokens + append_tokens));
+                const size_t k_cols = params_.K ? (params_.K->shape().size() > 1 ? params_.K->shape()[1] : params_.K->cols()) : 0;
+                const size_t v_cols = params_.V ? (params_.V->shape().size() > 1 ? params_.V->shape()[1] : params_.V->cols()) : 0;
+                if (expected_rows > 0 && k_cols > 0 && params_.K)
+                    info.addOutput("cache_k", params_.K, expected_rows, k_cols);
+                if (expected_rows > 0 && v_cols > 0 && params_.V)
+                    info.addOutput("cache_v", params_.V, expected_rows, v_cols);
             }
         }
 

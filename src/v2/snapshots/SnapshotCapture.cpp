@@ -336,16 +336,52 @@ namespace llaminar2
             return;
         }
 
-        // Handle standalone MoE routing stage — split router logits, indices, and weights
-        if (name.find("_moe_routing") != std::string::npos && dump.outputs.size() >= 3)
+        // Handle standalone MoE routing stage. Eager snapshot builds may
+        // provide host-stashed router logits plus routing vectors, while
+        // graph-captured runs publish only the tensor-backed routing outputs
+        // after replay. Route by output name so both contracts preserve the
+        // same parity keys without forcing host mirrors into graph capture.
+        if (name.find("_moe_routing") != std::string::npos)
         {
             size_t pos = name.find("_moe_routing");
             std::string prefix = name.substr(0, pos);
 
-            storeOutput(prefix + "_MOE_ROUTER_OUTPUT", dump.outputs[0]);
-            storeOutput(prefix + "_MOE_ROUTING_INDICES", dump.outputs[1]);
-            storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", dump.outputs[2]);
-            return;
+            const StageDumpInfo::OutputBuffer *router_logits = nullptr;
+            const StageDumpInfo::OutputBuffer *routing_indices = nullptr;
+            const StageDumpInfo::OutputBuffer *routing_weights = nullptr;
+
+            for (const auto &output : dump.outputs)
+            {
+                const std::string output_name = output.name ? output.name : "";
+                if (output_name == "router_logits" || output_name == "logits")
+                    router_logits = &output;
+                else if (output_name == "routing_indices" ||
+                         output_name == "indices" ||
+                         output_name == "output_indices_tensor")
+                    routing_indices = &output;
+                else if (output_name == "routing_weights" ||
+                         output_name == "weights" ||
+                         output_name == "output_weights_tensor")
+                    routing_weights = &output;
+            }
+
+            if (!router_logits && !routing_indices && !routing_weights &&
+                dump.outputs.size() >= 3)
+            {
+                router_logits = &dump.outputs[0];
+                routing_indices = &dump.outputs[1];
+                routing_weights = &dump.outputs[2];
+            }
+
+            if (router_logits && router_logits->data)
+                storeOutput(prefix + "_MOE_ROUTER_OUTPUT", *router_logits);
+            if (routing_indices && routing_indices->data)
+                storeOutput(prefix + "_MOE_ROUTING_INDICES", *routing_indices);
+            if (routing_weights && routing_weights->data)
+                storeOutput(prefix + "_MOE_ROUTING_WEIGHTS", *routing_weights);
+
+            if (router_logits || routing_indices || routing_weights)
+                return;
         }
 
         // Standard single-output stages
@@ -475,12 +511,25 @@ namespace llaminar2
             return result;
         }
 
+        if (stage_name.find("_moe_sparse_return_reduce") != std::string::npos &&
+            stage_name.find("_allreduce") != std::string::npos)
+        {
+            const size_t pos = stage_name.find("_moe_sparse_return_reduce");
+            return stage_name.substr(0, pos) + "_MOE_EXPERT_OUTPUT_ALLREDUCED";
+        }
+
         // Ordered vector: longest/most-specific suffixes FIRST to ensure correct
         // prefix extraction. E.g. "_gdn_wo_allreduce" must match before "_wo_allreduce"
         // so the prefix is "layerN" (not "layerN_gdn").
+        //
+        // Collective stages intentionally publish diagnostic *_ALLREDUCED keys.
+        // Canonical row-parallel keys such as ATTENTION_OUTPUT and FFN_DOWN are
+        // produced by the per-device partial projection stages and combined by
+        // TPSnapshot. This prevents graph-captured collective diagnostics from
+        // overwriting the semantic stage snapshot used by parity tests.
         static const std::vector<std::pair<std::string, std::string>> suffix_map = {
             // GDN (Gated Delta Net) linear attention stages — longest suffixes first
-            {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT"},
+            {"_gdn_wo_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_gdn_out_proj", "_ATTENTION_OUTPUT"},
             {"_gdn_proj", "_QKV_PROJECTION"},
             {"_short_conv", "_GDN_CONV1D_OUTPUT"},
@@ -489,7 +538,7 @@ namespace llaminar2
             // Standard attention stages
             {"_attn_norm", "_ATTENTION_NORM"},
             {"_attn_residual", "_ATTENTION_RESIDUAL"},
-            {"_wo_allreduce", "_ATTENTION_OUTPUT"},
+            {"_wo_allreduce", "_ATTENTION_OUTPUT_ALLREDUCED"},
             {"_wo_proj", "_ATTENTION_OUTPUT"},
             {"_q_norm", "_Q_NORM"},
             {"_k_norm", "_K_NORM"},
@@ -502,7 +551,7 @@ namespace llaminar2
             {"_attn_output_gate", "_ATTENTION_CONTEXT_GATED"},
             {"_attention", "_ATTENTION_CONTEXT"},
             // FFN stages
-            {"_down_allreduce", "_FFN_DOWN"},
+            {"_down_allreduce", "_FFN_DOWN_ALLREDUCED"},
             {"_ffn_norm", "_FFN_NORM"},
             {"_ffn_gate", "_FFN_GATE"},
             {"_ffn_up", "_FFN_UP"},
@@ -510,14 +559,14 @@ namespace llaminar2
             {"_down_proj", "_FFN_DOWN"},
             {"_ffn_residual", "_FFN_RESIDUAL"},
             // MoE stages
-            {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT"},
-            {"_moe_combined_allreduce", "_MOE_COMBINED_OUTPUT"},
-            {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT"},
+            {"_moe_expert_overlay_fast_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
+            {"_moe_combined_allreduce", "_MOE_COMBINED_OUTPUT_ALLREDUCED"},
+            {"_shared_expert_allreduce", "_MOE_SHARED_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_sparse_return_reduce", "_MOE_EXPERT_OUTPUT"},
             {"_shared_expert_gate", "_MOE_SHARED_GATE_OUTPUT"},
             {"_shared_expert", "_MOE_SHARED_EXPERT_OUTPUT"},
             {"_moe_expert_parallel_reduce", "_MOE_EXPERT_OUTPUT"},
-            {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT"},
+            {"_moe_expert_allreduce", "_MOE_EXPERT_OUTPUT_ALLREDUCED"},
             {"_moe_expert_ffn", "_MOE_EXPERT_OUTPUT"},
             {"_moe_combine", "_MOE_COMBINED_OUTPUT"},
             {"_moe_ffn", "_MOE_EXPERT_OUTPUT"},
@@ -549,6 +598,102 @@ namespace llaminar2
         for (char &c : result)
             c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
         return result;
+    }
+
+    std::vector<std::string> SnapshotCapture::possibleKeysForStageName(const std::string &stage_name)
+    {
+        auto prefixBefore = [&](const std::string &needle) -> std::string
+        {
+            const size_t pos = stage_name.find(needle);
+            return pos == std::string::npos ? stage_name : stage_name.substr(0, pos);
+        };
+
+        if (stage_name.find("_qkv_proj") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_qkv_proj");
+            return {prefix + "_Q_PROJECTION", prefix + "_K_PROJECTION", prefix + "_V_PROJECTION"};
+        }
+        if (stage_name.find("_gate_up") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_gate_up");
+            return {prefix + "_FFN_GATE", prefix + "_FFN_UP"};
+        }
+        if (stage_name.find("_rope") != std::string::npos &&
+            stage_name.find("_q_rope") == std::string::npos &&
+            stage_name.find("_k_rope") == std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_rope");
+            return {prefix + "_Q_ROPE", prefix + "_K_ROPE"};
+        }
+        if (stage_name.find("_gdn_proj") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_gdn_proj");
+            return {prefix + "_QKV_PROJECTION",
+                    prefix + "_GDN_Z_PROJECTION",
+                    prefix + "_GDN_ALPHA",
+                    prefix + "_GDN_BETA"};
+        }
+        if (stage_name.find("_q_gate_split") != std::string::npos)
+        {
+            return {prefixBefore("_q_gate_split") + "_FA_GATE"};
+        }
+        if (stage_name.find("_kv_append") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_kv_append");
+            return {prefix + "_KV_CACHE_K",
+                    prefix + "_KV_CACHE_V",
+                    prefix + "_KV_APPEND_SOURCE_K",
+                    prefix + "_KV_APPEND_SOURCE_V"};
+        }
+        if (stage_name.find("_attn_output_gate") != std::string::npos)
+        {
+            return {prefixBefore("_attn_output_gate") + "_ATTENTION_CONTEXT_GATED"};
+        }
+        if (stage_name.find("_attention") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_attention");
+            return {prefix + "_ATTENTION_CONTEXT",
+                    prefix + "_ATTENTION_EFFECTIVE_K",
+                    prefix + "_ATTENTION_EFFECTIVE_V"};
+        }
+        if (stage_name == "lm_head_allgather")
+        {
+            return {"LM_HEAD"};
+        }
+        if ((stage_name.find("_attn_norm") != std::string::npos ||
+             stage_name.find("_ffn_norm") != std::string::npos))
+        {
+            return {convertStageNameToSnapshotKey(stage_name)};
+        }
+        if (stage_name.find("_moe_ffn") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_moe_ffn");
+            return {prefix + "_MOE_EXPERT_OUTPUT",
+                    prefix + "_MOE_ROUTER_OUTPUT",
+                    prefix + "_MOE_ROUTING_INDICES",
+                    prefix + "_MOE_ROUTING_WEIGHTS"};
+        }
+        if (stage_name.find("_moe_expert_ffn") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_moe_expert_ffn");
+            return {prefix + "_MOE_EXPERT_OUTPUT",
+                    prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (stage_name.find("_shared_expert_gate") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_shared_expert_gate");
+            return {prefix + "_MOE_SHARED_GATE_OUTPUT",
+                    prefix + "_MOE_COMBINED_OUTPUT"};
+        }
+        if (stage_name.find("_moe_routing") != std::string::npos)
+        {
+            const std::string prefix = prefixBefore("_moe_routing");
+            return {prefix + "_MOE_ROUTER_OUTPUT",
+                    prefix + "_MOE_ROUTING_INDICES",
+                    prefix + "_MOE_ROUTING_WEIGHTS"};
+        }
+
+        return {convertStageNameToSnapshotKey(stage_name)};
     }
 
     // =========================================================================

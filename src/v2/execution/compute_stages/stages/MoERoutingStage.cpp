@@ -87,17 +87,12 @@ namespace llaminar2
 
         bool supportsGroupedPrefillGraphCaptureBackend(DeviceId device)
         {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-            (void)device;
-            return false;
-#else
             return supportsGroupedPrefillExecutionBackend(device);
-#endif
         }
 
         bool supportsDeviceRoutedDecodeGraphCaptureBackend(DeviceId device)
         {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
             (void)device;
             return false;
 #else
@@ -467,17 +462,28 @@ namespace llaminar2
             }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-            router_logits_ = std::move(cached_routing_.router_logits);
-            stashRoutingResults(cached_routing_.expert_indices,
-                                cached_routing_.expert_weights,
-                                seq_len,
-                                top_k);
-#else
-            routing_indices_f32_.clear();
-            routing_weights_.clear();
-            router_logits_.clear();
-            invalidateDumpInfoCache();
+            if (!cached_routing_.router_logits.empty())
+                router_logits_ = std::move(cached_routing_.router_logits);
+            else
+                router_logits_.clear();
+
+            const size_t expected_topk =
+                static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+            if (cached_routing_.expert_indices.size() >= expected_topk &&
+                cached_routing_.expert_weights.size() >= expected_topk)
+            {
+                stashRoutingResults(cached_routing_.expert_indices,
+                                    cached_routing_.expert_weights,
+                                    seq_len,
+                                    top_k);
+            }
+            else
 #endif
+            {
+                routing_indices_f32_.clear();
+                routing_weights_.clear();
+                invalidateDumpInfoCache();
+            }
             return true;
         }
 
@@ -799,7 +805,6 @@ namespace llaminar2
             return false;
         }
 
-#if !defined(ENABLE_PIPELINE_SNAPSHOTS)
         if (params_.device_id.is_gpu() && params_.seq_len == 1 &&
             !isDeviceRoutedDecodeGraphCapturable())
         {
@@ -829,7 +834,6 @@ namespace llaminar2
             return false;
             }
         }
-#endif
 
         const bool padded_prefill_replay =
             params_.device_id.is_gpu() &&
@@ -893,9 +897,33 @@ namespace llaminar2
         }
 
 #ifdef ENABLE_PIPELINE_SNAPSHOTS
-        // Stash routing data for snapshot capture
-        router_logits_ = std::move(cached_routing_.router_logits);
-        stashRoutingResults(cached_routing_.expert_indices, cached_routing_.expert_weights, seq_len, top_k);
+        /*
+         * Outside graph capture, GPU routeWithTensors() may still publish a host
+         * mirror for richer router snapshots. Captured replay deliberately keeps
+         * routing device-resident; post-graph snapshot draining will publish the
+         * output tensors below instead of relying on these optional host mirrors.
+         */
+        if (!cached_routing_.router_logits.empty())
+            router_logits_ = std::move(cached_routing_.router_logits);
+        else
+            router_logits_.clear();
+
+        const size_t expected_topk =
+            static_cast<size_t>(seq_len) * static_cast<size_t>(top_k);
+        if (cached_routing_.expert_indices.size() >= expected_topk &&
+            cached_routing_.expert_weights.size() >= expected_topk)
+        {
+            stashRoutingResults(cached_routing_.expert_indices,
+                                cached_routing_.expert_weights,
+                                seq_len,
+                                top_k);
+        }
+        else
+        {
+            routing_indices_f32_.clear();
+            routing_weights_.clear();
+            invalidateDumpInfoCache();
+        }
 #endif
 
         // Record routing result in decode histogram (if tracking enabled)
@@ -943,7 +971,7 @@ namespace llaminar2
 
     bool MoERoutingStage::supportsWarmupDependentGraphCapture() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
         if (params_.force_decode_equivalent_verifier_prefill)
@@ -999,16 +1027,16 @@ namespace llaminar2
 
     bool MoERoutingStage::isDeviceRoutedDecodeGraphCapturable() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS) || (!defined(HAVE_ROCM) && !defined(HAVE_CUDA))
+#if !defined(HAVE_ROCM) && !defined(HAVE_CUDA)
         return false;
 #else
         if (params_.force_decode_equivalent_verifier_prefill)
             return false;
 
         // Runtime-table decode routing is capture-safe when the GPU backend
-        // keeps top-k routing tensors device-resident. Snapshot builds still
-        // require host top-k/logit materialization, but decode histograms are
-        // merged lazily from DeviceMoELayerRuntime::decode_histogram.
+        // keeps top-k routing tensors device-resident. Snapshot builds drain
+        // tensor outputs after replay instead of forcing host top-k/logit
+        // materialization during capture.
         return supportsDeviceRoutedDecodeGraphCaptureBackend(params_.device_id) &&
                !params_.force_grouped_verifier_prefill_for_decode &&
                params_.seq_len == 1 &&
@@ -1082,12 +1110,8 @@ namespace llaminar2
 
     bool MoERoutingStage::isDecodeEquivalentVerifierPrefillGraphCaptureSupported() const
     {
-#if defined(ENABLE_PIPELINE_SNAPSHOTS)
-        return false;
-#else
         return supportsGroupedPrefillGraphCaptureBackend(params_.device_id) &&
                isDecodeEquivalentVerifierPrefillExecutionSupported();
-#endif
     }
 
     bool MoERoutingStage::isDecodeEquivalentVerifierPrefillGraphCapturable() const

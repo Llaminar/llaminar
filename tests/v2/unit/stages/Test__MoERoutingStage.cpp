@@ -481,7 +481,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntime
     params.moe_runtime_table = &runtime_table;
 
     MoERoutingStage stage(params);
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(stage.isGraphCapturable());
     EXPECT_TRUE(stage.needsOnGraphReplayed());
 #else
@@ -490,7 +490,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableAllowsHistogramWithInitializedRuntime
 #endif
 }
 
-TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFlags)
+TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsRuntimeTableFlags)
 {
     auto input = TestTensorFactory::createFP32({1, D_MODEL});
     auto gate_weights = TestTensorFactory::createFP32({NUM_EXPERTS, D_MODEL});
@@ -526,7 +526,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableRocmDecodeHonorsReleaseOnlyGuardAndFl
         params.moe_runtime_table = &runtime_table;
 
         MoERoutingStage runtime_stage(params);
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
         EXPECT_TRUE(runtime_stage.isGraphCapturable());
 #else
         EXPECT_FALSE(runtime_stage.isGraphCapturable());
@@ -560,7 +560,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
 
     MoERoutingStage unprepared_stage(params);
     EXPECT_FALSE(unprepared_stage.isGraphCapturable());
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(unprepared_stage.supportsWarmupDependentGraphCapture());
 #else
     EXPECT_FALSE(unprepared_stage.supportsWarmupDependentGraphCapture());
@@ -570,7 +570,7 @@ TEST_F(MoERoutingStageTest, GraphCapturableRuntimeHookRequiresInitializedStateWh
     ASSERT_TRUE(runtime_table.flipActiveBank(0, 1, nullptr));
 
     MoERoutingStage prepared_stage(params);
-#if defined(HAVE_ROCM) && !defined(ENABLE_PIPELINE_SNAPSHOTS)
+#if defined(HAVE_ROCM)
     EXPECT_TRUE(prepared_stage.isGraphCapturable());
     EXPECT_TRUE(prepared_stage.supportsWarmupDependentGraphCapture());
 #else

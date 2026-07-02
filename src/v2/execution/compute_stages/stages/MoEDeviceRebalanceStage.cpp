@@ -234,6 +234,11 @@ namespace llaminar2
         return std::string(WS_WAVE_STATE) + "_" + workspaceSuffix();
     }
 
+    std::string MoEDeviceRebalanceStage::gatheredWaveStateBufferName() const
+    {
+        return std::string(WS_GATHERED_WAVE_STATE) + "_" + workspaceSuffix();
+    }
+
     std::string MoEDeviceRebalanceStage::statusBufferName() const
     {
         return std::string(WS_STATUS) + "_" + workspaceSuffix();
@@ -257,6 +262,16 @@ namespace llaminar2
     std::string MoEDeviceRebalanceStage::gatheredTransferPayloadBufferName() const
     {
         return std::string(WS_GATHERED_TRANSFER_PAYLOAD) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::copyStatusBufferName() const
+    {
+        return std::string(WS_COPY_STATUS) + "_" + workspaceSuffix();
+    }
+
+    std::string MoEDeviceRebalanceStage::gatheredCopyStatusBufferName() const
+    {
+        return std::string(WS_GATHERED_COPY_STATUS) + "_" + workspaceSuffix();
     }
 
     std::string MoEDeviceRebalanceStage::applyStatusBufferName() const
@@ -651,9 +666,12 @@ namespace llaminar2
         }
 
         DeviceMoEExpertDirectoryEntry *local_directory = nullptr;
+        DeviceMoERebalanceApplyStatus *copy_status = nullptr;
+        DeviceMoERebalanceApplyStatus *gathered_copy_status = nullptr;
         DeviceMoERebalanceApplyStatus *apply_status = nullptr;
         DeviceMoERebalancePlanEntry *gathered_plan_entries = nullptr;
         DeviceMoERebalanceCommandBufferHeader *gathered_command_headers = nullptr;
+        DeviceMoERebalanceWaveState *gathered_wave_states = nullptr;
         DeviceMoEExpertDirectoryEntry *local_source_descriptors = nullptr;
         uint8_t *local_transfer_payload = nullptr;
         uint8_t *gathered_transfer_payload = nullptr;
@@ -670,16 +688,28 @@ namespace llaminar2
         }
         if (usesTransferSlotApply())
         {
+            copy_status = static_cast<DeviceMoERebalanceApplyStatus *>(
+                bound_workspace_->getBuffer(copyStatusBufferName()));
+            gathered_copy_status = static_cast<DeviceMoERebalanceApplyStatus *>(
+                bound_workspace_->getBuffer(gatheredCopyStatusBufferName()));
             gathered_plan_entries = static_cast<DeviceMoERebalancePlanEntry *>(
                 bound_workspace_->getBuffer(gatheredTransferPlanBufferName()));
             gathered_command_headers = static_cast<DeviceMoERebalanceCommandBufferHeader *>(
                 bound_workspace_->getBuffer(gatheredCommandHeaderBufferName()));
-            if (!gathered_plan_entries ||
-                !gathered_command_headers)
+            gathered_wave_states = static_cast<DeviceMoERebalanceWaveState *>(
+                bound_workspace_->getBuffer(gatheredWaveStateBufferName()));
+            if (!copy_status ||
+                !gathered_copy_status ||
+                !gathered_plan_entries ||
+                !gathered_command_headers ||
+                !gathered_wave_states)
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Missing transfer-slot metadata workspace buffers"
+                          << " copy_status=" << static_cast<void *>(copy_status)
+                          << " gathered_copy_status=" << static_cast<void *>(gathered_copy_status)
                           << " gathered_plan_entries=" << static_cast<void *>(gathered_plan_entries)
-                          << " gathered_command_headers=" << static_cast<void *>(gathered_command_headers));
+                          << " gathered_command_headers=" << static_cast<void *>(gathered_command_headers)
+                          << " gathered_wave_states=" << static_cast<void *>(gathered_wave_states));
                 return false;
             }
             if (usesCompactTransferSlots())
@@ -841,9 +871,9 @@ namespace llaminar2
         {
             if (!usesTransferSlotApply())
                 return true;
-            if (!gathered_plan_entries || !gathered_command_headers)
+            if (!gathered_plan_entries || !gathered_command_headers || !gathered_wave_states)
             {
-                LOG_ERROR("[MoEDeviceRebalanceStage] Domain command projection requires gathered command buffers");
+                LOG_ERROR("[MoEDeviceRebalanceStage] Domain command projection requires gathered command and wave buffers");
                 return false;
             }
             if (!moe_kernel->projectDeviceRebalanceDomainCommands(
@@ -855,7 +885,9 @@ namespace llaminar2
                     params_.config,
                     status,
                     static_cast<uint32_t>(payloadSlotCapacity()),
-                    static_cast<uint32_t>(commandBufferCount())))
+                    static_cast<uint32_t>(commandBufferCount()),
+                    gathered_wave_states,
+                    wave_state))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to project gathered root commands into local apply ABI");
                 return false;
@@ -906,6 +938,91 @@ namespace llaminar2
             return true;
         };
 
+        auto has_incoming_payload_edges = [&]() -> bool
+        {
+            if (!usesCollectivePayloadLane())
+                return false;
+            if (params_.payload_edge_mask == 0ULL)
+                return true;
+            const uint32_t destination =
+                static_cast<uint32_t>(params_.tp_device_idx);
+            const uint32_t participant_count =
+                std::min<uint32_t>(
+                    params_.config.participant_count,
+                    static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+            for (uint32_t source = 0; source < participant_count; ++source)
+            {
+                if (source == destination)
+                    continue;
+                const uint64_t edge_bit =
+                    moe_rebalance_policy::directedParticipantEdgeBit(
+                        source,
+                        destination,
+                        static_cast<uint32_t>(kDeviceMoEMaxParticipants));
+                if ((params_.payload_edge_mask & edge_bit) != 0ULL)
+                    return true;
+            }
+            return false;
+        };
+
+        auto apply_published_transfer_wave = [&](const char *context) -> bool
+        {
+            if (!usesReadyWaveApply())
+                return true;
+            if (!apply_status)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] " << context
+                          << " requires ready-wave apply status");
+                return false;
+            }
+            if (!moe_kernel->applyReadyDeviceRebalanceWave(
+                    runtime_layers,
+                    plan_entries,
+                    plan_count,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    params_.local_transfer_slots,
+                    params_.local_transfer_slot_count,
+                    params_.config,
+                    apply_status,
+                    controller_state,
+                    command_header,
+                    /*target_layer=*/-1,
+                    static_cast<uint32_t>(commandBufferCount())))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Failed to apply ready device rebalance wave after "
+                          << context);
+                return false;
+            }
+            return true;
+        };
+
+        auto gather_copy_status = [&](const char *context) -> bool
+        {
+            if (!copy_status || !gathered_copy_status)
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] " << context
+                          << " requires copy-status workspace buffers");
+                return false;
+            }
+            static_assert((sizeof(DeviceMoERebalanceApplyStatus) % sizeof(int32_t)) == 0);
+            const size_t copy_status_int32_words =
+                sizeof(DeviceMoERebalanceApplyStatus) / sizeof(int32_t);
+            if (!params_.tp_ctx->allgatherRawOnStream(
+                    copy_status,
+                    gathered_copy_status,
+                    copy_status_int32_words,
+                    CollectiveDataType::INT32,
+                    params_.tp_device_idx,
+                    transfer_stream,
+                    workspaceSuffix() + "_copy_status"))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] " << context
+                          << " copy-status allgather failed");
+                return false;
+            }
+            return true;
+        };
+
         auto copy_prepared_payload = [&](bool transfer_stream_already_ordered) -> bool
         {
             if (!usesCollectivePayloadLane())
@@ -953,7 +1070,7 @@ namespace llaminar2
                         static_cast<uint32_t>(collectivePayloadSlotCount()),
                         params_.collective_payload_slot_bytes,
                         params_.config,
-                        apply_status,
+                        copy_status,
                         controller_state,
                         static_cast<uint32_t>(commandBufferCount())))
                 {
@@ -972,7 +1089,7 @@ namespace llaminar2
                         static_cast<uint32_t>(collectivePayloadSlotCount()),
                         params_.collective_payload_slot_bytes,
                         params_.config,
-                        apply_status,
+                        copy_status,
                         controller_state,
                         static_cast<uint32_t>(commandBufferCount())))
                 {
@@ -1053,7 +1170,8 @@ namespace llaminar2
                 return false;
             }
 
-            if (!moe_kernel->unpackDeviceRebalanceCollectivePayloads(
+            if (has_incoming_payload_edges() &&
+                !moe_kernel->unpackDeviceRebalanceCollectivePayloads(
                     plan_entries,
                     plan_count,
                     static_cast<uint32_t>(transferPlanCapacity()),
@@ -1064,7 +1182,7 @@ namespace llaminar2
                     params_.local_transfer_slots,
                     params_.local_transfer_slot_count,
                     params_.config,
-                    apply_status,
+                    copy_status,
                     controller_state,
                     static_cast<uint32_t>(commandBufferCount())))
             {
@@ -1072,17 +1190,26 @@ namespace llaminar2
                 return false;
             }
 
+            if (!gather_copy_status("prepared payload copy"))
+                return false;
+
             if (!moe_kernel->publishDeviceRebalanceTransferComplete(
                     controller_state,
                     command_header,
                     wave_state,
-                    apply_status,
+                    copy_status,
+                    plan_entries,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    gathered_copy_status,
                     params_.config,
                     static_cast<uint32_t>(commandBufferCount())))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to publish device rebalance transfer completion");
                 return false;
             }
+
+            if (!apply_published_transfer_wave("prepared payload copy"))
+                return false;
 
             return join_transfer_stream_to_capture_stream("prepared payload copy");
         };
@@ -1108,12 +1235,16 @@ namespace llaminar2
             moe_kernel->setGPUStream(transfer_stream);
             static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
             static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
+            static_assert((sizeof(DeviceMoERebalanceWaveState) % sizeof(int32_t)) == 0);
             const size_t plan_int32_words =
                 (commandBufferCount() * transferPlanCapacity() *
                  sizeof(DeviceMoERebalancePlanEntry)) /
                 sizeof(int32_t);
             const size_t header_int32_words =
                 (commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader)) /
+                sizeof(int32_t);
+            const size_t wave_int32_words =
+                (commandBufferCount() * sizeof(DeviceMoERebalanceWaveState)) /
                 sizeof(int32_t);
             if (!params_.tp_ctx->allgatherRawOnStream(
                     plan_entries,
@@ -1137,6 +1268,18 @@ namespace llaminar2
                     workspaceSuffix() + "_transfer_header"))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-header allgather failed");
+                return false;
+            }
+            if (!params_.tp_ctx->allgatherRawOnStream(
+                    wave_state,
+                    gathered_wave_states,
+                    wave_int32_words,
+                    CollectiveDataType::INT32,
+                    params_.tp_device_idx,
+                    transfer_stream,
+                    workspaceSuffix() + "_transfer_wave"))
+            {
+                LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-wave allgather failed");
                 return false;
             }
 
@@ -1165,7 +1308,7 @@ namespace llaminar2
                     static_cast<uint32_t>(collectivePayloadSlotCount()),
                     params_.collective_payload_slot_bytes,
                     params_.config,
-                    apply_status,
+                    copy_status,
                     controller_state,
                     static_cast<uint32_t>(commandBufferCount())))
             {
@@ -1196,7 +1339,8 @@ namespace llaminar2
             }
 
             moe_kernel->setGPUStream(transfer_stream);
-            if (!moe_kernel->unpackDeviceRebalanceCollectivePayloads(
+            if (has_incoming_payload_edges() &&
+                !moe_kernel->unpackDeviceRebalanceCollectivePayloads(
                     plan_entries,
                     plan_count,
                     static_cast<uint32_t>(transferPlanCapacity()),
@@ -1207,7 +1351,7 @@ namespace llaminar2
                     params_.local_transfer_slots,
                     params_.local_transfer_slot_count,
                     params_.config,
-                    apply_status,
+                    copy_status,
                     controller_state,
                     static_cast<uint32_t>(commandBufferCount())))
             {
@@ -1215,17 +1359,26 @@ namespace llaminar2
                 return false;
             }
 
+            if (!gather_copy_status("sideband collective payload unpack"))
+                return false;
+
             if (!moe_kernel->publishDeviceRebalanceTransferComplete(
                     controller_state,
                     command_header,
                     wave_state,
-                    apply_status,
+                    copy_status,
+                    plan_entries,
+                    static_cast<uint32_t>(transferPlanCapacity()),
+                    gathered_copy_status,
                     params_.config,
                     static_cast<uint32_t>(commandBufferCount())))
             {
                 LOG_ERROR("[MoEDeviceRebalanceStage] Failed to publish sideband collective rebalance transfer completion");
                 return false;
             }
+
+            if (!apply_published_transfer_wave("sideband collective payload unpack"))
+                return false;
 
             if (!gpu_ctx->recordEventChecked(transfer_state->transferDoneEvent(),
                                              transfer_stream))
@@ -1328,11 +1481,14 @@ namespace llaminar2
                     {
                         static_assert((sizeof(DeviceMoERebalancePlanEntry) % sizeof(int32_t)) == 0);
                         static_assert((sizeof(DeviceMoERebalanceCommandBufferHeader) % sizeof(int32_t)) == 0);
+                        static_assert((sizeof(DeviceMoERebalanceWaveState) % sizeof(int32_t)) == 0);
                         const size_t plan_int32_words =
                             (commandBufferCount() * transferPlanCapacity() * sizeof(DeviceMoERebalancePlanEntry)) /
                             sizeof(int32_t);
                         const size_t header_int32_words =
                             (commandBufferCount() * sizeof(DeviceMoERebalanceCommandBufferHeader)) / sizeof(int32_t);
+                        const size_t wave_int32_words =
+                            (commandBufferCount() * sizeof(DeviceMoERebalanceWaveState)) / sizeof(int32_t);
                         if (!params_.tp_ctx->allgatherRawOnStream(
                                 plan_entries,
                                 gathered_plan_entries,
@@ -1355,6 +1511,18 @@ namespace llaminar2
                                 workspaceSuffix() + "_transfer_header"))
                         {
                             LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-header allgather failed");
+                            return false;
+                        }
+                        if (!params_.tp_ctx->allgatherRawOnStream(
+                                wave_state,
+                                gathered_wave_states,
+                                wave_int32_words,
+                                CollectiveDataType::INT32,
+                                params_.tp_device_idx,
+                                transfer_stream,
+                                workspaceSuffix() + "_transfer_wave"))
+                        {
+                            LOG_ERROR("[MoEDeviceRebalanceStage] Transfer-wave allgather failed");
                             return false;
                         }
 
@@ -1436,13 +1604,19 @@ namespace llaminar2
         }
         if (usesTransferSlotApply())
         {
+            bytes += sizeof(DeviceMoERebalanceApplyStatus);
+            bytes += static_cast<size_t>(params_.config.participant_count) *
+                     sizeof(DeviceMoERebalanceApplyStatus);
             bytes += transferPlanCapacity() *
                          static_cast<size_t>(params_.config.participant_count) *
                          commandBufferCount() *
                          sizeof(DeviceMoERebalancePlanEntry) +
                      static_cast<size_t>(params_.config.participant_count) *
                          commandBufferCount() *
-                         sizeof(DeviceMoERebalanceCommandBufferHeader);
+                         sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                     static_cast<size_t>(params_.config.participant_count) *
+                         commandBufferCount() *
+                         sizeof(DeviceMoERebalanceWaveState);
             if (usesCompactTransferSlots())
             {
                 bytes +=
@@ -1622,6 +1796,15 @@ namespace llaminar2
         }
         if (usesTransferSlotApply())
         {
+            reqs.buffers.push_back({copyStatusBufferName(),
+                                    sizeof(DeviceMoERebalanceApplyStatus),
+                                    256,
+                                    true});
+            reqs.buffers.push_back({gatheredCopyStatusBufferName(),
+                                    static_cast<size_t>(params_.config.participant_count) *
+                                        sizeof(DeviceMoERebalanceApplyStatus),
+                                    256,
+                                    true});
             reqs.buffers.push_back({gatheredTransferPlanBufferName(),
                                     transferPlanCapacity() *
                                         commandBufferCount() *
@@ -1633,6 +1816,12 @@ namespace llaminar2
                                     static_cast<size_t>(params_.config.participant_count) *
                                         commandBufferCount() *
                                         sizeof(DeviceMoERebalanceCommandBufferHeader),
+                                    256,
+                                    true});
+            reqs.buffers.push_back({gatheredWaveStateBufferName(),
+                                    static_cast<size_t>(params_.config.participant_count) *
+                                        commandBufferCount() *
+                                        sizeof(DeviceMoERebalanceWaveState),
                                     256,
                                     true});
             if (usesCompactTransferSlots())

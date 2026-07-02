@@ -199,6 +199,7 @@ namespace llaminar2
         int bucket_seq_len,
         PrefillGraphPreflightMode mode,
         bool collectives_graph_capturable,
+        bool moe_rebalancing_graph_stable,
         std::string *reject_stage_name,
         std::string *reject_stage_type) const
     {
@@ -216,8 +217,7 @@ namespace llaminar2
         if (!key.device_id.is_gpu())
             return PrefillGraphRejectReason::NotGPUDevice;
 
-        if (snapshots_active)
-            return PrefillGraphRejectReason::SnapshotsActive;
+        (void)snapshots_active;
 
         const bool padded_bucket =
             real_seq_len > 0 && bucket_seq_len > 0 && real_seq_len < bucket_seq_len;
@@ -227,7 +227,7 @@ namespace llaminar2
         if (padded_bucket && !config_.buckets_enabled)
             return PrefillGraphRejectReason::FeatureDisabled;
 
-        if (moe_rebalancing_active && padded_bucket)
+        if (moe_rebalancing_active && padded_bucket && !moe_rebalancing_graph_stable)
             return PrefillGraphRejectReason::ActiveMoERebalancing;
 
         if (collective_nodes && !collective_nodes->empty() && !collectives_graph_capturable)
@@ -408,6 +408,38 @@ namespace llaminar2
                                                                         << ", nodes=" << entry.node_count
                                                                         << ", device=" << key.device_id.toString());
 
+        return true;
+    }
+
+    bool PrefillGraphCache::abortCapture(const PrefillGraphCacheKey &key)
+    {
+        auto it = entries_.find(key);
+        if (it == entries_.end())
+            return true;
+
+        auto &entry = it->second;
+        if (entry.phase != PrefillGraphPhase::Capturing)
+            return true;
+
+        bool exited_capture = true;
+        if (entry.capture)
+        {
+            // endCapture() is required for its side effect of leaving CUDA/HIP
+            // stream capture mode. It may return false when the captured work
+            // invalidated the graph; that is still the cleanup path we need.
+            exited_capture = entry.capture->endCapture();
+        }
+
+        entry.capture.reset();
+        entry.phase = PrefillGraphPhase::Cold;
+        entry.node_count = 0;
+        entry.replay_count = 0;
+
+        if (!exited_capture)
+        {
+            LOG_WARN("[PrefillGraphCache] Aborted prefill graph capture for seq_len="
+                     << key.seq_len << " after capture graph reported invalid endCapture");
+        }
         return true;
     }
 

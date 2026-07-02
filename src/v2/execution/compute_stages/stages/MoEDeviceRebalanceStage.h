@@ -166,11 +166,14 @@ namespace llaminar2
         static constexpr const char *WS_GATHERED_TRANSFER_PLAN = "moe_rebalance_gathered_transfer_plan";
         static constexpr const char *WS_GATHERED_COMMAND_HEADER = "moe_rebalance_gathered_command_header";
         static constexpr const char *WS_WAVE_STATE = "moe_rebalance_wave_state";
+        static constexpr const char *WS_GATHERED_WAVE_STATE = "moe_rebalance_gathered_wave_state";
         static constexpr const char *WS_STATUS = "moe_rebalance_status";
         static constexpr const char *WS_LOCAL_DIRECTORY = "moe_rebalance_local_directory";
         static constexpr const char *WS_LOCAL_SOURCE_DESCRIPTORS = "moe_rebalance_local_source_descriptors";
         static constexpr const char *WS_LOCAL_TRANSFER_PAYLOAD = "moe_rebalance_local_transfer_payload";
         static constexpr const char *WS_GATHERED_TRANSFER_PAYLOAD = "moe_rebalance_gathered_transfer_payload";
+        static constexpr const char *WS_COPY_STATUS = "moe_rebalance_copy_status";
+        static constexpr const char *WS_GATHERED_COPY_STATUS = "moe_rebalance_gathered_copy_status";
         static constexpr const char *WS_APPLY_STATUS = "moe_rebalance_apply_status";
 
         struct Params
@@ -242,11 +245,14 @@ namespace llaminar2
         std::string gatheredTransferPlanBufferName() const;
         std::string gatheredCommandHeaderBufferName() const;
         std::string waveStateBufferName() const;
+        std::string gatheredWaveStateBufferName() const;
         std::string statusBufferName() const;
         std::string localDirectoryBufferName() const;
         std::string localSourceDescriptorsBufferName() const;
         std::string localTransferPayloadBufferName() const;
         std::string gatheredTransferPayloadBufferName() const;
+        std::string copyStatusBufferName() const;
+        std::string gatheredCopyStatusBufferName() const;
         std::string applyStatusBufferName() const;
         size_t localHistogramEntries() const;
         size_t gatheredHistogramEntries() const;

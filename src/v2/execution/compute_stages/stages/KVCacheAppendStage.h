@@ -157,8 +157,6 @@ namespace llaminar2
         {
             IComputeStage::resetSessionState();
             replay_advance_tokens_ = 0;
-            debug_append_source_k_snapshot_.clear();
-            debug_append_source_v_snapshot_.clear();
             debug_append_source_k_rows_ = 0;
             debug_append_source_k_cols_ = 0;
             debug_append_source_v_rows_ = 0;
@@ -219,17 +217,9 @@ namespace llaminar2
         /// before Q16_1 quantization. Lazy-allocated, reused across calls.
         std::vector<float> kv_rotation_scratch_;
 
-        /// Debug-only post-append KV snapshots. Populated only when
-        /// LLAMINAR_DEBUG_KV_CACHE_SNAPSHOT is enabled, so normal dump/coherence
-        /// paths do not copy persistent cache state back to host.
-        mutable std::vector<float> debug_cache_k_snapshot_;
-        mutable std::vector<float> debug_cache_v_snapshot_;
-
-        /// Debug-only source K/V copies captured immediately before append.
-        /// This avoids reading persistent cache views while still proving what
-        /// each request wrote into the cache append path.
-        std::vector<float> debug_append_source_k_snapshot_;
-        std::vector<float> debug_append_source_v_snapshot_;
+        /// Debug-only source K/V metadata for tensor-backed graph snapshots.
+        /// The actual bytes are captured by DeviceGraphExecutor's graph-stable
+        /// D2D snapshot-copy path, never by host reads inside execute().
         size_t debug_append_source_k_rows_ = 0;
         size_t debug_append_source_k_cols_ = 0;
         size_t debug_append_source_v_rows_ = 0;

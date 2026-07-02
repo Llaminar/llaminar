@@ -566,7 +566,8 @@ namespace llaminar2
         {
             return t == ComputeStageType::ALLREDUCE ||
                    t == ComputeStageType::ALLGATHER ||
-                   t == ComputeStageType::ALLGATHER_V;
+                   t == ComputeStageType::ALLGATHER_V ||
+                   t == ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER;
         };
 
         bool current_capturable = false;
@@ -951,7 +952,8 @@ namespace llaminar2
         bool has_collective_nodes,
         bool needs_segment_sync,
         uint64_t current_step,
-        const std::function<bool(ComputeNode &)> &execute_node_cb)
+        const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb)
     {
         if (!ctx || !gpu_ctx)
         {
@@ -963,7 +965,8 @@ namespace llaminar2
         {
             return t == ComputeStageType::ALLREDUCE ||
                    t == ComputeStageType::ALLGATHER ||
-                   t == ComputeStageType::ALLGATHER_V;
+                   t == ComputeStageType::ALLGATHER_V ||
+                   t == ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER;
         };
 
         const bool trace_replay = debugEnv().execution.gpu_graph_trace_replay;
@@ -1079,6 +1082,14 @@ namespace llaminar2
                     LOG_ERROR("[DeviceGraphCaptureController] Manual stage failed on replay: " << stage_name);
                     return false;
                 }
+            }
+
+            if (record_snapshot_copies_cb &&
+                !record_snapshot_copies_cb(*node, capture_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Manual replay snapshot copy failed: "
+                          << stage_name);
+                return false;
             }
 
             if (node->stage->isManualGraphBoundary() &&
@@ -1217,6 +1228,7 @@ namespace llaminar2
         IWorkerGPUContext *gpu_ctx,
         void *capture_stream,
         int segment_index,
+        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!ctx || !gpu_ctx)
@@ -1258,6 +1270,14 @@ namespace llaminar2
                 auto *node = graph.getNode(stage_name);
                 if (!node || !node->stage || !node->stage->execute(ctx))
                 {
+                    exec_ok = false;
+                    break;
+                }
+                if (record_snapshot_copies_cb &&
+                    !record_snapshot_copies_cb(*node, capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Re-capture snapshot copy failed: "
+                              << stage_name);
                     exec_ok = false;
                     break;
                 }
@@ -1578,6 +1598,7 @@ namespace llaminar2
         bool has_collective_nodes,
         uint64_t current_step,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         if (!ctx || !gpu_ctx)
@@ -1621,6 +1642,14 @@ namespace llaminar2
                 if (!execute_node_cb(*node))
                 {
                     LOG_ERROR("[DeviceGraphCaptureController] Capturable segment stage failed during Phase-2 execution: " << stage_name);
+                    phase2_exec_ok = false;
+                    break;
+                }
+                if (record_snapshot_copies_cb &&
+                    !record_snapshot_copies_cb(*node, capture_stream))
+                {
+                    LOG_ERROR("[DeviceGraphCaptureController] Capturable segment snapshot copy failed during Phase-2 execution: "
+                              << stage_name);
                     phase2_exec_ok = false;
                     break;
                 }
@@ -1684,7 +1713,8 @@ namespace llaminar2
         void *capture_stream,
         bool has_collective_nodes,
         uint64_t current_step,
-        const std::function<bool(ComputeNode &)> &execute_node_cb)
+        const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb)
     {
         if (!ctx || !gpu_ctx || !capture_stream)
         {
@@ -1696,7 +1726,8 @@ namespace llaminar2
         {
             return t == ComputeStageType::ALLREDUCE ||
                    t == ComputeStageType::ALLGATHER ||
-                   t == ComputeStageType::ALLGATHER_V;
+                   t == ComputeStageType::ALLGATHER_V ||
+                   t == ComputeStageType::TP_KV_CACHE_STATE_ALLGATHER;
         };
 
         /*
@@ -1748,6 +1779,20 @@ namespace llaminar2
                 return false;
             }
 
+            if (is_collective)
+            {
+                gpu_ctx->insertStreamDependency(capture_stream, compute_stream);
+                stage_stream = capture_stream;
+            }
+
+            if (record_snapshot_copies_cb &&
+                !record_snapshot_copies_cb(*node, stage_stream))
+            {
+                LOG_ERROR("[DeviceGraphCaptureController] Capture manual snapshot copy failed: "
+                          << stage_name);
+                return false;
+            }
+
             if (node->stage->isManualGraphBoundary() &&
                 !node->stage->manualGraphBoundaryComplete())
             {
@@ -1757,11 +1802,6 @@ namespace llaminar2
             }
 
             graph.markCompleted(stage_name);
-
-            if (is_collective)
-            {
-                gpu_ctx->insertStreamDependency(capture_stream, compute_stream);
-            }
         }
 
         segment.last_executed_step = current_step;
@@ -1820,6 +1860,7 @@ namespace llaminar2
         int segment_index,
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
+        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         ReplayCapturableResult result{};
@@ -1861,6 +1902,7 @@ namespace llaminar2
                 gpu_ctx,
                 capture_stream,
                 segment_index,
+                record_snapshot_copies_cb,
                 post_launch_cb);
             result.success = recapture_ok;
             return result;
@@ -1912,6 +1954,7 @@ namespace llaminar2
         const std::string &perf_context,
         const std::function<bool(const DeviceGraphExecutor::GraphSegment &)> &cohere_inputs_cb,
         const std::function<bool(ComputeNode &)> &execute_node_cb,
+        const std::function<bool(ComputeNode &, void *)> &record_snapshot_copies_cb,
         const std::function<void(DeviceGraphExecutor::GraphSegment &, void *)> &post_launch_cb)
     {
         ReplaySegmentResult result{};
@@ -1931,6 +1974,7 @@ namespace llaminar2
                 segment_index,
                 perf_context,
                 cohere_inputs_cb,
+                record_snapshot_copies_cb,
                 post_launch_cb);
             result.success = capturable_result.success;
             result.skipped_non_idempotent = capturable_result.skipped_non_idempotent;
@@ -1947,7 +1991,8 @@ namespace llaminar2
             has_collective_nodes,
             needs_segment_sync,
             current_step,
-            execute_node_cb);
+            execute_node_cb,
+            record_snapshot_copies_cb);
         result.success = manual_ok;
         return result;
     }
@@ -2076,6 +2121,34 @@ namespace llaminar2
                     return result;
                 }
 
+                /*
+                 * Snapshot copy nodes need their per-stage output descriptors and
+                 * storage allocated before stream capture begins. Some outputs,
+                 * especially in-place collective outputs such as TP allreduce
+                 * tensors, first appear in snapshot publication at the collective
+                 * stage itself. If we discover them while capture is active we
+                 * cannot allocate the destination tensor safely. This prepare
+                 * hook must not copy payload bytes: the point-in-time copy is
+                 * recorded only after the producing stage executes.
+                 */
+                if (hooks.prepare_snapshot_copies)
+                {
+                    for (const auto &stage_name : seg.stage_names)
+                    {
+                        auto *node = graph.getNode(stage_name);
+                        if (!node || !node->stage)
+                            continue;
+                        if (!hooks.prepare_snapshot_copies(*node, capture_stream))
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot prewarm failed before cached graph capture: "
+                                      << stage_name);
+                            result.reset_cache = true;
+                            result.success = false;
+                            return result;
+                        }
+                    }
+                }
+
                 // Drain any pending warmup work on the capture stream before
                 // starting capture. During warmup (step 0), all stages —
                 // including RCCL allreduce — execute on this stream. If that
@@ -2145,6 +2218,14 @@ namespace llaminar2
                             exec_ok = false;
                             break;
                         }
+                        if (hooks.record_snapshot_copies &&
+                            !hooks.record_snapshot_copies(*node, capture_stream))
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Snapshot copy failed during cached graph capture: "
+                                      << stage_name);
+                            exec_ok = false;
+                            break;
+                        }
                         graph.markCompleted(stage_name);
                     }
 
@@ -2210,6 +2291,15 @@ namespace llaminar2
                             result.success = false;
                             return result;
                         }
+                        if (hooks.record_snapshot_copies &&
+                            !hooks.record_snapshot_copies(*node, default_stream))
+                        {
+                            LOG_ERROR("[DeviceGraphCaptureController] Recovery snapshot copy failed for stage: "
+                                      << stage_name);
+                            result.reset_cache = true;
+                            result.success = false;
+                            return result;
+                        }
                         graph.markCompleted(stage_name);
                     }
 
@@ -2227,6 +2317,7 @@ namespace llaminar2
                     has_collective_nodes,
                     current_step,
                     hooks.execute_node,
+                    hooks.record_snapshot_copies,
                     hooks.post_launch);
                 if (!capture_finalize_ok)
                 {
@@ -2248,7 +2339,8 @@ namespace llaminar2
                     capture_stream,
                     has_collective_nodes,
                     current_step,
-                    hooks.execute_node);
+                    hooks.execute_node,
+                    hooks.record_snapshot_copies);
                 if (!manual_capture_ok)
                 {
                     result.reset_cache = true;
@@ -2439,6 +2531,7 @@ namespace llaminar2
                 segment_cache.perf_context,
                 hooks.cohere_inputs,
                 hooks.execute_node,
+                hooks.record_snapshot_copies,
                 hooks.post_launch);
             if (PerfStatsCollector::isEnabled())
             {

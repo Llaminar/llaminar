@@ -325,6 +325,7 @@ namespace llaminar2
         // KV Cache operations
         KV_CACHE_APPEND,
         KV_CACHE_GATHER,
+        TP_KV_CACHE_STATE_ALLGATHER, ///< Gather TP-local prefill K/V rows into full replicated decode KV rows
         ATTENTION_COMPUTE,
 
         // Quantization

@@ -171,8 +171,20 @@ namespace llaminar2
         /** Resolve PP copy info for the given input (after a cache-miss build). */
         virtual PPCopyInfo resolvePPCopyInfo(const ForwardInput &input) const = 0;
 
-        /** Check if MoE dynamic rebalancing is active (blocks prefill graph capture). */
+        /** Check if MoE dynamic rebalancing is active for this forward domain. */
         virtual bool isMoeRebalancingActive() const { return false; }
+
+        /**
+         * @brief True when active MoE placement changes are graph-stable.
+         *
+         * Homogeneous GPU LocalTP AE can publish ownership/replica changes by
+         * mutating persistent runtime tables and transfer slots in place. Captured
+         * prefill graphs may then replay against padded buckets because the graph
+         * records stable table pointers, not placement topology. Hosts that cannot
+         * prove this must keep the default false value so padded graph capture
+         * fails fast instead of silently executing an unsafe eager path.
+         */
+        virtual bool isMoeRebalancingGraphStableForPrefillCapture() const { return false; }
 
         /** Check if the host execution mode should run prefill eagerly instead of graph-capturing it. */
         virtual bool prefillGraphCaptureDisabledByHost() const { return false; }

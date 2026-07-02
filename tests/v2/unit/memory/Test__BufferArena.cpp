@@ -989,6 +989,32 @@ TEST(Test__BufferArena, AllocateWithFactoryCreatesFP32)
     EXPECT_EQ(t2->cols(), 128u);
 }
 
+TEST(Test__BufferArena, MappedModeKeepsGpuScratchBuffersDeviceLocal)
+{
+    MPIContext mpi_ctx(0, 1);
+    TensorFactory factory(mpi_ctx);
+    factory.setUseMappedMemoryForGPU(true);
+
+    ArenaConfig config;
+    config.factory = &factory;
+    config.use_mapped_memory = true;
+
+    BufferArena arena(config);
+    ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_ALPHA, 256, 16, "FP32", DeviceId::rocm(0)));
+    ASSERT_TRUE(arena.registerBuffer(BufferId::GDN_BETA, 256, 16, "FP32", DeviceId::rocm(0)));
+
+    ASSERT_TRUE(arena.allocate());
+
+    auto *alpha = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::GDN_ALPHA));
+    auto *beta = dynamic_cast<TensorBase *>(arena.getTensor(BufferId::GDN_BETA));
+    ASSERT_NE(alpha, nullptr);
+    ASSERT_NE(beta, nullptr);
+    EXPECT_FALSE(alpha->isMapped());
+    EXPECT_FALSE(beta->isMapped());
+    EXPECT_EQ(alpha->home_device(), DeviceId::rocm(0));
+    EXPECT_EQ(beta->home_device(), DeviceId::rocm(0));
+}
+
 TEST(Test__BufferArena, AllocateWithFactoryCreatesBF16)
 {
     MPIContext mpi_ctx(0, 1);

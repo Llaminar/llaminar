@@ -385,11 +385,13 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
                       sizeof(DeviceMoERebalancePlanEntry) +
                   transfer_command_buffers * static_cast<size_t>(config.participant_count) *
                       sizeof(DeviceMoERebalanceCommandBufferHeader) +
+                  transfer_command_buffers * static_cast<size_t>(config.participant_count) *
+                      sizeof(DeviceMoERebalanceWaveState) +
                   collective_payload_local_bytes +
                   collective_payload_gathered_bytes);
 
     const WorkspaceRequirements transfer_reqs = transfer_stage.getWorkspaceRequirements(0, 0, 0);
-    ASSERT_EQ(transfer_reqs.buffers.size(), 14u);
+    ASSERT_EQ(transfer_reqs.buffers.size(), 15u);
     const auto *transfer_plan_desc =
         transfer_reqs.find("moe_rebalance_transfer_plan_decode_rebalance");
     const auto *transfer_plan_count_desc =
@@ -402,6 +404,8 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
         transfer_reqs.find("moe_rebalance_gathered_transfer_plan_decode_rebalance");
     const auto *gathered_command_header_desc =
         transfer_reqs.find("moe_rebalance_gathered_command_header_decode_rebalance");
+    const auto *gathered_wave_state_desc =
+        transfer_reqs.find("moe_rebalance_gathered_wave_state_decode_rebalance");
     const auto *local_directory_desc =
         transfer_reqs.find("moe_rebalance_local_directory_decode_rebalance");
     const auto *gathered_directory_desc =
@@ -418,6 +422,7 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     ASSERT_NE(transfer_wave_state_desc, nullptr);
     ASSERT_NE(gathered_transfer_plan_desc, nullptr);
     ASSERT_NE(gathered_command_header_desc, nullptr);
+    ASSERT_NE(gathered_wave_state_desc, nullptr);
     ASSERT_NE(local_directory_desc, nullptr);
     ASSERT_EQ(gathered_directory_desc, nullptr)
         << "collective staging payloads carry source descriptors and must not allgather the full expert directory";
@@ -439,6 +444,9 @@ TEST_F(ComputeStagesTest, MoEDeviceRebalanceStage_WorkspaceContract)
     EXPECT_EQ(gathered_command_header_desc->size_bytes,
               transfer_command_buffers * static_cast<size_t>(config.participant_count) *
                   sizeof(DeviceMoERebalanceCommandBufferHeader));
+    EXPECT_EQ(gathered_wave_state_desc->size_bytes,
+              transfer_command_buffers * static_cast<size_t>(config.participant_count) *
+                  sizeof(DeviceMoERebalanceWaveState));
     EXPECT_EQ(local_directory_desc->size_bytes,
               local_directory_entries * sizeof(DeviceMoEExpertDirectoryEntry));
     EXPECT_EQ(local_transfer_payload_desc->size_bytes,

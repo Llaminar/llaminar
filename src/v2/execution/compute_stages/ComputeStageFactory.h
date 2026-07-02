@@ -16,6 +16,7 @@
 #include "stages/ResidualAddStage.h"
 #include "stages/KVCacheAppendStage.h"
 #include "stages/KVCacheGatherStage.h"
+#include "stages/TPKVCacheStateAllGatherStage.h"
 #include "stages/AttentionComputeStage.h"
 #include "stages/EmbeddingStage.h"
 #include "stages/HiddenStateRowSelectStage.h"
@@ -159,6 +160,12 @@ namespace llaminar2
          */
         static std::unique_ptr<IComputeStage> createKVCacheGather(
             const KVCacheGatherStage::Params &params);
+
+        /**
+         * @brief Create a LocalTP K/V state allgather handoff stage
+         */
+        static std::unique_ptr<IComputeStage> createTPKVCacheStateAllGather(
+            const TPKVCacheStateAllGatherStage::Params &params);
 
         /**
          * @brief Create a pure attention compute stage using KernelFactory

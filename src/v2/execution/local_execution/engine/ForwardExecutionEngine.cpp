@@ -339,6 +339,7 @@ namespace llaminar2
             bool moe_rebalancing_active,
             PrefillGraphPreflightMode mode = PrefillGraphPreflightMode::Default,
             bool collectives_graph_capturable = false,
+            bool moe_rebalancing_graph_stable = false,
             bool host_policy_disabled = false,
             std::string *reject_stage_name = nullptr,
             std::string *reject_stage_type = nullptr)
@@ -359,6 +360,7 @@ namespace llaminar2
                 effectiveBucketSeqLen(input),
                 mode,
                 collectives_graph_capturable,
+                moe_rebalancing_graph_stable,
                 reject_stage_name,
                 reject_stage_type);
         }
@@ -1757,18 +1759,10 @@ namespace llaminar2
 
         if (!is_decode)
         {
-            if (executor_.config().snapshot_callback)
-            {
-                // Snapshot tests need callbacks on cached prefill replays too.
-                // executeFastDecode() intentionally disables callbacks, so use
-                // the full policy whenever capture is enabled.
-                success = executor_.execute(*forward_cache.graph, ctx);
-            }
-            else
-            {
-                // Prefill with graph capture/replay state machine
-                success = executePrefillWithGraphCache(input, forward_cache, ctx, host);
-            }
+            // Prefill with graph capture/replay state machine. Snapshot capture
+            // is handled as a post-graph drain inside executePrefillWithGraphCache()
+            // so parity diagnostics do not force eager stage execution.
+            success = executePrefillWithGraphCache(input, forward_cache, ctx, host);
         }
         else
         {
@@ -2147,6 +2141,8 @@ namespace llaminar2
         const bool padded_bucket = isPaddedBucketExecution(input);
         const bool snapshots_active = (executor_.config().snapshot_callback != nullptr);
         const bool moe_rebalancing_active = host.isMoeRebalancingActive();
+        const bool moe_rebalancing_graph_stable =
+            host.isMoeRebalancingGraphStableForPrefillCapture();
         const bool host_prefill_graph_disabled = host.prefillGraphCaptureDisabledByHost();
         const bool prefill_collectives_graph_capturable =
             !forward_cache.collective_nodes.empty() &&
@@ -2276,6 +2272,7 @@ namespace llaminar2
                 moe_rebalancing_active,
                 PrefillGraphPreflightMode::ColdPaddedSupport,
                 prefill_collectives_graph_capturable,
+                moe_rebalancing_graph_stable,
                 host_prefill_graph_disabled,
                 &padded_reject_stage_name,
                 &padded_reject_stage_type);
@@ -2380,6 +2377,14 @@ namespace llaminar2
             for (auto *stage : forward_cache.replay_callback_stages)
                 stage->onGraphReplayed();
 
+            if (!executor_.publishSnapshotsAfterGraphExecution(
+                    *forward_cache.graph,
+                    stream,
+                    "prefill_graph_replay"))
+            {
+                return false;
+            }
+
             if (cache.config().trace)
                 LOG_INFO("[ForwardExecutionEngine] Prefill graph REPLAY seq_len=" << input.seq_len
                                                                                   << " replay_count=" << cache.replayCount(key));
@@ -2411,6 +2416,7 @@ namespace llaminar2
                 moe_rebalancing_active,
                 PrefillGraphPreflightMode::CaptureReady,
                 prefill_collectives_graph_capturable,
+                moe_rebalancing_graph_stable,
                 host_prefill_graph_disabled,
                 &capture_ready_reject_stage_name,
                 &capture_ready_reject_stage_type);
@@ -2431,11 +2437,23 @@ namespace llaminar2
             bindPrefillStreamToStages(stream);
             if (!preparePrefillGraphLaunchMetadata(stream, "capture"))
                 return false;
+            if (!executor_.prepareSnapshotsForGraphCapture(
+                    *forward_cache.graph,
+                    ctx,
+                    stream,
+                    "prefill_graph_capture"))
+            {
+                LOG_ERROR("[ForwardExecutionEngine] Prefill graph snapshot preparation failed for seq_len="
+                          << input.seq_len);
+                return false;
+            }
             gpu_ctx->synchronizeStream(stream);
             gpu_ctx->clearLastError();
 
+            gpu_ctx->setGraphCaptureActive(true);
             if (!cache.beginCapture(key, gpu_ctx, stream))
             {
+                gpu_ctx->setGraphCaptureActive(false);
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture BEGIN failed for seq_len=" << input.seq_len);
                 return false;
             }
@@ -2451,9 +2469,11 @@ namespace llaminar2
                     *forward_cache.graph, ctx, &forward_cache.collective_nodes);
             }
 
+            gpu_ctx->setGraphCaptureActive(false);
             if (!exec_success)
             {
                 LOG_ERROR("[ForwardExecutionEngine] Prefill graph capture EXECUTION failed for seq_len=" << input.seq_len);
+                cache.abortCapture(key);
                 return false;
             }
 
@@ -2485,6 +2505,14 @@ namespace llaminar2
             {
                 if (stage && stage->type() != ComputeStageType::KV_CACHE_APPEND)
                     stage->onGraphReplayed();
+            }
+
+            if (!executor_.publishSnapshotsAfterGraphExecution(
+                    *forward_cache.graph,
+                    stream,
+                    "prefill_graph_capture_launch"))
+            {
+                return false;
             }
 
             LOG_INFO("[ForwardExecutionEngine] Prefill graph CAPTURED seq_len=" << input.seq_len
@@ -2553,6 +2581,7 @@ namespace llaminar2
                         ? PrefillGraphPreflightMode::ColdPaddedSupport
                         : PrefillGraphPreflightMode::Default,
                     prefill_collectives_graph_capturable,
+                    moe_rebalancing_graph_stable,
                     host_prefill_graph_disabled,
                     &cold_reject_stage_name,
                     &cold_reject_stage_type);
@@ -2607,6 +2636,14 @@ namespace llaminar2
 
         if (!exec_success)
             return false;
+
+        if (!executor_.publishSnapshotsAfterGraphExecution(
+                *forward_cache.graph,
+                nullptr,
+                "prefill_graph_warmup"))
+        {
+            return false;
+        }
 
         // After successful warmup, check if graph capture is eligible
         if (cold_phase)
@@ -2736,6 +2773,7 @@ namespace llaminar2
                 host.isMoeRebalancingActive(),
                 PrefillGraphPreflightMode::Default,
                 prefill_collectives_graph_capturable,
+                host.isMoeRebalancingGraphStableForPrefillCapture(),
                 host.prefillGraphCaptureDisabledByHost(),
                 &bucketed_prefill_reject_stage_name,
                 &bucketed_prefill_reject_stage_type);

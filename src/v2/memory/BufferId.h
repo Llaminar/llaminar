@@ -36,6 +36,8 @@ namespace llaminar2
         Q_PROJ,      ///< Q projection output
         K_PROJ,      ///< K projection output
         V_PROJ,      ///< V projection output
+        K_FULL_PREFILL, ///< Full replicated K projection rows for phase-split decode cache seeding
+        V_FULL_PREFILL, ///< Full replicated V projection rows for phase-split decode cache seeding
         Q_ROPE,      ///< Post-RoPE Q
         K_ROPE,      ///< Post-RoPE K
         V_DEQUANT,   ///< Dequantized V
@@ -171,6 +173,10 @@ namespace llaminar2
             return "K_PROJ";
         case BufferId::V_PROJ:
             return "V_PROJ";
+        case BufferId::K_FULL_PREFILL:
+            return "K_FULL_PREFILL";
+        case BufferId::V_FULL_PREFILL:
+            return "V_FULL_PREFILL";
         case BufferId::Q_ROPE:
             return "Q_ROPE";
         case BufferId::K_ROPE:
