@@ -32,7 +32,7 @@ Llaminar supports the following model architectures initially:
 
 Latest benchmarks can be found here: 
 
-https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/e126900d/benchmark_results.csv
+https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/bcd2b199/benchmark_results.csv
 
 ## Accuracy
 
