@@ -34,6 +34,14 @@ Latest benchmarks can be found here:
 
 https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/e126900d/benchmark_results.csv
 
+## Accuracy
+
+Llaminar has a comprehensive parity test framework that compares each step and layer of inference against a Huggingface FP32 reference implementation, for each backend and various configurations (single device, pipeline parallel, tensor parallel).
+
+Latest parity test CSVs for all configurations can be found here: 
+
+https://github.com/Llaminar/llaminar/tree/develop/tests/v2/integration/parity/results/bcd2b199
+
 ## Quickstart
 
 ### Building Llaminar
