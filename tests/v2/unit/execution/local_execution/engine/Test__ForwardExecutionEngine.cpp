@@ -1330,6 +1330,39 @@ TEST_F(Test__ForwardExecutionEngine, Execute_NonExactBucketOnCpu_FallsThrough)
         << "No bucket should be applied in the fallthrough path.";
 }
 
+TEST_F(Test__ForwardExecutionEngine, Execute_AboveLargestBucketOnCpu_FallsThrough)
+{
+    // CPU prefill must not be constrained by GPU graph bucket boundaries. A
+    // prompt longer than the largest configured bucket should run unbucketed
+    // instead of failing with "real_seq_len exceeds largest prefill graph bucket".
+    ScopedDebugEnv env({
+        {"LLAMINAR_GPU_GRAPHS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKETS", "1"},
+        {"LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "4"},
+        {"LLAMINAR_PREFILL_GRAPH_MIN_SEQ", "1"},
+    });
+
+    auto engine = makeEngine(/*cache_enabled=*/true);
+    MockForwardExecutionHost host(&mock_ctx_);
+    host.graph_stage_count = 1;
+
+    const std::vector<int> tokens = {100, 101, 102, 103, 104};
+    const std::vector<int> positions = {400, 401, 402, 403, 404};
+    auto input = makeTestInput(5, 1, DeviceId::cpu(), tokens.data(), positions.data());
+    input.position_offset = 400;
+
+    ForwardOutput output{};
+    EXPECT_TRUE(engine.execute(input, output, host))
+        << "Above-largest bucket prefill on CPU should fall through to unbucketed execution.";
+    EXPECT_EQ(host.build_forward_graph_calls, 1);
+    EXPECT_EQ(host.last_forward_input.seq_len, 5);
+    EXPECT_EQ(host.last_forward_input.real_seq_len, 0);
+    EXPECT_EQ(host.last_forward_input.bucket_seq_len, 0);
+    EXPECT_EQ(host.last_token_ids, tokens);
+    EXPECT_EQ(host.last_position_ids, positions);
+    EXPECT_EQ(host.last_workspace_seq_len, 5);
+}
+
 // =========================================================================
 // Cache Management
 // =========================================================================

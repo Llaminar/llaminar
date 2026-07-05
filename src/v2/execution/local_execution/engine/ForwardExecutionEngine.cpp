@@ -919,8 +919,25 @@ namespace llaminar2
             return false;
         }
 
-        if (!is_decode && input.bucket_seq_len <= 0 && env.execution.prefill_graph_buckets &&
-            prefill_graph_min_seq_met && input.token_ids && input.batch_size == 1)
+        const bool raw_prefill_bucket_candidate =
+            !is_decode &&
+            input.bucket_seq_len <= 0 &&
+            env.execution.prefill_graph_buckets &&
+            prefill_graph_min_seq_met &&
+            input.token_ids &&
+            input.batch_size == 1;
+
+        if (raw_prefill_bucket_candidate && !prefill_cache_eligible)
+        {
+            // Bucketed prefill graphs are a GPU graph-cache feature.  CPU and
+            // otherwise-ineligible paths must not validate against graph bucket
+            // boundaries; they should run the ordinary unbucketed prefill path.
+            LOG_DEBUG("[ForwardExecutionEngine] Skipping prefill graph bucket selection for ineligible prefill: "
+                      << "seq_len=" << input.seq_len
+                      << " real_seq_len=" << input_real_seq_len
+                      << " device=" << input.device.toString());
+        }
+        else if (raw_prefill_bucket_candidate)
         {
             const int real_seq_len = input_real_seq_len;
             const auto selection = selectPrefillGraphBucket(
@@ -931,14 +948,6 @@ namespace llaminar2
                 LOG_ERROR("[ForwardExecutionEngine] Bucketed prefill graph request rejected: "
                           << selection.error << " (seq_len=" << input.seq_len << ")");
                 return false;
-            }
-            if (!selection.exact && !prefill_cache_eligible)
-            {
-                // Non-GPU devices cannot use padded graph buckets — fall through
-                // to unbucketed prefill execution (no error, just skip bucketing).
-                LOG_DEBUG("[ForwardExecutionEngine] Skipping padded bucket for non-GPU device: real_seq_len="
-                          << real_seq_len << " bucket_seq_len=" << selection.bucket_seq_len
-                          << " device=" << input.device.toString());
             }
         }
 
