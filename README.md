@@ -30,6 +30,10 @@ Llaminar supports the following model architectures initially:
 
 ## Benchmarks
 
+Llaminar is benchmarked with 2x RTX 3090Ti cards, 4x AMD Mi50 32GB cards, on a dual socket Xeon Gold 6238r with 768GB DDR4 at 6 channels per socket. 
+
+Llaminar usually* beats mainline Llama.cpp and ik_llama on focused benchmarks, especially dual socket CPU. 
+
 Latest benchmarks can be found here: 
 
 https://github.com/Llaminar/llaminar/blob/develop/benchmark_results/bcd2b199/benchmark_results.csv
